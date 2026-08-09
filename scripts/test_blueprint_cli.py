@@ -12,10 +12,11 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
-import pytest
+from types import SimpleNamespace
 
 import blueprint
 import blueprint_api
+import pytest
 
 
 def test_get_project_id_matches_configured_default_repo(monkeypatch):
@@ -452,7 +453,7 @@ def mock_api(monkeypatch):
         if "/release-versions?" in path or path.endswith("/release-versions"):
             # Paginated full-history endpoint. Echo the requested window so the
             # CLI's offset/limit handling and header/footer can be asserted.
-            from urllib.parse import urlparse, parse_qs
+            from urllib.parse import parse_qs, urlparse
 
             qs = parse_qs(urlparse(path).query)
             limit = int(qs.get("limit", ["20"])[0])
@@ -839,7 +840,7 @@ def mock_api(monkeypatch):
                 ],
             }
         if "/knowledge-documents" in path and method == "GET":
-            from urllib.parse import urlparse, parse_qs
+            from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(path).query)
             docs = [
                 {"id": "kdoc-001", "title": "API Rate Limiting", "source_kind": "web_research",
@@ -5809,7 +5810,106 @@ def test_deploy_receipt_post_failure_warns_and_exits_nonzero(monkeypatch, capsys
     assert "activation receipt could not be recorded" in err
 
 
-def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch):
+def test_deploy_agent_preflight_reports_install_state(monkeypatch, tmp_path, capsys):
+    """Preflight reports the host contract and never executes a pending approval."""
+    unit = tmp_path / "blueprint-deploy-agent.service"
+    shim = tmp_path / "blueprint-release"
+    poll = tmp_path / "deploy-agent.poll"
+    state = tmp_path / "deploy-agent.state"
+    unit.write_text("[Service]\n", encoding="utf-8")
+    shim.write_text("#!/bin/sh\n", encoding="utf-8")
+    shim.chmod(0o755)
+    poll.write_text(
+        json.dumps({"polled_at": blueprint.datetime.now(blueprint.timezone.utc).isoformat()}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(blueprint, "_DEPLOY_AGENT_UNIT_PATH", str(unit))
+    monkeypatch.setattr(blueprint, "_RELEASE_SHIM_PATH", str(shim))
+    real_lstat = blueprint.os.lstat
+
+    def fake_lstat(path):
+        info = real_lstat(path)
+        if str(path) in {str(unit), str(shim)}:
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=0, st_gid=0)
+        return info
+
+    monkeypatch.setattr(blueprint.os, "lstat", fake_lstat)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _project_id=None: "proj-1")
+    monkeypatch.setattr(
+        blueprint.subprocess,
+        "run",
+        lambda command, **kwargs: type(
+            "Result", (), {
+                "returncode": 0,
+                "stdout": "UnitFileState=enabled\nActiveState=active\nSubState=running\n",
+                "stderr": "",
+            }
+        )(),
+    )
+    calls = []
+    pending = False
+
+    def fake_api(method, path, body=None, timeout=30):
+        nonlocal pending
+        calls.append((method, path, body))
+        assert method == "GET"
+        return {
+            "versions": [{
+                "version_number": 7,
+                "status": "promoted",
+                "serving_status": "unconfirmed",
+                "activation_requested_at": (
+                    "2026-06-15T00:00:00Z" if pending else None
+                ),
+                "promoted_sha": _DEPLOY_PROMOTED_SHA,
+            }],
+            "total": 1,
+        }
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    args = [
+        "deploy-agent", "--preflight", "--json", "--project-id", "proj-1",
+        "--state-path", str(state), "--poll-state-path", str(poll),
+    ]
+
+    assert blueprint.main(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["passed"] is True
+    assert report["checks"]["service"]["enabled"] is True
+    assert report["checks"]["polling"]["last_poll_at"]
+    assert report["checks"]["activation"]["pending"] is False
+
+    unit.unlink()
+    shim.unlink()
+    assert blueprint.main(args) != 0
+    missing_output = capsys.readouterr().out
+    assert "unit file" in missing_output.lower()
+    assert "release shim" in missing_output.lower()
+
+    unit.write_text("[Service]\n", encoding="utf-8")
+    shim.write_text("#!/bin/sh\n", encoding="utf-8")
+    shim.chmod(0o755)
+    assert not state.exists()
+    pending = True
+    calls.clear()
+    shim_calls = []
+    monkeypatch.setattr(
+        blueprint,
+        "_invoke_release_shim",
+        lambda *a, **kw: shim_calls.append((a, kw)),
+    )
+
+    assert blueprint.main(args) == 0
+    pending_output = json.loads(capsys.readouterr().out)
+    assert pending_output["checks"]["activation"]["pending"] is True
+    assert all(value is True for value in pending_output["checks"]["activation"]["preconditions"].values())
+    assert not shim_calls
+    assert not any(method == "POST" for method, _, _ in calls)
+    assert not state.exists()
+
+
+def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, tmp_path):
     """The host agent consumes one live approval through the local shim, then
     records the exact promoted revision with the existing receipt endpoint."""
     calls = []
@@ -5832,7 +5932,11 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch):
     }
     monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda args: promoted)
 
-    assert blueprint._deploy_agent_once(argparse.Namespace(project_id=None)) is True
+    poll_path = tmp_path / "deploy-agent.poll"
+    assert blueprint._deploy_agent_once(
+        argparse.Namespace(project_id=None, poll_state_path=str(poll_path))
+    ) is True
+    assert json.loads(poll_path.read_text(encoding="utf-8"))["polled_at"]
 
     assert shim_calls == [[
         "sudo", "/usr/local/sbin/blueprint-release",
@@ -5847,6 +5951,34 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch):
         "revision": agent_revision,
         "host": "control-plane",
     }
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        ("HTTP 401: invalid credential", "unauthorized"),
+        ("cannot reach API at http://orchestrator: refused", "unreachable"),
+    ],
+)
+def test_deploy_agent_preflight_classifies_control_plane_failures(
+    monkeypatch, error, status
+):
+    """Preflight distinguishes credential rejection from transport failure."""
+    from blueprint_api import APIError
+
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _project_id=None: "proj-1")
+
+    def fail_api(*args, **kwargs):
+        raise APIError(error)
+
+    monkeypatch.setattr(blueprint, "api", fail_api)
+
+    control, activation = blueprint._activation_preflight(argparse.Namespace(project_id=None))
+
+    assert control["status"] == status
+    assert control["passed"] is False
+    assert activation["passed"] is False
+    assert "remediation" in control
 
 
 def test_deploy_agent_receipt_failure_retries_without_reexecuting_shim(

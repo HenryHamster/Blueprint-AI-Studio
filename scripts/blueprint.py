@@ -48,6 +48,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,12 @@ from blueprint_api import (
 
 SERVICE_NAME = os.environ.get("BLUEPRINT_GCP_SERVICE", "blueprint-orchestrator")
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "blueprint-orchestrator")
+
+_DEPLOY_AGENT_UNIT_PATH = "/etc/systemd/system/blueprint-deploy-agent.service"
+_DEPLOY_AGENT_POLL_PATH = "/run/blueprint-deploy-agent/deploy-agent.poll"
+_DEPLOY_AGENT_STATE_PATH = "/run/blueprint-deploy-agent/deploy-agent.state"
+_RELEASE_SHIM_PATH = "/usr/local/sbin/blueprint-release"
+_DEPLOY_AGENT_POLL_MAX_AGE_SECONDS = 120
 
 
 # ── output helpers ───────────────────────────────────────────────────────────
@@ -5525,8 +5532,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--lock-path", default="/run/blueprint-deploy-agent/deploy-agent.lock",
         help="Local serialization lock path (managed by the systemd runtime directory).")
     p_deploy_agent.add_argument(
-        "--state-path", default="/run/blueprint-deploy-agent/deploy-agent.state",
+        "--state-path", default=_DEPLOY_AGENT_STATE_PATH,
         help="Local receipt-retry state path (managed by the systemd runtime directory).")
+    p_deploy_agent.add_argument(
+        "--poll-state-path", default=_DEPLOY_AGENT_POLL_PATH,
+        help="Local successful-poll marker path (managed by the systemd runtime directory).")
+    p_deploy_agent.add_argument(
+        "--preflight", action="store_true",
+        help="Read-only installation, polling, connectivity, and activation checklist.")
 
     # envelope
     p_envelope = sub.add_parser(
@@ -5973,6 +5986,7 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
     receipt for the same approval instead of restarting the release.
     """
     approved = _read_live_approved_activation(args)
+    _write_deploy_agent_poll(getattr(args, "poll_state_path", None))
     if approved is None:
         return False
     promoted_sha = approved["promoted_sha"].lower()
@@ -6048,6 +6062,13 @@ def _read_deploy_agent_state(path: str | None) -> dict | None:
     return state
 
 
+def _write_deploy_agent_poll(path: str | None) -> None:
+    """Record a successful activation poll in a separate local marker."""
+    if not path:
+        return
+    _write_deploy_agent_state(path, {"polled_at": datetime.now(timezone.utc).isoformat()})
+
+
 def _write_deploy_agent_state(path: str | None, state: dict) -> None:
     """Atomically persist successful execution before receipt delivery."""
     if not path:
@@ -6082,6 +6103,290 @@ def _clear_deploy_agent_state(path: str | None) -> None:
         pass
 
 
+def _preflight_file(path: str, *, executable: bool = False) -> dict:
+    """Inspect one managed host file without following or changing it."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {
+            "exists": False,
+            "regular": False,
+            "passed": False,
+            "message": f"missing: {path}",
+            "remediation": "run the release bootstrap on the control-plane host",
+        }
+    except OSError as exc:
+        return {
+            "exists": False,
+            "regular": False,
+            "passed": False,
+            "message": f"cannot inspect {path}: {exc}",
+            "remediation": "inspect host permissions and rerun the release bootstrap",
+        }
+    regular = stat.S_ISREG(info.st_mode)
+    executable_ok = not executable or bool(info.st_mode & 0o111)
+    root_owned = info.st_uid == 0 and info.st_gid == 0
+    passed = regular and executable_ok and root_owned
+    problems = []
+    if not regular:
+        problems.append("not a regular file")
+    if executable and not executable_ok:
+        problems.append("not executable")
+    if not root_owned:
+        problems.append(f"owned by {info.st_uid}:{info.st_gid}, expected root:root")
+    result = {
+        "exists": True,
+        "regular": regular,
+        "executable": executable_ok if executable else None,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "passed": passed,
+        "message": f"present: {path}" if passed else f"{path}: {', '.join(problems)}",
+    }
+    if not passed:
+        result["remediation"] = (
+            "run the release bootstrap on the control-plane host and verify root:root ownership"
+        )
+    return result
+
+
+def _systemd_preflight() -> dict:
+    """Read the deploy-agent unit and its live systemd state."""
+    file_check = _preflight_file(_DEPLOY_AGENT_UNIT_PATH)
+    if not file_check["passed"]:
+        file_check["message"] = f"unit file: {file_check['message']}"
+        return {
+            "path": _DEPLOY_AGENT_UNIT_PATH,
+            "unit": os.path.basename(_DEPLOY_AGENT_UNIT_PATH),
+            "enabled": False,
+            "active": False,
+            **file_check,
+        }
+    unit = os.path.basename(_DEPLOY_AGENT_UNIT_PATH)
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/systemctl", "show", unit,
+                "--property=UnitFileState",
+                "--property=ActiveState",
+                "--property=SubState",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return {
+            "path": _DEPLOY_AGENT_UNIT_PATH,
+            "unit": unit,
+            "enabled": False,
+            "active": False,
+            "passed": False,
+            "message": f"cannot query systemd: {exc}",
+            "remediation": "run systemctl daemon-reload and enable --now blueprint-deploy-agent.service",
+        }
+    properties = {}
+    for line in (result.stdout or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            properties[key] = value
+    enabled = properties.get("UnitFileState") == "enabled"
+    active = properties.get("ActiveState") == "active"
+    passed = result.returncode == 0 and enabled and active
+    response = {
+        "path": _DEPLOY_AGENT_UNIT_PATH,
+        "unit": unit,
+        "enabled": enabled,
+        "active": active,
+        "active_state": properties.get("ActiveState"),
+        "sub_state": properties.get("SubState"),
+        "unit_file_state": properties.get("UnitFileState"),
+        "passed": passed,
+        "message": (
+            "installed, enabled, and active"
+            if passed else
+            f"enabled={properties.get('UnitFileState', 'unknown')}, "
+            f"active={properties.get('ActiveState', 'unknown')}"
+        ),
+    }
+    if not passed:
+        response["remediation"] = (
+            "run systemctl daemon-reload && systemctl enable --now "
+            "blueprint-deploy-agent.service"
+        )
+    return response
+
+
+def _poll_preflight(path: str) -> dict:
+    """Read the last successful poll marker and assess its age."""
+    marker = _read_deploy_agent_state(path)
+    polled_at = marker.get("polled_at") if marker else None
+    if not polled_at:
+        return {
+            "path": path,
+            "last_poll_at": None,
+            "seconds_since_last_poll": None,
+            "passed": False,
+            "message": "no successful poll has ever occurred",
+            "remediation": "start or restart blueprint-deploy-agent.service",
+        }
+    try:
+        parsed = datetime.fromisoformat(str(polled_at).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        age = max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+    except (TypeError, ValueError):
+        return {
+            "path": path,
+            "last_poll_at": polled_at,
+            "seconds_since_last_poll": None,
+            "passed": False,
+            "message": f"invalid successful-poll marker: {polled_at}",
+            "remediation": "restart blueprint-deploy-agent.service to recreate its poll marker",
+        }
+    passed = age <= _DEPLOY_AGENT_POLL_MAX_AGE_SECONDS
+    result = {
+        "path": path,
+        "last_poll_at": parsed.isoformat(),
+        "seconds_since_last_poll": round(age, 1),
+        "passed": passed,
+        "message": f"last successful poll {age:.1f}s ago",
+    }
+    if not passed:
+        result["remediation"] = "restart blueprint-deploy-agent.service and inspect its journal"
+    return result
+
+
+def _preflight_api_failure(exc: Exception) -> tuple[str, str]:
+    """Classify auth failures separately from transport/control-plane failures."""
+    message = str(exc)
+    if re.search(r"HTTP (401|403)\b", message):
+        return "unauthorized", (
+            "control plane rejected credentials; refresh BLUEPRINT_API_KEY or the agent token"
+        )
+    return "unreachable", (
+        "control plane is unreachable; verify network access and the configured API URL"
+    )
+
+
+def _activation_preflight(args: argparse.Namespace) -> tuple[dict, dict]:
+    """Read the activation endpoint once and derive all four approval predicates."""
+    try:
+        project_id = get_project_id(getattr(args, "project_id", None))
+        path = f"/api/admin/projects/{project_id}/release-versions?status=promoted&limit=1"
+        payload = api("GET", path)
+    except Exception as exc:  # noqa: BLE001 — diagnostic must report all config/transport failures
+        status, remediation = _preflight_api_failure(exc)
+        failure = {
+            "passed": False,
+            "status": status,
+            "message": str(exc),
+            "remediation": remediation,
+        }
+        return failure, {
+            "pending": False,
+            "preconditions": {
+                "status_promoted": False,
+                "serving_unconfirmed": False,
+                "activation_requested_at": False,
+                "promoted_sha_valid": False,
+            },
+            "passed": False,
+            "message": "not checked because the activation read failed",
+            "remediation": "restore control-plane access, then rerun preflight",
+        }
+    versions = payload.get("versions") if isinstance(payload, dict) else None
+    version = versions[0] if versions else None
+    control = {
+        "passed": True,
+        "status": "reachable_authenticated",
+        "message": "activation endpoint reachable and authenticated",
+        "endpoint": path,
+    }
+    preconditions = {
+        "status_promoted": bool(version and version.get("status") == "promoted"),
+        "serving_unconfirmed": bool(version and version.get("serving_status") == "unconfirmed"),
+        "activation_requested_at": bool(version and version.get("activation_requested_at")),
+        "promoted_sha_valid": bool(
+            version and _DEPLOY_REVISION_RE.fullmatch((version.get("promoted_sha") or "").lower())
+        ),
+    }
+    pending = bool(version and version.get("activation_requested_at"))
+    passed = not pending or all(preconditions.values())
+    activation = {
+        "pending": pending,
+        "version_number": version.get("version_number") if version else None,
+        "preconditions": preconditions,
+        "passed": passed,
+        "message": (
+            "installed, polling, nothing to do"
+            if not pending else
+            "approved activation is pending and all executor preconditions are satisfied"
+            if passed else
+            "activation request is present but one or more executor preconditions failed"
+        ),
+    }
+    if not passed:
+        activation["remediation"] = "repair the promoted activation state, then rerun preflight"
+    return control, activation
+
+
+def _cmd_deploy_agent_preflight(args: argparse.Namespace) -> int:
+    """Run the deploy-agent diagnostic without taking any activation action."""
+    service = _systemd_preflight()
+    polling = _poll_preflight(getattr(args, "poll_state_path", _DEPLOY_AGENT_POLL_PATH))
+    shim = _preflight_file(_RELEASE_SHIM_PATH, executable=True)
+    if not shim["passed"]:
+        shim["message"] = f"release shim: {shim['message']}"
+    control, activation = _activation_preflight(args)
+    state_path = getattr(args, "state_path", _DEPLOY_AGENT_STATE_PATH)
+    parked = _read_deploy_agent_state(state_path) is not None
+    state = {
+        "path": state_path,
+        "parked_for_receipt_retry": parked,
+        "passed": not parked,
+        "message": (
+            "no interrupted activation is parked"
+            if not parked else
+            "interrupted activation is parked awaiting receipt retry"
+        ),
+    }
+    if parked:
+        state["remediation"] = "restore control-plane access and run deploy-agent once to retry the receipt"
+    checks = {
+        "service": service,
+        "polling": polling,
+        "release_shim": shim,
+        "control_plane": control,
+        "activation": activation,
+        "state": state,
+    }
+    report = {"passed": all(check.get("passed", False) for check in checks.values()), "checks": checks}
+    _emit(args, report, lambda data: _render_deploy_agent_preflight(data))
+    return 0 if report["passed"] else 1
+
+
+def _render_deploy_agent_preflight(data: dict) -> None:
+    """Render a concise, actionable human-readable preflight checklist."""
+    print("=== DEPLOY AGENT PREFLIGHT ===")
+    labels = {
+        "service": "systemd unit",
+        "polling": "polling",
+        "release_shim": "release shim",
+        "control_plane": "control-plane access",
+        "activation": "approved activation",
+        "state": "crash-safe state",
+    }
+    for name, check in data["checks"].items():
+        status = "PASS" if check.get("passed") else "FAIL"
+        print(f"[{status}] {labels[name]}: {check.get('message', '')}")
+        if name == "activation":
+            for predicate, satisfied in check.get("preconditions", {}).items():
+                print(f"       {predicate}: {'satisfied' if satisfied else 'not satisfied'}")
+        if not check.get("passed") and check.get("remediation"):
+            print(f"       Remediation: {check['remediation']}")
+
+
 def _acquire_deploy_agent_lock(path: str):
     """Acquire the systemd-owned runtime lock without blocking another poll."""
     handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 - returned locked handle
@@ -6093,8 +6398,10 @@ def _acquire_deploy_agent_lock(path: str):
     return handle
 
 
-def cmd_deploy_agent(args: argparse.Namespace) -> None:
+def cmd_deploy_agent(args: argparse.Namespace) -> int | None:
     """Run the local approved-activation executor at a 30-second default cadence."""
+    if getattr(args, "preflight", False):
+        return _cmd_deploy_agent_preflight(args)
     if args.poll_interval <= 0:
         raise APIError(1, "poll interval must be positive")
     _require_write_config("deploy-agent")
@@ -6253,7 +6560,9 @@ def main(argv: list | None = None) -> int:
         proj_name = getattr(args, "project_name", None)
         if proj_name and not getattr(args, "project_id", None):
             args.project_id = resolve_project_id_by_name(proj_name)
-        handler(args)
+        result = handler(args)
+        if isinstance(result, int):
+            return result
     except APIError:
         return 1
     return 0
