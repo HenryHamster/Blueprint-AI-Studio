@@ -54,15 +54,19 @@ The trust chain never depends on the caller:
 
 Migrations are part of this path. The release tool compares the candidate
 image's baked schema revision with the live database head. Matching revisions
-use the normal hot-swap; when they differ, the tool stops both managed app
-units, waits for their containers to stop, runs the canonical migration
-transaction with the candidate image, verifies the resulting schema head, and
-starts the worker before the API. This is a bounded downtime window. If the
-migration choreography fails after the window begins, the app units remain
-stopped and the release must be fixed forward; the tool does not roll older
-code back across a possibly advanced schema. Operators do not run migrations
-separately, but must treat the deploy as a maintenance window and investigate
-or fix forward if it fails during migration.
+use the normal hot-swap. Before stopping either app unit for a mismatch, the
+tool verifies that the candidate's bundled Alembic graph reaches the target
+from the live head. A non-forward or unreachable target is refused with both
+app units still running; use an image matching the database or fix forward.
+Only a forward-reachable mismatch enters the bounded downtime window: the tool
+stops both managed app units, waits for their containers to stop, runs the
+canonical migration transaction with the candidate image, verifies the
+resulting schema head, and starts the worker before the API. If the migration
+choreography fails after the window begins, the app units remain stopped and
+the release must be fixed forward; the tool does not roll older code back
+across a possibly advanced schema. Operators do not run migrations separately,
+but must treat the deploy as a maintenance window and investigate or fix
+forward if it fails during migration.
 
 ## Host-side deploy agent (one-time install)
 
@@ -147,10 +151,13 @@ poll cadence; the agent never crashes a poll cycle into the service.
   never invokes the release executor again for that approval. The approval
   stays pending in the backend, so the next healthy cycle retries it. An
   operator can always hand-run `python scripts/blueprint.py deploy` instead.
-- **Manual rollback (unchanged):** `blueprint deploy` / the release tool's
-  rollback behavior is untouched. To roll back to an earlier revision, run
-  `python scripts/blueprint.py deploy --sha <earlier-main-sha> --force` (the
-  receipt records it). The bootstrap removes the legacy
-  `/etc/sudoers.d/blueprint-release` grant during installation; no manual
+- **Manual rollback:** run `python scripts/blueprint.py deploy --sha
+  <earlier-main-sha> --force` when an operator must select the earlier image.
+  The release tool permits the rollback only when that image has the same
+  schema as the live database (a hot swap); an older or unreachable schema is
+  refused before either app unit is stopped, and the operator must fix forward
+  or choose a schema-compatible image. The receipt records the attempt. The
+  bootstrap removes the legacy `/etc/sudoers.d/blueprint-release` grant during
+  installation; no manual
   sudoers revocation is needed. The active release executor is the root-owned
   socket service described above.

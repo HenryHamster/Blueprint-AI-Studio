@@ -43,6 +43,56 @@ _SCHEMA_REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _EXPECTED_SCHEMA_REVISION_LINE_RE = re.compile(
     r"^EXPECTED_SCHEMA_REVISION\s*=\s*(['\"])(?P<revision>[A-Za-z0-9_.-]+)\1$"
 )
+_SCHEMA_REACHABILITY_PROBE = """
+import ast
+import sys
+from pathlib import Path
+
+revisions = {}
+for path in Path('/app/alembic/versions').glob('*.py'):
+    try:
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        values = {}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in {'revision', 'down_revision'}:
+                    values[target.id] = ast.literal_eval(node.value)
+        revision = values.get('revision')
+        down_revision = values.get('down_revision')
+        if not isinstance(revision, str):
+            raise ValueError('missing revision')
+        if down_revision is None:
+            parents = ()
+        elif isinstance(down_revision, str):
+            parents = (down_revision,)
+        elif isinstance(down_revision, (tuple, list)) and all(isinstance(item, str) for item in down_revision):
+            parents = tuple(down_revision)
+        else:
+            raise ValueError('invalid down_revision')
+        if revision in revisions:
+            raise ValueError('duplicate revision')
+        revisions[revision] = parents
+    except Exception:
+        print('unreachable')
+        raise SystemExit(0)
+
+current, target = sys.argv[1:3]
+pending = [target]
+visited = set()
+reachable = False
+while pending:
+    revision = pending.pop()
+    if revision == current:
+        reachable = True
+        break
+    if revision in visited or revision not in revisions:
+        continue
+    visited.add(revision)
+    pending.extend(revisions[revision])
+print('reachable' if reachable else 'unreachable')
+""".strip()
 _SYSTEM_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _SERVICES = ("blueprint-api.service", "blueprint-worker.service")
 _ACTIVATION_ORDER = ("blueprint-worker.service", "blueprint-api.service")
@@ -1174,6 +1224,19 @@ def _run_local_migration(image_ref: str) -> None:
         raise RuntimeError(f"local migration exited {result}")
 
 
+def _schema_mismatch_refusal(
+    image_id: str,
+    image_label: str,
+    image_revision: str,
+    database_revision: str,
+    reason: str,
+) -> str:
+    return (
+        f"code-rollback refused: {image_label} {image_id} expects schema "
+        f"{image_revision} but DB is at {database_revision}; {reason}"
+    )
+
+
 def _code_rollback_refusal(prior_image_id: str) -> str | None:
     try:
         prior_revision = _image_schema_revision(prior_image_id)
@@ -1185,10 +1248,63 @@ def _code_rollback_refusal(prior_image_id: str) -> str | None:
         )
     if prior_revision == database_revision:
         return None
+    return _schema_mismatch_refusal(
+        prior_image_id,
+        "prior image",
+        prior_revision,
+        database_revision,
+        "a forward migration cannot be undone by restoring the old image -- "
+        "fix forward",
+    )
+
+
+def _target_schema_refusal(
+    image_id: str, target_revision: str, database_revision: str
+) -> str | None:
+    """Refuse a target that is not an Alembic descendant of the live head."""
+    if target_revision == database_revision:
+        return None
+    try:
+        result = _run(
+            [
+                "/usr/bin/docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--workdir",
+                "/app",
+                "--entrypoint",
+                "/usr/local/bin/python",
+                image_id,
+                "-c",
+                _SCHEMA_REACHABILITY_PROBE,
+                database_revision,
+                target_revision,
+            ],
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:
+        detail = f"could not determine migration reachability: {exc}"
+    else:
+        detail = (
+            "target is not forward-reachable from the live database head"
+            if result.returncode != 0 or result.stdout.strip() != "reachable"
+            else ""
+        )
+    if not detail:
+        return None
+    compatibility_refusal = _schema_mismatch_refusal(
+        image_id,
+        "candidate image",
+        target_revision,
+        database_revision,
+        f"{detail}; fix forward",
+    )
     return (
-        f"code-rollback refused: prior image {prior_image_id} expects schema "
-        f"{prior_revision} but DB is at {database_revision}; a forward migration "
-        "cannot be undone by restoring the old image -- fix forward"
+        f"release refused before stopping app units: {compatibility_refusal}; "
+        "app units remain running"
     )
 
 
@@ -1335,6 +1451,21 @@ def release(image_ref: str, revision: str) -> Path:
             "untouched_units": list(_UNTOUCHED_UNITS),
             "untouched_unit_markers_match": markers_match,
         }
+
+    target_refusal = _target_schema_refusal(
+        image_id, target_schema_revision, database_schema_before
+    )
+    if target_refusal is not None:
+        try:
+            evidence = _write_evidence(
+                _EVIDENCE_ROOT,
+                receipt("rollback_refused", target_refusal, False),
+            )
+        except Exception as evidence_exc:
+            raise RuntimeError(
+                f"{target_refusal}; EVIDENCE_WRITE_FAILED: {evidence_exc}"
+            ) from evidence_exc
+        raise RuntimeError(f"{target_refusal}; evidence={evidence}")
 
     touched_units: list[str] = []
     migration_choreography_started = False

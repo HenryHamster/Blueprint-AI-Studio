@@ -781,7 +781,13 @@ class LocalAppReleaseTests(unittest.TestCase):
             mocks = {
                 "atomic": stack.enter_context(patch.object(release, "_atomic_write")),
                 "run": stack.enter_context(
-                    patch.object(release, "_run", return_value=completed())
+                    patch.object(
+                        release,
+                        "_run",
+                        return_value=subprocess.CompletedProcess(
+                            [], 0, "reachable\n", ""
+                        ),
+                    )
                 ),
                 "container": stack.enter_context(
                     patch.object(release, "_verify_container")
@@ -1004,6 +1010,29 @@ class LocalAppReleaseTests(unittest.TestCase):
         mocks["restart"].assert_not_called()
         self.assertEqual(mocks["evidence"].call_args.args[1]["outcome"], "migration_failed")
 
+    def test_non_forward_schema_target_is_refused_before_stopping_units(self):
+        """A rollback target must be rejected while both app units remain up."""
+        with self._release_patches() as mocks:
+            mocks["image_schema"].return_value = "0741"
+            mocks["database_schema"].return_value = "0742"
+            mocks["run"].return_value = subprocess.CompletedProcess(
+                [], 0, "unreachable\n", ""
+            )
+            with (
+                patch.object(release, "_stop_unit_container") as stop,
+                patch.object(release, "_run_local_migration") as migrate,
+                self.assertRaises(RuntimeError) as caught,
+            ):
+                release.release(IMAGE_REF, REVISION)
+
+            stop.assert_not_called()
+            migrate.assert_not_called()
+            self.assertRegex(str(caught.exception), "not forward-reachable")
+            self.assertEqual(
+                mocks["evidence"].call_args.args[1]["outcome"],
+                "rollback_refused",
+            )
+
     def test_worker_activation_failure_rolls_back_only_touched_worker(self):
         def restart(unit: str, image: str, **_kwargs) -> None:
             if unit == "blueprint-worker.service" and image == NEW_IMAGE:
@@ -1139,6 +1168,27 @@ class LocalAppReleaseTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "one schema head"):
                     release._database_schema_revision()
+
+    def test_target_schema_reachability_probe_fails_closed(self):
+        with patch.object(
+            release,
+            "_run",
+            side_effect=RuntimeError("probe unavailable"),
+        ):
+            refusal = release._target_schema_refusal(NEW_IMAGE, "0743", "0742")
+        self.assertRegex(refusal or "", "could not determine migration reachability")
+
+    def test_target_schema_reachability_accepts_explicit_descendant(self):
+        with patch.object(
+            release,
+            "_run",
+            return_value=subprocess.CompletedProcess([], 0, "reachable\n", ""),
+        ) as probe:
+            self.assertIsNone(
+                release._target_schema_refusal(NEW_IMAGE, "0743", "0742")
+            )
+        command = probe.call_args.args[0]
+        self.assertEqual(command[-2:], ["0742", "0743"])
 
     def test_rollback_proceeds_when_prior_image_schema_matches_db(self):
         with self._release_patches(

@@ -91,16 +91,20 @@ The output must contain the worker account under
 
 The tool retains the prior image and compares the candidate's baked schema
 revision with the live database head. Matching revisions retain the existing
-hot-swap behavior. A mismatch uses bounded downtime: it stops both managed app
-units, waits for their exact containers to stop, runs the canonical local
-migration transaction with the candidate image, confirms the resulting schema
-head, then starts the worker before the API. Worker startup and sole-leadership
-readiness must pass before the API is touched. Local API revision and health
-must pass before public health. Once a migration downtime window begins, a
-failure leaves the app units stopped and requires a fix-forward release; it
-never rolls prior code back across a possibly advanced schema. Other failed
-activations roll back only their touched services using the same identity and
-readiness checks. Root-only receipts are written below
+hot-swap behavior. Before any unit is stopped for a mismatch, the tool checks
+the candidate image's bundled Alembic graph and requires the target to be
+forward-reachable from the live head. A non-forward or unreachable target is
+refused while both app units remain running; select an image matching the
+database or fix forward. A forward-reachable mismatch uses bounded downtime:
+it stops both managed app units, waits for their exact containers to stop, runs
+the canonical local migration transaction with the candidate image, confirms
+the resulting schema head, then starts the worker before the API. Worker
+startup and sole-leadership readiness must pass before the API is touched.
+Local API revision and health must pass before public health. Once a migration
+downtime window begins, a failure leaves the app units stopped and requires a
+fix-forward release; it never rolls prior code back across a possibly advanced
+schema. Other failed activations roll back only their touched services using
+the same identity and readiness checks. Root-only receipts are written below
 `/var/lib/blueprint/local-app-releases/`.
 
 Cloud Run remains a manually activated recovery target. Firebase Hosting
