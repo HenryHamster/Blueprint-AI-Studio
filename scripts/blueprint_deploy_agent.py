@@ -71,6 +71,7 @@ try:
     from blueprint import (
         APIError,
         _execute_deploy_shim,
+        _pending_activation_confirmation,
         _post_activation_receipt,
         _resolve_deploy_binding,
         _resolve_deploy_manifest,
@@ -82,6 +83,7 @@ except ImportError:  # pragma: no cover - installed layout puts scripts/ on path
     from blueprint import (  # noqa: E402
         APIError,
         _execute_deploy_shim,
+        _pending_activation_confirmation,
         _post_activation_receipt,
         _resolve_deploy_binding,
         _resolve_deploy_manifest,
@@ -252,14 +254,33 @@ def _execute_pending_activation(agent_args: argparse.Namespace) -> int:
         getattr(agent_args, "state_path", _DEFAULT_STATE_PATH)
     ).expanduser()
     pending_receipt = _read_activation_state(state_path)
-    if pending_receipt is not None and all(
+    matches_pending_receipt = pending_receipt is not None and all(
         pending_receipt.get(key) == value
         for key, value in {
             "version_number": version_number,
             "promoted_sha": binding_sha,
             "revision": revision,
         }.items()
-    ) and pending_receipt.get("phase") in {"accepted", "completed"}:
+    )
+    pending_phase = pending_receipt.get("phase") if pending_receipt is not None else None
+    if matches_pending_receipt and pending_phase == "failed":
+        logger.error(
+            "activation for v%s failed before its promoted SHA was observed serving",
+            version_number,
+        )
+        return 1
+    if matches_pending_receipt and pending_phase in {"accepted", "completed"}:
+        confirmation = _pending_activation_confirmation(pending_receipt, binding_sha)
+        _write_activation_state(state_path, pending_receipt)
+        if confirmation == "failed":
+            logger.error(
+                "activation for v%s failed: promoted SHA was not observed serving "
+                "before the deadline",
+                version_number,
+            )
+            return 1
+        if confirmation == "pending":
+            return 1
         try:
             _post_activation_receipt(deploy_args, promoted, revision)
         except APIError as exc:
@@ -296,6 +317,17 @@ def _execute_pending_activation(agent_args: argparse.Namespace) -> int:
         return 1
     activation_state["phase"] = "completed"
     _write_activation_state(state_path, activation_state)
+    confirmation = _pending_activation_confirmation(activation_state, binding_sha)
+    _write_activation_state(state_path, activation_state)
+    if confirmation == "failed":
+        logger.error(
+            "activation for v%s failed: promoted SHA was not observed serving "
+            "before the deadline",
+            version_number,
+        )
+        return 1
+    if confirmation == "pending":
+        return 1
     try:
         _post_activation_receipt(deploy_args, promoted, revision)
     except APIError as exc:

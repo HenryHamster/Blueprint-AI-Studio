@@ -59,6 +59,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.request import urlopen
 
 from blueprint_api import (
     APIError,
@@ -79,6 +80,11 @@ _RELEASE_SOCKET_PATH = "/run/blueprint-release.sock"
 _RELEASE_SOCKET_TIMEOUT_SECONDS = 60
 _RELEASE_SHIM_PATH = "/usr/local/sbin/blueprint-release"
 _DEPLOY_AGENT_POLL_MAX_AGE_SECONDS = 120
+# The root release shim can take several minutes to pull and verify an image.
+# Once it has accepted the handoff, give the locally served API a bounded window
+# to prove the promoted revision before treating the activation as failed.
+_DEPLOY_AGENT_CONFIRMATION_TIMEOUT_SECONDS = 15 * 60
+_LOCAL_SERVING_VERSION_URL = "http://127.0.0.1:8080/api/version"
 
 
 # ── output helpers ───────────────────────────────────────────────────────────
@@ -6411,12 +6417,30 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
     state_path = getattr(args, "state_path", None)
     pending_receipt = _read_deploy_agent_state(state_path)
     if pending_receipt is not None:
-        if (
+        matches_approval = (
             pending_receipt.get("version_number") == approved.get("version_number")
             and pending_receipt.get("promoted_sha") == promoted_sha
             and pending_receipt.get("revision") == promoted_sha
-            and pending_receipt.get("phase") in {"accepted", "completed"}
-        ):
+        )
+        if matches_approval and pending_receipt.get("phase") == "failed":
+            print(
+                f"Approved activation for v{approved.get('version_number')} failed "
+                "before its promoted SHA was observed serving.",
+                file=sys.stderr,
+            )
+            return False
+        if matches_approval and pending_receipt.get("phase") in {"accepted", "completed"}:
+            confirmation = _pending_activation_confirmation(pending_receipt, promoted_sha)
+            _write_deploy_agent_state(state_path, pending_receipt)
+            if confirmation == "failed":
+                print(
+                    f"Approved activation for v{approved.get('version_number')} failed: "
+                    "the promoted SHA was not observed serving before the deadline.",
+                    file=sys.stderr,
+                )
+                return False
+            if confirmation == "pending":
+                return False
             _post_activation_receipt(
                 argparse.Namespace(
                     project_id=getattr(args, "project_id", None),
@@ -6471,6 +6495,17 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
         return False
     activation_state["phase"] = "completed"
     _write_deploy_agent_state(state_path, activation_state)
+    confirmation = _pending_activation_confirmation(activation_state, promoted_sha)
+    _write_deploy_agent_state(state_path, activation_state)
+    if confirmation == "failed":
+        print(
+            f"Approved activation for v{current.get('version_number')} failed: "
+            "the promoted SHA was not observed serving before the deadline.",
+            file=sys.stderr,
+        )
+        return False
+    if confirmation == "pending":
+        return False
     _post_activation_receipt(
         argparse.Namespace(
             project_id=getattr(args, "project_id", None),
@@ -6482,6 +6517,59 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
     _clear_deploy_agent_state(state_path)
     print(f"Approved activation for v{current.get('version_number')} completed.")
     return True
+
+
+def _activation_confirmation_now() -> datetime:
+    """Return the wall-clock time used for durable activation deadlines."""
+    return datetime.now(timezone.utc)
+
+
+def _local_served_sha() -> str | None:
+    """Return the SHA from the canonical local serving probe, or ``None``.
+
+    ``local_app_release.py`` verifies this same loopback API endpoint as part of
+    a successful release.  The deploy agent deliberately needs a fresh read
+    after an accepted socket handoff: a rollback can occur after that handoff.
+    Transport, HTTP, JSON, and malformed-payload failures are all unconfirmed.
+    """
+    try:
+        with urlopen(_LOCAL_SERVING_VERSION_URL, timeout=5) as response:
+            if getattr(response, "status", None) != 200:
+                return None
+            payload = json.loads(response.read())
+    except (OSError, ValueError):
+        return None
+    sha = payload.get("sha") if isinstance(payload, dict) else None
+    return sha.lower() if isinstance(sha, str) else None
+
+
+def _pending_activation_confirmation(state: dict, expected_sha: str) -> str:
+    """Return ``confirmed``, ``pending``, or terminal ``failed`` for a receipt.
+
+    The first poll after the root shim has accepted/completed an activation
+    persists a deadline.  A later matching loopback SHA is the only route to a
+    receipt; an old SHA, unavailable API, or malformed response remains pending
+    until that deadline, then latches the local activation as failed.
+    """
+    now = _activation_confirmation_now()
+    raw_deadline = state.get("confirmation_deadline_at")
+    try:
+        deadline = datetime.fromisoformat(str(raw_deadline).replace("Z", "+00:00"))
+        if deadline.tzinfo is None:
+            raise ValueError("naive deadline")
+    except (TypeError, ValueError):
+        deadline = now + timedelta(seconds=_DEPLOY_AGENT_CONFIRMATION_TIMEOUT_SECONDS)
+        state["confirmation_deadline_at"] = deadline.isoformat()
+
+    served_sha = _local_served_sha()
+    if served_sha == expected_sha:
+        return "confirmed"
+    if now >= deadline:
+        state["phase"] = "failed"
+        state["failure_reason"] = "served_sha_not_confirmed_before_deadline"
+        state.pop("confirmation_deadline_at", None)
+        return "failed"
+    return "pending"
 
 
 def _read_deploy_agent_state(path: str | None) -> dict | None:

@@ -13,6 +13,7 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import blueprint
@@ -6165,6 +6166,7 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, t
         "activation_requested_at": "2026-06-15T00:00:00Z",
     }
     monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda args: promoted)
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: _DEPLOY_PROMOTED_SHA)
 
     poll_path = tmp_path / "deploy-agent.poll"
     assert blueprint._deploy_agent_once(
@@ -6182,6 +6184,107 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, t
         "revision": agent_revision,
         "host": "control-plane",
     }
+
+
+def _write_accepted_activation_state(state_path):
+    state_path.write_text(json.dumps({
+        "version_number": 7, "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "revision": _DEPLOY_PROMOTED_SHA, "phase": "accepted",
+    }), encoding="utf-8")
+
+
+def _approved_activation():
+    return {
+        "version_number": 7, "status": "promoted", "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "serving_status": "unconfirmed", "activation_requested_at": "2026-06-15T00:00:00Z",
+    }
+
+
+def _root_activation_retry(monkeypatch, state_path, served_sha, now=None):
+    posted, promoted = [], _approved_activation()
+    monkeypatch.setattr(blueprint, "_require_write_config", lambda _action: None)
+    monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda _args: promoted)
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: served_sha)
+    if now is not None:
+        monkeypatch.setattr(blueprint, "_activation_confirmation_now", lambda: now[0])
+    monkeypatch.setattr(blueprint, "_post_activation_receipt", lambda *args: posted.append(args))
+    return posted, argparse.Namespace(project_id=None, host="control-plane", state_path=str(state_path))
+
+
+def test_deploy_agent_does_not_confirm_when_served_sha_mismatches(monkeypatch, tmp_path):
+    """An accepted handoff stays unconfirmed, then terminally fails, when the old image serves."""
+    state_path, now = tmp_path / "deploy-agent.state", [datetime(2026, 6, 15, tzinfo=timezone.utc)]
+    _write_accepted_activation_state(state_path)
+    posted, args = _root_activation_retry(monkeypatch, state_path, "b" * 40, now)
+    assert blueprint._deploy_agent_once(args) is False
+    pending = json.loads(state_path.read_text(encoding="utf-8"))
+    assert pending["phase"] == "accepted"
+    assert pending["confirmation_deadline_at"]
+    assert posted == []
+
+    now[0] += timedelta(seconds=blueprint._DEPLOY_AGENT_CONFIRMATION_TIMEOUT_SECONDS)
+    assert blueprint._deploy_agent_once(args) is False
+    failed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert failed["phase"] == "failed"
+    assert failed["failure_reason"] == "served_sha_not_confirmed_before_deadline"
+    assert "confirmation_deadline_at" not in failed
+
+    assert blueprint._deploy_agent_once(args) is False
+    assert posted == []
+
+
+def test_deploy_agent_confirms_when_served_sha_matches(monkeypatch, tmp_path):
+    """An accepted socket timeout is retro-confirmed only after the local version endpoint matches."""
+    state_path = tmp_path / "deploy-agent.state"
+    _write_accepted_activation_state(state_path)
+    posted, args = _root_activation_retry(monkeypatch, state_path, _DEPLOY_PROMOTED_SHA)
+
+    assert blueprint._deploy_agent_once(args) is True
+    assert len(posted) == 1
+    assert not state_path.exists()
+
+
+def _standalone_pending_activation_setup(monkeypatch, state_path):
+    """Stub binding resolution so the standalone tests exercise its persisted receipt path."""
+    promoted = _approved_activation() | {"id": "uuid-promo"}
+    monkeypatch.setattr(blueprint, "load_config", dict)
+    monkeypatch.setattr(blueprint_deploy_agent, "get_project_id", lambda _value=None: "proj-1")
+    monkeypatch.setattr(blueprint_deploy_agent, "_latest_promoted_version", lambda _id: promoted)
+    monkeypatch.setattr(
+        blueprint_deploy_agent,
+        "_resolve_deploy_manifest",
+        lambda _args: (_DEPLOY_PROMOTED_SHA, f"sha256:{'0' * 64}", {}),
+    )
+    monkeypatch.setattr(blueprint_deploy_agent, "_resolve_deploy_binding", lambda *_args: promoted)
+    return promoted, argparse.Namespace(
+        project_id="proj-1",
+        host="control-plane",
+        dry_run=False,
+        state_path=str(state_path),
+    )
+
+
+@pytest.mark.parametrize(("served_sha", "expected_rc"), [("b" * 40, 1), (_DEPLOY_PROMOTED_SHA, 0)])
+def test_standalone_deploy_agent_served_sha_gate(monkeypatch, tmp_path, served_sha, expected_rc):
+    """The standalone agent fails old serving images and retro-confirms matching ones."""
+    posted = []
+    now = [datetime(2026, 6, 15, tzinfo=timezone.utc)]
+    state_path = tmp_path / "deploy-agent.state"
+    _write_accepted_activation_state(state_path)
+    _promoted, args = _standalone_pending_activation_setup(monkeypatch, state_path)
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: served_sha)
+    monkeypatch.setattr(blueprint, "_activation_confirmation_now", lambda: now[0])
+    monkeypatch.setattr(
+        blueprint_deploy_agent, "_post_activation_receipt", lambda *items: posted.append(items)
+    )
+
+    assert blueprint_deploy_agent._execute_pending_activation(args) == expected_rc
+    assert len(posted) == (1 if expected_rc == 0 else 0)
+    assert state_path.exists() is (expected_rc == 1)
+    if expected_rc == 1:
+        now[0] += timedelta(seconds=blueprint._DEPLOY_AGENT_CONFIRMATION_TIMEOUT_SECONDS)
+        assert blueprint_deploy_agent._execute_pending_activation(args) == 1
+        assert json.loads(state_path.read_text(encoding="utf-8"))["phase"] == "failed"
 
 
 @pytest.mark.parametrize(
@@ -6378,6 +6481,7 @@ def test_deploy_agent_receipt_failure_does_not_rerun_shim(
         "_request_release_socket",
         lambda digest, revision: socket_calls.append((digest, revision)),
     )
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: _DEPLOY_PROMOTED_SHA)
     args = argparse.Namespace(
         project_id=None,
         host="control-plane",
