@@ -86,6 +86,26 @@ def test_missing_diff_provenance_is_not_proven_test_absence():
     ) == "named_test_diff_provenance_unavailable"
 
 
+def test_named_test_authoritative_empty_diff_is_proven_absence():
+    """An explicitly recorded empty diff is absence, not missing provenance."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=[],
+    )
+
+    verdict = evaluate_code_acceptance(task)
+
+    assert verdict.satisfied is False
+    assert "not among the PR's changed files" in verdict.reason
+    record_code_acceptance_verdict(task)
+    assert classify_unsatisfied_reason(
+        task.context["code_acceptance_verdict"]
+    ) == "named_test_missing_from_diff"
+
+
 def test_corroborated_absence_is_a_non_existence_verdict_end_to_end():
     """End-to-end through the real writer: a backend-refuted declared test must
     not be credited — ``evaluate_code_acceptance`` must mint a non-existence

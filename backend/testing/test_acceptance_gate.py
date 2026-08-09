@@ -48,6 +48,7 @@ from app.acceptance_gate import (
     stamp_premerge_acceptance_finding,
     summarize_version_acceptance_aggregate,
     _evaluate_coverage_delta,
+    _paths_match,
 )
 from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
@@ -638,6 +639,25 @@ def test_named_test_present_verified_touches_seam_passes_and_records():
 # ─────────────────────────────────────────────────────────────────────────────
 # named_test — three fail-closed cases
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("changed", "declared", "expected"),
+    [
+        ("backend/testing/test_widget.py", "backend/testing/test_widget.py", True),
+        ("backend/testing/test_widget.py", "testing/test_widget.py", True),
+        ("testing/test_widget.py", "test_widget.py", True),
+        (r"backend\\testing\\test_widget.py", "testing/test_widget.py", True),
+        ("backend/testing/test_other.py", "testing/test_widget.py", False),
+        ("", "testing/test_widget.py", False),
+        ("backend/testing/test_widget.py", "", False),
+        (None, "testing/test_widget.py", False),
+        ("backend/testing/test_widget.py", None, False),
+    ],
+)
+def test_named_test_path_matching_contract(changed, declared, expected):
+    """Path matching tolerates repository-root conventions but fails closed."""
+    assert _paths_match(changed, declared) is expected
 
 
 def test_named_test_missing_from_changed_files_fails_closed():

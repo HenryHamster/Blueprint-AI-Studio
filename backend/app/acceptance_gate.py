@@ -322,8 +322,14 @@ def _paths_match(changed: str, declared: str) -> bool:
     Tolerant of leading-directory differences between the agent-reported changed
     paths and the declared ``test_path`` (one may be repo-relative, the other a
     subpath): an exact match, a suffix match in either direction, or a basename
-    match all count.
+    match all count. Runtime values that are not strings and blank paths are not
+    valid matches. Normalize Windows separators before comparing because GitHub,
+    agents, and declarations may use different path conventions.
     """
+    if not isinstance(changed, str) or not isinstance(declared, str):
+        return False
+    changed = changed.replace("\\", "/")
+    declared = declared.replace("\\", "/")
     changed = changed.strip().lstrip("./")
     declared = declared.strip().lstrip("./")
     if not changed or not declared:
