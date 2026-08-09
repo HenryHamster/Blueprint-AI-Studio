@@ -5,6 +5,7 @@ import { ReleaseQualificationFindings } from './ReleaseQualificationFindings';
 import { VersionSummaryPanel } from './VersionSummaryPanel';
 import {
   attestAcceptanceCriterion,
+  approveActivation,
   clearDeployFailed,
   cutVersion,
   fetchQualificationVerdicts,
@@ -154,6 +155,12 @@ interface LocalDialogConfig {
 export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, refreshError, lastSuccessfulRefreshAt, refreshing = false, agentServingShas, readOnly = true, canManageProject = false, canManagePlatform = false }: VersionLifecyclePanelProps) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [activationApproval, setActivationApproval] = useState<{
+    versionNumber: number;
+    activation_requested_at: string;
+    activation_requested_by: string;
+  } | null>(null);
+  const [activationApprovalError, setActivationApprovalError] = useState<string | null>(null);
   const [localDialog, setLocalDialog] = useState<LocalDialogConfig | null>(null);
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
   const [verdictsError, setVerdictsError] = useState<string | null>(null);
@@ -474,6 +481,34 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
     });
   };
 
+  const handleApproveActivation = (version: RecentVersion) => {
+    if (readOnly || !canManagePlatform || !projectId) return;
+    setLocalDialog({
+      title: `Approve activation of v${version.version_number}?`,
+      message: 'This approves the newest CI-built main release bound to this promotion. The host-side deploy agent will perform activation, and the serving receipt will confirm when it is live.',
+      confirmLabel: 'Approve activation',
+      onConfirm: async () => {
+        setLocalDialog(null);
+        setActionLoading('approve-activation');
+        setActivationApprovalError(null);
+        try {
+          const result = await approveActivation(projectId);
+          setActivationApproval({
+            versionNumber: result.version_number,
+            activation_requested_at: result.activation_requested_at,
+            activation_requested_by: result.activation_requested_by,
+          });
+          onRefresh();
+        } catch (error) {
+          setActivationApprovalError(error instanceof Error ? error.message : 'Request failed');
+        } finally {
+          setActionLoading(null);
+        }
+      },
+      requiredAccess: 'manage-platform',
+    });
+  };
+
   const handleReinstate = projectId && !readOnly
     ? async (criterionKey: string) => {
         try {
@@ -638,7 +673,20 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
           const awaiting = recent.find(
             v => v.status === 'promoted' && (v.serving?.status ?? v.serving_status) === 'unconfirmed',
           );
-          return awaiting ? <PromotedAwaitingActivationCallout version={awaiting} /> : null;
+          return awaiting ? (
+            <PromotedAwaitingActivationCallout
+              version={awaiting}
+              canApprove={canManagePlatform && !readOnly}
+              approving={actionLoading === 'approve-activation'}
+              approvalError={activationApprovalError}
+              onApprove={() => handleApproveActivation(awaiting)}
+              optimisticApproval={
+                activationApproval?.versionNumber === awaiting.version_number
+                  ? activationApproval
+                  : null
+              }
+            />
+          ) : null;
         })()}
         {cv && (
           <div className="space-y-1">

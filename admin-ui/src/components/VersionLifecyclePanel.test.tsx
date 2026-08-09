@@ -3545,6 +3545,130 @@ describe('VersionLifecyclePanel', () => {
       expect(callout).toBeInTheDocument();
       expect(callout).toHaveTextContent('awaiting activation');
       expect(callout).toHaveTextContent('v3');
+      expect(screen.getByTestId('approve-activation')).toHaveTextContent('Approve activation');
+    });
+
+    it('posts approval and shows approved-awaiting-activation without claiming activation completed', async () => {
+      const approvalResponse: api.ApproveActivationResponse = {
+        version_number: 3,
+        project_id: 'proj-1',
+        promoted_sha: 'promoted-sha',
+        activation_requested_at: '2026-06-01T12:05:00Z',
+        activation_requested_by: 'admin@example.com',
+        serving_status: 'unconfirmed',
+      };
+      let resolveApproval: ((response: api.ApproveActivationResponse) => void) | undefined;
+      const approveMock = vi.fn(() => new Promise<api.ApproveActivationResponse>((resolve) => {
+        resolveApproval = resolve;
+      }));
+      vi.mocked(api.approveActivation).mockImplementation(approveMock);
+      const awaitingVersion: api.RecentVersion = {
+        version_number: 3,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        serving_status: 'unconfirmed',
+      };
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 4 }),
+            recent_versions: [awaitingVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('approve-activation'));
+      expect(screen.getByText('Approve activation of v3?')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      await waitFor(() => expect(approveMock).toHaveBeenCalledWith('proj-1'));
+      expect(screen.getByRole('button', { name: 'Approving…' })).toBeDisabled();
+      if (!resolveApproval) throw new Error('approval resolver was not initialized');
+      resolveApproval(approvalResponse);
+      await waitFor(() => {
+        const callout = screen.getByTestId('promoted-awaiting-activation');
+        expect(callout).toHaveTextContent('approved — awaiting activation');
+        expect(callout).toHaveTextContent('Approved by admin@example.com');
+        expect(callout).toHaveTextContent('awaiting the activation receipt');
+        expect(callout).not.toHaveTextContent('serving_confirmed');
+        expect(callout).not.toHaveTextContent('activated');
+      });
+      expect(screen.queryByTestId('approve-activation')).not.toBeInTheDocument();
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
+    it('surfaces an approval rejection and leaves the action retryable', async () => {
+      const approveMock = vi.fn().mockRejectedValue(
+        new Error('v3 deploy failed; clear the deploy failure before approving activation.'),
+      );
+      vi.mocked(api.approveActivation).mockImplementation(approveMock);
+      const awaitingVersion: api.RecentVersion = {
+        version_number: 3,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        serving_status: 'unconfirmed',
+      };
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 4 }),
+            recent_versions: [awaitingVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('approve-activation'));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('approve-activation-error')).toHaveTextContent(
+          'deploy failed; clear the deploy failure before approving activation.',
+        );
+      });
+      expect(screen.getByTestId('approve-activation')).not.toBeDisabled();
+      expect(mockRefresh).not.toHaveBeenCalled();
+    });
+
+    it('hides approval from non-platform admins even while activation is awaiting', () => {
+      const awaitingVersion: api.RecentVersion = {
+        version_number: 3,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        serving_status: 'unconfirmed',
+      };
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 4 }),
+            recent_versions: [awaitingVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          canManagePlatform={false}
+        />
+      );
+
+      expect(screen.getByTestId('promoted-awaiting-activation')).toBeInTheDocument();
+      expect(screen.queryByTestId('approve-activation')).not.toBeInTheDocument();
     });
 
     it('does not render awaiting-activation callout when serving is resolved', () => {

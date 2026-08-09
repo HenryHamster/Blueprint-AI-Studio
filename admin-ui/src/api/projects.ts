@@ -630,6 +630,10 @@ export interface CurrentVersion {
   served_sha?: string | null;
   served_at?: string | null;
   deploy_failure_reason?: string | null;
+  // In-product activation approval provenance. Set while the promoted version
+  // remains unconfirmed; serving confirmation still comes from the receipt.
+  activation_requested_at?: string | null;
+  activation_requested_by?: string | null;
   // Aggregate required-artifact serving truth (additive). The headline
   // 'is it actually shipped' decision derives from this, NOT the backend-only
   // scalar: 'serving_confirmed' only when every required artifact confirms,
@@ -725,6 +729,10 @@ export interface RecentVersion {
   served_sha?: string | null;
   served_at?: string | null;
   deploy_failure_reason?: string | null;
+  // In-product activation approval provenance. Approval is not activation;
+  // the serving receipt remains authoritative for the terminal state.
+  activation_requested_at?: string | null;
+  activation_requested_by?: string | null;
   // Aggregate required-artifact serving truth (additive) — see CurrentVersion.
   aggregate_serving_status?: string | null;
   aggregate_deploy_failure_reason?: string | null;
@@ -1050,6 +1058,31 @@ export interface ClearDeployFailedResponse {
   clear_mode: 'verified' | 'operator_attested';
   operator_attested: boolean;
   attestation_reason: string | null;
+}
+
+export interface ApproveActivationResponse {
+  version_number: number;
+  project_id: string;
+  promoted_sha: string | null;
+  activation_requested_at: string;
+  activation_requested_by: string;
+  serving_status: string | null;
+}
+
+/** Record the admin's approval for the latest promoted, unconfirmed version.
+ * The host-side deploy agent performs activation and posts the receipt later. */
+export async function approveActivation(projectId: string): Promise<ApproveActivationResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/approve-activation`,
+    { method: 'POST' },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail =
+      data?.detail || data?.error?.message || `Failed to approve activation: ${res.status}`;
+    throw new Error(detail);
+  }
+  return data;
 }
 
 // Clear a stale post-promotion deploy_failed serving state. Without `force`, the
