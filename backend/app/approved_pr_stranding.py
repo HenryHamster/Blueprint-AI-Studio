@@ -91,20 +91,6 @@ def _resolve_integration_head(branch: str, *, repo_root: str) -> str | None:
     return None
 
 
-def _has_merge_conflict(output: str) -> bool:
-    """Recognize both old and new git merge-tree conflict renderings."""
-    conflict_markers = (
-        "<<<<<<<",
-        "|||||||",
-        ">>>>>>>",
-        "CONFLICT",
-        "changed in both",
-        "removed in both",
-        "added in both",
-    )
-    return any(marker in output for marker in conflict_markers)
-
-
 def inspect_approved_pr(
     *,
     base_sha: str | None,
@@ -167,7 +153,7 @@ def inspect_approved_pr(
         )
     merge_base_sha = merge_base.stdout.strip()
     merge_tree = _git(
-        ["merge-tree", merge_base_sha, integration_head_sha, head_sha],
+        ["merge-tree", "--write-tree", integration_head_sha, head_sha],
         repo_root=repo_root,
     )
     if merge_tree is None:
@@ -178,8 +164,10 @@ def inspect_approved_pr(
             merge_base_sha,
             "git merge-tree check failed",
         )
-    output = f"{merge_tree.stdout}\n{merge_tree.stderr}"
-    if _has_merge_conflict(output) or merge_tree.returncode == 1:
+    # The --write-tree interface uses its exit status as the conflict signal.
+    # Do not scan stdout/stderr: that stream includes merged file content,
+    # which may legitimately document conflict markers.
+    if merge_tree.returncode == 1:
         return ApprovedPrEvidence(
             "stranded",
             "conflicted",
@@ -315,14 +303,19 @@ async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -
             select(ReleaseVersion)
             .where(
                 ReleaseVersion.project_id.in_(projects),
-                ReleaseVersion.status == "open",
+                ReleaseVersion.status.in_(("open", "promoted")),
             )
             .order_by(ReleaseVersion.opened_at.desc())
         )
     ).scalars().all()
     current_versions: dict[Any, ReleaseVersion] = {}
     for version in versions:
-        current_versions.setdefault(version.project_id, version)
+        # A newly opened post-promotion version may not have a qualification
+        # attempt yet.  In that window, use the latest promoted version's
+        # persisted qualification identity instead of going silent.
+        cycle_id = _qualification_cycle_id(version)
+        if version.project_id not in current_versions and cycle_id:
+            current_versions[version.project_id] = version
 
     candidates: dict[tuple[Any, int, str], _ApprovedPrCandidate] = {}
     for task, project in rows:
