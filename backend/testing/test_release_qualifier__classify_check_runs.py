@@ -2904,6 +2904,7 @@ async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
         "severity": "low",
         "summary": "Unchanged path still leaks internal timing detail",
         "file": "backend/app/unchanged.py",
+        "blob_sha": "blob-unchanged",
         "key": rq._audit_finding_key(
             "Unchanged path still leaks internal timing detail",
             "backend/app/unchanged.py",
@@ -2913,6 +2914,7 @@ async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
         "severity": "low",
         "summary": "Old changed-path finding",
         "file": "backend/app/changed.py",
+        "blob_sha": "blob-old",
         "key": rq._audit_finding_key(
             "Old changed-path finding", "backend/app/changed.py"
         ),
@@ -3064,6 +3066,7 @@ async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
                 "severity": "low",
                 "summary": "Fresh changed-path finding",
                 "file": "backend/app/changed.py",
+                "blob_sha": "blob-new",
             }
         ],
         "reviewed_paths": {"backend/app/changed.py": "finding"},
@@ -3079,6 +3082,10 @@ async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
         fresh_report,
         reused_row.detail,
         expected_base_sha=same_surface_sha,
+        candidate_surface_paths={
+            "backend/app/unchanged.py": "blob-unchanged",
+            "backend/app/changed.py": "blob-new",
+        },
     )
     merged_findings = rq._extract_audit_findings(merged_report)
     assert {finding["summary"] for finding in merged_findings} == {
@@ -3125,6 +3132,7 @@ async def test_delta_scoped_audit_finalize_persists_merged_ledger_facts(
                 "severity": "low",
                 "summary": "Unchanged path still leaks internal timing detail",
                 "file": "backend/app/unchanged.py",
+                "blob_sha": "blob-unchanged",
                 "key": rq._audit_finding_key(
                     "Unchanged path still leaks internal timing detail",
                     "backend/app/unchanged.py",
@@ -3134,6 +3142,7 @@ async def test_delta_scoped_audit_finalize_persists_merged_ledger_facts(
                 "severity": "low",
                 "summary": "Old changed-path finding (superseded)",
                 "file": "backend/app/changed.py",
+                "blob_sha": "blob-old",
                 "key": rq._audit_finding_key(
                     "Old changed-path finding (superseded)",
                     "backend/app/changed.py",
@@ -3198,6 +3207,7 @@ async def test_delta_scoped_audit_finalize_persists_merged_ledger_facts(
                 "severity": "low",
                 "summary": "Fresh changed-path finding",
                 "file": "backend/app/changed.py",
+                "blob_sha": "blob-new",
                 "key": rq._audit_finding_key(
                     "Fresh changed-path finding", "backend/app/changed.py"
                 ),
@@ -3236,6 +3246,10 @@ async def test_delta_scoped_audit_finalize_persists_merged_ledger_facts(
         "smoketest_enabled": False,
         "started_at": "2026-07-16T00:00:00",
         "qualification_attempt_id": str(origin_attempt),
+        "audited_surface_paths": {
+            "backend/app/unchanged.py": "blob-unchanged",
+            "backend/app/changed.py": "blob-new",
+        },
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": None,
         "challenge_task_id": None,
@@ -3470,6 +3484,113 @@ def test_scoped_audit_merge_requires_bound_path_complete_unique_facts():
     assert unmerged["findings"] == []
     pathless = {**prior, "audit_findings": [{"severity": "low", "summary": "global"}]}
     assert rq._audit_detail_is_delta_reusable(pathless) is False
+
+
+def test_merge_scoped_audit_report_drops_finding_whose_blob_left_the_candidate():
+    base_sha = "a" * 40
+    prior = {
+        "audited_surface_paths": {"backend/app/unchanged.py": "old-blob"},
+        "audit_findings": [
+            {
+                "file": "backend/app/unchanged.py",
+                "blob_sha": "old-blob",
+                "severity": "high",
+                "summary": "fixed finding",
+            }
+        ],
+        "excluded_audit_findings": [],
+        "audit_findings_truncated": False,
+        "excluded_audit_findings_truncated": False,
+    }
+    report = {
+        "findings": [],
+        "reviewed_paths": {"backend/app/changed.py": "clean"},
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": base_sha,
+            "changed_paths": ["backend/app/changed.py"],
+        },
+    }
+
+    merged, _ = rq._merge_scoped_audit_report_with_prior_fact(
+        report,
+        report,
+        prior,
+        expected_base_sha=base_sha,
+        candidate_surface_paths={"backend/app/unchanged.py": "new-blob"},
+    )
+
+    assert merged["findings"] == []
+
+
+def test_merge_scoped_audit_report_carries_findings_it_cannot_disprove():
+    """Only a PROVEN blob mismatch drops a carried finding.
+
+    A prior finding on a path the candidate surface map does not cover, or one
+    with no recorded blob, is undisproven — dropping it would silently discard
+    real unchanged-path findings on every incremental merge.
+    """
+    base_sha = "b" * 40
+    prior = {
+        "audited_surface_paths": {"backend/app/unchanged.py": "old-blob"},
+        "audit_findings": [
+            {
+                "file": "backend/app/unchanged.py",
+                "blob_sha": "old-blob",
+                "severity": "high",
+                "summary": "unchanged blob still matches",
+            },
+            {
+                "file": "backend/app/no_blob.py",
+                "severity": "high",
+                "summary": "no blob recorded",
+            },
+            {
+                "file": "docs/notes.md",
+                "blob_sha": "doc-blob",
+                "severity": "medium",
+                "summary": "path outside the audited surface map",
+            },
+        ],
+        "excluded_audit_findings": [
+            {
+                "file": "backend/app/unchanged.py",
+                "severity": "high",
+                "summary": "excluded finding with no blob recorded",
+                "unverified": "true",
+            }
+        ],
+        "audit_findings_truncated": False,
+        "excluded_audit_findings_truncated": False,
+    }
+    report = {
+        "findings": [],
+        "reviewed_paths": {"backend/app/changed.py": "clean"},
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": base_sha,
+            "changed_paths": ["backend/app/changed.py"],
+        },
+    }
+
+    merged_scored, merged_original = rq._merge_scoped_audit_report_with_prior_fact(
+        report,
+        report,
+        prior,
+        expected_base_sha=base_sha,
+        candidate_surface_paths={"backend/app/unchanged.py": "old-blob"},
+    )
+
+    assert {f["summary"] for f in merged_scored["findings"]} == {
+        "unchanged blob still matches",
+        "no blob recorded",
+        "path outside the audited surface map",
+    }
+    # The excluded list carries too — it never records a blob for older
+    # persisted rows, so a blob requirement would empty it unconditionally.
+    assert [f["summary"] for f in merged_original["findings"]] == [
+        "excluded finding with no blob recorded"
+    ]
 
 
 def test_scoped_test_erosion_preserves_prior_blocker_and_cumulative_deltas():

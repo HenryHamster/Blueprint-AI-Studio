@@ -1462,7 +1462,37 @@ def _finding_subject_is_authorized_divergence(f: dict) -> bool:
     return False
 
 
-def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | None]:
+def _finding_matches_candidate_surface(
+    finding: Any,
+    candidate_surface_paths: dict[str, str] | None,
+) -> bool:
+    """Return False ONLY when the finding is *provably* stale evidence.
+
+    Proven by exactly one condition: the finding names a path the candidate's
+    audited-surface map covers, records a blob SHA, and that SHA differs from
+    the candidate's — the defect this gate closes (an audit graded against
+    blobs the candidate no longer contains).  Absence of blob identity is NOT
+    evidence of staleness, so everything else keeps deducting/carrying: an
+    unavailable map (``None``); a non-dict finding; a cross-cutting ``file: ""``
+    finding (a sanctioned auditor shape — ``agent/src/handlers/audits.ts``)
+    with no single blob to match; a path outside the audited-surface subset
+    (``.github/``, ``*.md``, ``__fixtures__``) the map does not cover.
+    """
+    if candidate_surface_paths is None or not isinstance(finding, dict):
+        return True
+    path = str(finding.get("file") or finding.get("path") or "").strip()
+    candidate_blob = candidate_surface_paths.get(path) if path else None
+    blob_sha = finding.get("blob_sha")
+    if not candidate_blob or not isinstance(blob_sha, str) or not blob_sha.strip():
+        return True
+    return candidate_blob == blob_sha.strip()
+
+
+def _score_audit(
+    report: dict[str, Any] | None,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
+) -> tuple[float | None, float | None]:
     """Derive ``(audit_score, test_erosion_score)`` from a RELEASE_AUDIT_REPORT.
 
     The agent emits ``{audit_score, test_erosion: {deleted_test_files,
@@ -1496,6 +1526,8 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     if isinstance(findings, list):
         for f in findings:
             if isinstance(f, dict):
+                if not _finding_matches_candidate_surface(f, candidate_surface_paths):
+                    continue
                 sev = str(f.get("severity") or f.get("level") or "").lower()
                 if not sev or not _finding_is_verified(f, sev):
                     continue
@@ -1655,7 +1687,11 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     return audit_score, _clamp01(score)
 
 
-def _compute_audit_reconciliation(report: dict[str, Any] | None) -> dict[str, Any]:
+def _compute_audit_reconciliation(
+    report: dict[str, Any] | None,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Compute audit-score reconciliation metadata for observability.
 
     Records the model's self-reported score alongside the deterministic
@@ -1671,9 +1707,8 @@ def _compute_audit_reconciliation(report: dict[str, Any] | None) -> dict[str, An
       are present.
     - ``score_delta`` — ``abs(findings_derived - model_reported)``, rounded
       to 4 dp, or None when either component is absent.
-    - ``excluded_findings_count`` — number of high/medium/critical/blocker/
-      warning findings excluded because their ``verification_note`` was absent
-      or too short (< 20 non-whitespace chars).
+    - ``excluded_findings_count`` — findings excluded for an absent/too-short
+      verification note or a blob proven absent from the candidate surface.
 
     This function is pure and does NOT change the gating math; call it
     alongside ``_score_audit`` to attach reconciliation fields to
@@ -1706,6 +1741,9 @@ def _compute_audit_reconciliation(report: dict[str, Any] | None) -> dict[str, An
         derived: float = 1.0
         for f in findings:
             if isinstance(f, dict):
+                if not _finding_matches_candidate_surface(f, candidate_surface_paths):
+                    excluded_count += 1
+                    continue
                 sev = str(f.get("severity") or f.get("level") or "").lower()
                 if sev:
                     if _finding_is_verified(f, sev):
@@ -2116,7 +2154,11 @@ def _compute_challenge_synthesis_from_binding_verdicts(
     }
 
 
-def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str]]:
+def _extract_audit_findings(
+    report: dict[str, Any] | None,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
+) -> list[dict[str, str]]:
     """Pull a compact, severity-sorted findings list from a RELEASE_AUDIT_REPORT.
 
     The audit sub-score is usually the binding constraint on promotion, but the
@@ -2142,6 +2184,10 @@ def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str
 
     out: list[dict[str, str]] = []
     for f in raw:
+        if candidate_surface_paths is not None and not _finding_matches_candidate_surface(
+            f, candidate_surface_paths
+        ):
+            continue
         file_path = ""
         if isinstance(f, dict):
             sev = str(f.get("severity") or f.get("level") or "unknown").lower()
@@ -2185,6 +2231,8 @@ def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str
 
 def _extract_excluded_audit_findings(
     report: dict[str, Any] | None,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """Pull the higher-severity findings the verification gate EXCLUDED from scoring.
 
@@ -2221,13 +2269,14 @@ def _extract_excluded_audit_findings(
         if not isinstance(f, dict):
             continue
         sev = str(f.get("severity") or f.get("level") or "unknown").lower()
+        stale = not _finding_matches_candidate_surface(f, candidate_surface_paths)
         # Only higher-severity findings that the gate dropped for lacking a
         # substantive verification_note belong here. Verified findings (and
         # low/info, which never require verification) are carried by
         # _extract_audit_findings instead.
-        if sev not in _SEVERITIES_REQUIRING_VERIFICATION:
+        if not stale and sev not in _SEVERITIES_REQUIRING_VERIFICATION:
             continue
-        if _finding_is_verified(f, sev):
+        if not stale and _finding_is_verified(f, sev):
             continue
         summary = (
             f.get("summary")
@@ -2244,8 +2293,18 @@ def _extract_excluded_audit_findings(
                 "summary": summary,
                 "unverified": "true",
             }
+            if stale:
+                item["reason"] = "stale_blob_not_in_candidate"
             if file_path:
                 item["file"] = file_path[:_DETAIL_NAME_MAX]
+            # Stamp blob identity (as _extract_audit_findings does) so a later
+            # incremental merge can evaluate staleness for THIS list too.
+            blob_sha = str(f.get("blob_sha") or "").strip()
+            if blob_sha:
+                item["blob_sha"] = blob_sha[:64]
+                item["surface_key"] = hashlib.sha256(
+                    f"{file_path.lower()}|{blob_sha}".encode()
+                ).hexdigest()[:16]
             item["key"] = _audit_finding_key(summary, item.get("file"))
             out.append(item)
 
@@ -2253,7 +2312,11 @@ def _extract_excluded_audit_findings(
     return out[:_MAX_CARRIED_FINDINGS]
 
 
-def _audit_findings_carry_meta(report: dict[str, Any] | None) -> dict[str, Any]:
+def _audit_findings_carry_meta(
+    report: dict[str, Any] | None,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Pre-cap totals + truncation flags for the two carried-findings lists.
 
     ``_extract_audit_findings`` / ``_extract_excluded_audit_findings`` cap at
@@ -2283,6 +2346,9 @@ def _audit_findings_carry_meta(report: dict[str, Any] | None) -> dict[str, Any]:
             summary = str(f)
         summary = str(summary).strip()[:_FINDING_SUMMARY_MAX]
         if not summary:
+            continue
+        if not _finding_matches_candidate_surface(f, candidate_surface_paths):
+            excluded_total += 1
             continue
         # Verified list: mirror _extract_audit_findings' scoring gate.
         if isinstance(f, dict) and not _finding_is_verified(f, sev):

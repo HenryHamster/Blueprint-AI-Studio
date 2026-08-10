@@ -6725,6 +6725,7 @@ async def _finalize_qualification(
     _audit_and_erosion_resolved = (
         "audit" in resolved_dims and "test_erosion" in resolved_dims
     )
+    _candidate_surface_paths = qual.get("audited_surface_paths")
     _resolved_audit_detail: dict[str, Any] = {}
     _prior_delta_audit_row = None
     _prior_delta_erosion_row = None
@@ -6827,8 +6828,11 @@ async def _finalize_qualification(
                 audit_report,
                 _prior_delta_audit_row.detail,
                 expected_base_sha=_prior_delta_sha,
+                candidate_surface_paths=qual.get("audited_surface_paths"),
             )
-        audit_score, test_erosion_score = _score_audit(audit_report)
+        audit_score, test_erosion_score = _score_audit(
+            audit_report, candidate_surface_paths=_candidate_surface_paths
+        )
         test_erosion_detail = _extract_test_erosion_detail(audit_report)
         if (
             _prior_delta_erosion_row is not None
@@ -6845,13 +6849,17 @@ async def _finalize_qualification(
         # Carry the findings (not just the score) into last_qualification so the
         # strategic agent can target them — otherwise the audit sub-score, usually
         # the binding constraint, is opaque to the loop.
-        audit_findings = _extract_audit_findings(audit_report)
+        audit_findings = _extract_audit_findings(
+            audit_report, candidate_surface_paths=_candidate_surface_paths
+        )
         # Carry the higher-severity findings the verification gate EXCLUDED from
         # scoring — for display only, marked unverified — so an audit whose
         # sub-score was inflated by dropped findings is rendered honestly instead of
         # reading as clean. Never confirmed blockers.  Use original report (the
         # unverified-primary gap is independent of the challenge reconciliation).
-        excluded_audit_findings = _extract_excluded_audit_findings(audit_report)
+        excluded_audit_findings = _extract_excluded_audit_findings(
+            audit_report, candidate_surface_paths=_candidate_surface_paths
+        )
         # Carry the specific test-erosion detail (deleted files / negative deltas)
         # so the agent can target it when test-erosion is the binding constraint,
         # the same way it sees audit_findings.
@@ -6928,7 +6936,9 @@ async def _finalize_qualification(
             surface_paths=qual.get("audited_surface_paths"),
             audit_findings=audit_findings,
             excluded_audit_findings=excluded_audit_findings,
-            findings_meta=_audit_findings_carry_meta(audit_report),
+            findings_meta=_audit_findings_carry_meta(
+                audit_report, candidate_surface_paths=_candidate_surface_paths
+            ),
             audit_missing_reason=audit_missing_reason,
             audit_scope=(audit_report or {}).get("audit_scope"),
             holistic_review=audit_report if isinstance(audit_report, dict) else None,
@@ -7628,8 +7638,12 @@ async def _finalize_qualification(
                     audit_report,
                     prior_audit_row.detail,
                     expected_base_sha=str(prior_audit_candidate_sha),
+                    candidate_surface_paths=qual.get("audited_surface_paths"),
                 )
-        audit_score, _delta_test_erosion_score = _score_audit(_audit_report_scored)
+        audit_score, _delta_test_erosion_score = _score_audit(
+            _audit_report_scored,
+            candidate_surface_paths=_candidate_surface_paths,
+        )
         if prior_audit_candidate_sha:
             prior_erosion_row = await _load_dimension_result(
                 session, version, str(prior_audit_candidate_sha), "test_erosion"
@@ -7655,18 +7669,26 @@ async def _finalize_qualification(
         # Carry the confirmed (actionable) findings into last_qualification so the
         # strategic agent can target them.  Use reconciled report when available so
         # refuted findings are not surfaced as actionable blockers.
-        audit_findings = _extract_audit_findings(_audit_report_scored)
+        audit_findings = _extract_audit_findings(
+            _audit_report_scored,
+            candidate_surface_paths=_candidate_surface_paths,
+        )
         excluded_audit_findings = _extract_excluded_audit_findings(
-            _audit_report_for_excluded
+            _audit_report_for_excluded,
+            candidate_surface_paths=_candidate_surface_paths,
         )
         # Pre-cap totals + truncation flags for both carried lists. Verified meta is
         # computed on the reconciled report (matches audit_findings just above);
         # excluded meta on the original report (matches excluded_audit_findings,
         # which is derived from audit_report — the unverified-primary gap is
         # independent of challenge reconciliation).
-        _verified_findings_meta = _audit_findings_carry_meta(_audit_report_scored)
+        _verified_findings_meta = _audit_findings_carry_meta(
+            _audit_report_scored,
+            candidate_surface_paths=_candidate_surface_paths,
+        )
         _excluded_findings_meta = _audit_findings_carry_meta(
-            _audit_report_for_excluded
+            _audit_report_for_excluded,
+            candidate_surface_paths=_candidate_surface_paths,
         )
         # Build the reconciliation record on the RECONCILED report so
         # findings_derived_score agrees with the applied audit_score.  The challenge
@@ -7674,7 +7696,10 @@ async def _finalize_qualification(
         # separate from excluded_findings_count (verification-gate drops) so they
         # are never double-counted.
         audit_reconciliation = {
-            **_compute_audit_reconciliation(_audit_report_scored),
+            **_compute_audit_reconciliation(
+                _audit_report_scored,
+                candidate_surface_paths=_candidate_surface_paths,
+            ),
             "audit_challenge": _compute_challenge_synthesis_from_binding_verdicts(
                 audit_report,
                 challenge_verdicts,
