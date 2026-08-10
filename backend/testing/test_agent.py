@@ -1380,6 +1380,101 @@ async def test_agent_heartbeat_upserts_vm_contact_tool_use(
 
 
 @pytest.mark.asyncio
+async def test_agent_heartbeat_records_active_tool_subprogress_after_status_override(
+    client: AsyncClient, db_session, mocker
+):
+    """A productive long command is not stalled when status prose changes.
+
+    Regression: task 90e7f3c8 kept heartbeating during ``./check test`` and
+    reported recent sub-progress, but task-authored prose had replaced the
+    literal ``Using tool: Bash`` prefix.  Its tool_trace invocation timestamp
+    therefore stayed eight minutes old and the reaper killed healthy work.
+    The explicit active-tool stamp must advance both the task-scoped and shared
+    progress clocks independently of display text.
+    """
+    from app.models import TaskContact, VmContact
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    # _record_vm_contact intentionally commits through an independent session
+    # so task-row lock contention cannot drop the liveness signal. Bind that
+    # session to this test database as well as the request-scoped fixture.
+    contact_session = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    mocker.patch("app.routers.agent.AsyncSessionLocal", contact_session)
+
+    project = Project(name="Active Tool Progress", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "runner:active-tool-progress"
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=vm_id,
+        started_at=_utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow(),
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    headers = {"x-agent-token": create_agent_token(str(task.id), vm_id)}
+    invocation_at = _utcnow() - timedelta(minutes=9)
+    subprogress_at = _utcnow() - timedelta(seconds=20)
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "status_message": (
+                "The publication gate remains clean "
+                "(8m 0s elapsed, last sub-progress 20s ago)"
+            ),
+            "tool_trace": [
+                {
+                    "t": invocation_at.isoformat(),
+                    "tool": "Bash",
+                    "input_preview": "./check test",
+                }
+            ],
+            "active_tool_progress_at": subprogress_at.isoformat(),
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    shared = await db_session.get(VmContact, vm_id)
+    scoped = await db_session.get(TaskContact, task.id)
+    assert task.last_tool_use_at is not None
+    assert abs((task.last_tool_use_at - subprogress_at).total_seconds()) < 1
+    assert shared is not None
+    assert shared.last_tool_use_at is not None
+    assert abs((shared.last_tool_use_at - subprogress_at).total_seconds()) < 1
+    assert scoped is not None
+    assert scoped.last_tool_use_at is not None
+    assert abs((scoped.last_tool_use_at - subprogress_at).total_seconds()) < 1
+
+
+def test_latest_heartbeat_progress_ignores_implausible_future_active_stamp():
+    """A producer clock bug cannot pin the monotonic reaper clock in future."""
+    from app.routers.agent import _latest_heartbeat_progress_at
+    from app.schemas import ToolTraceEntry
+
+    trace_at = _utcnow() - timedelta(seconds=10)
+    trace = [
+        ToolTraceEntry(
+            t=trace_at.isoformat(), tool="Bash", input_preview="./check test"
+        )
+    ]
+    result = _latest_heartbeat_progress_at(
+        trace,
+        _utcnow() + timedelta(hours=1),
+    )
+    assert result is not None
+    assert abs((result - trace_at).total_seconds()) < 1
+
+
+@pytest.mark.asyncio
 async def test_agent_heartbeat_malformed_tool_trace_t_does_not_advance_progress(
     client: AsyncClient, db_session
 ):

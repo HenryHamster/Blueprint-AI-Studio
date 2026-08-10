@@ -81,6 +81,195 @@ import { recordViewportScreenshotDownload, buildPromptSizeTelemetry, setPromptSi
 export { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
 export type { MigrationConflict } from './review-fix-migration.js';
 
+/** Backend ``AgentStatusPayload.verdict_json`` transport limit. */
+export const REVIEW_VERDICT_JSON_MAX_LENGTH = 10_000;
+
+const REVIEW_VERDICT_ARRAY_ITEM_CAP = 50;
+const REVIEW_VERDICT_IDENTITY_STRING_CAPS: Readonly<Record<string, number>> = {
+  verdict: 32,
+  issue_id: 128,
+  severity: 32,
+  file: 512,
+  line: 32,
+  disposition: 32,
+  reviewed_head_sha: 64,
+  reviewed_base_sha: 64,
+  investigated_files: 512,
+};
+
+function truncateReviewVerdictString(value: string, maxCharacters: number): string {
+  const characters = Array.from(value);
+  if (characters.length <= maxCharacters) return value;
+  if (maxCharacters <= 0) return '';
+  if (maxCharacters === 1) return '…';
+  return `${characters.slice(0, maxCharacters - 1).join('')}…`;
+}
+
+function boundReviewVerdictValue(
+  value: unknown,
+  textCap: number,
+  arrayItemCap: number,
+  key?: string,
+): unknown {
+  if (typeof value === 'string') {
+    const cap = key === undefined
+      ? textCap
+      : (REVIEW_VERDICT_IDENTITY_STRING_CAPS[key] ?? textCap);
+    return truncateReviewVerdictString(value, cap);
+  }
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, arrayItemCap)
+      .map(item => boundReviewVerdictValue(item, textCap, arrayItemCap, key));
+  }
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([childKey, childValue]) => [
+        childKey,
+        boundReviewVerdictValue(childValue, textCap, arrayItemCap, childKey),
+      ]),
+    );
+  }
+  return value;
+}
+
+function fitReviewVerdictWithArrayCap(
+  verdict: Record<string, unknown>,
+  arrayItemCap: number,
+): string | null {
+  const encode = (textCap: number): string => JSON.stringify(
+    boundReviewVerdictValue(verdict, textCap, arrayItemCap),
+  );
+  const emptyTextCandidate = encode(0);
+  if (emptyTextCandidate.length > REVIEW_VERDICT_JSON_MAX_LENGTH) return null;
+
+  // Find the largest uniform free-text cap that fits. Identity/provenance keys
+  // use their own small hard caps so a verbose description cannot erase the
+  // verdict, issue ids, locations, or reviewed SHAs.
+  let low = 0;
+  let high = REVIEW_VERDICT_JSON_MAX_LENGTH;
+  let best = emptyTextCandidate;
+  while (low <= high) {
+    const midpoint = Math.floor((low + high) / 2);
+    const candidate = encode(midpoint);
+    if (candidate.length <= REVIEW_VERDICT_JSON_MAX_LENGTH) {
+      best = candidate;
+      low = midpoint + 1;
+    } else {
+      high = midpoint - 1;
+    }
+  }
+  return best;
+}
+
+function compactReviewVerdictFallback(verdict: Record<string, unknown>): Record<string, unknown> {
+  const compactObject = (
+    value: unknown,
+    keys: readonly string[],
+  ): Record<string, unknown> | null => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+    const source = value as Record<string, unknown>;
+    return Object.fromEntries(
+      keys.filter(key => source[key] !== undefined).map(key => [key, source[key]]),
+    );
+  };
+  const compactArray = (
+    value: unknown,
+    keys: readonly string[],
+  ): Record<string, unknown>[] => (Array.isArray(value)
+    ? value
+      .map(item => compactObject(item, keys))
+      .filter((item): item is Record<string, unknown> => item !== null)
+      .slice(0, 10)
+    : []);
+
+  return {
+    verdict: typeof verdict.verdict === 'string' ? verdict.verdict : '',
+    ...(typeof verdict.feedback === 'string' ? { feedback: verdict.feedback } : {}),
+    issues: compactArray(
+      verdict.issues,
+      ['issue_id', 'severity', 'description', 'file', 'line'],
+    ),
+    ...(Array.isArray(verdict.resolutions) ? {
+      resolutions: compactArray(
+        verdict.resolutions,
+        ['issue_id', 'disposition', 'reason'],
+      ),
+    } : {}),
+    ...(Array.isArray(verdict.investigated_files)
+      ? { investigated_files: verdict.investigated_files.slice(0, 25) }
+      : {}),
+    ...(typeof verdict.review_was_parallelized === 'boolean'
+      ? { review_was_parallelized: verdict.review_was_parallelized }
+      : {}),
+    ...(typeof verdict.reviewed_head_sha === 'string'
+      ? { reviewed_head_sha: verdict.reviewed_head_sha }
+      : {}),
+    ...(typeof verdict.reviewed_base_sha === 'string'
+      ? { reviewed_base_sha: verdict.reviewed_base_sha }
+      : {}),
+    verdict_json_truncated: true,
+  };
+}
+
+/**
+ * Serialize a review verdict without ever violating the backend's 10,000-char
+ * status schema. The normal path is byte-for-byte JSON.stringify output. Only
+ * an oversized verdict is marked and compacted: first free text is shortened,
+ * then pathological arrays are bounded, with a defensive schema-shaped
+ * fallback for objects whose key structure alone exceeds the transport cap.
+ */
+export function serializeBoundedReviewVerdict(verdict: Record<string, unknown>): string {
+  const serialized = JSON.stringify(verdict);
+  if (serialized.length <= REVIEW_VERDICT_JSON_MAX_LENGTH) return serialized;
+
+  const marked = { ...verdict, verdict_json_truncated: true };
+  const fullArrayCandidate = fitReviewVerdictWithArrayCap(
+    marked,
+    REVIEW_VERDICT_ARRAY_ITEM_CAP,
+  );
+  if (fullArrayCandidate !== null) return fullArrayCandidate;
+
+  // Structural overhead from a pathological number of findings can exceed the
+  // cap even after all free text is empty. Retain the largest common array
+  // prefix that fits, then spend the remaining room on its text.
+  let low = 0;
+  let high = REVIEW_VERDICT_ARRAY_ITEM_CAP - 1;
+  let bestArrayCap = -1;
+  while (low <= high) {
+    const midpoint = Math.floor((low + high) / 2);
+    const candidate = JSON.stringify(boundReviewVerdictValue(marked, 0, midpoint));
+    if (candidate.length <= REVIEW_VERDICT_JSON_MAX_LENGTH) {
+      bestArrayCap = midpoint;
+      low = midpoint + 1;
+    } else {
+      high = midpoint - 1;
+    }
+  }
+  if (bestArrayCap >= 0) {
+    const candidate = fitReviewVerdictWithArrayCap(marked, bestArrayCap);
+    if (candidate !== null) return candidate;
+  }
+
+  const compact = compactReviewVerdictFallback(marked);
+  for (let arrayCap = 10; arrayCap >= 0; arrayCap--) {
+    const candidate = fitReviewVerdictWithArrayCap(compact, arrayCap);
+    if (candidate !== null) return candidate;
+  }
+
+  // All values below are explicitly hard-capped; this is a final invariant
+  // guard for a future unexpected verdict shape, not a normal production path.
+  return JSON.stringify({
+    verdict: truncateReviewVerdictString(
+      typeof verdict.verdict === 'string' ? verdict.verdict : '',
+      REVIEW_VERDICT_IDENTITY_STRING_CAPS.verdict,
+    ),
+    feedback: 'Review verdict was compacted to satisfy the status transport limit.',
+    issues: [],
+    verdict_json_truncated: true,
+  });
+}
+
 /**
  * Push with --force-with-lease, retrying if another agent raced us.
  *
@@ -973,7 +1162,7 @@ ${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewC
     if (reviewedBaseSha) {
       augmented.reviewed_base_sha = reviewedBaseSha;
     }
-    return JSON.stringify(augmented);
+    return serializeBoundedReviewVerdict(augmented);
   }
   function readReviewVerdictFromTempFile(): Record<string, unknown> | null {
     const verdictPath = `/tmp/review_verdict_${taskId}.json`;

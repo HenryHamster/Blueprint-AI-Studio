@@ -2364,6 +2364,33 @@ describe('agent runtime fingerprint heartbeats', () => {
     expect(body.agent_source_sha).toBe(sourceSha);
   });
 
+  it('reports structured active-tool progress when task prose replaces the tool prefix', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({}),
+    });
+    const subprogressAt = '2026-08-09T03:03:33.000Z';
+
+    _startHeartbeatForTesting(
+      'task-active-tool-progress',
+      () => 'The publication gate remains clean (8m elapsed, last sub-progress 24s ago)',
+      () => subprogressAt,
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const heartbeatCall = fetchMock.mock.calls.find(
+      ([url]) => String(url).endsWith('/api/agent/heartbeat'),
+    );
+    expect(heartbeatCall).toBeDefined();
+    const heartbeatBody = heartbeatCall?.[1]?.body;
+    expect(typeof heartbeatBody).toBe('string');
+    const body = JSON.parse(
+      defined(typeof heartbeatBody === 'string' ? heartbeatBody : undefined),
+    ) as { status_message?: string; active_tool_progress_at?: string };
+    expect(body.status_message).toContain('The publication gate remains clean');
+    expect(body.active_tool_progress_at).toBe(subprogressAt);
+  });
+
   it('omits agent_source_sha from task and VM heartbeats when identity absent', async () => {
     // The additive contract: a missing source identity must OMIT the field
     // rather than send a null/bogus value over the wire.

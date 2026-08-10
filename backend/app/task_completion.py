@@ -527,14 +527,17 @@ def _compute_first_attempt_succeeded(
 
     A degraded-unverified merge (environment/setup failure blocked real
     verification) does NOT count as a first-attempt success even if
-    attempt_count <= 1 and status == COMPLETED — the claim was never proven on
+    attempt_count == 0 and status == COMPLETED — the claim was never proven on
     HEAD.  Pass ``merge_verification`` as the
     :func:`~app.landed_signal.merge_verification_status` result at write time
     so the flag is accurate when the merge context is already available.
     """
     if merge_verification == "unverified_degraded":
         return False
-    return attempt_count <= 1 and status == TaskStatus.COMPLETED
+    # ``attempt_count`` is the number of retries already consumed.  The UI
+    # displays ``attempt_count + 1``, so a value of one is Attempt 2, not a
+    # successful first attempt.
+    return attempt_count == 0 and status == TaskStatus.COMPLETED
 
 
 def _stamp_orphan_remediation_outcome(
@@ -5082,7 +5085,10 @@ async def _handle_design_doc_completion(
         STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY,
     )
     from app.alert_dispatch import _create_strategic_alert
-    from app.task_locking import lock_project_for_strategic_transition
+    from app.task_locking import (
+        lock_project_for_strategic_transition,
+        lock_project_then_task,
+    )
     from app.strategic_events import emit_strategic_cycle_completed
 
     # Phase 1 emitted strategic_cycle_started at spawn time. Every path out of
@@ -5274,7 +5280,30 @@ async def _handle_design_doc_completion(
             flag_modified(project, "vision")
             session.add(project)
     except Exception as chain_exc:
-        # Only pre-captured identifiers in here — task may be expired (see above).
+        # _spawn_strategic_review performs advisory DB work while building the
+        # Phase-2 payload.  A failed flush can leave this AsyncSession in
+        # pending-rollback state; logging and then writing the alert/marker on
+        # that same transaction only masks the root error with
+        # PendingRollbackError.  Roll back unconditionally, then re-acquire the
+        # Project -> Task pair in canonical order so every recovery write below
+        # uses current, live ORM instances on a clean transaction.
+        await session.rollback()
+        async with lock_project_then_task(
+            session,
+            task_project_id,
+            task_id_value,
+            skip_locked=False,
+        ) as (recovered_project, recovered_task):
+            if recovered_project is None or recovered_task is None:
+                raise RuntimeError(
+                    "design-doc Phase-2 recovery could not refetch project/task"
+                ) from chain_exc
+            project = recovered_project
+            task = recovered_task
+        base_vision = dict(project.vision or {})
+
+        # Only pre-captured identifiers are used before the canonical refetch
+        # above — the original task/project may have been expired by rollback.
         phase2_spawn_failed = True
         phase2_failure_reason = str(chain_exc)[:200]
         logger.error(

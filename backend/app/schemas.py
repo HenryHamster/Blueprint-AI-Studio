@@ -368,6 +368,15 @@ class HeartbeatRequest(BaseModel):
     # heartbeat's value serves as a post-mortem when the reaper later kills
     # the task for heartbeat silence (AGENT_TIMEOUT diagnosis).
     tool_trace: List[ToolTraceEntry] | None = None
+    # Genuine output/progress timestamp for the currently-running tool.  This
+    # is separate from ``status_message`` because task-authored progress prose
+    # may replace the literal ``Using tool:`` prefix while the same foreground
+    # command is still running.  The reaper folds this into its existing
+    # last_tool_use_at progress clock, avoiding false ``agent_stalled`` reaps
+    # during long but productive checks without treating mere heartbeats as
+    # progress.  Omitted when no tool is in flight or it has emitted no
+    # sub-progress.
+    active_tool_progress_at: datetime | None = None
     # Fix-loop telemetry events emitted by the agent each iteration of a
     # lint/test/check fix loop. Validated by ``app.fix_loop_telemetry``;
     # piggybacks on heartbeat so we don't need a separate ingest endpoint.

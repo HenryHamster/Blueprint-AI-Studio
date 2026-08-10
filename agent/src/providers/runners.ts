@@ -483,6 +483,7 @@ const AUTH_FAILURE_PATTERNS: Readonly<Record<ProviderName, readonly string[]>> =
   anthropic: [
     'invalid x-api-key',
     'x-api-key header is required',
+    'organization has disabled claude subscription access',
     'oauth token has expired',
     'oauth token expired',
     'oauth authentication is currently not supported',

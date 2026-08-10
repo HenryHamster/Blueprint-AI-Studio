@@ -6896,6 +6896,33 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
             {"task_id": "task-abc", "reason": "no bwrap: fail-closed"},
         )
 
+    def test_duplicate_dispatch_declines_server_pin_and_releases_local_capacity(self):
+        """A duplicate pull is already PROVISIONING server-side, so merely
+        skipping it strands the task. Release the local permit and explicitly
+        decline the server claim in the same branch."""
+        from unittest.mock import patch
+
+        ledger = MagicMock()
+        capacity = MagicMock()
+        with patch.object(local_runner, "_notify_decline") as notify_decline:
+            local_runner._decline_duplicate_dispatch(
+                "https://api.example.com",
+                "tok-123",
+                "task-duplicate",
+                ledger,
+                "agent-poll:7",
+                capacity,
+            )
+
+        ledger.release.assert_called_once_with("agent-poll:7")
+        capacity.release.assert_called_once_with()
+        notify_decline.assert_called_once_with(
+            "https://api.example.com",
+            "tok-123",
+            "task-duplicate",
+            reason=local_runner._DUPLICATE_DISPATCH_DECLINE_REASON,
+        )
+
     def test_spawn_agent_task_reports_decline_reason(self):
         """_spawn_agent_task hands the fail-closed reason back to the caller
         (which forwards it to /decline-task) instead of only printing it."""

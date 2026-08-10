@@ -43,7 +43,6 @@ See also:
 """
 import argparse
 import contextlib
-import fcntl
 import hashlib
 import importlib.util
 import json
@@ -61,6 +60,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 from urllib.request import urlopen
+
+try:
+    import fcntl
+except ImportError:  # Windows: read-only/operator commands remain supported.
+    fcntl = None  # type: ignore[assignment]
 
 from blueprint_api import (
     APIError,
@@ -7030,6 +7034,11 @@ def _render_deploy_agent_preflight(data: dict) -> None:
 
 def _acquire_deploy_agent_lock(path: str):
     """Acquire the systemd-owned runtime lock without blocking another poll."""
+    if fcntl is None:
+        raise APIError(
+            "deploy-agent requires POSIX advisory locking; run it on the Linux "
+            "systemd host (all other blueprint commands support Windows)"
+        )
     path = os.path.expanduser(path)
     os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
     handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 - returned locked handle

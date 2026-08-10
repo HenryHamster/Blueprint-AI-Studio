@@ -3282,6 +3282,38 @@ def _notify_decline(
         pass  # best-effort — the stale-runner sweep is the safety net
 
 
+_DUPLICATE_DISPATCH_DECLINE_REASON = (
+    "duplicate dispatch while prior same-task process is still active"
+)
+
+
+def _decline_duplicate_dispatch(
+    orchestrator_url: str,
+    token: str,
+    task_id: str,
+    resource_ledger: "_ResourceLedger",
+    reservation_key: str,
+    capacity: threading.Semaphore | None,
+) -> None:
+    """Release both sides of a duplicate same-task pull immediately.
+
+    ``/next-task`` has already pinned the returned task in PROVISIONING. A
+    local ``continue`` therefore is not a harmless de-duplication: the server
+    sees an owned task while this runner has launched nothing for that claim.
+    Explicitly decline the server pin and release the local reservation/permit
+    so the task can be dispatched elsewhere without waiting for a stale sweep.
+    """
+    print(f"[runner] declining duplicate dispatch for task {task_id}", flush=True)
+    resource_ledger.release(reservation_key)
+    _release_capacity(capacity)
+    _notify_decline(
+        orchestrator_url,
+        token,
+        task_id,
+        reason=_DUPLICATE_DISPATCH_DECLINE_REASON,
+    )
+
+
 def _try_acquire_capacity(capacity: threading.Semaphore | None) -> bool:
     if capacity is None:
         return True
@@ -9076,9 +9108,15 @@ def main() -> None:
             with lock:
                 already_active = task_id in active_tasks
             if already_active:
-                print(f"[runner] skipping duplicate dispatch for task {task_id}", flush=True)
-                resource_ledger.release(reservation_key)
-                _release_capacity(agent_capacity)
+                _decline_duplicate_dispatch(
+                    orchestrator_url,
+                    token,
+                    task_id,
+                    resource_ledger,
+                    reservation_key,
+                    agent_capacity,
+                )
+                reservation_key = None
                 time.sleep(poll_interval)
                 continue
 

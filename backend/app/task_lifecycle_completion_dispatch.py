@@ -32,6 +32,14 @@ import logging
 import uuid
 from typing import Awaitable, Callable
 
+from sqlalchemy.exc import (
+    DisconnectionError,
+    InterfaceError,
+    InternalError,
+    OperationalError,
+    PendingRollbackError,
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import _sanitize_log
@@ -43,6 +51,39 @@ from app.task_blocked import reset_task_for_fresh_attempt
 from app.task_capabilities import get_task_capability
 
 logger = logging.getLogger(__name__)
+
+
+def _is_transient_completion_handler_error(exc: BaseException) -> bool:
+    """Classify retryable completion failures without relying on message text."""
+    if isinstance(
+        exc,
+        (
+            PendingRollbackError,
+            InterfaceError,
+            InternalError,
+            OperationalError,
+            DisconnectionError,
+            SQLAlchemyTimeoutError,
+        ),
+    ) or bool(getattr(exc, "connection_invalidated", False)):
+        return True
+
+    err_str = str(exc).lower()
+    return any(
+        kw in err_str
+        for kw in [
+            "api.github.com",
+            "502",
+            "503",
+            "connection",
+            "timeout",
+            "rate limit",
+            "ssl",
+            "name resolution",
+            "connection refused",
+            "greenlet",  # post-rollback expired-attr lazy-load; retryable
+        ]
+    )
 
 
 async def run_completion_dispatch(
@@ -249,23 +290,14 @@ async def run_completion_dispatch(
             # handler error so that loop can record this exact claim's
             # failure without re-running the agent or failing early.
             raise
-        # Detect transient errors (GitHub API, DB, network) and requeue instead of FAILED
-        err_str = str(handler_exc).lower()
-        is_transient = any(
-            kw in err_str
-            for kw in [
-                "api.github.com",
-                "502",
-                "503",
-                "connection",
-                "timeout",
-                "rate limit",
-                "ssl",
-                "name resolution",
-                "connection refused",
-                "greenlet",  # post-rollback expired-attr lazy-load; retryable
-            ]
-        )
+        # Detect transient errors (GitHub API, DB, network) and requeue instead
+        # of FAILED.
+        # SQLAlchemy's transaction-state and driver wrappers must be matched by
+        # type: PendingRollbackError deliberately omits the original DB error
+        # from its short message, and asyncpg InternalClientError is surfaced as
+        # InternalError.  String-only matching turned the successful d8ae77b0
+        # design-doc task into terminal FAILED after a transient disconnect.
+        is_transient = _is_transient_completion_handler_error(handler_exc)
         # Research task interrupted mid-spawn: findings are already committed
         # to task.plan_output and _research_spawn_pending is durable in context.
         # Requeuing the agent would discard those findings and start a new

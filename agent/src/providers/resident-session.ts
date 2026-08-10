@@ -334,17 +334,17 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     ? compatibleBaseArgs
     : [...compatibleBaseArgs, '--input-format', 'stream-json'];
   if (opts.appendSystemPrompt) {
-    if (capabilities && !capabilities.has('--append-system-prompt')) {
+    if (!capabilities.has('--append-system-prompt')) {
       throw new Error('resident identity requires Claude --append-system-prompt support');
     }
     args.push('--append-system-prompt', opts.appendSystemPrompt);
   }
   if (opts.replyTool) {
-    if (capabilities && (
+    if (
       !capabilities.has('--mcp-config')
       || !capabilities.has('--strict-mcp-config')
       || !capabilities.has('--allowedTools')
-    )) {
+    ) {
       throw new Error('resident native reply tool requires Claude --mcp-config, --strict-mcp-config, and --allowedTools support');
     }
     args.push('--mcp-config', opts.replyTool.mcpConfigPath, '--strict-mcp-config');
@@ -389,6 +389,22 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     if (matchesRateLimit(text, runner.provider, runner.authMode)) return 'rate_limited';
     if (matchesAuthFailure(text, runner.provider)) return 'dead_auth';
     return null;
+  };
+  const structuredFailureDiagnostic = (ev: ResidentStreamEvent): string => {
+    const fields = [
+      ev.terminalReason ? `terminal_reason=${ev.terminalReason}` : '',
+      ev.apiErrorStatus !== undefined ? `api_error_status=${String(ev.apiErrorStatus)}` : '',
+      ev.text ?? '',
+    ];
+    return fields.filter(Boolean).join(' ');
+  };
+  const classifyEventFailure = (ev: ResidentStreamEvent): 'rate_limited' | 'dead_auth' | null => {
+    // A structured terminal API status is stronger than free-text matching.
+    // In particular, Claude Code has emitted api_error_status=403 together
+    // with subtype=success for an organization-disabled OAuth account.
+    if (ev.apiErrorStatus === 429) return 'rate_limited';
+    if (ev.apiErrorStatus === 401 || ev.apiErrorStatus === 403) return 'dead_auth';
+    return ev.text ? classifyFailure(ev.text) : null;
   };
   // Claude's OAuth weekly-limit banner is sometimes emitted as an ordinary
   // assistant text frame before the CLI exits. Keep this deliberately narrow:
@@ -540,6 +556,10 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     const textQuotaBanner = ev.kind === 'text'
       && typeof ev.text === 'string'
       && isOAuthQuotaBanner(ev.text);
+    const terminalFailureEvent = ev.kind === 'error'
+      || ev.kind === 'other'
+      || textQuotaBanner
+      || (ev.kind === 'result' && ev.isError && ev.isTurnResult);
     if (
       staleResultsPending === 0
       && !ev.nested
@@ -548,13 +568,10 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       // that raw provider output as terminal evidence too; otherwise the
       // child exits and the resident is retried generically against the same
       // exhausted account.
-      && (ev.kind === 'error'
-        || ev.kind === 'other'
-        || textQuotaBanner
-        || (ev.kind === 'result' && ev.isError && ev.isTurnResult)) && ev.text
+      && terminalFailureEvent
     ) {
-      appendFailureText(ev.text);
-      const category = classifyFailure(failureTextTail);
+      appendFailureText(structuredFailureDiagnostic(ev));
+      const category = classifyEventFailure(ev) ?? classifyFailure(failureTextTail);
       if (category) terminalFailureCategory = category;
       if (activeTurn && category) {
         activeTurn.providerFailed = true;
@@ -694,9 +711,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         // the failure tail; otherwise a resident keeps accepting turns from an
         // exhausted account and the pool never gets a rate-limit signal to
         // rotate away from it.
-        const resultFailure = ev.text ? classifyFailure(ev.text) : null;
+        const resultFailure = classifyEventFailure(ev);
         if (resultFailure) {
-          appendFailureText(ev.text ?? '');
+          // Error-looking results were captured by the common terminal block
+          // above. Successful-looking quota banners reach only this branch.
+          if (!ev.isError) appendFailureText(structuredFailureDiagnostic(ev));
           terminalFailureCategory = resultFailure;
           if (activeTurn) {
             activeTurn.providerFailed = true;
@@ -731,8 +750,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         if (!ev.isError && !resultFailure) clearFailureEvidence();
         if (ev.isError && activeTurn) {
           activeTurn.providerFailed = true;
-          activeTurn.failureCategory = classifyFailure(failureTextTail);
-          const detail = sanitize([ev.text ?? '', failureTextTail].filter(Boolean).join('\n')).trim();
+          activeTurn.failureCategory = resultFailure ?? classifyFailure(failureTextTail);
+          const detail = sanitize([
+            structuredFailureDiagnostic(ev),
+            failureTextTail,
+          ].filter(Boolean).join('\n')).trim();
           activeTurn.failureDetail = detail.slice(-2_000)
             || 'provider returned a top-level error result without diagnostic text';
         }

@@ -444,6 +444,10 @@ describe('matchesAuthFailure', () => {
 
   it('detects OAuth org-disabled errors', () => {
     expect(matchesAuthFailure('oauth_org_not_allowed')).toBe(true);
+    expect(matchesAuthFailure(
+      'Your organization has disabled Claude subscription access for Claude Code · ' +
+      'Use an Anthropic API key instead, or ask your admin to enable access',
+    )).toBe(true);
   });
 
   it('matches case-insensitively', () => {

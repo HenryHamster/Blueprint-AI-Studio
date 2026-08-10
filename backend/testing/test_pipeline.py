@@ -5304,17 +5304,17 @@ class TestFirstAttemptMetrics:
         """Task completed on first try → _first_attempt_succeeded=True."""
         assert _compute_first_attempt_succeeded(0, TaskStatus.COMPLETED) is True
 
-    def test_second_attempt_success_is_not_first(self):
-        """Task completed after one retry → _first_attempt_succeeded=False (attempt_count=2)."""
+    def test_third_attempt_success_is_not_first(self):
+        """Two consumed retries (UI Attempt 3) cannot count as first-attempt success."""
         assert _compute_first_attempt_succeeded(2, TaskStatus.COMPLETED) is False
 
     def test_failed_task_is_not_first_attempt_success(self):
         """A failed task → _first_attempt_succeeded=False regardless of attempt count."""
         assert _compute_first_attempt_succeeded(0, TaskStatus.FAILED) is False
 
-    def test_attempt_count_1_is_within_first_attempt_threshold(self):
-        """attempt_count=1 (reaper retried once) still counts as first-attempt bucket."""
-        assert _compute_first_attempt_succeeded(1, TaskStatus.COMPLETED) is True
+    def test_attempt_count_1_is_a_retry(self):
+        """attempt_count=1 is UI Attempt 2, so it is not first-attempt success."""
+        assert _compute_first_attempt_succeeded(1, TaskStatus.COMPLETED) is False
 
 
 @pytest_asyncio.fixture()

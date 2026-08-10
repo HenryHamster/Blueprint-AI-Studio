@@ -4746,6 +4746,39 @@ def _parse_latest_tool_use_at(tool_trace) -> datetime | None:
         return None
 
 
+def _latest_heartbeat_progress_at(
+    tool_trace,
+    active_tool_progress_at: datetime | None,
+) -> datetime | None:
+    """Return the newest trustworthy progress stamp carried by a heartbeat.
+
+    ``tool_trace`` records top-level tool invocations.  A long-running command
+    can keep producing output after that invocation stamp while task-authored
+    status prose replaces the agent's literal ``Using tool:`` prefix.  The
+    structured ``active_tool_progress_at`` stamp carries that sub-progress so
+    the reaper does not mistake productive verification for an agent stall.
+
+    Future values are ignored instead of poisoning the monotonic off-row clock:
+    both VmContact and TaskContact use ``GREATEST``, so accepting a wildly
+    future producer timestamp would otherwise suppress stall detection until
+    wall-clock time caught up.  Five minutes permits ordinary host clock skew.
+    """
+    trace_at = _parse_latest_tool_use_at(tool_trace)
+    progress_at = active_tool_progress_at
+    if progress_at is not None:
+        if progress_at.tzinfo is not None:
+            progress_at = progress_at.astimezone(timezone.utc).replace(tzinfo=None)
+        if progress_at > _utcnow() + timedelta(minutes=5):
+            logger.warning(
+                "[HEARTBEAT] active_tool_progress_at is implausibly future-dated "
+                "(%s); ignoring it to preserve the monotonic progress clock",
+                progress_at.isoformat(),
+            )
+            progress_at = None
+    candidates = [stamp for stamp in (trace_at, progress_at) if stamp is not None]
+    return max(candidates) if candidates else None
+
+
 async def _record_vm_contact(
     vm_instance_id: str | None,
     last_tool_use_at: datetime | None = None,
@@ -5004,7 +5037,10 @@ async def agent_heartbeat(
     # advanced by ANY agent on that runner and a hung agent beside a working
     # sibling reads as "progressing" forever. ``req.task_id`` is already proven
     # equal to the JWT ``sub`` above, so this key is as trusted as the vm id.
-    _latest_tool_use_at = _parse_latest_tool_use_at(req.tool_trace)
+    _latest_tool_use_at = _latest_heartbeat_progress_at(
+        req.tool_trace,
+        req.active_tool_progress_at,
+    )
     await _record_vm_contact(
         token.get("vm_instance_id"), _latest_tool_use_at, task_id=req.task_id
     )

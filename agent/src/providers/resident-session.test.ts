@@ -340,6 +340,31 @@ describe('startResidentClaudeSession', () => {
     session.close();
   });
 
+  it('turns a structured terminal 403 into an immediate dead-auth account signal', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+
+    const turn = session.sendTurn('hello');
+    ctl.pushLine({
+      type: 'result',
+      subtype: 'success',
+      terminal_reason: 'api_error',
+      api_error_status: 403,
+      result: 'Your organization has disabled Claude subscription access for Claude Code',
+    });
+
+    const result = await turn;
+    expect(result).toMatchObject({
+      providerFailed: true,
+      failureCategory: 'dead_auth',
+    });
+    expect(result.failureDetail).toContain('api_error_status=403');
+    expect(session.failureCategory?.()).toBe('dead_auth');
+    expect(session.isAlive()).toBe(true);
+    session.close();
+  });
+
   it('retains a diagnostic for a generic top-level provider error while the child stays alive', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
@@ -609,6 +634,9 @@ describe('startResidentClaudeSession', () => {
     const turn = session.sendTurn('long task');
     session.interrupt();
     expect(ctl.stdinWrites.some((w) => w.includes('control_request'))).toBe(false);
+    // `process.kill` is a host method; Vitest only inspects the mock here and
+    // never calls the unbound reference.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(process.kill).toHaveBeenCalledWith(4242, 'SIGINT');
     ctl.pushLine({ type: 'result', result: 'stopped' });
     const r = await turn;

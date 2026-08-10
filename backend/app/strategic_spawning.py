@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
@@ -7983,19 +7983,42 @@ async def _spawn_strategic_review(
     _ci_compliance_block: dict[str, Any] | None = None
     try:
         from app import ci_compliance as _ci_compliance
+        from app.database import resolve_async_engine
 
-        _ci_status = await _ci_compliance.ensure_current_ci_compliance(session, project)
-        if _ci_status.get("status") == "success":
-            _ci_compliance_block = _ci_compliance.compact_ci_compliance(
-                _ci_status.get("data")
-            )
-            _ci_gate = ci_compliance_qualify_gate(
-                project, _ci_status.get("head_sha")
-            )
-            if _ci_gate.get("blocked"):
-                await _maybe_spawn_ci_compliance_cap_bump_fix(
-                    session, project, _ci_gate
+        # CI compliance is advisory context for the strategist.  It performs a
+        # JSONB write + flush when the integration HEAD is not cached.  Keeping
+        # that flush on the strategic-spawn session makes a transient DB error
+        # poison the *entire* Phase-2 transaction: the broad fail-open below
+        # then logs "continuing", but every subsequent query raises
+        # PendingRollbackError.  Use a short independent transaction bound to
+        # the same engine (including test-engine overrides) so an advisory
+        # signal can fail without invalidating the authoritative spawn.
+        _ci_factory = async_sessionmaker(
+            resolve_async_engine(session),
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with _ci_factory() as _ci_session:
+            _ci_project = await _ci_session.get(Project, project.id)
+            if _ci_project is None:
+                raise RuntimeError(
+                    f"project {project.id} disappeared while building CI compliance"
                 )
+            _ci_status = await _ci_compliance.ensure_current_ci_compliance(
+                _ci_session, _ci_project
+            )
+            if _ci_status.get("status") == "success":
+                _ci_compliance_block = _ci_compliance.compact_ci_compliance(
+                    _ci_status.get("data")
+                )
+                _ci_gate = ci_compliance_qualify_gate(
+                    _ci_project, _ci_status.get("head_sha")
+                )
+                if _ci_gate.get("blocked"):
+                    await _maybe_spawn_ci_compliance_cap_bump_fix(
+                        _ci_session, _ci_project, _ci_gate
+                    )
+            await _ci_session.commit()
     except Exception:
         logger.exception("[STRATEGIC] ci_compliance signal build failed; continuing")
     _open_completion_debt_block: dict[str, Any] | None = None

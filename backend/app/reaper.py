@@ -141,6 +141,37 @@ _reaper_last_progress: datetime | None = None
 # is identical unless tuned.
 REAPER_HANG_SECONDS = float(os.getenv("REAPER_HANG_SECONDS", "300"))
 
+# A worker restart must not turn control-plane downtime into task failures.
+# While the API/worker is offline, healthy runners cannot advance Task,
+# VmContact, TaskContact, or LocalRunner heartbeat timestamps.  The first
+# reaper cycle used to run immediately after process startup and charge that
+# outage to every in-flight task; on 2026-08-10 it reaped three live tasks six
+# seconds after a normal restart, before their runners had one heartbeat cycle
+# in which to reconnect.  Quarantine orphan *classification* briefly after a
+# process restart while all other recovery sweeps keep running.  Two minutes is
+# four normal 30-second heartbeat opportunities and is still far below any
+# operator-relevant stuck-task horizon.  A runtime override of 0 disables the
+# grace for tests/emergency tuning.
+_REAPER_STARTUP_ORPHAN_GRACE_SECONDS_DEFAULT = 120.0
+_REAPER_PROCESS_STARTED_AT = _utcnow()
+
+
+def _startup_orphan_grace_remaining(now: datetime) -> float:
+    """Return seconds before orphan classification is safe after startup."""
+    try:
+        grace_seconds = float(
+            _runtime_config.get(
+                "reaper_startup_orphan_grace_seconds",
+                _REAPER_STARTUP_ORPHAN_GRACE_SECONDS_DEFAULT,
+            )
+        )
+    except (TypeError, ValueError):
+        grace_seconds = _REAPER_STARTUP_ORPHAN_GRACE_SECONDS_DEFAULT
+    if grace_seconds <= 0:
+        return 0.0
+    elapsed = max(0.0, (now - _REAPER_PROCESS_STARTED_AT).total_seconds())
+    return max(0.0, grace_seconds - elapsed)
+
 
 from app.reaper_halt import (
     _REAPER_CYCLE_HALT_THRESHOLD,
@@ -485,6 +516,22 @@ async def reaper_service():
                 now = _utcnow()
                 ten_minutes_ago = now - timedelta(minutes=10)
                 fifteen_minutes_ago = now - timedelta(minutes=15)
+
+                startup_grace_remaining = _startup_orphan_grace_remaining(now)
+                if startup_grace_remaining > 0:
+                    # Keep the rest of the reaper cycle alive (queued-age,
+                    # EVALUATING, retry-after, and maintenance sweeps), but do
+                    # not classify timestamps that necessarily went stale while
+                    # this control plane was unavailable.  Once runners reconnect
+                    # they refresh the same rows the normal classifier reads.
+                    if active_tasks:
+                        logger.warning(
+                            "[REAPER] Startup reconnect grace active for %.0fs; "
+                            "deferring orphan classification for %d active task(s)",
+                            startup_grace_remaining,
+                            len(active_tasks),
+                        )
+                    active_tasks = []
 
                 # Batch query for PULL_REQUEST artifacts to support PR-based heartbeat
                 # cutoff reduction. Tasks with open PRs use a 90s cutoff instead of

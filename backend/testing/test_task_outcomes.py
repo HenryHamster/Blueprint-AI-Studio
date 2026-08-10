@@ -1166,8 +1166,8 @@ def test_first_attempt_succeeded_verified_is_unaffected():
     )
 
 
-def test_first_attempt_succeeded_none_verification_backward_compat():
-    """Passing None merge_verification preserves pre-change semantics."""
+def test_first_attempt_succeeded_none_verification_uses_retry_count():
+    """None verification still requires zero consumed retries."""
     from app.task_completion import _compute_first_attempt_succeeded
 
     assert (
@@ -1180,7 +1180,7 @@ def test_first_attempt_succeeded_none_verification_backward_compat():
         _compute_first_attempt_succeeded(
             1, TaskStatus.COMPLETED, merge_verification=None
         )
-        is True
+        is False
     )
     assert (
         _compute_first_attempt_succeeded(

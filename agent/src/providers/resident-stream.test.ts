@@ -277,6 +277,23 @@ describe('parseResidentLine', () => {
     expect(events[0]).toMatchObject({ kind: 'result', text: 'final answer', isTurnResult: true, sessionId: 's9' });
   });
 
+  it('marks a structured terminal api_error as failed even when subtype says success', () => {
+    const events = parseResidentLine(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      terminal_reason: 'api_error',
+      api_error_status: 403,
+      result: 'Your organization has disabled Claude subscription access for Claude Code',
+    }));
+    expect(events[0]).toMatchObject({
+      kind: 'result',
+      isError: true,
+      isTurnResult: true,
+      terminalReason: 'api_error',
+      apiErrorStatus: 403,
+    });
+  });
+
   it('carries token usage on a result event', () => {
     const events = parseResidentLine(JSON.stringify({
       type: 'result', result: 'done',

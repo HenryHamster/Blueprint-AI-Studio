@@ -155,6 +155,10 @@ export interface ResidentStreamEvent {
   sessionId?: string;
   /** true for a TOP-LEVEL result event — the completion signal for the active turn */
   isTurnResult?: boolean;
+  /** Structured terminal reason emitted by newer Claude Code result frames. */
+  terminalReason?: string;
+  /** HTTP status carried by a structured terminal API error result. */
+  apiErrorStatus?: number;
   /** true for a finalized top-level assistant text block (vs a streamed delta) */
   isAssistantMessage?: boolean;
   /** true when the event came from a nested sub-agent (parent_tool_use_id set) */
@@ -329,8 +333,27 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
 
   if (type === 'result') {
     const result = typeof obj.result === 'string' ? obj.result : '';
+    const terminalReason = typeof obj.terminal_reason === 'string'
+      ? obj.terminal_reason
+      : undefined;
+    const rawApiErrorStatus = obj.api_error_status;
+    const parsedApiErrorStatus = typeof rawApiErrorStatus === 'number'
+      ? rawApiErrorStatus
+      : (typeof rawApiErrorStatus === 'string' && rawApiErrorStatus.trim()
+          ? Number(rawApiErrorStatus)
+          : Number.NaN);
+    const apiErrorStatus = Number.isFinite(parsedApiErrorStatus)
+      ? Math.trunc(parsedApiErrorStatus)
+      : undefined;
+    // Claude Code can emit a terminal provider rejection with subtype=success
+    // and no is_error bit.  terminal_reason/api_error_status are the canonical
+    // failure signal in that shape; treating it as ordinary success makes the
+    // Resident keep waiting/retrying the same dead account until hard timeout.
+    const structuredApiError = terminalReason === 'api_error'
+      || (apiErrorStatus !== undefined && apiErrorStatus >= 400);
     events.push({
-      kind: 'result', text: result, isError: obj.is_error === true, isTurnResult: !nested, nested, sessionId,
+      kind: 'result', text: result, isError: obj.is_error === true || structuredApiError,
+      isTurnResult: !nested, nested, sessionId, terminalReason, apiErrorStatus,
       usage: extractResultUsage(obj),
       numTurns: extractResultTurns(obj),
     });

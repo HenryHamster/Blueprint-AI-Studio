@@ -18851,7 +18851,7 @@ async def test_spawn_strategic_review_includes_ci_compliance_when_available(
         },
         "computed": False,
     }
-    mocker.patch(
+    ensure_ci = mocker.patch(
         "app.ci_compliance.ensure_current_ci_compliance",
         new=AsyncMock(return_value=fake_envelope),
     )
@@ -18863,6 +18863,7 @@ async def test_spawn_strategic_review_includes_ci_compliance_when_available(
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
+    assert ensure_ci.await_args.args[0] is not db_session
 
     result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()

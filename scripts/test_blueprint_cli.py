@@ -6454,6 +6454,16 @@ def test_deploy_agent_confirms_when_served_sha_matches(monkeypatch, tmp_path):
     assert not state_path.exists()
 
 
+def test_deploy_agent_lock_reports_posix_requirement_without_fcntl(
+    monkeypatch, tmp_path
+):
+    """Importing the operator CLI on Windows must not fail at module import."""
+    monkeypatch.setattr(blueprint, "fcntl", None)
+
+    with pytest.raises(blueprint.APIError, match="POSIX advisory locking"):
+        blueprint._acquire_deploy_agent_lock(str(tmp_path / "deploy-agent.lock"))
+
+
 @pytest.mark.parametrize(
     "failure",
     [
