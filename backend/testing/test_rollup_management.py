@@ -8,6 +8,12 @@ from sqlalchemy.orm.attributes import flag_modified
 from unittest.mock import AsyncMock, MagicMock
 
 from app.models import Task, TaskStatus
+from app.operator_attention import _task_attention_item
+from app.terminal_rollup_pr_sweep import (
+    TERMINAL_ROLLUP_PR_ATTENTION_KEY,
+    TERMINAL_ROLLUP_PR_SWEEP_REQUEUES_KEY,
+    sweep_terminal_rollup_prs,
+)
 
 # Reuse the in-memory DB fixture + rollup-parent/child builders.
 from testing.test_rollup_cleanup import (
@@ -153,6 +159,140 @@ async def _make_merged_child(session, project_id, parent_id):
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
     )
+
+
+async def _make_failed_terminal_rollup_for_sweep(
+    session, project_id, *, pr_number: int, extra_context: dict | None = None
+):
+    """Build a FAILED rollup with one completed child for sweep acceptance tests."""
+    parent = await _make_task(
+        session,
+        project_id,
+        task_type="research",
+        status=TaskStatus.FAILED,
+        context={
+            "research_branch": f"research/sweep-{pr_number}",
+            "rollup_pr_number": pr_number,
+            "rollup_pr_url": f"https://github.test/pull/{pr_number}",
+            **(extra_context or {}),
+        },
+        plan_output="sweep acceptance parent",
+    )
+    await _make_merged_child(session, project_id, parent.id)
+    return parent
+
+
+@pytest.mark.asyncio
+async def test_terminal_rollup_sweep_requeues_tracked_open_pr(cleanup_db, mocker):
+    """A terminal rollup whose tracked PR is still open is requeued once."""
+    project = await _make_project(cleanup_db)
+    parent = await _make_failed_terminal_rollup_for_sweep(
+        cleanup_db, project.id, pr_number=18001
+    )
+    reconcile = mocker.patch(
+        "app.terminal_rollup_requeue.reconcile_terminal_rollup_requeue",
+        new_callable=AsyncMock,
+        return_value="open_pr_rearmed",
+    )
+
+    result = await sweep_terminal_rollup_prs(cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert result == {"open_pr_rearmed": 1}
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.context[TERMINAL_ROLLUP_PR_SWEEP_REQUEUES_KEY] == 1
+    reconcile.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_terminal_rollup_sweep_reconciles_merged_pr_idempotently(
+    cleanup_db, mocker
+):
+    """A merged terminal rollup is requeued once and never duplicated."""
+    project = await _make_project(cleanup_db)
+    parent = await _make_failed_terminal_rollup_for_sweep(
+        cleanup_db, project.id, pr_number=18002
+    )
+    reconcile = mocker.patch(
+        "app.terminal_rollup_requeue.reconcile_terminal_rollup_requeue",
+        new_callable=AsyncMock,
+        return_value="merged_pr_rearmed",
+    )
+    mocker.patch(
+        "app.terminal_rollup_pr_sweep._trigger_merged_parent_classifier",
+        new_callable=AsyncMock,
+    )
+
+    first = await sweep_terminal_rollup_prs(cleanup_db)
+    await cleanup_db.refresh(parent)
+    state_after_first = (parent.status, dict(parent.context or {}))
+    second = await sweep_terminal_rollup_prs(cleanup_db)
+
+    assert first == {"merged_pr_rearmed": 1}
+    assert second == {}
+    assert reconcile.await_count == 1
+    await cleanup_db.refresh(parent)
+    assert (parent.status, dict(parent.context or {})) == state_after_first
+
+
+@pytest.mark.asyncio
+async def test_terminal_rollup_sweep_surfaces_replacement_as_ambiguous(
+    cleanup_db, mocker
+):
+    """A replacement for a closed PR remains FAILED for operator judgment."""
+    project = await _make_project(cleanup_db)
+    parent = await _make_failed_terminal_rollup_for_sweep(
+        cleanup_db, project.id, pr_number=18003
+    )
+    reconcile = mocker.patch(
+        "app.terminal_rollup_requeue.reconcile_terminal_rollup_requeue",
+        new_callable=AsyncMock,
+        return_value="replacement_pr_rearmed",
+    )
+
+    result = await sweep_terminal_rollup_prs(cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert result == {"replacement_pr_rearmed": 1}
+    assert parent.status == TaskStatus.FAILED
+    assert (
+        parent.context[TERMINAL_ROLLUP_PR_ATTENTION_KEY]["outcome"]
+        == "replacement_pr_rearmed"
+    )
+    attention = _task_attention_item(
+        parent,
+        reason="terminal_rollup_pr_attention",
+        severity="needs_operator",
+    )
+    assert attention["reason"] == "terminal_rollup_pr_attention"
+    assert attention["severity"] == "needs_operator"
+    reconcile.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_terminal_rollup_sweep_ambiguous_case_is_idempotent(cleanup_db, mocker):
+    """An uncertain lookup is surfaced once and skipped on the next sweep."""
+    project = await _make_project(cleanup_db)
+    parent = await _make_failed_terminal_rollup_for_sweep(
+        cleanup_db, project.id, pr_number=18004
+    )
+    reconcile = mocker.patch(
+        "app.terminal_rollup_requeue.reconcile_terminal_rollup_requeue",
+        new_callable=AsyncMock,
+        return_value="lookup_uncertain_identity_preserved",
+    )
+
+    first = await sweep_terminal_rollup_prs(cleanup_db)
+    await cleanup_db.refresh(parent)
+    context_after_first = dict(parent.context or {})
+    second = await sweep_terminal_rollup_prs(cleanup_db)
+
+    assert first == {"lookup_uncertain_identity_preserved": 1}
+    assert second == {}
+    assert reconcile.await_count == 1
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert parent.context == context_after_first
 
 
 @pytest.mark.asyncio

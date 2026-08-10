@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 from time import monotonic as _monotonic
 
 from sqlalchemy import func
@@ -176,11 +176,17 @@ async def _reconcile_one(task_id, session: AsyncSession) -> str | None:
     from app.terminal_rollup_requeue import reconcile_terminal_rollup_requeue
 
     try:
-        outcome = await reconcile_terminal_rollup_requeue(locked, session)
+        outcome = cast(
+            str, await reconcile_terminal_rollup_requeue(locked, session)
+        )
+        # Only the tracked PR's own state is unambiguous enough to resurrect a
+        # terminal task automatically.  A closed predecessor with an open
+        # same-head replacement still needs operator judgment: that replacement
+        # may belong to a different attempt or owner, and blindly adopting it
+        # would widen this sweep beyond the requested merged/open contract.
         auto_rearm_outcome = outcome in {
             "merged_pr_rearmed",
             "open_pr_rearmed",
-            "replacement_pr_rearmed",
         }
         count = _sweep_requeue_count(locked)
         if not auto_rearm_outcome:
