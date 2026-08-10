@@ -28,7 +28,10 @@ from app.shared_state import (
     resolve_project_promotion_enabled,
     runtime_config as _runtime_config,
 )
-from app.release_artifacts import version_serving_summary as _version_serving_summary
+from app.release_artifacts import (
+    is_activation_rearmable_serving_status,
+    version_serving_summary as _version_serving_summary,
+)
 from app.qualification_state_resolver import (
     resolve_effective_qualification_state,
     resolve_newest_qualification_verdict,
@@ -1819,10 +1822,12 @@ async def approve_activation(
     path refuses any reported revision that differs, or a receipt once a newer
     promotion supersedes this version.
 
-    Requires ``serving_status == "unconfirmed"`` — the exact predicate the
-    attention item and callout use, so the in-product surface is one unambiguous
-    action.  Already ``serving_confirmed`` / ``deploy_failed`` /
-    ``confirmation_timed_out`` (or a never-armed ``serving_status`` NULL) -> 409.
+    Requires a promoted version whose aggregate serving status is either
+    ``unconfirmed`` or ``confirmation_timed_out``.  The latter is a
+    non-terminal report: its confirmation window elapsed without establishing
+    serving, so the same explicit operator approval remains available to
+    re-arm activation.  Already ``serving_confirmed`` / ``deploy_failed`` (or a
+    never-armed ``serving_status`` NULL) -> 409.
     Idempotent: re-approving a still-unconfirmed version returns the existing
     approval without re-stamping.
     """
@@ -1868,12 +1873,7 @@ async def approve_activation(
             status_code=409,
             detail=f"v{version.version_number} deploy failed; clear the deploy failure before approving activation.",
         )
-    if version.serving_status == "confirmation_timed_out":
-        raise HTTPException(
-            status_code=409,
-            detail=f"v{version.version_number} confirmation window timed out; a fresh promotion is required before activation can be approved.",
-        )
-    if version.serving_status != "unconfirmed":
+    if not is_activation_rearmable_serving_status(aggregate_status):
         raise HTTPException(
             status_code=409,
             detail=f"v{version.version_number} is not awaiting activation (serving_status={version.serving_status}).",

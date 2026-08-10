@@ -208,6 +208,19 @@ def artifact_is_unconfirmed(artifact: ReleaseDeployArtifact | None) -> bool:
     return (artifact.serving_status or "unconfirmed") == "unconfirmed"
 
 
+def is_activation_rearmable_serving_status(status: str | None) -> bool:
+    """Return whether a promoted version may receive an activation approval.
+
+    ``confirmation_timed_out`` is deliberately a non-terminal serving report:
+    the confirmation window elapsed without a positive observation, but no
+    deploy failure was established.  It therefore remains eligible for the
+    same explicit operator approval as ``unconfirmed``.  Keep this contract
+    here so activation consumers do not independently turn the report into a
+    terminal state.
+    """
+    return status in {"unconfirmed", "confirmation_timed_out"}
+
+
 # ``confirmation_timed_out`` reason codes that name no specific unsatisfied
 # gate.  ``no_new_revision`` is the backend's low-information backstop ("the
 # serving SHA just couldn't be confirmed in time") — not evidence of the actual
