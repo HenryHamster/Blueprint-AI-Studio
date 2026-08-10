@@ -78,6 +78,12 @@ from app.acceptance_window_invariants import (  # noqa: F401
     _ACCEPTANCE_WINDOW_POPULATION_KEYS,
     acceptance_window_sub_scores_violations,
 )
+from app.acceptance_provenance import (
+    COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
+    PARENT_DERIVED_CHANGED_FILES_KEY,
+    stamp_parent_derived_changed_files_signal as _stamp_parent_derived_signal,
+    stamp_commit_range_derived_changed_files_signal as _stamp_commit_range_signal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -306,53 +312,22 @@ def stamp_changed_files_signal(
     return signal
 
 
-# Sentinel marking a child's ``_pr_changed_files`` as INHERITED from its rollup
-# parent's combined diff rather than sourced from the child's own PR. The
-# parent's diff is the union of every sibling's changes, so a child's declared
-# test that actually lives in a SIBLING's slice would appear "present" here — the
-# named_test gate must therefore cap parent-derived credit at the unproven
-# (inferred) tier and never mint machine ``proven`` credit from it.
-PARENT_DERIVED_CHANGED_FILES_KEY = "_pr_changed_files_from_rollup_parent"
-
-# A rollup child does not own the parent PR, but its persisted review target
-# identifies the exact child PR range.  The compare result for that range is
-# authoritative in the same way as a GitHub PR diff; unlike the parent's union
-# diff it cannot include a sibling's files.  This marker is intentionally a new
-# provenance kind rather than an alias for ``PARENT_DERIVED_CHANGED_FILES_KEY``.
-COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY = "_pr_changed_files_from_rollup_commit_range"
-
-
 def stamp_parent_derived_changed_files_signal(paths: list[str]) -> dict[str, Any]:
-    """Changed-file signal for a rollup child inheriting its parent's combined diff.
-
-    Reuses :func:`stamp_changed_files_signal` for the non-lossy summary but marks
-    the list parent-derived and deliberately does NOT set the
-    ``_pr_changed_files_github_verified`` sentinel: the combined diff is a
-    superset (the union of all siblings' changes), so a child's declared test that
-    lives in a sibling's slice must not falsely earn full machine-``proven``
-    credit. Parent-derived credit is capped at the satisfied/unproven tier by
-    :func:`_evaluate_named_test`.
-    """
-    signal = stamp_changed_files_signal(paths, github_verified=False)
-    signal[PARENT_DERIVED_CHANGED_FILES_KEY] = True
-    signal["_pr_changed_files_provenance"] = "parent_derived"
-    return signal
+    """Stamp a rollup child inheriting its parent's combined diff."""
+    return _stamp_parent_derived_signal(
+        paths,
+        stamp_changed_files_signal=stamp_changed_files_signal,
+        parent_derived_key=PARENT_DERIVED_CHANGED_FILES_KEY,
+    )
 
 
 def stamp_commit_range_derived_changed_files_signal(paths: list[str]) -> dict[str, Any]:
-    """Stamp a rollup child's exact PR-range changed-file provenance.
-
-    The caller must have obtained *paths* from the child's immutable
-    ``base_sha...head_sha`` compare, never from the rollup parent's combined
-    diff.  The GitHub-verified sentinel makes a named-test match eligible for
-    ``proven=True``; the explicit provenance marker prevents this exact range
-    from being mistaken for the weaker parent-union fallback.
-    """
-    signal = stamp_changed_files_signal(paths, github_verified=True)
-    signal.pop(PARENT_DERIVED_CHANGED_FILES_KEY, None)
-    signal[COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY] = True
-    signal["_pr_changed_files_provenance"] = "commit_range_derived"
-    return signal
+    """Stamp a rollup child's exact PR-range changed-file provenance."""
+    return _stamp_commit_range_signal(
+        paths,
+        stamp_changed_files_signal=stamp_changed_files_signal,
+        parent_derived_key=PARENT_DERIVED_CHANGED_FILES_KEY,
+    )
 
 
 def _is_test_path(path: str) -> bool:

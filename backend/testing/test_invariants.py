@@ -10835,6 +10835,10 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         # HEAD) — the diff is meaningless if the SHAs are stale.
         "release_qualifier.py:check_hotfix_scope_preview",
 
+        # Approved-PR stranding compares the reviewed commit against the live
+        # integration tip; a cached tip could misclassify a just-landed PR.
+        "approved_pr_stranding.py:_inspect_approved_pr_with_github",
+
         "release_reconciliation.py:_reconcile_if_promotion_failed_landed",
         "release_reconciliation.py:_reconcile_if_not_promoted_but_pr_merged",
         "release_reconciliation.py:_reconcile_if_managed_check_wait",
