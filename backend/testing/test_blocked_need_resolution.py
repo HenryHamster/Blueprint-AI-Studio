@@ -2218,13 +2218,22 @@ def test_capability_proof_gate_full_cycle():
 
     # ── Phase 3: badge consistency — proof_records path uses tiered classification ──
     # A named_test proof_record should yield "proven" in the badge.
+    #
+    # ``proved_at`` MUST be fresh: the release-qualification gate below grades with
+    # ``now=_utcnow()``, and ``PROOF_FRESHNESS_TTL`` (evidence_primitive.py, 30 days)
+    # drops any ledger proof older than that window — so a hardcoded date turns this
+    # test into a wall-clock time-bomb that fails once the suite runs >30 days later.
+    # Anchor the proof to "now" so it stays inside the freshness window on any date.
+    from app.time_utils import _utcnow
+
+    _fresh_proved_at = _utcnow().isoformat()
     named_test_records = {
         "container-runtime": [
             {
                 "task_id": "provider-task-1",
                 "proof_kind": "named_test",
                 "proof_ref": "testing/test_blocked_need_resolution.py::test_capability_proof_gate_full_cycle",
-                "proved_at": "2026-07-11T00:00:00Z",
+                "proved_at": _fresh_proved_at,
                 "commit_sha": "",
             }
         ]
@@ -2243,7 +2252,7 @@ def test_capability_proof_gate_full_cycle():
                 "task_id": "backing:container-runtime",
                 "proof_kind": "backing_path",
                 "proof_ref": "container-runtime",
-                "proved_at": "2026-07-11T00:00:00Z",
+                "proved_at": _fresh_proved_at,
                 "commit_sha": "",
             }
         ]

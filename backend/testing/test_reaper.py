@@ -3661,6 +3661,18 @@ async def test_terminal_failure_non_provision_finalization(
     alert_mock = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
+    # Snapshot the alerted task's identity WHILE the reaper's session is still live.
+    # The reaper passes a Task loaded in its own session, which closes when the
+    # cycle ends; reading ``.id`` off ``await_args`` afterward raises
+    # DetachedInstanceError under some full-shard orderings (a sibling test can
+    # leave the shared session factory expiring instances on commit). Capturing at
+    # call-time makes the identity assertion independent of post-cycle session state.
+    _alerted_task_ids: list = []
+
+    async def _capture_alerted_task(task, *args, **kwargs):
+        _alerted_task_ids.append(task.id)
+
+    alert_mock.side_effect = _capture_alerted_task
     broadcast_mock = mocker.patch(
         "app.broadcast.broadcast_to_project", new_callable=AsyncMock
     )
@@ -3703,7 +3715,9 @@ async def test_terminal_failure_non_provision_finalization(
     }, f"failure_category must be persisted as a canonical class, got {persisted!r}"
 
     alert_mock.assert_awaited()
-    assert alert_mock.await_args.args[0].id == t.id
+    assert _alerted_task_ids[-1] == t.id, (
+        "the terminal-failure alert must be created for the finalized task"
+    )
 
     record_mock.assert_called_once()
     kwargs = record_mock.call_args.kwargs
