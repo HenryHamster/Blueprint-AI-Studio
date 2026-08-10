@@ -30,7 +30,7 @@ from app.landed_signal import (
     STRANDED_LANDING_REASON_KEY,
 )
 from app.models import Alert, AlertSeverity, Project, ReleaseVersion, Task
-from app.time_utils import _is_cadence_due, _utcnow
+from app.time_utils import _is_cadence_due, _strip_tz_assume_utc, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ _ALERT_TITLE = "Approved pull request has not reached the integration branch"
 
 EvidenceState = Literal["landed", "stranded", "unknown"]
 Mergeability = Literal["clean", "conflicted", "not_applicable", "unknown"]
+ReachabilitySignal = Literal["merge_sha", "head_sha", "neither"]
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,9 @@ class ApprovedPrEvidence:
     integration_head_sha: str | None = None
     merge_base_sha: str | None = None
     reason: str | None = None
+    reachability_signal: ReachabilitySignal = "neither"
+    checked_commit_sha: str | None = None
+    merge_commit_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,19 +109,21 @@ def inspect_approved_pr(
     *,
     base_sha: str | None,
     head_sha: str | None,
+    merge_commit_sha: str | None = None,
     integration_branch: str,
     repo_root: str,
 ) -> ApprovedPrEvidence:
-    """Classify a review target using git ancestry and merge-tree evidence.
+    """Classify a review target using merge-SHA-first ancestry evidence.
 
-    ``landed`` is possible only when ``merge-base --is-ancestor`` exits zero.
-    A non-zero result other than git's documented ``1`` is unknown.  For a
-    non-ancestor commit, the three-way merge tree distinguishes clean work from
-    a genuine conflict without requiring GitHub CLI authentication.
+    Squash merges create a new integration-branch commit, so the PR head is
+    not necessarily reachable even when the PR landed.  Check the immutable
+    merge commit first and use the review head only when no merge commit proves
+    reachability.  A non-ancestor target's three-way merge tree distinguishes
+    clean work from a genuine conflict without requiring GitHub CLI auth.
     """
-    if not base_sha or not head_sha:
+    if not base_sha or not (head_sha or merge_commit_sha):
         return ApprovedPrEvidence(
-            "unknown", "unknown", reason="review target lacks base_sha or head_sha"
+            "unknown", "unknown", reason="review target lacks base_sha and commit SHA"
         )
     integration_head_sha = _resolve_integration_head(
         integration_branch, repo_root=repo_root
@@ -129,29 +135,55 @@ def inspect_approved_pr(
             reason=f"integration branch {integration_branch!r} is unavailable locally",
         )
 
-    ancestry = _git(
-        ["merge-base", "--is-ancestor", head_sha, integration_head_sha],
-        repo_root=repo_root,
+    ancestry_errors: list[str] = []
+    attempted: list[str] = []
+    ancestry_candidates: tuple[tuple[ReachabilitySignal, str | None], ...] = (
+        ("merge_sha", merge_commit_sha),
+        ("head_sha", head_sha),
     )
-    if ancestry is None:
-        return ApprovedPrEvidence(
-            "unknown", "unknown", integration_head_sha, reason="git ancestry check failed"
+    for signal, commit_sha in ancestry_candidates:
+        if not commit_sha or commit_sha in attempted:
+            continue
+        attempted.append(commit_sha)
+        ancestry = _git(
+            ["merge-base", "--is-ancestor", commit_sha, integration_head_sha],
+            repo_root=repo_root,
         )
-    if ancestry.returncode == 0:
-        return ApprovedPrEvidence("landed", "not_applicable", integration_head_sha)
-    if ancestry.returncode != 1:
+        if ancestry is None:
+            ancestry_errors.append(f"{signal}: git ancestry check failed")
+            continue
+        if ancestry.returncode == 0:
+            return ApprovedPrEvidence(
+                "landed",
+                "not_applicable",
+                integration_head_sha=integration_head_sha,
+                reachability_signal=signal,
+                checked_commit_sha=commit_sha,
+                merge_commit_sha=merge_commit_sha,
+            )
+        if ancestry.returncode != 1:
+            ancestry_errors.append(
+                f"{signal}: git ancestry check exited {ancestry.returncode}"
+            )
+
+    if not attempted or ancestry_errors:
         return ApprovedPrEvidence(
             "unknown",
             "unknown",
             integration_head_sha,
-            reason=f"git ancestry check exited {ancestry.returncode}",
+            reason="; ".join(ancestry_errors) or "git ancestry check failed",
+            checked_commit_sha=merge_commit_sha or head_sha,
+            merge_commit_sha=merge_commit_sha,
         )
+
+    mergeability_sha = head_sha or merge_commit_sha
+    assert mergeability_sha is not None
 
     # Mergeability is evaluated against the current integration tip, not the
     # stale base SHA captured when the review was opened.  That is what makes a
     # clean strand distinguishable from a PR that now conflicts with main.
     merge_base = _git(
-        ["merge-base", integration_head_sha, head_sha],
+        ["merge-base", integration_head_sha, mergeability_sha],
         repo_root=repo_root,
     )
     if merge_base is None or merge_base.returncode != 0 or not merge_base.stdout.strip():
@@ -160,10 +192,12 @@ def inspect_approved_pr(
             "unknown",
             integration_head_sha,
             reason="could not resolve the review target merge base",
+            checked_commit_sha=mergeability_sha,
+            merge_commit_sha=merge_commit_sha,
         )
     merge_base_sha = merge_base.stdout.strip()
     merge_tree = _git(
-        ["merge-tree", "--write-tree", integration_head_sha, head_sha],
+        ["merge-tree", "--write-tree", integration_head_sha, mergeability_sha],
         repo_root=repo_root,
     )
     if merge_tree is None:
@@ -173,6 +207,8 @@ def inspect_approved_pr(
             integration_head_sha,
             merge_base_sha,
             "git merge-tree check failed",
+            checked_commit_sha=mergeability_sha,
+            merge_commit_sha=merge_commit_sha,
         )
     if (
         merge_tree.returncode != 0
@@ -183,7 +219,7 @@ def inspect_approved_pr(
         # the same conflict contract, while the output remains intentionally
         # ignored so conflict-marker text in a clean file cannot false-positive.
         merge_tree = _git(
-            ["merge-tree", merge_base_sha, integration_head_sha, head_sha],
+            ["merge-tree", merge_base_sha, integration_head_sha, mergeability_sha],
             repo_root=repo_root,
         )
         if merge_tree is None:
@@ -193,6 +229,8 @@ def inspect_approved_pr(
                 integration_head_sha,
                 merge_base_sha,
                 "legacy git merge-tree check failed",
+                checked_commit_sha=mergeability_sha,
+                merge_commit_sha=merge_commit_sha,
             )
         if any(
             marker in f"{merge_tree.stdout}\n{merge_tree.stderr}"
@@ -213,6 +251,8 @@ def inspect_approved_pr(
             "conflicted",
             integration_head_sha,
             merge_base_sha,
+            checked_commit_sha=mergeability_sha,
+            merge_commit_sha=merge_commit_sha,
         )
     if merge_tree.returncode != 0:
         return ApprovedPrEvidence(
@@ -221,9 +261,16 @@ def inspect_approved_pr(
             integration_head_sha,
             merge_base_sha,
             f"git merge-tree exited {merge_tree.returncode}",
+            checked_commit_sha=mergeability_sha,
+            merge_commit_sha=merge_commit_sha,
         )
     return ApprovedPrEvidence(
-        "stranded", "clean", integration_head_sha, merge_base_sha
+        "stranded",
+        "clean",
+        integration_head_sha,
+        merge_base_sha,
+        checked_commit_sha=merge_commit_sha or mergeability_sha,
+        merge_commit_sha=merge_commit_sha,
     )
 
 
@@ -264,8 +311,11 @@ async def _inspect_approved_pr_with_github(
 
     # Mergeability is descriptive only. It is deliberately fetched separately
     # from ancestry so a temporarily unavailable PR detail cannot turn a
-    # definitive compare result into an unknown verdict.
+    # definitive compare result into an unknown verdict.  A merged PR's API
+    # payload is also the durable source for the squash merge SHA when the
+    # merge observer did not already stamp it on the task.
     mergeability: Mergeability = "unknown"
+    observed_merge_commit_sha: str | None = None
     try:
         pull = await github.get_pull_request(
             token, owner, repo, candidate.pr_number, project_id=project_id
@@ -274,6 +324,9 @@ async def _inspect_approved_pr_with_github(
             mergeability = "clean"
         elif pull.get("mergeable") is False:
             mergeability = "conflicted"
+        api_merge_commit_sha = pull.get("merge_commit_sha")
+        if isinstance(api_merge_commit_sha, str) and api_merge_commit_sha.strip():
+            observed_merge_commit_sha = api_merge_commit_sha.strip()[:64]
     except Exception as exc:  # noqa: BLE001
         logger.info(
             "[APPROVED_PR] PR detail unavailable for #%s: %s",
@@ -285,14 +338,30 @@ async def _inspect_approved_pr_with_github(
         integration_head_sha = await github.get_branch_sha(
             token, owner, repo, branch, project_id=project_id, live=True
         )
-        reachable = await github.is_ancestor_of(
-            token,
-            owner,
-            repo,
-            candidate.commit_sha,
-            branch,
-            project_id=project_id,
+        merge_commit_sha = observed_merge_commit_sha or (
+            candidate.commit_sha
+            if candidate.commit_sha and candidate.commit_sha != candidate.head_sha
+            else None
         )
+        ancestry_results: list[tuple[ReachabilitySignal, str, bool | None]] = []
+        attempted_commits: set[str] = set()
+        ancestry_candidates: tuple[tuple[ReachabilitySignal, str | None], ...] = (
+            ("merge_sha", merge_commit_sha),
+            ("head_sha", candidate.head_sha),
+        )
+        for signal, commit_sha in ancestry_candidates:
+            if not commit_sha or commit_sha in attempted_commits:
+                continue
+            attempted_commits.add(commit_sha)
+            reachable = await github.is_ancestor_of(
+                token,
+                owner,
+                repo,
+                commit_sha,
+                branch,
+                project_id=project_id,
+            )
+            ancestry_results.append((signal, commit_sha, reachable))
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[APPROVED_PR] GitHub ancestry unavailable for PR #%s: %s",
@@ -303,21 +372,32 @@ async def _inspect_approved_pr_with_github(
             "unknown", "unknown", reason="GitHub ancestry check unavailable"
         )
 
-    if reachable is True:
-        return ApprovedPrEvidence(
-            "landed", "not_applicable", integration_head_sha=integration_head_sha
-        )
-    if reachable is False:
+    for signal, commit_sha, reachable in ancestry_results:
+        if reachable is True:
+            return ApprovedPrEvidence(
+                "landed",
+                "not_applicable",
+                integration_head_sha=integration_head_sha,
+                reachability_signal=signal,
+                checked_commit_sha=commit_sha,
+                merge_commit_sha=observed_merge_commit_sha,
+            )
+    if ancestry_results and all(reachable is False for _, _, reachable in ancestry_results):
         return ApprovedPrEvidence(
             "stranded",
             mergeability,
             integration_head_sha=integration_head_sha,
+            reachability_signal="neither",
+            checked_commit_sha=ancestry_results[0][1],
+            merge_commit_sha=observed_merge_commit_sha,
             reason="GitHub compare confirms the reviewed commit is not on the integration branch",
         )
     return ApprovedPrEvidence(
         "unknown",
         "unknown",
         integration_head_sha=integration_head_sha,
+        checked_commit_sha=(ancestry_results[0][1] if ancestry_results else None),
+        merge_commit_sha=observed_merge_commit_sha,
         reason="GitHub compare returned no definitive ancestry result",
     )
 
@@ -434,7 +514,10 @@ def _observation_for(
         "pr_number": candidate.pr_number,
         "base_sha": candidate.base_sha,
         "head_sha": candidate.head_sha,
-        "checked_commit_sha": candidate.commit_sha,
+        "checked_commit_sha": evidence.checked_commit_sha or candidate.commit_sha,
+        "merge_commit_sha": evidence.merge_commit_sha
+        or (candidate.commit_sha if candidate.commit_sha != candidate.head_sha else None),
+        "reachability_signal": evidence.reachability_signal,
         "state": evidence.state,
         "mergeability": evidence.mergeability,
         "integration_branch": get_project_integration_branch(candidate.project),
@@ -449,6 +532,8 @@ def _observation_for(
     changed = updated != old
     if changed:
         context = dict(task.context or {})
+        if evidence.merge_commit_sha:
+            context[LANDED_MERGE_SHA_KEY] = evidence.merge_commit_sha
         context[_OBSERVATION_KEY] = updated
         task.context = context
         flag_modified(task, "context")
@@ -466,9 +551,10 @@ async def sweep_approved_pr_stranding(
     """
     global _last_stranding_scan
     if repo_root is None:
-        scan_now = now or _utcnow()
+        scan_now = _strip_tz_assume_utc(now or _utcnow()) or _utcnow()
+        last_scan = _strip_tz_assume_utc(_last_stranding_scan)
         if not _is_cadence_due(
-            _last_stranding_scan, _STRANDING_SCAN_INTERVAL_SECONDS, scan_now
+            last_scan, _STRANDING_SCAN_INTERVAL_SECONDS, scan_now
         ):
             return {"scanned": 0, "stranded": 0, "unknown": 0, "alerts_created": 0}
         _last_stranding_scan = scan_now
@@ -544,7 +630,7 @@ async def sweep_approved_pr_stranding(
         )
         candidates.setdefault(candidate_key, candidate)
 
-    now = now or _utcnow()
+    now = _strip_tz_assume_utc(now or _utcnow()) or _utcnow()
     observations: list[tuple[_ApprovedPrCandidate, dict[str, Any]]] = []
     changed_tasks = False
     counts = {"scanned": len(candidates), "stranded": 0, "unknown": 0, "alerts_created": 0}
@@ -562,7 +648,12 @@ async def sweep_approved_pr_stranding(
             evidence = await asyncio.to_thread(
                 inspect_approved_pr,
                 base_sha=candidate.base_sha,
-                head_sha=candidate.commit_sha,
+                head_sha=candidate.head_sha or candidate.commit_sha,
+                merge_commit_sha=(
+                    candidate.commit_sha
+                    if candidate.commit_sha and candidate.commit_sha != candidate.head_sha
+                    else None
+                ),
                 integration_branch=branch,
                 repo_root=repo_root,
             )
@@ -624,9 +715,10 @@ async def sweep_approved_pr_stranding(
             continue
         message = (
             f"PR #{candidate.pr_number} has a recorded merge/review target, but checked commit "
-            f"{candidate.commit_sha} is not an ancestor of "
+            f"{observation.get('checked_commit_sha') or candidate.commit_sha} is not an ancestor of "
             f"{observation.get('integration_branch')} HEAD "
             f"{observation.get('integration_head_sha') or 'unknown'}. "
+            f"Reachability signal: {observation.get('reachability_signal', 'neither')}. "
             f"Mergeability classification: {observation.get('mergeability')}. "
             "Review approval is not treated as proof of landing."
         )

@@ -74,6 +74,16 @@ def _non_integration_merge_fixture(tmp_path: Path) -> tuple[Path, str, str, str]
     return repo, base_sha, head_sha, merge_commit_sha
 
 
+def _squash_merge_fixture(tmp_path: Path) -> tuple[Path, str, str, str]:
+    """Create a squash merge where only the new merge commit reaches main."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    _run("git", "checkout", "main", cwd=repo)
+    _run("git", "merge", "--squash", "approved-work", cwd=repo)
+    _run("git", "commit", "-m", "squash approved work", cwd=repo)
+    merge_commit_sha = _run("git", "rev-parse", "HEAD", cwd=repo)
+    return repo, base_sha, head_sha, merge_commit_sha
+
+
 def test_inspect_flags_clean_strand_and_ignores_ancestor(tmp_path: Path):
     repo, base_sha, head_sha, integration_sha = _git_fixture(tmp_path)
 
@@ -86,6 +96,7 @@ def test_inspect_flags_clean_strand_and_ignores_ancestor(tmp_path: Path):
     assert stranded.state == "stranded"
     assert stranded.mergeability == "clean"
     assert stranded.integration_head_sha == integration_sha
+    assert stranded.reachability_signal == "neither"
 
     landed = inspect_approved_pr(
         base_sha=base_sha,
@@ -95,6 +106,23 @@ def test_inspect_flags_clean_strand_and_ignores_ancestor(tmp_path: Path):
     )
     assert landed.state == "landed"
     assert landed.mergeability == "not_applicable"
+
+
+def test_inspect_prefers_squash_merge_commit_over_pr_head(tmp_path: Path):
+    repo, base_sha, head_sha, merge_commit_sha = _squash_merge_fixture(tmp_path)
+
+    evidence = inspect_approved_pr(
+        base_sha=base_sha,
+        head_sha=head_sha,
+        merge_commit_sha=merge_commit_sha,
+        integration_branch="main",
+        repo_root=str(repo),
+    )
+
+    assert evidence.state == "landed"
+    assert evidence.reachability_signal == "merge_sha"
+    assert evidence.checked_commit_sha == merge_commit_sha
+    assert head_sha != merge_commit_sha
 
 
 def test_inspect_reports_current_integration_conflict(tmp_path: Path):
@@ -274,6 +302,17 @@ async def test_stranded_verdict_without_local_checkout(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sweep_normalizes_aware_cadence_timestamp(db_session):
+    stranding._last_stranding_scan = datetime(2026, 8, 9, tzinfo=timezone.utc)
+
+    result = await sweep_approved_pr_stranding(
+        db_session, now=datetime(2026, 8, 10, tzinfo=timezone.utc)
+    )
+
+    assert result == {"scanned": 0, "stranded": 0, "unknown": 0, "alerts_created": 0}
+
+
+@pytest.mark.asyncio
 async def test_sweep_detects_strand_on_non_integration_branch(
     db_session, tmp_path: Path
 ):
@@ -320,6 +359,7 @@ async def test_sweep_detects_strand_on_non_integration_branch(
     assert first["stranded"] == 1
     assert first["alerts_created"] == 0
     assert task.context["approved_pr_stranding"]["checked_commit_sha"] == merge_commit_sha
+    assert task.context["approved_pr_stranding"]["reachability_signal"] == "neither"
 
     version.active_qualification_attempt_id = uuid.uuid4()
     db_session.add(version)
@@ -336,6 +376,7 @@ async def test_sweep_detects_strand_on_non_integration_branch(
     ).scalar_one()
     assert "PR #17141" in alert.message
     assert merge_commit_sha in alert.message
+    assert "Reachability signal: neither" in alert.message
 
 
 @pytest.mark.asyncio
