@@ -5919,9 +5919,19 @@ def test_migration_worker_values_rejects_untrusted_secret_shapes_and_accepts_val
     secrets = tmp_path / "secrets.json"
 
     args = argparse.Namespace(worker_env_file=str(role))
+    # A legitimately multi-line secret (PEM-encoded private key) must be accepted:
+    # worker secrets reach the migration container via the OS environment, which
+    # forwards newlines verbatim. Rejecting these caused a control-plane outage
+    # (units stopped, then the migration aborted on the secret validation).
+    multiline_pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        + "\n".join(["MIIEow" + "A" * 58 for _ in range(24)])
+        + "\n-----END RSA PRIVATE KEY-----\n"
+    )
     valid = {
         "DATABASE_URL": "postgresql+asyncpg://worker:p%40ss@ignored:5432/blueprint",
         "GITHUB_PAT_ENCRYPTION_KEY": "x" * 43,
+        "GITHUB_PRIVATE_KEY": multiline_pem,
     }
     secrets.write_text(json.dumps(valid), encoding="utf-8")
     secrets.chmod(0o600)
@@ -5929,6 +5939,9 @@ def test_migration_worker_values_rejects_untrusted_secret_shapes_and_accepts_val
     assert values["DATABASE_URL"] == (
         "postgresql+asyncpg://worker:p%40ss@blueprint-postgres:5432/blueprint?ssl=disable"
     )
+    # The multi-line value must survive untouched (not stripped, not rejected).
+    assert values["GITHUB_PRIVATE_KEY"] == multiline_pem
+    assert "\n" in values["GITHUB_PRIVATE_KEY"]
     assert credential_path == credential
     assert secrets_path == secrets
     assert network == "blueprint-control-plane"
@@ -5936,7 +5949,11 @@ def test_migration_worker_values_rejects_untrusted_secret_shapes_and_accepts_val
     for invalid in (
         ["not", "an", "object"],
         {"DATABASE_URL": ["not a string"]},
-        {"DATABASE_URL": "postgresql://worker:password@db:5432/blueprint\x1f"},
+        # An embedded NUL is the one byte the OS environment cannot carry, so it
+        # is the only value shape still rejected.
+        {"DATABASE_URL": "postgresql://worker:password@db:5432/blueprint\x00"},
+        # An empty key is not a usable env-var name.
+        {"DATABASE_URL": "postgresql://worker:password@db:5432/blueprint", "": "x"},
     ):
         secrets.write_text(json.dumps(invalid), encoding="utf-8")
         with pytest.raises(ValueError, match="worker secrets"):

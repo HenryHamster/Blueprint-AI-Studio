@@ -254,6 +254,12 @@ def _deploy_agent_unit(bundle: Path, install_user: str) -> bytes:
         "PrivateDevices=true\n"
         "RestrictSUIDSGID=true\n"
         "LockPersonality=true\n"
+        # The sandbox options above imply no-new-privileges at runtime, but the
+        # NoNewPrivileges D-Bus property getter reports only the explicitly
+        # configured field (it does not expose the implied value). Set it
+        # explicitly so `systemctl show --property=NoNewPrivileges` reads "yes"
+        # and _verify_release_execution_boundary can confirm the hardening.
+        "NoNewPrivileges=yes\n"
         "RuntimeDirectory=blueprint-deploy-agent\n"
         "RuntimeDirectoryMode=0750\n"
         "StateDirectory=blueprint-deploy-agent\n"
@@ -307,7 +313,14 @@ def _release_socket_unit(install_user: str) -> bytes:
 
 
 def _verify_release_execution_boundary(install_user: str) -> None:
-    """Read systemd's effective properties, including implicit no-new-privs."""
+    """Confirm systemd's reported User/NoNewPrivileges on both privilege sides.
+
+    ``systemctl show --property=NoNewPrivileges`` reports the explicitly
+    configured field, not the value implied by the sandbox options, so the
+    deploy-agent unit sets ``NoNewPrivileges=yes`` explicitly for this check to
+    observe. The root release executor keeps ``NoNewPrivileges=no`` so it can
+    cross the privilege boundary.
+    """
     expected = {"User", "NoNewPrivileges"}
     agent = _parse_systemctl_properties(
         _run([

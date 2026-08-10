@@ -5985,14 +5985,24 @@ def _migration_worker_values(args: argparse.Namespace) -> tuple[dict[str, str], 
         raise ValueError("worker secrets file is not valid JSON") from exc
     if not isinstance(secrets, dict) or not secrets:
         raise ValueError("worker secrets file must contain a non-empty JSON object")
+    # Worker-secret values are handed to the migration container through the OS
+    # environment (docker `run --env NAME`, subprocess env=...), which forwards
+    # bytes verbatim EXCEPT an embedded NUL (execve / os.environ cannot carry
+    # one). Legitimately multi-line secrets — e.g. a PEM-encoded GITHUB_PRIVATE_KEY
+    # — must therefore be accepted; only a NUL byte is impossible to pass. (The
+    # line-delimited worker role.env is a different medium, validated separately
+    # by _parse_worker_env, where control chars genuinely break KEY=VALUE framing.)
     if any(
         not isinstance(key, str)
         or not isinstance(value, str)
         or not key
-        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or "\x00" in value
         for key, value in secrets.items()
     ):
-        raise ValueError("worker secrets must contain only string values without control characters")
+        raise ValueError(
+            "worker secrets must be non-empty string keys mapping to string "
+            "values without embedded NUL bytes"
+        )
     database_url = secrets.get("DATABASE_URL")
     if not database_url:
         raise ValueError("worker secrets are missing DATABASE_URL")

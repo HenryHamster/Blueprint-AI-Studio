@@ -868,6 +868,9 @@ class LocalAppReleaseTests(unittest.TestCase):
             mocks["database_schema"] = stack.enter_context(
                 patch.object(release, "_database_schema_revision", return_value="0742")
             )
+            mocks["preflight"] = stack.enter_context(
+                patch.object(release, "_preflight_local_migration_inputs")
+            )
             stack.enter_context(patch.object(release, "_verify_services_stable"))
             stack.enter_context(patch.object(release, "_verify_worker_ready"))
             stack.enter_context(
@@ -1032,6 +1035,33 @@ class LocalAppReleaseTests(unittest.TestCase):
                 mocks["evidence"].call_args.args[1]["outcome"],
                 "rollback_refused",
             )
+
+    def test_bad_migration_inputs_abort_before_any_downtime(self):
+        """A deterministic input defect (e.g. a malformed worker secrets file)
+        must fail the release BEFORE any Restart=always unit is stopped, so the
+        control plane is never taken down for an error a preflight can catch.
+        This is the v31 outage class: the worker-secret validation ran only
+        inside the post-stop migration, so a rejected value stopped the control
+        plane and then aborted with nothing to restart across the migration."""
+        with self._release_patches() as mocks:
+            mocks["image_schema"].return_value = "0743"
+            mocks["database_schema"].return_value = "0742"
+            mocks["preflight"].side_effect = ValueError(
+                "worker secrets must be non-empty string keys mapping to string "
+                "values without embedded NUL bytes"
+            )
+            with (
+                patch.object(release, "_stop_unit_container") as stop,
+                patch.object(release, "_run_local_migration") as migrate,
+                self.assertRaisesRegex(Exception, "worker secrets"),
+            ):
+                release.release(IMAGE_REF, REVISION)
+        mocks["preflight"].assert_called_once_with(IMAGE_REF)
+        # Zero downtime, zero mutation: the preflight fired before the choreography.
+        stop.assert_not_called()
+        migrate.assert_not_called()
+        mocks["atomic"].assert_not_called()
+        mocks["restart"].assert_not_called()
 
     def test_worker_activation_failure_rolls_back_only_touched_worker(self):
         def restart(unit: str, image: str, **_kwargs) -> None:
