@@ -37,12 +37,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import release_version
 from app.models import (
     AuditFindingResolution,
+    Project,
     QualificationVerdict,
     ReleaseVersion,
     Task,
     TaskStatus,
 )
-from app.release_scoring import compute_challenged_vs_unchallenged_telemetry
+from app.release_scoring import (
+    compute_challenged_vs_unchallenged_telemetry,
+    project_audit_score,
+    project_promotion_confidence,
+)
 from app.shared_state import resolve_project_promotion_enabled
 from app.time_utils import _utcnow
 
@@ -1066,22 +1071,43 @@ def _compute_requalification_decision(
     truncated: bool,
     ledger_states: dict[str, str],
     open_version_id: str,
+    *,
+    policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Pure re-qualification readiness decision (no I/O; testable without a DB).
 
     ``ledger_states`` maps finding_key → resolution state string (e.g. "resolved",
     "stale"). Any key absent from the map is treated as "unresolved".
 
+    The projected audit score is computed over every carried finding, not just the
+    high/medium gating subset. Resolution state removes deductions from resolved
+    or stale findings, while low/info findings continue to count. Re-qualification
+    is ready only when the gating findings are resolved and the projected score
+    reaches the live promotion threshold.
+
     Truncation-safe: when ``truncated`` is True, the carried list was clipped at
-    the cap and hidden findings may exist. If ALL visible gating findings are
-    resolved we still allow re-qualification — a fresh run re-scores the full set.
-    Blocking forever on a truncated-but-fully-resolved list permanently wedges the
-    auto-redrive (see compute_requalification_readiness for context).
+    the cap and hidden findings may exist. If visible gating findings are resolved
+    and the visible projection reaches the threshold, we still allow
+    re-qualification — a fresh run re-scores the full set. A projection below the
+    threshold never claims readiness, even on a truncated list.
     """
+    valid_findings = [f for f in carried if isinstance(f, dict)]
+    resolved_keys = {
+        str(key)
+        for key, state in ledger_states.items()
+        if state in _RESOLVED_LEDGER_STATES
+    }
+    projected_audit = project_audit_score(
+        valid_findings,
+        resolved_finding_keys=resolved_keys,
+    )
+    projection = project_promotion_confidence(
+        projected_audit,
+        policy,
+    )
+
     gating: list[dict[str, Any]] = []
-    for f in carried:
-        if not isinstance(f, dict):
-            continue
+    for f in valid_findings:
         severity = str(f.get("severity") or "").lower()
         if severity not in _REQUALIFICATION_GATING_SEVERITIES:
             continue
@@ -1100,8 +1126,31 @@ def _compute_requalification_decision(
     gating_total = len(gating)
     gating_resolved = sum(1 for g in gating if g["state"] in _RESOLVED_LEDGER_STATES)
     all_resolved = gating_resolved == gating_total
+    projected_ready = bool(projection["projected_promotion_ready"])
 
-    if truncated and all_resolved:
+    if truncated and not all_resolved:
+        ready = False
+        reason = (
+            "carried audit findings were truncated at the cap — readiness cannot "
+            f"be asserted on a partial list ({gating_resolved}/{gating_total} "
+            "visible gating findings resolved)"
+        )
+    elif not all_resolved:
+        ready = False
+        reason = (
+            f"{gating_total - gating_resolved} of {gating_total} carried "
+            "high/medium audit finding(s) still unresolved"
+        )
+    elif not projected_ready:
+        ready = False
+        reason = (
+            f"all {gating_total} carried high/medium finding(s) are resolved or "
+            f"code-verified stale, but projected audit is "
+            f"{projected_audit:.4f} vs required {projection['required_audit_score']:.4f}; "
+            f"projected confidence is {projection['projected_confidence']:.4f} "
+            f"vs threshold {projection['promotion_confidence_threshold']:.4f}"
+        )
+    elif truncated:
         # All visible gating findings resolved. Even though the carried list was
         # clipped at the cap, allow re-qualification — the next run re-scores the
         # full finding set. Blocking forever on truncated-but-resolved findings
@@ -1111,14 +1160,6 @@ def _compute_requalification_decision(
             f"all {gating_total} visible high/medium finding(s) resolved or "
             "code-verified stale; note: carried list was truncated at the cap — "
             "re-qualification will re-score the full finding set"
-        )
-    elif truncated:
-        # Truncated with unresolved visible gating findings.
-        ready = False
-        reason = (
-            "carried audit findings were truncated at the cap — readiness cannot "
-            f"be asserted on a partial list ({gating_resolved}/{gating_total} "
-            "visible gating findings resolved)"
         )
     elif gating_total == 0:
         ready = True
@@ -1142,6 +1183,19 @@ def _compute_requalification_decision(
         "audit_findings_truncated": truncated,
         "gating_total": gating_total,
         "gating_resolved": gating_resolved,
+        "finding_total": len(valid_findings),
+        "resolved_finding_total": sum(
+            1
+            for finding in valid_findings
+            if str(finding.get("key") or _KEYLESS_FINDING_SENTINEL) in resolved_keys
+        ),
+        "projected_audit_score": projected_audit,
+        "required_audit_score": projection["required_audit_score"],
+        "projected_confidence": projection["projected_confidence"],
+        "promotion_confidence_threshold": projection[
+            "promotion_confidence_threshold"
+        ],
+        "projected_promotion_ready": projected_ready,
         "reason": reason,
         "findings": gating,
     }
@@ -1159,17 +1213,17 @@ async def compute_requalification_readiness(
     medium — low/info are advisory and ignored), and joins each against the
     resolution ledger by ``finding_key`` scoped to that ``release_version``.
 
-    ``requalification_ready`` is TRUE exactly when every gating carried finding
-    has a ledger row in state ``resolved`` OR ``stale``.  Convention for the
-    zero-gating-findings case: ready=True (nothing carried blocks re-qualification).
+    ``requalification_ready`` is TRUE when every gating carried finding has a
+    ledger row in state ``resolved`` OR ``stale`` and the full-list projected
+    confidence reaches the live promotion threshold. Convention for the
+    zero-gating-findings case: the score still decides readiness.
 
     Truncation-safe: if the carried list was clipped at the cap
     (``audit_findings_truncated``) and any VISIBLE gating finding is unresolved,
-    readiness is NOT claimed on the partial list.  If every visible gating
-    finding is resolved, readiness IS claimed despite truncation (with a
-    re-score caveat in the reason) — the next qualification run re-scores the
-    full finding set, and blocking forever on a truncated-but-fully-resolved
-    list would permanently wedge the auto-redrive.
+    readiness is NOT claimed on the partial list. If every visible gating finding
+    is resolved and the visible projection reaches the threshold, readiness IS
+    claimed despite truncation (with a re-score caveat in the reason) — the next
+    qualification run re-scores the full finding set.
     ``audit_findings_truncated`` is always surfaced so consumers can treat
     readiness conservatively.
 
@@ -1180,6 +1234,12 @@ async def compute_requalification_readiness(
           "audit_findings_truncated": bool,
           "gating_total": int,
           "gating_resolved": int,
+          "finding_total": int,
+          "resolved_finding_total": int,
+          "projected_audit_score": float,
+          "required_audit_score": float,
+          "projected_confidence": float,
+          "promotion_confidence_threshold": float,
           "reason": str,
           "findings": [
             {"key", "severity", "summary", "state": resolved|stale|unresolved}, ...
@@ -1196,6 +1256,13 @@ async def compute_requalification_readiness(
             "audit_findings_truncated": False,
             "gating_total": 0,
             "gating_resolved": 0,
+            "finding_total": 0,
+            "resolved_finding_total": 0,
+            "projected_audit_score": None,
+            "required_audit_score": None,
+            "projected_confidence": None,
+            "promotion_confidence_threshold": None,
+            "projected_promotion_ready": False,
             "reason": "no open release version — nothing to re-qualify",
             "findings": [],
         }
@@ -1212,6 +1279,13 @@ async def compute_requalification_readiness(
             "audit_findings_truncated": False,
             "gating_total": 0,
             "gating_resolved": 0,
+            "finding_total": 0,
+            "resolved_finding_total": 0,
+            "projected_audit_score": None,
+            "required_audit_score": None,
+            "projected_confidence": None,
+            "promotion_confidence_threshold": None,
+            "projected_promotion_ready": False,
             "reason": (
                 "promotion-CI remediation in flight — a fix for the last "
                 "promotion attempt's CI failures is being applied to the "
@@ -1238,8 +1312,19 @@ async def compute_requalification_readiness(
     )
     ledger_states: dict[str, str] = {row.finding_key: row.state for row in ledger_rows}
 
+    # Resolve the same live rubric used by qualification so the readiness report
+    # cannot drift when an operator changes the promotion threshold or weights.
+    from app.release_qualifier import _load_policy
+
+    project = await session.get(Project, project_id)
+    policy = _load_policy(project)
+
     result = _compute_requalification_decision(
-        carried, truncated, ledger_states, str(version.id)
+        carried,
+        truncated,
+        ledger_states,
+        str(version.id),
+        policy=policy,
     )
     result["qualification_provenance"] = provenance
     return result

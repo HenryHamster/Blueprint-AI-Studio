@@ -1695,6 +1695,13 @@ async def agent_fetch_qualification(
         "requalification_readiness_reason": None,
         "gating_total": None,
         "gating_resolved": None,
+        "finding_total": None,
+        "resolved_finding_total": None,
+        "projected_audit_score": None,
+        "required_audit_score": None,
+        "projected_confidence": None,
+        "promotion_confidence_threshold": None,
+        "projected_promotion_ready": None,
         "promotion_ci_green_gate": None,
     }
     try:
@@ -1714,6 +1721,15 @@ async def agent_fetch_qualification(
             "requalification_readiness_reason": readiness["reason"],
             "gating_total": readiness["gating_total"],
             "gating_resolved": readiness["gating_resolved"],
+            "finding_total": readiness["finding_total"],
+            "resolved_finding_total": readiness["resolved_finding_total"],
+            "projected_audit_score": readiness["projected_audit_score"],
+            "required_audit_score": readiness["required_audit_score"],
+            "projected_confidence": readiness["projected_confidence"],
+            "promotion_confidence_threshold": readiness[
+                "promotion_confidence_threshold"
+            ],
+            "projected_promotion_ready": readiness["projected_promotion_ready"],
             # Populated by the CI-green-gate block below; keep the key present so
             # the response shape is stable whether or not that compute succeeds.
             "promotion_ci_green_gate": None,

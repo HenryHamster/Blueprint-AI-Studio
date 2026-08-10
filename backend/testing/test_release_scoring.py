@@ -20,6 +20,7 @@ harness without Postgres.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -735,6 +736,42 @@ class TestScoreAuditFailClosed:
         report = {"findings": [{"severity": "low", "summary": "nit", "file": ""}]}
         audit, _erosion = rs._score_audit(report)
         assert audit == round(1.0 - 0.02, 4)
+
+
+class TestPromotionProjection:
+    """The readiness projection must use the same full-list audit arithmetic."""
+
+    _PROJECTION_POLICY: ClassVar[dict] = {
+        "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
+        "threshold": 0.81,
+    }
+
+    @staticmethod
+    def _finding(severity: str) -> dict:
+        finding = {"severity": severity, "summary": f"{severity} finding"}
+        if severity in {"high", "medium"}:
+            finding["verification_note"] = _VNOTE
+        return finding
+
+    def test_v32_full_finding_list_projects_to_045_and_06514(self):
+        findings = [self._finding("high")]
+        findings += [self._finding("medium") for _ in range(4)]
+        findings += [self._finding("low") for _ in range(6)]
+
+        audit = rs.project_audit_score(findings)
+        projection = rs.project_promotion_confidence(audit, self._PROJECTION_POLICY)
+
+        assert audit == pytest.approx(0.45)
+        assert projection["projected_confidence"] == pytest.approx(0.6514)
+        assert projection["required_audit_score"] == pytest.approx(0.7421)
+
+    def test_v29_three_low_findings_projects_to_094_and_09174(self):
+        audit = rs.project_audit_score([self._finding("low") for _ in range(3)])
+        projection = rs.project_promotion_confidence(audit, self._PROJECTION_POLICY)
+
+        assert audit == pytest.approx(0.94)
+        assert projection["projected_confidence"] == pytest.approx(0.9174)
+        assert projection["promotion_confidence_threshold"] == pytest.approx(0.81)
 
 
 # ---------------------------------------------------------------------------

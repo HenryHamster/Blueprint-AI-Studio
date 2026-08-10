@@ -263,9 +263,62 @@ class TestComputeRequalificationDecision:
             "gating_resolved",
             "reason",
             "findings",
+            "projected_audit_score",
+            "required_audit_score",
+            "projected_confidence",
+            "promotion_confidence_threshold",
         ):
             assert key in result, f"missing key: {key}"
         assert result["open_version_id"] == "test-version-id"
+
+    def test_full_list_projection_can_hold_after_all_gating_findings_resolve(self):
+        """Resolved high/medium/critical findings do not erase unresolved lows.
+
+        This is the readiness inversion: the gating subset is fully resolved, but
+        thirteen remaining low findings keep the full-list audit below the
+        required score and therefore must not arm re-qualification.
+        """
+        carried = [
+            self._finding("high-1", "high"),
+            self._finding("medium-1", "medium"),
+            self._finding("critical-1", "critical"),
+            *[self._finding(f"low-{i}", "low") for i in range(13)],
+        ]
+        policy = {
+            "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
+            "threshold": 0.81,
+        }
+        ledger = {
+            "high-1": "resolved",
+            "medium-1": "stale",
+            "critical-1": "resolved",
+        }
+
+        result = _compute_requalification_decision(
+            carried,
+            truncated=False,
+            ledger_states=ledger,
+            open_version_id="vid",
+            policy=policy,
+        )
+
+        assert result["gating_resolved"] == result["gating_total"] == 3
+        assert result["projected_audit_score"] == pytest.approx(0.74)
+        assert result["required_audit_score"] == pytest.approx(0.7421)
+        assert result["projected_confidence"] == pytest.approx(0.8089)
+        assert result["promotion_confidence_threshold"] == pytest.approx(0.81)
+        assert result["requalification_ready"] is False
+
+        ready = _compute_requalification_decision(
+            carried,
+            truncated=False,
+            ledger_states={**ledger, "low-0": "resolved"},
+            open_version_id="vid",
+            policy=policy,
+        )
+        assert ready["projected_audit_score"] == pytest.approx(0.76)
+        assert ready["projected_confidence"] == pytest.approx(0.8197)
+        assert ready["requalification_ready"] is True
 
 
 async def _make_project_and_version(db_session, *, phase: str = "stabilize"):

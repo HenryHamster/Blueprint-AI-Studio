@@ -443,6 +443,13 @@ def _compact_finding_resolution(value: Any, *, text_cap: int) -> dict | None:
         "gating_total",
         "gating_resolved",
         "audit_findings_truncated",
+        "finding_total",
+        "resolved_finding_total",
+        "projected_audit_score",
+        "required_audit_score",
+        "projected_confidence",
+        "promotion_confidence_threshold",
+        "projected_promotion_ready",
     ):
         if value.get(key) is not None:
             out[key] = value.get(key)

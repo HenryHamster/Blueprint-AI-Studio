@@ -1630,6 +1630,13 @@ async def test_agent_fetch_qualification_returns_latest_verdict_findings(
     # carry no resolution-ledger rows, so the gating (HIGH+MEDIUM) findings read as
     # unresolved and the trigger is not met.
     assert body["requalification_ready"] is False
+    assert body["finding_total"] == 2
+    assert body["resolved_finding_total"] == 0
+    assert body["projected_audit_score"] == pytest.approx(1.0)
+    assert body["projected_confidence"] == pytest.approx(0.95)
+    assert body["projected_promotion_ready"] is True
+    assert body["projected_confidence"] >= body["promotion_confidence_threshold"]
+    assert body["required_audit_score"] == pytest.approx(0.9079)
     assert "finding_resolution" in body
     states = {f["state"] for f in body["finding_resolution"]}
     assert states == {"unresolved"}
@@ -1834,6 +1841,9 @@ async def test_agent_fetch_qualification_surfaces_finding_resolution_states(
     assert res2.status_code == 200, res2.text
     body2 = res2.json()
     assert body2["requalification_ready"] is True
+    assert body2["resolved_finding_total"] == 2
+    assert body2["projected_audit_score"] == pytest.approx(1.0)
+    assert body2["projected_confidence"] >= body2["promotion_confidence_threshold"]
     states2 = {f["key"]: f["state"] for f in body2["finding_resolution"]}
     assert states2[high["key"]] == "resolved"
     assert states2[medium["key"]] == "stale"

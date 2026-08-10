@@ -132,6 +132,59 @@ def promotion_threshold_for_policy(policy: dict[str, Any]) -> float:
     return float(policy.get("threshold", PROMOTION_CONFIDENCE_THRESHOLD))
 
 
+def _active_quality_weights(policy: dict[str, Any]) -> tuple[float, float]:
+    """Return the normalized audit and test-erosion weights used by the gate."""
+    weights = policy.get("weights") or _DEFAULT_POLICY["weights"]
+    from decimal import Decimal
+
+    active_audit = Decimal(str(float(weights.get("audit", _DEFAULT_POLICY["weights"]["audit"]))))
+    active_test = Decimal(
+        str(float(weights.get("test_erosion", _DEFAULT_POLICY["weights"]["test_erosion"])))
+    )
+    active_sum = active_audit + active_test
+    if active_sum <= 0:
+        return (
+            _DEFAULT_POLICY["weights"]["audit"],
+            _DEFAULT_POLICY["weights"]["test_erosion"],
+        )
+    return float(active_audit / active_sum), float(active_test / active_sum)
+
+
+def project_promotion_confidence(
+    audit_score: float,
+    policy: dict[str, Any] | None = None,
+    *,
+    test_erosion: float = 1.0,
+    judged_tier_met_fraction: float = 1.0,
+) -> dict[str, float | bool]:
+    """Project the promotion score after audit findings are resolved.
+
+    Re-qualification readiness has no new test-erosion or category-grade result
+    yet, so this is the best-case projection for those dimensions while retaining
+    the all-judged tier penalty used by the scored candidate.  All weights and the
+    promotion bar come from the same policy helpers as ``compute_composite``.
+    """
+    resolved_policy = policy or _DEFAULT_POLICY
+    w_audit, w_test = _active_quality_weights(resolved_policy)
+    threshold = promotion_threshold_for_policy(resolved_policy)
+    audit = _clamp01(audit_score)
+    erosion = _clamp01(test_erosion)
+    judged_fraction = _clamp01(judged_tier_met_fraction)
+    penalty_factor = 1.0 - JUDGED_TIER_PENALTY_WEIGHT * judged_fraction
+    confidence = _clamp01((w_audit * audit + w_test * erosion) * penalty_factor)
+    required_audit = (
+        (threshold / penalty_factor - w_test * erosion) / w_audit
+        if w_audit > 0.0
+        else float("inf")
+    )
+    return {
+        "projected_confidence": round(confidence, 4),
+        "promotion_confidence_threshold": round(threshold, 4),
+        "required_audit_score": round(required_audit, 4),
+        "projected_promotion_ready": confidence >= threshold,
+    }
+
+
 # Default coverage threshold used ONLY when the merge-grade artifact omits an
 # explicit ``covers_goal`` boolean but does report a numeric ``coverage_score``.
 # The agent's explicit boolean is authoritative when present.
@@ -994,25 +1047,10 @@ def compute_composite(
     ``blocker`` remains the first failing gate, while a hard-blocked
     ``confidence`` remains exactly ``0.0``.
     """
-    weights = policy.get("weights") or _DEFAULT_POLICY["weights"]
     threshold = promotion_threshold_for_policy(policy)
     # Qualifier VM smoke is retired. Accept legacy three-key policies, ignore
     # their smoke weight, and renormalize the two active deterministic signals.
-    w_audit = float(weights.get("audit", _DEFAULT_POLICY["weights"]["audit"]))
-    w_test = float(
-        weights.get("test_erosion", _DEFAULT_POLICY["weights"]["test_erosion"])
-    )
-    from decimal import Decimal
-
-    active_audit = Decimal(str(w_audit))
-    active_test = Decimal(str(w_test))
-    active_sum = active_audit + active_test
-    if active_sum <= 0:
-        w_audit = _DEFAULT_POLICY["weights"]["audit"]
-        w_test = _DEFAULT_POLICY["weights"]["test_erosion"]
-    else:
-        w_audit = float(active_audit / active_sum)
-        w_test = float(active_test / active_sum)
+    w_audit, w_test = _active_quality_weights(policy)
 
     # Hard blockers — checked before any weighting. ``None`` is the sentinel
     # for "this active dimension hit an irrecoverable blocker"; the caller
@@ -1564,6 +1602,39 @@ def _finding_matches_candidate_surface(
     return candidate_blob == blob_sha.strip()
 
 
+def project_audit_score(
+    findings: list[dict[str, Any]] | None,
+    *,
+    resolved_finding_keys: set[str] | frozenset[str] = frozenset(),
+    candidate_surface_paths: dict[str, str] | None = None,
+) -> float:
+    """Score the complete finding list after applying durable resolutions.
+
+    This is the shared findings-derived arithmetic used by the audit scorer and
+    the re-qualification readiness projection.  Resolution state removes a
+    finding's deduction; low/info findings remain in the calculation, so a
+    gating-only view can never overstate readiness.
+    """
+    derived = 1.0
+    if not isinstance(findings, list):
+        return derived
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        finding_key = str(finding.get("key") or "__keyless__")
+        if finding_key in resolved_finding_keys:
+            continue
+        if not _finding_matches_candidate_surface(finding, candidate_surface_paths):
+            continue
+        severity = str(finding.get("severity") or finding.get("level") or "").lower()
+        if not severity or not _finding_is_verified(finding, severity):
+            continue
+        if _finding_subject_is_authorized_divergence(finding):
+            continue
+        derived -= _AUDIT_DEDUCTIONS.get(severity, _AUDIT_DEDUCTION_UNKNOWN)
+    return _clamp01(derived)
+
+
 def _score_audit(
     report: dict[str, Any] | None,
     *,
@@ -1598,21 +1669,10 @@ def _score_audit(
     findings = report.get("findings")
     if not isinstance(findings, list):
         findings = report.get("issues")
-    derived: float = 1.0
-    if isinstance(findings, list):
-        for f in findings:
-            if isinstance(f, dict):
-                if not _finding_matches_candidate_surface(f, candidate_surface_paths):
-                    continue
-                sev = str(f.get("severity") or f.get("level") or "").lower()
-                if not sev or not _finding_is_verified(f, sev):
-                    continue
-                if _finding_subject_is_authorized_divergence(f):
-                    # Owned by the deterministic migration-identity gate — do
-                    # not double-count it as an audit deduction.
-                    continue
-                derived -= _AUDIT_DEDUCTIONS.get(sev, _AUDIT_DEDUCTION_UNKNOWN)
-    derived = _clamp01(derived)
+    derived = project_audit_score(
+        findings,
+        candidate_surface_paths=candidate_surface_paths,
+    )
     missing_reason = _audit_missing_reason(report)
     audit_score: float | None = derived
     if missing_reason in (

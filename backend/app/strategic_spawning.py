@@ -7465,6 +7465,13 @@ async def _spawn_strategic_review(
                         "gating_total",
                         "gating_resolved",
                         "audit_findings_truncated",
+                        "finding_total",
+                        "resolved_finding_total",
+                        "projected_audit_score",
+                        "required_audit_score",
+                        "projected_confidence",
+                        "promotion_confidence_threshold",
+                        "projected_promotion_ready",
                         "reason",
                     )
                     if _readiness.get(key) is not None
@@ -7504,7 +7511,10 @@ async def _spawn_strategic_review(
                         f"high/medium finding is resolved-or-stale "
                         f"({_readiness.get('gating_resolved', 0)}/"
                         f"{_readiness.get('gating_total', 0)}), so the pre-registered "
-                        f"re-qualification trigger is MET. PREFER emitting a fresh "
+                        f"re-qualification trigger is MET and the projected confidence "
+                        f"({_readiness.get('projected_confidence', 0):.4f}) reaches its "
+                        f"threshold ({_readiness.get('promotion_confidence_threshold', 0):.4f}). "
+                        f"PREFER emitting a fresh "
                         f"qualify_request to re-qualify the current HEAD; a new audit "
                         f"against the current snapshot will confirm the findings are "
                         f"cleared. Prior list (against {_cand_short}) in "
@@ -7518,8 +7528,10 @@ async def _spawn_strategic_review(
                     _stabilize_hint += _stale_preamble + (
                         f" The finding-resolution ledger shows {_outstanding} of "
                         f"{_gating_total} gating high/medium finding(s) still "
-                        f"UNRESOLVED, so the re-qualification trigger is NOT met. Do "
-                        f"NOT emit a blanket qualify_request yet — it would just "
+                        f"UNRESOLVED, or the full-list projected confidence is below "
+                        f"the required audit score ({_readiness.get('projected_audit_score', 0):.4f} "
+                        f"vs {_readiness.get('required_audit_score', 0):.4f}), so the "
+                        f"re-qualification trigger is NOT met. Do NOT emit a blanket qualify_request yet — it would just "
                         f"re-flag the unresolved finding(s). Instead, prioritize the "
                         f"outstanding fix-first work: scope audit/fundamentals-mode "
                         f"remediation at the unresolved finding(s) and record each as "
