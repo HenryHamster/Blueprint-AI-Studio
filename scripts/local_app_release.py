@@ -31,6 +31,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import frontend_release_manifest as frontend_manifest
+from release_preconditions import RehearsalReport, verify_privilege_boundary
 
 _IMAGE_PREFIX = (
     "us-central1-docker.pkg.dev/blueprint-orchestrator/blueprint-repo/"
@@ -1253,6 +1254,67 @@ def _preflight_local_migration_inputs(image_ref: str) -> None:
     )
 
 
+def _run_pre_stop_rehearsal(
+    image_id: str,
+    image_ref: str,
+    revision: str,
+    install_user: str,
+    target_schema_revision: str,
+    database_schema_before: str,
+) -> RehearsalReport:
+    """Prove all deterministic release preconditions before stopping units."""
+    verify_privilege_boundary(
+        install_user,
+        agent_unit="blueprint-deploy-agent.service",
+        release_unit="blueprint-release.service",
+        run=_run,
+    )
+    _preflight_local_migration_inputs(image_ref)
+    target_refusal = _target_schema_refusal(
+        image_id, target_schema_revision, database_schema_before
+    )
+    if target_refusal is not None:
+        raise RuntimeError(target_refusal)
+    return RehearsalReport(
+        candidate=image_ref,
+        revision=revision,
+        checked=(
+            "live systemd privilege boundary",
+            "worker secret and static migration inputs",
+            "candidate migration reachability from live schema",
+        ),
+        deferred=(
+            "migration apply and post-migration schema verification (mutates live DB)",
+            "unit stop/start and application health verification (requires downtime)",
+        ),
+    )
+
+
+def rehearse(image_ref: str, revision: str) -> RehearsalReport:
+    """Validate a locally available candidate without pulling, stopping, or writing."""
+    if not _is_root():
+        raise PermissionError("local app rehearsal must run as root")
+    if not _IMAGE_REF_RE.fullmatch(image_ref):
+        raise ValueError("image-ref must be the approved Artifact Registry digest")
+    if not _REVISION_RE.fullmatch(revision):
+        raise ValueError("expected-revision must be a full lowercase git SHA")
+    install_user = os.environ.get("SUDO_USER", "")
+    if not _SYSTEM_USER_RE.fullmatch(install_user) or install_user == "root":
+        raise ValueError("SUDO_USER must identify the non-root service account")
+    bundle_sha256 = _verify_frontend(image_ref, revision)
+    image_id = _inspect_candidate(image_ref, revision, bundle_sha256)
+    target_schema_revision = _image_schema_revision(image_id)
+    database_schema_before = _database_schema_revision()
+    return _run_pre_stop_rehearsal(
+        image_id,
+        image_ref,
+        revision,
+        install_user,
+        target_schema_revision,
+        database_schema_before,
+    )
+
+
 def _schema_mismatch_refusal(
     image_id: str,
     image_label: str,
@@ -1481,14 +1543,26 @@ def release(image_ref: str, revision: str) -> Path:
             "untouched_unit_markers_match": markers_match,
         }
 
-    target_refusal = _target_schema_refusal(
-        image_id, target_schema_revision, database_schema_before
-    )
-    if target_refusal is not None:
+    try:
+        _run_pre_stop_rehearsal(
+            image_id,
+            image_ref,
+            revision,
+            install_user,
+            target_schema_revision,
+            database_schema_before,
+        )
+    except Exception as precondition_error:
+        target_refusal = str(precondition_error)
+        outcome = (
+            "rollback_refused"
+            if "release refused before stopping" in target_refusal
+            else "precondition_failed"
+        )
         try:
             evidence = _write_evidence(
                 _EVIDENCE_ROOT,
-                receipt("rollback_refused", target_refusal, False),
+                receipt(outcome, target_refusal, False),
             )
         except Exception as evidence_exc:
             raise RuntimeError(
@@ -1500,10 +1574,6 @@ def release(image_ref: str, revision: str) -> Path:
     migration_choreography_started = False
     try:
         if migration_required:
-            # Fail deterministic, static-input defects (e.g. a malformed worker
-            # secrets file) BEFORE bounded downtime begins, so the control plane
-            # is never stopped for an error that a preflight can catch.
-            _preflight_local_migration_inputs(image_ref)
             # A schema-changing deploy cannot hot-swap: the old image rejects
             # the advanced DB and the candidate rejects the old DB.  Stop both
             # Restart=always units first, wait for each managed container to be
@@ -1696,8 +1766,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-revision", required=True)
+    parser.add_argument(
+        "--rehearse",
+        action="store_true",
+        help="validate candidate preconditions without stopping or changing units",
+    )
     args = parser.parse_args()
     try:
+        if args.rehearse:
+            report = rehearse(args.image, args.expected_revision)
+            print(
+                "LOCAL_APP_RELEASE_REHEARSAL "
+                + json.dumps(report.as_dict(), sort_keys=True)
+            )
+            return 0
         evidence = _locked_release(args.image, args.expected_revision)
     except (OSError, ValueError, RuntimeError, PermissionError) as exc:
         print(f"ERROR: {exc}", file=os.sys.stderr)

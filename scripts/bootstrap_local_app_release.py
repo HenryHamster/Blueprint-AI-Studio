@@ -10,6 +10,7 @@ agent's sandbox.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -21,6 +22,7 @@ from pathlib import Path
 _SOURCE_NAMES = (
     "frontend_release_manifest.py",
     "local_app_release.py",
+    "release_preconditions.py",
     "local_api_service.py",
     "local_worker_service.py",
     "blueprint.py",
@@ -69,15 +71,9 @@ def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def _parse_systemctl_properties(payload: str, expected: set[str]) -> dict[str, str]:
-    properties: dict[str, str] = {}
-    for line in payload.splitlines():
-        key, separator, value = line.partition("=")
-        if not separator or key not in expected or key in properties:
-            raise RuntimeError("invalid systemctl property output")
-        properties[key] = value
-    if set(properties) != expected:
-        raise RuntimeError("incomplete systemctl property output")
-    return properties
+    from release_preconditions import parse_systemctl_properties
+
+    return parse_systemctl_properties(payload, expected)
 
 
 def _trusted_file(path: Path) -> bytes:
@@ -321,29 +317,14 @@ def _verify_release_execution_boundary(install_user: str) -> None:
     observe. The root release executor keeps ``NoNewPrivileges=no`` so it can
     cross the privilege boundary.
     """
-    expected = {"User", "NoNewPrivileges"}
-    agent = _parse_systemctl_properties(
-        _run([
-            "/usr/bin/systemctl",
-            "show",
-            _DEPLOY_AGENT_UNIT.name,
-            *(f"--property={name}" for name in sorted(expected)),
-        ]).stdout,
-        expected,
+    from release_preconditions import verify_privilege_boundary
+
+    verify_privilege_boundary(
+        install_user,
+        agent_unit=_DEPLOY_AGENT_UNIT.name,
+        release_unit=_RELEASE_SERVICE.name,
+        run=_run,
     )
-    release = _parse_systemctl_properties(
-        _run([
-            "/usr/bin/systemctl",
-            "show",
-            _RELEASE_SERVICE.name,
-            *(f"--property={name}" for name in sorted(expected)),
-        ]).stdout,
-        expected,
-    )
-    if agent != {"User": install_user, "NoNewPrivileges": "yes"}:
-        raise RuntimeError("deploy agent effective hardening is incomplete")
-    if release != {"User": "root", "NoNewPrivileges": "no"}:
-        raise RuntimeError("release executor is still subject to no-new-privileges")
 
 
 def _install_deploy_agent(
@@ -729,13 +710,35 @@ def bootstrap(revision: str) -> Path:
     return bundle
 
 
+def rehearse(image_ref: str, revision: str):
+    """Run the candidate rehearsal without installing or stopping anything."""
+    import local_app_release
+
+    return local_app_release.rehearse(image_ref, revision)
+
+
 def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--revision", required=True)
+    parser.add_argument("--image")
+    parser.add_argument(
+        "--rehearse",
+        action="store_true",
+        help="check candidate preconditions without changing units or files",
+    )
     args = parser.parse_args()
     try:
+        if args.rehearse:
+            if not args.image:
+                parser.error("--rehearse requires --image")
+            report = rehearse(args.image, args.revision)
+            print(
+                "LOCAL_APP_RELEASE_REHEARSAL "
+                + json.dumps(report.as_dict(), sort_keys=True)
+            )
+            return 0
         bundle = bootstrap(args.revision)
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

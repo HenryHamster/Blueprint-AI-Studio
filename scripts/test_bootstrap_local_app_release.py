@@ -484,6 +484,16 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         ):
             bootstrap._verify_release_execution_boundary("henry_hamster")
 
+    def test_rehearse_delegates_to_candidate_release_tool(self):
+        sentinel = object()
+        with unittest.mock.patch(
+            "local_app_release.rehearse", return_value=sentinel
+        ) as rehearse:
+            self.assertIs(
+                bootstrap.rehearse("image@digest", "a" * 40), sentinel
+            )
+        rehearse.assert_called_once_with("image@digest", "a" * 40)
+
     def test_approved_activation_rehearses_root_handoff_and_receipt(self):
         deploy_blueprint = blueprint
         revision = "a" * 40

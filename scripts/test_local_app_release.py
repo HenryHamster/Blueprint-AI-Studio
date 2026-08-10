@@ -61,7 +61,6 @@ class LocalAppReleaseTests(unittest.TestCase):
                     "RW": False,
                 }
             ],
-            "State": {"Running": True},
         }
 
     @staticmethod
@@ -797,6 +796,7 @@ class LocalAppReleaseTests(unittest.TestCase):
                 ),
             }
             stack.enter_context(patch.object(release, "_is_root", return_value=True))
+            stack.enter_context(patch.object(release, "verify_privilege_boundary"))
             stack.enter_context(
                 patch.dict(os.environ, {"SUDO_USER": "henry_hamster"}, clear=True)
             )
@@ -1062,6 +1062,59 @@ class LocalAppReleaseTests(unittest.TestCase):
         migrate.assert_not_called()
         mocks["atomic"].assert_not_called()
         mocks["restart"].assert_not_called()
+
+    def test_pre_stop_rehearsal_reports_checked_and_deferred_preconditions(self):
+        with (
+            patch.object(release, "verify_privilege_boundary") as boundary,
+            patch.object(release, "_preflight_local_migration_inputs") as inputs,
+            patch.object(release, "_target_schema_refusal", return_value=None),
+        ):
+            report = release._run_pre_stop_rehearsal(
+                NEW_IMAGE,
+                IMAGE_REF,
+                REVISION,
+                "henry_hamster",
+                "0743",
+                "0742",
+            )
+
+        boundary.assert_called_once_with(
+            "henry_hamster",
+            agent_unit="blueprint-deploy-agent.service",
+            release_unit="blueprint-release.service",
+            run=release._run,
+        )
+        inputs.assert_called_once_with(IMAGE_REF)
+        self.assertFalse(report.units_stopped)
+        self.assertIn("worker secret", report.checked[1])
+        self.assertIn("migration apply", report.deferred[0])
+        self.assertEqual(report.as_dict()["units_stopped"], False)
+
+    def test_rehearse_discovers_candidate_without_registry_pull(self):
+        with (
+            patch.object(release, "_is_root", return_value=True),
+            patch.dict(os.environ, {"SUDO_USER": "henry_hamster"}, clear=True),
+            patch.object(release, "_verify_frontend", return_value="e" * 64),
+            patch.object(release, "_inspect_candidate", return_value=NEW_IMAGE),
+            patch.object(release, "_image_schema_revision", return_value="0742"),
+            patch.object(release, "_database_schema_revision", return_value="0742"),
+            patch.object(
+                release,
+                "_run_pre_stop_rehearsal",
+                return_value=release.RehearsalReport(
+                    IMAGE_REF,
+                    REVISION,
+                    ("candidate",),
+                    ("downtime",),
+                ),
+            ) as rehearsal,
+        ):
+            report = release.rehearse(IMAGE_REF, REVISION)
+
+        self.assertEqual(report.candidate, IMAGE_REF)
+        rehearsal.assert_called_once_with(
+            NEW_IMAGE, IMAGE_REF, REVISION, "henry_hamster", "0742", "0742"
+        )
 
     def test_worker_activation_failure_rolls_back_only_touched_worker(self):
         def restart(unit: str, image: str, **_kwargs) -> None:
