@@ -234,6 +234,28 @@ def test_blocked_verdict_reports_all_gates_and_confidence_ceiling():
     assert result["confidence_ceiling"] < _POLICY["threshold"]
 
 
+def test_attempt_five_reports_required_audit_score_from_scoring_math():
+    """The 0.38 / 7-of-9 shape names the audit score needed to clear 0.81."""
+    policy = {**_POLICY, "threshold": 0.81}
+    categories = [_cat(f"c-{index}", "met") for index in range(7)] + [
+        _cat("c-7", "not_met"),
+        _cat("c-8", "not_met"),
+    ]
+    result = rs.compute_composite(
+        **_perfect_kwargs(
+            audit_score=0.38,
+            category_verdicts=categories,
+            policy=policy,
+        )
+    )
+
+    assert "criterion_coverage_incomplete" in result["failing_gates"]
+    assert result["confidence_ceiling"] == pytest.approx(0.6134)
+    assert result["confidence_ceiling"] < policy["threshold"]
+    assert result["required_sub_scores"] == {"audit": pytest.approx(0.7421)}
+    assert result["sub_scores"]["required_sub_scores"] == result["required_sub_scores"]
+
+
 def test_walkthrough_failure_is_added_to_persisted_gate_diagnostics():
     from app.release_qualifier import _apply_walkthrough_decision
 

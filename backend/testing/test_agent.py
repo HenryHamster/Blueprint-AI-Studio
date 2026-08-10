@@ -651,24 +651,17 @@ async def test_agent_compute_job_launch_reuses_existing_active_job(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("artifact_status", "reason_code", "expected_aggregate", "expected_message"),
+    ("artifact_status", "reason_code"),
     [
-        ("unconfirmed", None, "unconfirmed", "waiting on required artifacts"),
-        (
-            "deploy_failed",
-            "image_not_live",
-            "deploy_failed",
-            "required artifacts failed",
-        ),
+        ("unconfirmed", None),
+        ("deploy_failed", "image_not_live"),
     ],
 )
-async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed(
+async def test_agent_compute_job_live_proof_ignores_optional_agent_image(
     client: AsyncClient,
     db_session,
     artifact_status,
     reason_code,
-    expected_aggregate,
-    expected_message,
 ):
     project = Project(name="Agent Compute Live Proof Gate", user_id="test-user-123")
     db_session.add(project)
@@ -723,17 +716,11 @@ async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed
         },
     )
 
-    assert resp.status_code == 412
-    detail = resp.json()["error"]["message"]
-    assert detail["error"] == "live_release_precondition_failed"
-    assert detail["reason"] == "release_not_serving_confirmed"
-    assert expected_message in detail["message"]
-    assert "agent_image" in detail["message"]
-    evidence = detail["live_release_evidence"]
-    assert evidence["release_version_number"] == 3
-    assert evidence["aggregate_serving_status"] == expected_aggregate
+    # agent_image remains observable, but #17189 deliberately removed it from
+    # the required serving aggregate so worker-fleet freshness cannot gate jobs.
+    assert resp.status_code == 200
     jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
-    assert jobs == []
+    assert len(jobs) == 1
 
 
 @pytest.mark.asyncio

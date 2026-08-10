@@ -1216,17 +1216,39 @@ def compute_composite(
         )
     else:
         confidence_ceiling = existing_confidence
+    category_penalty_factor = 1.0
     if category_verdicts:
         _met = [v for v in category_verdicts if (v or {}).get("status") == "met"]
         if _met:
             _judged = sum(
                 1 for v in _met if (v or {}).get("tier", "judged") != "machine"
             )
-            confidence_ceiling *= 1.0 - JUDGED_TIER_PENALTY_WEIGHT * (
+            category_penalty_factor = 1.0 - JUDGED_TIER_PENALTY_WEIGHT * (
                 _judged / len(_met)
             )
+            confidence_ceiling *= category_penalty_factor
     confidence_ceiling = round(_clamp01(confidence_ceiling), 4)
     sub_scores["confidence_ceiling"] = confidence_ceiling
+
+    # Solve the active scoring equation here, beside its canonical weights, so
+    # reports can name the actionable term instead of inferring it from the
+    # primary blocker. Only feasible, currently unmet requirements are emitted;
+    # a term needing more than 1.0 is not independently actionable.
+    required_sub_scores: dict[str, float] = {}
+    if confidence_ceiling < threshold:
+        target = threshold / category_penalty_factor
+        if w_debt > 0.0 and debt_pressure_score is not None:
+            target = (target - w_debt * sub_scores["debt_pressure"]) / (1.0 - w_debt)
+        if w_audit > 0.0:
+            required_audit = (target - w_test * sub_scores["test_erosion"]) / w_audit
+            if sub_scores["audit"] < required_audit <= 1.0:
+                required_sub_scores["audit"] = round(required_audit, 4)
+        if w_test > 0.0:
+            required_test = (target - w_audit * sub_scores["audit"]) / w_test
+            if sub_scores["test_erosion"] < required_test <= 1.0:
+                required_sub_scores["test_erosion"] = round(required_test, 4)
+    if required_sub_scores:
+        sub_scores["required_sub_scores"] = required_sub_scores
 
     if blocker is not None:
         return {
@@ -1236,6 +1258,7 @@ def compute_composite(
             "blocker": blocker,
             "failing_gates": failing_gates,
             "confidence_ceiling": confidence_ceiling,
+            "required_sub_scores": required_sub_scores,
         }
 
     # Debt-pressure weight (defaults to 0.0 = observe mode: recorded but not
@@ -1274,6 +1297,7 @@ def compute_composite(
         "blocker": None,
         "failing_gates": failing_gates,
         "confidence_ceiling": confidence,
+        "required_sub_scores": required_sub_scores,
     }
 
 

@@ -8704,6 +8704,7 @@ async def _finalize_qualification(
         "sub_scores": extended_sub_scores,
         "failing_gates": composite.get("failing_gates") or [],
         "confidence_ceiling": composite.get("confidence_ceiling"),
+        "required_sub_scores": composite.get("required_sub_scores") or {},
         "stranded_approved_prs": qual.get("stranded_approved_prs"),
         "blocker": composite["blocker"],
         # Execution-site of the responsible check (dir: tag promotion blockers
@@ -9037,6 +9038,7 @@ async def _finalize_qualification(
                 f"{blocker_label}. Failing gates: "
                 f"{', '.join(composite.get('failing_gates') or [])}. "
                 f"Confidence ceiling: {composite.get('confidence_ceiling')}. "
+                f"Required sub-scores: {composite.get('required_sub_scores') or 'none'}. "
                 "Not promoted; staying in stabilize."
             )
         else:
@@ -9045,7 +9047,9 @@ async def _finalize_qualification(
                 f"v{version.version_number} qualified at confidence "
                 f"{composite['confidence']:.2f}, below the "
                 f"{policy.get('threshold')} promotion bar — not promoted, "
-                f"staying in stabilize. Sub-scores: {scores_str}."
+                f"staying in stabilize. Sub-scores: {scores_str}. "
+                f"Confidence ceiling: {composite.get('confidence_ceiling')}; "
+                f"required sub-scores: {composite.get('required_sub_scores') or 'none'}."
             )
         await _notify_operator(
             session,
