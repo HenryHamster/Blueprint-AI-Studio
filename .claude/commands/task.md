@@ -1,52 +1,31 @@
-Create a Blueprint task from the user's request and submit it to the deployed orchestrator.
+Create a Blueprint task from the user's request through the operator CLI.
 
 User request: $ARGUMENTS
 
 ## How to execute
 
-### 1. Determine task type
-Based on the user's request, pick the appropriate type:
-- **create** (default): Write code, open a PR
-- **plan**: Decompose a large task into subtasks
-- **research**: Analyze the codebase and suggest improvements
-- **review**: Review an existing PR (requires pr_number and branch)
-- **fix**: Fix an existing PR from review feedback (requires pr_number and branch)
+1. Choose the server-supported task type. Common choices are `create`, `plan`,
+   `research`, `review`, and `fix`; `review` and `fix` require both a PR number
+   and branch.
+2. Write a short title and a concise outcome-oriented prompt. One task should be
+   one PR-worthy change.
+3. For a code-producing task, declare exactly one acceptance contract:
+   - `--acceptance-test PATH::TEST` when a named test can prove the change;
+   - `--acceptance-behavior "..."` when the proof is an observable behavior;
+   - `--acceptance-evidence-file FILE.json` for advanced evidence kinds.
+4. Supply a stable `--idempotency-key` when retrying the same intended create.
+5. Require an operator-supplied `BLUEPRINT_CONFIG` path and an exact `--project`
+   or `--project-id`. The operator config is distinct from the read-only
+   `BLUEPRINT_AGENT_CONFIG`; do not infer either path or read either file. If the
+   operator config or project selector is unavailable, stop and ask for it.
+6. After authorization, run
+   `BLUEPRINT_CONFIG="/absolute/operator.json" ./blueprint tasks create TITLE PROMPT --project PROJECT ... --yes`
+   on Unix. On Windows, set `$env:BLUEPRINT_CONFIG` to the operator-provided path
+   and run `.\blueprint.ps1 tasks create TITLE PROMPT --project PROJECT ... --yes`.
+7. Report the exact task ID, title, type, prompt, acceptance declaration, and PR
+   metadata when applicable.
 
-### 2. Craft the agent prompt
-The Blueprint agent runs Claude Code with full repo access — it can explore the codebase itself. Keep prompts concise: describe WHAT to achieve and key constraints, not step-by-step implementation details.
-
-A good prompt:
-- Clear objective in 1-2 sentences
-- Key constraints or things to avoid (if any)
-- Scope: one task = one PR-worthy change
-
-Don't over-specify. The agent will figure out implementation details.
-
-### 3. Pick a title
-Short, descriptive, under 60 chars. Use conventional commit style: "feat:", "fix:", "refactor:", "research:", etc.
-
-### 4. Submit
-Use the helper script — it reads auth from `.blueprint-config.json` (never hardcode secrets):
-
-```bash
-cd "D:\Henry\VSCode\Codebase\Blueprint" && python3 scripts/blueprint_api.py create_task "TITLE" "PROMPT" "TASK_TYPE"
-```
-
-Or for more control (e.g., review/fix tasks with pr_number):
-```bash
-cd "D:\Henry\VSCode\Codebase\Blueprint" && python3 << 'PYEOF'
-from scripts.blueprint_api import create_task
-import json
-result = create_task(
-    title="...",
-    prompt="...",
-    task_type="research",  # or create, plan, review, fix
-    # pr_number=15,        # for review/fix tasks
-    # branch="blueprint/task-abc123",  # for review/fix tasks
-)
-print(json.dumps(result, indent=2))
-PYEOF
-```
-
-### 5. Report back
-Show the user: task ID, title, type, and the prompt you submitted. Keep it brief.
+Do not call `scripts/blueprint_api.py`, read `.blueprint-config.json`, embed an
+API key, or use an inline Python/bash heredoc. Task creation is a mutation and
+must use an operator-authorized config; the coding-agent MCP is read-only by
+design. Never use `BLUEPRINT_AGENT_CONFIG` to create a task.

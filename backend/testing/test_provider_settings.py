@@ -620,11 +620,13 @@ async def test_get_settings_publishes_task_capability_contract(client):
     create = contract["create"]
     assert create["label"] == "Create"
     assert create["user_launchable"] is True
+    assert create["requires_acceptance_evidence"] is True
     assert create["reservable"] is True
     assert create["delivers_product"] is True
     # A read-only, non-launchable type is published with the right flags.
     assert contract["security_audit"]["periodic_eligible"] is True
     assert contract["security_audit"]["agent_mode"] == "read_only"
+    assert contract["security_audit"]["requires_acceptance_evidence"] is False
 
 
 async def test_task_capabilities_endpoint_mirrors_settings_contract(client):

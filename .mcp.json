@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "blueprint": {
+      "type": "stdio",
+      "command": "${BLUEPRINT_PYTHON:-python}",
+      "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/scripts/blueprint_mcp.py"
+      ],
+      "env": {
+        "BLUEPRINT_CONFIG": "${BLUEPRINT_AGENT_CONFIG:-__BLUEPRINT_AGENT_CONFIG_NOT_SET__}"
+      }
+    }
+  }
+}

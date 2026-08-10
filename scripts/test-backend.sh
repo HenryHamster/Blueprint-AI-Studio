@@ -562,6 +562,7 @@ if [ "${1:-}" = "--standalone" ]; then
   )
   # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
   [ -f /repo/scripts/test_blueprint_cli.py ] && STANDALONE_ARGS+=(/repo/scripts/test_blueprint_cli.py)
+  [ -f /repo/scripts/test_blueprint_mcp.py ] && STANDALONE_ARGS+=(/repo/scripts/test_blueprint_mcp.py)
   # The runner-isolation suite covers the GPU probe's arch gate, probe/real
   # container-name isolation, and the pre-probe image pull. It lives under
   # scripts/ (which ships standalone to runner hosts), so the `pytest testing/`
@@ -630,7 +631,7 @@ if [ $# -gt 0 ]; then
 fi
 
 echo "=== Standalone tests ==="
-_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_admin_auth_invariant.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py "${STANDALONE_RELEASE_TEST_ARGS[@]}" testing/test_test_durations_freshness.py testing/test_shard_balance.py testing/test_vitest_durations_freshness.py -v --noconftest
+_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_admin_auth_invariant.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py /repo/scripts/test_blueprint_mcp.py "${STANDALONE_RELEASE_TEST_ARGS[@]}" testing/test_test_durations_freshness.py testing/test_shard_balance.py testing/test_vitest_durations_freshness.py -v --noconftest
 
 echo "=== Full test suite ==="
 if [ "${#TESTMON_ARGS[@]}" -gt 0 ]; then
