@@ -233,7 +233,11 @@ def test_docker_junit_attribution_distinguishes_existing_and_new_failures(
             str(repo),
         ],
         cwd=repo,
-        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TASK_ID": "task-introducer-123",
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -243,5 +247,33 @@ def test_docker_junit_attribution_distinguishes_existing_and_new_failures(
     assert (result.returncode != 0) is should_fail, output
     if should_fail:
         assert "newly_introduced" in output
+        assert '"task_id": "task-introducer-123"' in output
     else:
         assert "no new failures vs base" in output
+
+
+def test_new_static_finding_without_task_identity_fails_closed(tmp_path: Path) -> None:
+    """A new finding must not be downgraded to an unknown task owner."""
+    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "new")
+    environment = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    environment.pop("TASK_ID", None)
+    result = subprocess.run(
+        [
+            "python3",
+            "scripts/static_release_guard.py",
+            "--base",
+            "automain",
+            "--repo-root",
+            str(repo),
+        ],
+        cwd=repo,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "TASK_ID is missing" in output
+    assert "newly_introduced" in output

@@ -130,6 +130,26 @@ def _run_size_guard(repo: Path, base_root: Path) -> subprocess.CompletedProcess[
     )
 
 
+def _task_id() -> str:
+    """Return the runner-provided task identity used for guard attribution."""
+    return os.environ.get("TASK_ID", "").strip()
+
+
+def _attributed_findings(
+    findings: dict[str, str], *, task_id: str, source: str
+) -> list[dict[str, str]]:
+    """Attach the current task to findings, refusing an unknown owner."""
+    if findings and not task_id:
+        names = json.dumps(sorted(findings))
+        raise RuntimeError(
+            f"{source} finding(s) cannot be attributed: TASK_ID is missing ({names})"
+        )
+    return [
+        {"task_id": task_id, "test": key, "detail": detail}
+        for key, detail in sorted(findings.items())
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="automain")
@@ -158,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  - {path}")
 
     failures: list[str] = []
+    task_id = _task_id()
     base_ref = _base_ref(repo, args.base)
     assert base_ref is not None
     with tempfile.TemporaryDirectory(prefix="blueprint-static-guard-") as temp_dir:
@@ -172,6 +193,17 @@ def main(argv: list[str] | None = None) -> int:
         size_result = _run_size_guard(repo, base_root)
         if size_result.returncode != 0:
             print("[static guard] module size guard FAILED")
+            try:
+                size_findings = _attributed_findings(
+                    {"<module-size-guard>": size_result.stdout + size_result.stderr},
+                    task_id=task_id,
+                    source="module size guard",
+                )
+            except RuntimeError as exc:
+                print(f"[static guard] ERROR: {exc}", file=sys.stderr)
+                failures.append("module size guard attribution")
+            else:
+                print(f"[static guard] findings: {json.dumps(size_findings)}")
             print(size_result.stdout, end="")
             print(size_result.stderr, end="", file=sys.stderr)
             failures.append("module size guard")
@@ -224,8 +256,16 @@ def main(argv: list[str] | None = None) -> int:
                 # real failure, and must not be converted into a green result.
                 new_failures = {"<harness>": current_result.stderr or current_result.stdout}
             if new_failures:
-                print("[static guard] standalone static corpus FAILED for this diff")
-                print(f"[static guard] new failures: {json.dumps(sorted(new_failures))}")
+                try:
+                    attributed = _attributed_findings(
+                        new_failures, task_id=task_id, source="standalone static corpus"
+                    )
+                except RuntimeError as exc:
+                    print(f"[static guard] ERROR: {exc}", file=sys.stderr)
+                    failures.append("standalone static corpus attribution")
+                else:
+                    print("[static guard] standalone static corpus FAILED for this diff")
+                    print(f"[static guard] new failures: {json.dumps(attributed)}")
                 print(current_result.stdout, end="")
                 print(current_result.stderr, end="", file=sys.stderr)
                 failures.append("standalone static corpus")
