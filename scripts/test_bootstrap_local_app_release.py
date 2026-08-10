@@ -301,6 +301,11 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             payload.index("StartLimitBurst=3"), payload.index("[Service]")
         )
         self.assertIn("User=henry_hamster", payload)
+        # NoNewPrivileges must be set EXPLICITLY: systemctl's property getter
+        # reports the configured field, not the value implied by the sandbox
+        # options, so _verify_release_execution_boundary only reads "yes" when
+        # the unit states it outright. Guard against a regression to implicit.
+        self.assertIn("NoNewPrivileges=yes", payload)
         self.assertIn("RuntimeDirectory=blueprint-deploy-agent", payload)
         self.assertIn("RuntimeDirectoryMode=0750", payload)
         self.assertIn("StateDirectory=blueprint-deploy-agent", payload)
