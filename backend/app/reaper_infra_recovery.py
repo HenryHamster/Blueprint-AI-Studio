@@ -21,6 +21,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    advance_task_lifetime_attempt,
     bank_task_current_attempt,
 )
 from app.shared_state import (
@@ -419,7 +420,11 @@ async def run_infra_recovery_and_hold_maintenance(
                 f"[REAPER] Resurrecting infra-failed task {_t.id} "
                 f"(failure_category={_fail_cat}) — infrastructure recovered"
             )
-            _new_ctx = dict(_ctx)
+            # Close the failed attempt while its retry counter and diagnostic
+            # context are still authoritative; reset only after the immutable
+            # snapshot has captured both.
+            bank_task_current_attempt(_t, stopped_at=_utcnow())
+            _new_ctx = dict(_t.context or {})
             _new_ctx["_resurrection_count"] = _ctx.get("_resurrection_count", 0) + 1
             _new_ctx["_resurrected_from"] = _fail_cat
             # Clear all infra retry state so the task runs like a fresh dispatch.
@@ -442,7 +447,7 @@ async def run_infra_recovery_and_hold_maintenance(
             _t.llm_account_id = None
             clear_retry_after(_t)
             _t.attempt_count = 0
-            bank_task_current_attempt(_t, stopped_at=_utcnow())
+            advance_task_lifetime_attempt(_t)
             _t.status = TaskStatus.QUEUED
             _t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             _t.last_heartbeat = None

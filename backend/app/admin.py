@@ -54,8 +54,12 @@ from app.models import (
     TaskWakeRegistration,
     DeploymentState,
     DeploymentStatus,
+    TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY,
+    TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY,
     _utcnow,
+    get_task_lifetime_attempt_ordinal,
     get_task_total_vm_cost_usd_or_none,
+    task_lifetime_attempt_ordinal,
 )
 from app.auth import get_current_user
 from app.task_locking import task_lock
@@ -440,6 +444,35 @@ async def get_all_tasks(
     # Join artifacts to include all artifacts per task
     task_ids = [t.id for t in tasks]
 
+    # ``attempt_count`` is a retry-budget counter and can be reset for a fresh
+    # operator retry epoch.  Project the durable banked-history length in one
+    # bounded query for only this page; do not load the attempt-history JSONB
+    # blob into every list-row Task object.
+    attempt_history_count_map: Dict[str, int | None] = {}
+    if task_ids:
+        if resolve_dialect_name(session) == "sqlite":
+            attempt_history_count_expr = case(
+                (
+                    func.json_type(Task.attempt_history_db) == "array",
+                    func.json_array_length(Task.attempt_history_db),
+                ),
+                else_=None,
+            )
+        else:
+            attempt_history_count_expr = case(
+                (
+                    func.jsonb_typeof(Task.attempt_history_db) == "array",
+                    func.jsonb_array_length(Task.attempt_history_db),
+                ),
+                else_=None,
+            )
+        attempt_history_count_stmt = select(
+            Task.id,
+            attempt_history_count_expr.label("banked_attempt_count"),
+        ).where(Task.id.in_(task_ids))
+        for _row in (await session.execute(attempt_history_count_stmt)).all():
+            attempt_history_count_map[str(_row.id)] = _row.banked_attempt_count
+
     # Fetch slim payload display fields (type, pr_number, spend_cap_usd) without
     # loading the full payloads blob (which carries large agent prompt text and
     # research_findings). Uses the same JSONB subscript notation as the direction
@@ -611,6 +644,26 @@ async def get_all_tasks(
     result_list = []
     for t in tasks:
         _slim_payload = slim_payload_map.get(str(t.id), {})
+        _banked_attempt_count = attempt_history_count_map.get(str(t.id))
+        if _banked_attempt_count is None:
+            # Rollout compatibility for rows whose history still lives in the
+            # legacy context key rather than the dedicated JSONB column.
+            _legacy_attempt_history = (t.context or {}).get("attempt_history")
+            _banked_attempt_count = (
+                len(_legacy_attempt_history)
+                if isinstance(_legacy_attempt_history, list)
+                else 0
+            )
+        _attempt_number = task_lifetime_attempt_ordinal(
+            t.attempt_count,
+            _banked_attempt_count,
+            current_attempt_ordinal=(t.context or {}).get(
+                TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY
+            ),
+            last_banked_attempt_ordinal=(t.context or {}).get(
+                TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY
+            ),
+        )
         # Stash slim payload so task.first_payload returns it without accessing
         # the deferred Task.payloads column (which is not in _TASK_LIST_COLS).
         object.__setattr__(t, "_projected_first_payload", _slim_payload)
@@ -641,6 +694,7 @@ async def get_all_tasks(
             if t.last_tool_use_at
             else None,
             "attempt_count": t.attempt_count,
+            "attempt_number": _attempt_number,
             # Durable BLOCKED-state metadata (alembic 0137). Nullable for any
             # non-BLOCKED or pre-migration task; the admin UI guards on presence.
             "blocker_kind": t.blocker_kind,
@@ -2237,6 +2291,7 @@ async def get_task(
         if task.last_tool_use_at
         else None,
         "attempt_count": task.attempt_count,
+        "attempt_number": get_task_lifetime_attempt_ordinal(task),
         # Durable BLOCKED-state metadata (alembic 0137). Nullable for any
         # non-BLOCKED or pre-migration task; the admin UI guards on presence.
         "blocker_kind": task.blocker_kind,

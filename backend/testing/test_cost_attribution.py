@@ -46,7 +46,15 @@ from testing.factories import _utcnow, make_project, make_task
 
 from app.auth import create_agent_token
 from app.cost_telemetry_reconciliation import reconcile_provider_reported_usage
-from app.models import TaskStatus, bank_task_current_attempt
+from app.models import (
+    TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY,
+    TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY,
+    TaskStatus,
+    advance_task_lifetime_attempt,
+    bank_task_current_attempt,
+    get_task_lifetime_attempt_ordinal,
+    with_task_attempt_banking,
+)
 
 
 def _load_cost_reconciliation_module():
@@ -206,6 +214,125 @@ def test_bank_task_current_attempt_carries_provider_usage_into_history():
     assert snapshot["llm_cache_read_input_tokens"] == 300
     # The live column is cleared so the next attempt does not double-count.
     assert task.provider_reported_usage is None
+
+
+def test_attempt_ordinal_first_budgeted_failure_advances_to_attempt_two():
+    """Increment-before-bank retry code must snapshot Attempt 1, not Attempt 2."""
+    task = make_task(
+        status=TaskStatus.FAILED,
+        attempt_count=0,
+        api_call_summary=_summary(input_tokens=10, output_tokens=2),
+    )
+    current_ordinal = get_task_lifetime_attempt_ordinal(task)
+    task.attempt_count += 1
+
+    bank_task_current_attempt(task, attempt_ordinal=current_ordinal)
+    advance_task_lifetime_attempt(task)
+
+    assert task.attempt_history[-1]["attempt_ordinal"] == 1
+    assert get_task_lifetime_attempt_ordinal(task) == 2
+
+
+def test_attempt_ordinal_mixed_unbanked_budget_and_banked_exempt_failure():
+    """Disjoint retry-count/history evidence advances monotonically without sum."""
+    task = make_task(
+        status=TaskStatus.FAILED,
+        # Attempt 1 died before telemetry and consumed budget, so no history row
+        # exists; this runtime-exempt failure is the live Attempt 2.
+        attempt_count=1,
+        api_call_summary=_summary(input_tokens=10, output_tokens=2),
+    )
+
+    bank_task_current_attempt(task)
+    advance_task_lifetime_attempt(task)
+
+    assert task.attempt_history[-1]["attempt_ordinal"] == 2
+    assert task.attempt_count == 1
+    assert get_task_lifetime_attempt_ordinal(task) == 3
+
+
+def test_placeholder_banking_is_idempotent_and_stale_context_keeps_markers():
+    """A telemetry-free boundary is counted once and stale merges keep markers."""
+    task = make_task(status=TaskStatus.FAILED, attempt_count=0)
+
+    first = bank_task_current_attempt(task)
+    second = bank_task_current_attempt(task)
+    merged = with_task_attempt_banking(task, {"preserved": True})
+
+    assert first is not None
+    assert first["attempt_ordinal"] == 1
+    assert second is None
+    assert len(task.attempt_history) == 1
+    assert merged[TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY] == 1
+    assert merged[TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY] == 1
+    assert merged["preserved"] is True
+
+
+def test_bank_task_current_attempt_retains_distinct_bounded_failure_diagnostics():
+    """Closed attempts keep their own forensic evidence across retry epochs."""
+    task = make_task(
+        status=TaskStatus.FAILED,
+        attempt_count=1,
+        api_call_summary=_summary(input_tokens=100, output_tokens=20),
+        context={
+            "failure_class": "EXTERNAL_API",
+            "failure_category": "EXTERNAL_API",
+            "agent_failure_category_raw": "claude_code_failed",
+            "agent_error_report": {
+                "schema": 1,
+                "provider": "anthropic",
+                "exit_code": 1,
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": "first ghp_firstattemptsecret provider failure",
+                "provider_errors": [],
+            },
+        },
+    )
+    task.latest_status_message = (
+        "x" * 2200 + " first ghp_firstattemptsecret failure tail"
+    )
+
+    bank_task_current_attempt(task, stopped_at=_utcnow())
+
+    # Simulate a separately requeued retry epoch whose retry budget was reset.
+    # Its lifetime ordinal must still advance, while its retry counter remains an
+    # explicitly separate value.  This attempt intentionally has no report.
+    task.status = TaskStatus.FAILED
+    task.attempt_count = 1
+    task.api_call_summary = _summary(input_tokens=200, output_tokens=30)
+    task.context = {
+        "failure_class": "CODE_ERROR",
+        "failure_category": "CODE_ERROR",
+        "agent_failure_category_raw": "incomplete",
+    }
+    task.latest_status_message = "second ghs_secondattemptsecret failure tail"
+
+    bank_task_current_attempt(task, stopped_at=_utcnow())
+
+    assert task.attempt_history is not None
+    first, second = task.attempt_history
+    assert [first["attempt_ordinal"], second["attempt_ordinal"]] == [2, 3]
+    assert [first["retry_count_at_bank"], second["retry_count_at_bank"]] == [1, 1]
+    assert [first["status"], second["status"]] == ["FAILED", "FAILED"]
+    assert [first["failure_class"], second["failure_class"]] == [
+        "EXTERNAL_API",
+        "CODE_ERROR",
+    ]
+    assert [
+        first["agent_failure_category_raw"],
+        second["agent_failure_category_raw"],
+    ] == ["claude_code_failed", "incomplete"]
+    assert "first" in first["failure_message_tail"]
+    assert "second" in second["failure_message_tail"]
+    assert len(first["failure_message_tail"]) == 2000
+    assert len(second["failure_message_tail"]) <= 2000
+    assert "firstattemptsecret" not in first["failure_message_tail"]
+    assert "secondattemptsecret" not in second["failure_message_tail"]
+    assert "firstattemptsecret" not in first["agent_error_report"]["stderr_tail"]
+    assert "agent_error_report" not in second, (
+        "a report-less attempt must not inherit the previous attempt's report"
+    )
 
 
 def test_reconciliation_accumulates_provider_usage_across_attempts():

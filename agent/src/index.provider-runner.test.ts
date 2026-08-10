@@ -105,7 +105,9 @@ import {
   _setLastProviderRunErrorReportForTesting,
   claudeHelpSupportsPartialMessages,
   probeClaudeCapabilities,
+  RuntimeUnavailableError,
   stripUnsupportedClaudeOptionalArgs,
+  TextOnlyProviderUnavailableError,
   type ProviderRunErrorReport,
 } from './providers/runners.js';
 import { execFileSync, spawn, spawnSync, execSync } from 'child_process';
@@ -576,6 +578,27 @@ describe('VmConfigMissingError', () => {
     // runRoleOnce's catch reads .failureCategory; vm_config_missing maps to
     // PROVISION_FAILURE backend-side — never RATE_LIMIT ("usage exhausted").
     expect(err.failureCategory).toBe('vm_config_missing');
+  });
+});
+
+describe('TextOnlyProviderUnavailableError', () => {
+  it('uses the graceful runtime-unavailable control type while preserving its diagnostic', () => {
+    const err = new TextOnlyProviderUnavailableError(
+      'anthropic',
+      'cli_cannot_prove_toolless_strict_mcp_turn_cap',
+    );
+
+    // runRoleOnce converts RuntimeUnavailableError to GracefulShutdownSignal
+    // exit 42. This subtype identity is what keeps a deterministic strict-MCP
+    // capability miss from incrementing the local runner failure streak.
+    expect(err).toBeInstanceOf(TextOnlyProviderUnavailableError);
+    expect(err).toBeInstanceOf(RuntimeUnavailableError);
+    expect(err.failureCategory).toBe('runtime_unavailable');
+    expect(err.gracefulExitCode).toBe(42);
+    expect(err.message).toBe(
+      'text_only_provider_unavailable:anthropic:' +
+      'cli_cannot_prove_toolless_strict_mcp_turn_cap',
+    );
   });
 });
 

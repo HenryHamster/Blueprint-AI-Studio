@@ -43,6 +43,23 @@ const baseProps = {
   onViewLogs: vi.fn(),
 };
 
+describe('TaskCard attempt ordinal', () => {
+  it('prefers the lifetime ordinal after a retry-budget reset', () => {
+    render(
+      <TaskCard
+        task={makeTask({ attempt_count: 0, attempt_number: 2 })}
+        {...baseProps}
+      />,
+    );
+    expect(screen.getByText('#2')).toBeInTheDocument();
+  });
+
+  it('falls back to the legacy retry counter when the ordinal is absent', () => {
+    render(<TaskCard task={makeTask({ attempt_count: 2 })} {...baseProps} />);
+    expect(screen.getByText('#3')).toBeInTheDocument();
+  });
+});
+
 describe('TaskCard viewer access', () => {
   beforeEach(() => vi.clearAllMocks());
 

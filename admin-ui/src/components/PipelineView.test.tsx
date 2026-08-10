@@ -30,6 +30,17 @@ describe('PipelineView task status visibility', () => {
     vi.clearAllMocks();
   });
 
+  it('shows the lifetime attempt ordinal after the retry-budget counter resets', () => {
+    render(
+      <PipelineView
+        tasks={[makeTask({ status: 'IN_PROGRESS', attempt_count: 0, attempt_number: 2 })]}
+        onViewLogs={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTitle('Attempt 2')).toHaveTextContent('↺2');
+  });
+
   it('keeps blocked and dependency-waiting tasks visible after removing local status chips', async () => {
     const user = userEvent.setup();
     const tasks = [

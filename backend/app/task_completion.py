@@ -42,6 +42,7 @@ from app.models import (
     Task,
     TaskHistory,
     TaskStatus,
+    task_lifetime_attempt_ordinal,
 )
 from app.deploy_identity import project_is_deploy_repo
 from app.repo_bootstrap import (
@@ -522,6 +523,9 @@ def _compute_first_attempt_succeeded(
     attempt_count: int,
     status: "TaskStatus",
     merge_verification: "str | None" = None,
+    *,
+    banked_attempt_count: int = 0,
+    lifetime_attempt_ordinal: int | None = None,
 ) -> bool:
     """Return True if the task completed successfully on its first attempt.
 
@@ -534,10 +538,18 @@ def _compute_first_attempt_succeeded(
     """
     if merge_verification == "unverified_degraded":
         return False
-    # ``attempt_count`` is the number of retries already consumed.  The UI
-    # displays ``attempt_count + 1``, so a value of one is Attempt 2, not a
-    # successful first attempt.
-    return attempt_count == 0 and status == TaskStatus.COMPLETED
+    # ``attempt_count`` is the number of retries consumed in the current retry
+    # epoch.  Manual fresh-attempt requeues reset it, while attempt history keeps
+    # the closed prior executions.  Either source proving a retry makes this a
+    # later-attempt outcome.
+    ordinal = (
+        lifetime_attempt_ordinal
+        if isinstance(lifetime_attempt_ordinal, int)
+        and not isinstance(lifetime_attempt_ordinal, bool)
+        and lifetime_attempt_ordinal > 0
+        else task_lifetime_attempt_ordinal(attempt_count, banked_attempt_count)
+    )
+    return ordinal == 1 and status == TaskStatus.COMPLETED
 
 
 def _stamp_orphan_remediation_outcome(

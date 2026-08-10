@@ -15789,6 +15789,73 @@ class TestTaskListPlanSubtasksContract:
     """GET /api/admin/tasks drops heavy JSONB blobs and exposes plan_subtasks."""
 
     @pytest.mark.asyncio
+    async def test_list_and_detail_project_lifetime_attempt_ordinal(
+        self, client: AsyncClient, db_session
+    ):
+        """Fresh retry epochs retain a lifetime ordinal without loading history blobs."""
+        project = await _make_project(db_session)
+        reset_counter = Task(
+            project_id=project.id,
+            title="manual-reset",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.IN_PROGRESS,
+            attempt_count=0,
+            attempt_history_db=[{"vm_runtime_cost_usd": 0.01}],
+        )
+        overlapping_evidence = Task(
+            project_id=project.id,
+            title="normal-retries",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.IN_PROGRESS,
+            attempt_count=2,
+            attempt_history_db=[{"vm_runtime_cost_usd": 0.01}],
+        )
+        mixed_evidence = Task(
+            project_id=project.id,
+            title="mixed-budget-and-exempt-retries",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.IN_PROGRESS,
+            attempt_count=1,
+            attempt_history_db=[
+                {"attempt_ordinal": 2, "vm_runtime_cost_usd": 0.01}
+            ],
+            context={
+                "_lifetime_attempt_ordinal": 3,
+                "_last_banked_attempt_ordinal": 2,
+            },
+        )
+        legacy_history = Task(
+            project_id=project.id,
+            title="legacy-history",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.IN_PROGRESS,
+            attempt_count=0,
+            context={"attempt_history": [{"vm_runtime_cost_usd": 0.01}]},
+        )
+        db_session.add_all(
+            [reset_counter, overlapping_evidence, mixed_evidence, legacy_history]
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        by_title = {row["title"]: row for row in resp.json()["tasks"]}
+        assert by_title["manual-reset"]["attempt_count"] == 0
+        assert by_title["manual-reset"]["attempt_number"] == 2
+        # The two sources overlap on ordinary retries; they are maxed, not added.
+        assert by_title["normal-retries"]["attempt_number"] == 3
+        assert (
+            by_title["mixed-budget-and-exempt-retries"]["attempt_number"] == 3
+        )
+        assert by_title["legacy-history"]["attempt_number"] == 2
+        assert "attempt_history" not in by_title["manual-reset"]
+
+        detail = await client.get(f"/api/admin/tasks/{reset_counter.id}")
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["attempt_count"] == 0
+        assert detail.json()["attempt_number"] == 2
+
+    @pytest.mark.asyncio
     async def test_list_hides_backend_managed_unless_explicitly_included(
         self, client: AsyncClient, db_session
     ):

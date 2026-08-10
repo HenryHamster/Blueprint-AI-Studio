@@ -56,6 +56,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    advance_task_lifetime_attempt,
     bank_task_current_attempt,
     with_task_attempt_banking,
 )
@@ -586,6 +587,7 @@ async def provision_and_handle(
                                 failed_task, ctx
                             )
                             failed_task.context = ctx
+                            advance_task_lifetime_attempt(failed_task)
                             failed_task.status = (
                                 TaskStatus.QUEUED
                             )
@@ -713,6 +715,7 @@ async def provision_and_handle(
                                     failed_task, ctx
                                 )
                                 failed_task.context = ctx
+                                advance_task_lifetime_attempt(failed_task)
                                 failed_task.status = (
                                     TaskStatus.QUEUED
                                 )

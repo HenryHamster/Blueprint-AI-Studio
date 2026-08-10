@@ -39,6 +39,7 @@ from app.models import (
     TaskStatus,
     TaskWakeRegistration,
     WakeDeliveryState,
+    get_task_lifetime_attempt_ordinal,
 )
 from app.auth import create_agent_token, create_vm_scoped_token
 from app.schemas import AgentStatusPayload
@@ -14600,6 +14601,106 @@ async def test_rate_limit_requeue_clears_terminated_cache(
 
 
 @pytest.mark.asyncio
+async def test_runtime_unavailable_local_runner_records_decline_without_retry_burn(
+    client: AsyncClient, db_session, mocker
+):
+    """A post-claim provider/runtime mismatch must move to different hardware.
+
+    Discovery review is intentionally pinned to Anthropic.  Changing provider
+    would weaken its strict text-only contract, so the backend must preserve the
+    payload pin while recording the incapable local runner in the same
+    ``declined_by`` ledger used by pre-claim declines.
+    """
+    from app.routers.agent import _terminated_task_ids
+    from app.runner_decline import recently_declined_runner_ids
+
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    restore_resident_binding = mocker.patch(
+        "app.routers.agent_status._restore_resident_retry_binding",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="Runtime Runner Decline Test",
+        user_id="test-user-runtime-runner-decline",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = uuid.uuid4()
+    runner_vm_id = f"runner:{runner_id}"
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "discovery_review",
+                "prompt": "Judge the frozen discovery bet",
+                "provider_preference": ["anthropic"],
+            }
+        ],
+        vm_instance_id=runner_vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        context={
+            "runner_target_id": str(runner_id),
+            "runner_hostname": "iconlab-test",
+            "llm_provider": "anthropic",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    _terminated_task_ids.pop(task_id, None)
+    token = create_agent_token(task_id, runner_vm_id)
+    response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id,
+            "status": "FAILED",
+            "failure_category": "runtime_unavailable",
+            "logs": (
+                "Fatal error: text_only_provider_unavailable:anthropic:"
+                "cli_cannot_prove_toolless_strict_mcp_turn_cap"
+            ),
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "retrying"
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1, "runner incompatibility must not burn a code retry"
+    assert task.attempt_history[-1]["attempt_ordinal"] == 2
+    assert get_task_lifetime_attempt_ordinal(task) == 3
+    assert task.retry_after_until is None
+    assert task.first_payload["provider_preference"] == ["anthropic"]
+    assert recently_declined_runner_ids(task) == {str(runner_id)}
+    record = task.context["declined_by"][str(runner_id)]
+    assert record["count"] == 1
+    assert record["hostname"] == "iconlab-test"
+    assert record["same_runner_retryable"] is False
+    assert "text_only_provider_unavailable:anthropic" in record["reason"]
+    assert "runner_target_id" not in task.context
+    assert "runner_hostname" not in task.context
+    assert task_id not in _terminated_task_ids
+    restore_resident_binding.assert_awaited_once()
+    assert restore_resident_binding.await_args.kwargs["excluded_runner_ids"] == {
+        str(runner_id)
+    }
+
+    _terminated_task_ids.pop(task_id, None)
+
+
+@pytest.mark.asyncio
 async def test_completed_terminal_populates_terminated_cache(
     client: AsyncClient, db_session, mocker
 ):
@@ -23481,6 +23582,137 @@ async def test_failed_status_without_report_drops_stale_report(
     # classifies CODE_ERROR and burns the retry — same as the no-report test.
     assert ctx.get("agent_failure_category_raw") == "claude_code_failed"
     assert task.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_two_failed_retries_bank_distinct_attempt_diagnostics(
+    client: AsyncClient, db_session, mocker
+):
+    """Each failed agent run keeps its own report/message before fresh reset."""
+    import app.max_plan_pool as pool_mod
+
+    account_id = "aaaaaaaa-0001-4000-a000-00000000er04"
+    pool = _healthy_account_pool_and_task_ctx(account_id)
+    mocker.patch.object(pool_mod, "_account_by_id", pool)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(
+        name="Per-attempt Failure Diagnostics Test",
+        user_id="test-user-attempt-diagnostics-001",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first_vm_id = "agent-vm-attempt-diagnostics-001"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test retry forensics"}],
+        vm_instance_id=first_vm_id,
+        vm_provisioned_at=_utcnow() - timedelta(minutes=2),
+        started_at=_utcnow() - timedelta(minutes=2),
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": account_id, "llm_model": "claude-sonnet-4-6"},
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    first_response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id_str,
+            "status": "FAILED",
+            "failure_category": "test_failed",
+            "logs": "first attempt unit tests failed",
+            "error_report": {
+                "schema": 1,
+                "task_id": task_id_str,
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "exit_code": 1,
+                "duration_ms": 120_000,
+                "model_output_seen": True,
+                "result_event_seen": True,
+                "provider_errors": [],
+                "stderr_tail": "first structured stderr",
+                "last_stream_event": "result",
+            },
+        },
+        headers={"x-agent-token": create_agent_token(task_id_str, first_vm_id)},
+    )
+    assert first_response.status_code == 200, first_response.text
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1
+    assert task.attempt_history is not None
+    assert len(task.attempt_history) == 1
+    first_snapshot = task.attempt_history[0]
+    assert first_snapshot["attempt_ordinal"] == 1
+    assert first_snapshot["retry_count_at_bank"] == 1
+    assert first_snapshot["failure_class"] == "CODE_ERROR"
+    assert first_snapshot["agent_failure_category_raw"] == "test_failed"
+    assert first_snapshot["failure_message_tail"] == "first attempt unit tests failed"
+    assert first_snapshot["agent_error_report"]["stderr_tail"] == (
+        "first structured stderr"
+    )
+
+    # Model a fresh dispatch of the queued retry.  The first report was stripped
+    # by reset_task_for_fresh_attempt; the second status deliberately omits one.
+    second_vm_id = "agent-vm-attempt-diagnostics-002"
+    task.status = TaskStatus.IN_PROGRESS
+    task.vm_instance_id = second_vm_id
+    task.vm_provisioned_at = _utcnow() - timedelta(minutes=1)
+    task.started_at = _utcnow() - timedelta(minutes=1)
+    task.context = {
+        **(task.context or {}),
+        "llm_account_id": account_id,
+        "llm_model": "claude-sonnet-4-6",
+    }
+    pool[account_id]["active_tasks"] = 1
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    second_response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id_str,
+            "status": "FAILED",
+            "failure_category": "incomplete",
+            "logs": "second attempt exited before publishing",
+        },
+        headers={"x-agent-token": create_agent_token(task_id_str, second_vm_id)},
+    )
+    assert second_response.status_code == 200, second_response.text
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 2
+    assert task.attempt_history is not None
+    assert len(task.attempt_history) == 2
+    first_snapshot, second_snapshot = task.attempt_history
+    assert [
+        first_snapshot["attempt_ordinal"],
+        second_snapshot["attempt_ordinal"],
+    ] == [1, 2]
+    assert [
+        first_snapshot["retry_count_at_bank"],
+        second_snapshot["retry_count_at_bank"],
+    ] == [1, 2]
+    assert second_snapshot["failure_class"] == "CODE_ERROR"
+    assert second_snapshot["agent_failure_category_raw"] == "incomplete"
+    assert second_snapshot["failure_message_tail"] == (
+        "second attempt exited before publishing"
+    )
+    assert "agent_error_report" in first_snapshot
+    assert "agent_error_report" not in second_snapshot, (
+        "a report-less retry must not inherit the previous attempt's report"
+    )
 
 
 @pytest.mark.asyncio

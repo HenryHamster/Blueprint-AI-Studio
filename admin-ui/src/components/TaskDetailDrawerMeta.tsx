@@ -44,6 +44,7 @@ function formatCreatedBy(value: string): string {
 
 export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { task: Task; tasks?: Task[]; gcpProjectId?: string; onNavigateToTask?: (taskId: string) => void }) {
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
+  const attemptNumber = task.attempt_number ?? ((task.attempt_count ?? 0) + 1);
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
   const duration = useElapsedTime(task.started_at ?? '', isTerminal ? task.last_heartbeat : undefined);
   const durationStats = useDurationStats(task.project_id);
@@ -195,7 +196,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           {task.last_tool_use_at ? timeAgo(task.last_tool_use_at) : 'No tool use recorded'}
         </span>
       </DetailRow>
-      {task.attempt_count != null && <DetailRow label="Attempts"><span>{task.attempt_count}</span></DetailRow>}
+      {(task.attempt_number != null || task.attempt_count != null) && <DetailRow label="Attempt"><span>{attemptNumber}</span></DetailRow>}
       {task.api_call_summary != null && (() => {
         const s = task.api_call_summary;
         const calls = s.llm_call_count ?? 0;

@@ -32,7 +32,12 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.models import Task, TaskStatus, bank_task_current_attempt
+from app.models import (
+    Task,
+    TaskStatus,
+    advance_task_lifetime_attempt,
+    bank_task_current_attempt,
+)
 from app.time_utils import _utcnow, clear_retry_after
 
 # Canonical failure class for precondition blockers (mirrors
@@ -565,6 +570,7 @@ def reset_task_for_fresh_attempt(task: Task) -> None:
         task,
         stopped_at=task.vm_stopped_at or _utcnow(),
     )
+    advance_task_lifetime_attempt(task)
 
     # ``payloads`` is JSONB. Mutating a nested payload in place is not reliably
     # visible to SQLAlchemy, so restore through a copied container and mark the

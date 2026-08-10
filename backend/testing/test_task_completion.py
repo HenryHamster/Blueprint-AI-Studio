@@ -187,6 +187,17 @@ class TestComputeFirstAttemptSucceeded:
         """attempt_count=1 means one retry was consumed (UI Attempt 2)."""
         assert _compute_first_attempt_succeeded(1, TaskStatus.COMPLETED) is False
 
+    def test_banked_attempt_is_not_first_after_counter_reset(self):
+        """A manual fresh retry epoch cannot turn lifetime Attempt 2 into Attempt 1."""
+        assert (
+            _compute_first_attempt_succeeded(
+                0,
+                TaskStatus.COMPLETED,
+                banked_attempt_count=1,
+            )
+            is False
+        )
+
     def test_attempt_two_is_not_first(self):
         assert _compute_first_attempt_succeeded(2, TaskStatus.COMPLETED) is False
 

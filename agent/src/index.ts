@@ -4322,7 +4322,9 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // task failure. Convert to GracefulShutdownSignal so main() can exit with
     // code 42, signalling the runner to skip the failure-streak increment.
     // eslint-disable-next-line @typescript-eslint/only-throw-error -- GracefulShutdownSignal is a typed control signal, not an Error
-    if (error instanceof RuntimeUnavailableError) throw new GracefulShutdownSignal('runtime_unavailable', 42);
+    if (error instanceof RuntimeUnavailableError) {
+      throw new GracefulShutdownSignal('runtime_unavailable', error.gracefulExitCode);
+    }
     // Re-throw so the role loop terminates — failures don't get warm
     // continuity; the orchestrator cold-provisions for the next role.
     throw error;

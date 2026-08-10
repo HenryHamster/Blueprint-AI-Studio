@@ -190,6 +190,8 @@ export interface Task {
   started_at?: string;
   last_heartbeat?: string;
   attempt_count?: number;
+  /** One-based lifetime ordinal; survives fresh retry-epoch counter resets. */
+  attempt_number?: number;
   // Durable blocker metadata for the non-terminal BLOCKED state (backend
   // alembic 0137 / models.py). All four are nullable — older task payloads
   // (and any non-BLOCKED task) carry null/undefined, so every consumer must

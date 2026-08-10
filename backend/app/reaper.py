@@ -48,7 +48,9 @@ from app.models import (
     TaskStatus,
     VmContact,
     TaskContact,
+    advance_task_lifetime_attempt,
     bank_task_current_attempt,
+    get_task_lifetime_attempt_ordinal,
 )
 from app.compute import (
     get_provision_error,
@@ -1527,6 +1529,7 @@ async def reaper_service():
                             # there. Requeue once onto a different account — no retry budget
                             # consumed (DEAD_AUTH is an INFRA class).
                             bank_task_current_attempt(task, stopped_at=_utcnow())
+                            advance_task_lifetime_attempt(task)
                             task.status = TaskStatus.QUEUED
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
@@ -1580,6 +1583,7 @@ async def reaper_service():
                             # in the unlocked I/O block above; rl_acct_id and rl_model
                             # captured there. Apply the resulting state mutations here.
                             bank_task_current_attempt(task, stopped_at=_utcnow())
+                            advance_task_lifetime_attempt(task)
                             task.status = TaskStatus.QUEUED
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
@@ -2085,6 +2089,9 @@ async def reaper_service():
                                 session.add(task)
                                 _deferred_parent_requeues.append(task)
                             else:
+                                _current_attempt_ordinal = (
+                                    get_task_lifetime_attempt_ordinal(task)
+                                )
                                 if not is_provision_failure and not ext_api_fast_path:
                                     task.attempt_count += 1
                                 if is_provision_failure:
@@ -2099,7 +2106,11 @@ async def reaper_service():
                                 reap_acct = (get_task_llm_account_id(reap_ctx) or "?")[
                                     :8
                                 ]
-                                bank_task_current_attempt(task, stopped_at=_utcnow())
+                                bank_task_current_attempt(
+                                    task,
+                                    stopped_at=_utcnow(),
+                                    attempt_ordinal=_current_attempt_ordinal,
+                                )
                                 task.latest_status_message = f"Reaped ({retry_label}): {reap_reason} [zone={reap_zone}, acct={reap_acct}]"
                                 task.status = TaskStatus.QUEUED
                                 _pre_strip_reaper_ctx = task.context or {}

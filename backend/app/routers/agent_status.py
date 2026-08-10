@@ -34,6 +34,7 @@ from app.models import (
     TaskStatus,
     TASK_AGENT_STATUS_IDEMPOTENT_STATUSES,
     bank_task_current_attempt,
+    get_task_lifetime_attempt_ordinal,
     get_task_total_vm_cost_usd,
     with_task_attempt_banking,
 )
@@ -107,6 +108,11 @@ from app.cost_ceiling import check_daily_cost_ceiling as _check_daily_cost_ceili
 from app.resident_retry_binding import (
     restore_resident_retry_binding as _restore_resident_retry_binding,
     sync_resident_retry_wait_after_commit as _sync_resident_retry_wait_after_commit,
+)
+from app.runner_decline import (
+    DECLINE_ESCALATION_THRESHOLD,
+    maybe_create_decline_alert,
+    record_runner_decline,
 )
 
 logger = logging.getLogger(__name__)
@@ -3565,16 +3571,66 @@ async def update_agent_status(
 
         _NON_GENUINE_TERMINAL_CLASSES = (SCOPE_EMPTY, REASSIGNED)
 
+        # A local runner can pass dispatch-time capability checks and only then
+        # discover that its provider CLI cannot satisfy a stricter runtime
+        # contract (for example Anthropic text-only strict-MCP support). Treat
+        # that deterministic host mismatch exactly like a pre-claim decline:
+        # preserve the provider pin, exclude this runner for the task, and do
+        # not consume a code retry.  The runner identity must be captured before
+        # reset_task_for_fresh_attempt clears the per-attempt dispatch binding.
+        _raw_failure_category = (payload.failure_category or "").strip().lower()
+        _runtime_decline_runner_id: str | None = None
+        _runtime_decline_hostname: str | None = None
+        _runtime_decline_reason: str | None = None
+        _current_vm_id = str(task.vm_instance_id or "")
+        if (
+            _raw_failure_category == "runtime_unavailable"
+            and _current_vm_id.startswith("runner:")
+            and _current_vm_id.removeprefix("runner:")
+        ):
+            _runtime_decline_runner_id = _current_vm_id.removeprefix("runner:")
+            _runtime_decline_hostname = str(
+                (task.context or {}).get("runner_hostname") or ""
+            ) or None
+            _runtime_decline_reason = "runtime_unavailable: " + _sanitize_log_tail(
+                payload.logs or "provider runtime cannot satisfy task contract",
+                470,
+            )
+
         # Retry logic for failed tasks
         if (
             payload.status == TaskStatus.FAILED
-            and task.attempt_count < _runtime_config["max_retries"]
+            and (
+                _runtime_decline_runner_id is not None
+                or task.attempt_count < _runtime_config["max_retries"]
+            )
             and failure_class not in _NON_GENUINE_TERMINAL_CLASSES
         ):
-            task.attempt_count += 1
-            bank_task_current_attempt(task, stopped_at=task.vm_stopped_at)
+            _current_attempt_ordinal = get_task_lifetime_attempt_ordinal(task)
+            if _runtime_decline_runner_id is None:
+                task.attempt_count += 1
+            bank_task_current_attempt(
+                task,
+                stopped_at=task.vm_stopped_at,
+                attempt_ordinal=_current_attempt_ordinal,
+            )
             _prior_retry_ctx = dict(task.context or {})
             reset_task_for_fresh_attempt(task)
+            _runtime_decline_total = 0
+            if _runtime_decline_runner_id is not None:
+                _, _runtime_decline_total = record_runner_decline(
+                    task,
+                    _runtime_decline_runner_id,
+                    reason=_runtime_decline_reason or "runtime_unavailable",
+                    hostname=_runtime_decline_hostname,
+                    same_runner_retryable=False,
+                )
+                task.latest_status_message = (
+                    "Runtime-incompatible runner "
+                    f"{_runtime_decline_hostname or _runtime_decline_runner_id} "
+                    f"declined task (decline #{_runtime_decline_total}): "
+                    f"{_runtime_decline_reason or 'runtime_unavailable'}"
+                )[:500]
             ctx = dict(task.context or {})
             for _guidance_key in (
                 "_api_failure_retries",
@@ -3595,7 +3651,21 @@ async def update_agent_status(
             _terminated_task_ids.pop(str(task.id), None)
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             # Add retry delay for transient failures to avoid hammering exhausted resources
-            if failure_class == "RATE_LIMIT":
+            if _runtime_decline_runner_id is not None:
+                # The next dispatch should immediately select another eligible
+                # runner (or fall through to cloud); a generic provision-delay
+                # would only postpone that already-safe handoff.
+                task.retry_after_until = None
+                ctx.pop("provision_failures", None)
+                logger.info(
+                    "[ORCHESTRATOR] Task %s declined post-claim runtime on "
+                    "runner %s (decline #%d) — retrying elsewhere without "
+                    "consuming attempt budget",
+                    task.id,
+                    _runtime_decline_runner_id,
+                    _runtime_decline_total,
+                )
+            elif failure_class == "RATE_LIMIT":
                 # Track per-account rate-limit hit count for exponential backoff
                 rl_counts = dict(ctx.get("rate_limit_counts") or {})
                 if acct_id:
@@ -3660,14 +3730,33 @@ async def update_agent_status(
                         "[ORCHESTRATOR] Failed to escalate effort for task %s",
                         task.id,
                     )
+            # A resident retry normally restores its hard pin. Pass the
+            # task-local runtime exclusion through so the helper cannot undo a
+            # deterministic decline by re-pinning the exact same runner.
             await _restore_resident_retry_binding(
                 task,
                 session,
                 _prior_retry_ctx,
+                excluded_runner_ids=(
+                    {_runtime_decline_runner_id}
+                    if _runtime_decline_runner_id is not None
+                    else None
+                ),
             )
             ctx = dict(task.context or {})
             task.context = ctx
             session.add(task)
+
+            if (
+                _runtime_decline_runner_id is not None
+                and _runtime_decline_total >= DECLINE_ESCALATION_THRESHOLD
+            ):
+                await maybe_create_decline_alert(
+                    session,
+                    task,
+                    _runtime_decline_total,
+                    _runtime_decline_reason or "runtime_unavailable",
+                )
 
             # Same defensive pattern as the early commit below: production
             # 2026-05-04 logged 2x PendingRollbackError at this commit when
@@ -3697,6 +3786,15 @@ async def update_agent_status(
                     "attempt_count": task.attempt_count,
                 },
             )
+            if _runtime_decline_runner_id is not None:
+                return {
+                    "status": "retrying",
+                    "message": (
+                        f"Task {task.id} declined runtime-incompatible runner "
+                        f"{_runtime_decline_runner_id}; retrying elsewhere without "
+                        "consuming retry budget"
+                    ),
+                }
             return {
                 "status": "retrying",
                 "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)",
@@ -3843,6 +3941,8 @@ async def update_agent_status(
                     task.attempt_count,
                     payload.status,
                     merge_verification=_merge_verification_status(task),
+                    banked_attempt_count=len(task.attempt_history or []),
+                    lifetime_attempt_ordinal=get_task_lifetime_attempt_ordinal(task),
                 )
                 _proj = None
                 try:

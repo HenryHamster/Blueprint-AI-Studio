@@ -70,6 +70,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    advance_task_lifetime_attempt,
     bank_task_current_attempt,
 )
 from app.resource_envelope import (
@@ -1625,6 +1626,7 @@ async def orchestrator_worker():
                             zombie.cancel()
                             cancelled_provision_ids.append(str(t.id))
                         bank_task_current_attempt(fresh_t, stopped_at=_utcnow())
+                        advance_task_lifetime_attempt(fresh_t)
                         fresh_t.status = TaskStatus.QUEUED
                         fresh_t.started_at = None
                         fresh_t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
