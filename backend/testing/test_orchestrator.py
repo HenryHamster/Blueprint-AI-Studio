@@ -788,6 +788,11 @@ _BACKEND_VERIFICATION_BUILD_CONFIG = {"directories": [{
     },
 }]}
 
+_BACKEND_BUILD_CONFIG_WITHOUT_VERIFICATION = {"directories": [{
+    "path": "backend", "type": "python", "lint_cmd": "ruff check .",
+    "test_cmd": "python3 -m pytest",
+}]}
+
 
 def test_project_verification_requirement_comes_from_capability_and_build_config():
     from app.runner_eligibility import (
@@ -1021,6 +1026,114 @@ async def test_try_runner_dispatch_falls_through_to_cloud_without_verification(
     assert dispatched is False
     assert task.status == TaskStatus.QUEUED
     assert (task.context or {}).get("runner_target_id") is None
+
+
+@pytest.mark.parametrize("identity_source", ["deploy-identity", "legacy-flag"])
+@pytest.mark.asyncio
+async def test_deploy_repo_dispatch_requires_proof_without_build_config_declaration(
+    db_session, monkeypatch, identity_source,
+):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _try_runner_dispatch,
+    )
+
+    if identity_source == "deploy-identity":
+        monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "blueprint/blueprint")
+        legacy_self_repo = False
+    else:
+        monkeypatch.delenv("DEPLOY_REPO_IDENTITY", raising=False)
+        monkeypatch.setattr(
+            "app.orchestrator_runner_dispatch.deploy_repo_identity", lambda: None
+        )
+        legacy_self_repo = True
+    project = make_project(
+        name="deploy-repo-authoring",
+        user_id=_TEST_USER,
+        github_owner="Blueprint",
+        github_repo="Blueprint",
+        is_self_repo=legacy_self_repo,
+        build_config=_BACKEND_BUILD_CONFIG_WITHOUT_VERIFICATION,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "fix", "prompt": "author backend"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    incapable = RunnerDispatchSnapshot(
+        uuid.uuid4(), project.id, {"task_types": "all", "max_concurrent": 1}
+    )
+    capable = RunnerDispatchSnapshot(
+        uuid.uuid4(),
+        project.id,
+        {
+            "task_types": "all",
+            "max_concurrent": 1,
+            "project_verification": _passing_project_verification(),
+        },
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [incapable, capable]}, {}
+    )
+
+    assert dispatched is True
+    assert task.status == TaskStatus.PROVISIONING
+    assert (task.context or {}).get("runner_target_id") == str(capable.id)
+
+
+@pytest.mark.parametrize(
+    ("github_owner", "github_repo", "task_type"),
+    [
+        pytest.param("customer", "service", "create", id="external-authoring"),
+        pytest.param("Blueprint", "Blueprint", "research", id="deploy-read-only"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tasks_without_self_repo_authoring_contract_keep_legacy_eligibility(
+    db_session, monkeypatch, github_owner, github_repo, task_type,
+):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _try_runner_dispatch,
+    )
+
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "blueprint/blueprint")
+    project = make_project(
+        name=f"legacy-{task_type}",
+        user_id=_TEST_USER,
+        github_owner=github_owner,
+        github_repo=github_repo,
+        build_config=_BACKEND_BUILD_CONFIG_WITHOUT_VERIFICATION,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": task_type, "prompt": "run task"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    legacy_runner = RunnerDispatchSnapshot(
+        uuid.uuid4(), project.id, {"task_types": "all", "max_concurrent": 1}
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [legacy_runner]}, {}
+    )
+
+    assert dispatched is True
+    assert task.status == TaskStatus.PROVISIONING
+    assert (task.context or {}).get("runner_target_id") == str(legacy_runner.id)
 
 
 @pytest.mark.asyncio
@@ -2867,6 +2980,14 @@ class TestReaperService:
         class _StopLoop(Exception):
             pass
 
+        # These cases exercise the steady-state reaper decisions. Startup
+        # reconnect grace has dedicated coverage in test_reaper.py; disabling
+        # it here prevents process import time from masking the behavior each
+        # test is asserting.
+        mocker.patch.dict(
+            _main_module._runtime_config,
+            {"reaper_startup_orphan_grace_seconds": 0},
+        )
         mocker.patch("asyncio.sleep", side_effect=_StopLoop)
         return _StopLoop
 

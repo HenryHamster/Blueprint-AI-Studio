@@ -401,6 +401,32 @@ def _mainline_git_ref(repo_root: str | None = None) -> str:
     return "HEAD"
 
 
+def _git_shallow_file_path(repo_root: str) -> str:
+    """Resolve Git's shallow-boundary file for clones and linked worktrees."""
+    legacy_path = os.path.join(repo_root, ".git", "shallow")
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "rev-parse",
+                "--git-path",
+                "shallow",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — legacy path still covers ordinary clones
+        return legacy_path
+    resolved = result.stdout.strip() if result.returncode == 0 else ""
+    if not resolved:
+        return legacy_path
+    return resolved if os.path.isabs(resolved) else os.path.join(repo_root, resolved)
+
+
 def _git_history_is_truncated(repo_root: str | None = None) -> bool:
     """True when the MAINLINE history source is truncated by a shallow boundary.
 
@@ -422,7 +448,7 @@ def _git_history_is_truncated(repo_root: str | None = None) -> bool:
     truncated.  A boundary on an unrelated branch must not fail closed.
     """
     root = repo_root or _REPO_ROOT
-    shallow_path = os.path.join(root, ".git", "shallow")
+    shallow_path = _git_shallow_file_path(root)
     if not os.path.isfile(shallow_path):
         return False
     try:
@@ -1443,6 +1469,24 @@ def _git_commit_parent_count(sha: str, repo_root: str) -> int | None:
     return len(result.stdout.split())
 
 
+def _git_commit_is_shallow_boundary(sha: str, repo_root: str) -> bool:
+    """Return whether ``sha`` is an explicit shallow-clone boundary.
+
+    Git hides a shallow boundary's parent and renders ``git show`` as though
+    the boundary were a root commit.  For ``module_size_limits.json`` that is
+    a whole-file addition, so the ordinary ``old -> new`` pair parser cannot
+    adjudicate a ledger record even when the cited commit made the real bump.
+    The shallow file is positive evidence of that loss; an unreadable or
+    absent shallow file is not treated as a boundary.
+    """
+    shallow_path = _git_shallow_file_path(repo_root)
+    try:
+        with open(shallow_path, encoding="utf-8") as f:
+            return any(line.strip() == sha for line in f)
+    except OSError:
+        return False
+
+
 def phantom_ledger_records(
     *,
     repo_root: str | None = None,
@@ -1525,6 +1569,7 @@ def phantom_ledger_records(
     if result.returncode != 0:
         return []
     bump_map = _git_log_bump_map(result.stdout)
+    mainline_history_truncated = _git_history_is_truncated(root)
 
     # Collect records and the SHAs they cite, then resolve all SHAs in one batch.
     records: list[tuple[str, str, int, int, str]] = []
@@ -1578,20 +1623,30 @@ def phantom_ledger_records(
             continue
         ancestry = _commit_in_mainline_ancestry(sha, root)
         if ancestry is False:
-            phantoms.append(
-                (
-                    section,
-                    key,
-                    old_cap,
-                    new_cap,
-                    sha,
-                    "commit is not in the mainline ancestry",
+            if not mainline_history_truncated:
+                phantoms.append(
+                    (
+                        section,
+                        key,
+                        old_cap,
+                        new_cap,
+                        sha,
+                        "commit is not in the mainline ancestry",
+                    )
                 )
-            )
-            continue
+                continue
+            # ``merge-base --is-ancestor`` also exits 1 when the connecting
+            # path lies beyond a shallow boundary. A reference clone can still
+            # resolve the older commit object, so suppress only the ambiguous
+            # ancestry verdict and continue to inspect its direct diff below.
         if ancestry is None:
             # An ancestry probe failure is evidence loss, not proof of a fake
             # record. Never delete on this polarity.
+            continue
+        if _git_commit_is_shallow_boundary(sha, root):
+            # The parent is deliberately hidden, so ``git show`` synthesizes a
+            # root/full-file-add diff. A missing pair there is evidence loss,
+            # not proof that the ledger row is fabricated.
             continue
         parent_count = _git_commit_parent_count(sha, root)
         if parent_count is None or parent_count > 1:

@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.deploy_identity import deploy_repo_identity, project_matches_deploy_identity
 from app.models import (
     ComputeJob,
     ComputeJobStatus,
@@ -819,9 +820,36 @@ async def _try_runner_dispatch(
         if _task_is_authoring(task_type)
         else None
     )
+    # The generated publication gate treats this deployment's own repo as a
+    # special fail-closed case: any authoring task may touch backend/ and then
+    # must run its Python/Postgres checks.  Mirror that requirement at dispatch
+    # even if the optional per-directory declaration drifted out of build_config;
+    # external projects retain the declaration-driven contract unchanged.
+    deploy_identity = deploy_repo_identity()
+    is_deploy_repo = bool(
+        project is not None
+        and deploy_identity is not None
+        and project_matches_deploy_identity(project, deploy_identity)
+    )
+    if project is not None and deploy_identity is None:
+        # Dispatch uses a deliberate raiseload projection that excludes the
+        # legacy is_self_repo field. Query that one scalar only on unstamped
+        # deployments; synchronously reading the ORM attribute would crash the
+        # entire dispatch cycle, while dropping the fallback would fail open.
+        is_deploy_repo = bool(
+            (
+                await session.execute(
+                    select(Project.is_self_repo).where(Project.id == project.id)
+                )
+            ).scalar_one_or_none()
+        )
     requires_project_verification = bool(
         project is not None
-        and _task_requires_project_verification(task_type, project.build_config)
+        and _task_is_authoring(task_type)
+        and (
+            is_deploy_repo
+            or _task_requires_project_verification(task_type, project.build_config)
+        )
     )
     # A declared accelerator (flat or nested compute_experiment form) restricts
     # eligibility to GPU runners. Read generically so the gate is uniform; agent

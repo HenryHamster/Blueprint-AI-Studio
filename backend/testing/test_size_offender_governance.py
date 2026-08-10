@@ -1367,6 +1367,145 @@ def test_phantom_ledger_records_skips_beyond_boundary_on_shallow(tmp_path, mocke
     assert phantoms == []
 
 
+def test_phantom_ledger_records_preserves_bump_at_shallow_boundary(
+    tmp_path, mocker
+):
+    """A real bump at the shallow boundary is unverifiable, not a phantom.
+
+    Depth-one clones hide the bump commit's parent. Git consequently renders
+    ``module_size_limits.json`` as a whole-file addition, which contains no
+    parseable ``old -> new`` pair even though the full repository proves the
+    ledger record. This is the production task-VM shape.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    _hermetic_write_cap(str(source), 100)
+    _hermetic_commit(str(source), "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(str(source), 200)
+    _hermetic_commit(
+        str(source), "bump at boundary", date="2026-01-02T00:00:00+00:00"
+    )
+    bump_sha = _hermetic_head_sha(str(source))
+
+    checkout = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth=1", f"file://{source}", str(checkout)],
+        check=True,
+    )
+
+    phantoms = _phantom_ledger(
+        str(checkout),
+        "m.py",
+        {
+            "commit_sha": bump_sha,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    )
+
+    assert phantoms == []
+    linked = tmp_path / "linked-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "--detach", str(linked), "HEAD"],
+        cwd=checkout,
+        check=True,
+    )
+    assert (linked / ".git").is_file()
+    assert slp._git_history_is_truncated(str(linked)) is True
+    assert _phantom_ledger(
+        str(linked),
+        "m.py",
+        {
+            "commit_sha": bump_sha,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    ) == []
+
+
+def test_phantom_ledger_records_preserves_resolvable_bump_beyond_boundary(
+    tmp_path, mocker
+):
+    """A reference clone must not turn a truncated ancestry probe into proof.
+
+    Task VMs clone with a shallow mainline plus a baked object-store reference.
+    An older ledger SHA therefore resolves even though Git will not traverse
+    the mainline past its newer shallow boundary; ``merge-base --is-ancestor``
+    returns 1 in that ambiguous graph. Preserve the row until a complete
+    checkout can adjudicate it.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    _hermetic_write_cap(str(source), 100)
+    _hermetic_commit(str(source), "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(str(source), 200)
+    _hermetic_commit(
+        str(source), "real bump", date="2026-01-02T00:00:00+00:00"
+    )
+    bump_sha = _hermetic_head_sha(str(source))
+    (source / "module_size_limits.json").write_text(
+        json.dumps({"backend": {"m.py": 200, "later.py": 1}}, indent=2),
+        encoding="utf-8",
+    )
+    _hermetic_commit(
+        str(source), "newer boundary", date="2026-01-03T00:00:00+00:00"
+    )
+
+    checkout = tmp_path / "shallow-reference"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "-q",
+            "--depth=1",
+            "--reference-if-able",
+            str(source),
+            f"file://{source}",
+            str(checkout),
+        ],
+        check=True,
+    )
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{bump_sha}^{{commit}}"],
+        cwd=checkout,
+        check=False,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", bump_sha, "main"],
+        cwd=checkout,
+        check=False,
+    ).returncode == 1
+
+    phantoms = _phantom_ledger(
+        str(checkout),
+        "m.py",
+        {
+            "commit_sha": bump_sha,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    )
+
+    assert phantoms == []
+    wrong_pair = _phantom_ledger(
+        str(checkout),
+        "m.py",
+        {
+            "commit_sha": bump_sha,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 50,
+            "new_cap": 200,
+        },
+    )
+    assert len(wrong_pair) == 1
+    assert "diff shows no recorded bump" in wrong_pair[0][-1]
+
+
 def test_phantom_ledger_records_flags_non_ancestor_commit(tmp_path, mocker):
     """A commit outside the mainline ancestry is a phantom even when its object
     resolves — the bump it made was never merged, so it must not be in the
