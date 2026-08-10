@@ -9,7 +9,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.release_artifacts import summarize_required_artifact_gap
+from app.release_artifacts import (
+    PENDING_OPERATOR_ACTIVATION_REASON,
+    summarize_required_artifact_gap,
+)
 from app import pause_clock, release_version
 from app.models import Alert, AlertSeverity, DeploymentState
 from app.shared_state import runtime_config as _runtime_config
@@ -413,6 +416,10 @@ async def _alert_promotion_deploy_failed(
         aggregate_deploy_failure_reason or version.deploy_failure_reason or "unknown"
     )
     _reason_text = {
+        PENDING_OPERATOR_ACTIVATION_REASON: (
+            "the promoted version is awaiting operator activation on the local "
+            "control plane"
+        ),
         "no_new_revision": (
             "no new healthy production revision booted within the confirmation window"
         ),
@@ -432,6 +439,19 @@ async def _alert_promotion_deploy_failed(
         "halted": "the deploy was HALTED after the promotion",
         "sha_mismatch": ("the live serving SHA does not match the promoted SHA"),
     }.get(reason, reason)
+    _is_activation_pending = reason == PENDING_OPERATOR_ACTIVATION_REASON
+    _resolution_text = (
+        "Approve activation so the local control plane can run the promoted "
+        "revision."
+        if _is_activation_pending
+        else "Investigate the deploy / roll forward a fix."
+    )
+    _outcome_text = (
+        "The promotion is awaiting activation and is not yet live."
+        if _is_activation_pending
+        else "The promotion did NOT ship — the version is flagged deploy_failed "
+        "and must not be treated as live."
+    )
     _artifact_gap = summarize_required_artifact_gap(artifact_evidence)
     _artifact_text = f" Aggregate evidence: {_artifact_gap}." if _artifact_gap else ""
 
@@ -445,9 +465,8 @@ async def _alert_promotion_deploy_failed(
                 f"Release v{version.version_number} merged to the promotion "
                 f"target (promoted_sha={(version.promoted_sha or '')[:12] or '?'}) "
                 f"but its deploy is NOT serving: {_reason_text} "
-                f"(reason={reason}). The promotion did NOT ship — the version is "
-                f"flagged deploy_failed and must not be treated as live. "
-                f"Investigate the deploy / roll forward a fix.{_artifact_text}"
+                f"(reason={reason}). {_outcome_text} {_resolution_text}"
+                f"{_artifact_text}"
             ),
         )
     )
@@ -461,7 +480,7 @@ async def _alert_promotion_deploy_failed(
             (
                 f"v{version.version_number} promoted to the production branch but "
                 f"its deploy never confirmed serving ({_reason_text}). This "
-                f"promotion did NOT ship; the version is flagged deploy_failed."
+                f"{_outcome_text} {_resolution_text}"
                 + (f" {_artifact_gap}." if _artifact_gap else "")
             ),
             extra={

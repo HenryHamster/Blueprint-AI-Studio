@@ -174,9 +174,8 @@ from app.max_plan_pool import (  # noqa: F401
 
 # Current revision from Cloud Run (set on startup)
 _current_revision: str = os.getenv("K_REVISION", "local-dev")
-# Default SHA; overwritten at startup by resolve_deployed_sha() when running on
-# Cloud Run (DEPLOY_SHA is never set by the deploy pipeline, so this is "unknown"
-# until _init_deployment_state resolves the real serving SHA from the revision).
+# Default SHA; the local API and worker services stamp DEPLOY_SHA from the
+# release manifest, and startup still resolves the real serving SHA when needed.
 _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
 
 # When this process actually started serving the current revision — captured
