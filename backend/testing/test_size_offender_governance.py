@@ -21,8 +21,10 @@ import pytest
 from sqlmodel import select
 
 from app import hotfix_backmerge as hb
+from app import release_qualifier as rq
 from app import size_limit_policy as slp
 from app.models import Alert, Project
+from testing import check_size_limits as csl
 from app.size_limit_policy import (
     CHRONIC_BUMP_THRESHOLD,
     CHRONIC_WINDOW_DAYS,
@@ -106,6 +108,93 @@ async def _alerts_for(db_session, project_id) -> list[Alert]:
         .scalars()
         .all()
     )
+
+
+def _write_lines(path: Path, count: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(f"line {i}" for i in range(count)) + "\n")
+
+
+def test_self_heal_clamps_governed_release_qualifier_cap(tmp_path, mocker):
+    """The real fix path honors release_qualifier.py's declared cap relationship."""
+    repo_root = Path(__file__).parents[2]
+    limits_path = tmp_path / "module_size_limits.json"
+    limits_path.write_text(
+        json.dumps(
+            {
+                "_doc": "fixture",
+                "backend": {"release_qualifier.py": 10300},
+            }
+        )
+        + "\n"
+    )
+
+    # A generic 15% bump for the current 10330-line file would be 11900. The
+    # production fixer must discover and clamp to the module's 10500 constant.
+    mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[])
+    assert (
+        csl.main(
+            [
+                "--fix",
+                "--sections",
+                "backend",
+                "--repo-root",
+                str(repo_root),
+                "--json",
+                str(limits_path),
+            ]
+        )
+        == 0
+    )
+
+    limits = json.loads(limits_path.read_text())
+    cap = limits["backend"]["release_qualifier.py"]
+    count = len(
+        (repo_root / "backend/app/release_qualifier.py")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert cap == 10500
+    assert cap == rq._MODULE_SIZE_GOVERNANCE_CAP
+    assert count <= cap
+    assert cap - count < cap * 0.10
+
+
+def test_self_heal_removes_cap_for_deleted_file(tmp_path):
+    """--fix removes stale entries once a capped source file is deleted."""
+    repo_root = tmp_path / "repo"
+    source_root = repo_root / "backend" / "app"
+    _write_lines(source_root / "kept.py", 20)
+    limits_path = repo_root / "backend" / "testing" / "module_size_limits.json"
+    limits_path.parent.mkdir(parents=True)
+    limits_path.write_text(
+        json.dumps(
+            {
+                "_doc": "fixture",
+                "backend": {"deleted.py": 100, "kept.py": 100},
+            }
+        )
+        + "\n"
+    )
+
+    assert (
+        csl.main(
+            [
+                "--fix",
+                "--sections",
+                "backend",
+                "--repo-root",
+                str(repo_root),
+                "--json",
+                str(limits_path),
+            ]
+        )
+        == 0
+    )
+
+    limits = json.loads(limits_path.read_text())
+    assert "deleted.py" not in limits["backend"]
+    assert limits["backend"]["kept.py"] == 100
 
 
 # ---------------------------------------------------------------------------

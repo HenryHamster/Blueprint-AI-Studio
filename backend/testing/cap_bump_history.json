@@ -1367,6 +1367,12 @@
           "commit_date": "2026-07-06T03:30:49Z",
           "old_cap": 6200,
           "new_cap": 7200
+        },
+        {
+          "commit_sha": "52d9f90d5719b12583f5da6753a9f9bb7efd319f",
+          "commit_date": "2026-08-06T07:47:06Z",
+          "old_cap": 7200,
+          "new_cap": 8350
         }
       ],
       "rollup_management.py": [
@@ -2963,6 +2969,12 @@
           "commit_date": "2026-08-08T02:56:43.899076+00:00",
           "old_cap": 2650,
           "new_cap": 3150
+        },
+        {
+          "commit_sha": "e6bd88cf9fb56bf54bbfee26d4200833d081d560",
+          "commit_date": "2026-08-09T20:01:25Z",
+          "old_cap": 3150,
+          "new_cap": 3650
         }
       ],
       "routers/admin_project_tools.py": [
@@ -3073,6 +3085,12 @@
           "commit_date": "2026-06-06T21:56:23Z",
           "old_cap": 1650,
           "new_cap": 2000
+        },
+        {
+          "commit_sha": "f446d6e9c6cc2c995a0620cc92d7ee46dfc0546e",
+          "commit_date": "2026-07-26T13:20:32-07:00",
+          "old_cap": 2000,
+          "new_cap": 2350
         }
       ],
       "prompts/task-type-focus.ts": [
@@ -4097,8 +4115,14 @@
           "new_cap": 13650
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-09T23:03:30Z",
+          "commit_sha": "6a2dd99fb12ba581bca7c4e9a7f3de144a6ccca8",
+          "commit_date": "2026-08-09T23:04:28+00:00",
+          "old_cap": 13650,
+          "new_cap": 15750
+        },
+        {
+          "commit_sha": "bb0cc18d939a9e67428a8220be5d6df23c82b18b",
+          "commit_date": "2026-08-10T00:15:43+00:00",
           "old_cap": 13650,
           "new_cap": 15800
         }

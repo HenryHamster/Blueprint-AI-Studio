@@ -16,6 +16,7 @@ so the checker can import it without any install step or runtime context.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -26,7 +27,72 @@ from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 
 
-def bump_size_limit(current_size: int) -> int:
+class GovernanceCapExceededError(ValueError):
+    """Raised when a file is already beyond its declared governing cap."""
+
+
+_SECTION_SOURCE_DIRS = {
+    "backend": ("backend", "app"),
+    "agent": ("agent", "src"),
+    "frontend": ("admin-ui", "src"),
+    "testing": ("backend", "testing"),
+}
+
+
+def _governing_caps_for_module(
+    module_key: str, section: str, repo_root: str | None = None
+) -> list[int]:
+    """Discover integer ``*_SIZE_GOVERNANCE_CAP`` declarations for a module.
+
+    Governance belongs next to the source it protects. Reading the declaration
+    from the module's AST keeps this policy generic: a future module can opt in
+    by declaring its own governing constant without adding a filename-specific
+    branch here. Invalid or unavailable source is treated as having no
+    discovered relationship; the ordinary cap policy remains available.
+    """
+    root = repo_root or _REPO_ROOT
+    source_root_parts = _SECTION_SOURCE_DIRS.get(section)
+    if source_root_parts is None:
+        return []
+    source_root = os.path.abspath(os.path.join(root, *source_root_parts))
+    source_path = os.path.abspath(os.path.join(source_root, module_key))
+    try:
+        if os.path.commonpath((source_root, source_path)) != source_root:
+            return []
+        with open(source_path, encoding="utf-8") as source_file:
+            tree = ast.parse(source_file.read(), filename=source_path)
+    except (OSError, SyntaxError, UnicodeError, ValueError):
+        return []
+
+    caps: list[int] = []
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets.extend(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets.append(node.target)
+            value = node.value
+        else:
+            continue
+        if not isinstance(value, ast.Constant) or isinstance(value.value, bool):
+            continue
+        if not isinstance(value.value, int):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id.endswith(
+                "_SIZE_GOVERNANCE_CAP"
+            ):
+                caps.append(value.value)
+    return caps
+
+
+def bump_size_limit(
+    current_size: int,
+    module_key: str | None = None,
+    section: str = "backend",
+    repo_root: str | None = None,
+) -> int:
     """Return the new cap for a file that breached its size limit.
 
     Policy: the larger of ``current_size + 200`` (a flat floor so a small
@@ -37,7 +103,20 @@ def bump_size_limit(current_size: int) -> int:
     floor = current_size + 200
     proportional = int(current_size * 1.15)
     raw = max(floor, proportional)
-    return ((raw + 49) // 50) * 50
+    proposed = ((raw + 49) // 50) * 50
+    if module_key is None:
+        return proposed
+
+    governing_caps = _governing_caps_for_module(module_key, section, repo_root)
+    if not governing_caps:
+        return proposed
+    governing_cap = min(governing_caps)
+    if current_size > governing_cap:
+        raise GovernanceCapExceededError(
+            f"{section}/{module_key} is already {current_size} lines, beyond "
+            f"its governing cap {governing_cap}"
+        )
+    return min(proposed, governing_cap)
 
 
 def is_breach(count: int | None, cap: int | None) -> bool:
@@ -1205,6 +1284,7 @@ def classify_breach(
     section: str = "backend",
     *,
     override_chronic: bool = False,
+    repo_root: str | None = None,
 ) -> BreachVerdict:
     """Classify a size breach as routine or chronic-offender escalation.
 
@@ -1234,9 +1314,21 @@ def classify_breach(
         # (override_chronic=True) still grants the bump — it is the documented
         # human-approval escape hatch, identical to a verified chronic offender.
         if override_chronic:
+            try:
+                suggested_new_limit = bump_size_limit(
+                    current_size, module_key, section, repo_root
+                )
+            except GovernanceCapExceededError as exc:
+                return BreachVerdict(
+                    is_chronic=True,
+                    suggested_new_limit=None,
+                    bump_count=0,
+                    history_unavailable=True,
+                    reason=f"Refusing cap bump: {exc}.",
+                )
             return BreachVerdict(
                 is_chronic=True,
-                suggested_new_limit=bump_size_limit(current_size),
+                suggested_new_limit=suggested_new_limit,
                 bump_count=0,
                 history_unavailable=True,
                 reason=(
@@ -1270,9 +1362,22 @@ def classify_breach(
             ),
         )
 
+    try:
+        suggested_new_limit = bump_size_limit(
+            current_size, module_key, section, repo_root
+        )
+    except GovernanceCapExceededError as exc:
+        return BreachVerdict(
+            is_chronic=True,
+            suggested_new_limit=None,
+            bump_count=bump_count,
+            history_unavailable=False,
+            reason=f"Refusing cap bump: {exc}.",
+        )
+
     return BreachVerdict(
         is_chronic=chronic,
-        suggested_new_limit=bump_size_limit(current_size),
+        suggested_new_limit=suggested_new_limit,
         bump_count=bump_count,
         history_unavailable=False,
         reason=(

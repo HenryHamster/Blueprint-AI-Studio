@@ -14871,7 +14871,6 @@
   "testing/test_release_reconciliation.py::test_previously_deployed_sha_uses_prior_when_current_contains_promoted": 0.064,
   "testing/test_release_reconciliation.py::test_promotion_ci_selfheal_enabled_resolver": 1.47,
   "testing/test_release_reconciliation.py::test_summarize_armed_unconfirmed_promotion_still_gates": 3.25,
-  "testing/test_release_reconciliation.py::test_summarize_skips_absent_required_non_backend_provider": 0.156,
   "testing/test_release_reconciliation.py::test_summarize_unarmed_promotion_is_na_not_phantom_unconfirmed": 16.68,
   "testing/test_release_scoring.py::TestBlockerExecutionSite::test_candidate_side_blockers": 7.35,
   "testing/test_release_scoring.py::TestBlockerExecutionSite::test_criterion_coverage_gate_is_deployed_side": 15.56,

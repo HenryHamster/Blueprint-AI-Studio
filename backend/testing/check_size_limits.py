@@ -69,17 +69,27 @@ if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
 
-def _bump_size_limit(current_size: int) -> int:
+def _bump_size_limit(
+    current_size: int,
+    module_key: str | None = None,
+    section: str = "backend",
+    repo_root: str | None = None,
+) -> int:
     """Canonical bump policy, shared with the server endpoint.
 
     Imported lazily so the ``sys.path`` setup above runs before the import and
     the module stays runnable as a bare script from the repo root."""
     from app.size_limit_policy import bump_size_limit
 
-    return bump_size_limit(current_size)
+    return bump_size_limit(current_size, module_key, section, repo_root)
 
 
-def recommended_cap_for_line_count(current_size: int) -> int:
+def recommended_cap_for_line_count(
+    current_size: int,
+    module_key: str | None = None,
+    section: str = "backend",
+    repo_root: str | None = None,
+) -> int:
     """Return the canonical cap for a newly tracked source file.
 
     Keeping the uncapped-file path behind this named policy boundary makes the
@@ -87,7 +97,7 @@ def recommended_cap_for_line_count(current_size: int) -> int:
     It intentionally delegates to the same bump policy used for existing
     breaches, so adding a cap cannot create a second headroom rule.
     """
-    return _bump_size_limit(current_size)
+    return _bump_size_limit(current_size, module_key, section, repo_root)
 
 
 def _classify_breach(
@@ -96,6 +106,7 @@ def _classify_breach(
     section: str = "backend",
     *,
     override_chronic: bool = False,
+    repo_root: str | None = None,
 ):
     """Chronic-offender-aware breach verdict, shared with the server endpoint.
 
@@ -103,7 +114,11 @@ def _classify_breach(
     from app.size_limit_policy import classify_breach
 
     return classify_breach(
-        module_key, current_size, section, override_chronic=override_chronic
+        module_key,
+        current_size,
+        section,
+        override_chronic=override_chronic,
+        repo_root=repo_root,
     )
 
 
@@ -115,6 +130,7 @@ def classify_size_record(
     *,
     override_chronic: bool = False,
     with_verdict: bool = True,
+    repo_root: str | None = None,
 ) -> dict:
     """Content-injectable breach-and-bump classification for ONE counted record.
 
@@ -144,7 +160,11 @@ def classify_size_record(
     verdict = None
     if breach and with_verdict:
         verdict = _classify_breach(
-            rel, count, section, override_chronic=override_chronic
+            rel,
+            count,
+            section,
+            override_chronic=override_chronic,
+            repo_root=repo_root,
         )
     return {"rel": rel, "count": count, "cap": cap, "breach": breach, "verdict": verdict}
 
@@ -264,7 +284,13 @@ def iter_capped_paths(root: str, caps: dict) -> "list[tuple[str, str, int | None
     return [(rel, os.path.join(root, rel), cap) for rel, cap in caps.items()]
 
 
-def scan_section(caps: dict, root: str, section: str = "backend") -> list[dict]:
+def scan_section(
+    caps: dict,
+    root: str,
+    section: str = "backend",
+    *,
+    repo_root: str | None = None,
+) -> list[dict]:
     """Line-count every file in ``caps`` under ``root``.
 
     Returns one record per file: ``{rel, path, count, cap, breach, verdict}``.
@@ -279,7 +305,14 @@ def scan_section(caps: dict, root: str, section: str = "backend") -> list[dict]:
     records = []
     for rel, path, cap in iter_capped_paths(root, caps):
         count = count_lines(path) if os.path.isfile(path) else None
-        rec = classify_size_record(rel, count, cap, section, with_verdict=False)
+        rec = classify_size_record(
+            rel,
+            count,
+            cap,
+            section,
+            with_verdict=False,
+            repo_root=repo_root,
+        )
         rec["path"] = path
         records.append(rec)
     return records
@@ -350,7 +383,9 @@ def evaluate(
         if root is None:
             skipped.append(section)
             continue
-        checked[section] = scan_section(caps, root, section)
+        checked[section] = scan_section(
+            caps, root, section, repo_root=repo_root
+        )
     return checked, skipped
 
 
@@ -641,6 +676,12 @@ def main(argv: list[str] | None = None) -> int:
         for rec in checked.get(section, [])
         if rec["breach"]
     ]
+    stale_caps = [
+        (section, rec)
+        for section in args.sections
+        for rec in checked.get(section, [])
+        if rec["count"] is None
+    ]
 
     # Complementary guardrail: uncapped source files over the coverage threshold.
     # A capped-but-breached file is handled by ``breaches`` above; a file with no
@@ -675,12 +716,18 @@ def main(argv: list[str] | None = None) -> int:
         phantoms = phantom_ledger_records(
             repo_root=args.repo_root, ledger_path=ledger_path
         )
-        if not breaches and not uncapped and not phantoms:
+        if not breaches and not uncapped and not phantoms and not stale_caps:
             print("No breaches to fix — all scoped files within cap.")
             return 0
         chronic_skipped: list[tuple[str, dict, str]] = []
         bumped: list[tuple[str, dict, int]] = []
         added: list[tuple[str, dict, int]] = []
+        removed: list[tuple[str, dict]] = []
+        for section, rec in stale_caps:
+            section_caps = data.get(section)
+            if isinstance(section_caps, dict) and rec["rel"] in section_caps:
+                del section_caps[rec["rel"]]
+                removed.append((section, rec))
         for section, rec in breaches:
             verdict = classify_size_record(
                 rec["rel"],
@@ -688,6 +735,7 @@ def main(argv: list[str] | None = None) -> int:
                 rec["cap"],
                 section,
                 override_chronic=args.force_chronic,
+                repo_root=args.repo_root,
             )["verdict"]
             if verdict["is_chronic"] and not args.force_chronic:
                 print(
@@ -714,14 +762,16 @@ def main(argv: list[str] | None = None) -> int:
         for section, rec in uncapped:
             # Uncapped files have no bump history to check — they are new to the
             # tracking system, so they cannot be chronic offenders yet.
-            new_cap = recommended_cap_for_line_count(rec["count"])
+            new_cap = recommended_cap_for_line_count(
+                rec["count"], rec["rel"], section, args.repo_root
+            )
             data.setdefault(section, {})[rec["rel"]] = new_cap
             print(
                 f"[add]  {section}/{rec['rel']}: {rec['count']} lines — "
                 f"added cap {new_cap}"
             )
             added.append((section, rec, new_cap))
-        if bumped or added:
+        if bumped or added or removed:
             write_limits(args.json_path, data)
         if bumped or phantoms:
             # Keep the committed cap-bump-history ledger (the deployed
@@ -764,6 +814,10 @@ def main(argv: list[str] | None = None) -> int:
             actions.append(f"Added {len(added)} cap(s)")
         if actions:
             print(f"{'; '.join(actions)} in {args.json_path}.")
+        if removed:
+            print(
+                f"Removed {len(removed)} stale cap(s) from {args.json_path}."
+            )
         if chronic_skipped:
             print(
                 f"\n{len(chronic_skipped)} chronic offender(s) skipped — "

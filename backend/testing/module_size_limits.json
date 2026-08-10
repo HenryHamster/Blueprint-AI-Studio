@@ -295,6 +295,7 @@
     "test_metrics_integrity_sweep.py": 9200,
     "test_digest_metrics.py": 9050,
     "test_release_reconciliation.py": 8950,
+    "test_size_offender_governance.py": 1800,
     "test_salvage_bundle_standalone.py": 8600,
     "test_compute_experiment_completion.py": 7700,
     "test_pipeline.py": 7650,
