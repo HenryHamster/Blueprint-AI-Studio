@@ -1224,6 +1224,35 @@ def _run_local_migration(image_ref: str) -> None:
         raise RuntimeError(f"local migration exited {result}")
 
 
+def _preflight_local_migration_inputs(image_ref: str) -> None:
+    """Validate migration inputs that depend only on static host state.
+
+    The worker-secret validation (`_migration_worker_values`) is a pure function
+    of the on-disk worker role.env and secrets JSON, so a malformed secrets file
+    fails deterministically whether checked now or inside the post-stop
+    migration.  Running it here — BEFORE any Restart=always unit is stopped —
+    means such a defect aborts the release with ZERO downtime, instead of after
+    the control plane is already down.  (A too-strict version of that validation,
+    reached only inside the post-stop migration, is exactly what turned the v31
+    schema deploy into a control-plane outage.)  This mirrors the Namespace
+    `_run_local_migration` hands `cmd_migrate`; the call is side-effect free, so
+    the real migration re-runs it harmlessly.
+    """
+    import blueprint
+
+    blueprint._migration_worker_values(
+        argparse.Namespace(
+            local=True,
+            image=image_ref,
+            sha=None,
+            worker_env_file=None,
+            worker_secrets_file=None,
+            registry_credential_file=None,
+            network=None,
+        )
+    )
+
+
 def _schema_mismatch_refusal(
     image_id: str,
     image_label: str,
@@ -1471,6 +1500,10 @@ def release(image_ref: str, revision: str) -> Path:
     migration_choreography_started = False
     try:
         if migration_required:
+            # Fail deterministic, static-input defects (e.g. a malformed worker
+            # secrets file) BEFORE bounded downtime begins, so the control plane
+            # is never stopped for an error that a preflight can catch.
+            _preflight_local_migration_inputs(image_ref)
             # A schema-changing deploy cannot hot-swap: the old image rejects
             # the advanced DB and the candidate rejects the old DB.  Stop both
             # Restart=always units first, wait for each managed container to be
