@@ -24,7 +24,6 @@ from app import hotfix_backmerge as hb
 from app import release_qualifier as rq
 from app import size_limit_policy as slp
 from app.models import Alert, Project
-from testing import check_size_limits as csl
 from app.size_limit_policy import (
     CHRONIC_BUMP_THRESHOLD,
     CHRONIC_WINDOW_DAYS,
@@ -114,6 +113,157 @@ async def _alerts_for(db_session, project_id) -> list[Alert]:
 def _write_lines(path: Path, count: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(f"line {i}" for i in range(count)) + "\n")
+
+
+def _checker_repo(root: Path, *, source_exists: bool = True) -> Path:
+    """Create the minimal checker checkout used by baseline attribution tests."""
+    testing_dir = root / "backend" / "testing"
+    testing_dir.mkdir(parents=True)
+    (root / "backend" / "app").mkdir(parents=True)
+    (testing_dir / "module_size_limits.json").write_text(
+        json.dumps(
+            {"_doc": "fixture", "backend": {"deleted.py": 100}},
+            indent=2,
+        )
+        + "\n"
+    )
+    if source_exists:
+        _write_lines(root / "backend" / "app" / "deleted.py", 20)
+    return root
+
+
+def _ledger_finding(
+    *,
+    status: str,
+    sha: str = "deadbeef" * 5,
+) -> tuple:
+    if status == "phantom":
+        return (
+            "backend",
+            "deleted.py",
+            50,
+            100,
+            sha,
+            "commit's diff shows no recorded bump for this key/pair",
+        )
+    return (
+        "backend",
+        "deleted.py",
+        50,
+        100,
+        sha,
+        "2026-01-01T00:00:00+00:00",
+        status,
+    )
+
+
+def _run_checker(repo: Path, base: Path) -> int:
+    return csl.main(
+        [
+            "--json",
+            str(repo / "backend" / "testing" / "module_size_limits.json"),
+            "--repo-root",
+            str(repo),
+            "--base-root",
+            str(base),
+            "--sections",
+            "backend",
+        ]
+    )
+
+
+def test_checker_inherited_stale_cap_does_not_fail_unrelated_diff(tmp_path, capsys):
+    """A stale cap already present on base is advisory, not task-owned drift."""
+    repo = _checker_repo(tmp_path / "repo", source_exists=False)
+    base = _checker_repo(tmp_path / "base", source_exists=False)
+
+    assert _run_checker(repo, base) == 0
+    output = capsys.readouterr().out
+    assert "[pre-existing] backend/deleted.py" in output
+    assert "[stale-cap]" not in output
+
+
+def test_checker_stale_cap_introduced_by_diff_still_fails(tmp_path, capsys):
+    """Deleting a file on the task branch keeps the stale-cap finding blocking."""
+    repo = _checker_repo(tmp_path / "repo", source_exists=False)
+    base = _checker_repo(tmp_path / "base", source_exists=True)
+
+    assert _run_checker(repo, base) == 1
+    output = capsys.readouterr().out
+    assert "[stale-cap] backend/deleted.py" in output
+    assert "[pre-existing]" not in output
+
+
+@pytest.mark.parametrize("finding_kind", ["phantom", "absent"])
+def test_checker_inherited_ledger_finding_does_not_fail_unrelated_diff(
+    tmp_path, capsys, mocker, finding_kind
+):
+    """The same phantom or absent record on base is not blamed on this task."""
+    repo = _checker_repo(tmp_path / "repo")
+    base = _checker_repo(tmp_path / "base")
+    finding = _ledger_finding(
+        status=(
+            slp.LEDGER_BUMP_ABSENT
+            if finding_kind == "absent"
+            else "phantom"
+        )
+    )
+
+    def findings_for(*, repo_root, **_kwargs):
+        return [finding]
+
+    mocker.patch(
+        "app.size_limit_policy.phantom_ledger_records",
+        side_effect=(findings_for if finding_kind == "phantom" else lambda **_kwargs: []),
+    )
+    mocker.patch(
+        "app.size_limit_policy.missing_ledger_bump_records",
+        side_effect=(findings_for if finding_kind == "absent" else lambda **_kwargs: []),
+    )
+    mocker.patch("app.size_limit_policy._mainline_git_ref", return_value="main")
+    (repo / ".git").mkdir()
+    (base / ".git").mkdir()
+
+    assert _run_checker(repo, base) == 0
+    output = capsys.readouterr().out
+    marker = "[ledger-phantom]" if finding_kind == "phantom" else "[ledger-missing]"
+    assert "[pre-existing] backend/deleted.py" in output
+    assert marker not in output
+
+
+@pytest.mark.parametrize("finding_kind", ["phantom", "absent"])
+def test_checker_new_ledger_finding_still_fails(tmp_path, capsys, mocker, finding_kind):
+    """A ledger finding absent from base remains attributed to this task."""
+    repo = _checker_repo(tmp_path / "repo")
+    base = _checker_repo(tmp_path / "base")
+    finding = _ledger_finding(
+        status=(
+            slp.LEDGER_BUMP_ABSENT
+            if finding_kind == "absent"
+            else "phantom"
+        )
+    )
+
+    def findings_for(*, repo_root, **_kwargs):
+        return [finding] if Path(repo_root) == repo else []
+
+    mocker.patch(
+        "app.size_limit_policy.phantom_ledger_records",
+        side_effect=(findings_for if finding_kind == "phantom" else lambda **_kwargs: []),
+    )
+    mocker.patch(
+        "app.size_limit_policy.missing_ledger_bump_records",
+        side_effect=(findings_for if finding_kind == "absent" else lambda **_kwargs: []),
+    )
+    mocker.patch("app.size_limit_policy._mainline_git_ref", return_value="main")
+    (repo / ".git").mkdir()
+    (base / ".git").mkdir()
+
+    assert _run_checker(repo, base) == 1
+    output = capsys.readouterr().out
+    marker = "[ledger-phantom]" if finding_kind == "phantom" else "[ledger-missing]"
+    assert marker in output
+    assert "[pre-existing]" not in output
 
 
 def test_self_heal_clamps_governed_release_qualifier_cap(tmp_path, mocker):
@@ -636,9 +786,8 @@ def test_parse_bump_history_raises_on_git_failure(real_git_checkout):
     with patch(
         "app.size_limit_policy.subprocess.run",
         side_effect=FileNotFoundError("git not found"),
-    ):
-        with pytest.raises(BumpHistoryUnavailableError):
-            parse_bump_history("raises_git.py", "backend")
+    ), pytest.raises(BumpHistoryUnavailableError):
+        parse_bump_history("raises_git.py", "backend")
 
 
 def test_parse_bump_history_raises_on_nonzero_git_exit(real_git_checkout):
@@ -649,9 +798,10 @@ def test_parse_bump_history_raises_on_nonzero_git_exit(real_git_checkout):
     result = subprocess.CompletedProcess(
         args=[], returncode=128, stdout="", stderr="fatal: bad revision"
     )
-    with patch("app.size_limit_policy.subprocess.run", return_value=result):
-        with pytest.raises(BumpHistoryUnavailableError):
-            parse_bump_history("raises_rc.py", "backend")
+    with patch("app.size_limit_policy.subprocess.run", return_value=result), pytest.raises(
+        BumpHistoryUnavailableError
+    ):
+        parse_bump_history("raises_rc.py", "backend")
 
 
 def test_classify_breach_git_read_failure_refuses_bump(real_git_checkout):
@@ -1113,7 +1263,7 @@ def test_phantom_ledger_records_flags_wrong_old_cap(tmp_path, mocker):
         },
     )
     assert len(phantoms) == 1
-    section, key, old_cap, new_cap, sha, reason = phantoms[0]
+    section, key, old_cap, new_cap, _sha, reason = phantoms[0]
     assert (section, key, old_cap, new_cap) == ("backend", "m.py", 50, 200)
     assert "no recorded bump" in reason
 

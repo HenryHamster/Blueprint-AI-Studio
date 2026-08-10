@@ -481,6 +481,116 @@ def _split_preexisting(
     return blocking, preexisting
 
 
+def _split_preexisting_records(
+    offenders: list,
+    base_identities: set[tuple] | None,
+    identity,
+) -> tuple[list, list]:
+    """Partition non-size findings using exact identities from the base.
+
+    ``None`` means the baseline could not establish this finding class. That
+    is deliberately different from an empty set: unavailable evidence must
+    fail closed, while an established clean baseline can excuse nothing.
+    """
+    if base_identities is None:
+        return offenders, []
+    blocking = [
+        record for record in offenders if identity(record) not in base_identities
+    ]
+    preexisting = [
+        record for record in offenders if identity(record) in base_identities
+    ]
+    return blocking, preexisting
+
+
+def _ledger_record_identity(record: tuple) -> tuple:
+    """Return the stable fields that identify one ledger finding."""
+    return tuple(record[:5])
+
+
+def _collect_baseline_governance_findings(
+    base_root: str,
+    sections: list[str],
+    *,
+    json_path: str,
+    repo_root: str,
+) -> tuple[set[tuple], set[tuple] | None, set[tuple] | None, str | None]:
+    """Collect stale-cap and ledger findings from a base checkout.
+
+    Size offenders have a line-count baseline, but stale caps and ledger
+    findings are discrete records. They therefore need exact base identities.
+    Ledger identities are unavailable when the base has no usable mainline git
+    ref; returning ``None`` for those classes preserves fail-closed behavior.
+    """
+    relative_json = os.path.relpath(
+        os.path.abspath(json_path), os.path.abspath(repo_root)
+    )
+    if relative_json == os.pardir or relative_json.startswith(
+        os.pardir + os.sep
+    ):
+        return (
+            set(),
+            None,
+            None,
+            f"limits JSON {json_path} is outside repo root {repo_root}",
+        )
+    base_json = os.path.join(base_root, relative_json)
+    try:
+        base_data = load_limits(base_json)
+    except (OSError, ValueError) as exc:
+        return set(), None, None, f"cannot read {base_json}: {exc}"
+
+    checked, _skipped = evaluate(
+        base_data, sections, base_root, use_env_overrides=False
+    )
+    stale = {
+        (section, rec["rel"])
+        for section, records in checked.items()
+        for rec in records
+        if rec["count"] is None
+    }
+
+    from app.size_limit_policy import (
+        LEDGER_BUMP_ABSENT,
+        _mainline_git_ref,
+        missing_ledger_bump_records,
+        phantom_ledger_records,
+    )
+
+    if not os.path.isdir(os.path.join(base_root, ".git")):
+        return stale, None, None, f"{base_root} is not a git checkout"
+    try:
+        ref = _mainline_git_ref(base_root)
+    except Exception as exc:
+        return stale, None, None, f"could not resolve the base mainline ref: {exc}"
+    if ref == "HEAD":
+        return stale, None, None, "base checkout has no mainline branch"
+
+    base_ledger = os.path.join(
+        base_root,
+        os.path.dirname(relative_json),
+        "cap_bump_history.json",
+    )
+    phantoms = phantom_ledger_records(
+        repo_root=base_root, ledger_path=base_ledger
+    )
+    missing = missing_ledger_bump_records(
+        repo_root=base_root,
+        caps_json_path=base_json,
+        ledger_path=base_ledger,
+    )
+    return (
+        stale,
+        {_ledger_record_identity(record) for record in phantoms},
+        {
+            _ledger_record_identity(record)
+            for record in missing
+            if record[6] == LEDGER_BUMP_ABSENT
+        },
+        None,
+    )
+
+
 def _mainline_limits_via_git(repo_root: str) -> "tuple[dict | None, str | None]":
     """Read ``module_size_limits.json`` at the MAINLINE ancestry tip.
 
@@ -504,7 +614,7 @@ def _mainline_limits_via_git(repo_root: str) -> "tuple[dict | None, str | None]"
         return None, f"{repo_root} is not a git checkout"
     try:
         ref = _mainline_git_ref(repo_root)
-    except Exception as exc:  # noqa: BLE001 — a probe; degrade to a clear skip
+    except Exception as exc:
         return None, f"could not resolve the mainline ref: {exc}"
     if ref == "HEAD":
         return None, "no mainline branch present (ref helper fell back to HEAD)"
@@ -522,7 +632,7 @@ def _mainline_limits_via_git(repo_root: str) -> "tuple[dict | None, str | None]"
             timeout=10,
             cwd=repo_root,
         )
-    except Exception as exc:  # noqa: BLE001 — a probe; degrade to a clear skip
+    except Exception as exc:
         return None, f"git show {ref}:.../module_size_limits.json raised: {exc}"
     if result.returncode != 0:
         return None, (
@@ -572,7 +682,7 @@ def detect_unjustified_cap_raises(
     only guards the raising direction. A module absent from the baseline (a NEW
     cap for a previously-uncapped file) is not a raise either.
     """
-    raises: "list[tuple[str, str, int, int]]" = []
+    raises: list[tuple[str, str, int, int]] = []
     for section in sections:
         current_caps = data.get(section) or {}
         baseline_caps = mainline_data.get(section) or {}
@@ -963,6 +1073,28 @@ def main(argv: list[str] | None = None) -> int:
                 "offender as introduced by this change"
             )
 
+    base_stale_caps: set[tuple] = set()
+    base_phantom_identities: set[tuple] | None = set()
+    base_absent_identities: set[tuple] | None = set()
+    if args.base_root:
+        (
+            base_stale_caps,
+            base_phantom_identities,
+            base_absent_identities,
+            governance_baseline_reason,
+        ) = _collect_baseline_governance_findings(
+            args.base_root,
+            args.sections,
+            json_path=args.json_path,
+            repo_root=args.repo_root,
+        )
+        if governance_baseline_reason:
+            print(
+                f"[baseline] governance findings unavailable "
+                f"({governance_baseline_reason}) — treating every stale or "
+                "ledger finding as introduced by this change"
+            )
+
     exit_code = 0
     blocking_breaches, preexisting_breaches = _split_preexisting(
         breaches, base_breached
@@ -980,8 +1112,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         exit_code = 1
 
-    if stale_caps:
-        for section, rec in stale_caps:
+    blocking_stale_caps, preexisting_stale_caps = _split_preexisting_records(
+        stale_caps,
+        base_stale_caps,
+        lambda record: (record[0], record[1]["rel"]),
+    )
+    if blocking_stale_caps:
+        for section, rec in blocking_stale_caps:
             print(
                 f"[stale-cap] {section}/{rec['rel']}: cap {rec['cap']} targets "
                 "a missing file — run with --fix to remove the stale cap and "
@@ -1014,6 +1151,14 @@ def main(argv: list[str] | None = None) -> int:
         ("uncapped", section, rec, base_count)
         for section, rec, base_count in preexisting_uncapped
     ]
+    preexisting_count = len(preexisting)
+    for section, rec in preexisting_stale_caps:
+        print(
+            f"[pre-existing] {section}/{rec['rel']}: stale cap targets a missing "
+            "file on the base branch — inherited from the base branch, not "
+            "introduced by this change"
+        )
+    preexisting_count += len(preexisting_stale_caps)
     if preexisting:
         for kind, section, rec, base_count in preexisting:
             print(
@@ -1079,19 +1224,29 @@ def main(argv: list[str] | None = None) -> int:
     phantoms = phantom_ledger_records(
         repo_root=args.repo_root, ledger_path=ledger_path
     )
-    if phantoms:
-        for section, key, old_cap, new_cap, commit_sha, reason in phantoms:
+    blocking_phantoms, preexisting_phantoms = _split_preexisting_records(
+        phantoms, base_phantom_identities, _ledger_record_identity
+    )
+    if blocking_phantoms:
+        for section, key, old_cap, new_cap, commit_sha, reason in blocking_phantoms:
             print(
                 f"[ledger-phantom] {section}/{key}: ledger records "
                 f"{old_cap} -> {new_cap} at {commit_sha[:12]} — {reason}"
             )
         print(
-            f"\n{len(phantoms)} phantom cap-bump-history record(s) — records the "
+            f"\n{len(blocking_phantoms)} phantom cap-bump-history record(s) — records the "
             "mainline git history cannot justify. Run this checker with --fix to "
             f"rebuild {os.path.basename(ledger_path)} from git (pruning phantoms), "
             "or remove the listed records from the ledger."
         )
         exit_code = 1
+    for section, key, old_cap, new_cap, commit_sha, _reason in preexisting_phantoms:
+        print(
+            f"[pre-existing] {section}/{key}: ledger phantom {old_cap} -> "
+            f"{new_cap} at {commit_sha[:12]} — inherited from the base branch, "
+            "not introduced by this change"
+        )
+    preexisting_count += len(preexisting_phantoms)
 
     # Pending attribution is NOT drift: the ledger holds the bump, only its
     # provenance is still the placeholder every pre-commit auto-bump must write.
@@ -1119,7 +1274,10 @@ def main(argv: list[str] | None = None) -> int:
             f"the observed provenance into {os.path.basename(ledger_path)}."
         )
 
-    if absent_ledger_records:
+    blocking_absent, preexisting_absent = _split_preexisting_records(
+        absent_ledger_records, base_absent_identities, _ledger_record_identity
+    )
+    if blocking_absent:
         for (
             section,
             rel,
@@ -1128,21 +1286,33 @@ def main(argv: list[str] | None = None) -> int:
             commit_sha,
             _commit_date,
             _status,
-        ) in absent_ledger_records:
+        ) in blocking_absent:
             print(
                 f"[ledger-missing] {section}/{rel}: git records {old_cap} -> "
                 f"{new_cap} at {commit_sha[:12]}, but cap-bump-history has no "
                 "matching evidence"
             )
         print(
-            f"\n{len(absent_ledger_records)} git-recorded cap bump(s) are "
+            f"\n{len(blocking_absent)} git-recorded cap bump(s) are "
             "missing from the ledger. Run this checker with --fix to rebuild "
             f"{os.path.basename(ledger_path)}."
         )
         exit_code = 1
+    for section, rel, old_cap, new_cap, commit_sha, _date, _status in preexisting_absent:
+        print(
+            f"[pre-existing] {section}/{rel}: ledger missing {old_cap} -> "
+            f"{new_cap} at {commit_sha[:12]} — inherited from the base branch, "
+            "not introduced by this change"
+        )
+    preexisting_count += len(preexisting_absent)
 
-    if exit_code == 0 and not preexisting:
+    if exit_code == 0 and not preexisting and preexisting_count == 0:
         print("All scoped files within their size caps.")
+    elif preexisting_count:
+        print(
+            f"\n{preexisting_count} pre-existing governance finding(s) inherited "
+            "from the base branch — NOT blocking this change."
+        )
     return exit_code
 
 
