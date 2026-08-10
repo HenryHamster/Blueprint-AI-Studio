@@ -287,7 +287,7 @@
     "test_digest.py": 12250,
     "test_diagnostics.py": 1605,
     "test_task_lifecycle.py": 12100,
-    "test_acceptance_criteria.py": 15800,
+    "test_acceptance_criteria.py": 13650,
     "test_acceptance_criteria__walkthrough.py": 903,
     "test_playbook_sr_metrics.py": 11650,
     "test_direction_outcomes.py": 11600,
