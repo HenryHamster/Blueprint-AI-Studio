@@ -1983,6 +1983,12 @@
           "commit_date": "2026-06-23T20:38:38Z",
           "old_cap": 2000,
           "new_cap": 2350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-10T01:42:55.221349+00:00",
+          "old_cap": 2350,
+          "new_cap": 2750
         }
       ],
       "sr_analytics_catch_rate.py": [
@@ -2409,6 +2415,12 @@
           "commit_date": "2026-07-12T07:19:38Z",
           "old_cap": 2450,
           "new_cap": 3050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-10T01:42:55.221349+00:00",
+          "old_cap": 3050,
+          "new_cap": 3600
         }
       ],
       "runtime_config_state.py": [
