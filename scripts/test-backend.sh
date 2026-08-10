@@ -429,6 +429,24 @@ if [ "$USE_DOCKER" = "1" ] && [ -d .. ]; then
   ENV_ARGS="$ENV_ARGS -v ${REPO_HOST_PATH}:/repo:ro"
 fi
 
+# The static release guard supplies a host-side temporary JUnit path. Docker
+# containers cannot write to that path unless its directory is mounted, and
+# the container also needs the remapped path in its environment. Keep the
+# caller's filename so the host can parse the report after `docker run` exits.
+if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
+  STATIC_GUARD_OUTPUT_DIR="$(dirname -- "$BLUEPRINT_STATIC_GUARD_JUNIT")"
+  STATIC_GUARD_OUTPUT_NAME="$(basename -- "$BLUEPRINT_STATIC_GUARD_JUNIT")"
+  [ -d "$STATIC_GUARD_OUTPUT_DIR" ] || {
+    echo "ERROR: static guard JUnit output directory is unavailable: $STATIC_GUARD_OUTPUT_DIR" >&2
+    exit 2
+  }
+  if [ "$USE_DOCKER" = "1" ]; then
+    ENV_ARGS="$ENV_ARGS -v ${STATIC_GUARD_OUTPUT_DIR}:/static-guard-output"
+    BLUEPRINT_STATIC_GUARD_JUNIT="/static-guard-output/${STATIC_GUARD_OUTPUT_NAME}"
+    ENV_ARGS="$ENV_ARGS -e BLUEPRINT_STATIC_GUARD_JUNIT=$BLUEPRINT_STATIC_GUARD_JUNIT"
+  fi
+fi
+
 ENV_VARS="DATABASE_URL=${PG_DSN:-postgresql+asyncpg://x:x@localhost/x} \
   USE_TEST_POSTGRES=$([ "$USE_POSTGRES" = "1" ] && echo true || echo false) \
   GCP_PROJECT_ID=test-project \

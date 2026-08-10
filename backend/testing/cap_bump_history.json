@@ -1117,6 +1117,12 @@
           "commit_date": "2026-07-12T18:13:52Z",
           "old_cap": 3350,
           "new_cap": 3900
+        },
+        {
+          "commit_sha": "b339eed08d4a0d14078cebe5dc5898a4822e8d21",
+          "commit_date": "2026-08-07T08:50:56+00:00",
+          "old_cap": 3900,
+          "new_cap": 4550
         }
       ],
       "autonomous_research_residual.py": [
@@ -2257,6 +2263,12 @@
           "commit_date": "2026-06-14T22:47:48Z",
           "old_cap": 1850,
           "new_cap": 2250
+        },
+        {
+          "commit_sha": "b339eed08d4a0d14078cebe5dc5898a4822e8d21",
+          "commit_date": "2026-08-07T08:50:56+00:00",
+          "old_cap": 2250,
+          "new_cap": 2650
         }
       ],
       "problem_model.py": [
@@ -2653,8 +2665,8 @@
           "new_cap": 2200
         },
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T09:54:02.855012+00:00",
+          "commit_sha": "e940798acd038550d776afbe340a997e33f99489",
+          "commit_date": "2026-08-08T10:27:07+00:00",
           "old_cap": 2200,
           "new_cap": 2300
         }
@@ -2741,8 +2753,8 @@
           "new_cap": 2050
         },
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T06:52:49.741498+00:00",
+          "commit_sha": "e940798acd038550d776afbe340a997e33f99489",
+          "commit_date": "2026-08-08T10:27:07+00:00",
           "old_cap": 2050,
           "new_cap": 2400
         }
@@ -2953,8 +2965,8 @@
           "new_cap": 2650
         },
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T02:56:43.899076+00:00",
+          "commit_sha": "b6ecafa899a649fa8455b2805b7222c15ebd7d89",
+          "commit_date": "2026-08-08T03:08:16+00:00",
           "old_cap": 2650,
           "new_cap": 3150
         },
@@ -3053,8 +3065,8 @@
           "new_cap": 2100
         },
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T09:54:02.855012+00:00",
+          "commit_sha": "e940798acd038550d776afbe340a997e33f99489",
+          "commit_date": "2026-08-08T10:27:07+00:00",
           "old_cap": 2100,
           "new_cap": 2500
         }
@@ -4285,40 +4297,40 @@
       ],
       "test_strategic_session_messages.py": [
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T03:58:05.053929+00:00",
+          "commit_sha": "1e5f78062654cb289b02ba9ba86fe78b41ed16c8",
+          "commit_date": "2026-08-07T20:58:05-07:00",
           "old_cap": 1950,
           "new_cap": 2250
         }
       ],
       "test_rollup_management.py": [
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T13:14:31.213062+00:00",
+          "commit_sha": "ce711b78a5445705a44e6c36023ac941b7299f92",
+          "commit_date": "2026-08-08T14:04:37+00:00",
           "old_cap": 5350,
           "new_cap": 6250
         }
       ],
       "test_discovery_review.py": [
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T13:14:31.213062+00:00",
+          "commit_sha": "ce711b78a5445705a44e6c36023ac941b7299f92",
+          "commit_date": "2026-08-08T14:04:37+00:00",
           "old_cap": 1807,
           "new_cap": 2100
         }
       ],
       "test_dependency_contracts.py": [
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T18:13:51.043279+00:00",
+          "commit_sha": "5b97819a25d4a7b5bc96898280533338c565f341",
+          "commit_date": "2026-08-08T19:11:48+00:00",
           "old_cap": 1616,
           "new_cap": 2000
         }
       ],
       "test_admin_routers__version_lifecycle.py": [
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T20:45:46.483058+00:00",
+          "commit_sha": "4563da0dc6816e09a6c043495367890542be094e",
+          "commit_date": "2026-08-08T21:15:34+00:00",
           "old_cap": 4800,
           "new_cap": 5600
         }

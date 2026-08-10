@@ -80,10 +80,17 @@ def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.Co
     return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, check=False)
 
 
-def _junit_failures(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    root = ET.parse(path).getroot()
+def _junit_failures(path: Path, *, label: str) -> dict[str, str]:
+    if not path.is_file():
+        raise RuntimeError(f"{label} JUnit report is missing: {path}")
+    if path.stat().st_size == 0:
+        raise RuntimeError(f"{label} JUnit report is empty: {path}")
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise RuntimeError(f"{label} JUnit report is not parseable: {path}: {exc}") from exc
+    if not any(element.tag == "testcase" for element in root.iter()):
+        raise RuntimeError(f"{label} JUnit report has no testcase records: {path}")
     failures: dict[str, str] = {}
     for case in root.iter("testcase"):
         failure = case.find("failure")
@@ -181,30 +188,39 @@ def main(argv: list[str] | None = None) -> int:
         current_junit = Path(temp_dir) / "current.xml"
         base_result = _run_static_corpus(base_root, base_junit)
         current_result = _run_static_corpus(repo, current_junit)
-        base_failures = _junit_failures(base_junit)
-        current_failures = _junit_failures(current_junit)
-        new_failures = {
-            key: detail
-            for key, detail in current_failures.items()
-            if key not in base_failures or base_failures[key] != detail
-        }
-        if current_result.returncode != 0 and not new_failures and not current_failures:
-            # A harness/import failure has no testcase identity. It is still a
-            # real failure, and must not be converted into a green result.
-            new_failures = {"<harness>": current_result.stderr or current_result.stdout}
-        if new_failures:
-            print("[static guard] standalone static corpus FAILED for this diff")
-            print(f"[static guard] new failures: {json.dumps(sorted(new_failures))}")
+        try:
+            base_failures = _junit_failures(base_junit, label="base")
+            current_failures = _junit_failures(current_junit, label="current")
+        except RuntimeError as exc:
+            print(f"[static guard] ERROR: cannot attribute standalone corpus: {exc}", file=sys.stderr)
+            print(base_result.stdout, end="")
+            print(base_result.stderr, end="", file=sys.stderr)
             print(current_result.stdout, end="")
             print(current_result.stderr, end="", file=sys.stderr)
-            failures.append("standalone static corpus")
-        elif current_result.returncode != 0 and base_result.returncode == 0:
-            print("[static guard] standalone static corpus FAILED")
-            print(current_result.stdout, end="")
-            print(current_result.stderr, end="", file=sys.stderr)
-            failures.append("standalone static corpus")
+            failures.append("standalone static corpus attribution")
         else:
-            print("[static guard] standalone static corpus OK (no new failures vs base)")
+            new_failures = {
+                key: detail
+                for key, detail in current_failures.items()
+                if key not in base_failures or base_failures[key] != detail
+            }
+            if current_result.returncode != 0 and not new_failures and not current_failures:
+                # A harness/import failure has no testcase identity. It is still a
+                # real failure, and must not be converted into a green result.
+                new_failures = {"<harness>": current_result.stderr or current_result.stdout}
+            if new_failures:
+                print("[static guard] standalone static corpus FAILED for this diff")
+                print(f"[static guard] new failures: {json.dumps(sorted(new_failures))}")
+                print(current_result.stdout, end="")
+                print(current_result.stderr, end="", file=sys.stderr)
+                failures.append("standalone static corpus")
+            elif current_result.returncode != 0 and base_result.returncode == 0:
+                print("[static guard] standalone static corpus FAILED")
+                print(current_result.stdout, end="")
+                print(current_result.stderr, end="", file=sys.stderr)
+                failures.append("standalone static corpus")
+            else:
+                print("[static guard] standalone static corpus OK (no new failures vs base)")
 
     if failures:
         print(f"[static guard] FAIL — {', '.join(failures)}", file=sys.stderr)

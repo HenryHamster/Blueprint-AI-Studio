@@ -8,6 +8,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -81,3 +83,151 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
     output = result.stdout + result.stderr
     assert "module size" in output.lower()
     assert "size_probe.py" in output
+
+
+def _prepare_docker_attribution_repo(tmp_path: Path, current_state: str) -> tuple[Path, Path]:
+    """Build a tiny repository that exercises the real Docker harness path."""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "backend" / "testing").mkdir(parents=True)
+    (tmp_path / "backend" / "app").mkdir(parents=True)
+    for relative in (
+        "static_release_guard.py",
+        "test-backend.sh",
+        "backend-test-route.sh",
+    ):
+        source = REPO_ROOT / "scripts" / relative
+        shutil.copy2(source, tmp_path / "scripts" / relative)
+    shutil.copy2(
+        REPO_ROOT / "backend" / "testing" / "check_size_limits.py",
+        tmp_path / "backend" / "testing" / "check_size_limits.py",
+    )
+    (tmp_path / "backend" / "requirements.txt").write_text("pytest\n")
+    (tmp_path / "backend" / "Dockerfile").write_text("FROM scratch\n")
+    shutil.copy2(
+        REPO_ROOT / "backend" / "app" / "size_limit_policy.py",
+        tmp_path / "backend" / "app" / "size_limit_policy.py",
+    )
+    (tmp_path / "backend" / "testing" / "module_size_limits.json").write_text(
+        '{"backend": {}, "agent": {}, "frontend": {}}\n'
+    )
+    (tmp_path / "attribution_state").write_text("preexisting\n")
+    for relative in (
+        "scripts/static_release_guard.py",
+        "scripts/test-backend.sh",
+        "scripts/backend-test-route.sh",
+    ):
+        os.chmod(tmp_path / relative, 0o755)
+
+    docker_bin = tmp_path / "fake-bin" / "docker"
+    docker_bin.parent.mkdir()
+    docker_bin.write_text(
+        r'''#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  info|pull|build) exit 0 ;;
+  image) exit 1 ;;
+  run)
+    repo_root=""
+    output_root=""
+    junit=""
+    image_seen=0
+    command=()
+    i=2
+    while [ "$i" -le "$#" ]; do
+      arg="${!i}"
+      case "$arg" in
+        --rm) ;;
+        -v)
+          i=$((i + 1))
+          mount="${!i}"
+          host="${mount%%:*}"
+          target="${mount#*:}"
+          target="${target%%:*}"
+          if [ "$target" = "/repo" ]; then repo_root="$host"; fi
+          if [ "$target" = "/static-guard-output" ]; then output_root="$host"; fi
+          ;;
+        -e)
+          i=$((i + 1))
+          value="${!i}"
+          case "$value" in BLUEPRINT_STATIC_GUARD_JUNIT=*) junit="${value#*=}" ;; esac
+          ;;
+        *)
+          if [ "$image_seen" -eq 0 ]; then
+            image_seen=1
+          else
+            command+=("$arg")
+          fi
+          ;;
+      esac
+      i=$((i + 1))
+    done
+    is_pytest=0
+    for arg in "${command[@]}"; do
+      [ "$arg" = "pytest" ] && is_pytest=1
+    done
+    if [ "$is_pytest" -eq 0 ]; then exit 0; fi
+    # Before the fix, the command receives a host /tmp path but that path is
+    # not mounted. Model Docker's disposable container filesystem by refusing
+    # to create a host report unless the harness supplies the output mount.
+    [ -n "$junit" ] && [ -n "$output_root" ] || exit 0
+    state="$(cat "$repo_root/attribution_state")"
+    report="$output_root/$(basename "$junit")"
+    if [ "$state" = "preexisting" ]; then
+      cat >"$report" <<'XML'
+<testsuite tests="1" failures="1"><testcase classname="guard" name="preexisting"><failure message="preexisting">preexisting</failure></testcase></testsuite>
+XML
+      exit 1
+    fi
+    cat >"$report" <<'XML'
+<testsuite tests="2" failures="2"><testcase classname="guard" name="preexisting"><failure message="preexisting">preexisting</failure></testcase><testcase classname="guard" name="newly_introduced"><failure message="newly introduced">newly introduced</failure></testcase></testsuite>
+XML
+    exit 1
+    ;;
+  *) exit 0 ;;
+esac
+'''
+    )
+    os.chmod(docker_bin, 0o755)
+
+    _git(tmp_path, "init", "-b", "automain")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "base")
+    _git(tmp_path, "switch", "-c", "task")
+    (tmp_path / "attribution_state").write_text(f"{current_state}\n")
+    with (tmp_path / "scripts" / "static_release_guard.py").open("a") as guard:
+        guard.write("# task changes static-guard path\n")
+    _git(tmp_path, "add", "attribution_state", "scripts/static_release_guard.py")
+    _git(tmp_path, "commit", "-m", "change static corpus outcome")
+    return docker_bin.parent, tmp_path
+
+
+@pytest.mark.parametrize("current_state, should_fail", [("preexisting", False), ("new", True)])
+def test_docker_junit_attribution_distinguishes_existing_and_new_failures(
+    tmp_path: Path, current_state: str, should_fail: bool
+) -> None:
+    """The Docker-backed corpus attributes only failures introduced by the task."""
+    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, current_state)
+    result = subprocess.run(
+        [
+            "python3",
+            "scripts/static_release_guard.py",
+            "--base",
+            "automain",
+            "--repo-root",
+            str(repo),
+        ],
+        cwd=repo,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert (result.returncode != 0) is should_fail, output
+    if should_fail:
+        assert "newly_introduced" in output
+    else:
+        assert "no new failures vs base" in output
