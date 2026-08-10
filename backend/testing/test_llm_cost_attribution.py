@@ -30,7 +30,9 @@ instead of the base input rate:
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -45,7 +47,7 @@ from app.llm_cost_attribution import (
     _task_llm_attempts,
     compute_llm_cost_breakdown,
 )
-from app.models import TaskStatus, bank_task_current_attempt
+from app.models import DeploymentState, Project, TaskStatus, bank_task_current_attempt
 from testing.factories import make_task
 
 
@@ -537,8 +539,8 @@ def test_strategic_cycle_cost_series_partitions_at_boundary():
     reached serving from cycles that ran after. This test pins the slicing that
     fixes that: ``by_cycle`` carries each cycle's first/last task timestamps
     (a per-cycle TIME SERIES that can be partitioned at any timestamp), and
-    ``by_serving_sha`` attributes every cycle to the serving revision live when
-    its first task was last updated — cycles before the boundary land in the
+    ``by_serving_sha`` attributes a cycle only when its complete execution span
+    fits inside one serving interval — cycles before the boundary land in the
     old-sha bucket, cycles at-or-after the boundary in the new-sha bucket, and
     the buckets reconcile to the aggregate total_usd. A cycle predating the
     oldest timeline boundary lands in a None-sha bucket rather than being
@@ -620,7 +622,7 @@ def test_strategic_cycle_cost_series_partitions_at_boundary():
     assert sc["total_usd"] == pytest.approx(expected_total)
     assert sc["per_event_usd"] == pytest.approx(expected_total / 4)
 
-    # by_cycle is a per-cycle TIME SERIES, oldest-first, with the updated_at
+    # by_cycle is a per-cycle TIME SERIES, oldest-first, with the execution
     # span of each cycle's tasks so a reading partitions at any timestamp.
     by_cycle = sc["by_cycle"]
     assert len(by_cycle) == 4
@@ -662,6 +664,129 @@ def test_strategic_cycle_cost_series_partitions_at_boundary():
     assert set(by_sha_pre) == {None}
     assert by_sha_pre[None]["cycle_count"] == 1
     assert by_sha_pre[None]["total_usd"] == pytest.approx(_cost(100, 20))
+
+
+def test_truncated_cycle_series_cannot_silently_back_a_partition():
+    """The advertised cycle time series must retain every cycle."""
+    now = _utcnow()
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "strategic_review"}],
+            strategic_cycle_id=f"cycle-{i}",
+            created_at=now - timedelta(minutes=61 - i),
+            updated_at=now - timedelta(minutes=61 - i),
+            api_call_summary={
+                "total_input_tokens": 100,
+                "total_output_tokens": 10,
+                "llm_call_count": 1,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+        for i in range(61)
+    ]
+
+    series = _compact_llm_cost_attribution(tasks)["strategic_cycle_cost_per_event"]
+    assert series["by_cycle_capped"] is False
+    assert len(series["by_cycle"]) == 61
+    assert [row["cycle_id"] for row in series["by_cycle"]] == [
+        f"cycle-{i}" for i in range(61)
+    ]
+    assert sum(row["total_usd"] for row in series["by_cycle"]) == pytest.approx(
+        series["total_usd"]
+    )
+
+
+def test_serving_sha_slice_reports_its_own_pricing_coverage():
+    """Each serving-sha bucket reports coverage from only its own cycle tasks."""
+    now = _utcnow()
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+    input_rate, output_rate = LLM_TOKEN_PRICING[(
+        "anthropic",
+        "claude-sonnet-4-6",
+    )]
+
+    def _cycle_task(
+        cycle_id: str,
+        ts: datetime,
+        provider: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> object:
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "strategic_review"}],
+            strategic_cycle_id=cycle_id,
+            created_at=ts,
+            updated_at=ts,
+            api_call_summary={
+                "total_input_tokens": input_tokens,
+                "total_output_tokens": output_tokens,
+                "llm_call_count": 1,
+            },
+            provider=provider,
+            model=model,
+        )
+
+    priced_input = 1_000
+    priced_output = 100
+    unpriced_input = 10_000
+    unpriced_output = 1_000
+    tasks = [
+        _cycle_task(
+            "cycle-priced",
+            now - timedelta(days=2),
+            "anthropic",
+            "claude-sonnet-4-6",
+            priced_input,
+            priced_output,
+        ),
+        _cycle_task(
+            "cycle-unpriced",
+            now - timedelta(days=1),
+            "unknown-provider",
+            "unknown-model",
+            unpriced_input,
+            unpriced_output,
+        ),
+    ]
+
+    result = _compact_llm_cost_attribution(
+        tasks,
+        serving_sha_timeline=[
+            {"since": (now - timedelta(days=3)).isoformat(), "sha": old_sha},
+            {"since": (now - timedelta(days=1, hours=12)).isoformat(), "sha": new_sha},
+        ],
+    )
+    slices = {
+        row["serving_sha"]: row
+        for row in result["strategic_cycle_cost_per_event"]["by_serving_sha"]
+    }
+
+    priced_cost = priced_input * input_rate + priced_output * output_rate
+    estimated_unpriced = (
+        unpriced_input * UNPRICED_FALLBACK_INPUT_RATE
+        + unpriced_output * UNPRICED_FALLBACK_OUTPUT_RATE
+    )
+    assert slices[old_sha]["unpriced_coverage"] == 1.0
+    assert slices[old_sha]["estimated_unpriced_cost_usd"] == 0.0
+    assert slices[old_sha]["unpriced_input_tokens"] == 0
+    assert slices[new_sha]["unpriced_coverage"] == 0.0
+    assert slices[new_sha]["estimated_unpriced_cost_usd"] == round(
+        estimated_unpriced, 6
+    )
+    assert slices[new_sha]["unpriced_input_tokens"] == unpriced_input
+    assert slices[new_sha]["unpriced_output_tokens"] == unpriced_output
+    # The slice fields are independent: the aggregate remains the priced-dollar
+    # total while the coverage denominator includes estimated unpriced spend.
+    assert slices[old_sha]["total_usd"] == pytest.approx(priced_cost)
+    assert slices[new_sha]["total_usd"] == 0.0
+    assert result["unpriced_coverage"] == round(
+        priced_cost / (priced_cost + estimated_unpriced), 4
+    )
 
 
 def test_serving_sha_timeline_from_snapshots_builds_boundaries():
@@ -710,3 +835,147 @@ def test_serving_sha_timeline_from_snapshots_builds_boundaries():
     )
     assert [b["sha"] for b in rollback] == ["shaX", "shaY", "shaX"]
 
+
+def test_cycle_straddling_a_serving_boundary_is_not_attributed_to_either_side():
+    """A cycle spanning promotion cannot be truthfully assigned to one SHA."""
+    now = _utcnow()
+    boundary = now - timedelta(hours=1)
+    started = boundary - timedelta(minutes=10)
+    completed = boundary + timedelta(minutes=10)
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "strategic_review"}],
+        strategic_cycle_id="cycle-straddling-boundary",
+        created_at=started,
+        started_at=started,
+        completed_at=completed,
+        updated_at=completed,
+        api_call_summary={
+            "total_input_tokens": 1_000,
+            "total_output_tokens": 100,
+            "llm_call_count": 1,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = _compact_llm_cost_attribution(
+        [task],
+        serving_sha_timeline=[
+            {"since": (now - timedelta(days=1)).isoformat(), "sha": old_sha},
+            {"since": boundary.isoformat(), "sha": new_sha},
+        ],
+    )
+    rows = result["strategic_cycle_cost_per_event"]["by_serving_sha"]
+    by_sha = {row["serving_sha"]: row for row in rows}
+
+    assert set(by_sha) == {None}
+    assert by_sha[None]["cycle_count"] == 1
+    assert by_sha[None]["total_usd"] > 0
+
+
+async def test_load_serving_timeline_reads_deployment_state_timestamp():
+    from app.efficiency_snapshot import _load_serving_sha_timeline
+
+    now = _utcnow()
+    deployed_at = now - timedelta(hours=2)
+    project_id = Project().id
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+    project = Project(id=project_id, design_doc={})
+    deployment = DeploymentState(
+        current_sha=new_sha,
+        deployed_at=deployed_at,
+    )
+
+    class _Session:
+        async def get(self, model, _identity, **_kwargs):
+            if model is Project:
+                return project
+            assert model is DeploymentState
+            return deployment
+
+    with (
+        patch(
+            "app.efficiency_snapshot._read_snapshot_history",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "captured_at": (now - timedelta(days=1)).isoformat(),
+                        "serving_sha": old_sha,
+                    }
+                ]
+            ),
+        ),
+        patch("app.efficiency_snapshot._utcnow", return_value=now),
+    ):
+        timeline = await _load_serving_sha_timeline(_Session(), project_id)
+
+    assert timeline == [
+        {"since": (now - timedelta(days=1)).isoformat(), "sha": old_sha},
+        {"since": deployed_at.isoformat(), "sha": new_sha},
+    ]
+
+
+async def test_load_serving_timeline_rejects_unknown_deployment_sha():
+    """A non-SHA ``current_sha`` must not open a current serving boundary.
+
+    ``DeploymentState.current_sha`` initializes to the literal ``"unknown"``
+    when DEPLOY_SHA is unset, which is truthy but names no revision. Accepting
+    it would attribute strategic cycles to a fabricated serving sha that passes
+    downstream "non-blank str" identity checks.
+    """
+    from app.efficiency_snapshot import _load_serving_sha_timeline
+
+    now = _utcnow()
+    project_id = Project().id
+    old_sha = "a" * 40
+    project = Project(id=project_id, design_doc={})
+    deployment = DeploymentState(
+        current_sha="unknown",
+        deployed_at=now - timedelta(hours=2),
+    )
+
+    class _Session:
+        async def get(self, model, _identity, **_kwargs):
+            if model is Project:
+                return project
+            assert model is DeploymentState
+            return deployment
+
+    snapshots = [
+        {
+            "captured_at": (now - timedelta(days=1)).isoformat(),
+            "serving_sha": old_sha,
+        }
+    ]
+    with (
+        patch(
+            "app.efficiency_snapshot._read_snapshot_history",
+            new=AsyncMock(return_value=snapshots),
+        ),
+        patch("app.efficiency_snapshot._utcnow", return_value=now),
+        patch.dict(os.environ, {}, clear=False),
+    ):
+        os.environ.pop("DEPLOY_SHA", None)
+        timeline = await _load_serving_sha_timeline(_Session(), project_id)
+
+    # Only the snapshot boundary survives — no "unknown" boundary is appended.
+    assert timeline == [
+        {"since": (now - timedelta(days=1)).isoformat(), "sha": old_sha}
+    ]
+
+    # With no snapshot either, the timeline is None rather than a fabricated one.
+    with (
+        patch(
+            "app.efficiency_snapshot._read_snapshot_history",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch("app.efficiency_snapshot._utcnow", return_value=now),
+        patch.dict(os.environ, {}, clear=False),
+    ):
+        os.environ.pop("DEPLOY_SHA", None)
+        assert await _load_serving_sha_timeline(_Session(), project_id) is None

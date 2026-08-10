@@ -145,3 +145,30 @@ those readings.
    field layout so rows stay comparable, and update `BASELINE_READINGS` in
    `backend/scripts/strategic_cycle_cost_projection.py` so section [8] prints
    the new record too.
+
+## Serving-SHA readings are a separate ledger
+
+The efficiency snapshot exposes `data.llm_cost_attribution.strategic_cycle_cost_per_event.by_serving_sha`.
+Copy complete rows into `SERVING_SHA_READINGS` in the projection script,
+preserving `serving_sha`, `cycle_count`, `total_usd`, `per_event_usd`,
+`first_cycle_at`, `last_cycle_at`,
+and `unpriced_coverage`.
+
+These rows answer whether a deployed revision's cycles are cheaper, but are
+not baseline readings: a serving slice has a different boundary. The script validates
+the SHA, coverage range, and
+`per_event_usd = total_usd / cycle_count` arithmetic before comparing a row;
+missing or ambiguous attribution is unavailable. The comparison uses the
+serving row's `per_event_usd` against frozen `BASELINE_COST_PER_CYCLE_USD` and
+reports the delta, but never appends the row to `BASELINE_READINGS`. Recording a
+serving-SHA result therefore cannot move the anchor it is measured against.
+
+## Cost-verdict qualification
+
+The projection applies `MINIMUM_COST_VERDICT_N = 30`, where `n` is the sum of
+`cycle_count` across validated slices. Thin evidence returns
+`available: false`, `verdict: "insufficient_sample"`, `n`, `required_n`, and no
+cost delta. Valid cycle timestamps also produce `projected_date`; absent
+timestamps stay `null` rather than inventing a collection rate.
+
+`serving_sha_record()` reports unweighted `mean_usd`, `median_usd`, and sample `stddev_usd`; one slice has `stddev_usd: null`, and invalid slices are `unavailable`.

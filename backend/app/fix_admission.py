@@ -95,6 +95,8 @@ async def prepare_direct_fix_admission(
     fix_target: dict[str, str | int] = {
         "project_id": str(project_id),
         "pr_number": int(pr_number),
+        # Carry the ambient base for audit and final merge authority; fix
+        # admission identity is the immutable PR head.
         "base_sha": base_sha,
         "head_sha": head_sha,
     }

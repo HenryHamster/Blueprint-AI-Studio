@@ -1095,10 +1095,10 @@ async def test_review_approve_does_not_spawn_fix(
 
 
 @pytest.mark.asyncio
-async def test_cached_approve_with_stale_base_always_respawns_exact_target_review(
+async def test_cached_approve_with_base_drift_stays_admitted(
     client: AsyncClient, db_session, mocker
 ):
-    """A stale cached APPROVE is never authoritative for the live target."""
+    """A base-only advance does not discard a cached head-bound APPROVE."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
@@ -1170,9 +1170,11 @@ async def test_cached_approve_with_stale_base_always_respawns_exact_target_revie
     )
 
     await db_session.refresh(review_task)
-    assert "Stale/unproven approval discarded" in (
-        review_task.latest_status_message or ""
+    assert review_task.status == TaskStatus.EVALUATING
+    assert review_task.latest_status_message == (
+        "Review approved, waiting for CI on PR #110..."
     )
+    assert _review_loop(review_task).get("review_approved") is True
     result = await db_session.execute(
         select(Task).where(
             Task.project_id == project.id,
@@ -1180,11 +1182,9 @@ async def test_cached_approve_with_stale_base_always_respawns_exact_target_revie
         )
     )
     children = result.scalars().all()
-    assert not [task for task in children if _task_type(task) == "fix"]
+    assert not [task for task in children if _task_type(task) in {"fix", "review"}]
     merge_mock.assert_not_awaited()
-    rereviews = [task for task in children if _task_type(task) == "review"]
-    assert len(rereviews) == 1
-    assert _review_loop(rereviews[0]).get("review_target") == {
+    assert _review_loop(review_task).get("review_target") == {
         "project_id": str(project.id),
         "pr_number": 110,
         "base_sha": "live-base",

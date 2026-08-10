@@ -26,6 +26,8 @@ from sqlmodel import select
 from app.database import AsyncSessionLocal
 from app.context_bounds import bound_review_history
 from app.models import (
+    TASK_ORIGINATION_REMEDIATION,
+    TASK_ORIGINATION_SMOKETEST,
     Task,
     TaskHistory,
     Project,
@@ -54,6 +56,7 @@ from app.review_pipeline import (
     build_ci_failure_fix_prompt,
     build_merge_conflict_fix_prompt,
     reconciled_approve_markers,
+    stale_respawn_delta_base_sha,
     evaluate_auto_approve_small_main,
     ensure_issue_ids,
     should_skip_initial_review,
@@ -3140,20 +3143,17 @@ async def _process_post_commit(
                     and _assigned_pr_number == int(pr_number)
                     and reviewed_head_sha
                     == str(_assigned_review_target.get("head_sha") or "")
-                    and reviewed_base_sha
-                    == str(_assigned_review_target.get("base_sha") or "")
                 )
                 if (
                     _assigned_target_matches
                     and _completion_review_target is not None
                     and reviewed_head_sha
                     == str(_completion_review_target.get("head_sha") or "")
-                    and reviewed_base_sha
-                    == str(_completion_review_target.get("base_sha") or "")
                 ):
-                    # Only the backend may grant closure provenance.  Agent-
-                    # supplied SHAs are compared first, then overwritten from
-                    # the server target and bound to this durable review row.
+                    # Only the backend may grant closure provenance. The
+                    # agent-supplied head is compared first; the ambient base
+                    # is overwritten from the server target and both are bound
+                    # to this durable review row.
                     _current_review_entry.update(
                         {
                             "reviewed_head_sha": str(
@@ -3407,8 +3407,9 @@ async def _process_post_commit(
                         "issues": issues,
                         "resolutions": resolutions,
                         "investigated_files": investigated_files,
-                        # Cache only a verdict whose agent-stamped SHAs matched
-                        # the live target; preserve both for replay validation.
+                        # Cache only a verdict whose agent-stamped head matched
+                        # the live target; preserve both SHAs for audit and the
+                        # final merge-authority validation.
                         "reviewed_head_sha": target["head_sha"],
                         "reviewed_base_sha": target["base_sha"],
                     }
@@ -3464,9 +3465,7 @@ async def _process_post_commit(
                         return {"status": "accepted"}
                     if (
                         not reviewed_head_sha
-                        or not reviewed_base_sha
                         or reviewed_head_sha != _live_approve_target["head_sha"]
-                        or reviewed_base_sha != _live_approve_target["base_sha"]
                     ):
                         task.status = TaskStatus.COMPLETED
                         task.latest_status_message = (
@@ -3499,6 +3498,18 @@ async def _process_post_commit(
                             branch,
                             base_branch,
                             original_task_id=original_task_id,
+                            # Re-review only the head delta that made the
+                            # approval stale. Base drift (and missing
+                            # provenance) falls back to a full review: the
+                            # head-relative delta would be empty and the
+                            # respawn would rubber-stamp code never reviewed
+                            # against the new base.
+                            delta_base_sha=stale_respawn_delta_base_sha(
+                                reviewed_head_sha=reviewed_head_sha,
+                                reviewed_base_sha=reviewed_base_sha,
+                                live_head_sha=_live_approve_target["head_sha"],
+                                live_base_sha=_live_approve_target["base_sha"],
+                            ),
                             review_target=_live_approve_target,
                         )
                         await session.commit()
@@ -3972,13 +3983,11 @@ async def _process_post_commit(
                         live_base_sha = str(pr_data.get("base", {}).get("sha", ""))
                         approve_target_is_stale = (
                             not reviewed_head_sha
-                            or not reviewed_base_sha
                             or reviewed_head_sha != head_sha
-                            or reviewed_base_sha != live_base_sha
                         )
                         if approve_target_is_stale:
                             # Do not let an APPROVE issued for a different
-                            # comparison range enter CI/merge lifecycle. There
+                            # reviewed head enter CI/merge lifecycle. There
                             # is deliberately no discard-count escape hatch:
                             # repeated branch motion can cost another bounded
                             # delta review, but it can never make a stale
@@ -4005,6 +4014,16 @@ async def _process_post_commit(
                                     branch,
                                     base_branch,
                                     original_task_id=original_task_id,
+                                    # Keep the defensive merge-path respawn
+                                    # consistent with the primary stale guard:
+                                    # delta only when the head really moved and
+                                    # the base held still.
+                                    delta_base_sha=stale_respawn_delta_base_sha(
+                                        reviewed_head_sha=reviewed_head_sha,
+                                        reviewed_base_sha=reviewed_base_sha,
+                                        live_head_sha=head_sha,
+                                        live_base_sha=live_base_sha,
+                                    ),
                                     review_target={
                                         "project_id": str(task.project_id),
                                         "pr_number": int(pr_number),
@@ -4023,11 +4042,7 @@ async def _process_post_commit(
                                     )
                             await session.commit()
                             return {"status": "accepted"}
-                        if (
-                            reviewed_head_sha == head_sha
-                            and reviewed_base_sha
-                            == live_base_sha
-                        ):
+                        if reviewed_head_sha == head_sha:
                             _record_structured_review_result(
                                 {
                                     "project_id": str(task.project_id),
@@ -4865,6 +4880,7 @@ async def _process_post_commit(
                                                     vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                                                     status=TaskStatus.QUEUED,
                                                     created_by="ORCHESTRATOR",
+                                                    origination=TASK_ORIGINATION_SMOKETEST,
                                                 )
                                                 session.add(smoketest_task)
                                                 await session.commit()
@@ -5049,6 +5065,7 @@ async def _process_post_commit(
                                                             status=TaskStatus.QUEUED,
                                                             requires_approval=False,
                                                             created_by="ORCHESTRATOR",
+                                                            origination=TASK_ORIGINATION_REMEDIATION,
                                                         )
                                                         session.add(rescan_task)
                                                         await session.commit()

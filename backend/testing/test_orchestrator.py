@@ -908,13 +908,16 @@ def test_select_eligible_runner_requires_explicit_browser_proof():
     )
     # The heartbeat writes the browser capability NESTED under
     # isolation_backends (capabilities_inventory in scripts/runner_isolation.py).
-    # Only that nested flag earns the browser gate.
+    # The nested Docker + Chromium evidence earns the browser gate.
     capable = RunnerDispatchSnapshot(
         id=uuid.uuid4(),
         project_id=project_id,
         capabilities={
             "task_types": "all",
-            "isolation_backends": {"playwright_chromium_usable": True},
+            "isolation_backends": {
+                "docker_usable": True,
+                "playwright_chromium_usable": True,
+            },
         },
     )
 

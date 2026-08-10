@@ -21,6 +21,8 @@ from app.models import (
     AlertSeverity,
     ArtifactType,
     Project,
+    TASK_ORIGINATION_REMEDIATION,
+    TASK_ORIGINATION_SMOKETEST,
     Task,
     TaskHistory,
     TaskStatus,
@@ -328,6 +330,7 @@ async def maybe_spawn_smoketest_fix(
                                 vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                                 status=TaskStatus.QUEUED,
                                 created_by="ORCHESTRATOR",
+                                origination=TASK_ORIGINATION_SMOKETEST,
                             )
                             _smoketest_spawn_state = {
                                 "project_id": task.project_id,
@@ -489,6 +492,7 @@ async def maybe_spawn_smoketest_fix(
                             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                             status=_smoketest_spawn_state["status"],
                             created_by=_smoketest_spawn_state["created_by"],
+                            origination=TASK_ORIGINATION_SMOKETEST,
                         )
                         session.add(_retry_task)
                         await session.flush()
@@ -644,6 +648,7 @@ async def maybe_spawn_debug_create(
                         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                         status=TaskStatus.QUEUED,
                         created_by="ORCHESTRATOR",
+                        origination=TASK_ORIGINATION_REMEDIATION,
                     )
                     session.add(fix_task)
                     await session.flush()

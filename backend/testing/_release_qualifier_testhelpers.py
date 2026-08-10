@@ -787,6 +787,20 @@ async def _add_version_criterion(
     return criterion
 
 
+async def _seed_walkthrough_compatible_rubric(db_session, project, version):
+    """Seed the retired-v26 canonical keys so the walkthrough_e2e probe's
+    evidence contract intersects the open version's ACTIVE rubric (the
+    request-time compatibility gate in run_qualification)."""
+    for _wt_key in ("c-dfdc9d82", "c-f52fd975", "c-5214996f"):
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key=_wt_key,
+            text=f"walkthrough {_wt_key}",
+        )
+
+
 def _with_current_qualification_contract(project, version, record=None):
     """Return a pending qualification record with a self-consistent contract.
 
@@ -2097,6 +2111,7 @@ __all__ = [
     '_audit_tasks',
     '_promotion_failed_record',
     '_seed_qualification_children',
+    '_seed_walkthrough_compatible_rubric',
     '_add_version_criterion',
     '_with_current_qualification_contract',
     '_LEDGER_SHA_A',

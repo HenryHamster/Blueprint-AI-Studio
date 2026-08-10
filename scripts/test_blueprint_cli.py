@@ -5,6 +5,7 @@ module imports cleanly, and that --json emits valid JSON for a read command —
 all with blueprint_api.api mocked so no network/credentials are needed.
 """
 import argparse
+import contextlib
 import hashlib
 import io
 import json
@@ -12,10 +13,14 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
-import pytest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 import blueprint
 import blueprint_api
+import local_app_release as local_release
+import pytest
 
 
 def test_get_project_id_matches_configured_default_repo(monkeypatch):
@@ -281,6 +286,7 @@ HELP_INVOCATIONS = [
     ["compute", "analyze"],
     ["compute", "run"],
     ["compute", "launch"],
+    ["migrate"],
     ["tasks", "create"],
 ]
 
@@ -452,7 +458,7 @@ def mock_api(monkeypatch):
         if "/release-versions?" in path or path.endswith("/release-versions"):
             # Paginated full-history endpoint. Echo the requested window so the
             # CLI's offset/limit handling and header/footer can be asserted.
-            from urllib.parse import urlparse, parse_qs
+            from urllib.parse import parse_qs, urlparse
 
             qs = parse_qs(urlparse(path).query)
             limit = int(qs.get("limit", ["20"])[0])
@@ -839,7 +845,7 @@ def mock_api(monkeypatch):
                 ],
             }
         if "/knowledge-documents" in path and method == "GET":
-            from urllib.parse import urlparse, parse_qs
+            from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(path).query)
             docs = [
                 {"id": "kdoc-001", "title": "API Rate Limiting", "source_kind": "web_research",
@@ -5514,7 +5520,7 @@ def _deploy_gh_fake(revision: str = _DEPLOY_REV, compare_status: str = "ahead"):
         if args[:2] == ("run", "list"):
             return json.dumps([{
                 "databaseId": 4242,
-                "headSha": "e" * 40,
+                "headSha": revision,
                 "status": "completed",
                 "conclusion": "success",
                 "createdAt": "2026-06-15T00:00:00Z",
@@ -5538,6 +5544,90 @@ def _deploy_gh_fake(revision: str = _DEPLOY_REV, compare_status: str = "ahead"):
         raise AssertionError(f"unexpected gh call: {args}")
 
     return fake_gh
+
+
+def test_fetch_deploy_manifest_queries_github_for_approved_sha(monkeypatch):
+    """An approved SHA is found even when it is outside the recent run page."""
+    approved_sha = "b" * 40
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        if args[:2] == ("run", "list"):
+            assert "--commit" in args
+            assert args[args.index("--commit") + 1] == approved_sha
+            return json.dumps([{
+                "databaseId": 9001,
+                "headSha": approved_sha,
+                "status": "completed",
+                "conclusion": "success",
+                "createdAt": "2026-06-15T00:00:00Z",
+            }])
+        if args[:2] == ("run", "download"):
+            temporary = args[args.index("-D") + 1]
+            manifest = {
+                "image_ref": f"gcr.io/blueprint/app@sha256:{'1' * 64}",
+                "revision": approved_sha,
+            }
+            body = json.dumps(manifest).encode()
+            manifest_path = os.path.join(temporary, "local-app-release.json")
+            with open(manifest_path, "wb") as handle:
+                handle.write(body)
+            with open(manifest_path + ".sha256", "w", encoding="utf-8") as handle:
+                handle.write(hashlib.sha256(body).hexdigest())
+            return ""
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(blueprint, "_gh", fake_gh)
+
+    release = blueprint._fetch_deploy_manifest(approved_sha)
+
+    assert release["run"]["databaseId"] == 9001
+    assert release["revision"] == approved_sha
+    assert calls[0][:2] == ("run", "list")
+
+
+def test_fetch_deploy_manifest_accepts_abbreviated_sha(monkeypatch):
+    """Short --sha values use the prefix-capable main branch lookup."""
+    approved_sha = "b" * 40
+    prefix = approved_sha[:7]
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        if args[:2] == ("run", "list"):
+            assert "--branch" in args
+            assert args[args.index("--branch") + 1] == "main"
+            assert "--commit" not in args
+            return json.dumps([{
+                "databaseId": 9002,
+                "headSha": approved_sha,
+                "status": "completed",
+                "conclusion": "success",
+                "createdAt": "2026-06-15T00:00:00Z",
+            }])
+        if args[:2] == ("run", "download"):
+            temporary = args[args.index("-D") + 1]
+            manifest = {
+                "image_ref": f"gcr.io/blueprint/app@sha256:{'1' * 64}",
+                "revision": approved_sha,
+            }
+            body = json.dumps(manifest).encode()
+            manifest_path = os.path.join(temporary, "local-app-release.json")
+            with open(manifest_path, "wb") as handle:
+                handle.write(body)
+            with open(manifest_path + ".sha256", "w", encoding="utf-8") as handle:
+                handle.write(hashlib.sha256(body).hexdigest())
+            return ""
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(blueprint, "_gh", fake_gh)
+
+    release = blueprint._fetch_deploy_manifest(prefix)
+
+    assert release["run"]["databaseId"] == 9002
+    assert release["revision"] == approved_sha
+    assert calls[0][:2] == ("run", "list")
 
 
 def _deploy_api_fake(calls, *, promoted=None, post_failure=None):
@@ -5637,6 +5727,331 @@ def test_deploy_defaults_to_promoted_version(monkeypatch, capsys):
     assert body["host"] == "hamsterwheel"
 
 
+def test_migrate_local_runs_alembic_upgrade_against_local_db(monkeypatch, tmp_path, capsys):
+    """The local migration is a repeatable worker-image container transaction."""
+    image = (
+        "us-central1-docker.pkg.dev/blueprint-orchestrator/blueprint-repo/"
+        "blueprint-orchestrator@sha256:" + "a" * 64
+    )
+    secrets = tmp_path / "worker-secrets.json"
+    secrets.write_text(
+        json.dumps(
+            {
+                "DATABASE_URL": "postgresql+asyncpg://worker:p%40ss@ignored:5432/blueprint",
+                "GITHUB_PAT_ENCRYPTION_KEY": "x" * 43,
+            }
+        ),
+        encoding="utf-8",
+    )
+    secrets.chmod(0o600)
+    credential = tmp_path / "worker-gcp.json"
+    credential.write_text(
+        json.dumps(
+            {
+                "type": "service_account",
+                "project_id": "blueprint-orchestrator",
+                "client_email": (
+                    "blueprint-local-worker-runtime@blueprint-orchestrator.iam.gserviceaccount.com"
+                ),
+                "private_key": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+            }
+        ),
+        encoding="utf-8",
+    )
+    credential.chmod(0o600)
+    role_env = tmp_path / "worker.role.env"
+    role_env.write_text(
+        "\n".join(
+            [
+                f"BLUEPRINT_WORKER_SECRETS_FILE={secrets}",
+                f"BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE={credential}",
+                "BLUEPRINT_CONTROL_PLANE_NETWORK=blueprint-control-plane",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    role_env.chmod(0o600)
+
+    registry_inputs = []
+
+    @contextlib.contextmanager
+    def fake_registry_config(path):
+        registry_inputs.append(path)
+        yield tmp_path / "docker-config"
+
+    monkeypatch.setattr(blueprint, "_migration_registry_config", fake_registry_config)
+    docker_calls = []
+    fail_upgrade = False
+
+    def fake_run(command, **kwargs):
+        nonlocal fail_upgrade
+        docker_calls.append((command, kwargs))
+        if command[-2:] == ["pull", image]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command[-2:] == ["alembic", "current"]:
+            return SimpleNamespace(
+                returncode=0, stdout="Current revision(s): 0739\n", stderr=""
+            )
+        if command[-3:] == ["alembic", "upgrade", "head"]:
+            return SimpleNamespace(
+                returncode=17 if fail_upgrade else 0,
+                stdout="",
+                stderr="migration failed\n" if fail_upgrade else "",
+            )
+        raise AssertionError(f"unexpected docker command: {command}")
+
+    monkeypatch.setattr(blueprint.subprocess, "run", fake_run)
+    argv = [
+        "migrate", "--local", "--image", image,
+        "--worker-env-file", str(role_env),
+    ]
+
+    assert blueprint.main(argv) == 0
+    assert registry_inputs == [credential]
+    pull = next(command for command, _ in docker_calls if "pull" in command)
+    assert pull[-2:] == ["pull", image]
+    container_calls = [
+        (command, kwargs)
+        for command, kwargs in docker_calls
+        if "run" in command
+    ]
+    assert [command[command.index("alembic"):] for command, _ in container_calls] == [
+        ["alembic", "current"],
+        ["alembic", "upgrade", "head"],
+        ["alembic", "current"],
+    ]
+    for command, kwargs in container_calls:
+        assert image in command
+        assert "--network" in command
+        assert command[command.index("--network") + 1] == "blueprint-control-plane"
+        assert command[command.index("--pull") + 1] == "never"
+        assert "--read-only" in command
+        assert command[command.index("--cap-drop") + 1] == "ALL"
+        assert command[command.index("--security-opt") + 1] == "no-new-privileges"
+        assert command[command.index("--tmpfs") + 1] == "/tmp:rw,noexec,nosuid,size=512m"
+        assert (
+            f"type=bind,src={credential},dst=/var/run/blueprint/gcp.json,readonly"
+            in command
+        )
+        assert "--env" in command and "DATABASE_URL" in command
+        assert kwargs["env"]["DATABASE_URL"] == (
+            "postgresql+asyncpg://worker:p%40ss@blueprint-postgres:5432/blueprint?ssl=disable"
+        )
+    assert "Current revision(s): 0739" in capsys.readouterr().out
+
+    # Re-running the same command issues the normal idempotent `upgrade head`;
+    # Alembic makes it a no-op when the database is already current.
+    assert blueprint.main(argv) == 0
+    assert sum(
+        command[command.index("alembic"):] == ["alembic", "upgrade", "head"]
+        for command, _ in docker_calls
+        if "alembic" in command
+    ) == 2
+
+    fail_upgrade = True
+    assert blueprint.main(argv) == 17
+    assert "migration container exited 17" in capsys.readouterr().err
+
+
+def test_migration_credential_text_pins_worker_service_account_identity(tmp_path):
+    credential = {
+        "type": "service_account",
+        "project_id": "blueprint-orchestrator",
+        "client_email": (
+            "blueprint-local-worker-runtime@blueprint-orchestrator.iam.gserviceaccount.com"
+        ),
+        "private_key": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+    }
+    path = tmp_path / "credential.json"
+    text = json.dumps(credential)
+    path.write_text(text, encoding="utf-8")
+
+    assert blueprint._migration_credential_text(path) == text
+
+    for field, value in (
+        ("type", "authorized_user"),
+        ("project_id", "another-project"),
+        ("client_email", "other@blueprint-orchestrator.iam.gserviceaccount.com"),
+    ):
+        invalid = dict(credential, **{field: value})
+        path.write_text(json.dumps(invalid), encoding="utf-8")
+        with pytest.raises(ValueError, match="wrong identity"):
+            blueprint._migration_credential_text(path)
+
+    path.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        blueprint._migration_credential_text(path)
+
+
+def test_migration_secure_file_rejects_links_and_insecure_modes(tmp_path):
+    regular = tmp_path / "regular"
+    regular.write_text("safe", encoding="utf-8")
+    regular.chmod(0o600)
+    assert blueprint._migration_secure_file(str(regular), "input") == regular
+
+    insecure = tmp_path / "insecure"
+    insecure.write_text("unsafe", encoding="utf-8")
+    insecure.chmod(0o640)
+    with pytest.raises(ValueError, match="0600"):
+        blueprint._migration_secure_file(str(insecure), "input")
+
+    link = tmp_path / "link"
+    link.symlink_to(regular)
+    with pytest.raises(ValueError, match="non-symlink"):
+        blueprint._migration_secure_file(str(link), "input")
+
+
+def test_migration_worker_values_rejects_untrusted_secret_shapes_and_accepts_valid_input(
+    tmp_path,
+):
+    credential = tmp_path / "credential.json"
+    credential.write_text("{}", encoding="utf-8")
+    credential.chmod(0o600)
+    role = tmp_path / "role.env"
+    role.write_text(
+        f"BLUEPRINT_WORKER_SECRETS_FILE={tmp_path / 'secrets.json'}\n"
+        f"BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE={credential}\n"
+        "BLUEPRINT_CONTROL_PLANE_NETWORK=blueprint-control-plane\n",
+        encoding="utf-8",
+    )
+    role.chmod(0o600)
+    secrets = tmp_path / "secrets.json"
+
+    args = argparse.Namespace(worker_env_file=str(role))
+    valid = {
+        "DATABASE_URL": "postgresql+asyncpg://worker:p%40ss@ignored:5432/blueprint",
+        "GITHUB_PAT_ENCRYPTION_KEY": "x" * 43,
+    }
+    secrets.write_text(json.dumps(valid), encoding="utf-8")
+    secrets.chmod(0o600)
+    values, credential_path, secrets_path, network = blueprint._migration_worker_values(args)
+    assert values["DATABASE_URL"] == (
+        "postgresql+asyncpg://worker:p%40ss@blueprint-postgres:5432/blueprint?ssl=disable"
+    )
+    assert credential_path == credential
+    assert secrets_path == secrets
+    assert network == "blueprint-control-plane"
+
+    for invalid in (
+        ["not", "an", "object"],
+        {"DATABASE_URL": ["not a string"]},
+        {"DATABASE_URL": "postgresql://worker:password@db:5432/blueprint\x1f"},
+    ):
+        secrets.write_text(json.dumps(invalid), encoding="utf-8")
+        with pytest.raises(ValueError, match="worker secrets"):
+            blueprint._migration_worker_values(args)
+
+
+def test_migration_image_requires_approved_immutable_artifact_registry_reference():
+    valid = (
+        "us-central1-docker.pkg.dev/blueprint-orchestrator/blueprint-repo/"
+        "blueprint-orchestrator@sha256:" + "a" * 64
+    )
+    assert blueprint._migration_image(argparse.Namespace(image=valid)) == (valid, None)
+
+    for invalid in (
+        "docker.io/library/worker:latest",
+        valid.replace("blueprint-repo", "other-repo"),
+        valid[:-1] + "g",
+    ):
+        with pytest.raises(ValueError, match="approved immutable"):
+            blueprint._migration_image(argparse.Namespace(image=invalid))
+def test_migration_deploy_stops_units_before_migrate_and_starts_after(monkeypatch):
+    """A schema-changing release has one ordered, bounded downtime window."""
+    image_ref = local_release._IMAGE_PREFIX + "@sha256:" + "d" * 64
+    api_path = Path("/etc/blueprint/nodes/henry_hamster/roles/api/role.env")
+    old_image = "sha256:" + "b" * 64
+    api_payload = (
+        f"BLUEPRINT_API_IMAGE_ID={old_image}\n"
+        "BLUEPRINT_API_SECRETS_FILE=/safe/api.json\n"
+    ).encode()
+    worker_payload = (
+        f"BLUEPRINT_WORKER_IMAGE_ID={old_image}\n"
+        "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE=/safe/worker.json\n"
+    ).encode()
+    events: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(local_release, "_is_root", lambda: True)
+    monkeypatch.setenv("SUDO_USER", "henry_hamster")
+    monkeypatch.setattr(local_release, "_trusted_root_directory", lambda _path: None)
+    monkeypatch.setattr(local_release, "_validate_manifest", lambda *_args: None)
+    monkeypatch.setattr(local_release, "_uid_for_user", lambda _user: 1000)
+    monkeypatch.setattr(
+        local_release,
+        "_secure_role_file",
+        lambda path: api_payload if path == api_path else worker_payload,
+    )
+    monkeypatch.setattr(
+        local_release, "_public_origin", lambda *_args: "https://release.test"
+    )
+    monkeypatch.setattr(
+        local_release, "_service_marker", lambda unit: ("active", unit)
+    )
+    monkeypatch.setattr(
+        local_release, "_hash_protected_tree", lambda _root: {"safe": "hash"}
+    )
+    monkeypatch.setattr(local_release, "_assert_edge_is_decoupled", lambda: None)
+    monkeypatch.setattr(local_release, "_local_version_payload", lambda: b'{"sha":"old"}')
+    monkeypatch.setattr(
+        local_release, "_public_snapshot", lambda _url: (b'{"sha":"old"}', "hash")
+    )
+    monkeypatch.setattr(local_release, "_prepare_evidence_root", lambda _root: None)
+    monkeypatch.setattr(
+        local_release, "_secure_registry_credential", lambda *_args: "credential"
+    )
+    monkeypatch.setattr(
+        local_release,
+        "_registry_auth",
+        lambda _credential: contextlib.nullcontext(Path("/tmp/registry")),
+    )
+    monkeypatch.setattr(local_release, "_run", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(local_release, "_verify_frontend", lambda *_args: "e" * 64)
+    monkeypatch.setattr(local_release, "_inspect_candidate", lambda *_args: "sha256:" + "c" * 64)
+    monkeypatch.setattr(local_release, "_retain_prior_image", lambda _image: "retained:old")
+    monkeypatch.setattr(local_release, "_image_schema_revision", lambda _image: "0743")
+    database_revisions = iter(("0742", "0743"))
+    monkeypatch.setattr(
+        local_release, "_database_schema_revision", lambda: next(database_revisions)
+    )
+    monkeypatch.setattr(
+        local_release,
+        "_stop_unit_container",
+        lambda unit, _container, _allowed: events.append(("stop", unit)),
+    )
+
+    def migrate(args: argparse.Namespace) -> int:
+        assert args.local is True
+        assert args.image == image_ref
+        events.append(("migrate", args.image))
+        return 0
+
+    monkeypatch.setattr(blueprint, "cmd_migrate", migrate)
+    monkeypatch.setattr(local_release, "_atomic_write", lambda *_args: None)
+    monkeypatch.setattr(
+        local_release,
+        "_start_service",
+        lambda unit, _image, *, allowed_images: events.append(("start", unit)),
+    )
+    monkeypatch.setattr(local_release, "_wait_verified", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(local_release, "_verify_health", lambda *_args: None)
+    monkeypatch.setattr(
+        local_release,
+        "_write_evidence",
+        lambda *_args: Path("/var/lib/blueprint/local-app-releases/evidence.json"),
+    )
+
+    local_release.release(image_ref, "a" * 40)
+
+    assert events == [
+        ("stop", "blueprint-worker.service"),
+        ("stop", "blueprint-api.service"),
+        ("migrate", image_ref),
+        ("start", "blueprint-worker.service"),
+        ("start", "blueprint-api.service"),
+    ]
+
+
 def test_deploy_refuses_without_promoted_version(monkeypatch, capsys):
     """deploy refuses to activate when the project has no promoted release version
     unless --force is given."""
@@ -5654,6 +6069,30 @@ def test_deploy_refuses_without_promoted_version(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "no promoted release version" in out
     # No SSH activation, no receipt.
+    assert not any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
+
+
+def test_deploy_force_remains_unbound_without_promoted_version(monkeypatch):
+    """The shared helpers preserve the legacy emergency --force escape hatch."""
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "GET" and "release-versions" in path and "status=promoted" in path:
+            return {"versions": [], "total": 0, "limit": 1, "offset": 0}
+        return {}
+
+    _deploy_env(monkeypatch, fake_api)
+    shim_calls = []
+    monkeypatch.setattr(
+        blueprint.subprocess,
+        "run",
+        lambda command, **kwargs: shim_calls.append(command)
+        or type("R", (), {"returncode": 0})(),
+    )
+
+    assert blueprint.main(["deploy", "--host", "hamsterwheel", "--yes", "--force"]) == 0
+    assert shim_calls[0][:3] == ["ssh", "-t", "hamsterwheel"]
     assert not any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
 
 
@@ -5700,3 +6139,388 @@ def test_deploy_receipt_post_failure_warns_and_exits_nonzero(monkeypatch, capsys
     err = capsys.readouterr().err
     assert "activation receipt could not be recorded" in err
 
+
+def test_deploy_agent_preflight_reports_install_state(monkeypatch, tmp_path, capsys):
+    """Preflight reports the host contract and never executes a pending approval."""
+    unit = tmp_path / "blueprint-deploy-agent.service"
+    shim = tmp_path / "blueprint-release"
+    poll = tmp_path / "deploy-agent.poll"
+    state = tmp_path / "deploy-agent.state"
+    unit.write_text("[Service]\n", encoding="utf-8")
+    shim.write_text("#!/bin/sh\n", encoding="utf-8")
+    shim.chmod(0o755)
+    poll.write_text(
+        json.dumps({"polled_at": blueprint.datetime.now(blueprint.timezone.utc).isoformat()}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(blueprint, "_DEPLOY_AGENT_UNIT_PATH", str(unit))
+    monkeypatch.setattr(blueprint, "_RELEASE_SHIM_PATH", str(shim))
+    real_lstat = blueprint.os.lstat
+
+    def fake_lstat(path):
+        info = real_lstat(path)
+        if str(path) in {str(unit), str(shim)}:
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=0, st_gid=0)
+        return info
+
+    monkeypatch.setattr(blueprint.os, "lstat", fake_lstat)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _project_id=None: "proj-1")
+    monkeypatch.setattr(
+        blueprint.subprocess,
+        "run",
+        lambda command, **kwargs: type(
+            "Result", (), {
+                "returncode": 0,
+                "stdout": "UnitFileState=enabled\nActiveState=active\nSubState=running\n",
+                "stderr": "",
+            }
+        )(),
+    )
+    calls = []
+    pending = False
+
+    def fake_api(method, path, body=None, timeout=30):
+        nonlocal pending
+        calls.append((method, path, body))
+        assert method == "GET"
+        return {
+            "versions": [{
+                "version_number": 7,
+                "status": "promoted",
+                "serving_status": "unconfirmed",
+                "activation_requested_at": (
+                    "2026-06-15T00:00:00Z" if pending else None
+                ),
+                "promoted_sha": _DEPLOY_PROMOTED_SHA,
+            }],
+            "total": 1,
+        }
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    args = [
+        "deploy-agent", "--preflight", "--json", "--project-id", "proj-1",
+        "--state-path", str(state), "--poll-state-path", str(poll),
+    ]
+
+    assert blueprint.main(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["passed"] is True
+    assert report["checks"]["service"]["enabled"] is True
+    assert report["checks"]["polling"]["last_poll_at"]
+    assert report["checks"]["activation"]["pending"] is False
+
+    unit.unlink()
+    shim.unlink()
+    assert blueprint.main(args) != 0
+    missing_output = capsys.readouterr().out
+    assert "unit file" in missing_output.lower()
+    assert "release shim" in missing_output.lower()
+
+    unit.write_text("[Service]\n", encoding="utf-8")
+    shim.write_text("#!/bin/sh\n", encoding="utf-8")
+    shim.chmod(0o755)
+    assert not state.exists()
+    pending = True
+    calls.clear()
+    shim_calls = []
+    monkeypatch.setattr(
+        blueprint,
+        "_invoke_release_shim",
+        lambda *a, **kw: shim_calls.append((a, kw)),
+    )
+
+    assert blueprint.main(args) == 0
+    pending_output = json.loads(capsys.readouterr().out)
+    assert pending_output["checks"]["activation"]["pending"] is True
+    assert all(value is True for value in pending_output["checks"]["activation"]["preconditions"].values())
+    assert not shim_calls
+    assert not any(method == "POST" for method, _, _ in calls)
+    assert not state.exists()
+
+
+def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, tmp_path):
+    """The host agent consumes one live approval through the local shim, then
+    records the exact promoted revision with the existing receipt endpoint."""
+    calls = []
+    api_fake = _deploy_api_fake(calls)
+    agent_revision = _DEPLOY_PROMOTED_SHA
+    _deploy_env(monkeypatch, api_fake, revision=agent_revision)
+    socket_calls = []
+    monkeypatch.setattr(
+        blueprint,
+        "_request_release_socket",
+        lambda digest, revision: socket_calls.append((digest, revision)),
+    )
+    promoted = {
+        "version_number": 7,
+        "status": "promoted",
+        "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "serving_status": "unconfirmed",
+        "activation_requested_at": "2026-06-15T00:00:00Z",
+    }
+    monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda args: promoted)
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: _DEPLOY_PROMOTED_SHA)
+
+    poll_path = tmp_path / "deploy-agent.poll"
+    assert blueprint._deploy_agent_once(
+        argparse.Namespace(project_id=None, poll_state_path=str(poll_path))
+    ) is True
+    assert json.loads(poll_path.read_text(encoding="utf-8"))["polled_at"]
+
+    assert socket_calls == [(f"sha256:{'0' * 64}", agent_revision)]
+    receipt = next(
+        body for method, path, body in calls
+        if method == "POST" and path.endswith("/activation-receipt")
+    )
+    assert receipt == {
+        "version_number": 7,
+        "revision": agent_revision,
+        "host": "control-plane",
+    }
+
+
+def test_deploy_agent_retries_failed_activation_phase_then_confirms(
+    monkeypatch, tmp_path
+):
+    """A transient root failure is retried before one receipt is posted."""
+    from blueprint_api import APIError
+
+    calls = []
+    promoted = {
+        "version_number": 7,
+        "status": "promoted",
+        "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "serving_status": "unconfirmed",
+        "activation_requested_at": "2026-06-15T00:00:00Z",
+    }
+    _deploy_env(
+        monkeypatch,
+        _deploy_api_fake(calls, promoted=promoted),
+        revision=_DEPLOY_PROMOTED_SHA,
+    )
+    release_results = iter(
+        [
+            APIError("release executor failed: transient one"),
+            APIError("release executor failed: transient two"),
+            True,
+        ]
+    )
+    release_calls = []
+    monkeypatch.setattr(
+        blueprint,
+        "_invoke_release_shim",
+        lambda *args, **kwargs: (
+            release_calls.append((args, kwargs)),
+            (lambda result: (_ for _ in ()).throw(result)
+             if isinstance(result, Exception) else result)(next(release_results)),
+        )[1],
+    )
+    sleeps = []
+    monkeypatch.setattr(blueprint.time, "sleep", sleeps.append)
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: _DEPLOY_PROMOTED_SHA)
+
+    state_path = tmp_path / "deploy-agent.state"
+    assert blueprint._deploy_agent_once(
+        argparse.Namespace(project_id=None, state_path=str(state_path))
+    ) is True
+
+    assert len(release_calls) == 3
+    assert sleeps == [5.0, 10.0]
+    assert not state_path.exists()
+    receipts = [
+        body for method, path, body in calls
+        if method == "POST" and path.endswith("/activation-receipt")
+    ]
+    assert receipts == [{
+        "version_number": 7,
+        "revision": _DEPLOY_PROMOTED_SHA,
+        "host": "control-plane",
+    }]
+
+
+def _write_accepted_activation_state(state_path):
+    state_path.write_text(json.dumps({
+        "version_number": 7, "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "revision": _DEPLOY_PROMOTED_SHA, "phase": "accepted",
+    }), encoding="utf-8")
+
+
+def _approved_activation():
+    return {
+        "version_number": 7, "status": "promoted", "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "serving_status": "unconfirmed", "activation_requested_at": "2026-06-15T00:00:00Z",
+    }
+
+
+def _root_activation_retry(monkeypatch, state_path, served_sha, now=None):
+    posted, promoted = [], _approved_activation()
+    monkeypatch.setattr(blueprint, "_require_write_config", lambda _action: None)
+    monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda _args: promoted)
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: served_sha)
+    if now is not None:
+        monkeypatch.setattr(blueprint, "_activation_confirmation_now", lambda: now[0])
+    monkeypatch.setattr(blueprint, "_post_activation_receipt", lambda *args: posted.append(args))
+    return posted, argparse.Namespace(project_id=None, host="control-plane", state_path=str(state_path))
+
+
+def test_deploy_agent_does_not_confirm_when_served_sha_mismatches(monkeypatch, tmp_path):
+    """An accepted handoff stays unconfirmed, then terminally fails, when the old image serves."""
+    state_path, now = tmp_path / "deploy-agent.state", [datetime(2026, 6, 15, tzinfo=timezone.utc)]
+    _write_accepted_activation_state(state_path)
+    posted, args = _root_activation_retry(monkeypatch, state_path, "b" * 40, now)
+    assert blueprint._deploy_agent_once(args) is False
+    pending = json.loads(state_path.read_text(encoding="utf-8"))
+    assert pending["phase"] == "accepted"
+    assert pending["confirmation_deadline_at"]
+    assert posted == []
+
+    now[0] += timedelta(seconds=blueprint._DEPLOY_AGENT_CONFIRMATION_TIMEOUT_SECONDS)
+    assert blueprint._deploy_agent_once(args) is False
+    failed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert failed["phase"] == "failed"
+    assert failed["failure_reason"] == "served_sha_not_confirmed_before_deadline"
+    assert "confirmation_deadline_at" not in failed
+
+    assert blueprint._deploy_agent_once(args) is False
+    assert posted == []
+
+
+def test_deploy_agent_confirms_when_served_sha_matches(monkeypatch, tmp_path):
+    """An accepted socket timeout is retro-confirmed only after the local version endpoint matches."""
+    state_path = tmp_path / "deploy-agent.state"
+    _write_accepted_activation_state(state_path)
+    posted, args = _root_activation_retry(monkeypatch, state_path, _DEPLOY_PROMOTED_SHA)
+
+    assert blueprint._deploy_agent_once(args) is True
+    assert len(posted) == 1
+    assert not state_path.exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "release executor socket unavailable: [Errno 111] refused",
+        "release executor failed: rollback completed",
+    ],
+)
+def test_deploy_agent_does_not_post_receipt_when_shim_raises(
+    monkeypatch, tmp_path, failure
+):
+    """A failed release retries three times and records its terminal reason."""
+    from blueprint_api import APIError
+
+    promoted = {
+        "id": "uuid-promo",
+        "version_number": 7,
+        "status": "promoted",
+        "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "serving_status": "unconfirmed",
+        "activation_requested_at": "2026-06-15T00:00:00Z",
+    }
+    calls = []
+    _deploy_env(
+        monkeypatch,
+        _deploy_api_fake(calls, promoted=promoted),
+        revision=_DEPLOY_PROMOTED_SHA,
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "_invoke_release_shim",
+        lambda *args, **kwargs: (_ for _ in ()).throw(APIError(failure)),
+    )
+    monkeypatch.setattr(blueprint.time, "sleep", lambda _seconds: None)
+    state_path = tmp_path / "deploy-agent.state"
+    args = argparse.Namespace(
+        project_id=None,
+        host="control-plane",
+        state_path=str(state_path),
+    )
+
+    assert blueprint._deploy_agent_once(args) is False
+    assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
+    failed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert failed["phase"] == "failed"
+    assert failed["activation_attempts"] == 3
+    assert failed["root_release"]["status"] == "failed"
+    assert failed["root_release"]["attempts"] == 3
+    assert failure in failed["root_release"]["failure_reason"]
+
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: None)
+    assert blueprint._deploy_agent_once(args) is False
+    assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
+    resumed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert resumed["phase"] == "failed"
+    assert resumed["failure_reason"] == failed["failure_reason"]
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        ("HTTP 401: invalid credential", "unauthorized"),
+        ("cannot reach API at http://orchestrator: refused", "unreachable"),
+    ],
+)
+def test_deploy_agent_preflight_classifies_control_plane_failures(
+    monkeypatch, error, status
+):
+    """Preflight distinguishes credential rejection from transport failure."""
+    from blueprint_api import APIError
+
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _project_id=None: "proj-1")
+
+    def fail_api(*args, **kwargs):
+        raise APIError(error)
+
+    monkeypatch.setattr(blueprint, "api", fail_api)
+
+    control, activation = blueprint._activation_preflight(argparse.Namespace(project_id=None))
+
+    assert control["status"] == status
+    assert control["passed"] is False
+    assert activation["passed"] is False
+    assert "remediation" in control
+
+
+def test_deploy_agent_read_only_config_refuses_before_shim(monkeypatch, tmp_path):
+    """A read-only agent credential is rejected before any activation lookup or shim call."""
+    shim_calls = []
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(
+        blueprint,
+        "_read_live_approved_activation",
+        lambda _args: pytest.fail("read-only config must stop before polling"),
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "_invoke_release_shim",
+        lambda *args, **kwargs: shim_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(SystemExit):
+        blueprint._deploy_agent_once(
+            argparse.Namespace(
+                project_id=None,
+                state_path=str(tmp_path / "agent.state"),
+            )
+        )
+    assert not shim_calls
+
+
+def test_deploy_agent_noops_without_live_approval(monkeypatch):
+    """No approval (or a resolved approval) never reaches GitHub, the shim,
+    or the receipt endpoint."""
+    monkeypatch.setattr(blueprint, "_require_write_config", lambda _action: None)
+    monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda args: None)
+    monkeypatch.setattr(
+        blueprint,
+        "_fetch_deploy_manifest",
+        lambda *args, **kwargs: pytest.fail("agent must not fetch a manifest"),
+    )
+    monkeypatch.setattr(
+        blueprint.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("agent must not invoke the shim"),
+    )
+
+    assert blueprint._deploy_agent_once(argparse.Namespace(project_id=None)) is False

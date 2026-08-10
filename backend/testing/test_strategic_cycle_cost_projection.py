@@ -78,6 +78,8 @@ def test_script_is_importable_and_exposes_the_model_functions():
         "cohort_capped",
         "baseline_record",
         "baseline_per_cycle_stats",
+        "serving_sha_record",
+        "serving_sha_comparison",
         "project_monthly_spend",
         "project_monthly_spend_with_tasks",
         "load_measured_split",
@@ -988,6 +990,139 @@ def test_baseline_per_cycle_stats_empty_readings_fails_closed():
     assert stats["statistic_note"]
 
 
+def test_serving_sha_reading_does_not_move_the_baseline_anchor():
+    mod = _load_module()
+    anchor = mod.BASELINE_COST_PER_CYCLE_USD
+    serving_reading = {
+        "serving_sha": "f" * 40,
+        "cycle_count": 30,
+        "total_usd": 180.0,
+        "per_event_usd": 6.0,
+        "unpriced_coverage": 0.0,
+    }
+    record = mod.serving_sha_record([serving_reading])
+    comparison = mod.serving_sha_comparison(serving_reading)
+
+    assert record["readings"][0]["cost_arithmetic_consistent"] is True
+    assert comparison["available"] is True
+    assert comparison["serving_cost_per_cycle_usd"] == pytest.approx(6.0)
+    assert comparison["baseline_cost_per_cycle_usd"] == pytest.approx(anchor)
+    assert comparison["below_baseline_pct"] == pytest.approx((anchor - 6.0) / anchor)
+
+
+def test_serving_sha_record_derives_and_validates_per_event_arithmetic():
+    mod = _load_module()
+    derived = mod.serving_sha_record(
+        [{"serving_sha": "a" * 40, "cycle_count": 30, "total_usd": 75.0}]
+    )
+    assert derived["available"] is True
+    assert derived["readings"][0]["per_event_usd"] == pytest.approx(2.5)
+
+    inconsistent = mod.serving_sha_record(
+        [{
+            "serving_sha": "b" * 40,
+            "cycle_count": 4,
+            "total_usd": 10.0,
+            "per_event_usd": 99.0,
+        }]
+    )
+    assert inconsistent["available"] is False
+    assert inconsistent["readings"][0]["reading_valid"] is False
+
+def test_thin_cohort_yields_insufficient_verdict_with_required_n_and_projected_date():
+    """A valid-looking thin slice is not directional cost evidence."""
+    mod = _load_module()
+    result = mod.serving_sha_comparison(
+        {
+            "serving_sha": "c" * 40,
+            "cycle_count": 10,
+            "total_usd": 60.0,
+            "per_event_usd": 6.0,
+            "first_cycle_at": "2026-08-01T00:00:00+00:00",
+            "last_cycle_at": "2026-08-02T00:00:00+00:00",
+        }
+    )
+
+    assert result["available"] is False
+    assert result["verdict"] == "insufficient_sample"
+    assert result["n"] == 10
+    assert result["required_n"] == mod.MINIMUM_COST_VERDICT_N == 30
+    assert result["projected_date"] == "2026-08-04"
+    assert result["serving_cost_per_cycle_usd"] is None
+    assert result["dispersion"]["stddev_usd"] is None
+
+
+def test_serving_sha_record_reports_validated_per_slice_dispersion():
+    mod = _load_module()
+    record = mod.serving_sha_record(
+        [
+            {"serving_sha": "a" * 40, "cycle_count": 15, "total_usd": 90.0,
+             "per_event_usd": 6.0},
+            {"serving_sha": "b" * 40, "cycle_count": 15, "total_usd": 120.0,
+             "per_event_usd": 8.0},
+        ]
+    )
+
+    assert record["available"] is True
+    dispersion = record["dispersion"]
+    assert dispersion["mean_usd"] == pytest.approx(7.0)
+    assert dispersion["stddev_usd"] == pytest.approx(math.sqrt(2.0))
+
+    single = mod.serving_sha_record(
+        [{"serving_sha": "a" * 40, "cycle_count": 30, "total_usd": 180.0}]
+    )
+    assert single["qualification"]["available"] is True
+    assert single["dispersion"]["stddev_usd"] is None
+
+
+def test_serving_sha_record_rejects_non_sha_identity():
+    """A non-blank string that is not a git SHA is not a serving identity.
+
+    ``DeploymentState.current_sha`` initializes to the literal ``"unknown"``,
+    so a bare ``isinstance(str) and non-blank`` check would qualify a reading
+    whose cohort is attributed to a revision that does not exist.
+    """
+    mod = _load_module()
+    for bogus in ("unknown", "", "   ", "not-a-sha", "z" * 40, "f" * 64, 123, None):
+        record = mod.serving_sha_record(
+            [
+                {
+                    "serving_sha": bogus,
+                    "cycle_count": 30,
+                    "total_usd": 75.0,
+                    "per_event_usd": 2.5,
+                }
+            ]
+        )
+        assert record["readings"][0]["serving_sha_valid"] is False, bogus
+        assert record["readings"][0]["reading_valid"] is False, bogus
+        assert record["available"] is False, bogus
+
+    # A real 40-hex SHA (and the 7-hex short form) still qualifies.
+    for good in ("a" * 40, "abc1234"):
+        record = mod.serving_sha_record(
+            [
+                {
+                    "serving_sha": good,
+                    "cycle_count": 30,
+                    "total_usd": 75.0,
+                    "per_event_usd": 2.5,
+                }
+            ]
+        )
+        assert record["readings"][0]["serving_sha_valid"] is True, good
+
+
+def test_serving_sha_comparison_fails_closed_without_attribution_identity():
+    mod = _load_module()
+    result = mod.serving_sha_comparison(
+        {"serving_sha": None, "cycle_count": 2, "total_usd": 1.0, "per_event_usd": 0.5}
+    )
+    assert result["available"] is False
+    assert result["serving_cost_per_cycle_usd"] is None
+    assert result["below_baseline_pct"] is None
+
+
 def test_main_output_uses_the_derived_baseline():
     """The CLI anchors on the derived baseline and no longer cites $4.41.
 
@@ -1003,5 +1138,6 @@ def test_main_output_uses_the_derived_baseline():
     assert "$4.41" not in out
     assert f"${mod.BASELINE_COST_PER_CYCLE_USD:.2f}" in out
     assert "recorded baseline readings" in out
+    assert "[9] Serving-SHA readings" in out
     assert "median" in out and "MEAN" in out
     assert f"{mod.BASELINE_COST_PER_CYCLE_USD:.4f}" in out

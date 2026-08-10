@@ -158,6 +158,87 @@ import walkthrough_stack as wts
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
+_verification_toolchain: "iso.VerificationToolchain | None" = None
+
+
+def _verification_toolchain_root() -> str:
+    configured = os.environ.get("BLUEPRINT_RUNNER_VERIFICATION_TOOLCHAIN", "").strip()
+    root = configured or os.path.join(
+        os.path.expanduser("~"), ".blueprint", "verification-toolchain"
+    )
+    if not os.path.isabs(root) or "\x00" in root:
+        raise ValueError("verification toolchain root must be an absolute path")
+    if os.path.islink(root):
+        raise ValueError("verification toolchain root must not be a symlink")
+    return os.path.abspath(root)
+
+
+def _bootstrap_verification_toolchain() -> "iso.VerificationToolchain | None":
+    try:
+        root = _verification_toolchain_root()
+        requirements = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "backend", "requirements.txt")
+        )
+        if not os.path.isfile(requirements):
+            raise FileNotFoundError(requirements)
+        with open(requirements, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        venv = os.path.join(root, "venv")
+        python_path = os.path.join(venv, "bin", "python")
+        marker = os.path.join(root, "requirements.sha256")
+        marker_matches = False
+        try:
+            with open(marker, encoding="ascii") as fh:
+                marker_matches = fh.read().strip() == digest
+        except OSError:
+            pass
+
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+        def run(argv, timeout, env=None):
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+            if result.returncode:
+                raise RuntimeError((result.stderr or result.stdout or "toolchain command failed")[-700:])
+            return result
+        if not marker_matches or not os.path.isfile(python_path):
+            if os.path.isdir(venv):
+                shutil.rmtree(venv)
+            run([sys.executable, "-m", "venv", venv], 300)
+            run(
+                [python_path, "-m", "pip", "install", "--disable-pip-version-check",
+                 "--no-input", "--requirement", requirements],
+                900,
+                {"PATH": os.path.dirname(python_path), "HOME": root,
+                 "LANG": os.environ.get("LANG", "C"), "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+            )
+            with open(marker, "w", encoding="ascii") as fh:
+                fh.write(digest + "\n")
+
+        tool_env = {
+            "PATH": os.pathsep.join((os.path.dirname(python_path), os.defpath)),
+            "HOME": root,
+            "LANG": os.environ.get("LANG", "C"),
+        }
+        ruff_input = os.path.join(root, ".ruff-verification.py")
+        with open(ruff_input, "w", encoding="utf-8") as fh:
+            fh.write("verification_value = 1\n")
+        try:
+            run([python_path, "-m", "ruff", "check", "--isolated", "--no-cache", ruff_input], 30, tool_env)
+        finally:
+            try:
+                os.remove(ruff_input)
+            except OSError:
+                pass
+        bindir_text = run([python_path, "-c", "from pgserver._commands import POSTGRES_BIN_PATH; print(POSTGRES_BIN_PATH)"], 30, tool_env)
+        bindir = bindir_text.stdout.strip()
+        required = ("pg_config", "initdb", "pg_ctl", "pg_isready", "psql")
+        if not bindir or any(not os.access(os.path.join(bindir, name), os.X_OK) for name in required):
+            raise RuntimeError("pgserver did not expose a complete PostgreSQL server bindir")
+        return iso.VerificationToolchain(python_path=python_path, postgres_bindir=bindir)
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        print(f"[runner] verification toolchain unavailable: {str(exc)[:700]}", flush=True)
+        return None
+
 def _require_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -7553,8 +7634,19 @@ def _earn_project_verification(
     caps: "iso.Capabilities",
     agent_binary: list[str] | None,
     agent_image: str | None,
+    verification_toolchain: "iso.VerificationToolchain | None" = None,
 ) -> dict:
     """Probe the write-agent boundary once; never change general availability."""
+    if verification_toolchain is None:
+        reason = "verification toolchain bootstrap incomplete"
+        failed_probe = {"ok": False, "exit_code": None, "reason": reason}
+        return {
+            "version": iso.PROJECT_VERIFICATION_VERSION,
+            "boundary": {"class": iso.CLASS_AGENT, "backend": iso.DECLINE},
+            "ready": False,
+            "reason": reason,
+            "probes": {"ruff": dict(failed_probe), "docker_postgres": dict(failed_probe)},
+        }
     try:
         with tempfile.TemporaryDirectory(prefix="blueprint-verification-") as workspace:
             shutil.copy2(
@@ -7569,6 +7661,7 @@ def _earn_project_verification(
                 source_env=dict(os.environ),
                 task_type="fix",
                 agent_image=agent_image,
+                verification_toolchain=verification_toolchain,
             )
             return iso.probe_project_verification(plan)
     except Exception as exc:  # noqa: BLE001 — readiness proof is fail-closed evidence
@@ -8062,6 +8155,7 @@ def _spawn_agent_task(
     llm_env: dict[str, str] | None = None,
     llm_files: list[dict[str, str]] | None = None,
     decline_reason_out: list[str] | None = None,
+    verification_toolchain: "iso.VerificationToolchain | None" = None,
 ) -> bool:
     """Plan (fail-closed) + spawn one claimed agent task; record it for reaping.
 
@@ -8210,6 +8304,7 @@ def _spawn_agent_task(
         source_env=dict(os.environ),
         task_type=task_type,
         agent_image=plan_image,
+        verification_toolchain=verification_toolchain or _verification_toolchain,
     )
     if plan.declined:
         return _decline(plan.decline_reason or "sandbox plan declined")
@@ -8448,6 +8543,8 @@ def main() -> None:
         # agent_image kept as-is; the fail-closed image-present check below applies.
 
     caps = _get_capabilities()
+    global _verification_toolchain
+    _verification_toolchain = _bootstrap_verification_toolchain()
 
     # FAIL-CLOSED image check (Fix 3): a docker-usable box with BLUEPRINT_AGENT_IMAGE
     # set but the image ABSENT would still advertise agent_available=True and drain
@@ -8492,7 +8589,7 @@ def main() -> None:
     # and compute availability: read-only work and compute stay claimable when
     # Ruff or Docker/Postgres verification is unavailable.
     project_verification = _earn_project_verification(
-        caps, agent_binary, agent_image
+        caps, agent_binary, agent_image, _verification_toolchain
     )
 
     # LOUD warning (Fix 2): a docker-only box (docker + agent image usable, but NO

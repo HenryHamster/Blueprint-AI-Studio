@@ -42,17 +42,25 @@ See also:
     subcommands.
 """
 import argparse
+import contextlib
+import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.request import urlopen
 
 from blueprint_api import (
     APIError,
@@ -63,8 +71,42 @@ from blueprint_api import (
     resolve_project_id_by_name,
 )
 
+# Keep the retry policy shared with the backend's activation contract.  The
+# bootstrap copies this standalone module beside blueprint.py; source-tree CLI
+# runs load the same file from backend/app.
+_ACTIVATION_MODULE = Path(__file__).resolve().with_name("release_activation.py")
+if not _ACTIVATION_MODULE.is_file():
+    _ACTIVATION_MODULE = (
+        Path(__file__).resolve().parents[1] / "backend" / "app" / "release_activation.py"
+    )
+if not _ACTIVATION_MODULE.is_file():
+    raise ImportError(f"activation retry module missing: {_ACTIVATION_MODULE}")
+
+_activation_spec = importlib.util.spec_from_file_location(
+    "_blueprint_release_activation", _ACTIVATION_MODULE
+)
+if _activation_spec is None or _activation_spec.loader is None:
+    raise ImportError(f"cannot load activation retry module: {_ACTIVATION_MODULE}")
+_activation_module = importlib.util.module_from_spec(_activation_spec)
+_activation_spec.loader.exec_module(_activation_module)
+ActivationPhaseFailure = _activation_module.ActivationPhaseFailure
+retry_activation_phase = _activation_module.retry_activation_phase
+
 SERVICE_NAME = os.environ.get("BLUEPRINT_GCP_SERVICE", "blueprint-orchestrator")
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "blueprint-orchestrator")
+
+_DEPLOY_AGENT_UNIT_PATH = "/etc/systemd/system/blueprint-deploy-agent.service"
+_DEPLOY_AGENT_POLL_PATH = "/run/blueprint-deploy-agent/deploy-agent.poll"
+_DEPLOY_AGENT_STATE_PATH = "/var/lib/blueprint-deploy-agent/deploy-agent.state"
+_RELEASE_SOCKET_PATH = "/run/blueprint-release.sock"
+_RELEASE_SOCKET_TIMEOUT_SECONDS = 60
+_RELEASE_SHIM_PATH = "/usr/local/sbin/blueprint-release"
+_DEPLOY_AGENT_POLL_MAX_AGE_SECONDS = 120
+# The root release shim can take several minutes to pull and verify an image.
+# Once it has accepted the handoff, give the locally served API a bounded window
+# to prove the promoted revision before treating the activation as failed.
+_DEPLOY_AGENT_CONFIRMATION_TIMEOUT_SECONDS = 15 * 60
+_LOCAL_SERVING_VERSION_URL = "http://127.0.0.1:8080/api/version"
 
 
 # ── output helpers ───────────────────────────────────────────────────────────
@@ -5509,8 +5551,67 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Deploy even when no promoted release version exists or the built "
-             "revision does not contain the promoted SHA (emergency override).",
+        "revision does not contain the promoted SHA (emergency override).",
     )
+
+    # migrate
+    p_migrate = sub.add_parser(
+        "migrate", parents=[common],
+        help="Run Alembic against the local serving PostgreSQL in the deployed image.",
+        description=(
+            "Apply local serving-database migrations in a one-off container. "
+            "The --local acknowledgement is required because this command never "
+            "targets the cloud database."
+        ),
+    )
+    p_migrate.add_argument(
+        "--local", action="store_true", required=True,
+        help="Acknowledge that the target is the local blueprint PostgreSQL.",
+    )
+    p_migrate.add_argument(
+        "--sha", help="Migration image revision (prefix ok); defaults to the newest successful main build.",
+    )
+    p_migrate.add_argument(
+        "--image", "--worker-image", dest="image",
+        help="Full immutable worker/app image reference; overrides --sha manifest lookup.",
+    )
+    p_migrate.add_argument(
+        "--worker-env-file",
+        help="Worker role EnvironmentFile (defaults to the installed local worker role).",
+    )
+    p_migrate.add_argument(
+        "--worker-secrets-file",
+        help="Worker secrets JSON (defaults to the worker role configuration).",
+    )
+    p_migrate.add_argument(
+        "--registry-credential-file",
+        help="Worker Artifact Registry credential JSON (defaults to the worker role configuration).",
+    )
+    p_migrate.add_argument(
+        "--network",
+        help="Private Docker network (defaults to BLUEPRINT_CONTROL_PLANE_NETWORK).",
+    )
+    p_deploy_agent = sub.add_parser(
+        "deploy-agent", parents=[common],
+        help="Run the trusted local executor for approved activations.")
+    p_deploy_agent.add_argument(
+        "--once", action="store_true",
+        help="Poll and process at most one approved activation, then exit.")
+    p_deploy_agent.add_argument(
+        "--poll-interval", type=int, default=30,
+        help="Seconds between approval polls (default: 30).")
+    p_deploy_agent.add_argument(
+        "--lock-path", default="/run/blueprint-deploy-agent/deploy-agent.lock",
+        help="Local serialization lock path (managed by the systemd runtime directory).")
+    p_deploy_agent.add_argument(
+        "--state-path", default=_DEPLOY_AGENT_STATE_PATH,
+        help="Local receipt-retry state path (managed by the systemd runtime directory).")
+    p_deploy_agent.add_argument(
+        "--poll-state-path", default=_DEPLOY_AGENT_POLL_PATH,
+        help="Local successful-poll marker path (managed by the systemd runtime directory).")
+    p_deploy_agent.add_argument(
+        "--preflight", action="store_true",
+        help="Read-only installation, polling, connectivity, and activation checklist.")
 
     # envelope
     p_envelope = sub.add_parser(
@@ -5791,51 +5892,331 @@ _DEPLOY_REPO = "HenryHamster/BlueprintAIStudio"
 _DEPLOY_WORKFLOW = "Deploy Blueprint"
 _DEPLOY_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DEPLOY_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_MIGRATION_IMAGE_PREFIX = (
+    "us-central1-docker.pkg.dev/blueprint-orchestrator/"
+    "blueprint-repo/blueprint-orchestrator"
+)
+_MIGRATION_IMAGE_RE = re.compile(
+    rf"^{re.escape(_MIGRATION_IMAGE_PREFIX)}@sha256:[0-9a-f]{{64}}$"
+)
+_MIGRATION_REGISTRY = "us-central1-docker.pkg.dev"
+_MIGRATION_DOCKER = "/usr/bin/docker"
+_MIGRATION_NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+_MIGRATION_HARDENING_ARGS = (
+    "--pull", "never", "--read-only",
+    "--tmpfs", "/tmp:rw,noexec,nosuid,size=512m",
+    "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges",
+)
+
+
+def _migration_secure_file(path_text: str, label: str) -> Path:
+    """Resolve a worker-owned input without following a replacement symlink."""
+    path = Path(path_text)
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{label} must be a regular, non-symlink file")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError(f"{label} must be mode 0600 or stricter")
+    return path
+
+
+def _migration_role_env(path: Path) -> dict[str, str]:
+    """Parse the literal systemd EnvironmentFile used by the worker unit."""
+    values: dict[str, str] = {}
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            raise ValueError(f"invalid worker EnvironmentFile entry at line {line_number}")
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError(f"worker EnvironmentFile value for {key} contains control characters")
+        if key in values:
+            raise ValueError(f"worker EnvironmentFile repeats {key}")
+        values[key] = value
+    return values
+
+
+def _migration_worker_values(args: argparse.Namespace) -> tuple[dict[str, str], Path, Path, str]:
+    """Load the exact worker runtime inputs needed by the migration container."""
+    role_path_text = getattr(args, "worker_env_file", None) or os.environ.get(
+        "BLUEPRINT_WORKER_ENV_FILE", ""
+    )
+    if not role_path_text:
+        candidates = sorted(Path("/etc/blueprint/nodes").glob("*/roles/worker/role.env"))
+        if len(candidates) != 1:
+            raise ValueError(
+                "could not identify one installed worker role; pass --worker-env-file"
+            )
+        role_path = _migration_secure_file(
+            str(candidates[0]), "worker EnvironmentFile"
+        )
+    else:
+        role_path = _migration_secure_file(role_path_text, "worker EnvironmentFile")
+    role = _migration_role_env(role_path)
+
+    def configured(name: str, argument: str | None = None) -> str:
+        value = argument or role.get(name) or os.environ.get(name, "")
+        if not value:
+            raise ValueError(f"{name} is required by the worker migration contract")
+        return value
+
+    secrets_path = _migration_secure_file(
+        configured("BLUEPRINT_WORKER_SECRETS_FILE", getattr(args, "worker_secrets_file", None)),
+        "worker secrets file",
+    )
+    credential_path = _migration_secure_file(
+        configured(
+            "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE",
+            getattr(args, "registry_credential_file", None),
+        ),
+        "worker registry credential file",
+    )
+    network = configured("BLUEPRINT_CONTROL_PLANE_NETWORK", getattr(args, "network", None))
+    if not _MIGRATION_NETWORK_RE.fullmatch(network):
+        raise ValueError("worker control-plane network is not a safe Docker network name")
+    try:
+        secrets = json.loads(secrets_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("worker secrets file is not valid JSON") from exc
+    if not isinstance(secrets, dict) or not secrets:
+        raise ValueError("worker secrets file must contain a non-empty JSON object")
+    if any(
+        not isinstance(key, str)
+        or not isinstance(value, str)
+        or not key
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        for key, value in secrets.items()
+    ):
+        raise ValueError("worker secrets must contain only string values without control characters")
+    database_url = secrets.get("DATABASE_URL")
+    if not database_url:
+        raise ValueError("worker secrets are missing DATABASE_URL")
+    secrets["DATABASE_URL"] = _migration_local_database_url(database_url)
+    return secrets, credential_path, secrets_path, network
+
+
+def _migration_local_database_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"postgresql", "postgresql+asyncpg"}:
+        raise ValueError("worker DATABASE_URL must use PostgreSQL")
+    if not parsed.username or parsed.password is None or not parsed.path.strip("/"):
+        raise ValueError("worker DATABASE_URL must include user, password, and database")
+    userinfo = parsed.netloc.rsplit("@", 1)[0]
+    query = [
+        pair for pair in parsed.query.split("&")
+        if pair and pair.partition("=")[0].lower() not in {"ssl", "sslmode"}
+    ]
+    query.append("ssl=disable")
+    return urlunsplit(
+        SplitResult(
+            parsed.scheme,
+            f"{userinfo}@blueprint-postgres:5432",
+            parsed.path,
+            "&".join(query),
+            parsed.fragment,
+        )
+    )
+
+
+def _migration_credential_text(path: Path) -> str:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("worker registry credential is not valid JSON") from exc
+    expected_email = (
+        "blueprint-local-worker-runtime@blueprint-orchestrator.iam.gserviceaccount.com"
+    )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("type") != "service_account"
+        or payload.get("project_id") != "blueprint-orchestrator"
+        or payload.get("client_email") != expected_email
+        or not isinstance(payload.get("private_key"), str)
+    ):
+        raise ValueError("worker registry credential has the wrong identity")
+    return path.read_text(encoding="utf-8")
+
+
+@contextlib.contextmanager
+def _migration_registry_config(credential_path: Path):
+    """Create the same ephemeral Docker login used by local_app_release."""
+    credential_text = _migration_credential_text(credential_path)
+    directory = Path(tempfile.mkdtemp(prefix="blueprint-registry-auth-", dir="/run"))
+    os.chmod(directory, 0o700)
+    cleanup_error: str | None = None
+    try:
+        login = subprocess.run(
+            [
+                _MIGRATION_DOCKER, "--config", str(directory), "login",
+                "--username", "_json_key", "--password-stdin",
+                f"https://{_MIGRATION_REGISTRY}",
+            ],
+            input=credential_text,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if login.returncode != 0:
+            detail = (login.stderr or login.stdout or "").strip()
+            raise RuntimeError(f"registry login failed{': ' + detail if detail else ''}")
+        credential_text = ""
+        yield directory
+    finally:
+        logout = subprocess.run(
+            [_MIGRATION_DOCKER, "--config", str(directory), "logout", _MIGRATION_REGISTRY],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if logout.returncode != 0:
+            cleanup_error = "docker logout failed"
+        try:
+            for entry in directory.iterdir():
+                entry.unlink()
+            directory.rmdir()
+        except OSError as exc:
+            cleanup_error = f"registry credential cleanup failed: {exc}"
+        if cleanup_error:
+            raise RuntimeError(cleanup_error)
+
+
+def _migration_image(args: argparse.Namespace) -> tuple[str, str | None]:
+    image = getattr(args, "image", None)
+    if image:
+        if not _MIGRATION_IMAGE_RE.fullmatch(image):
+            raise ValueError("--image must be the approved immutable Artifact Registry worker image")
+        return image, None
+    release = _fetch_deploy_manifest(getattr(args, "sha", None))
+    return f"{_MIGRATION_IMAGE_PREFIX}@{release['digest']}", release["revision"]
+
+
+def _migration_container_command(
+    config: Path,
+    image: str,
+    network: str,
+    credential_path: Path,
+    environment: dict[str, str],
+    action: tuple[str, ...],
+) -> list[str]:
+    forwarded = sorted(
+        set(environment)
+        | {
+            "BLUEPRINT_PROCESS_ROLE",
+            "BLUEPRINT_DEPLOYMENT_MODE",
+            "PYTHONDONTWRITEBYTECODE",
+            "HOME",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        }
+    )
+    return [
+        _MIGRATION_DOCKER, "--config", str(config), "run", "--rm",
+        "--network", network, *_MIGRATION_HARDENING_ARGS,
+        "--mount", f"type=bind,src={credential_path},dst=/var/run/blueprint/gcp.json,readonly",
+        *(item for name in forwarded for item in ("--env", name)),
+        image, *action,
+    ]
+
+
+def _run_migration_container(command: list[str], environment: dict[str, str]) -> int:
+    result = subprocess.run(
+        command, capture_output=True, text=True, check=False,
+        timeout=600, env=environment,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode != 0:
+        print(f"ERROR: migration container exited {result.returncode}", file=sys.stderr)
+    return result.returncode
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Apply local migrations with the selected immutable worker image."""
+    if not args.local:  # argparse requires this; retain the guard for direct callers.
+        print("ERROR: migrate requires --local", file=sys.stderr)
+        return 2
+    try:
+        image, revision = _migration_image(args)
+        secrets, credential_path, _secrets_path, network = _migration_worker_values(args)
+        environment = dict(secrets)
+        environment.update(
+            {
+                "BLUEPRINT_PROCESS_ROLE": "worker",
+                "BLUEPRINT_DEPLOYMENT_MODE": "local-production",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "HOME": "/tmp",
+                "GOOGLE_APPLICATION_CREDENTIALS": "/var/run/blueprint/gcp.json",
+            }
+        )
+        print("=== LOCAL DATABASE MIGRATION ===")
+        print(f"  Image:     {image}")
+        if revision:
+            print(f"  Revision:  {revision}")
+        with _migration_registry_config(credential_path) as config:
+            pull = subprocess.run(
+                [_MIGRATION_DOCKER, "--config", str(config), "pull", image],
+                capture_output=True, text=True, check=False, timeout=600,
+            )
+            if pull.stdout:
+                print(pull.stdout, end="")
+            if pull.stderr:
+                print(pull.stderr, end="", file=sys.stderr)
+            if pull.returncode != 0:
+                print(f"ERROR: migration image pull exited {pull.returncode}", file=sys.stderr)
+                return pull.returncode
+            base = lambda action: _migration_container_command(
+                config, image, network, credential_path, environment, action
+            )
+            print("  Before:")
+            before = _run_migration_container(base(("alembic", "current")), environment)
+            if before != 0:
+                return before
+            upgrade = _run_migration_container(
+                base(("alembic", "upgrade", "head")), environment
+            )
+            if upgrade != 0:
+                return upgrade
+            print("  After:")
+            return _run_migration_container(base(("alembic", "current")), environment)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: local migration failed: {exc}", file=sys.stderr)
+        return 1
 
 
 def _gh(*gh_args: str) -> str:
     """Run gh and return stdout, mapping failure to APIError for main()."""
     proc = subprocess.run(
-        ["gh", *gh_args], capture_output=True, text=True
+        ["gh", *gh_args], capture_output=True, text=True, check=False
     )
     if proc.returncode != 0:
         print(f"ERROR: gh {' '.join(gh_args[:3])}... failed: {proc.stderr.strip()[:400]}")
-        raise APIError(proc.returncode, proc.stderr.strip()[:400])
+        raise APIError(proc.stderr.strip()[:400])
     return proc.stdout
 
 
-def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | None:
-    """Resolve the promoted release version this deploy binds to (or ``None``).
-
-    Bind the built revision to the project's latest promoted release version:
-    query the backend for the newest ``status=promoted`` version and, when the
-    built revision differs from the promoted SHA, verify via the GitHub compare
-    API that the build CONTAINS the promoted commit (status ``identical`` or
-    ``ahead``).  Refuse ``behind``/``diverged`` revisions — a build that does not
-    include the promoted commit must not be surfaced as the promoted version
-    serving.  ``--force`` bypasses every refusal (emergency override); with no
-    promoted version at all, ``--force`` returns ``None`` and the deploy proceeds
-    unbound (legacy behavior, no receipt).
-    """
+def _read_latest_promoted_version(args: argparse.Namespace) -> dict | None:
+    """Read the current promoted version, without interpreting CLI overrides."""
     pid = get_project_id(getattr(args, "project_id", None))
     versions_data, err = _safe_read(
         f"/api/admin/projects/{pid}/release-versions?status=promoted&limit=1"
     )
     if err:
         print(f"ERROR: could not read promoted release versions: {err}")
-        raise APIError(1, "promoted version lookup failed")
+        raise APIError("promoted version lookup failed")
     versions = (versions_data or {}).get("versions") or []
-    promoted = versions[0] if versions else None
-    if promoted is None:
-        if getattr(args, "force", False):
-            print("  WARNING: no promoted release version found — deploying "
-                  "unbound (--force).")
-            return None
-        print("ERROR: no promoted release version found for this project; "
-              "refusing to activate a revision that is not bound to a "
-              "promotion. Use --force to deploy anyway.")
-        raise APIError(1, "no promoted release version")
+    return versions[0] if versions else None
 
+
+def _validate_deploy_binding(
+    revision: str, promoted: dict, *, force: bool = False
+) -> None:
+    """Verify that ``revision`` is the promotion or its GitHub descendant."""
     promoted_sha = (promoted.get("promoted_sha") or "").lower()
     version_number = promoted.get("version_number")
     status = "identical"
@@ -5845,7 +6226,7 @@ def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | N
         ))
         status = (compare.get("status") or "unknown")
         if status not in ("identical", "ahead"):
-            if getattr(args, "force", False):
+            if force:
                 print(f"  WARNING: built revision {revision[:12]} is {status} "
                       f"the promoted SHA {promoted_sha[:12]} — binding check "
                       "bypassed (--force).")
@@ -5854,10 +6235,819 @@ def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | N
                       f"promoted SHA {promoted_sha[:12]}; refusing to activate a "
                       "revision that does not contain the promoted commit. Use "
                       "--force to deploy anyway.")
-                raise APIError(1, "revision not descendant of promoted sha")
+                raise APIError("revision not descendant of promoted sha")
     print(f"  Binding:   v{version_number} (promoted {promoted_sha[:12]}, "
           f"build {status})")
+
+
+def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | None:
+    """Resolve and verify the version this legacy CLI deploy binds to.
+
+    ``--force`` retains its emergency legacy behavior: no promotion can mean
+    an unbound deploy, and a non-descendant can still be activated deliberately.
+    """
+    promoted = _read_latest_promoted_version(args)
+    if promoted is None:
+        if getattr(args, "force", False):
+            print("  WARNING: no promoted release version found — deploying "
+                  "unbound (--force).")
+            return None
+        print("ERROR: no promoted release version found for this project; "
+              "refusing to activate a revision that is not bound to a "
+              "promotion. Use --force to deploy anyway.")
+        raise APIError("no promoted release version")
+    _validate_deploy_binding(revision, promoted, force=getattr(args, "force", False))
     return promoted
+
+
+def _fetch_deploy_manifest(wanted_sha: str | None = None) -> dict:
+    """Fetch a CI manifest and verify its checksum, digest, and revision.
+
+    The interactive CLI and deploy agent share this exact artifact-validation
+    path. Neither caller treats a downloaded manifest as activation authority
+    until promotion binding has separately succeeded.
+    """
+    requested = (wanted_sha or "").lower() or None
+    run_list_args = [
+        "run", "list", "--repo", _DEPLOY_REPO, "--workflow", _DEPLOY_WORKFLOW,
+    ]
+    if requested is None or not _DEPLOY_REVISION_RE.fullmatch(requested):
+        # GitHub's --commit filter requires the full head SHA. Keep the
+        # documented abbreviated --sha form on the prefix-capable branch page.
+        run_list_args.extend(["--branch", "main", "--limit", "15"])
+    else:
+        # The agent is polling an approval for a specific commit. Ask GitHub
+        # for that commit directly; filtering a recent global page can lose a
+        # still-retained artifact after enough newer deployments land.
+        run_list_args.extend(["--commit", requested, "--limit", "15"])
+    run_list_args.extend(["--json", "databaseId,headSha,status,conclusion,createdAt"])
+    runs = json.loads(_gh(*run_list_args))
+    run = next(
+        (
+            item for item in runs
+            if item.get("status") == "completed" and item.get("conclusion") == "success"
+            and (requested is None or item.get("headSha", "").startswith(requested))
+        ),
+        None,
+    )
+    if run is None:
+        print("ERROR: no successful Deploy Blueprint run found"
+              + (f" for sha {requested}" if requested else "."))
+        raise APIError("no successful deploy run")
+    sha = run["headSha"]
+    with tempfile.TemporaryDirectory() as temporary:
+        _gh(
+            "run", "download", str(run["databaseId"]), "--repo", _DEPLOY_REPO,
+            "-n", f"local-app-release-{sha}", "-D", temporary,
+        )
+        manifest_path = os.path.join(temporary, "local-app-release.json")
+        with open(manifest_path, "rb") as handle:
+            manifest_bytes = handle.read()
+        with open(manifest_path + ".sha256", encoding="utf-8") as handle:
+            expected_digest = handle.read().split()[0]
+        if hashlib.sha256(manifest_bytes).hexdigest() != expected_digest:
+            print("ERROR: manifest checksum mismatch — refusing to deploy.")
+            raise APIError("manifest checksum mismatch")
+        manifest = json.loads(manifest_bytes)
+    digest = (manifest.get("image_ref") or "").rsplit("@", 1)[-1]
+    revision = manifest.get("revision") or ""
+    if not _DEPLOY_DIGEST_RE.fullmatch(digest) or not _DEPLOY_REVISION_RE.fullmatch(revision):
+        print("ERROR: manifest digest/revision failed validation — refusing to deploy.")
+        raise APIError("manifest validation failed")
+    return {"run": run, "digest": digest, "revision": revision}
+
+
+def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> bool:
+    """Use the root-owned release socket, or the legacy remote SSH path."""
+    if host is None:
+        return _request_release_socket(digest, revision)
+    command = ["ssh", "-t", host, "sudo", _RELEASE_SHIM_PATH, digest, revision]
+    proc = subprocess.run(command, check=False)
+    if proc.returncode != 0:
+        print(f"ERROR: release exited {proc.returncode} — the release tool "
+              "rolls back failed activations; inspect its receipt on the host.")
+        raise APIError(f"release failed with exit code {proc.returncode}")
+    return True
+
+
+def _request_release_socket(digest: str, revision: str) -> bool:
+    """Send the approval, reporting when execution outlives the socket wait."""
+    if not _DEPLOY_REVISION_RE.fullmatch(revision):
+        raise APIError("release revision failed validation")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise APIError("release digest failed validation")
+    request_sent = False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(_RELEASE_SOCKET_TIMEOUT_SECONDS)
+            connection.connect(_RELEASE_SOCKET_PATH)
+            connection.sendall(f"{digest} {revision}\n".encode("ascii"))
+            request_sent = True
+            connection.shutdown(socket.SHUT_WR)
+            response = connection.recv(256).decode("ascii", errors="replace").strip()
+    except TimeoutError as exc:
+        if request_sent:
+            print(
+                "Release executor is still running; receipt delivery is parked "
+                "for the next poll.",
+                file=sys.stderr,
+            )
+            return False
+        raise APIError(f"release executor socket unavailable: {exc}") from exc
+    except OSError as exc:
+        if request_sent:
+            print(
+                "Release executor handoff was accepted but its response was "
+                "lost; receipt delivery is parked for the next poll.",
+                file=sys.stderr,
+            )
+            return False
+        raise APIError(f"release executor socket unavailable: {exc}") from exc
+    if response != "OK":
+        detail = response.removeprefix("ERROR ") or "empty executor response"
+        raise APIError(f"release executor failed: {detail}")
+    return True
+
+
+def _resolve_deploy_manifest(args: argparse.Namespace) -> tuple[str, str, dict]:
+    """Expose the validated manifest tuple used by the standalone agent."""
+    release = _fetch_deploy_manifest(getattr(args, "sha", None))
+    return release["revision"], release["digest"], release["run"]
+
+
+def _execute_deploy_shim(
+    args: argparse.Namespace,
+    revision: str,
+    digest: str,
+    *,
+    inplace: bool = False,
+) -> bool:
+    """Run the canonical root-owned executor, locally or over legacy SSH."""
+    return _invoke_release_shim(
+        digest,
+        revision,
+        host=None if inplace else getattr(args, "host", None),
+    )
+
+
+def _execute_deploy(
+    args: argparse.Namespace,
+    revision: str,
+    digest: str,
+    promoted: dict | None,
+    *,
+    inplace: bool = False,
+) -> None:
+    """Execute the shim, then post the receipt as a distinct stage."""
+    release_completed = _execute_deploy_shim(args, revision, digest, inplace=inplace)
+    if release_completed is False:
+        print(
+            "Release is still running; activation receipt will be retried by "
+            "the deploy agent.",
+            file=sys.stderr,
+        )
+        return
+    print("Release activated. Runners self-update on their next heartbeat.")
+    _post_activation_receipt(args, promoted, revision)
+
+
+def _read_live_approved_activation(args: argparse.Namespace) -> dict | None:
+    """Return only a promoted version that is still approved and unconfirmed."""
+    promoted = _read_latest_promoted_version(args)
+    if promoted is None:
+        return None
+    promoted_sha = (promoted.get("promoted_sha") or "").lower()
+    if (
+        promoted.get("status") != "promoted"
+        or promoted.get("serving_status") != "unconfirmed"
+        or not promoted.get("activation_requested_at")
+        or not _DEPLOY_REVISION_RE.fullmatch(promoted_sha)
+    ):
+        return None
+    return promoted
+
+
+def _deploy_agent_once(args: argparse.Namespace) -> bool:
+    """Execute one current approval and post the existing activation receipt.
+
+    The activation intent is recorded before the shim invocation. If the
+    control plane is temporarily unavailable, later polls retry only that
+    receipt for the same approval instead of restarting the release.
+    """
+    # Keep this guard in the cycle, not only in cmd_deploy_agent: a long-lived
+    # service can have its config changed after startup, and a read-only agent
+    # credential must never reach the privileged executor.
+    _require_write_config("deploy-agent")
+    approved = _read_live_approved_activation(args)
+    _write_deploy_agent_poll(getattr(args, "poll_state_path", None))
+    if approved is None:
+        return False
+    promoted_sha = approved["promoted_sha"].lower()
+    state_path = getattr(args, "state_path", None)
+    pending_receipt = _read_deploy_agent_state(state_path)
+    if pending_receipt is not None:
+        matches_approval = (
+            pending_receipt.get("version_number") == approved.get("version_number")
+            and pending_receipt.get("promoted_sha") == promoted_sha
+            and pending_receipt.get("revision") == promoted_sha
+        )
+        if matches_approval and pending_receipt.get("phase") == "failed":
+            print(
+                f"Approved activation for v{approved.get('version_number')} failed "
+                f"before its promoted SHA was observed serving: "
+                f"{pending_receipt.get('failure_reason', 'no failure reason recorded')}.",
+                file=sys.stderr,
+            )
+            return False
+        if matches_approval and pending_receipt.get("phase") == "started":
+            # The started marker is the at-most-once fence. A restart after
+            # this point cannot distinguish an in-flight release from one
+            # that completed before the agent died, so reconcile through the
+            # same serving probe used after an accepted socket handoff.
+            confirmation = _pending_activation_confirmation(pending_receipt, promoted_sha)
+            _write_deploy_agent_state(state_path, pending_receipt)
+            if confirmation == "failed":
+                print(
+                    f"Approved activation for v{approved.get('version_number')} failed: "
+                    "the promoted SHA was not observed serving before the deadline.",
+                    file=sys.stderr,
+                )
+                return False
+            if confirmation == "pending":
+                return False
+            pending_receipt["phase"] = "completed"
+            _write_deploy_agent_state(state_path, pending_receipt)
+            _post_activation_receipt(
+                argparse.Namespace(
+                    project_id=getattr(args, "project_id", None),
+                    host=getattr(args, "host", "control-plane"),
+                ),
+                approved,
+                promoted_sha,
+            )
+            _clear_deploy_agent_state(state_path)
+            print(f"Approved activation for v{approved.get('version_number')} completed.")
+            return True
+        if matches_approval and pending_receipt.get("phase") in {"accepted", "completed"}:
+            confirmation = _pending_activation_confirmation(pending_receipt, promoted_sha)
+            _write_deploy_agent_state(state_path, pending_receipt)
+            if confirmation == "failed":
+                print(
+                    f"Approved activation for v{approved.get('version_number')} failed: "
+                    "the promoted SHA was not observed serving before the deadline.",
+                    file=sys.stderr,
+                )
+                return False
+            if confirmation == "pending":
+                return False
+            _post_activation_receipt(
+                argparse.Namespace(
+                    project_id=getattr(args, "project_id", None),
+                    host=getattr(args, "host", "control-plane"),
+                ),
+                approved,
+                promoted_sha,
+            )
+            _clear_deploy_agent_state(state_path)
+            print(f"Approved activation for v{approved.get('version_number')} completed.")
+            return True
+        _clear_deploy_agent_state(state_path)
+
+    # Approved activations are bound by the receipt endpoint to this exact
+    # promoted SHA. The legacy CLI still uses the descendant binding below.
+    release = _fetch_deploy_manifest(promoted_sha)
+    if release["revision"] != promoted_sha:
+        raise APIError("manifest revision does not match approved promoted sha")
+    _validate_deploy_binding(release["revision"], approved)
+    # Download can take long enough for a superseding promotion. Re-read before
+    # touching the privileged shim; the receipt endpoint also rejects any race
+    # that occurs during the shim invocation.
+    current = _read_live_approved_activation(args)
+    if (
+        current is None
+        or current.get("version_number") != approved.get("version_number")
+        or (current.get("promoted_sha") or "").lower() != promoted_sha
+        or release["revision"] != (current.get("promoted_sha") or "").lower()
+    ):
+        print("Approved activation changed before execution; leaving it for the next poll.")
+        return False
+    activation_state = {
+        "version_number": current.get("version_number"),
+        "promoted_sha": promoted_sha,
+        "revision": release["revision"],
+        "phase": "started",
+        "activation_attempts": 0,
+    }
+    # Persist the intent before crossing the privileged boundary. This is the
+    # at-most-once fence when the agent dies or the socket wait expires while
+    # the root service continues the release.
+    _write_deploy_agent_state(state_path, activation_state)
+
+    def invoke_activation(attempt: int) -> bool:
+        # Persist the attempt counter before crossing the privileged boundary.
+        # A process restart therefore cannot silently reset a failed phase's
+        # retry budget or mistake a terminal failure for a timeout.
+        activation_state["activation_attempts"] = attempt
+        activation_state["root_release"] = {
+            "phase": "activation",
+            "attempt": attempt,
+            "status": "started",
+        }
+        _write_deploy_agent_state(state_path, activation_state)
+        return _invoke_release_shim(release["digest"], release["revision"], host=None)
+
+    try:
+        release_completed = retry_activation_phase(
+            "activation",
+            lambda: invoke_activation(activation_state["activation_attempts"] + 1),
+            retry_if=lambda exc: isinstance(exc, APIError),
+            sleep=time.sleep,
+        )
+    except ActivationPhaseFailure as failure:
+        activation_state["phase"] = "failed"
+        activation_state["failure_reason"] = str(failure)
+        activation_state["root_release"] = {
+            "phase": failure.phase,
+            "status": "failed",
+            "attempts": failure.attempts,
+            "failure_reason": str(failure.final_exception),
+        }
+        _write_deploy_agent_state(state_path, activation_state)
+        print(
+            f"Approved activation for v{current.get('version_number')} failed: "
+            f"{failure}",
+            file=sys.stderr,
+        )
+        return False
+    if release_completed is False:
+        activation_state["phase"] = "accepted"
+        activation_state.setdefault("root_release", {})["status"] = "accepted"
+        _write_deploy_agent_state(state_path, activation_state)
+        return False
+    activation_state["phase"] = "completed"
+    activation_state.setdefault("root_release", {})["status"] = "completed"
+    _write_deploy_agent_state(state_path, activation_state)
+    confirmation = _pending_activation_confirmation(activation_state, promoted_sha)
+    _write_deploy_agent_state(state_path, activation_state)
+    if confirmation == "failed":
+        print(
+            f"Approved activation for v{current.get('version_number')} failed: "
+            "the promoted SHA was not observed serving before the deadline.",
+            file=sys.stderr,
+        )
+        return False
+    if confirmation == "pending":
+        return False
+    _post_activation_receipt(
+        argparse.Namespace(
+            project_id=getattr(args, "project_id", None),
+            host=getattr(args, "host", "control-plane"),
+        ),
+        current,
+        release["revision"],
+    )
+    _clear_deploy_agent_state(state_path)
+    print(f"Approved activation for v{current.get('version_number')} completed.")
+    return True
+
+
+def _activation_confirmation_now() -> datetime:
+    """Return the wall-clock time used for durable activation deadlines."""
+    return datetime.now(timezone.utc)
+
+
+def _local_served_sha() -> str | None:
+    """Return the SHA from the canonical local serving probe, or ``None``.
+
+    ``local_app_release.py`` verifies this same loopback API endpoint as part of
+    a successful release.  The deploy agent deliberately needs a fresh read
+    after an accepted socket handoff: a rollback can occur after that handoff.
+    Transport, HTTP, JSON, malformed-payload, and abbreviated-SHA failures are
+    all unconfirmed.  The endpoint's ``sha`` is the full promoted Git SHA;
+    deployment-status views may abbreviate it independently.
+    """
+    try:
+        with urlopen(_LOCAL_SERVING_VERSION_URL, timeout=5) as response:
+            if getattr(response, "status", None) != 200:
+                return None
+            payload = json.loads(response.read())
+    except (OSError, ValueError):
+        return None
+    sha = payload.get("sha") if isinstance(payload, dict) else None
+    if not isinstance(sha, str):
+        return None
+    normalized_sha = sha.lower()
+    return normalized_sha if _DEPLOY_REVISION_RE.fullmatch(normalized_sha) else None
+
+
+def _pending_activation_confirmation(state: dict, expected_sha: str) -> str:
+    """Return ``confirmed``, ``pending``, or terminal ``failed`` for a receipt.
+
+    The first poll after the root shim has accepted/completed an activation
+    persists a deadline.  A later matching loopback SHA is the only route to a
+    receipt; an old SHA, unavailable API, or malformed response remains pending
+    until that deadline, then latches the local activation as failed.
+    """
+    expected_sha = expected_sha.lower()
+    now = _activation_confirmation_now()
+    raw_deadline = state.get("confirmation_deadline_at")
+    try:
+        deadline = datetime.fromisoformat(str(raw_deadline).replace("Z", "+00:00"))
+        if deadline.tzinfo is None:
+            raise ValueError("naive deadline")
+    except (TypeError, ValueError):
+        deadline = now + timedelta(seconds=_DEPLOY_AGENT_CONFIRMATION_TIMEOUT_SECONDS)
+        state["confirmation_deadline_at"] = deadline.isoformat()
+
+    served_sha = _local_served_sha()
+    if served_sha == expected_sha:
+        return "confirmed"
+    if now >= deadline:
+        state["phase"] = "failed"
+        state["failure_reason"] = "served_sha_not_confirmed_before_deadline"
+        state.pop("confirmation_deadline_at", None)
+        return "failed"
+    return "pending"
+
+
+def _read_deploy_agent_state(path: str | None) -> dict | None:
+    """Read the agent's host-local receipt retry marker, if it is valid."""
+    if not path:
+        return None
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    return state
+
+
+def _write_deploy_agent_poll(path: str | None) -> None:
+    """Record a successful activation poll in a separate local marker."""
+    if not path:
+        return
+    _write_deploy_agent_state(path, {"polled_at": datetime.now(timezone.utc).isoformat()})
+
+
+def _write_deploy_agent_state(path: str | None, state: dict) -> None:
+    """Atomically persist an activation intent before receipt delivery."""
+    if not path:
+        return
+    path = os.path.expanduser(path)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".deploy-agent.", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _clear_deploy_agent_state(path: str | None) -> None:
+    """Remove a delivered or superseded receipt retry marker."""
+    if not path:
+        return
+    try:
+        os.unlink(os.path.expanduser(path))
+    except FileNotFoundError:
+        pass
+
+
+def _preflight_file(path: str, *, executable: bool = False) -> dict:
+    """Inspect one managed host file without following or changing it."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {
+            "exists": False,
+            "regular": False,
+            "passed": False,
+            "message": f"missing: {path}",
+            "remediation": "run the release bootstrap on the control-plane host",
+        }
+    except OSError as exc:
+        return {
+            "exists": False,
+            "regular": False,
+            "passed": False,
+            "message": f"cannot inspect {path}: {exc}",
+            "remediation": "inspect host permissions and rerun the release bootstrap",
+        }
+    regular = stat.S_ISREG(info.st_mode)
+    executable_ok = not executable or bool(info.st_mode & 0o111)
+    root_owned = info.st_uid == 0 and info.st_gid == 0
+    passed = regular and executable_ok and root_owned
+    problems = []
+    if not regular:
+        problems.append("not a regular file")
+    if executable and not executable_ok:
+        problems.append("not executable")
+    if not root_owned:
+        problems.append(f"owned by {info.st_uid}:{info.st_gid}, expected root:root")
+    result = {
+        "exists": True,
+        "regular": regular,
+        "executable": executable_ok if executable else None,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "passed": passed,
+        "message": f"present: {path}" if passed else f"{path}: {', '.join(problems)}",
+    }
+    if not passed:
+        result["remediation"] = (
+            "run the release bootstrap on the control-plane host and verify root:root ownership"
+        )
+    return result
+
+
+def _systemd_preflight() -> dict:
+    """Read the deploy-agent unit and its live systemd state."""
+    file_check = _preflight_file(_DEPLOY_AGENT_UNIT_PATH)
+    if not file_check["passed"]:
+        file_check["message"] = f"unit file: {file_check['message']}"
+        return {
+            "path": _DEPLOY_AGENT_UNIT_PATH,
+            "unit": os.path.basename(_DEPLOY_AGENT_UNIT_PATH),
+            "enabled": False,
+            "active": False,
+            **file_check,
+        }
+    unit = os.path.basename(_DEPLOY_AGENT_UNIT_PATH)
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/systemctl", "show", unit,
+                "--property=UnitFileState",
+                "--property=ActiveState",
+                "--property=SubState",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return {
+            "path": _DEPLOY_AGENT_UNIT_PATH,
+            "unit": unit,
+            "enabled": False,
+            "active": False,
+            "passed": False,
+            "message": f"cannot query systemd: {exc}",
+            "remediation": "run systemctl daemon-reload and enable --now blueprint-deploy-agent.service",
+        }
+    properties = {}
+    for line in (result.stdout or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            properties[key] = value
+    enabled = properties.get("UnitFileState") == "enabled"
+    active = properties.get("ActiveState") == "active"
+    passed = result.returncode == 0 and enabled and active
+    response = {
+        "path": _DEPLOY_AGENT_UNIT_PATH,
+        "unit": unit,
+        "enabled": enabled,
+        "active": active,
+        "active_state": properties.get("ActiveState"),
+        "sub_state": properties.get("SubState"),
+        "unit_file_state": properties.get("UnitFileState"),
+        "passed": passed,
+        "message": (
+            "installed, enabled, and active"
+            if passed else
+            f"enabled={properties.get('UnitFileState', 'unknown')}, "
+            f"active={properties.get('ActiveState', 'unknown')}"
+        ),
+    }
+    if not passed:
+        response["remediation"] = (
+            "run systemctl daemon-reload && systemctl enable --now "
+            "blueprint-deploy-agent.service"
+        )
+    return response
+
+
+def _poll_preflight(path: str) -> dict:
+    """Read the last successful poll marker and assess its age."""
+    marker = _read_deploy_agent_state(path)
+    polled_at = marker.get("polled_at") if marker else None
+    if not polled_at:
+        return {
+            "path": path,
+            "last_poll_at": None,
+            "seconds_since_last_poll": None,
+            "passed": False,
+            "message": "no successful poll has ever occurred",
+            "remediation": "start or restart blueprint-deploy-agent.service",
+        }
+    try:
+        parsed = datetime.fromisoformat(str(polled_at).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        age = max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+    except (TypeError, ValueError):
+        return {
+            "path": path,
+            "last_poll_at": polled_at,
+            "seconds_since_last_poll": None,
+            "passed": False,
+            "message": f"invalid successful-poll marker: {polled_at}",
+            "remediation": "restart blueprint-deploy-agent.service to recreate its poll marker",
+        }
+    passed = age <= _DEPLOY_AGENT_POLL_MAX_AGE_SECONDS
+    result = {
+        "path": path,
+        "last_poll_at": parsed.isoformat(),
+        "seconds_since_last_poll": round(age, 1),
+        "passed": passed,
+        "message": f"last successful poll {age:.1f}s ago",
+    }
+    if not passed:
+        result["remediation"] = "restart blueprint-deploy-agent.service and inspect its journal"
+    return result
+
+
+def _preflight_api_failure(exc: Exception) -> tuple[str, str]:
+    """Classify auth failures separately from transport/control-plane failures."""
+    message = str(exc)
+    if re.search(r"HTTP (401|403)\b", message):
+        return "unauthorized", (
+            "control plane rejected credentials; refresh BLUEPRINT_API_KEY or the agent token"
+        )
+    return "unreachable", (
+        "control plane is unreachable; verify network access and the configured API URL"
+    )
+
+
+def _activation_preflight(args: argparse.Namespace) -> tuple[dict, dict]:
+    """Read the activation endpoint once and derive all four approval predicates."""
+    try:
+        project_id = get_project_id(getattr(args, "project_id", None))
+        path = f"/api/admin/projects/{project_id}/release-versions?status=promoted&limit=1"
+        payload = api("GET", path)
+    except Exception as exc:  # noqa: BLE001 — diagnostic must report all config/transport failures
+        status, remediation = _preflight_api_failure(exc)
+        failure = {
+            "passed": False,
+            "status": status,
+            "message": str(exc),
+            "remediation": remediation,
+        }
+        return failure, {
+            "pending": False,
+            "preconditions": {
+                "status_promoted": False,
+                "serving_unconfirmed": False,
+                "activation_requested_at": False,
+                "promoted_sha_valid": False,
+            },
+            "passed": False,
+            "message": "not checked because the activation read failed",
+            "remediation": "restore control-plane access, then rerun preflight",
+        }
+    versions = payload.get("versions") if isinstance(payload, dict) else None
+    version = versions[0] if versions else None
+    control = {
+        "passed": True,
+        "status": "reachable_authenticated",
+        "message": "activation endpoint reachable and authenticated",
+        "endpoint": path,
+    }
+    preconditions = {
+        "status_promoted": bool(version and version.get("status") == "promoted"),
+        "serving_unconfirmed": bool(version and version.get("serving_status") == "unconfirmed"),
+        "activation_requested_at": bool(version and version.get("activation_requested_at")),
+        "promoted_sha_valid": bool(
+            version and _DEPLOY_REVISION_RE.fullmatch((version.get("promoted_sha") or "").lower())
+        ),
+    }
+    pending = bool(version and version.get("activation_requested_at"))
+    passed = not pending or all(preconditions.values())
+    activation = {
+        "pending": pending,
+        "version_number": version.get("version_number") if version else None,
+        "preconditions": preconditions,
+        "passed": passed,
+        "message": (
+            "installed, polling, nothing to do"
+            if not pending else
+            "approved activation is pending and all executor preconditions are satisfied"
+            if passed else
+            "activation request is present but one or more executor preconditions failed"
+        ),
+    }
+    if not passed:
+        activation["remediation"] = "repair the promoted activation state, then rerun preflight"
+    return control, activation
+
+
+def _cmd_deploy_agent_preflight(args: argparse.Namespace) -> int:
+    """Run the deploy-agent diagnostic without taking any activation action."""
+    service = _systemd_preflight()
+    polling = _poll_preflight(getattr(args, "poll_state_path", _DEPLOY_AGENT_POLL_PATH))
+    shim = _preflight_file(_RELEASE_SHIM_PATH, executable=True)
+    if not shim["passed"]:
+        shim["message"] = f"release shim: {shim['message']}"
+    control, activation = _activation_preflight(args)
+    state_path = getattr(args, "state_path", _DEPLOY_AGENT_STATE_PATH)
+    parked = _read_deploy_agent_state(state_path) is not None
+    state = {
+        "path": state_path,
+        "parked_for_receipt_retry": parked,
+        "passed": not parked,
+        "message": (
+            "no interrupted activation is parked"
+            if not parked else
+            "interrupted activation is parked awaiting receipt retry"
+        ),
+    }
+    if parked:
+        state["remediation"] = "restore control-plane access and run deploy-agent once to retry the receipt"
+    checks = {
+        "service": service,
+        "polling": polling,
+        "release_shim": shim,
+        "control_plane": control,
+        "activation": activation,
+        "state": state,
+    }
+    report = {"passed": all(check.get("passed", False) for check in checks.values()), "checks": checks}
+    _emit(args, report, lambda data: _render_deploy_agent_preflight(data))
+    return 0 if report["passed"] else 1
+
+
+def _render_deploy_agent_preflight(data: dict) -> None:
+    """Render a concise, actionable human-readable preflight checklist."""
+    print("=== DEPLOY AGENT PREFLIGHT ===")
+    labels = {
+        "service": "systemd unit",
+        "polling": "polling",
+        "release_shim": "release shim",
+        "control_plane": "control-plane access",
+        "activation": "approved activation",
+        "state": "crash-safe state",
+    }
+    for name, check in data["checks"].items():
+        status = "PASS" if check.get("passed") else "FAIL"
+        print(f"[{status}] {labels[name]}: {check.get('message', '')}")
+        if name == "activation":
+            for predicate, satisfied in check.get("preconditions", {}).items():
+                print(f"       {predicate}: {'satisfied' if satisfied else 'not satisfied'}")
+        if not check.get("passed") and check.get("remediation"):
+            print(f"       Remediation: {check['remediation']}")
+
+
+def _acquire_deploy_agent_lock(path: str):
+    """Acquire the systemd-owned runtime lock without blocking another poll."""
+    path = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
+    handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 - returned locked handle
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def cmd_deploy_agent(args: argparse.Namespace) -> int | None:
+    """Run the local approved-activation executor at a 30-second default cadence."""
+    if getattr(args, "preflight", False):
+        return _cmd_deploy_agent_preflight(args)
+    if args.poll_interval <= 0:
+        raise APIError("poll interval must be positive")
+    _require_write_config("deploy-agent")
+    lock = _acquire_deploy_agent_lock(args.lock_path)
+    if lock is None:
+        print("deploy-agent: another activation poll is already running; skipping.")
+        return
+    try:
+        while True:
+            try:
+                _deploy_agent_once(args)
+            except (APIError, OSError, json.JSONDecodeError) as exc:
+                print(f"deploy-agent: transient poll failure: {exc}", file=sys.stderr)
+                if args.once and isinstance(exc, APIError):
+                    raise
+            if args.once:
+                return
+            time.sleep(args.poll_interval)
+    finally:
+        lock.close()
 
 
 def _post_activation_receipt(
@@ -5917,47 +7107,10 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     re-verifies digest, revision label, and health with automatic rollback —
     so this client is a convenience, not a trust boundary.
     """
-    runs = json.loads(_gh(
-        "run", "list", "--repo", _DEPLOY_REPO, "--workflow", _DEPLOY_WORKFLOW,
-        "--branch", "main", "--limit", "15",
-        "--json", "databaseId,headSha,status,conclusion,createdAt",
-    ))
-    wanted_sha = (args.sha or "").lower() or None
-    run = next(
-        (
-            r for r in runs
-            if r.get("status") == "completed" and r.get("conclusion") == "success"
-            and (wanted_sha is None or r.get("headSha", "").startswith(wanted_sha))
-        ),
-        None,
-    )
-    if run is None:
-        print("ERROR: no successful Deploy Blueprint run found"
-              + (f" for sha {wanted_sha}" if wanted_sha else "") + ".")
-        raise APIError(1, "no successful deploy run")
-    sha = run["headSha"]
-    with tempfile.TemporaryDirectory() as tmp:
-        _gh(
-            "run", "download", str(run["databaseId"]), "--repo", _DEPLOY_REPO,
-            "-n", f"local-app-release-{sha}", "-D", tmp,
-        )
-        manifest_path = os.path.join(tmp, "local-app-release.json")
-        checksum_path = manifest_path + ".sha256"
-        with open(manifest_path, "rb") as fh:
-            manifest_bytes = fh.read()
-        with open(checksum_path, encoding="utf-8") as fh:
-            expected_digest = fh.read().split()[0]
-        actual_digest = hashlib.sha256(manifest_bytes).hexdigest()
-        if actual_digest != expected_digest:
-            print("ERROR: manifest checksum mismatch — refusing to deploy.")
-            raise APIError(1, "manifest checksum mismatch")
-        manifest = json.loads(manifest_bytes)
-    image_ref = manifest.get("image_ref", "")
-    revision = manifest.get("revision", "")
-    digest = image_ref.rsplit("@", 1)[-1]
-    if not _DEPLOY_DIGEST_RE.fullmatch(digest) or not _DEPLOY_REVISION_RE.fullmatch(revision):
-        print("ERROR: manifest digest/revision failed validation — refusing to deploy.")
-        raise APIError(1, "manifest validation failed")
+    release = _fetch_deploy_manifest(args.sha)
+    run = release["run"]
+    digest = release["digest"]
+    revision = release["revision"]
 
     print("=== LOCAL CONTROL-PLANE DEPLOY ===")
     print(f"  Host:      {args.host}")
@@ -5974,16 +7127,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         if answer not in ("y", "yes"):
             print("Aborted.")
             return
-    proc = subprocess.run([
-        "ssh", "-t", args.host,
-        "sudo", "/usr/local/sbin/blueprint-release", digest, revision,
-    ])
-    if proc.returncode != 0:
-        print(f"ERROR: release exited {proc.returncode} — the release tool "
-              "rolls back failed activations; inspect its receipt on the host.")
-        raise APIError(proc.returncode, "release failed")
-    print("Release activated. Runners self-update on their next heartbeat.")
-    _post_activation_receipt(args, promoted, revision)
+    _execute_deploy(args, revision, digest, promoted)
 
 
 _DISPATCH = {
@@ -6015,6 +7159,8 @@ _DISPATCH = {
     "knowledge": cmd_knowledge,
     "compute": cmd_compute,
     "deploy": cmd_deploy,
+    "migrate": cmd_migrate,
+    "deploy-agent": cmd_deploy_agent,
 }
 
 
@@ -6039,7 +7185,9 @@ def main(argv: list | None = None) -> int:
         proj_name = getattr(args, "project_name", None)
         if proj_name and not getattr(args, "project_id", None):
             args.project_id = resolve_project_id_by_name(proj_name)
-        handler(args)
+        result = handler(args)
+        if isinstance(result, int):
+            return result
     except APIError:
         return 1
     return 0

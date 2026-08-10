@@ -3661,6 +3661,18 @@ async def test_terminal_failure_non_provision_finalization(
     alert_mock = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
+    # Snapshot the alerted task's identity WHILE the reaper's session is still live.
+    # The reaper passes a Task loaded in its own session, which closes when the
+    # cycle ends; reading ``.id`` off ``await_args`` afterward raises
+    # DetachedInstanceError under some full-shard orderings (a sibling test can
+    # leave the shared session factory expiring instances on commit). Capturing at
+    # call-time makes the identity assertion independent of post-cycle session state.
+    _alerted_task_ids: list = []
+
+    async def _capture_alerted_task(task, *args, **kwargs):
+        _alerted_task_ids.append(task.id)
+
+    alert_mock.side_effect = _capture_alerted_task
     broadcast_mock = mocker.patch(
         "app.broadcast.broadcast_to_project", new_callable=AsyncMock
     )
@@ -3703,7 +3715,9 @@ async def test_terminal_failure_non_provision_finalization(
     }, f"failure_category must be persisted as a canonical class, got {persisted!r}"
 
     alert_mock.assert_awaited()
-    assert alert_mock.await_args.args[0].id == t.id
+    assert _alerted_task_ids[-1] == t.id, (
+        "the terminal-failure alert must be created for the finalized task"
+    )
 
     record_mock.assert_called_once()
     kwargs = record_mock.call_args.kwargs
@@ -5931,10 +5945,16 @@ async def test_step9_calcification_alert_fires_for_repeated_hard_blockers(
     await _run_reaper_once()
     await reaper_db.refresh(version)
 
+    # Scoped to the calcification event type — the same Step 9 sweep runs
+    # independent lifecycle checks (e.g. the standing full-suite drift sentinel)
+    # that may emit their own alerts for this project.
     alerts = (
         (
             await reaper_db.execute(
-                _select(_Alert).where(_Alert.project_id == project.id)
+                _select(_Alert).where(
+                    _Alert.project_id == project.id,
+                    _Alert.event_type == "release.calcifying",
+                )
             )
         )
         .scalars()
@@ -5973,10 +5993,16 @@ async def test_step9_calcification_alert_not_fired_for_dry_run_hold(
 
     await _run_reaper_once()
 
+    # Scoped to the calcification event type: the assertion is that a dry-run
+    # hold raises no CALCIFICATION alert.  Unrelated sweep observations (e.g.
+    # the standing full-suite drift sentinel) are not part of that contract.
     alerts = (
         (
             await reaper_db.execute(
-                _select(_Alert).where(_Alert.project_id == project.id)
+                _select(_Alert).where(
+                    _Alert.project_id == project.id,
+                    _Alert.event_type == "release.calcifying",
+                )
             )
         )
         .scalars()

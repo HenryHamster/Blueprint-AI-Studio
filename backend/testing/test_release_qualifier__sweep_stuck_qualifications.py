@@ -622,9 +622,19 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     assert audit_task.status == TaskStatus.CANCELLED
     assert audit_task.vm_stopped_at is not None
 
-    # An operator-visible Alert was raised.
+    # An operator-visible Alert was raised.  Scoped to the timeout event type:
+    # the same sweep also runs independent lifecycle checks (e.g. the standing
+    # full-suite drift sentinel) that may emit their own alerts for this
+    # project, and this assertion is about the timeout signal only.
     alerts = (
-        (await db_session.execute(_select(Alert).where(Alert.project_id == project.id)))
+        (
+            await db_session.execute(
+                _select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.event_type == "release.qualification_timeout",
+                )
+            )
+        )
         .scalars()
         .all()
     )
@@ -1851,8 +1861,18 @@ async def test_sweep_finalize_crash_loop_force_finalizes_and_alerts(db_session, 
     assert version.phase == "stabilize"  # returned to stabilize for re-qualification
 
     # A WARNING Alert must be raised so the crash-loop is visible to operators.
+    # Scoped to the crash-loop event type — the same sweep runs independent
+    # lifecycle checks (e.g. the standing full-suite drift sentinel) that may
+    # emit their own alerts for this project.
     alerts = (
-        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.event_type == "release.qualification_crash_loop",
+                )
+            )
+        )
         .scalars()
         .all()
     )
@@ -2777,13 +2797,18 @@ async def test_sweep_timeout_fires_when_started_at_unparseable(db_session, mocke
     assert version.last_qualification["blocker"] == "qualification_timeout"
     assert version.phase == "stabilize"
 
-    # An operator-visible Alert was raised.
+    # An operator-visible Alert was raised.  Scoped to the timeout event type —
+    # the same sweep runs independent lifecycle checks (e.g. the standing
+    # full-suite drift sentinel) that may emit their own alerts for this project.
     from app.models import Alert as _Alert
 
     alerts = (
         (
             await db_session.execute(
-                _select(_Alert).where(_Alert.project_id == project.id)
+                _select(_Alert).where(
+                    _Alert.project_id == project.id,
+                    _Alert.event_type == "release.qualification_timeout",
+                )
             )
         )
         .scalars()
@@ -5046,7 +5071,10 @@ async def test_sweep_triggers_calcification_check(db_session, mocker):
     alerts = (
         (
             await db_session.execute(
-                select(_Alert).where(_Alert.project_id == project.id)
+                select(_Alert).where(
+                    _Alert.project_id == project.id,
+                    _Alert.event_type == "release.calcifying",
+                )
             )
         )
         .scalars()
@@ -5059,6 +5087,67 @@ async def test_sweep_triggers_calcification_check(db_session, mocker):
 # ===========================================================================
 # Drift sentinel — cancelled-run cooldown-bounded re-dispatch + red-only reaction
 # ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_unavailable_alerts_once_per_project(db_session, mocker):
+    """An unavailable full-suite gate raises one operator alert per project.
+
+    The alert retains the automain HEAD and gate reason, while its project-level
+    dedupe key prevents every subsequent sweep/merge from creating another row.
+    """
+    from app.models import AlertSeverity
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    HEAD_SHA = "unava1able" * 4
+    NEXT_HEAD_SHA = "newhead00" * 5
+    REASON = "failed to dispatch ci.yml on automain"
+    NEXT_REASON = "GitHub API timeout while reading ci.yml"
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            side_effect=[
+                {
+                    "gate_state": "unavailable",
+                    "head_sha": HEAD_SHA,
+                    "reason": REASON,
+                },
+                {
+                    "gate_state": "unavailable",
+                    "head_sha": NEXT_HEAD_SHA,
+                    "reason": NEXT_REASON,
+                },
+            ]
+        ),
+    )
+
+    factory = _shared_session_factory(db_session)
+    assert await _check_full_suite_drift_sentinel(
+        version.id, session_factory=factory
+    ) is True
+    assert await _check_full_suite_drift_sentinel(
+        version.id, session_factory=factory
+    ) is True
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert alert.event_type == "release.ci_unresolved"
+    assert alert.dedupe_key == f"drift_sentinel:unavailable:{project.id}"
+    assert NEXT_HEAD_SHA[:12] in alert.message
+    assert NEXT_REASON in alert.message
+    assert gate_mock.await_count == 2
 
 
 @pytest.mark.asyncio

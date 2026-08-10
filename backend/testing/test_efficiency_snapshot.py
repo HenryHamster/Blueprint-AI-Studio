@@ -40,7 +40,7 @@ from app.efficiency_snapshot import (
     LLM_TOKEN_PRICING,
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
-    ORIGINATION_CAPTURED_AT,
+    ORIGINATION_MAX_RESIDUAL_SHARE,
     ORIGINATION_MIN_QUOTABLE_COHORT,
     build_merged_work_origination_reading,
     PROMPT_STATIC_BYTES_THRESHOLD,
@@ -90,8 +90,15 @@ from app.models import (
     ImprovementLaneStatus,
     TaskStatus,
     TASK_ORIGINATION_RESEARCH,
+    TASK_ORIGINATION_REVIEW,
+    TASK_ORIGINATION_ROLLUP,
     TASK_ORIGINATION_STRATEGIST,
+    TASK_ORIGINATION_SYSTEM,
     bank_task_current_attempt,
+)
+from app.research_completion import (
+    TASK_ORIGINATION_COHORT_START,
+    TASK_ORIGINATION_COHORT_START_ISO,
 )
 from app.llm_cost_attribution import (
     UNPRICED_FALLBACK_INPUT_RATE,
@@ -11548,6 +11555,10 @@ async def test_compute_current_axes_exposes_cohort_coverage(db_session):
     assert axes["cohort_requested_window_days"] == 7
     assert axes["cohort_effective_window_start"] is not None
     assert axes["cohort_effective_window_end"] is not None
+    assert (
+        axes["merged_work_origination"]["cohort_created_at_floor"]
+        == "2026-08-08T06:59:00+00:00"
+    )
 
 
 @pytest.mark.asyncio
@@ -11802,7 +11813,7 @@ async def test_capped_cohort_reports_effective_window_as_authoritative(
 
 def test_origination_reading_quotes_a_fully_covered_window():
     """A complete, sufficiently sized classified window yields real shares."""
-    window_start = ORIGINATION_CAPTURED_AT + timedelta(days=1)
+    window_start = TASK_ORIGINATION_COHORT_START + timedelta(days=1)
     window_end = window_start + timedelta(days=7)
     split = {
         TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
@@ -11820,27 +11831,89 @@ def test_origination_reading_quotes_a_fully_covered_window():
     assert reading["unquotable_reason"] is None
 
 
-def test_origination_reading_refuses_a_window_before_capture():
-    """A pre-capture window is explicitly unquotable, never a zero share."""
-    window_start = ORIGINATION_CAPTURED_AT - timedelta(days=1)
-    window_end = ORIGINATION_CAPTURED_AT + timedelta(days=6)
+def test_origination_reading_gates_on_the_cohort_floor_not_the_landing_window():
+    """The pre-capture gate is keyed on creation floor, not landing window.
+
+    ``window_start`` bounds LANDING time. A landing window reaching back before
+    the 0735 capture boundary says nothing about whether a backfilled row is in
+    the cohort — the ``created_at`` floor is what excludes it. A cohort floored
+    at the canonical boundary must therefore stay QUOTABLE even when the landing
+    window starts earlier, and only an under-floored cohort is refused.
+    """
     split = {
         TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
         TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
     }
-
-    reading = build_merged_work_origination_reading(
-        split, window_start=window_start, window_end=window_end
+    early_landing_window = build_merged_work_origination_reading(
+        split,
+        window_start=TASK_ORIGINATION_COHORT_START - timedelta(days=30),
+        window_end=TASK_ORIGINATION_COHORT_START + timedelta(days=6),
     )
 
-    assert reading["status"] == "UNQUOTABLE"
-    assert reading["unquotable_reason"] == "window_predates_origination_capture"
-    assert reading["research_share_of_commissioned"] is None
+    assert early_landing_window["status"] == "QUOTABLE"
+    assert early_landing_window["unquotable_reason"] is None
+    assert early_landing_window["window_fully_captured"] is True
+    assert early_landing_window["research_share_of_commissioned"] == pytest.approx(0.5)
+
+    under_floored = build_merged_work_origination_reading(
+        split,
+        window_start=TASK_ORIGINATION_COHORT_START + timedelta(days=1),
+        window_end=TASK_ORIGINATION_COHORT_START + timedelta(days=8),
+        cohort_created_at_floor=TASK_ORIGINATION_COHORT_START - timedelta(seconds=1),
+    )
+
+    assert under_floored["status"] == "UNQUOTABLE"
+    assert under_floored["unquotable_reason"] == "cohort_predates_origination_capture"
+    assert under_floored["window_fully_captured"] is False
+    assert under_floored["research_share_of_commissioned"] is None
+
+
+def test_origination_capture_boundary_is_a_single_constant():
+    """The emitted capture start IS the created_at floor the query applied."""
+    reading = build_merged_work_origination_reading(
+        {TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT},
+        window_start=TASK_ORIGINATION_COHORT_START + timedelta(days=1),
+        window_end=TASK_ORIGINATION_COHORT_START + timedelta(days=8),
+    )
+
+    assert reading["origination_capture_start"] == TASK_ORIGINATION_COHORT_START_ISO
+    assert reading["cohort_created_at_floor"] == TASK_ORIGINATION_COHORT_START_ISO
+    assert reading["origination_capture_start"] == reading["cohort_created_at_floor"]
+
+
+def test_named_automatic_classes_are_not_scored_as_contamination():
+    """Attributed automation must not null the shares; only SYSTEM residual can.
+
+    ``unattributed_merged`` counts every class outside the commissioned four,
+    which now includes the NAMED automatic classes. Keying contamination on that
+    bucket would fire on essentially every real window (automation children
+    routinely outnumber commissioned work), pinning the axis permanently dark.
+    """
+    window_start = TASK_ORIGINATION_COHORT_START + timedelta(days=1)
+    window_end = window_start + timedelta(days=7)
+    automation_heavy = build_merged_work_origination_reading(
+        {
+            TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT,
+            TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT,
+            TASK_ORIGINATION_REVIEW: 200,
+            TASK_ORIGINATION_ROLLUP: 200,
+        },
+        window_start=window_start,
+        window_end=window_end,
+    )
+
+    # Automation dominates the merged total 4:1 ...
+    assert automation_heavy["unattributed_merged"] == 400
+    # ... yet none of it is residual, so the reading stays quotable.
+    assert automation_heavy["residual_merged"] == 0
+    assert automation_heavy["contamination_rate"] == 0.0
+    assert automation_heavy["status"] == "QUOTABLE"
+    assert automation_heavy["research_share_of_commissioned"] == pytest.approx(0.5)
 
 
 def test_origination_reading_refuses_an_undersized_cohort():
     """A small classified cohort cannot support a directional share claim."""
-    window_start = ORIGINATION_CAPTURED_AT + timedelta(days=1)
+    window_start = TASK_ORIGINATION_COHORT_START + timedelta(days=1)
     window_end = window_start + timedelta(days=7)
     reading = build_merged_work_origination_reading(
         {TASK_ORIGINATION_RESEARCH: 1, TASK_ORIGINATION_STRATEGIST: 1},
@@ -11855,7 +11928,7 @@ def test_origination_reading_refuses_an_undersized_cohort():
 
 def test_origination_reading_distinguishes_no_data_from_a_valid_zero():
     """No rows are not the same fact as a measured zero research share."""
-    window_start = ORIGINATION_CAPTURED_AT + timedelta(days=1)
+    window_start = TASK_ORIGINATION_COHORT_START + timedelta(days=1)
     window_end = window_start + timedelta(days=7)
 
     no_data = build_merged_work_origination_reading(
@@ -11872,15 +11945,18 @@ def test_origination_reading_distinguishes_no_data_from_a_valid_zero():
     assert no_data["research_share_of_commissioned"] is None
     assert zero["status"] == "QUOTABLE"
     assert zero["research_share_of_commissioned"] == 0.0
+
     contaminated = build_merged_work_origination_reading(
         {
             TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT,
             TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT,
-            "SYSTEM": ORIGINATION_MIN_QUOTABLE_COHORT,
+            TASK_ORIGINATION_SYSTEM: ORIGINATION_MIN_QUOTABLE_COHORT,
         },
         window_start=window_start,
         window_end=window_end,
     )
+    # SYSTEM is a third of merged work — well past the residual ceiling.
+    assert contaminated["contamination_rate"] > ORIGINATION_MAX_RESIDUAL_SHARE
     assert contaminated["status"] == "UNQUOTABLE"
     assert contaminated["unquotable_reason"] == "cohort_too_contaminated"
     assert contaminated["research_share_of_commissioned"] is None
@@ -12205,6 +12281,42 @@ async def test_write_snapshot_writes_to_efficiency_table(db_session):
     assert rows[0].blob["captured_at"] == snap["captured_at"]
     assert rows[0].metric_def_version == METRIC_DEF_VERSION
     assert rows[0].blob[AXIS_COST_PER_MERGED_PR] == snap[AXIS_COST_PER_MERGED_PR]
+
+
+@pytest.mark.asyncio
+async def test_persisted_origination_reading_carries_cohort_provenance(db_session):
+    """A written origination reading retains its evidence boundary on read."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    snapshot = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    reading = drift["merged_work_origination"]
+    assert reading == snapshot["merged_work_origination"]
+    assert reading["window_start"] < reading["window_end"]
+    # ONE capture boundary: the emitted start IS the created_at floor the query
+    # applied, so these two fields can never contradict each other.
+    assert (
+        reading["origination_capture_start"] == TASK_ORIGINATION_COHORT_START_ISO
+    )
+    assert reading["cohort_created_at_floor"] == TASK_ORIGINATION_COHORT_START_ISO
+    # The cohort IS creation-floored at the boundary, so it is fully captured —
+    # the production window must never be stamped pre-capture on the landing axis.
+    assert reading["window_fully_captured"] is True
+    assert reading["unquotable_reason"] != "cohort_predates_origination_capture"
+    assert "cohort_size" in reading
+    assert "contamination_rate" in reading
+    # This fixture merges a single unclassified task, so the only honest refusal
+    # is the empty-commissioned-denominator one — not a pre-capture verdict.
+    assert reading["status"] == "UNQUOTABLE"
+    assert reading["unquotable_reason"] == "no_commissioned_origination_data"
 
 
 @pytest.mark.asyncio

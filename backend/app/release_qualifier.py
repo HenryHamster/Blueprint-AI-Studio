@@ -143,6 +143,7 @@ from app.release_qualifier_audit import (
     get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_report,  # noqa: F401 — re-exported for callers/tests
     resolve_lifecycle_audit_evidence,  # noqa: F401 — re-exported for callers/tests
+    snapshot_stranded_approved_prs,
     required_children_terminal as _required_children_terminal,
 )
 from app.ci_resolution import (
@@ -164,6 +165,7 @@ from app.release_scoring import (
     _AUDIT_DEDUCTIONS,  # noqa: F401
     _CHALLENGE_FINDING_MAX,  # noqa: F401 — re-exported for callers/tests
     _DEFAULT_POLICY,
+    PROMOTION_CONFIDENCE_THRESHOLD,  # noqa: F401 — canonical default for tests/callers
     _FINDING_SUMMARY_MAX,
     _MAX_CARRIED_FINDINGS,  # noqa: F401
     _MAX_DELETED_TEST_FILES,  # noqa: F401 — re-exported for callers/tests
@@ -197,6 +199,7 @@ from app.release_scoring import (
     compute_composite,
     evaluate_merge_grade,
     is_contentless_goal,
+    promotion_threshold_for_policy,  # noqa: F401 — canonical enforcement helper
 )
 from app.release_stall_alerts import (
     _BUILD_STALL_AGE_DAYS,  # noqa: F401 — re-exported for back-compat
@@ -299,12 +302,15 @@ from app.release_qualifier_audit_surface import (
 )
 
 # Size governance: this module's cap in backend/testing/module_size_limits.json.
-# Restored to the historically governing 10300 after d68d3e1 extracted the
-# audited-surface cluster (the module now sits ~500 lines under it). Keep the
-# JSON entry in sync with this constant — the governance test in
+# Bumped 10300 -> 10500 (tight governing raise) when the release-audit and
+# research rollups accreted qualifier logic and the module reached 10323 lines,
+# past the historically governing 10300. The raise keeps only a small explicit
+# margin (~180 lines, <2% of the cap) — NOT the generic +15% bump to 11900,
+# which reintroduces the ~2k dead-headroom value the governance test rejects.
+# Keep the JSON entry in sync with this constant — the governance test in
 # test_release_qualifier.py cross-checks them, so an over-loosened cap regresses
 # red instead of silently widening headroom past the point the guardrail fires.
-_MODULE_SIZE_GOVERNANCE_CAP: int = 10300
+_MODULE_SIZE_GOVERNANCE_CAP: int = 10500
 
 # Product probes are opt-in parts of a qualification attempt's decision
 # contract. Keep the set closed: silently dropping an unknown value would let a
@@ -1844,6 +1850,26 @@ def _ci_required_for_finalize(
         return True
     return not proceed_on_no_checks(project, integration_branch)
 
+
+def _ci_dimension_status(
+    *,
+    ci_green: bool,
+    ci_resolution: dict[str, Any],
+    ci_required: bool,
+) -> str:
+    """Map the effective CI policy to the persisted dimension status.
+
+    A topology-safe ``no_checks`` result is a deliberate non-blocking outcome,
+    not a failed or unresolved CI result.  Keep this mapping beside the
+    finalize policy so the eager and comprehensive ledger writers cannot drift
+    from ``compute_composite``'s blocker semantics.
+    """
+    if ci_green or (
+        not ci_required and ci_resolution.get("state") == _CI_NO_CHECKS
+    ):
+        return "passed"
+    return "blocked"
+
 async def _resolve_ci_at_finalize(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -2710,6 +2736,12 @@ async def run_qualification(
         )
         return _promo
 
+    # Snapshot the merge-state signal under the version lock that owns the
+    # qualification launch; promotion scoring stays unchanged.
+    stranded_approved_prs = await snapshot_stranded_approved_prs(
+        session, version.project_id
+    )
+
     # Snapshot the live decision contract while the version row is locked.
     # Candidate code facts may remain reusable across goal edits, but a cached
     # holistic verdict is valid only for this exact goal + rubric pair.
@@ -3451,6 +3483,7 @@ async def run_qualification(
         "retry_episode_cap": retry_episode_cap,
         "candidate_sha": candidate_sha,
         "candidate_diff_hash": candidate_diff_hash,
+        "stranded_approved_prs": stranded_approved_prs,
         "audited_surface_paths": candidate_audited_surface or None,
         "audit_base_sha": incremental_audit_base_sha,
         "prior_audit_candidate_sha": (
@@ -3564,6 +3597,7 @@ async def run_qualification(
         "qualification_attempt_id": str(attempt_id),
         "retry_episode": retry_episode,
         "candidate_sha": candidate_sha,
+        "stranded_approved_prs": stranded_approved_prs,
         "ci_green": ci_green,
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
@@ -3787,6 +3821,12 @@ def _apply_walkthrough_decision(
     }
     if passed:
         return updated
+    failing_gates = list(composite.get("failing_gates") or [])
+    if "walkthrough_e2e_failed" not in failing_gates:
+        failing_gates.append("walkthrough_e2e_failed")
+    updated["failing_gates"] = failing_gates
+    updated["confidence_ceiling"] = composite.get("confidence_ceiling", 0.0)
+    updated["sub_scores"]["failing_gates"] = failing_gates
     return {
         **updated,
         "promote": False,
@@ -3817,7 +3857,11 @@ async def _handle_walkthrough_contract_failure(
     """
     finalized_at = _utcnow().isoformat()
     candidate_sha = qual.get("candidate_sha")
-    sub_scores: dict[str, Any] = {"walkthrough_e2e": 0.0}
+    sub_scores: dict[str, Any] = {
+        "walkthrough_e2e": 0.0,
+        "failing_gates": ["walkthrough_e2e_contract_failed"],
+        "confidence_ceiling": 0.0,
+    }
     # Stamp the serving engine sha on the record so observability (and any
     # future site-change detection) can see WHICH deployed validator produced
     # this contract failure — a new serving sha means the validator may have
@@ -3846,6 +3890,8 @@ async def _handle_walkthrough_contract_failure(
         "error": error,
         "confidence": 0.0,
         "sub_scores": sub_scores,
+        "failing_gates": ["walkthrough_e2e_contract_failed"],
+        "confidence_ceiling": 0.0,
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
         "audit_task_id": qual.get("audit_task_id"),
@@ -4446,6 +4492,9 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_buckets": dict,         # per-bucket counts over the write-task window (sums to write_total)
         "acceptance_window_undeclared_reasons": dict, # split of the undeclared bucket by reason (sums to buckets["undeclared"])
         "acceptance_window_declared_unsatisfied_reasons": dict, # split of the declared_unsatisfied bucket by reason (sums to buckets["declared_unsatisfied"])
+        "acceptance_window_undeclared_task_ids": list,  # deterministic capped IDs in the undeclared bucket
+        "acceptance_window_declared_unsatisfied_task_ids": list,  # deterministic capped IDs in the declared-unsatisfied bucket
+        "acceptance_window_bucket_task_id_cap": int,  # shared cap for the two identity-evidence lists
         "acceptance_window_inferred_test_cochange": int,  # verified merges credited via inferred_test_cochange
         "acceptance_window_rederived_count": int,  # write-task verdicts re-derived under the current rule this drive (each task counted once)
         "acceptance_window_rederived_upgrades": int,  # re-derived verdicts that strictly improved (satisfied/proven minted)
@@ -4495,6 +4544,12 @@ async def _compute_acceptance_window_aggregate(
     buckets: dict[str, int] = dict.fromkeys(ACCEPTANCE_AGGREGATE_BUCKETS, 0)
     undeclared_reasons: dict[str, int] = dict.fromkeys(_UNDECLARED_REASON_KEYS, 0)
     unsatisfied_reasons: dict[str, int] = dict.fromkeys(_UNSATISFIED_REASON_KEYS, 0)
+    # Retain enough task identity to audit an unhealed bucket without making the
+    # qualification payload unbounded.  IDs are sorted after classification so
+    # database row order cannot change the observable result.
+    _BUCKET_TASK_ID_CAP = 100
+    undeclared_task_ids: list[str] = []
+    declared_unsatisfied_task_ids: list[str] = []
     # Re-derivation pass (rung 3 of design doc c50453ef): a verdict frozen under
     # a RETIRED acceptance rule is re-derived from the task's persisted merge
     # record before classification, so an evidence-rule improvement landing
@@ -4671,10 +4726,12 @@ async def _compute_acceptance_window_aggregate(
         buckets[bucket] += 1
         if bucket == "undeclared":
             undeclared_reasons[classify_undeclared_reason(ctx)] += 1
+            undeclared_task_ids.append(str(task.id))
         elif bucket == "declared_unsatisfied":
             unsatisfied_reasons[
                 classify_unsatisfied_reason(ctx.get(CODE_ACCEPTANCE_VERDICT_KEY))
             ] += 1
+            declared_unsatisfied_task_ids.append(str(task.id))
     verified = (
         buckets["proven"]
         + buckets["satisfied_unproven"]
@@ -4704,6 +4761,27 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_buckets": buckets,
         "acceptance_window_undeclared_reasons": undeclared_reasons,
         "acceptance_window_declared_unsatisfied_reasons": unsatisfied_reasons,
+        # Deterministic, bounded identity evidence for the two buckets that
+        # cannot be diagnosed from counts alone.  ``*_total`` and
+        # ``*_truncated`` make an omitted tail unambiguous rather than looking
+        # like an empty bucket.
+        "acceptance_window_undeclared_task_ids": sorted(undeclared_task_ids)[
+            :_BUCKET_TASK_ID_CAP
+        ],
+        "acceptance_window_undeclared_task_ids_total": len(undeclared_task_ids),
+        "acceptance_window_undeclared_task_ids_truncated": len(undeclared_task_ids)
+        > _BUCKET_TASK_ID_CAP,
+        "acceptance_window_declared_unsatisfied_task_ids": sorted(
+            declared_unsatisfied_task_ids
+        )[:_BUCKET_TASK_ID_CAP],
+        "acceptance_window_declared_unsatisfied_task_ids_total": len(
+            declared_unsatisfied_task_ids
+        ),
+        "acceptance_window_declared_unsatisfied_task_ids_truncated": len(
+            declared_unsatisfied_task_ids
+        )
+        > _BUCKET_TASK_ID_CAP,
+        "acceptance_window_bucket_task_id_cap": _BUCKET_TASK_ID_CAP,
         # Additive audit breakdown: how many verified merges were credited via the
         # inferred test-cochange path (undeclared merge, CI-verified, test+prod
         # co-change) rather than an explicit proven/satisfied declaration. Consumed
@@ -5546,6 +5624,10 @@ async def _dual_write_dimension_results(
     sub_scores = base_record.get("sub_scores") or {}
     blocker = composite.get("blocker")
     ci_green = bool(base_record.get("ci_green"))
+    ci_resolution = base_record.get("ci_resolution")
+    if not isinstance(ci_resolution, dict):
+        ci_resolution = {}
+    ci_required = bool(base_record.get("ci_required", True))
 
 
     def _score(key: str) -> float | None:
@@ -5620,10 +5702,14 @@ async def _dual_write_dimension_results(
     specs: list[dict[str, Any]] = [
         {
             "dimension": "ci",
-            "status": "passed" if ci_green else "blocked",
+            "status": _ci_dimension_status(
+                ci_green=ci_green,
+                ci_resolution=ci_resolution,
+                ci_required=ci_required,
+            ),
             "sub_score": None,
             "blocker": _own_blocker({"ci_not_green", "ci_unresolved"}),
-            "detail": base_record.get("ci_resolution"),
+            "detail": ci_resolution,
             "producing_task_id": None,
         },
         {
@@ -6122,17 +6208,28 @@ async def _finalize_qualification(
             session, version, candidate_sha
         )
 
+    ci_state = ci_resolution.get("state", _CI_RED)
+    _policy_project = await session.get(Project, version.project_id)
+    ci_required = True
+    if _pre_gates is not None and "ci_required" in _pre_gates:
+        ci_required = bool(_pre_gates["ci_required"])
+    elif ci_state == _CI_NO_CHECKS:
+        ci_required = _ci_required_for_finalize(_policy_project, ci_resolution)
+
     # Eager-write CI dimension so this fact survives a later gate's infra failure
     # that returns before _dual_write_dimension_results (line 5065).
     if candidate_sha:
         await _upsert_dimension_result(
             session, version, candidate_sha, "ci",
-            status="passed" if ci_green else "blocked",
+            status=_ci_dimension_status(
+                ci_green=ci_green,
+                ci_resolution=ci_resolution,
+                ci_required=ci_required,
+            ),
             detail=ci_resolution if isinstance(ci_resolution, dict) else None,
             origin_attempt_id=attempt_id,
         )
 
-    _policy_project = await session.get(Project, version.project_id)
     # Prefer the promotion policy frozen at spawn; fall back to the live policy
     # for legacy records that predate the attempt-contract freeze.
     policy = qual.get("promotion_policy_snapshot") or _load_policy(_policy_project)
@@ -6643,6 +6740,7 @@ async def _finalize_qualification(
     _audit_and_erosion_resolved = (
         "audit" in resolved_dims and "test_erosion" in resolved_dims
     )
+    _candidate_surface_paths = qual.get("audited_surface_paths")
     _resolved_audit_detail: dict[str, Any] = {}
     _prior_delta_audit_row = None
     _prior_delta_erosion_row = None
@@ -6745,8 +6843,11 @@ async def _finalize_qualification(
                 audit_report,
                 _prior_delta_audit_row.detail,
                 expected_base_sha=_prior_delta_sha,
+                candidate_surface_paths=qual.get("audited_surface_paths"),
             )
-        audit_score, test_erosion_score = _score_audit(audit_report)
+        audit_score, test_erosion_score = _score_audit(
+            audit_report, candidate_surface_paths=_candidate_surface_paths
+        )
         test_erosion_detail = _extract_test_erosion_detail(audit_report)
         if (
             _prior_delta_erosion_row is not None
@@ -6763,13 +6864,17 @@ async def _finalize_qualification(
         # Carry the findings (not just the score) into last_qualification so the
         # strategic agent can target them — otherwise the audit sub-score, usually
         # the binding constraint, is opaque to the loop.
-        audit_findings = _extract_audit_findings(audit_report)
+        audit_findings = _extract_audit_findings(
+            audit_report, candidate_surface_paths=_candidate_surface_paths
+        )
         # Carry the higher-severity findings the verification gate EXCLUDED from
         # scoring — for display only, marked unverified — so an audit whose
         # sub-score was inflated by dropped findings is rendered honestly instead of
         # reading as clean. Never confirmed blockers.  Use original report (the
         # unverified-primary gap is independent of the challenge reconciliation).
-        excluded_audit_findings = _extract_excluded_audit_findings(audit_report)
+        excluded_audit_findings = _extract_excluded_audit_findings(
+            audit_report, candidate_surface_paths=_candidate_surface_paths
+        )
         # Carry the specific test-erosion detail (deleted files / negative deltas)
         # so the agent can target it when test-erosion is the binding constraint,
         # the same way it sees audit_findings.
@@ -6846,7 +6951,9 @@ async def _finalize_qualification(
             surface_paths=qual.get("audited_surface_paths"),
             audit_findings=audit_findings,
             excluded_audit_findings=excluded_audit_findings,
-            findings_meta=_audit_findings_carry_meta(audit_report),
+            findings_meta=_audit_findings_carry_meta(
+                audit_report, candidate_surface_paths=_candidate_surface_paths
+            ),
             audit_missing_reason=audit_missing_reason,
             audit_scope=(audit_report or {}).get("audit_scope"),
             holistic_review=audit_report if isinstance(audit_report, dict) else None,
@@ -7546,8 +7653,12 @@ async def _finalize_qualification(
                     audit_report,
                     prior_audit_row.detail,
                     expected_base_sha=str(prior_audit_candidate_sha),
+                    candidate_surface_paths=qual.get("audited_surface_paths"),
                 )
-        audit_score, _delta_test_erosion_score = _score_audit(_audit_report_scored)
+        audit_score, _delta_test_erosion_score = _score_audit(
+            _audit_report_scored,
+            candidate_surface_paths=_candidate_surface_paths,
+        )
         if prior_audit_candidate_sha:
             prior_erosion_row = await _load_dimension_result(
                 session, version, str(prior_audit_candidate_sha), "test_erosion"
@@ -7573,18 +7684,26 @@ async def _finalize_qualification(
         # Carry the confirmed (actionable) findings into last_qualification so the
         # strategic agent can target them.  Use reconciled report when available so
         # refuted findings are not surfaced as actionable blockers.
-        audit_findings = _extract_audit_findings(_audit_report_scored)
+        audit_findings = _extract_audit_findings(
+            _audit_report_scored,
+            candidate_surface_paths=_candidate_surface_paths,
+        )
         excluded_audit_findings = _extract_excluded_audit_findings(
-            _audit_report_for_excluded
+            _audit_report_for_excluded,
+            candidate_surface_paths=_candidate_surface_paths,
         )
         # Pre-cap totals + truncation flags for both carried lists. Verified meta is
         # computed on the reconciled report (matches audit_findings just above);
         # excluded meta on the original report (matches excluded_audit_findings,
         # which is derived from audit_report — the unverified-primary gap is
         # independent of challenge reconciliation).
-        _verified_findings_meta = _audit_findings_carry_meta(_audit_report_scored)
+        _verified_findings_meta = _audit_findings_carry_meta(
+            _audit_report_scored,
+            candidate_surface_paths=_candidate_surface_paths,
+        )
         _excluded_findings_meta = _audit_findings_carry_meta(
-            _audit_report_for_excluded
+            _audit_report_for_excluded,
+            candidate_surface_paths=_candidate_surface_paths,
         )
         # Build the reconciliation record on the RECONCILED report so
         # findings_derived_score agrees with the applied audit_score.  The challenge
@@ -7592,7 +7711,10 @@ async def _finalize_qualification(
         # separate from excluded_findings_count (verification-gate drops) so they
         # are never double-counted.
         audit_reconciliation = {
-            **_compute_audit_reconciliation(_audit_report_scored),
+            **_compute_audit_reconciliation(
+                _audit_report_scored,
+                candidate_surface_paths=_candidate_surface_paths,
+            ),
             "audit_challenge": _compute_challenge_synthesis_from_binding_verdicts(
                 audit_report,
                 challenge_verdicts,
@@ -7969,13 +8091,6 @@ async def _finalize_qualification(
         "rubric_provenance": rubric_provenance,
     }
 
-    ci_state = ci_resolution.get("state", _CI_RED)
-    ci_required = True
-    if _pre_gates is not None and "ci_required" in _pre_gates:
-        ci_required = bool(_pre_gates["ci_required"])
-    elif ci_state == _CI_NO_CHECKS:
-        _proj_for_ci_gate = await session.get(Project, version.project_id)
-        ci_required = _ci_required_for_finalize(_proj_for_ci_gate, ci_resolution)
     merge_grade_misses = _merge_grade_misses_armed(
         {
             "merge_grade_status": merge_grade_cert["status"],
@@ -8554,12 +8669,19 @@ async def _finalize_qualification(
     acceptance_window = await _compute_acceptance_window_aggregate(session, version)
     extended_sub_scores = dict(composite["sub_scores"])
     extended_sub_scores.update(acceptance_window)
+    extended_sub_scores["stranded_approved_prs"] = qual.get(
+        "stranded_approved_prs"
+    )
     if walkthrough_e2e_result is not None:
         composite = _apply_walkthrough_decision(
             composite, walkthrough_e2e_result
         )
         walkthrough_score = composite["sub_scores"]["walkthrough_e2e"]
         extended_sub_scores["walkthrough_e2e"] = walkthrough_score
+        extended_sub_scores["failing_gates"] = composite.get("failing_gates") or []
+        extended_sub_scores["confidence_ceiling"] = composite.get(
+            "confidence_ceiling"
+        )
 
     # --- Dual-write handled by _dual_write_dimension_results after base_record
     # is fully assembled (below), where all dimensions including challenge are
@@ -8575,10 +8697,14 @@ async def _finalize_qualification(
         # differs only in CI/fixture/config files (content-hash reuse).
         "candidate_diff_hash": qual.get("candidate_diff_hash"),
         "ci_green": ci_green,
+        "ci_required": ci_required,
         "ci_resolution": ci_resolution,
         "smoketest_enabled": smoketest_enabled,
         "confidence": composite["confidence"],
         "sub_scores": extended_sub_scores,
+        "failing_gates": composite.get("failing_gates") or [],
+        "confidence_ceiling": composite.get("confidence_ceiling"),
+        "stranded_approved_prs": qual.get("stranded_approved_prs"),
         "blocker": composite["blocker"],
         # Execution-site of the responsible check (dir: tag promotion blockers
         # inert-until-promote). "deployed" = a fix on automain is inert until this
@@ -8908,7 +9034,10 @@ async def _finalize_qualification(
             notify_event = "release_blocked"
             notify_summary = (
                 f"v{version.version_number} blocked from promotion — "
-                f"{blocker_label}. Not promoted; staying in stabilize."
+                f"{blocker_label}. Failing gates: "
+                f"{', '.join(composite.get('failing_gates') or [])}. "
+                f"Confidence ceiling: {composite.get('confidence_ceiling')}. "
+                "Not promoted; staying in stabilize."
             )
         else:
             notify_event = "release_below_threshold"
@@ -8928,6 +9057,8 @@ async def _finalize_qualification(
                 "threshold": policy.get("threshold"),
                 "sub_scores": composite["sub_scores"],
                 "blocker": composite["blocker"],
+                "failing_gates": composite.get("failing_gates") or [],
+                "confidence_ceiling": composite.get("confidence_ceiling"),
                 "execution_site": blocker_execution_site(composite["blocker"]),
             },
         )

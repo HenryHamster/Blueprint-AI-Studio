@@ -135,10 +135,23 @@ class TestComputeCompositeHardBlockers:
             smoketest_score=0.7,
             policy=_POLICY,
         )
-        assert result["sub_scores"] == {
-            "audit": 0.8,
-            "test_erosion": 0.9,
+        # The scored inputs are still reported verbatim, alongside the two
+        # additive diagnostics that explain the block: every gate that failed,
+        # and the confidence the candidate would reach once they clear.
+        assert result["sub_scores"]["audit"] == 0.8
+        assert result["sub_scores"]["test_erosion"] == 0.9
+        assert result["sub_scores"]["failing_gates"] == ["ci_not_green"]
+        # 4/7 * 0.8 + 3/7 * 0.9, rounded to 4dp — no debt weight in _POLICY.
+        assert result["sub_scores"]["confidence_ceiling"] == 0.8429
+        # Nothing else leaks into the blocked verdict's sub_scores.
+        assert set(result["sub_scores"]) == {
+            "audit",
+            "test_erosion",
+            "failing_gates",
+            "confidence_ceiling",
         }
+        assert result["failing_gates"] == ["ci_not_green"]
+        assert result["confidence_ceiling"] == 0.8429
 
 
 class TestComputeCompositeCiState:
@@ -2689,6 +2702,129 @@ class TestExtractAuditFindings:
         out = rq._extract_audit_findings(report)
         assert out[0]["file"] == "x/y.py"
         assert out[0]["key"] == rq._audit_finding_key("nit", "x/y.py")
+
+    def test_only_proven_blob_mismatch_is_excluded(self):
+        """Staleness must be PROVEN, never inferred from missing identity.
+
+        Only a finding whose path is covered by the candidate surface map AND
+        whose recorded blob differs is stale evidence.  A cross-cutting
+        finding (``file: ""``), a finding on a path outside the audited-surface
+        subset, and a finding with no recorded blob are all undisproven and
+        must keep deducting.
+        """
+        candidate_surface_paths = {
+            "backend/app/current.py": "candidate-current-blob",
+            "backend/app/changed.py": "candidate-changed-blob",
+        }
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Graded against a blob the candidate does not have.",
+                    "file": "backend/app/current.py",
+                    "blob_sha": "stale-blob",
+                    "verification_note": "Confirmed against the older candidate tree.",
+                },
+                {
+                    "severity": "low",
+                    "summary": "Current candidate style issue.",
+                    "file": "backend/app/current.py",
+                    "blob_sha": "candidate-current-blob",
+                },
+                {
+                    "severity": "medium",
+                    "summary": "Finding with no recorded blob.",
+                    "file": "backend/app/changed.py",
+                    "verification_note": "Confirmed in the candidate source tree.",
+                },
+                {
+                    "severity": "high",
+                    "summary": "Cross-cutting finding with no file.",
+                    "file": "",
+                    "verification_note": "Confirmed in the candidate source tree.",
+                },
+                {
+                    "severity": "medium",
+                    "summary": "Finding on a path outside the audited surface.",
+                    "file": ".github/workflows/ci.yml",
+                    "blob_sha": "some-blob",
+                    "verification_note": "Confirmed in the candidate source tree.",
+                },
+            ],
+        }
+
+        audit_score, _ = rq._score_audit(
+            report, candidate_surface_paths=candidate_surface_paths
+        )
+        expected = 1.0 - (
+            rq._AUDIT_DEDUCTIONS["low"]
+            + 2 * rq._AUDIT_DEDUCTIONS["medium"]
+            + rq._AUDIT_DEDUCTIONS["high"]
+        )
+        assert audit_score == pytest.approx(max(expected, 0.0))
+
+        carried = rq._extract_audit_findings(
+            report, candidate_surface_paths=candidate_surface_paths
+        )
+        assert sorted(finding["summary"] for finding in carried) == sorted(
+            [
+                "Current candidate style issue.",
+                "Finding with no recorded blob.",
+                "Cross-cutting finding with no file.",
+                "Finding on a path outside the audited surface.",
+            ]
+        )
+
+        excluded = rq._extract_excluded_audit_findings(
+            report, candidate_surface_paths=candidate_surface_paths
+        )
+        assert [finding["summary"] for finding in excluded] == [
+            "Graded against a blob the candidate does not have."
+        ]
+        assert excluded[0]["reason"] == "stale_blob_not_in_candidate"
+        # The excluded extractor stamps blob identity (mirroring
+        # _extract_audit_findings) so an incremental merge can evaluate this
+        # list's carry-forward at all.
+        assert excluded[0]["blob_sha"] == "stale-blob"
+        assert excluded[0]["surface_key"]
+
+        meta = rq._audit_findings_carry_meta(
+            report, candidate_surface_paths=candidate_surface_paths
+        )
+        assert meta["audit_findings_total"] == len(carried) == 4
+        assert meta["excluded_audit_findings_total"] == len(excluded) == 1
+
+        reconciliation = rq._compute_audit_reconciliation(
+            report, candidate_surface_paths=candidate_surface_paths
+        )
+        assert reconciliation["findings_derived_score"] == pytest.approx(audit_score)
+        assert reconciliation["excluded_findings_count"] == len(excluded)
+
+    def test_findings_without_blob_identity_still_deduct(self):
+        """The pre-blob-stamping shape must not be zeroed out wholesale."""
+        candidate_surface_paths = {"backend/app/a.py": "blob-a"}
+        report = {
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": "Legacy finding with no blob_sha recorded.",
+                    "file": "backend/app/a.py",
+                    "verification_note": "Confirmed in the candidate source tree.",
+                },
+            ],
+        }
+        audit_score, _ = rq._score_audit(
+            report, candidate_surface_paths=candidate_surface_paths
+        )
+        assert audit_score == pytest.approx(
+            max(1.0 - rq._AUDIT_DEDUCTIONS["critical"], 0.0)
+        )
+        assert (
+            rq._extract_excluded_audit_findings(
+                report, candidate_surface_paths=candidate_surface_paths
+            )
+            == []
+        )
 
 
 class TestAuditFindingsCarryMeta:

@@ -158,15 +158,15 @@ elif [ "$USE_POSTGRES" = "1" ] && _AUTO_POSTGRES_FLAG="$(select_backend_test_rou
   USE_DOCKER=0
   PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
   echo "=== Using off-image pgserver PostgreSQL sandbox ==="
-elif command -v docker &>/dev/null; then
+elif command -v docker &>/dev/null && docker info >/dev/null 2>&1; then
   USE_DOCKER=1
 else
   USE_DOCKER=0
   if [ "$USE_POSTGRES" = "1" ]; then
-    echo "ERROR: --postgres requires Docker" >&2
+    echo "ERROR: --postgres requires a usable Docker daemon" >&2
     exit 2
   fi
-  echo "=== Docker not found — running pytest directly ==="
+  echo "=== Docker unavailable — running pytest directly ==="
   # Ensure pip-installed binaries are on PATH
   export PATH="$HOME/.local/bin:$PATH"
   # Install dependencies if needed (use uv if pip is unavailable)
@@ -464,6 +464,14 @@ _run() {
   fi
 }
 
+STANDALONE_RELEASE_TEST_ARGS=()
+if [ "$USE_DOCKER" = "1" ]; then
+  STANDALONE_RELEASE_TEST_ARGS+=(/repo/scripts/test_bootstrap_local_app_release.py)
+elif [ -f ../scripts/test_bootstrap_local_app_release.py ]; then
+  # Docker-less local runs are rooted at the checkout, not the /repo bind mount.
+  STANDALONE_RELEASE_TEST_ARGS+=(../scripts/test_bootstrap_local_app_release.py)
+fi
+
 if [ "$USE_DOCKER" = "1" ]; then
   # Fast path: resolve a prebuilt deps image (local baked → GHCR pull) and
   # bind-mount the source (set in _run). Falls back loudly to the local build on
@@ -539,6 +547,9 @@ if [ "${1:-}" = "--standalone" ]; then
   # scripts/ (which ships standalone to runner hosts), so the `pytest testing/`
   # shards never collect it — without this line the whole gate is untested in CI.
   [ -f /repo/scripts/test_runner_isolation.py ] && STANDALONE_ARGS+=(/repo/scripts/test_runner_isolation.py)
+  # This exit-proof release suite covers durable handoff, serving confirmation,
+  # and receipt retry behavior that pytest's backend shards do not collect.
+  STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
   _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest
   exit 0
 fi
@@ -595,7 +606,7 @@ if [ $# -gt 0 ]; then
 fi
 
 echo "=== Standalone tests ==="
-_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_admin_auth_invariant.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py testing/test_test_durations_freshness.py testing/test_shard_balance.py testing/test_vitest_durations_freshness.py -v --noconftest
+_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_admin_auth_invariant.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py "${STANDALONE_RELEASE_TEST_ARGS[@]}" testing/test_test_durations_freshness.py testing/test_shard_balance.py testing/test_vitest_durations_freshness.py -v --noconftest
 
 echo "=== Full test suite ==="
 if [ "${#TESTMON_ARGS[@]}" -gt 0 ]; then

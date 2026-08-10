@@ -2096,6 +2096,8 @@ async def backfill_unverified_merge_evidence(
     session: AsyncSession,
     project_id: uuid.UUID,
     direction_key: str | None = None,
+    *,
+    diagnostic: dict[str, str] | None = None,
 ) -> int:
     """Backfill criterion evidence for tasks whose unverified merge prevented it.
 
@@ -2110,7 +2112,9 @@ async def backfill_unverified_merge_evidence(
     context carries that direction_id.
 
     Best-effort: errors are logged and swallowed so a backfill failure never blocks
-    the caller (the reconcile-backfill endpoint).
+    the caller (the reconcile-backfill endpoint).  Callers that need to preserve a
+    failed pass in an execution ledger may provide ``diagnostic``; it receives a
+    stable error code and exception class while this API remains count-compatible.
 
     Returns the count of new ``CriterionEvidence`` rows recorded.
     """
@@ -2331,11 +2335,16 @@ async def backfill_unverified_merge_evidence(
                 total,
             )
         return total
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "backfill_unverified_merge_evidence: failed for project %s",
             project_id,
         )
+        if diagnostic is not None:
+            diagnostic.update(
+                error="backfill_unverified_merge_evidence_failed",
+                error_type=type(exc).__name__,
+            )
         return 0
 
 
@@ -2347,12 +2356,125 @@ async def backfill_unverified_merge_evidence(
 _ROLLUP_PARENT_WALK_MAX_DEPTH = 8
 
 
+def _rollup_child_commit_range(task: Task) -> tuple[str, str] | None:
+    """Return the backend-persisted immutable PR range for a rollup child."""
+    context = task.context or {}
+    review_loop = context.get("review_loop")
+    candidates = [
+        review_loop.get("review_target")
+        if isinstance(review_loop, dict)
+        else None,
+        review_loop.get("fix_target")
+        if isinstance(review_loop, dict)
+        else None,
+        context.get("review_target"),
+        context.get("fix_target"),
+    ]
+    for target in candidates:
+        if not isinstance(target, dict):
+            continue
+        base_sha = target.get("base_sha")
+        head_sha = target.get("head_sha")
+        if (
+            isinstance(base_sha, str)
+            and base_sha.strip()
+            and isinstance(head_sha, str)
+            and head_sha.strip()
+            and base_sha.strip() != head_sha.strip()
+        ):
+            return base_sha.strip(), head_sha.strip()
+
+    if isinstance(review_loop, dict):
+        base_sha = review_loop.get("base_sha")
+        head_sha = review_loop.get("head_sha")
+        if (
+            isinstance(base_sha, str)
+            and base_sha.strip()
+            and isinstance(head_sha, str)
+            and head_sha.strip()
+            and base_sha.strip() != head_sha.strip()
+        ):
+            return base_sha.strip(), head_sha.strip()
+
+    base_sha = context.get("base_sha")
+    head_sha = context.get("head_sha")
+    if (
+        isinstance(base_sha, str)
+        and base_sha.strip()
+        and isinstance(head_sha, str)
+        and head_sha.strip()
+        and base_sha.strip() != head_sha.strip()
+    ):
+        return base_sha.strip(), head_sha.strip()
+    return None
+
+
+async def stamp_rollup_child_commit_range(
+    task: Task,
+    *,
+    gh_token: str,
+    owner: str,
+    repo: str,
+) -> bool:
+    """Stamp a child's exact PR-range diff, returning whether it was resolved.
+
+    ``review_target`` is written by the backend from the live PR before review
+    or merge.  Comparing those immutable SHAs is exact child provenance even
+    though the child never owns the rollup parent's PR.  ``None`` from GitHub
+    means indeterminate and leaves the existing context untouched; an empty
+    list is authoritative proof of an empty child range and is therefore still
+    stamped.
+    """
+    commit_range = _rollup_child_commit_range(task)
+    if commit_range is None:
+        return False
+    from app.acceptance_gate import (
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        record_code_acceptance_verdict,
+        stamp_commit_range_derived_changed_files_signal,
+    )
+    from app.github_refs import get_files_changed_between_refs
+
+    base_sha, head_sha = commit_range
+    try:
+        changed = await get_files_changed_between_refs(
+            gh_token,
+            owner,
+            repo,
+            base_sha,
+            head_sha,
+            project_id=str(task.project_id),
+        )
+    except Exception:
+        logger.warning(
+            "rollup child %s commit-range compare failed",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        return False
+    if changed is None:
+        return False
+
+    context = dict(task.context or {})
+    # ``dict.update`` cannot remove provenance from the previous stamp.  Clear
+    # the legacy parent-derived sentinels on the task before applying the exact
+    # child range, so the old union diff cannot continue to cap this verdict.
+    context.pop(PARENT_DERIVED_CHANGED_FILES_KEY, None)
+    context.pop("_pr_changed_files_truncated", None)
+    context.update(stamp_commit_range_derived_changed_files_signal(changed))
+    task.context = context
+    record_code_acceptance_verdict(task)
+    return True
+
+
 async def backfill_rollup_child_changed_files(
     session: AsyncSession,
     project_id: uuid.UUID,
     direction_key: str | None = None,
+    *,
+    diagnostic: dict[str, str] | None = None,
 ) -> int:
-    """Retroactively stamp a rollup parent's changed files onto landed children.
+    """Repair legacy rollup children that landed before source stamping existed.
 
     The forward-path propagation in
     :func:`app.rollup_management._propagate_landed_to_staging_merged_descendants`
@@ -2363,16 +2485,14 @@ async def backfill_rollup_child_changed_files(
     stuck at ``declared_unsatisfied``; the unverified-merge backfill skips them
     because ``_changed_files(task)`` is empty.
 
-    This best-effort reconcile pass finds landed COMPLETED tasks that carry NO
-    ``_pr_changed_files`` but whose nearest landed ancestor (walking
-    ``parent_task_id``) DOES carry a GitHub-verified changed-file list, and
-    stamps that list onto the child using the SAME parent-derived semantics as
-    the forward path: :func:`stamp_parent_derived_changed_files_signal`
-    (``setdefault`` — never clobber a child's own list — and deliberately NO
-    ``_pr_changed_files_github_verified`` sentinel, so credit is capped at the
-    satisfied/unproven tier and never mints machine ``proven`` credit from the
-    parent's union diff).  The acceptance verdict is then re-evaluated so a stale
-    ``declared_unsatisfied`` reason flips.
+    The canonical path now compares each child's backend-persisted immutable
+    ``base_sha...head_sha`` range and stamps
+    :func:`stamp_commit_range_derived_changed_files_signal`, replacing any
+    self-report and clearing legacy parent-derived sentinels.  Once exact
+    provenance is stamped, later backfill runs skip the child. The parent-union
+    path remains
+    only as a compatibility fallback for old rows that have no usable child
+    range; it is deliberately never used when the exact compare succeeds.
 
     Wired to run BEFORE :func:`backfill_unverified_merge_evidence` in the
     reconcile endpoint so that, within the SAME run, a newly-stamped child is
@@ -2381,8 +2501,11 @@ async def backfill_rollup_child_changed_files(
     ``direction_key``, when provided, scopes the search to tasks whose context
     carries that ``direction_id`` (matching the sibling backfills).
 
-    Idempotent (``setdefault`` — a re-run stamps nothing new) and best-effort
-    (errors are logged and swallowed so a failure never blocks the caller).
+    Idempotent (clean exact-range stamps are skipped; legacy stamps with stale
+    sentinels get one repair pass) and best-effort (errors are logged and
+    swallowed so a failure never blocks the caller). A caller may provide
+    ``diagnostic`` to retain a stable error code and exception class when the
+    swallowed failure must remain auditable.
 
     Returns the count of children newly stamped by this call.
     """
@@ -2395,6 +2518,34 @@ async def backfill_rollup_child_changed_files(
         _BATCH_LIMIT = 500
         stamped_total = 0
         offset = 0
+        # Resolve credentials once for exact child-range comparisons.  A missing
+        # credential only disables this best-effort legacy repair; the parent
+        # fallback below remains conservative and GitHub-verified.
+        gh_credentials: tuple[str, str, str] | None = None
+        try:
+            from app.routers.agent import get_github_token_for_task
+
+            first_task = (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == project_id,
+                        Task.status == TaskStatus.COMPLETED,
+                        landed_signal_predicate(session),
+                    )
+                    .limit(1)
+                )
+            ).scalars().first()
+            if first_task is not None:
+                gh_credentials = await get_github_token_for_task(
+                    first_task.id, session
+                )
+        except Exception:
+            logger.info(
+                "backfill_rollup_child_changed_files: exact-range credentials unavailable",
+                exc_info=True,
+            )
+
         # Cache ancestor lookups across the scan — sibling children share the
         # same rollup parent, so one github-verified resolution per ancestor id
         # avoids re-walking the chain for every child.
@@ -2486,12 +2637,46 @@ async def backfill_rollup_child_changed_files(
             for task in batch:
                 if not is_merged_completion(task):
                     continue
-                # Only children that lack their own changed-file context — a
-                # child that already carries a list is left untouched (setdefault
-                # / idempotency).
-                if _acceptance_gate._changed_files(task):
-                    continue
                 if task.parent_task_id is None:
+                    continue
+
+                # The exact range is immutable and already authoritative.  Do
+                # not re-fetch or re-stamp it on every reconcile invocation. A
+                # legacy exact stamp may still carry the old parent-derived or
+                # truncation sentinel, so let that shape run once more through
+                # the merge-site cleanup above.
+                task_context = task.context or {}
+                if (
+                    task_context.get(
+                        _acceptance_gate.COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY
+                    )
+                    is True
+                    and task_context.get(
+                        _acceptance_gate.PARENT_DERIVED_CHANGED_FILES_KEY
+                    )
+                    is not True
+                    and "_pr_changed_files_truncated" not in task_context
+                ):
+                    continue
+
+                # Exact child provenance supersedes both self-reported and
+                # parent-derived lists.  This is intentionally attempted before
+                # the old skip-if-has-list guard: that guard made the dominant
+                # v31 named_test_missing_from_diff bucket unreachable.
+                if gh_credentials is not None and await stamp_rollup_child_commit_range(
+                    task,
+                    gh_token=gh_credentials[0],
+                    owner=gh_credentials[1],
+                    repo=gh_credentials[2],
+                ):
+                    session.add(task)
+                    batch_stamped += 1
+                    continue
+
+                # Legacy fallback: only inherit a parent's union when the child
+                # has no changed-file list at all.  It remains soft/unproven and
+                # is never allowed to shadow an exact range or a self-report.
+                if _acceptance_gate._changed_files(task):
                     continue
 
                 parent_changed = await _github_verified_ancestor_changed(task)
@@ -2521,11 +2706,16 @@ async def backfill_rollup_child_changed_files(
                 stamped_total,
             )
         return stamped_total
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "backfill_rollup_child_changed_files: failed for project %s",
             project_id,
         )
+        if diagnostic is not None:
+            diagnostic.update(
+                error="backfill_rollup_child_changed_files_failed",
+                error_type=type(exc).__name__,
+            )
         return 0
 
 
@@ -3391,6 +3581,7 @@ async def record_operator_walkthrough_evidence(
 async def record_acceptance_window_coverage_evidence(
     session: AsyncSession,
     version: Any,
+    diagnostic: dict[str, Any] | None = None,
 ) -> int:
     """Record covering ``acceptance_window_recompute`` evidence when the version's
     acceptance-window metric re-scores genuinely non-zero.
@@ -3412,7 +3603,10 @@ async def record_acceptance_window_coverage_evidence(
     every failure is logged and swallowed so it never raises into the sweep or
     qualification path.
 
-    Returns the number of evidence rows newly recorded.
+    Returns the number of evidence rows newly recorded.  When ``diagnostic`` is
+    supplied, writes one observational ``branch`` value describing why the
+    minter recorded evidence or legitimately skipped it.  This is deliberately
+    not persisted as criterion evidence and changes no coverage decision.
 
     **DEPLOYED-SIDE CONSTRAINT**: this function executes inside the deployed
     orchestrator process at the deployed (main) SHA, called from
@@ -3431,6 +3625,8 @@ async def record_acceptance_window_coverage_evidence(
         # evidence row does not create recurring work on every reaper cycle.
         targets = await _resolve_acceptance_window_criteria(session, version)
         if not targets:
+            if diagnostic is not None:
+                diagnostic["branch"] = "no_target_criterion"
             logger.info(
                 "record_acceptance_window_coverage_evidence: no active criterion "
                 "names the acceptance-window metric on version %s — recording nothing",
@@ -3449,6 +3645,8 @@ async def record_acceptance_window_coverage_evidence(
         )
         already_present = {ev.criterion_id for ev in ev_result.scalars().all()}
         if len(already_present) == len(target_ids):
+            if diagnostic is not None:
+                diagnostic["branch"] = "evidence_already_present"
             return 0
 
         latest_landed_updated_at = (
@@ -3467,6 +3665,8 @@ async def record_acceptance_window_coverage_evidence(
         )
         version_id = version.id
         if _acceptance_window_recompute_state.get(version_id) == state_fingerprint:
+            if diagnostic is not None:
+                diagnostic["branch"] = "unchanged_window_state"
             return 0
 
         aggregate = await release_qualifier._compute_acceptance_window_aggregate(
@@ -3475,6 +3675,8 @@ async def record_acceptance_window_coverage_evidence(
         write_total = int(aggregate.get("acceptance_window_write_total") or 0)
         verified = int(aggregate.get("acceptance_window_verified") or 0)
         if write_total <= 0 or verified <= 0:
+            if diagnostic is not None:
+                diagnostic["branch"] = "false_zero_window"
             # Cache only the intentional no-write outcome. A coverable window
             # relies on durable evidence idempotency instead: caching before its
             # transaction commits could let a transient insert/commit failure
@@ -3524,8 +3726,14 @@ async def record_acceptance_window_coverage_evidence(
             write_total,
             verified,
         )
+        if diagnostic is not None:
+            diagnostic["branch"] = (
+                "evidence_recorded" if recorded else "evidence_already_present"
+            )
         return recorded
     except Exception:
+        if diagnostic is not None:
+            diagnostic["branch"] = "error"
         logger.exception(
             "record_acceptance_window_coverage_evidence: failed for version %s",
             getattr(version, "id", None),

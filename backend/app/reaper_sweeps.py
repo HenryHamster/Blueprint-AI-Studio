@@ -4260,7 +4260,9 @@ _ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS = 3600
 _last_acceptance_healing_backfill_sweep: datetime | None = None
 
 
-async def sweep_acceptance_verdict_healing_backfills(session, now=None) -> int:
+async def sweep_acceptance_verdict_healing_backfills(
+    session, now=None
+) -> int:
     """Step 21b: Heal stale declared_unsatisfied acceptance verdicts on the sweep.
 
     Runs the two reconcile-only backfills that heal stale acceptance verdicts for
@@ -4328,9 +4330,42 @@ async def sweep_acceptance_verdict_healing_backfills(session, now=None) -> int:
                 open_ver = await _cur_open_ver(session, pid)
                 if open_ver is None:
                     continue
-                stamped = await _backfill_rollup(session, pid)
-                unverified = await _backfill_unverified(session, pid)
-                window_evidence = await _record_window_evidence(session, open_ver)
+                rollup_diagnostic: dict[str, str] = {}
+                stamped = await _backfill_rollup(
+                    session, pid, diagnostic=rollup_diagnostic
+                )
+                if rollup_diagnostic:
+                    # The helper preserves endpoint best-effort behavior by
+                    # swallowing its own failure.  Clear any failed transaction
+                    # before independently attempting the remaining passes.
+                    await session.rollback()
+                    # rollback() expires every ORM instance, including the
+                    # version passed to the final window minter.  Re-query it
+                    # before the next independent pass so async attribute reads
+                    # cannot trigger a synchronous MissingGreenlet refresh.
+                    open_ver = await _cur_open_ver(session, pid)
+                    if open_ver is None:
+                        raise RuntimeError(
+                            "open release version closed during acceptance healing"
+                        )
+
+                unverified_diagnostic: dict[str, str] = {}
+                unverified = await _backfill_unverified(
+                    session, pid, diagnostic=unverified_diagnostic
+                )
+                if unverified_diagnostic:
+                    await session.rollback()
+                    # See the corresponding rollup-pass reload above: this
+                    # rollback also expires open_ver before the window minter.
+                    open_ver = await _cur_open_ver(session, pid)
+                    if open_ver is None:
+                        raise RuntimeError(
+                            "open release version closed during acceptance healing"
+                        )
+                window_diagnostic: dict[str, Any] = {}
+                window_evidence = await _record_window_evidence(
+                    session, open_ver, diagnostic=window_diagnostic
+                )
                 # Each pass commits internally per batch; this commit flushes the
                 # window-minter rows (already persisted by record_evidence) and
                 # keeps the per-project transaction clean for the next project.

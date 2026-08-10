@@ -25,7 +25,13 @@ from app.context_bounds import bound_review_history, warn_if_context_oversized
 from app.ci_merge_helpers import revoke_review_authority_for_active_fix
 from app.database import resolve_dialect_name
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
-from app.models import TASK_ORIGINATION_REVIEW, Task, TaskHistory, TaskStatus
+from app.models import (
+    TASK_ORIGINATION_REVIEW,
+    TASK_ORIGINATION_ROLLUP,
+    Task,
+    TaskHistory,
+    TaskStatus,
+)
 from app.payload_schemas import validate_internal_payload
 from app.review_fix_lane_pilot import PILOT_PROPAGATE_KEYS
 from app.shared_state import (
@@ -1209,7 +1215,11 @@ async def _spawn_verify_tests_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        origination=TASK_ORIGINATION_REVIEW,
+        origination=(
+            TASK_ORIGINATION_ROLLUP
+            if _is_rollup_chain_source(source_task)
+            else TASK_ORIGINATION_REVIEW
+        ),
     )
     session.add(new_task)
     try:
@@ -1630,7 +1640,11 @@ async def _handle_lane_checkpoint_recovery(
         vm_instance_id=None,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        origination=TASK_ORIGINATION_REVIEW,
+        origination=(
+            TASK_ORIGINATION_ROLLUP
+            if _is_rollup_chain_source(source_task)
+            else TASK_ORIGINATION_REVIEW
+        ),
     )
     session.add(recovery_task)
     await session.flush()  # assign recovery_task.id for the lane rebind
@@ -1725,6 +1739,43 @@ async def _pinned_unclaimed_sibling_exists(
         filters.append(Task.context["warm_target_pr"].as_string() == str(pr_number))
     stmt = select(Task.id).where(*filters).limit(1)
     return (await session.execute(stmt)).first() is not None
+
+
+def stale_respawn_delta_base_sha(
+    *,
+    reviewed_head_sha: object,
+    reviewed_base_sha: object,
+    live_head_sha: object,
+    live_base_sha: object,
+) -> str:
+    """Narrowest *safe* diff base for a respawned exact-target review.
+
+    A delta review runs ``git diff <delta_base_sha>..HEAD`` with the broad
+    review context deliberately suppressed (agent/src/handlers/review-fix.ts).
+    That narrowing is only sound when the head actually moved AND the base did
+    not: the discarded review already covered ``reviewed_base..reviewed_head``,
+    so the head delta is then the sole unreviewed range.
+
+    Returns "" — meaning a FULL re-review — in every other case:
+
+    * **base-drift only** (``reviewed_head == live head``): the delta range is
+      empty, so a delta reviewer inspects nothing and rubber-stamps an
+      approval, or silently drops a real REQUEST_CHANGES finding.
+    * **the base moved at all**: the code was never reviewed against the new
+      base, and no head-relative delta can cover that.
+    * **missing provenance** on either side: never guess a narrower scope.
+    """
+    reviewed_head = str(reviewed_head_sha or "")
+    reviewed_base = str(reviewed_base_sha or "")
+    live_head = str(live_head_sha or "")
+    live_base = str(live_base_sha or "")
+    if not (reviewed_head and reviewed_base and live_head and live_base):
+        return ""
+    # base moved  -> no head-relative delta can cover it.
+    # head held   -> the delta range would be empty.
+    if reviewed_base != live_base or reviewed_head == live_head:
+        return ""
+    return reviewed_head
 
 
 async def _spawn_pipeline_task(
@@ -4310,7 +4361,11 @@ async def _spawn_pipeline_task(
         vm_instance_id=spawn_vm_instance_id,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        origination=TASK_ORIGINATION_REVIEW,
+        origination=(
+            TASK_ORIGINATION_ROLLUP
+            if is_rollup_source
+            else TASK_ORIGINATION_REVIEW
+        ),
     )
     if task_type == "fix":
         # Commit the active child and authority revocation atomically.  Every

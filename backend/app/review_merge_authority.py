@@ -171,6 +171,10 @@ async def enforce_merge_authority(
         )
         live_base = str(fetched_target.get("base_sha") or "")
         live_head = str(fetched_target.get("head_sha") or "")
+        # Admission/staleness checks key on head only because the integration
+        # branch tip is ambient. This final boundary intentionally differs:
+        # the merge PUT must be authorized for the exact base+head pair CI
+        # validated.
         if (
             live_base == expected_base
             and live_head == expected_head

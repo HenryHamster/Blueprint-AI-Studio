@@ -23,7 +23,7 @@ import os
 import re
 import statistics
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence, cast
 
@@ -42,6 +42,7 @@ from app.landed_signal import (
     is_verified_merge,
 )
 from app.models import (
+    DeploymentState,
     ImprovementLane,
     ImprovementLaneStatus,
     PoolIdleCostLedger,
@@ -50,6 +51,7 @@ from app.models import (
     PoolVmState,
     Project,
     ProjectEfficiencySnapshot,
+    TASK_ORIGINATION_SYSTEM,
     Task,
     TaskStatus,
     _utcnow,
@@ -348,11 +350,23 @@ _AXIS_WINDOW_DAYS = 7
 
 # Migration 0735 added Task.origination with a SYSTEM server default, which
 # backfilled every pre-existing task. Origination shares are therefore only
-# evidence-bearing after the migration's capture boundary; older rows are a
-# residual, not proof of direct/system work.
-ORIGINATION_CAPTURED_AT = datetime(2026, 8, 7)
+# evidence-bearing for rows CREATED at or after the capture boundary; older rows
+# read SYSTEM as a backfill artifact, not as proof of system-originated work.
+#
+# There is exactly ONE capture boundary, and it lives in
+# :data:`app.research_completion.TASK_ORIGINATION_COHORT_START` — the same
+# constant :func:`merged_work_origination_split` floors ``Task.created_at``
+# against. It is imported lazily (research_completion imports this module) so
+# the emitted ``origination_capture_start`` can never drift from the floor the
+# query actually applied.
 ORIGINATION_MIN_QUOTABLE_COHORT = 20
-ORIGINATION_MAX_UNATTRIBUTED_SHARE = 0.20
+# Ceiling on the SYSTEM RESIDUAL share of merged work. SYSTEM is the only class
+# migration 0735 contaminated: it is both the backfill default and the catch-all
+# for anything unclassified. The named automatic classes (REVIEW, HOTFIX,
+# ROLLUP, QUALIFIER, EVERGREEN, REMEDIATION, SMOKETEST) are legitimately
+# attributed automation — they are outside the commissioned denominator by
+# design, but they are NOT residual and must not count as contamination.
+ORIGINATION_MAX_RESIDUAL_SHARE = 0.20
 
 # Row cap applied to _load_recent_tasks. Past this many terminal tasks in the
 # requested window, the loaded cohort is a recency SAMPLE (most-recently-
@@ -418,6 +432,8 @@ _SNAPSHOT_HISTORY_MAX = 7
 #      reconciles with the aggregate total_usd), and by_cycle_capped — so a
 #      decision-loop reading can separate cycles that ran before a lever reached
 #      serving from cycles that ran after.
+# v18: cycle timestamps use task execution spans, and the current serving boundary
+#      uses the durable DeploymentState.deployed_at instead of snapshot capture time.
 METRIC_DEF_VERSION = "v18"
 
 
@@ -426,25 +442,62 @@ def build_merged_work_origination_reading(
     *,
     window_start: datetime,
     window_end: datetime,
+    cohort_created_at_floor: datetime | None = None,
 ) -> dict[str, Any]:
     """Attach evidence provenance to the merged-work origination split.
 
-    Suppress shares unless the window is post-0735, sufficiently sized, and not
-    mostly residual-contaminated; retain counts for diagnosis when unquotable.
-    """
-    from app.research_completion import merged_work_origination_reading
+    Suppress shares unless the cohort is creation-floored at or after the 0735
+    capture boundary, is sufficiently sized, and is not mostly SYSTEM residual;
+    retain counts for diagnosis when unquotable.
 
-    reading = cast(dict[str, Any], merged_work_origination_reading(dict(split)))
-    merged_total = reading["merged_total"]
-    commissioned_total = reading["commissioned_total"]
-    unattributed = reading["unattributed_merged"]
-    contamination_rate = (
-        round(unattributed / merged_total, 4) if merged_total else None
+    ``cohort_created_at_floor`` is the ``Task.created_at`` floor the caller
+    actually applied when building ``split`` (default: the canonical
+    :data:`~app.research_completion.TASK_ORIGINATION_COHORT_START`). The
+    pre-capture gate is keyed on THAT floor, not on ``window_start``:
+    ``window_start`` bounds LANDING time (``COALESCE(completed_at, updated_at)``),
+    and a landing window that reaches back before the boundary says nothing about
+    whether a backfilled row is in the cohort — only the creation floor does.
+    """
+    from app.research_completion import (
+        TASK_ORIGINATION_COHORT_START,
+        merged_work_origination_reading,
     )
 
+    if cohort_created_at_floor is None:
+        cohort_created_at_floor = TASK_ORIGINATION_COHORT_START
+    # The canonical constant is naive-UTC (it is compared against a UTC DB
+    # column); render it UTC-aware so the emitted boundary is unambiguous and
+    # byte-identical to TASK_ORIGINATION_COHORT_START_ISO.
+    floor_aware = (
+        cohort_created_at_floor
+        if cohort_created_at_floor.tzinfo is not None
+        else cohort_created_at_floor.replace(tzinfo=timezone.utc)
+    )
+    floor_iso = floor_aware.isoformat()
+    # Compare on a single tz convention so an aware caller floor never raises.
+    capture_start = TASK_ORIGINATION_COHORT_START.replace(tzinfo=timezone.utc)
+    cohort_fully_captured = floor_aware >= capture_start
+
+    reading = cast(
+        dict[str, Any],
+        merged_work_origination_reading(
+            dict(split),
+            cohort_created_at_floor=floor_iso,
+        ),
+    )
+    merged_total = reading["merged_total"]
+    commissioned_total = reading["commissioned_total"]
+    # Contamination is the SYSTEM residual share of merged work — the exact
+    # quantity migration 0735's backfill default inflates. Deliberately NOT
+    # `unattributed_merged` (merged_total - commissioned_total), which also
+    # counts the named automatic classes; those are attributed automation, so
+    # scoring them as contamination would null every share on every real window.
+    residual = int(split.get(TASK_ORIGINATION_SYSTEM, 0))
+    contamination_rate = round(residual / merged_total, 4) if merged_total else None
+
     reason: str | None = None
-    if window_start < ORIGINATION_CAPTURED_AT:
-        reason = "window_predates_origination_capture"
+    if not cohort_fully_captured:
+        reason = "cohort_predates_origination_capture"
     elif merged_total == 0:
         reason = "no_origination_data"
     elif commissioned_total == 0:
@@ -453,7 +506,7 @@ def build_merged_work_origination_reading(
         reason = "cohort_too_small"
     elif (
         contamination_rate is not None
-        and contamination_rate > ORIGINATION_MAX_UNATTRIBUTED_SHARE
+        and contamination_rate > ORIGINATION_MAX_RESIDUAL_SHARE
     ):
         reason = "cohort_too_contaminated"
 
@@ -474,9 +527,12 @@ def build_merged_work_origination_reading(
             "window_days": round(
                 (window_end - window_start).total_seconds() / 86400, 1
             ),
-            "origination_capture_start": ORIGINATION_CAPTURED_AT.isoformat(),
-            "window_fully_captured": window_start >= ORIGINATION_CAPTURED_AT,
+            # Single capture boundary: this is the same instant the split's
+            # created_at floor used, so the two fields can never disagree.
+            "origination_capture_start": floor_iso,
+            "window_fully_captured": cohort_fully_captured,
             "cohort_size": commissioned_total,
+            "residual_merged": residual,
             "contamination_rate": contamination_rate,
             "status": "QUOTABLE" if quotable else "UNQUOTABLE",
             "unquotable_reason": reason,
@@ -548,14 +604,16 @@ def _serving_sha_timeline_from_snapshots(
     snapshots: Sequence[Mapping[str, Any]],
     current_sha: str | None,
     now: datetime,
+    current_deployed_at: datetime | None = None,
 ) -> list[Dict[str, Any]] | None:
     """Build the sorted serving-sha boundary list a cycle-cost slice needs.
 
     Each snapshot that carries a ``serving_sha`` contributes a boundary: from
     its ``captured_at`` onward that revision was serving until a later snapshot
-    superseded it. ``current_sha`` (the live ``DEPLOY_SHA``) is appended at
-    ``now`` so cycles active after the newest snapshot still attribute to the
-    revision serving right now. Consecutive boundaries with the same sha are
+    superseded it. ``current_sha`` is appended at its durable deployment time
+    when available, or at ``now`` for legacy/pre-stamp deployments, so cycles
+    active after the newest snapshot still attribute to the revision serving
+    right now. Consecutive boundaries with the same sha are
     collapsed to the earliest stamp (that is when the sha's serving period
     began), which keeps the timeline minimal and the attribution correct across
     back-to-back snapshots of an unchanged revision.
@@ -580,7 +638,10 @@ def _serving_sha_timeline_from_snapshots(
             since = since.replace(tzinfo=None)
         boundaries.append((since, sha))
     if current_sha:
-        boundaries.append((now, current_sha))
+        since = current_deployed_at or now
+        if since.tzinfo is not None:
+            since = since.replace(tzinfo=None)
+        boundaries.append((since, current_sha))
     if not boundaries:
         return None
     boundaries.sort(key=lambda pair: pair[0])
@@ -599,20 +660,37 @@ async def _load_serving_sha_timeline(
     """Load the serving-sha timeline a project's cycle-cost slices need.
 
     Merges the design_doc container and ``project_efficiency_snapshot`` table
-    history (via :func:`_read_snapshot_history`) and appends the current
-    ``DEPLOY_SHA`` at now, so both the daily snapshot write path and the live
-    agent endpoint can slice strategic-cycle cost by serving revision. Returns
-    None when no snapshot carries a serving_sha and no DEPLOY_SHA is stamped.
+    history (via :func:`_read_snapshot_history`) with the durable
+    ``DeploymentState.current_sha/deployed_at`` boundary, so both the daily
+    snapshot write path and the live agent endpoint can slice strategic-cycle
+    cost by serving revision. Legacy snapshots and ``DEPLOY_SHA`` remain the
+    fallback when the deployment record is unavailable.
     """
     project = await session.get(Project, project_id, populate_existing=True)
     if project is None:
         return None
     container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     snapshots = await _read_snapshot_history(session, project_id, container)
-    from app.deployed_sha import get_serving_sha
+    deployment = await session.get(DeploymentState, 1)
+    from app.deployed_sha import _looks_like_git_sha, get_serving_sha
+
+    # The singleton initializes current_sha to the literal "unknown" whenever
+    # DEPLOY_SHA is unset / the deployment identity cannot be resolved. That
+    # value is truthy but names no revision, so accepting it would attribute
+    # strategic cycles to a fabricated serving sha that downstream identity
+    # checks (which only test "non-blank str") would happily accept. Only a
+    # real git SHA may open a serving boundary; anything else falls through to
+    # the DEPLOY_SHA reader, which validates the same way and returns None when
+    # there is no identity to report.
+    if deployment is not None and _looks_like_git_sha(deployment.current_sha):
+        current_sha = deployment.current_sha
+        current_deployed_at = deployment.deployed_at
+    else:
+        current_sha = get_serving_sha()
+        current_deployed_at = None
 
     return _serving_sha_timeline_from_snapshots(
-        snapshots, get_serving_sha(), _utcnow()
+        snapshots, current_sha, _utcnow(), current_deployed_at
     )
 
 
@@ -3043,6 +3121,7 @@ async def compute_current_axes(
     # derived from the 5000-row `tasks` cohort above, which is created_at-ordered
     # and capped, so it would answer a different (and biased) question.
     from app.research_completion import (  # noqa: PLC0415 — avoids an import cycle
+        TASK_ORIGINATION_COHORT_START,
         merged_work_origination_split,
     )
 
@@ -3055,9 +3134,11 @@ async def compute_current_axes(
             session,
             project_id,
             since=origination_window_start,
+            created_since=TASK_ORIGINATION_COHORT_START,
         ),
         window_start=origination_window_start,
         window_end=origination_window_end,
+        cohort_created_at_floor=TASK_ORIGINATION_COHORT_START,
     )
 
     # Provider routing A/B verdict (direction d-cf39cb40): derive from the

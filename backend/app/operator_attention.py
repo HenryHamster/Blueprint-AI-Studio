@@ -55,6 +55,7 @@ from app.message_audience import (
 )
 from app.reaper_orphan_classify import _classify_orphan
 from app.release_artifacts import version_serving_summary
+from app.release_qualifier_audit import snapshot_stranded_approved_prs
 from app.release_version import current_open_version
 from app.routers.admin_runners import _runner_health
 from app.runner_project_binding import runner_allowed_for_project
@@ -66,6 +67,7 @@ from app.strategic_runtime_work import (
     task_awaiting_strategic_local_runner_since,
 )
 from app.task_movement import build_task_movement_explanation
+from app.terminal_rollup_pr_sweep import TERMINAL_ROLLUP_PR_ATTENTION_KEY
 from app.time_utils import _utcnow
 from app.workbench_contracts import compact_text, normalize_target
 
@@ -109,6 +111,7 @@ _DEAD_RUNNER_PREVIEW_LIMIT = 4
 _STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT = 4
 _STALE_COMPLETION_DEBT_AFTER = timedelta(hours=24)
 _STALE_COMPLETION_DEBT_PREVIEW_LIMIT = 4
+_STRANDED_APPROVED_PR_PREVIEW_LIMIT = 4
 
 # How long before an operator attestation expires the system starts warning
 # the operator.  Attestations carry ATTESTATION_WINDOW_DAYS (7 days) from
@@ -177,6 +180,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "approval_required"): 10,
     ("needs_operator", "hand_merge_required"): 15,
     ("needs_operator", "alert"): 20,
+    ("needs_operator", "terminal_rollup_pr_attention"): 25,
     ("needs_operator", "local_runner_hold"): 30,
     ("needs_operator", "promotion_awaiting_activation"): 35,
     ("needs_operator", "stale_runner_pin"): 40,
@@ -429,6 +433,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
+    "terminal_rollup_pr_attention": {
+        "mode": "task_lifecycle",
+        "clears_when": "rollup_pr_reconciled_or_task_requeued_or_archived",
+        "operator_action": "inspect_rollup_pr_and_requeue_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
     "experiment_outcome": {
         "mode": "task_lifecycle",
         "clears_when": "task_archived_or_outside_6h_window",
@@ -582,6 +593,7 @@ def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str,
     label = {
         "approval_required": "Approval required",
         "hand_merge_required": "Hand-merge required",
+        "terminal_rollup_pr_attention": "Terminal rollup PR needs review",
         "failed_task": "Task failed",
         "blocked_task": "Task blocked",
         "parked_task": "Task parked",
@@ -1864,9 +1876,11 @@ async def _load_stale_unworked_completion_debts(
         detail_dict = entry.detail if isinstance(entry.detail, dict) else {}
         linked = detail_dict.get("linked_tasks")
         if isinstance(linked, list):
-            for x in linked:
-                if isinstance(x, dict) and x.get("task_id"):
-                    all_task_ids.append(str(x["task_id"]))
+            all_task_ids.extend(
+                str(x["task_id"])
+                for x in linked
+                if isinstance(x, dict) and x.get("task_id")
+            )
 
     status_map = await _resolve_linked_task_statuses(session, all_task_ids)
 
@@ -2104,6 +2118,9 @@ async def get_operator_message_counts(
         ).scalar()
         or 0
     )
+    # Deliberately NOT including the stranded-approved-PR snapshot here: this
+    # is the high-frequency badge poll and must stay integer-only.  The snapshot
+    # is a JSONB scan and is served by build_operator_attention instead.
     return {
         "blocker": counts.get(MessageType.BLOCKER, 0),
         "question": counts.get(MessageType.QUESTION, 0),
@@ -2138,6 +2155,7 @@ async def build_operator_attention(
             )
         )
     ).scalar_one_or_none()
+    stranded_snapshot = await snapshot_stranded_approved_prs(session, project.id)
 
     _base_filters = [
         ProjectMessage.project_id == project.id,
@@ -2355,9 +2373,29 @@ async def build_operator_attention(
         session,
         project.id,
     )
+    terminal_rollup_attention_filters = (
+        Task.project_id == project.id,
+        Task.archived.is_(False),
+        Task.status == TaskStatus.FAILED,
+        Task.context[TERMINAL_ROLLUP_PR_ATTENTION_KEY].as_string().is_not(None),
+        operator_visible_audience_filter(Task.context),
+    )
+    terminal_rollup_attention_count = int(
+        (
+            await session.execute(
+                select(func.count()).select_from(Task).where(
+                    *terminal_rollup_attention_filters
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
     # Keep preserved hand-merge PRs visible as their own operator item rather
     # than letting the generic FAILED-task watch preview consume the signal.
-    generic_failed_count = max(failed_count - handmerge_preserved_count, 0)
+    generic_failed_count = max(
+        failed_count - handmerge_preserved_count - terminal_rollup_attention_count,
+        0,
+    )
 
     local_runner_hold_filters = local_runner_hold_task_filters(project.id)
     strategic_local_runner_hold_filters = strategic_local_runner_hold_task_filters(
@@ -2529,10 +2567,24 @@ async def build_operator_attention(
                     Task.archived.is_(False),
                     Task.status == TaskStatus.FAILED,
                     Task.context["pr_preserved_for_handmerge"].as_boolean().is_not(True),
+                    Task.context[TERMINAL_ROLLUP_PR_ATTENTION_KEY].as_string().is_(None),
                     operator_visible_audience_filter(Task.context),
                 )
                 .order_by(Task.updated_at.desc())
                 .limit(3)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    terminal_rollup_attention_tasks = list(
+        (
+            await session.execute(
+                select(Task)
+                .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
+                .where(*terminal_rollup_attention_filters)
+                .order_by(Task.updated_at.desc())
+                .limit(4)
             )
         )
         .scalars()
@@ -2742,7 +2794,11 @@ async def build_operator_attention(
                         project.id,
                     )
     except Exception:
-        pass
+        logger.exception(
+            "operator_attention: failed to load promoted activation attention "
+            "for project %s",
+            project.id,
+        )
 
     # Latest promoted version awaiting serving activation: while the most recent
     # promotion is still ``unconfirmed``, the operator's single activation
@@ -2886,6 +2942,14 @@ async def build_operator_attention(
                 severity="needs_operator",
             )
         )
+    for task in terminal_rollup_attention_tasks:
+        add_candidate(
+            _task_attention_item(
+                task,
+                reason="terminal_rollup_pr_attention",
+                severity="needs_operator",
+            )
+        )
     for task in failed_tasks:
         add_candidate(_task_attention_item(task, reason="failed_task", severity="watch"))
     for task in unmet_experiment_preview:
@@ -2929,6 +2993,7 @@ async def build_operator_attention(
         + corroboration_failed_count
         + (1 if stale_debt_count > 0 else 0)
         + (1 if promoted_awaiting_activation_item is not None else 0)
+        + terminal_rollup_attention_count
     )
     total_watch = (
         generic_failed_count
@@ -3009,11 +3074,17 @@ async def build_operator_attention(
             "error_alerts": error_alert_count,
             "warning_alerts": warning_alert_count,
             "failed_tasks": generic_failed_count,
+            "terminal_rollup_pr_attention": terminal_rollup_attention_count,
             "blocked_tasks": blocked_count,
             "parked_tasks": parked_count,
             "handmerge_preserved_tasks": handmerge_preserved_count,
             "experiment_outcomes": unmet_experiment_count,
             "stale_completion_debts": stale_debt_count,
+            "stranded_approved_prs": stranded_snapshot.get("count"),
+            "stranded_approved_prs_status": stranded_snapshot.get("status"),
+            "stranded_approved_prs_preview": list(
+                stranded_snapshot.get("pr_numbers") or []
+            )[:_STRANDED_APPROVED_PR_PREVIEW_LIMIT],
         },
         "items": items,
     }

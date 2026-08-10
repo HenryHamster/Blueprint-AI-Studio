@@ -1367,12 +1367,6 @@
           "commit_date": "2026-07-06T03:30:49Z",
           "old_cap": 6200,
           "new_cap": 7200
-        },
-        {
-          "commit_sha": "52d9f90d5719b12583f5da6753a9f9bb7efd319f",
-          "commit_date": "2026-08-06T07:47:06Z",
-          "old_cap": 7200,
-          "new_cap": 8350
         }
       ],
       "rollup_management.py": [
@@ -1636,6 +1630,14 @@
           "commit_sha": "a9e0d7e833945b020c36dba2d6c3c5b782b75665",
           "commit_date": "2026-06-30T08:42:47Z",
           "old_cap": 650,
+          "new_cap": 900
+        }
+      ],
+      "admin_task_approvals.py": [
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-09T00:00:00Z",
+          "old_cap": 850,
           "new_cap": 900
         }
       ],
@@ -1981,6 +1983,12 @@
           "commit_date": "2026-06-23T20:38:38Z",
           "old_cap": 2000,
           "new_cap": 2350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-10T01:42:55.221349+00:00",
+          "old_cap": 2350,
+          "new_cap": 2750
         }
       ],
       "sr_analytics_catch_rate.py": [
@@ -2407,6 +2415,12 @@
           "commit_date": "2026-07-12T07:19:38Z",
           "old_cap": 2450,
           "new_cap": 3050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-10T01:42:55.221349+00:00",
+          "old_cap": 3050,
+          "new_cap": 3600
         }
       ],
       "runtime_config_state.py": [
@@ -4081,6 +4095,12 @@
           "commit_date": "2026-07-23T01:13:06Z",
           "old_cap": 11750,
           "new_cap": 13650
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-09T23:03:30Z",
+          "old_cap": 13650,
+          "new_cap": 15800
         }
       ],
       "test_ci_completion.py": [

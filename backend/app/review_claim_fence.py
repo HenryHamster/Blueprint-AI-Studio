@@ -90,16 +90,37 @@ def _target_matches_live(
     pr_number: int,
     live_target: dict[str, str | int],
 ) -> bool:
+    """Validate the immutable PR/head identity of an assigned target.
+
+    The base branch tip is ambient while review or fix work is being claimed:
+    unrelated merges may move it without changing the code under review.  It
+    is refreshed by the caller before the task is persisted and remains part
+    of the target for the final merge-safety check.
+
+    ``project_id`` is deliberately NOT compared.  This predicate is applied to
+    sibling candidates drawn from ``chain_tasks``, which spans every project
+    ``repository_project_ids`` returns for the same owner/repo — a duplicate
+    registered under a second project carries its own ``project_id``.  Testing
+    it against the fenced task's ``live_target`` would drop those siblings from
+    the contender sets, letting each duplicate elect itself canonical and run a
+    second concurrent review/fix on the same PR.  ``pr_number`` + ``head_sha``,
+    within a scope already restricted to one repository, pin the PR identity.
+    """
     if not isinstance(assigned, dict):
         return False
     try:
         assigned_pr = int(assigned.get("pr_number") or 0)
     except (TypeError, ValueError):
         return False
+    assigned_head = str(assigned.get("head_sha") or "")
+    # Base SHA is deliberately not part of admission identity: it is the
+    # ambient integration-branch tip and may advance under an unchanged PR.
+    # The final merge-authority boundary is responsible for the strict
+    # base+head comparison immediately before submission.
     return bool(
         assigned_pr == pr_number
-        and str(assigned.get("base_sha") or "") == live_target["base_sha"]
-        and str(assigned.get("head_sha") or "") == live_target["head_sha"]
+        and assigned_head
+        and assigned_head == live_target["head_sha"]
     )
 
 

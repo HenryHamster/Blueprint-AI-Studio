@@ -58,12 +58,14 @@ from app.compute_jobs import append_progress_sample, normalize_terminal_command_
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.runner_config import config_generation, live_safe_config
 from app.runner_pull_skip import (
+    SKIP_CODE_CAPABILITY_MISMATCH,
     SKIP_CODE_CREDENTIAL_ERROR,
     SKIP_CODE_NO_ACCOUNT,
     cached_skip,
     clear_skip_marker,
     has_skip_marker,
     maybe_escalate_pull_skip,
+    release_capability_mismatched_task,
     skip_marker_is_fresh,
     skip_seen_at,
     stamp_skip_reason,
@@ -1294,9 +1296,26 @@ async def next_task(
     credentials: dict | None = None
     skipped: list[dict] = []
     to_escalate: list[tuple[Task, str, str]] = []
+    # Deterministic capability mismatches (browser-required task pinned to a runner
+    # with no usable Chromium). Collected in the cheap pre-pass and released AFTER
+    # the credential loop, alongside to_escalate — releasing takes a row lock, and
+    # taking one mid-loop would hold it across the pool-locking credential
+    # resolutions this endpoint is written to keep lock-free.
+    to_release_capability: list[tuple[Task, str]] = []
     lost_races = 0
     attempts_left = _next_task_resolve_attempts()
     now = _utcnow()
+
+    # The SAME browser contract the dispatch selector consumes, so the pull-time
+    # guard and _select_eligible_runner agree exactly on which tasks need Chromium.
+    # Lazy: orchestrator_runner_dispatch closes an import cycle with this module.
+    from app.orchestrator_runner_dispatch import (
+        _runner_lacks_required_browser as _task_runner_lacks_required_browser,
+    )
+
+    def _runner_lacks_required_browser(candidate: Task) -> bool:
+        """This runner cannot satisfy a browser-required candidate pinned to it."""
+        return _task_runner_lacks_required_browser(runner, candidate)
 
     def _note_skip(candidate: Task, code: str, reason: str) -> None:
         skipped.append(
@@ -1310,6 +1329,25 @@ async def next_task(
 
     resolvable: list[Task] = []
     for candidate in candidates:
+        # DETERMINISTIC capability mismatch, checked FIRST: a browser-required task
+        # was pinned to this runner but the runner reports no usable Chromium. The
+        # mismatch is a property of the hardware, not a transient pool cooldown, so
+        # re-polling can never route it HERE — release it to QUEUED now instead of
+        # stamping a skip and waiting out the ~20-min escalation clock. Normal
+        # dispatch already filters browser work to Chromium-capable runners, so the
+        # released task re-routes to one (or holds QUEUED until one has a free
+        # slot). This backstops every pin path that bypasses the selector's browser
+        # gate — direct pins, or a runner that lost the capability after being
+        # pinned. Ahead of the freshness short-circuit so a stale marker from an
+        # earlier episode can never mask the mismatch.
+        if _runner_lacks_required_browser(candidate):
+            reason = (
+                "runner reports no usable Chromium (playwright_chromium_usable) "
+                "but the task requires browser-based acceptance evidence"
+            )
+            _note_skip(candidate, SKIP_CODE_CAPABILITY_MISMATCH, reason)
+            to_release_capability.append((candidate, reason))
+            continue
         # Short-circuit: this candidate was proved unroutable seconds ago. Reuse
         # the recorded reason instead of re-acquiring the global pool lock to
         # re-derive it. This is what stops a poll from costing one pool-lock
@@ -1417,6 +1455,17 @@ async def next_task(
     for skipped_task, skip_code, skip_reason in to_escalate:
         await maybe_escalate_pull_skip(
             session, skipped_task, skip_code, skip_reason, runner_id=runner_id
+        )
+
+    # ── Release capability mismatches, now that no credential resolution remains ─
+    # Deferred for the SAME reason as the escalation above: the release re-locks
+    # the row, and holding that lock across the pool-locking credential resolutions
+    # is the exact shape this endpoint exists to avoid. A mismatch is deterministic,
+    # so this is an immediate unpin (no skip-count clock) — the pin is gone by the
+    # end of this poll and normal dispatch re-routes the task to a capable runner.
+    for released_task, release_reason in to_release_capability:
+        await release_capability_mismatched_task(
+            session, released_task, release_reason
         )
 
     if task is None:

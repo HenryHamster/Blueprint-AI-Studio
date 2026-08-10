@@ -242,9 +242,27 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
                 sentinel in blocker_text
                 for sentinel in _DETERMINISTIC_CAPABILITY_BLOCKERS
             ):
-                # The unchanged runner image cannot satisfy this capability.
-                # Re-running the full authoring/test workload is deterministic
-                # waste, so hold until infrastructure changes.
+                # Viewport infrastructure is deterministic for one runner image,
+                # but not for the fleet: a newly capable live runner can satisfy
+                # the task without an operator requeue. Recheck only when the
+                # task's declared/observed paths actually enter the admin-ui gate;
+                # unrelated deterministic blockers retain their permanent hold.
+                from app.orchestrator_runner_dispatch import (
+                    _load_active_runners_cache,
+                    _task_requires_browser,
+                )
+
+                if _task_requires_browser(task):
+                    active_runners = await _load_active_runners_cache(session)
+                    from app.runner_eligibility import _runner_chromium_usable
+
+                    if any(
+                        _runner_chromium_usable(runner)
+                        for runner in active_runners.get(task.project_id, [])
+                    ):
+                        return "retry"
+                # No capable runner is live yet. Re-running would deterministically
+                # hit the same infrastructure sentinel, so remain parked.
                 return "waiting"
             return "retry"
         return "waiting"

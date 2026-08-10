@@ -10835,6 +10835,10 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         # HEAD) — the diff is meaningless if the SHAs are stale.
         "release_qualifier.py:check_hotfix_scope_preview",
 
+        # Approved-PR stranding compares the reviewed commit against the live
+        # integration tip; a cached tip could misclassify a just-landed PR.
+        "approved_pr_stranding.py:_inspect_approved_pr_with_github",
+
         "release_reconciliation.py:_reconcile_if_promotion_failed_landed",
         "release_reconciliation.py:_reconcile_if_not_promoted_but_pr_merged",
         "release_reconciliation.py:_reconcile_if_managed_check_wait",
@@ -10846,6 +10850,13 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         # then writes it under an expected-head lease. Cached tips would defeat
         # the compare-and-swap and can recreate the empty-commit loop.
         "rollup_size_preflight.py:preflight_rollup_size_caps",
+        # Approved-PR stranding detection fetches the integration branch's exact
+        # live HEAD to decide whether an approved PR's commit actually landed
+        # (is an ancestor). The checked head is reported verbatim in the evidence
+        # and operator alert, and a <=60s-stale cached tip could flip the
+        # ancestor test either way — producing a false stranding verdict or
+        # missing a real one. This read is SHA-critical.
+        "approved_pr_stranding.py:_inspect_approved_pr_with_github",
     }
 )
 

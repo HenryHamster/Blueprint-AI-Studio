@@ -37,6 +37,8 @@ from app.models import (
     StrategicCycle,
     Task,
     TaskStatus,
+    TASK_ORIGINATION_RESEARCH,
+    TASK_ORIGINATION_STRATEGIST,
     PoolVm,
     PoolVmState,
     ArtifactType,
@@ -168,6 +170,7 @@ async def _make_task(
     depends_on: list | None = None,
     latest_status_message: str | None = None,
     vm_instance_id: str | None = None,
+    origination: str | None = None,
 ) -> Task:
     # Audit W1: extract promoted columns from context for legacy fixtures.
     ctx = dict(context or {})
@@ -186,6 +189,7 @@ async def _make_task(
         depends_on=depends_on or [],
         latest_status_message=latest_status_message,
         vm_instance_id=vm_instance_id,
+        origination=origination or "SYSTEM",
         **extra,
     )
     session.add(task)
@@ -1888,6 +1892,43 @@ async def test_requeue_cancels_failed_children_and_creates_clones(tl_db, mocker)
     assert clone.context["_max_attempts"] == 4
     assert clone.context["_previous_error"] == "Build failed: tests failing"
     assert clone.context.get("_previous_failure_class") is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origination",
+    [TASK_ORIGINATION_RESEARCH, TASK_ORIGINATION_STRATEGIST],
+)
+async def test_requeue_clone_inherits_origination(tl_db, mocker, origination):
+    """Requeue clones retain the source task's durable origination class."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        origination=origination,
+        latest_status_message="Build failed: tests failing",
+    )
+
+    assert await _requeue_parent_task(parent, session) == 1
+
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert clone.origination == origination
 
 
 @pytest.mark.asyncio
@@ -10516,11 +10557,54 @@ async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker
     assert spawned_task_type == "review", (
         f"Stale-head discard must respawn a review, got {spawned_task_type!r}"
     )
+    assert calls[0][1]["delta_base_sha"] == "oldsha0000000"
 
     # Context flags.
     ctx = review_task.context or {}
     assert ctx.get("_review_stale_head") is True, "_review_stale_head must be set"
     assert not any(call[0][1] == "fix" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_base_only_request_changes_keeps_review_admitted(tl_db, mocker):
+    """Base-only drift keeps the head-bound REQUEST_CHANGES result usable."""
+    calls, review_task = await _run_stale_head_branch(
+        tl_db,
+        mocker,
+        reviewed_head_sha="samehead00000",
+        live_head_sha="samehead00000",
+        reviewed_base_sha="oldbase000000",
+        live_base_sha="newbase111111",
+    )
+
+    assert not any(c[0][1] == "review" for c in calls)
+    fix_calls = [c for c in calls if c[0][1] == "fix"]
+    assert len(fix_calls) == 1
+    assert (review_task.context or {}).get("_review_stale_head") is not True
+
+
+@pytest.mark.asyncio
+async def test_base_and_head_drift_request_changes_respawns_full_review(
+    tl_db, mocker
+):
+    """When the base moved too, no head-relative delta can cover the change.
+
+    The prior review proved ``old base..old head``. A delta from the old head
+    would show the head motion but never the effect of the new base, so the
+    respawn must fall back to a full review.
+    """
+    calls, _ = await _run_stale_head_branch(
+        tl_db,
+        mocker,
+        reviewed_head_sha="oldhead000000",
+        live_head_sha="newhead111111",
+        reviewed_base_sha="oldbase000000",
+        live_base_sha="newbase111111",
+    )
+
+    review_calls = [c for c in calls if c[0][1] == "review"]
+    assert len(review_calls) == 1
+    assert review_calls[0][1]["delta_base_sha"] == ""
 
 
 @pytest.mark.asyncio
@@ -10798,6 +10882,7 @@ async def test_missing_review_provenance_respawns_exact_target_review(tl_db, moc
         "base_sha": "livebasesha",
         "head_sha": "anylivesha",
     }
+    assert review_calls[0][1]["delta_base_sha"] == ""
     assert (review_task.context or {}).get("_review_stale_head") is True
 
 

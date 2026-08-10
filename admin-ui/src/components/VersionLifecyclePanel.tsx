@@ -485,7 +485,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
     if (readOnly || !canManagePlatform || !projectId) return;
     setLocalDialog({
       title: `Approve activation of v${version.version_number}?`,
-      message: 'This approves the newest CI-built main release bound to this promotion. The host-side deploy agent will perform activation, and the serving receipt will confirm when it is live.',
+      message: 'This records approval for the newest CI-built main release bound to this promotion; approval itself does not deploy immediately. The installed control-plane deploy agent polls for this approval, validates the bound manifest, invokes the root release service, and posts a serving receipt after activation. If the agent is not installed and running, use blueprint deploy manually for the bound release.',
       confirmLabel: 'Approve activation',
       onConfirm: async () => {
         setLocalDialog(null);

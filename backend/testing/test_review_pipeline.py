@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 from sqlalchemy import select
 
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
+from app.review_request_changes import run_request_changes
 from app.review_pipeline import (
     MAX_REVIEW_FIX_ITERATIONS,
     MAX_REVIEW_HISTORY_FEEDBACK_CHARS,
@@ -147,6 +148,121 @@ async def test_fix_origins_inherit_pre_fix_head_for_delta_rereview(
     assert created is True and fix_task is not None, origin
     fix_loop = (fix_task.context or {}).get("review_loop", {})
     assert fix_loop.get("reviewed_head_sha") == expected_head, origin
+
+
+@pytest.mark.asyncio
+async def test_stale_head_respawn_is_delta_scoped_over_prior_reviewed_head(
+    db_session, mocker
+):
+    """A real stale REQUEST_CHANGES verdict respawns only the new head delta."""
+    captured: list[dict] = []
+
+    async def _capture_spawn(*args, **kwargs):
+        captured.append(kwargs)
+        return None, False
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "backend/app/review_pipeline.py"}],
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": "live-head", "ref": "feat/review"},
+            "base": {"sha": "base-sha", "ref": "main"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success"},
+    )
+
+    project = await _make_db_project(db_session)
+    original = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"review_loop": {}},
+    )
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review", "pr_number": 706}],
+        context={
+            "review_loop": {
+                "pr_number": 706,
+                "branch": "feat/review",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+                "iteration": 1,
+                "review_target": _review_target(
+                    project.id, 706, "base-sha", "reviewed-head"
+                ),
+            }
+        },
+    )
+    await _persist(db_session, original, review_task)
+
+    action_taken, response = await run_request_changes(
+        review_task,
+        pr_number=706,
+        branch="feat/review",
+        base_branch="main",
+        original_task_id=str(original.id),
+        original_prompt="Review the change",
+        feedback="Found a real defect",
+        issues=[{"description": "The stale path loses the issue ledger", "severity": "major"}],
+        resolutions=[],
+        investigated_files=["backend/app/review_pipeline.py"],
+        verdict_unparseable=False,
+        reviewed_head_sha="reviewed-head",
+        reviewed_base_sha="base-sha",
+        _review_iteration=1,
+        _current_review_entry={
+            "iteration": 1,
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "Found a real defect",
+            "issues": [
+                {
+                    "description": "The stale path loses the issue ledger",
+                    "severity": "major",
+                }
+            ],
+            "resolutions": [],
+            "reviewed_head_sha": "reviewed-head",
+            "reviewed_base_sha": "base-sha",
+        },
+        review_loop=(review_task.context or {})["review_loop"],
+        _record_structured_review_result=lambda _target: None,
+        session=db_session,
+    )
+
+    assert action_taken is True
+    assert response == {"status": "accepted"}
+    assert len(captured) == 1
+    assert captured[0]["delta_base_sha"] == "reviewed-head"
+    assert captured[0]["review_target"] == _review_target(
+        project.id, 706, "base-sha", "live-head"
+    )
+
+    await db_session.refresh(original)
+    ledger = ((original.context or {}).get("review_loop") or {}).get("issue_ledger")
+    assert ledger and any(
+        row["description"] == "The stale path loses the issue ledger"
+        for row in ledger["open"]
+    )
 
 
 @pytest.mark.asyncio

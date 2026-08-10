@@ -3,8 +3,11 @@
 
 The command is intentionally root-only and hamsterwheel-specific. It pulls an
 Artifact Registry image by digest, verifies its OCI revision and bundled UI,
-then atomically updates only the API and worker role environment files. Any
-activation or health-check failure restores both prior files and services.
+then atomically updates only the API and worker role environment files. A
+schema-changing candidate uses a bounded stop -> migrate -> start transaction;
+once that downtime begins, failure is held for fix-forward rather than rolling
+an older image onto a potentially advanced schema. Other activation or
+health-check failures restore both prior files and services.
 """
 
 from __future__ import annotations
@@ -36,9 +39,73 @@ _IMAGE_PREFIX = (
 _IMAGE_REF_RE = re.compile(rf"^{re.escape(_IMAGE_PREFIX)}@sha256:[0-9a-f]{{64}}$")
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_SCHEMA_REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_EXPECTED_SCHEMA_REVISION_LINE_RE = re.compile(
+    r"^EXPECTED_SCHEMA_REVISION\s*=\s*(['\"])(?P<revision>[A-Za-z0-9_.-]+)\1$"
+)
+_SCHEMA_REACHABILITY_PROBE = """
+import ast
+import sys
+from pathlib import Path
+
+revisions = {}
+for path in Path('/app/alembic/versions').glob('*.py'):
+    try:
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        values = {}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in {'revision', 'down_revision'}:
+                    values[target.id] = ast.literal_eval(node.value)
+        revision = values.get('revision')
+        down_revision = values.get('down_revision')
+        if not isinstance(revision, str):
+            raise ValueError('missing revision')
+        if down_revision is None:
+            parents = ()
+        elif isinstance(down_revision, str):
+            parents = (down_revision,)
+        elif isinstance(down_revision, (tuple, list)) and all(isinstance(item, str) for item in down_revision):
+            parents = tuple(down_revision)
+        else:
+            raise ValueError('invalid down_revision')
+        if revision in revisions:
+            raise ValueError('duplicate revision')
+        revisions[revision] = parents
+    except Exception:
+        print('unreachable')
+        raise SystemExit(0)
+
+current, target = sys.argv[1:3]
+pending = [target]
+visited = set()
+reachable = False
+while pending:
+    revision = pending.pop()
+    if revision == current:
+        reachable = True
+        break
+    if revision in visited or revision not in revisions:
+        continue
+    visited.add(revision)
+    pending.extend(revisions[revision])
+print('reachable' if reachable else 'unreachable')
+""".strip()
 _SYSTEM_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _SERVICES = ("blueprint-api.service", "blueprint-worker.service")
 _ACTIVATION_ORDER = ("blueprint-worker.service", "blueprint-api.service")
+# App units may legitimately be crash-looping (activating/failed) or absent
+# (inactive) when a release runs — e.g. a migration-carrying deploy left the
+# prior image unable to satisfy the new schema-version gate.  Replacing that
+# broken image is exactly what a release does, so these states must not block
+# it; the image validation in _validate_managed_container stays the hard safety
+# gate against acting on an unexpected image.  Any other ActiveState is
+# unexpected and still refuses the release.
+_RECOVERABLE_APP_STATES = frozenset(
+    {"active", "activating", "deactivating", "inactive", "failed"}
+)
 _UNTOUCHED_UNITS = (
     "blueprint-database.service",
     "blueprint-database-backup.timer",
@@ -741,7 +808,13 @@ def _stop_unit_container(
         container_id = _validate_managed_container(
             container, existing, allowed_images
         )
-    _run(["/usr/bin/systemctl", "stop", "--no-block", unit])
+    # Block until systemd has fully stopped the unit before touching its
+    # container.  A non-blocking stop returns while Restart=always is still
+    # armed, so a crash-looping old image (common after a migration deploy)
+    # gets auto-restarted mid-swap and races the tool's own docker stop/remove
+    # ("removal of container ... already in progress").  A blocking stop
+    # cancels the restart cycle so the container is static when we proceed.
+    _run(["/usr/bin/systemctl", "stop", unit], timeout=120)
     if container_id is not None:
         stop = _run(
             [
@@ -814,6 +887,17 @@ def _restart_service(
 ) -> None:
     container = _CONTAINERS[unit]
     _stop_unit_container(unit, container, allowed_images)
+    _start_service(unit, image_id, allowed_images=allowed_images)
+
+
+def _start_service(
+    unit: str,
+    image_id: str,
+    *,
+    allowed_images: frozenset[str],
+) -> None:
+    """Start a previously stopped managed unit on the selected image."""
+    container = _CONTAINERS[unit]
     _run(["/usr/bin/systemctl", "reset-failed", unit], check=False)
     _run(["/usr/bin/systemctl", "start", unit], timeout=120)
     _wait_service_container(unit, container, image_id)
@@ -1065,6 +1149,165 @@ def _retain_prior_image(image_id: str) -> str:
     return tag
 
 
+def _image_schema_revision(image_id: str) -> str:
+    result = _run(
+        [
+            "/usr/bin/docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "/bin/sh",
+            image_id,
+            "-c",
+            "grep -E '^EXPECTED_SCHEMA_REVISION[[:space:]]*=' "
+            "/app/app/main.py",
+        ],
+        timeout=60,
+    )
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise RuntimeError(
+            f"prior image {image_id} does not expose one schema revision"
+        )
+    match = _EXPECTED_SCHEMA_REVISION_LINE_RE.fullmatch(lines[0])
+    if match is None:
+        raise RuntimeError(
+            f"prior image {image_id} exposes an invalid schema revision"
+        )
+    return match.group("revision")
+
+
+def _database_schema_revision() -> str:
+    result = _run(
+        [
+            "/usr/bin/docker",
+            "exec",
+            "--user=postgres",
+            _DATABASE_CONTAINER,
+            "psql",
+            "--username=blueprint",
+            "--dbname=blueprint",
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            "SELECT version_num FROM alembic_version ORDER BY version_num;",
+        ],
+        timeout=30,
+    )
+    revisions = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(revisions) != 1 or not _SCHEMA_REVISION_RE.fullmatch(revisions[0]):
+        raise RuntimeError("live database does not expose one schema head")
+    return revisions[0]
+
+
+def _run_local_migration(image_ref: str) -> None:
+    """Run the canonical local migration primitive for this immutable image."""
+    # The root-installed release bundle includes blueprint.py and blueprint_api.py.
+    # Calling cmd_migrate keeps this path on the same hardened container contract
+    # as `blueprint migrate --local`, rather than creating a second migration path.
+    import blueprint
+
+    result = blueprint.cmd_migrate(
+        argparse.Namespace(
+            local=True,
+            image=image_ref,
+            sha=None,
+            worker_env_file=None,
+            worker_secrets_file=None,
+            registry_credential_file=None,
+            network=None,
+        )
+    )
+    if result != 0:
+        raise RuntimeError(f"local migration exited {result}")
+
+
+def _schema_mismatch_refusal(
+    image_id: str,
+    image_label: str,
+    image_revision: str,
+    database_revision: str,
+    reason: str,
+) -> str:
+    return (
+        f"code-rollback refused: {image_label} {image_id} expects schema "
+        f"{image_revision} but DB is at {database_revision}; {reason}"
+    )
+
+
+def _code_rollback_refusal(prior_image_id: str) -> str | None:
+    try:
+        prior_revision = _image_schema_revision(prior_image_id)
+        database_revision = _database_schema_revision()
+    except Exception as exc:
+        return (
+            "code-rollback refused: could not verify schema compatibility for "
+            f"prior image {prior_image_id}: {exc}; fix forward"
+        )
+    if prior_revision == database_revision:
+        return None
+    return _schema_mismatch_refusal(
+        prior_image_id,
+        "prior image",
+        prior_revision,
+        database_revision,
+        "a forward migration cannot be undone by restoring the old image -- "
+        "fix forward",
+    )
+
+
+def _target_schema_refusal(
+    image_id: str, target_revision: str, database_revision: str
+) -> str | None:
+    """Refuse a target that is not an Alembic descendant of the live head."""
+    if target_revision == database_revision:
+        return None
+    try:
+        result = _run(
+            [
+                "/usr/bin/docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--workdir",
+                "/app",
+                "--entrypoint",
+                "/usr/local/bin/python",
+                image_id,
+                "-c",
+                _SCHEMA_REACHABILITY_PROBE,
+                database_revision,
+                target_revision,
+            ],
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:
+        detail = f"could not determine migration reachability: {exc}"
+    else:
+        detail = (
+            "target is not forward-reachable from the live database head"
+            if result.returncode != 0 or result.stdout.strip() != "reachable"
+            else ""
+        )
+    if not detail:
+        return None
+    compatibility_refusal = _schema_mismatch_refusal(
+        image_id,
+        "candidate image",
+        target_revision,
+        database_revision,
+        f"{detail}; fix forward",
+    )
+    return (
+        f"release refused before stopping app units: {compatibility_refusal}; "
+        "app units remain running"
+    )
+
+
 def _prepare_evidence_root(directory: Path) -> None:
     _trusted_root_directory(Path("/var/lib"))
     _trusted_root_directory(Path("/var/lib/blueprint"))
@@ -1148,8 +1391,11 @@ def release(image_ref: str, revision: str) -> Path:
     if prior_api != prior_worker or not _IMAGE_ID_RE.fullmatch(prior_api):
         raise RuntimeError("current API and worker image IDs are not a safe pair")
     for unit in _SERVICES:
-        if _service_marker(unit)[0] != "active":
-            raise RuntimeError(f"{unit} must be active before release")
+        state = _service_marker(unit)[0]
+        if state not in _RECOVERABLE_APP_STATES:
+            raise RuntimeError(
+                f"{unit} is in unexpected state {state!r}; refusing to release"
+            )
     untouched_before = {unit: _service_marker(unit) for unit in _UNTOUCHED_UNITS}
     for unit, marker in untouched_before.items():
         if marker[0] != "active":
@@ -1182,6 +1428,9 @@ def release(image_ref: str, revision: str) -> Path:
     image_id = _inspect_candidate(image_ref, revision, bundle_sha256)
     retained_tag = _retain_prior_image(prior_api)
     allowed_images = frozenset({prior_api, image_id})
+    target_schema_revision = _image_schema_revision(image_id)
+    database_schema_before = _database_schema_revision()
+    migration_required = target_schema_revision != database_schema_before
 
     def receipt(outcome: str, error: str, markers_match: bool) -> dict[str, object]:
         return {
@@ -1192,6 +1441,9 @@ def release(image_ref: str, revision: str) -> Path:
             "image_id": image_id,
             "prior_image_id": prior_api,
             "retained_prior_tag": retained_tag,
+            "target_schema_revision": target_schema_revision,
+            "database_schema_before": database_schema_before,
+            "migration_required": migration_required,
             "outcome": outcome,
             "error_sha256": (
                 hashlib.sha256(error.encode()).hexdigest() if error else None
@@ -1200,8 +1452,40 @@ def release(image_ref: str, revision: str) -> Path:
             "untouched_unit_markers_match": markers_match,
         }
 
+    target_refusal = _target_schema_refusal(
+        image_id, target_schema_revision, database_schema_before
+    )
+    if target_refusal is not None:
+        try:
+            evidence = _write_evidence(
+                _EVIDENCE_ROOT,
+                receipt("rollback_refused", target_refusal, False),
+            )
+        except Exception as evidence_exc:
+            raise RuntimeError(
+                f"{target_refusal}; EVIDENCE_WRITE_FAILED: {evidence_exc}"
+            ) from evidence_exc
+        raise RuntimeError(f"{target_refusal}; evidence={evidence}")
+
     touched_units: list[str] = []
+    migration_choreography_started = False
     try:
+        if migration_required:
+            # A schema-changing deploy cannot hot-swap: the old image rejects
+            # the advanced DB and the candidate rejects the old DB.  Stop both
+            # Restart=always units first, wait for each managed container to be
+            # gone, then use the existing hardened migration transaction.
+            migration_choreography_started = True
+            for unit in _ACTIVATION_ORDER:
+                _stop_unit_container(unit, _CONTAINERS[unit], allowed_images)
+            _run_local_migration(image_ref)
+            database_schema_after = _database_schema_revision()
+            if database_schema_after != target_schema_revision:
+                raise RuntimeError(
+                    "local migration completed at schema "
+                    f"{database_schema_after}, but target image expects "
+                    f"{target_schema_revision}"
+                )
         _atomic_write(
             api_path,
             _replace_role_values(
@@ -1224,7 +1508,10 @@ def release(image_ref: str, revision: str) -> Path:
         )
         for unit in _ACTIVATION_ORDER:
             touched_units.append(unit)
-            _restart_service(unit, image_id, allowed_images=allowed_images)
+            if migration_required:
+                _start_service(unit, image_id, allowed_images=allowed_images)
+            else:
+                _restart_service(unit, image_id, allowed_images=allowed_images)
             if unit == "blueprint-worker.service":
                 _wait_verified(
                     _verify_worker_ready,
@@ -1244,6 +1531,37 @@ def release(image_ref: str, revision: str) -> Path:
         )
     except Exception as exc:
         error = str(exc)
+        if migration_choreography_started:
+            hold_message = (
+                "migration deploy failed after bounded downtime began "
+                f"({error}); app units are intentionally left stopped; "
+                "do not roll back code across the migration — fix forward"
+            )
+            try:
+                evidence = _write_evidence(
+                    _EVIDENCE_ROOT,
+                    receipt("migration_failed", hold_message, False),
+                )
+            except (OSError, PermissionError, RuntimeError, ValueError) as evidence_exc:
+                raise RuntimeError(
+                    f"{hold_message}; EVIDENCE_WRITE_FAILED: {evidence_exc}"
+                ) from exc
+            raise RuntimeError(f"{hold_message}; evidence={evidence}") from exc
+        rollback_refusal = _code_rollback_refusal(prior_api)
+        if rollback_refusal is not None:
+            try:
+                evidence = _write_evidence(
+                    _EVIDENCE_ROOT,
+                    receipt("rollback_refused", rollback_refusal, False),
+                )
+            except Exception as evidence_exc:
+                raise RuntimeError(
+                    f"release failed ({error}); {rollback_refusal}; "
+                    f"EVIDENCE_WRITE_FAILED: {evidence_exc}"
+                ) from exc
+            raise RuntimeError(
+                f"release failed ({error}); {rollback_refusal}; evidence={evidence}"
+            ) from exc
         rollback_errors: list[str] = []
         for path, payload in snapshots.items():
             try:

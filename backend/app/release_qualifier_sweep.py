@@ -793,17 +793,74 @@ async def _check_full_suite_drift_sentinel(
                     return True
 
             if gate_state == "unavailable":
-                # The gate could not resolve creds / HEAD / API.  A transient
-                # failure is self-healing on the next sweep; surface it in logs
-                # rather than staying fully silent (the pre-fix behaviour).
-                logger.warning(
-                    "[DRIFT_SENTINEL] full-suite CI gate unavailable for project %s "
-                    "HEAD %s — %s",
-                    version.project_id,
-                    head_sha[:8] if head_sha else "?",
-                    gate.get("reason") or "unknown reason",
+                # The gate could not resolve creds / HEAD / API.  This is
+                # self-healing on the next sweep, but must not remain invisible
+                # while full-suite CI drift accumulates.  Keep one active alert
+                # per project so every new automain merge does not create a new
+                # operator incident for the same unresolved integration signal.
+                reason = str(gate.get("reason") or "unknown reason")
+                dedupe_key = f"drift_sentinel:unavailable:{version.project_id}"
+                head_label = head_sha[:8] if head_sha else "?"
+                head_detail = head_sha[:12] if head_sha else "?"
+                title = (
+                    f"Full-suite CI unavailable on integration branch "
+                    f"({head_label})"
                 )
-                return False
+                message = (
+                    f"Standing drift sentinel could not evaluate ci.yml "
+                    f"for automain HEAD {head_detail}: {reason}. "
+                    "Full-suite CI drift is currently unverified; "
+                    "inspect GitHub connectivity and retry."
+                )
+                existing = (
+                    (
+                        await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == version.project_id,
+                                Alert.dedupe_key == dedupe_key,
+                                Alert.dismissed_at.is_(None),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if existing is None:
+                    session.add(
+                        Alert(
+                            project_id=version.project_id,
+                            severity=AlertSeverity.WARNING,
+                            title=title,
+                            message=message,
+                            dedupe_key=dedupe_key,
+                            event_type="release.ci_unresolved",
+                        )
+                    )
+                    await session.commit()
+                    logger.warning(
+                        "[DRIFT_SENTINEL] full-suite CI gate unavailable for project %s "
+                        "HEAD %s — alert raised: %s",
+                        version.project_id,
+                        head_sha[:8] if head_sha else "?",
+                        reason,
+                    )
+                else:
+                    existing.severity = AlertSeverity.WARNING
+                    existing.title = title
+                    existing.message = message
+                    existing.event_type = "release.ci_unresolved"
+                    existing.occurrence_count = int(existing.occurrence_count or 1) + 1
+                    existing.last_seen_at = _utcnow()
+                    session.add(existing)
+                    await session.commit()
+                    logger.warning(
+                        "[DRIFT_SENTINEL] full-suite CI gate unavailable for project %s "
+                        "HEAD %s — alert refreshed: %s",
+                        version.project_id,
+                        head_label,
+                        reason,
+                    )
+                return True
 
             if gate_state != "red":
                 return False

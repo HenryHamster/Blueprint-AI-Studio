@@ -14,7 +14,7 @@ import logging
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -30,6 +30,7 @@ from app.models import (
     Project,
     QualificationVerdict,
     ReleaseVersion,
+    TASK_ORIGINATION_QUALIFIER,
     Task,
     TaskHistory,
     TaskStatus,
@@ -75,6 +76,142 @@ _INFRA_ATTEMPT_HISTORY_LIMIT = 5
 # asyncio only holds weak references to scheduled tasks, so without this a
 # webhook coroutine could be garbage-collected mid-flight (RUF006).
 _INFRA_WEBHOOK_TASKS: set[asyncio.Task[Any]] = set()
+
+_STRANDED_APPROVED_PR_SCAN_LIMIT = 101
+_STRANDED_APPROVED_PR_PREVIEW_LIMIT = 20
+
+# Approvals on a cancelled task are deliberate abandonment, not stranding.
+_STRANDED_APPROVED_PR_EXCLUDED_STATUSES = (TaskStatus.CANCELLED,)
+
+
+def _unavailable_stranded_approved_pr_snapshot(
+    *, observed_at: str, reason: str
+) -> dict[str, Any]:
+    return {
+        "status": "unavailable", "count": None, "pr_numbers": [],
+        "details": [], "observed_at": observed_at, "reason": reason[:240],
+    }
+
+
+def _stranded_approved_pr_columns(session: AsyncSession) -> tuple[Any, Any]:
+    """Return the (approved-flag, review-target) SQL expressions for the scan.
+
+    Only the narrow ``review_loop.review_target`` sub-object is selected — a
+    Task's ``context`` JSONB is permitted up to 100KB, so hydrating whole rows
+    (or even the whole ``context`` column) is far too heavy for the badge-poll
+    and qualification-launch call sites.
+    """
+    if resolve_dialect_name(session) == "sqlite":
+        return (
+            func.json_extract(Task.context, "$.review_loop.review_approved"),
+            func.json_extract(Task.context, "$.review_loop.review_target"),
+        )
+    return (
+        Task.context["review_loop"]["review_approved"].as_boolean(),
+        Task.context["review_loop"]["review_target"],
+    )
+
+
+def _coerce_review_target(raw: Any) -> dict[str, Any] | None:
+    """Normalise the dialect-dependent JSON sub-value into a dict, or None."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+async def snapshot_stranded_approved_prs(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    observed_at: str | None = None,
+) -> dict[str, Any]:
+    """Snapshot approved review targets without a confirmed landing marker.
+
+    The landed filter lives in SQL (``~landed_signal_predicate``) so the bounded
+    scan sees only genuinely unlanded approvals — ``review_approved`` persists
+    forever after a merge, so filtering in Python after the cap would make every
+    mature project report ``unavailable``.
+
+    The query runs inside a SAVEPOINT.  ``run_qualification`` calls this while
+    holding the version row's ``with_for_update`` lock in an open transaction;
+    on PostgreSQL a failed statement poisons the whole transaction, so absorbing
+    the failure requires rolling back to a nested point rather than swallowing
+    the exception and leaving the caller's transaction aborted.
+    """
+    observed = observed_at or _utcnow().isoformat()
+    try:
+        approved, review_target = _stranded_approved_pr_columns(session)
+        # ``landed_signal_predicate`` evaluates to NULL (not FALSE) on a row
+        # missing the JSON keys entirely, and ``NOT NULL`` is NULL — which would
+        # silently drop exactly the unlanded rows this snapshot exists to find.
+        not_landed = func.coalesce(landed_signal_predicate(session), False).is_(
+            False
+        )
+        stmt = (
+            select(Task.id, review_target)
+            .where(
+                Task.project_id == project_id,
+                Task.archived.is_(False),
+                approved.is_(True),
+                Task.status.not_in(_STRANDED_APPROVED_PR_EXCLUDED_STATUSES),
+                not_landed,
+            )
+            .order_by(Task.updated_at.asc())
+            .limit(_STRANDED_APPROVED_PR_SCAN_LIMIT)
+        )
+        async with session.begin_nested():
+            rows = list((await session.execute(stmt)).all())
+    except Exception as exc:  # noqa: BLE001 - readout must not break qualification
+        logger.warning("[RELEASE_QUALIFIER] approved-PR snapshot unavailable for %s: %s", project_id, exc)
+        return _unavailable_stranded_approved_pr_snapshot(
+            observed_at=observed,
+            reason=f"approved PR query failed: {type(exc).__name__}",
+        )
+
+    if len(rows) >= _STRANDED_APPROVED_PR_SCAN_LIMIT:
+        return _unavailable_stranded_approved_pr_snapshot(
+            observed_at=observed,
+            reason="approved PR scan exceeded bounded qualification snapshot",
+        )
+
+    # Degrade per row: ``review_target`` is optional on an approved loop
+    # (task_lifecycle stamps it only when a live target exists), and the scan is
+    # oldest-first, so legacy rows are exactly the ones most likely to lack it.
+    # One unparseable row must not void the whole project readout.
+    by_pr_number: dict[int, dict[str, Any]] = {}
+    unparseable = 0
+    for task_id, raw_target in rows:
+        target = _coerce_review_target(raw_target)
+        pr_number = target.get("pr_number") if target else None
+        if (
+            isinstance(pr_number, bool)
+            or not isinstance(pr_number, int)
+            or pr_number <= 0
+        ):
+            unparseable += 1
+            continue
+        by_pr_number.setdefault(
+            pr_number,
+            {
+                "pr_number": pr_number,
+                "task_id": str(task_id),
+                "head_sha": target.get("head_sha"),
+                "base_sha": target.get("base_sha"),
+            },
+        )
+
+    details = [by_pr_number[number] for number in sorted(by_pr_number)]
+    return {
+        "status": "available",
+        "count": len(details),
+        "pr_numbers": [item["pr_number"] for item in details],
+        "details": details[:_STRANDED_APPROVED_PR_PREVIEW_LIMIT],
+        "unparseable_approvals": unparseable,
+        "observed_at": observed,
+    }
 
 _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
     {
@@ -407,6 +544,7 @@ async def _spawn_release_audit_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_QUALIFIER,
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
@@ -500,6 +638,7 @@ async def _spawn_release_audit_challenge_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_QUALIFIER,
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
@@ -710,6 +849,7 @@ async def _spawn_qualifier_walkthrough_task(
         status=TaskStatus.PROVISIONING,
         vm_provisioned_at=_utcnow(),
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_QUALIFIER,
         context={
             "release_version_id": str(version_id),
             "qualifier_walkthrough_e2e": True,
@@ -833,6 +973,7 @@ async def _spawn_release_merge_grade_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_QUALIFIER,
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
@@ -1114,6 +1255,7 @@ async def _spawn_direction_merge_grade_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_QUALIFIER,
         context={
             "direction_id": direction_id,
             "candidate_sha": candidate_sha,
@@ -1505,6 +1647,12 @@ async def _handle_infra_failure(
         "error": infra_error,
         "signature": signature,
         "candidate_sha": qual.get("candidate_sha"),
+        "stranded_approved_prs": qual.get("stranded_approved_prs"),
+        "sub_scores": (
+            {"stranded_approved_prs": qual["stranded_approved_prs"]}
+            if qual.get("stranded_approved_prs") is not None
+            else {}
+        ),
         "engine_sha": engine_sha,
         "failing_leg": _infer_infra_leg(infra_error),
         "child_failures": child_failures,
@@ -1554,6 +1702,7 @@ async def _handle_infra_failure(
         "retry_episode": qual.get("retry_episode", 0),
         "retry_episode_cap": qual.get("retry_episode_cap"),
         "candidate_sha": qual.get("candidate_sha"),
+        "stranded_approved_prs": qual.get("stranded_approved_prs"),
         "engine_sha": engine_sha,
         "ci_green": qual.get("ci_green"),
         "smoketest_enabled": qual.get("smoketest_enabled", False),
@@ -1802,6 +1951,10 @@ async def _handle_infra_failure(
     promotion_enabled = resolve_project_promotion_enabled(version.project_id)
     _verdict_sub_scores: dict[str, Any] = {"infra_failure": infra_evidence}
     _verdict_sub_scores.update(resolved_dimensions)
+    if qual.get("stranded_approved_prs") is not None:
+        _verdict_sub_scores["stranded_approved_prs"] = qual[
+            "stranded_approved_prs"
+        ]
     await _record_qualification_verdict(
         session,
         version,

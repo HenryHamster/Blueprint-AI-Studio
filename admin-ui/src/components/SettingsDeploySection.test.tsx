@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { DeploySection } from './SettingsDeploySection';
+import { PromotedAwaitingActivationCallout } from './VersionLifecyclePanelPrimitives';
 import { apiFetch } from '../api';
 
 vi.mock('../api', () => ({ apiFetch: vi.fn() }));
@@ -204,5 +205,29 @@ describe('MergeGradeGateSettings (via DeploySection)', () => {
       expect(patchCalls).toHaveLength(1);
     });
     expect(screen.queryByText('Must be a number between 0.0 and 1.0')).toBeNull();
+  });
+});
+
+describe('activation deployment status', () => {
+  it('explains that the control-plane deploy agent executes approval before a receipt can arrive', () => {
+    render(
+      <PromotedAwaitingActivationCallout
+        version={{
+          version_number: 4,
+          status: 'promoted',
+          opened_at: '2026-07-01T12:00:00Z',
+          promoted_at: '2026-07-01T12:00:00Z',
+          qualification_attempts: 1,
+          last_qualification: null,
+          serving: { status: 'unconfirmed' },
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId('promoted-awaiting-activation')).toHaveTextContent('control-plane deploy agent');
+    expect(screen.getByTestId('promoted-awaiting-activation')).toHaveTextContent(
+      'If the agent is not installed and running, use blueprint deploy manually',
+    );
+    expect(screen.getByTestId('promoted-awaiting-activation')).not.toHaveTextContent('host-side activation executor');
   });
 });

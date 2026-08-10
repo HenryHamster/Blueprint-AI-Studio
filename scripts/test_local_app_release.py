@@ -781,7 +781,13 @@ class LocalAppReleaseTests(unittest.TestCase):
             mocks = {
                 "atomic": stack.enter_context(patch.object(release, "_atomic_write")),
                 "run": stack.enter_context(
-                    patch.object(release, "_run", return_value=completed())
+                    patch.object(
+                        release,
+                        "_run",
+                        return_value=subprocess.CompletedProcess(
+                            [], 0, "reachable\n", ""
+                        ),
+                    )
                 ),
                 "container": stack.enter_context(
                     patch.object(release, "_verify_container")
@@ -855,6 +861,12 @@ class LocalAppReleaseTests(unittest.TestCase):
                 patch.object(
                     release, "_retain_prior_image", return_value="retained:old"
                 )
+            )
+            mocks["image_schema"] = stack.enter_context(
+                patch.object(release, "_image_schema_revision", return_value="0742")
+            )
+            mocks["database_schema"] = stack.enter_context(
+                patch.object(release, "_database_schema_revision", return_value="0742")
             )
             stack.enter_context(patch.object(release, "_verify_services_stable"))
             stack.enter_context(patch.object(release, "_verify_worker_ready"))
@@ -962,6 +974,65 @@ class LocalAppReleaseTests(unittest.TestCase):
                 ],
             )
 
+    def test_nonmigration_deploy_does_not_stop_units(self):
+        """The established hot-swap path remains untouched when schemas match."""
+        with (
+            self._release_patches() as mocks,
+            patch.object(release, "_stop_unit_container") as stop,
+            patch.object(release, "_run_local_migration") as migrate,
+        ):
+            release.release(IMAGE_REF, REVISION)
+        stop.assert_not_called()
+        migrate.assert_not_called()
+        self.assertEqual(mocks["restart"].call_count, 2)
+
+    def test_migration_deploy_holds_and_does_not_rollback_on_failure(self):
+        """Once migration downtime starts, failures require a fix-forward release."""
+        with self._release_patches() as mocks:
+            mocks["image_schema"].return_value = "0743"
+            mocks["database_schema"].return_value = "0742"
+            with (
+                patch.object(release, "_stop_unit_container") as stop,
+                patch.object(
+                    release,
+                    "_run_local_migration",
+                    side_effect=RuntimeError("upgrade failed"),
+                ) as migrate,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "app units are intentionally left stopped.*do not roll back code.*fix forward",
+                ),
+            ):
+                release.release(IMAGE_REF, REVISION)
+        migrate.assert_called_once_with(IMAGE_REF)
+        self.assertEqual(stop.call_count, 2)
+        mocks["atomic"].assert_not_called()
+        mocks["restart"].assert_not_called()
+        self.assertEqual(mocks["evidence"].call_args.args[1]["outcome"], "migration_failed")
+
+    def test_non_forward_schema_target_is_refused_before_stopping_units(self):
+        """A rollback target must be rejected while both app units remain up."""
+        with self._release_patches() as mocks:
+            mocks["image_schema"].return_value = "0741"
+            mocks["database_schema"].return_value = "0742"
+            mocks["run"].return_value = subprocess.CompletedProcess(
+                [], 0, "unreachable\n", ""
+            )
+            with (
+                patch.object(release, "_stop_unit_container") as stop,
+                patch.object(release, "_run_local_migration") as migrate,
+                self.assertRaises(RuntimeError) as caught,
+            ):
+                release.release(IMAGE_REF, REVISION)
+
+            stop.assert_not_called()
+            migrate.assert_not_called()
+            self.assertRegex(str(caught.exception), "not forward-reachable")
+            self.assertEqual(
+                mocks["evidence"].call_args.args[1]["outcome"],
+                "rollback_refused",
+            )
+
     def test_worker_activation_failure_rolls_back_only_touched_worker(self):
         def restart(unit: str, image: str, **_kwargs) -> None:
             if unit == "blueprint-worker.service" and image == NEW_IMAGE:
@@ -1009,6 +1080,128 @@ class LocalAppReleaseTests(unittest.TestCase):
                         NEW_IMAGE,
                         allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
                     ),
+                    call(
+                        "blueprint-worker.service",
+                        OLD_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                    call(
+                        "blueprint-api.service",
+                        OLD_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                ],
+            )
+
+    def test_rollback_refused_when_prior_image_schema_behind_db(self):
+        with self._release_patches(
+            health_error=RuntimeError("candidate health failed")
+        ) as mocks:
+            mocks["image_schema"].side_effect = ["0743", "0742"]
+            mocks["database_schema"].return_value = "0743"
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "code-rollback refused: prior image .* expects schema 0742 "
+                "but DB is at 0743.*fix forward",
+            ):
+                release.release(IMAGE_REF, REVISION)
+
+            self.assertEqual(mocks["atomic"].call_count, 2)
+            self.assertEqual(
+                mocks["restart"].call_args_list,
+                [
+                    call(
+                        "blueprint-worker.service",
+                        NEW_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                    call(
+                        "blueprint-api.service",
+                        NEW_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                ],
+            )
+            mocks["container"].assert_not_called()
+            self.assertEqual(
+                mocks["evidence"].call_args.args[1]["outcome"],
+                "rollback_refused",
+            )
+
+    def test_image_schema_revision_parses_one_expected_revision_and_fails_closed(self):
+        with patch.object(
+            release.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                ["docker", "run"],
+                0,
+                'EXPECTED_SCHEMA_REVISION = "0740"\n',
+                "",
+            ),
+        ) as run_mock:
+            self.assertEqual(release._image_schema_revision(OLD_IMAGE), "0740")
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 60)
+
+        for stdout in ("", 'EXPECTED_SCHEMA_REVISION = "0740"\n' * 2):
+            with self.subTest(stdout=stdout), patch.object(
+                release.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout, ""),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "one schema revision"):
+                    release._image_schema_revision(OLD_IMAGE)
+
+    def test_database_schema_revision_parses_one_head_and_fails_closed(self):
+        with patch.object(
+            release.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "0740\n", ""),
+        ) as run_mock:
+            self.assertEqual(release._database_schema_revision(), "0740")
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 30)
+
+        for stdout in ("", "0740\n0741\n"):
+            with self.subTest(stdout=stdout), patch.object(
+                release.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout, ""),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "one schema head"):
+                    release._database_schema_revision()
+
+    def test_target_schema_reachability_probe_fails_closed(self):
+        with patch.object(
+            release,
+            "_run",
+            side_effect=RuntimeError("probe unavailable"),
+        ):
+            refusal = release._target_schema_refusal(NEW_IMAGE, "0743", "0742")
+        self.assertRegex(refusal or "", "could not determine migration reachability")
+
+    def test_target_schema_reachability_accepts_explicit_descendant(self):
+        with patch.object(
+            release,
+            "_run",
+            return_value=subprocess.CompletedProcess([], 0, "reachable\n", ""),
+        ) as probe:
+            self.assertIsNone(
+                release._target_schema_refusal(NEW_IMAGE, "0743", "0742")
+            )
+        command = probe.call_args.args[0]
+        self.assertEqual(command[-2:], ["0742", "0743"])
+
+    def test_rollback_proceeds_when_prior_image_schema_matches_db(self):
+        with self._release_patches(
+            health_error=RuntimeError("candidate health failed")
+        ) as mocks:
+            mocks["image_schema"].return_value = "0743"
+            mocks["database_schema"].return_value = "0743"
+            with self.assertRaisesRegex(RuntimeError, "rolled back"):
+                release.release(IMAGE_REF, REVISION)
+
+            self.assertEqual(
+                mocks["restart"].call_args_list[-2:],
+                [
                     call(
                         "blueprint-worker.service",
                         OLD_IMAGE,

@@ -67,6 +67,18 @@ PROJECT_VERIFICATION_SANDBOX_PATH = (
 PROJECT_VERIFICATION_VENV = "/opt/blueprint-backend-venv"
 
 
+@dataclass(frozen=True)
+class VerificationToolchain:
+    """Private interpreter and pgserver paths exposed only to bwrap."""
+
+    python_path: str
+    postgres_bindir: str
+
+    @property
+    def root(self) -> str:
+        return os.path.dirname(os.path.dirname(self.python_path))
+
+
 # ── Env allowlists (never os.environ.copy) ───────────────────────────────────
 
 # Provider creds + LLM config an AGENT task legitimately needs. Mirrors the
@@ -194,6 +206,8 @@ _AGENT_IDENTITY_ENV_KEYS: frozenset[str] = frozenset(
         # source_env — deliberately NOT in AGENT_ENV_ALLOWLIST) so a docker
         # agent image's baked marker stays authoritative.
         "AGENT_SOURCE_SHA",
+        "BLUEPRINT_SANDBOX_PYTHON",
+        "BLUEPRINT_SANDBOX_PG_BINDIR",
     }
 )
 _AGENT_INJECTED_ENV_ALLOWLIST: frozenset[str] = frozenset(
@@ -1907,6 +1921,7 @@ def plan_agent_execution(
     task_type: str | None = None,
     agent_image: str | None = None,
     per_task_creds: dict[str, str] | None = None,
+    verification_toolchain: VerificationToolchain | None = None,
 ) -> ExecutionPlan:
     """Build the isolation plan for an agent task, or DECLINE (fail-closed).
 
@@ -2029,6 +2044,14 @@ def plan_agent_execution(
         PROJECT_VERIFICATION_VENV,
         *npm_tool_roots(tools),
     ]
+    tool_dirs = [os.path.join(PROJECT_VERIFICATION_VENV, "bin")]
+    verification_injected: dict[str, str] = {}
+    if verification_toolchain is not None:
+        ro_binds.append(verification_toolchain.root)
+        tool_dirs += [os.path.dirname(verification_toolchain.python_path), verification_toolchain.postgres_bindir]
+        verification_injected = {"BLUEPRINT_SANDBOX_PYTHON": verification_toolchain.python_path,
+                                 "BLUEPRINT_SANDBOX_PG_BINDIR": verification_toolchain.postgres_bindir}
+    tool_dirs += tool_dirs_for(tools)
 
     env = build_agent_env(
         source_env,
@@ -2038,8 +2061,9 @@ def plan_agent_execution(
             # mountpoint itself: rm -rf on the mountpoint returns EBUSY.
             "AGENT_WORKSPACE": SANDBOX_WORKSPACE + "/agent",
             "HOME": SANDBOX_HOME,
+            **verification_injected,
         },
-        [os.path.join(PROJECT_VERIFICATION_VENV, "bin"), *tool_dirs_for(tools)],
+        tool_dirs,
         per_task_creds=per_task_creds,
     )
 

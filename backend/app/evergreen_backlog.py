@@ -40,6 +40,7 @@ from sqlmodel import select
 from app.models import (
     EvergreenBacklogItem,
     EvergreenFillDecisionLog,
+    TASK_ORIGINATION_EVERGREEN,
     Task,
     TaskStatus,
     _utcnow,
@@ -808,6 +809,7 @@ async def spawn_evergreen_probe(
         priority=EVERGREEN_PROBE_PRIORITY,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_EVERGREEN,
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         idempotency_key=evergreen_fill_idempotency_key(project_id, item.id),
     )

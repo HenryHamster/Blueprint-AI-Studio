@@ -1034,8 +1034,8 @@ export function PromotedAwaitingActivationCallout({
       </div>
       <p className="text-ui-sm text-amber-300/80">
         {approved
-          ? <>Approved by {activationRequestedBy || 'an administrator'}; awaiting the activation receipt{deadlineText}.</>
-          : <>Approve activation to have the host-side deploy agent perform the bound release, or run <span className="font-mono">blueprint deploy</span> for an emergency override{deadlineText}.</>}
+          ? <>Approved by {activationRequestedBy || 'an administrator'}; the installed control-plane deploy agent will validate the bound manifest, invoke the root release service, and post a serving receipt after activation{deadlineText}.</>
+          : <>Approval records the request; it does not deploy immediately. The installed control-plane deploy agent polls for this approval, invokes the root release service for the bound release, and posts the serving receipt after activation. If the agent is not installed and running, use <span className="font-mono">blueprint deploy</span> manually{deadlineText}.</>}
       </p>
       {canApprove && !approved && onApprove && (
         <button

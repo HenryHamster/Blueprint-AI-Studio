@@ -23,14 +23,32 @@ sudo env -i \
 ```
 
 The bootstrap installs a new content-addressed script bundle and redirects only
-the API unit's future starts to the new wrapper. Because systemd dependencies
+the API unit's future starts to the new wrapper, installs the always-on
+non-root deploy agent, and installs a socket-activated root release executor.
+Because systemd dependencies
 cannot be removed by a drop-in, it snapshots the legacy edge base unit and
 noninteractive drop-in, renders the complete reviewed edge unit with the live
 immutable helper and environment paths, and retires the obsolete drop-in to a
 root-only recovery copy. It preserves original file modes for rollback,
 performs `daemon-reload`, and does not restart the API, worker, database,
 backup timer, or edge. It verifies the effective dependency and hardening
-contracts, all five unit markers, and every unrelated role/base file.
+contracts, including systemd's effective `NoNewPrivileges` values, all five
+unit markers, and every unrelated role/base file. Receipt-retry state is kept
+under `/var/lib/blueprint-deploy-agent/` so a deploy-agent restart cannot cause
+the release to run twice.
+
+The deploy agent does not use `sudo`: its hardened non-root unit connects to
+`/run/blueprint-release.sock`, whose root-owned socket unit starts
+`blueprint-release.service` as root. The socket ACL is limited to the service
+account. The agent's live approval read, exact CI manifest binding, superseding
+promotion re-read, and activation receipt POST remain the authority checks;
+the root executor independently validates the digest and revision before it
+starts the immutable release tool. A failed root-release activation phase is
+retried at most three times, with 5 seconds and then 10 seconds of backoff.
+Accepted or ambiguous socket handoffs are fenced and never replayed. Exhaustion
+is reported and persisted as `phase=failed` with the attempt count and
+`root_release.failure_reason`; it is not converted into a serving-confirmation
+timeout.
 
 ## Release
 
@@ -76,13 +94,22 @@ gcloud artifacts repositories get-iam-policy blueprint-repo \
 The output must contain the worker account under
 `roles/artifactregistry.reader` and must not add the API runtime account.
 
-The tool retains the prior image, stops only a container whose immutable ID and
-runtime contract match the managed API or worker, waits for the unit and that
-exact container to stop, and starts the worker before the API. Worker startup
-and sole-leadership readiness must pass before the API is touched. Local API
-revision and health must pass before public health. Only services touched by a
-failed activation are rolled back, using the same identity and readiness
-checks. Root-only receipts are written below
+The tool retains the prior image and compares the candidate's baked schema
+revision with the live database head. Matching revisions retain the existing
+hot-swap behavior. Before any unit is stopped for a mismatch, the tool checks
+the candidate image's bundled Alembic graph and requires the target to be
+forward-reachable from the live head. A non-forward or unreachable target is
+refused while both app units remain running; select an image matching the
+database or fix forward. A forward-reachable mismatch uses bounded downtime:
+it stops both managed app units, waits for their exact containers to stop, runs
+the canonical local migration transaction with the candidate image, confirms
+the resulting schema head, then starts the worker before the API. Worker
+startup and sole-leadership readiness must pass before the API is touched.
+Local API revision and health must pass before public health. Once a migration
+downtime window begins, a failure leaves the app units stopped and requires a
+fix-forward release; it never rolls prior code back across a possibly advanced
+schema. Other failed activations roll back only their touched services using
+the same identity and readiness checks. Root-only receipts are written below
 `/var/lib/blueprint/local-app-releases/`.
 
 Cloud Run remains a manually activated recovery target. Firebase Hosting

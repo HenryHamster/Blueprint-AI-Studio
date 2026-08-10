@@ -731,14 +731,46 @@ _BROWSER_EVIDENCE_KINDS = frozenset(
 )
 
 
-def _payload_requires_browser(payload: dict) -> bool:
-    """Read the generic browser-capability contract from a task payload."""
+def _paths_require_browser(paths: object) -> bool:
+    """Return whether a declared/observed path set enters the viewport gate."""
+    if not isinstance(paths, (list, tuple, set)):
+        return False
+    return any(
+        isinstance(path, str) and path.startswith("admin-ui/src/")
+        for path in paths
+    )
+
+
+def _payload_requires_browser(payload: dict, context: dict) -> bool:
+    """Read the browser contract from payload and task path provenance.
+
+    ``related_files`` is available before an agent starts (the dispatch-time
+    authoring scope), while ``_pr_changed_files`` is the authoritative observed
+    diff once GitHub has reported it. Either path set must trigger the same
+    ``check:107`` admin-ui gate; missing provenance never grants capability.
+    """
     if payload.get("requires_browser") is True:
+        return True
+    if _paths_require_browser(payload.get("related_files")):
+        return True
+    if _paths_require_browser((context or {}).get("related_files")):
+        return True
+    if _paths_require_browser((context or {}).get("_pr_changed_files")):
         return True
     evidence = payload.get("acceptance_evidence")
     if not isinstance(evidence, dict):
         return False
     return str(evidence.get("kind") or "").strip().lower() in _BROWSER_EVIDENCE_KINDS
+
+
+def _task_requires_browser(task: Task) -> bool:
+    """Evaluate the browser contract using the task's complete provenance."""
+    return _payload_requires_browser(task.first_payload or {}, task.context or {})
+
+
+def _runner_lacks_required_browser(runner: LocalRunner, task: Task) -> bool:
+    """Return whether ``runner`` must refuse this task's browser contract."""
+    return not _runner_chromium_usable(runner) and _task_requires_browser(task)
 
 async def _try_runner_dispatch(
     session: AsyncSession,
@@ -849,7 +881,7 @@ async def _try_runner_dispatch(
         # declines still look transient, re-pick the decliner instead.
         declined_exclusion_advisory=decline_exclusion_is_advisory(task, task_type),
         requires_project_verification=requires_project_verification,
-        requires_browser=_payload_requires_browser(payload),
+        requires_browser=_task_requires_browser(task),
     )
     if runner is None:
         return False
@@ -1439,8 +1471,8 @@ def _select_eligible_runner(
             # proof is accepted. Older runners omit this capability and therefore
             # fall through to the Packer-proven cloud image instead of claiming a
             # task that will fail after Chromium bootstrap. Reads the NESTED
-            # isolation_backends.playwright_chromium_usable flag the heartbeat
-            # writes (always a plain bool).
+            # isolation_backends Docker + Playwright cache evidence the heartbeat
+            # writes (always plain bools), requiring both legs.
             out = [r for r in out if _runner_chromium_usable(r)]
         if accelerator:
             # Trust VERIFIED GPU capability, not the bare self-reported has_gpu bool:

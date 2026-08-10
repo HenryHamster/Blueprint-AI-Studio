@@ -20,6 +20,7 @@ from typing import Any
 from app.release_scoring import (
     _extract_audit_findings,
     _extract_excluded_audit_findings,
+    _finding_matches_candidate_surface,
     _score_audit,
 )
 
@@ -251,6 +252,7 @@ def _merge_scoped_audit_report_with_prior_fact(
     prior_detail: Any,
     *,
     expected_base_sha: str | None = None,
+    candidate_surface_paths: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Merge unchanged-path facts into a freshly reviewed delta report.
 
@@ -258,6 +260,11 @@ def _merge_scoped_audit_report_with_prior_fact(
     otherwise ``audit_scope.changed_paths`` is the superseded set. Paths in that
     set are replaced by the fresh result (including an explicit clean result).
     Findings on every other path are carried from the durable prior audit fact.
+    When ``candidate_surface_paths`` is supplied, a prior finding is dropped
+    only when the candidate tree *disproves* it — the path is covered by the
+    candidate surface map and its recorded blob SHA differs. Findings on paths
+    outside that map, or with no recorded blob, are not disproven and still
+    carry.
     """
     if not isinstance(scored_report, dict) or not isinstance(original_report, dict):
         return scored_report, original_report
@@ -288,6 +295,13 @@ def _merge_scoped_audit_report_with_prior_fact(
         for finding in findings:
             path = _audit_finding_path(finding)
             if not isinstance(finding, dict) or not path or path in reviewed_paths:
+                continue
+            # Drop a prior finding ONLY when the candidate tree provably
+            # contradicts it (same predicate the scorer uses): the path is in
+            # the candidate surface map AND the recorded blob differs. A
+            # finding on a path outside the audited-surface map, or one with no
+            # recorded blob, is not disproven and must still carry forward.
+            if not _finding_matches_candidate_surface(finding, candidate_surface_paths):
                 continue
             identity = _audit_finding_identity(finding)
             if identity in seen:

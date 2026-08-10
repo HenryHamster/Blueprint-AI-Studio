@@ -35,10 +35,12 @@ same way the reproduce-on-HEAD verdict does.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-import uuid
 import operator
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
@@ -66,6 +68,22 @@ from app.payload_schemas import (
     read_acceptance_evidence,
 )
 from app.viewport_evidence import resolve_visual_evidence
+
+# The release-qualifier acceptance-window population contract lives in a pure
+# sibling module so this chronic gate stays below its existing size cap.  Keep
+# these names importable here: metrics sweeps and older callers use this module
+# as their canonical compatibility surface.
+from app.acceptance_window_invariants import (  # noqa: F401
+    _ACCEPTANCE_WINDOW_KEYS,
+    _ACCEPTANCE_WINDOW_POPULATION_KEYS,
+    acceptance_window_sub_scores_violations,
+)
+from app.acceptance_provenance import (
+    COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
+    PARENT_DERIVED_CHANGED_FILES_KEY,
+    stamp_parent_derived_changed_files_signal as _stamp_parent_derived_signal,
+    stamp_commit_range_derived_changed_files_signal as _stamp_commit_range_signal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,12 +152,16 @@ CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 # :func:`effective_acceptance_verdict` (rung 3), which re-derives any recorded
 # row whose stamp predates the current rule.
 #
+# v3: rollup children now carry an authoritative changed-file signal derived from
+# their own immutable PR commit range.  That provenance is distinct from the
+# parent's union diff, so a matching named test may earn machine proof.
+#
 # v2: the evaluation rules changed this version — :func:`_merge_acceptance_test_block`
 # now also reads the inherited rollup-child block (:data:`INHERITED_ACCEPTANCE_BLOCK_KEY`)
 # and the window-corroboration marker semantics changed, so a row stamped under v1
 # can score differently under the current core. Bumping retires those v1 stamps so
 # rung 3 re-derives them instead of trusting a verdict the retired rule produced.
-ACCEPTANCE_RULE_VERSION = 2
+ACCEPTANCE_RULE_VERSION = 3
 
 # ``rederived_by`` stamped on a re-derived verdict (design doc c50453ef §5).
 # Identifies the actor that re-scored already-merged work so an auditor can tell
@@ -239,6 +261,19 @@ def _context_changed_files(context: Mapping[str, Any] | None) -> list[str]:
     return [p for p in raw if isinstance(p, str) and p.strip()]
 
 
+def _changed_file_provenance_available(context: Mapping[str, Any] | None) -> bool:
+    """Whether the context contains a recorded (possibly empty) PR diff list.
+
+    An empty list is authoritative evidence of an empty diff. A missing or
+    malformed value means the backend never learned the diff and must not
+    classify that absence as proof that a declared test was omitted.
+    """
+    raw = (context or {}).get("_pr_changed_files")
+    return isinstance(raw, list) and all(
+        isinstance(path, str) and bool(path.strip()) for path in raw
+    )
+
+
 def _changed_files(task: Task) -> list[str]:
     """The PR's changed-file paths recorded on the task, as a list of strings."""
     return _context_changed_files(task.context)
@@ -277,29 +312,22 @@ def stamp_changed_files_signal(
     return signal
 
 
-# Sentinel marking a child's ``_pr_changed_files`` as INHERITED from its rollup
-# parent's combined diff rather than sourced from the child's own PR. The
-# parent's diff is the union of every sibling's changes, so a child's declared
-# test that actually lives in a SIBLING's slice would appear "present" here — the
-# named_test gate must therefore cap parent-derived credit at the unproven
-# (inferred) tier and never mint machine ``proven`` credit from it.
-PARENT_DERIVED_CHANGED_FILES_KEY = "_pr_changed_files_from_rollup_parent"
-
-
 def stamp_parent_derived_changed_files_signal(paths: list[str]) -> dict[str, Any]:
-    """Changed-file signal for a rollup child inheriting its parent's combined diff.
+    """Stamp a rollup child inheriting its parent's combined diff."""
+    return _stamp_parent_derived_signal(
+        paths,
+        stamp_changed_files_signal=stamp_changed_files_signal,
+        parent_derived_key=PARENT_DERIVED_CHANGED_FILES_KEY,
+    )
 
-    Reuses :func:`stamp_changed_files_signal` for the non-lossy summary but marks
-    the list parent-derived and deliberately does NOT set the
-    ``_pr_changed_files_github_verified`` sentinel: the combined diff is a
-    superset (the union of all siblings' changes), so a child's declared test that
-    lives in a sibling's slice must not falsely earn full machine-``proven``
-    credit. Parent-derived credit is capped at the satisfied/unproven tier by
-    :func:`_evaluate_named_test`.
-    """
-    signal = stamp_changed_files_signal(paths, github_verified=False)
-    signal[PARENT_DERIVED_CHANGED_FILES_KEY] = True
-    return signal
+
+def stamp_commit_range_derived_changed_files_signal(paths: list[str]) -> dict[str, Any]:
+    """Stamp a rollup child's exact PR-range changed-file provenance."""
+    return _stamp_commit_range_signal(
+        paths,
+        stamp_changed_files_signal=stamp_changed_files_signal,
+        parent_derived_key=PARENT_DERIVED_CHANGED_FILES_KEY,
+    )
 
 
 def _is_test_path(path: str) -> bool:
@@ -313,8 +341,14 @@ def _paths_match(changed: str, declared: str) -> bool:
     Tolerant of leading-directory differences between the agent-reported changed
     paths and the declared ``test_path`` (one may be repo-relative, the other a
     subpath): an exact match, a suffix match in either direction, or a basename
-    match all count.
+    match all count. Runtime values that are not strings and blank paths are not
+    valid matches. Normalize Windows separators before comparing because GitHub,
+    agents, and declarations may use different path conventions.
     """
+    if not isinstance(changed, str) or not isinstance(declared, str):
+        return False
+    changed = changed.replace("\\", "/")
+    declared = declared.replace("\\", "/")
     changed = changed.strip().lstrip("./")
     declared = declared.strip().lstrip("./")
     if not changed or not declared:
@@ -985,6 +1019,7 @@ def _evaluate_named_test(
     evidence: AcceptanceEvidence,
     changed: list[str],
     verified: bool,
+    changed_file_provenance_available: bool = True,
     truncated: bool = False,
     parent_derived: bool = False,
     targeted_green: bool = False,
@@ -1123,6 +1158,15 @@ def _evaluate_named_test(
             "test does not prove this declaration",
         )
     if not test_present:
+        if not changed_file_provenance_available:
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                f"declared named_test {declared_path!r} could not be evaluated "
+                "because PR changed-file provenance was unavailable — "
+                "_pr_changed_files was never recorded",
+            )
         if truncated and corroborated is False:
             # The truncation soft credit rests on the premise that the declared
             # test "may ship beyond the stored 50-path prefix". A backend-REFUTED
@@ -1615,6 +1659,7 @@ def evaluate_acceptance(
         )
 
     changed = _context_changed_files(context)
+    changed_file_provenance_available = _changed_file_provenance_available(context)
     verified = _merge_was_test_verified(context)
     truncated = bool((context or {}).get("_pr_changed_files_truncated"))
     parent_derived_files = bool(
@@ -1667,6 +1712,7 @@ def evaluate_acceptance(
             evidence,
             changed,
             verified,
+            changed_file_provenance_available,
             truncated,
             parent_derived=parent_derived_files,
             targeted_green=targeted_green,
@@ -1712,6 +1758,99 @@ def evaluate_acceptance(
     return AcceptanceGateVerdict(
         True, False, evidence.kind, f"unrecognized acceptance kind {evidence.kind!r}"
     )
+
+
+# These are the durable evaluator inputs; verdict and audit metadata are excluded.
+_ACCEPTANCE_INPUT_CONTEXT_KEYS = (
+    "_pr_changed_files",
+    "_pr_changed_files_truncated",
+    PARENT_DERIVED_CHANGED_FILES_KEY,
+    COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
+    "_pr_changed_files_provenance",
+    ACCEPTANCE_TEST_CORROBORATED_KEY,
+    TEST_COVERAGE_RESULT_KEY,
+    "viewport_failure_screenshot_uri",
+    INHERITED_ACCEPTANCE_BLOCK_KEY,
+)
+_ACCEPTANCE_INPUT_REVIEW_LOOP_KEYS = (
+    UNVERIFIED_MERGE_REASON_KEY,
+    MERGE_ACCEPTANCE_BLOCK_KEY,
+    ACCEPTANCE_TEST_TARGETED_GREEN_KEY,
+    ACCEPTANCE_TEST_TARGETED_DESCRIPTOR_KEY,
+)
+_ACCEPTANCE_TEST_BLOCK_INPUT_KEYS = (
+    "present", "ran", "status", "passed", "selector", "descriptor"
+)
+
+
+def _fingerprint_mapping(value: Any, keys: tuple[str, ...]) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {
+        key: value[key]
+        for key in keys
+        if key in value
+    }
+
+
+def acceptance_input_fingerprint(
+    payload: dict | None,
+    context: Mapping[str, Any] | None,
+    project_id: object,
+) -> str:
+    """Hash evaluator inputs so late evidence can invalidate a current stamp."""
+    source = context or {}
+    relevant_context: dict[str, Any] = {}
+    for key in _ACCEPTANCE_INPUT_CONTEXT_KEYS:
+        if key not in source:
+            continue
+        value = source[key]
+        if key in (INHERITED_ACCEPTANCE_BLOCK_KEY, TEST_COVERAGE_RESULT_KEY):
+            keys = (
+                ("coverage_pct", "source")
+                if key == TEST_COVERAGE_RESULT_KEY
+                else _ACCEPTANCE_TEST_BLOCK_INPUT_KEYS
+            )
+            value = _fingerprint_mapping(value, keys)
+            if value is None:
+                continue
+        elif key == ACCEPTANCE_TEST_CORROBORATED_KEY:
+            if not isinstance(value, bool):
+                continue
+        elif key in (
+            "_pr_changed_files_truncated",
+            PARENT_DERIVED_CHANGED_FILES_KEY,
+            COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
+        ):
+            value = bool(value)
+        relevant_context[key] = value
+    review_loop = source.get(REVIEW_LOOP_KEY)
+    if isinstance(review_loop, Mapping):
+        projected_review_loop: dict[str, Any] = {}
+        for key in _ACCEPTANCE_INPUT_REVIEW_LOOP_KEYS:
+            if key not in review_loop:
+                continue
+            value = review_loop[key]
+            if key == MERGE_ACCEPTANCE_BLOCK_KEY:
+                value = _fingerprint_mapping(value, _ACCEPTANCE_TEST_BLOCK_INPUT_KEYS)
+                if value is None:
+                    continue
+            projected_review_loop[key] = value
+        if projected_review_loop:
+            relevant_context[REVIEW_LOOP_KEY] = projected_review_loop
+    material = {
+        "payload": payload,
+        "project_id": str(project_id),
+        "context": relevant_context,
+    }
+    canonical = json.dumps(
+        material,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
@@ -1832,6 +1971,9 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
         # rule and re-derive them (design doc c50453ef). Consumed by
         # :func:`effective_acceptance_verdict`.
         "rule_version": ACCEPTANCE_RULE_VERSION,
+        "input_fingerprint": acceptance_input_fingerprint(
+            task.first_payload, task.context, task.project_id
+        ),
         # Audit honesty (design doc c50453ef §5): this is the ORIGINAL recording
         # of the verdict at land time, not a re-derivation. A re-derivation
         # (rule-version bump) sets this to False and nests the original verdict
@@ -1886,8 +2028,15 @@ def effective_acceptance_verdict(task: Task) -> dict | None:
     frozen = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
     if not isinstance(frozen, dict):
         return None
-    if frozen.get("rule_version") == ACCEPTANCE_RULE_VERSION:
-        # Stamped by the current rule — nothing to re-derive.
+    current_fingerprint = acceptance_input_fingerprint(
+        task.first_payload, task.context, task.project_id
+    )
+    if (
+        frozen.get("rule_version") == ACCEPTANCE_RULE_VERSION
+        and frozen.get("input_fingerprint") == current_fingerprint
+    ):
+        # Stamped by the current rule against these exact inputs — nothing to
+        # re-derive. Missing fingerprints are legacy rows and are healed below.
         return frozen
     rederived = evaluate_acceptance(task.first_payload, task.context, task.project_id)
     if not rederived.declared:
@@ -1914,6 +2063,7 @@ def effective_acceptance_verdict(task: Task) -> dict | None:
             "reason": rederived.reason,
             "proof_ref": rederived.proof_ref,
             "rule_version": ACCEPTANCE_RULE_VERSION,
+            "input_fingerprint": current_fingerprint,
             "stamped_at_land_time": False,
             "rederived_at": _utcnow().isoformat(),
             "rederived_by": REDERIVED_BY_QUALIFIER,
@@ -2160,6 +2310,7 @@ def classify_undeclared_reason(context: Mapping[str, Any] | None) -> str:
 # even on verdicts stamped without a ``reason`` (legacy / manually-written rows)
 # or carrying a future reason string this module has not seen yet.
 _UNSATISFIED_REASON_KEYS: tuple[str, ...] = (
+    "named_test_diff_provenance_unavailable",
     "named_test_missing_from_diff",
     "named_test_not_run_green",
     "named_test_test_only_diff",
@@ -2216,6 +2367,8 @@ def classify_unsatisfied_reason(recorded: Any) -> str:
     if kind == "named_test":
         if "describes a DIFFERENT test" in reason_str:
             return "named_test_block_describes_other_test"
+        if "changed-file provenance was unavailable" in reason_str:
+            return "named_test_diff_provenance_unavailable"
         if "is not among the PR's changed files" in reason_str:
             return "named_test_missing_from_diff"
         if "did not run green under a real merge-test verdict" in reason_str:
@@ -2600,20 +2753,20 @@ async def backfill_acceptance_verdicts(session) -> int:
        treated an ABSENT/malformed ``review_loop`` as unverified, so a landed
        task whose context simply lacked a ``review_loop`` dict was scored
        unsatisfied even though the merge was genuinely verified;
-    3. ``satisfied=False`` with the "is not among the PR's changed files"
+    3. ``satisfied=False`` with either a missing-diff or unavailable-provenance
        reason — recorded when changed-file provenance was absent or late
        (rollup children merge via the PARENT's single PR, so a verdict stamped
-       before the parent's ``_pr_changed_files`` arrived reads as missing-from-
-       diff). Late-arriving provenance flips these to satisfied (proven when
-       the task's own PR files are GitHub-verified, else capped at
-       satisfied_unproven for the parent-derived union diff). Candidates of
-       this class are re-admitted to the sweep once changed-file provenance
-       has arrived — even when an OLD run already stamped the one-shot
-       ``_backfill_checked_at`` marker on them — and leave the window
-       terminally (``_backfill_missing_diff_terminal_at``) when provenance
-       was in hand yet re-evaluation still failed. Fresh provenance clears
-       both markers, so late re-stamps always re-admit the task without the
-       class ever monopolizing the LIMIT-200 window.
+       before the parent's ``_pr_changed_files`` arrived cannot distinguish
+       omission from missing data). Late-arriving provenance flips these to
+       satisfied (proven when the task's own PR files are GitHub-verified, else
+       capped at satisfied_unproven for the parent-derived union diff).
+       Candidates of this class are re-admitted to the sweep once changed-file
+       provenance has arrived — even when an OLD run already stamped the
+       one-shot ``_backfill_checked_at`` marker on them — and leave the window
+       terminally (``_backfill_missing_diff_terminal_at``) when provenance was
+       in hand yet re-evaluation still failed. Fresh provenance clears both
+       markers, so late re-stamps always re-admit the task without the class
+       ever monopolizing the LIMIT-200 window.
 
     Each class is re-evaluated with the current (fixed) logic, and
     :class:`~app.models.CriterionEvidence` is recorded via
@@ -2656,11 +2809,17 @@ async def backfill_acceptance_verdicts(session) -> int:
         # ``context -> 'code_acceptance_verdict' -> 'reason'`` on Postgres,
         # ``$.code_acceptance_verdict.reason`` on SQLite. NULL when the verdict
         # or reason is absent, so a LIKE on the result selects only the
-        # missing-from-diff class.
-        _missing_from_diff_verdict = func.json_extract(
-            Task.context, "$.code_acceptance_verdict.reason"
-        ).like("%is not among the PR's changed files%")
-        # Re-admission gate for the missing-from-diff class: changed-file
+        # missing-diff and unavailable-provenance classes.
+        _missing_from_diff_verdict = or_(
+            func.json_extract(
+                Task.context, "$.code_acceptance_verdict.reason"
+            ).like("%is not among the PR's changed files%"),
+            func.json_extract(
+                Task.context, "$.code_acceptance_verdict.reason"
+            ).like("%changed-file provenance was unavailable%"),
+        )
+        # Re-admission gate for the missing-diff/unavailable-provenance classes:
+        # changed-file
         # provenance has arrived (``_pr_changed_files`` is always a list when
         # stamped, so NULL means absent) and no sweep has yet found the task
         # unprovable WITH that provenance in hand (terminal marker absent).
@@ -2675,10 +2834,13 @@ async def backfill_acceptance_verdicts(session) -> int:
         )
     else:
         _backfill_checked = not_(Task.context.has_key("_backfill_checked_at"))
-        _missing_from_diff_verdict = (
+        _missing_from_diff_verdict = or_(
             Task.context["code_acceptance_verdict"]["reason"].astext.like(
                 "%is not among the PR's changed files%"
-            )
+            ),
+            Task.context["code_acceptance_verdict"]["reason"].astext.like(
+                "%changed-file provenance was unavailable%"
+            ),
         )
         _missing_diff_readmit = and_(
             _missing_from_diff_verdict,
@@ -2711,7 +2873,7 @@ async def backfill_acceptance_verdicts(session) -> int:
             .correlate(Task)
         )
     # Candidates are tasks the sweep has not examined yet, OR tasks whose
-    # persisted verdict is the missing-from-diff class AND whose changed-file
+    # persisted verdict is a missing-diff/unavailable-provenance class AND whose changed-file
     # provenance has since arrived — even if an OLD sweep run already stamped
     # the one-shot ``_backfill_checked_at`` marker on them (those markers were
     # stamped before the missing-from-diff class was re-evaluable, so honoring
@@ -2811,11 +2973,12 @@ async def backfill_acceptance_verdicts(session) -> int:
                 #       simply lacked a review_loop dict was recorded unsatisfied
                 #       with the "did not run green" reason even though the merge
                 #       was genuinely verified.
-                #   (b) Missing-from-diff: the declared named_test was not in the
-                #       recorded changed-file list — often because rollup children
-                #       never owned a PR and the parent's changed files arrived
-                #       LATE. Late-arriving provenance can flip this class, so it
-                #       is admitted to re-evaluation; when still unprovable it is
+                #   (b) Missing diff provenance/omission: the declared named_test
+                #       was not found in the recorded changed-file list, or no
+                #       list was recorded — often because rollup children never
+                #       owned a PR and the parent's changed files arrived LATE.
+                #       Late-arriving provenance can flip this class, so it is
+                #       admitted to re-evaluation; when still unprovable it is
                 #       marked (terminally so when provenance was already in hand)
                 #       and re-admitted only when fresh provenance clears the
                 #       markers (see the ``missing_from_diff`` handling below).
@@ -2823,6 +2986,7 @@ async def backfill_acceptance_verdicts(session) -> int:
                 reason_str = reason if isinstance(reason, str) else ""
                 missing_from_diff = (
                     "is not among the PR's changed files" in reason_str
+                    or "changed-file provenance was unavailable" in reason_str
                 )
                 if not isinstance(reason, str) or (
                     "did not run green under a real merge-test verdict" not in reason
@@ -2845,6 +3009,9 @@ async def backfill_acceptance_verdicts(session) -> int:
                     "proof_ref": re_eval.proof_ref,
                     "backfilled": True,
                     "rule_version": ACCEPTANCE_RULE_VERSION,
+                    "input_fingerprint": acceptance_input_fingerprint(
+                        task.first_payload, ctx, task.project_id
+                    ),
                 }
                 task.context = ctx
                 session.add(task)
@@ -2891,6 +3058,9 @@ async def backfill_acceptance_verdicts(session) -> int:
                         "proof_ref": re_eval.proof_ref,
                         "backfilled": True,
                         "rule_version": ACCEPTANCE_RULE_VERSION,
+                        "input_fingerprint": acceptance_input_fingerprint(
+                            task.first_payload, ctx, task.project_id
+                        ),
                     }
                     task.context = ctx
                     session.add(task)
@@ -2939,96 +3109,6 @@ async def backfill_acceptance_verdicts(session) -> int:
         return upgraded
     finally:
         session.sync_session.expire_on_commit = _prior_expire
-
-
-# ---------------------------------------------------------------------------
-# Release-qualifier acceptance_window sub_scores invariant guard
-# ---------------------------------------------------------------------------
-
-#: The five keys emitted by ``_compute_acceptance_window_aggregate`` and merged
-#: into ``last_qualification["sub_scores"]``.  The helper is fail-safe: it
-#: returns ``[]`` when NONE of these keys are present (legacy verdicts).
-_ACCEPTANCE_WINDOW_KEYS: frozenset[str] = frozenset(
-    {
-        "acceptance_window_total",
-        "acceptance_window_verified",
-        "acceptance_window_fraction",
-        "acceptance_window_write_total",
-        "acceptance_window_total_all_merges",
-    }
-)
-
-# The two keys introduced by the write-task-population fix.  Their absence means
-# the verdict was written by pre-fix code (3-key schema) and should be skipped by
-# invariant checks that only apply to the new schema.
-_ACCEPTANCE_WINDOW_POPULATION_KEYS: frozenset[str] = frozenset(
-    {"acceptance_window_write_total", "acceptance_window_total_all_merges"}
-)
-
-
-def acceptance_window_sub_scores_violations(sub_scores: dict) -> list[str]:
-    """Return invariants VIOLATED by the ``acceptance_window_*`` fields in ``sub_scores``.
-
-    Empty list ⇒ every guarantee holds (or the fields are absent — legacy-safe).
-    Pure and read-only: never mutates, never raises. Fail-safe over legacy
-    verdicts that predate the acceptance-window keys.
-
-    Invariants checked (matching the population contract in
-    ``_compute_acceptance_window_aggregate``):
-      * ``verified >= 0``
-      * ``write_total >= 0``
-      * ``verified <= write_total``
-      * ``write_total <= total_all_merges``
-      * ``fraction is None iff write_total == 0, else fraction == verified / write_total``
-    """
-    # Skip when the new population keys are absent — this covers both the zero-key
-    # case (no acceptance_window fields at all) and the pre-fix 3-key schema
-    # (acceptance_window_total/verified/fraction without write_total/total_all_merges).
-    # Checking for the new keys rather than any of the 5 prevents false violations
-    # on healthy legacy verdicts where write_total would default to 0.
-    if not any(k in sub_scores for k in _ACCEPTANCE_WINDOW_POPULATION_KEYS):
-        return []
-
-    violations: list[str] = []
-
-    verified: int = int(sub_scores.get("acceptance_window_verified") or 0)
-    write_total: int = int(sub_scores.get("acceptance_window_write_total") or 0)
-    total_all: int = int(sub_scores.get("acceptance_window_total_all_merges") or 0)
-    fraction = sub_scores.get("acceptance_window_fraction")
-
-    if verified < 0:
-        violations.append(f"acceptance_window_verified ({verified}) is negative")
-    if write_total < 0:
-        violations.append(f"acceptance_window_write_total ({write_total}) is negative")
-    if verified > write_total:
-        violations.append(
-            f"acceptance_window_verified ({verified}) exceeds "
-            f"acceptance_window_write_total ({write_total})"
-        )
-    if write_total > total_all:
-        violations.append(
-            f"acceptance_window_write_total ({write_total}) exceeds "
-            f"acceptance_window_total_all_merges ({total_all})"
-        )
-    if write_total == 0:
-        if fraction is not None:
-            violations.append(
-                f"acceptance_window_fraction ({fraction}) is not None "
-                "with zero write_total (expected None)"
-            )
-    else:
-        expected = verified / write_total
-        if fraction is None:
-            violations.append(
-                f"acceptance_window_fraction is None but write_total ({write_total}) > 0"
-            )
-        elif fraction != expected:
-            violations.append(
-                f"acceptance_window_fraction ({fraction}) != "
-                f"verified/write_total ({verified}/{write_total} = {expected})"
-            )
-
-    return violations
 
 
 # ---------------------------------------------------------------------------

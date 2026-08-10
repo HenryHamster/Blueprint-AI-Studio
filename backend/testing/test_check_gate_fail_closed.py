@@ -129,6 +129,69 @@ def test_genuine_noop_diff_still_exits_zero(tmp_path: Path) -> None:
     assert "PASS" in combined, f"expected the green PASS marker, got:\n{combined}"
 
 
+def test_required_backend_verification_unavailable_is_a_hard_failure(
+    tmp_path: Path,
+) -> None:
+    """A missing PostgreSQL route cannot become a non-blocking check skip."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "branch", "automain")
+    (repo / "scripts").mkdir()
+    (repo / "backend" / "app").mkdir(parents=True)
+    (repo / "backend" / "testing").mkdir(parents=True)
+    shutil.copy2(_ROUTE_HELPER, repo / "scripts" / "backend-test-route.sh")
+    shutil.copy2(
+        _REPO_ROOT / "backend" / "testing" / "impacted_tests.py",
+        repo / "backend" / "testing" / "impacted_tests.py",
+    )
+    # The gate checks that the sanctioned harness exists before probing the
+    # route. It must still fail on the unavailable route, without invoking it.
+    harness = repo / "scripts" / "test-backend.sh"
+    harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    harness.chmod(harness.stat().st_mode | stat.S_IXUSR)
+
+    (repo / "backend" / "app" / "changed.py").write_text(
+        "VALUE = 1\n", encoding="utf-8"
+    )
+    (repo / "backend" / "testing" / "test_changed.py").write_text(
+        "def test_changed():\n    assert True\n", encoding="utf-8"
+    )
+    # The VM used for this test does not provide Ruff. This narrow shim lets
+    # the test reach the PostgreSQL capability decision while delegating every
+    # other python invocation to the real interpreter.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"${2:-}\" = \"ruff\" ]; then exit 0; fi\n"
+        f"exec {sys.executable} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+
+    env = os.environ.copy()
+    env["WORKSPACE"] = str(repo)
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["BLUEPRINT_SANDBOX_PYTHON"] = str(tmp_path / "missing-python")
+    result = subprocess.run(
+        ["bash", str(_CHECK)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, (
+        "required backend verification must fail when PostgreSQL is unavailable; "
+        f"got exit {result.returncode} with output:\n{combined}"
+    )
+    assert "required backend verification FAILED — PostgreSQL runtime unavailable" in combined
+    assert "GATE-ENVIRONMENT: required backend verification skipped" not in combined
+    assert "[check] PASS" not in combined
+
+
 def test_off_image_pgserver_route_wins_without_baked_paths(tmp_path: Path) -> None:
     """An importable pgserver package is a real route, not a Docker fallback."""
     pg_bin = tmp_path / "pg-bin"
@@ -175,6 +238,7 @@ def test_backend_route_stays_fail_closed_without_a_runtime(tmp_path: Path) -> No
     fake_pg_config.chmod(fake_pg_config.stat().st_mode | stat.S_IXUSR)
     env = os.environ.copy()
     env["BLUEPRINT_SANDBOX_PYTHON"] = "/usr/bin/python3"
+    env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONPATH"] = str(tmp_path / "empty-python-path")
     env["PATH"] = str(tmp_path)
     result = subprocess.run(

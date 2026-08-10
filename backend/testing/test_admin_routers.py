@@ -16555,4 +16555,3 @@ async def test_upload_url_opportunistically_cleans_bounded_expired_receipts(
 # Runner lifecycle + compute-image endpoints
 # (moved to test_admin_routers__runners.py)
 # ═══════════════════════════════════════════════════════════════════════════════
-

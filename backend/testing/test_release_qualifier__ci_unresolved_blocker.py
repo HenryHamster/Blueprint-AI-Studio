@@ -637,10 +637,16 @@ async def test_sweep_triggers_stabilize_stall_check(db_session):
     )
     await db_session.commit()
 
+    # Scoped to the stabilize-stall event type — the same sweep runs independent
+    # lifecycle checks (e.g. the standing full-suite drift sentinel) that may
+    # emit their own alerts for this project.
     alerts = (
         (
             await db_session.execute(
-                select(_Alert).where(_Alert.project_id == project.id)
+                select(_Alert).where(
+                    _Alert.project_id == project.id,
+                    _Alert.event_type == "release.stabilize_stalled",
+                )
             )
         )
         .scalars()
@@ -1054,6 +1060,45 @@ async def test_finalize_records_ci_resolution_on_not_promoted(db_session, mocker
     assert ci_res["state"] == rq._CI_PENDING
     assert ci_res["resolved_sha"] is None
     assert ci_res["detail"] == "no check-runs on candidate and no PR head with CI"
+
+
+@pytest.mark.asyncio
+async def test_finalize_relaxed_no_checks_records_ci_dimension_as_passed(
+    db_session, mocker
+):
+    """A topology-safe no_checks result is passed in the persisted CI ledger."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    mocker.patch.object(
+        rq, "resolve_project_promotion_enabled", return_value=False
+    )
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    mocker.patch.object(rq, "promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(
+            rq._CI_NO_CHECKS,
+            ci_required=False,
+            integration_branch_topology={
+                "integration_branch": "automain",
+                "promotion_target": "main",
+                "candidate_reachable_from_integration": True,
+            },
+        ),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    assert result.get("blocker") is None
+    rows = await _dimension_rows_by_dim(db_session, version)
+    assert rows["ci"].status == "passed"
+    assert rows["ci"].detail["state"] == rq._CI_NO_CHECKS
+    assert rows["ci"].detail["integration_branch_topology"][
+        "candidate_reachable_from_integration"
+    ] is True
 
 
 @pytest.mark.asyncio
@@ -4592,6 +4637,12 @@ async def test_acceptance_window_fraction_nonzero_with_inferred_cochange(db_sess
     assert reasons["no_changed_files_context"] == 1
     assert reasons["no_test_prod_cochange"] == 1
     assert sum(reasons.values()) == buckets["undeclared"]
+    undeclared_ids = agg["acceptance_window_undeclared_task_ids"]
+    assert undeclared_ids == sorted(undeclared_ids)
+    assert len(undeclared_ids) == buckets["undeclared"]
+    assert agg["acceptance_window_undeclared_task_ids_total"] == buckets["undeclared"]
+    assert agg["acceptance_window_undeclared_task_ids_truncated"] is False
+    assert agg["acceptance_window_bucket_task_id_cap"] == 100
 
     # (c) The additive nested keys do not break the sub-scores invariant guard.
     assert acceptance_window_sub_scores_violations(agg) == []
@@ -4709,8 +4760,56 @@ async def test_acceptance_window_aggregate_declared_unsatisfied_reasons(db_sessi
     for key, count in reasons.items():
         assert count == expected_counts.get(key, 0), key
 
+    unsatisfied_ids = agg["acceptance_window_declared_unsatisfied_task_ids"]
+    assert unsatisfied_ids == sorted(unsatisfied_ids)
+    assert len(unsatisfied_ids) == buckets["declared_unsatisfied"]
+    assert (
+        agg["acceptance_window_declared_unsatisfied_task_ids_total"]
+        == buckets["declared_unsatisfied"]
+    )
+    assert agg["acceptance_window_declared_unsatisfied_task_ids_truncated"] is False
+
     # The additive breakdown does not break the sub-scores invariant guard.
     assert acceptance_window_sub_scores_violations(agg) == []
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_bucket_task_ids_are_capped_with_truthful_tail_metadata(
+    db_session,
+):
+    """Identity evidence is deterministic and cannot grow with an old version window."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project, version = await _make_project_and_version(db_session)
+    for index in range(101):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"capped-unsatisfied-{index}",
+                payloads=[{"type": "create"}],
+                status=TaskStatus.COMPLETED,
+                context={
+                    "pr_merged": True,
+                    "landed_on_integration": True,
+                    CODE_ACCEPTANCE_VERDICT_KEY: {
+                        "kind": "named_test",
+                        "satisfied": False,
+                        "proven": False,
+                        "reason": "named_test_missing_from_diff",
+                    },
+                },
+            )
+        )
+    await db_session.commit()
+
+    aggregate = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    ids = aggregate["acceptance_window_declared_unsatisfied_task_ids"]
+    assert aggregate["acceptance_window_declared_unsatisfied_task_ids_total"] == 101
+    assert aggregate["acceptance_window_declared_unsatisfied_task_ids_truncated"] is True
+    assert aggregate["acceptance_window_bucket_task_id_cap"] == 100
+    assert len(ids) == 100
+    assert ids == sorted(ids)
 
 
 @pytest.mark.asyncio
@@ -4746,6 +4845,7 @@ async def test_acceptance_window_rederives_stale_rule_version_verdicts(db_sessio
     from app.acceptance_gate import (
         ACCEPTANCE_RULE_VERSION,
         CODE_ACCEPTANCE_VERDICT_KEY,
+        acceptance_input_fingerprint,
         effective_acceptance_verdict,
     )
 
@@ -4826,6 +4926,13 @@ async def test_acceptance_window_rederives_stale_rule_version_verdicts(db_sessio
                 "rule_version": ACCEPTANCE_RULE_VERSION,
             },
         },
+    )
+    control_task.context[CODE_ACCEPTANCE_VERDICT_KEY][
+        "input_fingerprint"
+    ] = acceptance_input_fingerprint(
+        control_task.first_payload,
+        control_task.context,
+        control_task.project_id,
     )
     # A current-rule stamp is trusted verbatim — never re-derived.
     assert (
@@ -5896,8 +6003,13 @@ class TestRecoverConfidenceFromCiUnresolved:
         assert out.get("confidence_recovered_from_ci_unresolved") is True
         # blocker should now be absent or None (no remaining hard blocker)
         assert out.get("blocker") is None or out.get("blocker") == ""
-        # Original fields preserved
-        assert out["sub_scores"] == record["sub_scores"]
+        # Original score inputs remain intact while the recompute refreshes the
+        # additive diagnostics that describe the now-cleared CI gate.
+        assert out["sub_scores"]["audit"] == record["sub_scores"]["audit"]
+        assert out["sub_scores"]["test_erosion"] == record["sub_scores"]["test_erosion"]
+        assert out["sub_scores"]["failing_gates"] == []
+        assert out["failing_gates"] == []
+        assert out["confidence_ceiling"] == 1.0
 
     def test_ci_unresolved_recovery_blocker_clears_when_ci_green(self):
         """After recovery, ci_unresolved blocker is gone (re-ran compute_composite with ci_green=True)."""

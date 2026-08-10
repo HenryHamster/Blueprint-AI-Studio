@@ -3599,6 +3599,10 @@ async def test_fetch_efficiency_snapshot(client: AsyncClient, db_session):
     assert "llm_cache_hit_rate" in data
     assert "format_compliance" in data
     assert data["window_days"] == 7
+    assert (
+        data["merged_work_origination"]["cohort_created_at_floor"]
+        == "2026-08-08T06:59:00+00:00"
+    )
 
 
 @pytest.mark.asyncio

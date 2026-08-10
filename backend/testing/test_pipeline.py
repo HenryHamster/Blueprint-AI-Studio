@@ -30,7 +30,16 @@ from app.review_pipeline import (
     _spawn_pipeline_task,
 )
 from app.rollup_management import _check_and_trigger_rollup
-from app.models import Alert, AlertSeverity, Project, Task, TaskStatus, DeploymentStatus
+from app.models import (
+    TASK_ORIGINATION_REVIEW,
+    TASK_ORIGINATION_ROLLUP,
+    Alert,
+    AlertSeverity,
+    Project,
+    Task,
+    TaskStatus,
+    DeploymentStatus,
+)
 
 
 # ── Verdict Parsing ─────────────────────────────────────────────────────────
@@ -5543,6 +5552,36 @@ async def test_review_task_inherits_priority_100(spawn_db, mocker):
 
     assert result is not None and was_created
     assert result.priority == 100, f"Expected priority 100 but got {result.priority}"
+    assert result.origination == TASK_ORIGINATION_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_rollup_pipeline_child_is_stamped_as_rollup(spawn_db, mocker):
+    """Rollup review chains use their own attribution bucket."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1")
+    spawn_db.add(project)
+    await spawn_db.commit()
+    await spawn_db.refresh(project)
+
+    source = await _make_spawn_task(
+        spawn_db,
+        project.id,
+        context={"_is_rollup_review": True},
+    )
+    result, was_created = await _spawn_pipeline_task(
+        source_task=source,
+        task_type="review",
+        pr_number=4242,
+        branch="rollup",
+        base_branch="main",
+        original_task_id=str(source.id),
+        session=spawn_db,
+    )
+
+    assert result is not None and was_created
+    assert result.origination == TASK_ORIGINATION_ROLLUP
 
 
 @pytest.mark.asyncio

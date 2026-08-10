@@ -26,12 +26,19 @@ from app.migration_reconciliation import effective_authorized_divergences
 logger = logging.getLogger(__name__)
 
 
+# Canonical fleet default for the promotion confidence gate.  The packaged
+# promotion_policy.yaml value and runtime-config seed must agree with this
+# value; the release-qualifier guard tests that contract.  Runtime and
+# per-project policy overrides are intentionally resolved above this default.
+PROMOTION_CONFIDENCE_THRESHOLD = 0.90
+
+
 # Hardcoded fallback used when promotion_policy.yaml is missing, unreadable, or
 # malformed.  MUST match the documented defaults in promotion_policy.yaml so a
 # parse failure degrades to the intended rubric rather than a silent surprise.
 _DEFAULT_POLICY: dict[str, Any] = {
     "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
-    "threshold": 0.90,
+    "threshold": PROMOTION_CONFIDENCE_THRESHOLD,
 }
 
 # total_open count at which _score_completion_debt_pressure reaches 0.0.
@@ -113,6 +120,16 @@ def _clamp01(value: float) -> float:
     if v > 1.0:
         return 1.0
     return v
+
+
+def promotion_threshold_for_policy(policy: dict[str, Any]) -> float:
+    """Return the threshold the composite promotion gate must enforce.
+
+    A resolved policy may carry an operator-configured threshold.  The shared
+    canonical default is used only when a caller supplies an incomplete policy,
+    keeping fallback behavior and the enforcement path on the same definition.
+    """
+    return float(policy.get("threshold", PROMOTION_CONFIDENCE_THRESHOLD))
 
 
 # Default coverage threshold used ONLY when the merge-grade artifact omits an
@@ -972,11 +989,13 @@ def compute_composite(
     blocker fires, ``confidence`` is the policy-weighted sum of the active
     sub-scores.  ``promote`` is True iff ``confidence >= threshold``.
 
-    Returns ``{confidence, promote, sub_scores, blocker}`` where ``blocker`` is
-    a short human-readable string when a hard blocker fired, else None.
+    Returns the historical ``{confidence, promote, sub_scores, blocker}`` keys
+    plus additive ``failing_gates`` and ``confidence_ceiling`` diagnostics.
+    ``blocker`` remains the first failing gate, while a hard-blocked
+    ``confidence`` remains exactly ``0.0``.
     """
     weights = policy.get("weights") or _DEFAULT_POLICY["weights"]
-    threshold = float(policy.get("threshold", _DEFAULT_POLICY["threshold"]))
+    threshold = promotion_threshold_for_policy(policy)
     # Qualifier VM smoke is retired. Accept legacy three-key policies, ignore
     # their smoke weight, and renormalize the two active deterministic signals.
     w_audit = float(weights.get("audit", _DEFAULT_POLICY["weights"]["audit"]))
@@ -1007,12 +1026,13 @@ def compute_composite(
     # reported as "audit_missing" rather than mislabelled "test_file_deleted":
     # a None test_erosion only genuinely means a deleted test file when the
     # audit report itself was present (audit_score not None).
-    blocker: str | None = None
+    failing_gates: list[str] = []
     if not ci_green and ci_state == _CI_RED:
         # A confirmed red build is ALWAYS a hard blocker — never promote over a
         # known-failing build, regardless of whether the project gates per-PR
         # merges on CI.
         blocker = "ci_not_green"
+        failing_gates.append(blocker)
     elif not ci_green and (ci_required or ci_state != "no_checks"):
         # Unresolved CI (pending or GitHub I/O degraded) is a resolution /
         # infrastructure concern, not a quality signal, and must keep blocking.
@@ -1020,13 +1040,15 @@ def compute_composite(
         # caller already classified as topology-safe by setting ci_required
         # False. A project-wide CI relaxation must not mask pending/API errors.
         blocker = "ci_unresolved"
-    elif migration_collision:
+        failing_gates.append(blocker)
+    if migration_collision:
         # A deterministic Alembic revision-identity collision between the
         # candidate and the deployed promotion target — checked ahead of the
         # audit-derived blockers so it is a clear, attributed gate rather than a
         # soft, score-eroding audit finding the spawned auditor might miss.
         blocker = "migration_identity_collision"
-    elif migration_apply_blocked:
+        failing_gates.append(blocker)
+    if migration_apply_blocked:
         # The candidate's migration chain, replayed the deploy way against
         # production's REAL recorded schema state on an isolated scratch DB,
         # leaves the schema missing a required object (the renumber-skip class,
@@ -1034,7 +1056,8 @@ def compute_composite(
         # from the filename-identity collision above — checked after it so a
         # candidate failing both reports the identity collision first.
         blocker = "migration_apply_drift"
-    elif env_preflight_enabled and env_preflight_score is None:
+        failing_gates.append(blocker)
+    if env_preflight_enabled and env_preflight_score is None:
         # No boot/env-prerequisite evidence was produced by the candidate — the
         # evidence producer never ran, or ran but produced no usable manifest.
         # This is a DETERMINISTIC quality verdict (never an infra-failure retry
@@ -1044,7 +1067,8 @@ def compute_composite(
         # and BEFORE ``boot_prereq_missing`` because with no evidence we cannot
         # certify the boot gate at all — individual prerequisite presence is moot.
         blocker = "boot_prereq_evidence_missing"
-    elif env_preflight_enabled and env_preflight_missing and not env_preflight_ack_override:
+        failing_gates.append(blocker)
+    if env_preflight_enabled and env_preflight_missing and not env_preflight_ack_override:
         # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4).
         # runtime_config default: True (Armed).  A candidate-declared,
         # in-scope boot prerequisite is ABSENT from the deploy-target env — the
@@ -1062,12 +1086,14 @@ def compute_composite(
         # ordered blocker above it (CI, migrations) still wins, and a blocker below
         # (capability-proof, coverage, quality) still fires on its own merits.
         blocker = "boot_prereq_missing"
-    elif merge_grade_misses:
+        failing_gates.append(blocker)
+    if merge_grade_misses:
         # The armable-dark blind-grade gate: coverage_verdict == "misses" AND the
         # operator has raised merge_grade_block_threshold above 0.0.  Distinct from
         # the canonical goal-verification gate so operators see the right label.
         blocker = "merge_grade_misses"
-    elif category_verdicts is not None and any(
+        failing_gates.append(blocker)
+    if category_verdicts is not None and any(
         (v or {}).get("status") != "met" for v in category_verdicts
     ):
         # GOAL-VERIFICATION GATE (redesign): the acceptance criteria ARE the
@@ -1079,26 +1105,37 @@ def compute_composite(
         # penalty below.  The blocker STRING is preserved so downstream re-drive /
         # trigger / state-resolver plumbing keyed on it keeps firing.
         blocker = "criterion_coverage_incomplete"
-    elif residual_uncaptured_gap:
+        failing_gates.append(blocker)
+    if residual_uncaptured_gap and "criterion_coverage_incomplete" not in failing_gates:
         # RESIDUAL gate (redesign): the grader found a goal aspect that NONE of
         # the categories capture — the rubric is incomplete for this candidate, so
         # even an all-``met`` category set cannot certify the goal.  Same blocker
         # string, distinguished for operators via sub_scores["residual_uncaptured_gap"].
         blocker = "criterion_coverage_incomplete"
-    elif capability_proof_blocked:
+        failing_gates.append(blocker)
+    if capability_proof_blocked:
         # The capability proof gate is in ENFORCE mode and there are working
         # capabilities whose proof status is not ``proven`` — the gate would
         # block dependents that name them.  Block promotion until the unproven
         # capabilities are either proven or the gate is dialled back to observe.
         blocker = "capability_proof_gate_blocked"
-    elif audit_score is None:
+        failing_gates.append(blocker)
+    if audit_score is None:
         # An audit that produced no usable score is a soft signal, but without
         # it the composite is meaningless — treat as a blocker so a missing
         # audit can never promote on test_erosion alone.  Reported
         # ahead of test_file_deleted because a missing report nulls both.
         blocker = "audit_missing"
+        failing_gates.append(blocker)
     elif test_erosion is None:
         blocker = "test_file_deleted"
+        failing_gates.append(blocker)
+
+    # Preserve the historical ordered blocker while retaining every independent
+    # failing gate for diagnosis.  The list is intentionally de-duplicated:
+    # category and residual failures are two observations of the same gate.
+    failing_gates = list(dict.fromkeys(failing_gates))
+    blocker: str | None = failing_gates[0] if failing_gates else None
 
     # Sub-scores are always reported (clamped) for observability, even when a
     # blocker fired and the composite is forced to zero.
@@ -1160,20 +1197,50 @@ def compute_composite(
     if merge_grade_exempt:
         sub_scores["merge_grade_exempt"] = True
 
+    sub_scores["failing_gates"] = failing_gates
+
+    # Compute the score the candidate could reach if its hard gates were
+    # cleared, using the exact active weight, debt, and judged-tier arithmetic
+    # below.  This is deliberately computed before the hard-block return so a
+    # blocked verdict still explains whether promotion is reachable without
+    # pretending that the blocked candidate promoted.
+    w_debt = float((policy.get("weights") or {}).get("completion_debt", 0.0))
+    w_debt = max(0.0, min(w_debt, 0.5))
+    existing_confidence = (
+        w_audit * sub_scores["audit"] + w_test * sub_scores["test_erosion"]
+    )
+    if w_debt > 0.0 and debt_pressure_score is not None:
+        confidence_ceiling = (
+            (1.0 - w_debt) * existing_confidence
+            + w_debt * sub_scores["debt_pressure"]
+        )
+    else:
+        confidence_ceiling = existing_confidence
+    if category_verdicts:
+        _met = [v for v in category_verdicts if (v or {}).get("status") == "met"]
+        if _met:
+            _judged = sum(
+                1 for v in _met if (v or {}).get("tier", "judged") != "machine"
+            )
+            confidence_ceiling *= 1.0 - JUDGED_TIER_PENALTY_WEIGHT * (
+                _judged / len(_met)
+            )
+    confidence_ceiling = round(_clamp01(confidence_ceiling), 4)
+    sub_scores["confidence_ceiling"] = confidence_ceiling
+
     if blocker is not None:
         return {
             "confidence": 0.0,
             "promote": False,
             "sub_scores": sub_scores,
             "blocker": blocker,
+            "failing_gates": failing_gates,
+            "confidence_ceiling": confidence_ceiling,
         }
 
     # Debt-pressure weight (defaults to 0.0 = observe mode: recorded but not
     # blended).  When > 0 the existing sub-scores are scaled by (1 - w_debt)
     # and the debt-pressure term is added so the total remains in [0, 1].
-    w_debt = float((policy.get("weights") or {}).get("completion_debt", 0.0))
-    w_debt = max(0.0, min(w_debt, 0.5))  # cap at 50% to bound disruption
-
     existing_confidence = (
         w_audit * sub_scores["audit"]
         + w_test * sub_scores["test_erosion"]
@@ -1205,6 +1272,8 @@ def compute_composite(
         "promote": confidence >= threshold,
         "sub_scores": sub_scores,
         "blocker": None,
+        "failing_gates": failing_gates,
+        "confidence_ceiling": confidence,
     }
 
 
@@ -1445,7 +1514,37 @@ def _finding_subject_is_authorized_divergence(f: dict) -> bool:
     return False
 
 
-def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | None]:
+def _finding_matches_candidate_surface(
+    finding: Any,
+    candidate_surface_paths: dict[str, str] | None,
+) -> bool:
+    """Return False ONLY when the finding is *provably* stale evidence.
+
+    Proven by exactly one condition: the finding names a path the candidate's
+    audited-surface map covers, records a blob SHA, and that SHA differs from
+    the candidate's — the defect this gate closes (an audit graded against
+    blobs the candidate no longer contains).  Absence of blob identity is NOT
+    evidence of staleness, so everything else keeps deducting/carrying: an
+    unavailable map (``None``); a non-dict finding; a cross-cutting ``file: ""``
+    finding (a sanctioned auditor shape — ``agent/src/handlers/audits.ts``)
+    with no single blob to match; a path outside the audited-surface subset
+    (``.github/``, ``*.md``, ``__fixtures__``) the map does not cover.
+    """
+    if candidate_surface_paths is None or not isinstance(finding, dict):
+        return True
+    path = str(finding.get("file") or finding.get("path") or "").strip()
+    candidate_blob = candidate_surface_paths.get(path) if path else None
+    blob_sha = finding.get("blob_sha")
+    if not candidate_blob or not isinstance(blob_sha, str) or not blob_sha.strip():
+        return True
+    return candidate_blob == blob_sha.strip()
+
+
+def _score_audit(
+    report: dict[str, Any] | None,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
+) -> tuple[float | None, float | None]:
     """Derive ``(audit_score, test_erosion_score)`` from a RELEASE_AUDIT_REPORT.
 
     The agent emits ``{audit_score, test_erosion: {deleted_test_files,
@@ -1479,6 +1578,8 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     if isinstance(findings, list):
         for f in findings:
             if isinstance(f, dict):
+                if not _finding_matches_candidate_surface(f, candidate_surface_paths):
+                    continue
                 sev = str(f.get("severity") or f.get("level") or "").lower()
                 if not sev or not _finding_is_verified(f, sev):
                     continue
@@ -1638,7 +1739,11 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     return audit_score, _clamp01(score)
 
 
-def _compute_audit_reconciliation(report: dict[str, Any] | None) -> dict[str, Any]:
+def _compute_audit_reconciliation(
+    report: dict[str, Any] | None,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Compute audit-score reconciliation metadata for observability.
 
     Records the model's self-reported score alongside the deterministic
@@ -1654,9 +1759,8 @@ def _compute_audit_reconciliation(report: dict[str, Any] | None) -> dict[str, An
       are present.
     - ``score_delta`` — ``abs(findings_derived - model_reported)``, rounded
       to 4 dp, or None when either component is absent.
-    - ``excluded_findings_count`` — number of high/medium/critical/blocker/
-      warning findings excluded because their ``verification_note`` was absent
-      or too short (< 20 non-whitespace chars).
+    - ``excluded_findings_count`` — findings excluded for an absent/too-short
+      verification note or a blob proven absent from the candidate surface.
 
     This function is pure and does NOT change the gating math; call it
     alongside ``_score_audit`` to attach reconciliation fields to
@@ -1689,6 +1793,9 @@ def _compute_audit_reconciliation(report: dict[str, Any] | None) -> dict[str, An
         derived: float = 1.0
         for f in findings:
             if isinstance(f, dict):
+                if not _finding_matches_candidate_surface(f, candidate_surface_paths):
+                    excluded_count += 1
+                    continue
                 sev = str(f.get("severity") or f.get("level") or "").lower()
                 if sev:
                     if _finding_is_verified(f, sev):
@@ -2099,7 +2206,11 @@ def _compute_challenge_synthesis_from_binding_verdicts(
     }
 
 
-def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str]]:
+def _extract_audit_findings(
+    report: dict[str, Any] | None,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
+) -> list[dict[str, str]]:
     """Pull a compact, severity-sorted findings list from a RELEASE_AUDIT_REPORT.
 
     The audit sub-score is usually the binding constraint on promotion, but the
@@ -2125,6 +2236,10 @@ def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str
 
     out: list[dict[str, str]] = []
     for f in raw:
+        if candidate_surface_paths is not None and not _finding_matches_candidate_surface(
+            f, candidate_surface_paths
+        ):
+            continue
         file_path = ""
         if isinstance(f, dict):
             sev = str(f.get("severity") or f.get("level") or "unknown").lower()
@@ -2168,6 +2283,8 @@ def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str
 
 def _extract_excluded_audit_findings(
     report: dict[str, Any] | None,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """Pull the higher-severity findings the verification gate EXCLUDED from scoring.
 
@@ -2204,13 +2321,14 @@ def _extract_excluded_audit_findings(
         if not isinstance(f, dict):
             continue
         sev = str(f.get("severity") or f.get("level") or "unknown").lower()
+        stale = not _finding_matches_candidate_surface(f, candidate_surface_paths)
         # Only higher-severity findings that the gate dropped for lacking a
         # substantive verification_note belong here. Verified findings (and
         # low/info, which never require verification) are carried by
         # _extract_audit_findings instead.
-        if sev not in _SEVERITIES_REQUIRING_VERIFICATION:
+        if not stale and sev not in _SEVERITIES_REQUIRING_VERIFICATION:
             continue
-        if _finding_is_verified(f, sev):
+        if not stale and _finding_is_verified(f, sev):
             continue
         summary = (
             f.get("summary")
@@ -2227,8 +2345,18 @@ def _extract_excluded_audit_findings(
                 "summary": summary,
                 "unverified": "true",
             }
+            if stale:
+                item["reason"] = "stale_blob_not_in_candidate"
             if file_path:
                 item["file"] = file_path[:_DETAIL_NAME_MAX]
+            # Stamp blob identity (as _extract_audit_findings does) so a later
+            # incremental merge can evaluate staleness for THIS list too.
+            blob_sha = str(f.get("blob_sha") or "").strip()
+            if blob_sha:
+                item["blob_sha"] = blob_sha[:64]
+                item["surface_key"] = hashlib.sha256(
+                    f"{file_path.lower()}|{blob_sha}".encode()
+                ).hexdigest()[:16]
             item["key"] = _audit_finding_key(summary, item.get("file"))
             out.append(item)
 
@@ -2236,7 +2364,11 @@ def _extract_excluded_audit_findings(
     return out[:_MAX_CARRIED_FINDINGS]
 
 
-def _audit_findings_carry_meta(report: dict[str, Any] | None) -> dict[str, Any]:
+def _audit_findings_carry_meta(
+    report: dict[str, Any] | None,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Pre-cap totals + truncation flags for the two carried-findings lists.
 
     ``_extract_audit_findings`` / ``_extract_excluded_audit_findings`` cap at
@@ -2266,6 +2398,9 @@ def _audit_findings_carry_meta(report: dict[str, Any] | None) -> dict[str, Any]:
             summary = str(f)
         summary = str(summary).strip()[:_FINDING_SUMMARY_MAX]
         if not summary:
+            continue
+        if not _finding_matches_candidate_surface(f, candidate_surface_paths):
+            excluded_total += 1
             continue
         # Verified list: mirror _extract_audit_findings' scoring gate.
         if isinstance(f, dict) and not _finding_is_verified(f, sev):

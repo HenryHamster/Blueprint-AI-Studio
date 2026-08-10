@@ -345,10 +345,21 @@ def _recover_confidence_from_ci_unresolved(
         ),
     )
 
+    recovered_sub_scores = dict(sub_scores)
+    for key in ("failing_gates", "confidence_ceiling"):
+        if key in (recovered.get("sub_scores") or {}):
+            recovered_sub_scores[key] = recovered["sub_scores"][key]
     return {
         **base_record,
         "confidence": recovered["confidence"],
         "blocker": recovered.get("blocker"),
+        "sub_scores": recovered_sub_scores,
+        "failing_gates": recovered.get("failing_gates")
+        or recovered_sub_scores.get("failing_gates")
+        or [],
+        "confidence_ceiling": recovered.get("confidence_ceiling")
+        if recovered.get("confidence_ceiling") is not None
+        else recovered_sub_scores.get("confidence_ceiling"),
         "confidence_recovered_from_ci_unresolved": True,
     }
 

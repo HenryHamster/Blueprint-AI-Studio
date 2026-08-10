@@ -1,7 +1,6 @@
 """Tests for reaper bug-message sweep helpers (Step 18e: unlinked BLOCKER decay)."""
 
 from unittest.mock import AsyncMock
-
 import pytest
 import pytest_asyncio
 from datetime import timedelta
@@ -10,7 +9,13 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 
-from app.models import MessageType, Project, ProjectMessage
+from app.models import (
+    MessageType,
+    Project,
+    ProjectMessage,
+    Task,
+    TaskStatus,
+)
 from app.reaper_bug_message_sweeps import (
     STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS,
     sweep_decay_stale_unlinked_blocker_messages,
@@ -258,15 +263,15 @@ async def test_acceptance_healing_backfill_cadence_gated(sweep_db):
     try:
         now = _utcnow()
         first = await rsw.sweep_acceptance_verdict_healing_backfills(sweep_db, now=now)
-        assert first == 0, "no projects -> nothing to heal, but the timer fires"
+        assert first == 0
         assert rsw._last_acceptance_healing_backfill_sweep == now
 
-        # Immediate second call within the interval is suppressed without
-        # re-stamping the timer.
-        second = await rsw.sweep_acceptance_verdict_healing_backfills(
-            sweep_db, now=now
-        )
-        assert second == 0
+        # Many suppressed calls within the interval do not re-stamp the timer.
+        for _ in range(5):
+            second = await rsw.sweep_acceptance_verdict_healing_backfills(
+                sweep_db, now=now
+            )
+            assert second == 0
         assert rsw._last_acceptance_healing_backfill_sweep == now
     finally:
         rsw._last_acceptance_healing_backfill_sweep = _prev
@@ -310,3 +315,187 @@ async def test_acceptance_healing_backfill_skips_closed_projects(sweep_db, mocke
     rollup.assert_not_called()
     unverified.assert_not_called()
     window.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_healing_backfill_records_stamped_only_change(sweep_db, mocker):
+    """A rollup-context repair runs even when it mints no evidence."""
+    import app.reaper_sweeps as rsw
+    from app import release_version as rv
+
+    project = await _make_project(sweep_db)
+    await rv.open_version(sweep_db, project.id, version_number=1)
+    await sweep_db.commit()
+
+    rollup = mocker.patch(
+        "app.acceptance_criteria.backfill_rollup_child_changed_files",
+        new=AsyncMock(return_value=1),
+    )
+    mocker.patch(
+        "app.acceptance_criteria.backfill_unverified_merge_evidence",
+        new=AsyncMock(return_value=0),
+    )
+    mocker.patch(
+        "app.acceptance_criteria.record_acceptance_window_coverage_evidence",
+        new=AsyncMock(return_value=0),
+    )
+
+    previous = rsw._last_acceptance_healing_backfill_sweep
+    rsw._last_acceptance_healing_backfill_sweep = None
+    try:
+        result = await rsw.sweep_acceptance_verdict_healing_backfills(
+            sweep_db, now=_utcnow()
+        )
+    finally:
+        rsw._last_acceptance_healing_backfill_sweep = previous
+
+    assert result == 0
+    rollup.assert_awaited_once_with(sweep_db, project.id, diagnostic={})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("helper_name", "pass_name", "error_code"),
+    [
+        (
+            "backfill_rollup_child_changed_files",
+            "rollup_child_changed_files",
+            "backfill_rollup_child_changed_files_failed",
+        ),
+        (
+            "backfill_unverified_merge_evidence",
+            "unverified_merge_evidence",
+            "backfill_unverified_merge_evidence_failed",
+        ),
+    ],
+)
+async def test_acceptance_healing_backfill_continues_after_reconcile_pass_error(
+    sweep_db, mocker, real_orm_expiry, helper_name, pass_name, error_code
+):
+    """Reconcile errors do not poison the independent window pass."""
+    import app.reaper_sweeps as rsw
+    from app import release_version as rv
+    from sqlalchemy import inspect as sa_inspect
+
+    project = await _make_project(sweep_db)
+    await rv.open_version(sweep_db, project.id, version_number=1)
+    await sweep_db.commit()
+
+    async def failed_reconcile_pass(_session, _project_id, *, diagnostic):
+        diagnostic["error"] = error_code
+        diagnostic["error_type"] = "DatabaseError"
+        return 0
+
+    mocker.patch(
+        f"app.acceptance_criteria.{helper_name}",
+        new=failed_reconcile_pass,
+    )
+    other_helper = (
+        "backfill_unverified_merge_evidence"
+        if helper_name == "backfill_rollup_child_changed_files"
+        else "backfill_rollup_child_changed_files"
+    )
+    other_pass = mocker.patch(
+        f"app.acceptance_criteria.{other_helper}", new=AsyncMock(return_value=0)
+    )
+    window_attribute_reads = False
+
+    async def record_window_evidence(_session, version, *, diagnostic):
+        nonlocal window_attribute_reads
+        # This is deliberately an async-side-effect read of the fields used by
+        # the real minter.  An expired instance raises MissingGreenlet here; a
+        # refreshed instance proves the independent pass stayed usable.
+        assert not sa_inspect(version).expired
+        _ = version.id
+        _ = version.project_id
+        window_attribute_reads = True
+        diagnostic["branch"] = "no_targets"
+        return 0
+
+    window_pass = mocker.patch(
+        "app.acceptance_criteria.record_acceptance_window_coverage_evidence",
+        new=AsyncMock(side_effect=record_window_evidence),
+    )
+
+    previous = rsw._last_acceptance_healing_backfill_sweep
+    rsw._last_acceptance_healing_backfill_sweep = None
+    try:
+        result = await rsw.sweep_acceptance_verdict_healing_backfills(
+            sweep_db, now=_utcnow()
+        )
+    finally:
+        rsw._last_acceptance_healing_backfill_sweep = previous
+
+    assert result == 0
+    other_pass.assert_awaited_once()
+    window_pass.assert_awaited_once()
+    assert window_attribute_reads
+
+
+@pytest.mark.asyncio
+async def test_acceptance_verdict_healing_sweep_mints_window_evidence(sweep_db):
+    """Step 21b heals a real evidence-producing project without side effects on a false zero."""
+    from app import acceptance_criteria as ac
+    from app import release_version as rv
+    import app.reaper_sweeps as rsw
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    false_zero_project = await _make_project(sweep_db)
+    healed_project = Project(name="sweep-healed", user_id="user1")
+    sweep_db.add(healed_project)
+    await sweep_db.commit()
+    await sweep_db.refresh(healed_project)
+
+    false_zero_version = await rv.open_version(
+        sweep_db, false_zero_project.id, version_number=1
+    )
+    healed_version = await rv.open_version(
+        sweep_db, healed_project.id, version_number=1
+    )
+    await sweep_db.commit()
+
+    for project, version in (
+        (false_zero_project, false_zero_version),
+        (healed_project, healed_version),
+    ):
+        await ac.create_criterion(
+            sweep_db,
+            project.id,
+            version.id,
+            "Acceptance window fraction becomes non-zero",
+        )
+
+    # This is a genuinely landed write task with a pre-existing soft acceptance
+    # verdict.  The sweep minter may record a probe row, but it does not alter
+    # the verdict or satisfy the false-zero project's criterion.
+    landed = Task(
+        project_id=healed_project.id,
+        title="landed write with accepted test",
+        payloads=[{"type": "create", "prompt": "normal healing"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        completed_at=healed_version.opened_at + timedelta(seconds=1),
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "kind": "named_test",
+                "satisfied": True,
+                "proven": False,
+                "reason": "named_test_present_in_diff",
+            },
+        },
+    )
+    sweep_db.add(landed)
+    await sweep_db.commit()
+
+    previous = rsw._last_acceptance_healing_backfill_sweep
+    rsw._last_acceptance_healing_backfill_sweep = None
+    try:
+        result = await rsw.sweep_acceptance_verdict_healing_backfills(
+            sweep_db, now=_utcnow()
+        )
+    finally:
+        rsw._last_acceptance_healing_backfill_sweep = previous
+
+    assert result >= 1

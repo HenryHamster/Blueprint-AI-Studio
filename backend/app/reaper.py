@@ -325,6 +325,7 @@ from app.reaper_sweeps import (
     sweep_acceptance_verdict_healing_backfills,
     _sweep_strategic_cycle_starvation,
 )
+from app.approved_pr_stranding import sweep_approved_pr_stranding
 from app.acceptance_gate import backfill_acceptance_verdicts
 
 
@@ -1966,7 +1967,7 @@ async def reaper_service():
                                     original_task_id=str(task.id),
                                 )
                                 _ho_spawn_ok = True
-                            except Exception as _spawn_exc:  # noqa: BLE001
+                            except Exception as _spawn_exc:
                                 # Review spawn is best-effort from the reaper — if it
                                 # fails, the `_pr_state_check_pending` marker set
                                 # above (left in place since we don't clear it on
@@ -2759,6 +2760,20 @@ async def reaper_service():
                     # crashes are swallowed inside the sweep; this re-raise covers
                     # scan-level failures (e.g. DB error on the initial query).
                     raise
+
+                # Step 9a: review approval is not merge proof.  Keep this on the
+                # same recurring reaper surface so a terminal task cannot hide an
+                # approved PR that never reached the integration branch.
+                _mark_reaper_progress()
+                try:
+                    await sweep_approved_pr_stranding(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Approved-PR stranding sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
 
                 # Step 10: Routine message retention — purge stale routine ops messages.
                 _mark_reaper_progress()

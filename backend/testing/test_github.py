@@ -2129,8 +2129,8 @@ async def test_pr_merged_unregistered_repo_ignored(client, db_session, mocker):
 @pytest.mark.asyncio
 async def test_pr_merged_already_merged_task_is_idempotent(client, db_session, mocker):
     """
-    A second closed+merged webhook for a task that is already pr_merged=True
-    does not trigger another rollup check.
+    An already-landed backend merge receives the authoritative GitHub diff once,
+    without triggering another rollup check or retaining stale backfill markers.
     """
     from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 
@@ -2140,6 +2140,20 @@ async def test_pr_merged_already_merged_task_is_idempotent(client, db_session, m
     )
     rollup_mock = mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.github_auth.get_repo_installation_token",
+        new_callable=AsyncMock,
+        return_value="installation-token",
+    )
+    get_files_mock = mocker.patch(
+        "app.github_pulls.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[
+            {"filename": "backend/app/routers/github.py"},
+            {"filename": "backend/testing/test_github.py"},
+            {"filename": None},
+        ],
     )
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -2161,7 +2175,11 @@ async def test_pr_merged_already_merged_task_is_idempotent(client, db_session, m
         title="Already merged",
         payloads=[{"type": "create", "prompt": "x"}],
         status=TaskStatus.COMPLETED,
-        context={"pr_merged": True},
+        context={
+            "pr_merged": True,
+            "_backfill_checked_at": "stale",
+            "_backfill_missing_diff_terminal_at": "stale",
+        },
         created_by="user1",
     )
     db_session.add(task)
@@ -2178,8 +2196,19 @@ async def test_pr_merged_already_merged_task_is_idempotent(client, db_session, m
 
     payload_bytes = _make_pr_merged_payload("idemorg", "idemrepo", 3)
     resp = await _post_webhook(client, payload_bytes, "pull_request")
+    duplicate_resp = await _post_webhook(client, payload_bytes, "pull_request")
 
     assert resp.status_code == 200
+    assert duplicate_resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.context["_pr_changed_files"] == [
+        "backend/app/routers/github.py",
+        "backend/testing/test_github.py",
+    ]
+    assert task.context["_pr_changed_files_github_verified"] is True
+    assert "_backfill_checked_at" not in task.context
+    assert "_backfill_missing_diff_terminal_at" not in task.context
+    assert get_files_mock.await_count == 1
     # Task was already merged — rollup should NOT be triggered again
     rollup_mock.assert_not_called()
 
@@ -5478,4 +5507,3 @@ async def test_commit_file_changes_identical_tree_creates_no_empty_commit(mocker
 
     assert not any("/git/refs/heads/" in url for url in urls)
     assert not any("/git/refs/heads/" in url for url in urls)
-

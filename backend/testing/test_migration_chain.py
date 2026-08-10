@@ -1404,7 +1404,7 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_schema_head_chains_through_0740_localrunner_agent_source_sha():
+def test_schema_head_chains_through_0751_acceptance_healing_cleanup():
     """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
@@ -1419,7 +1419,13 @@ def test_schema_head_chains_through_0740_localrunner_agent_source_sha():
     - 0737 (cross-project perf indexes) revises 0736
     - 0738 (approved-activation control columns) revises 0737
     - 0739 (LocalRunner source identity) revises 0738
-    - 0740 (LocalRunner agent_source_sha) revises 0739 — current schema head
+    - 0740 (LocalRunner agent_source_sha) revises 0739
+    - 0741 (requeue origination checkpoint) revises 0740
+    - 0742 (origination reading cohort checkpoint) revises 0741
+    - 0743 (automatic origination taxonomy checkpoint) revises 0742
+    - 0744 (acceptance-healing sweep-run ledger) revises 0743
+    - 0750 (reserved acceptance-healing follow-up) revises 0744
+    - 0751 removes the unused acceptance-healing sweep-run ledger — current schema head
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1498,6 +1504,24 @@ def test_schema_head_chains_through_0740_localrunner_agent_source_sha():
     localrunner_source_sha = (
         versions_dir / "0740_localrunner_agent_source_sha.py"
     ).read_text()
+    requeue_origination = (
+        versions_dir / "0741_requeue_origination_checkpoint.py"
+    ).read_text()
+    origination_cohort = (
+        versions_dir / "0742_scope_origination_reading_cohort.py"
+    ).read_text()
+    automatic_origination = (
+        versions_dir / "0743_name_automatic_origination_classes.py"
+    ).read_text()
+    acceptance_healing_sweep_runs = (
+        versions_dir / "0744_acceptance_healing_sweep_runs.py"
+    ).read_text()
+    acceptance_healing_sweep_follow_up = (
+        versions_dir / "0750_acceptance_healing_sweep_runs.py"
+    ).read_text()
+    acceptance_healing_cleanup = (
+        versions_dir / "0751_drop_acceptance_healing_sweep_runs.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1547,10 +1571,27 @@ def test_schema_head_chains_through_0740_localrunner_agent_source_sha():
     # 0740 chains from 0739: durable LocalRunner agent_source_sha provenance.
     assert parse_revision_identifiers(localrunner_source_sha) == ("0740", "0739")
     assert '"agent_source_sha"' in localrunner_source_sha
+    # 0741 chains from 0740: requeue origination preservation checkpoint.
+    assert parse_revision_identifiers(requeue_origination) == ("0741", "0740")
+    assert parse_revision_identifiers(origination_cohort) == ("0742", "0741")
+    assert parse_revision_identifiers(automatic_origination) == ("0743", "0742")
+    assert parse_revision_identifiers(acceptance_healing_sweep_runs) == ("0744", "0743")
+    assert parse_revision_identifiers(acceptance_healing_sweep_follow_up) == (
+        "0750",
+        "0744",
+    )
+    assert parse_revision_identifiers(acceptance_healing_cleanup) == (
+        "0751",
+        "0750",
+    )
+    assert '"acceptancehealingsweeprun"' in acceptance_healing_sweep_runs
+    assert '"project_results"' in acceptance_healing_sweep_runs
+    assert 'op.drop_table("acceptancehealingsweeprun")' in acceptance_healing_cleanup
+    assert "op.create_table(" in acceptance_healing_cleanup
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0740", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0740', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0751", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0751', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

@@ -10,7 +10,6 @@ import {
   detectLinterKind,
   validateCfgShellSafety,
   isBlueprintSelfRepo,
-  projectVerificationDirectories,
   projectVerificationTargets,
   shouldRunBackendMergeGate,
   sanitizeCiFailureSelectors,
@@ -300,6 +299,16 @@ export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
 set -uo pipefail
 ${agentTokenFn}
 ${jsonFieldFn}
+# Receipt paths are derived once, before any early exit can bypass cleanup.
+# TASK_ID is the runtime identity when present; the generated task ID remains
+# the safe fallback for local/manual invocation.
+_VERIFY_TASK_ID="\${TASK_ID:-${cfg.taskId}}"
+_VERIFY_RECEIPT="/tmp/project_verification_receipt_\${_VERIFY_TASK_ID}.json"
+_VERIFY_HARNESS_RECEIPT="/tmp/backend_verification_harness_\${_VERIFY_TASK_ID}.json"
+if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT"; then
+  echo "[check] unable to remove prior verification receipt(s) — refusing to run" >&2
+  exit 1
+fi
 WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
@@ -324,7 +333,6 @@ done
 # config-driven pytest gate below only if this environment still cannot run
 # the suite faithfully. ./pr surfaces it after a passing \`./check test\`.
 rm -f /tmp/check_gate_env_${cfg.taskId}.txt
-${projectVerificationDirectories(cfg).length > 0 ? `rm -f /tmp/project_verification_receipt_${cfg.taskId}.json` : ''}
 
 # Determine changed paths: committed since base + uncommitted. Fail closed
 # when the base diff cannot be computed — a silently-empty CHANGED used to
