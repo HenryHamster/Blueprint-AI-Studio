@@ -14,15 +14,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_check_runs_static_guard_only_for_test_gate() -> None:
-    """The two-tree corpus is not paid for by lint/build-only checks."""
+    """The release guard is invoked only by the explicit test/merge gate."""
     source = (REPO_ROOT / "check").read_text()
+    release_block_start = source.index("# The database-free release guard corpus")
+    release_block_end = source.index("# Idempotent npm install", release_block_start)
+    release_block = source[release_block_start:release_block_end]
     guard_call = 'run "static release guards (task diff)" python3 scripts/static_release_guard.py'
-    guard_start = source.index(guard_call)
-    test_gate_start = source.rfind('if [ "$WITH_TESTS" = "1" ]; then', 0, guard_start)
-    assert test_gate_start >= 0
-    assert source.find(guard_call, test_gate_start) == guard_start
-    assert "--size-only --base \"$BASE\" --repo-root \"$PWD\"" in source
-    assert source.find("fi", guard_start) < source.find("# Idempotent npm install", guard_start)
+    assert 'if [ "$WITH_TESTS" = "1" ]; then' in release_block
+    assert guard_call in release_block
+    assert "--size-only" not in release_block
+    assert "static release guard deferred" in release_block
+    assert "refusing to skip the gate" in release_block
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -79,7 +81,7 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
     _git(tmp_path, "commit", "-m", "breach size cap")
 
     result = subprocess.run(
-        ["bash", str(tmp_path / "check")],
+        ["bash", str(tmp_path / "check"), "test"],
         cwd=tmp_path,
         env={**os.environ, "WORKSPACE": str(tmp_path)},
         capture_output=True,
