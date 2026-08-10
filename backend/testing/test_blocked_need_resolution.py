@@ -3042,8 +3042,10 @@ async def _create_project_with_caps(
                     "task_id": f"proof:{name}",
                     "proof_kind": "named_test",
                     "proof_ref": f"testing/test_{name}.py::test_{name}",
-                    "proved_at": "2026-07-16T00:00:00Z",
-                    "commit_sha": "a" * 40,
+                    # Freshness-graded downstream (coverage / trial-eligibility /
+                    # auto-graduation all default now→_utcnow()); keep within the
+                    # 30d TTL relative to real now, not a fixed absolute date.
+                    "proved_at": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
                 }
             ]
 

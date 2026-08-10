@@ -2462,6 +2462,7 @@ class TestSpawnGateAbsorbsAliasBypassClosed:
         proven in ledger) still clears the enforce gate. Positive regression guard:
         the fix must not break legitimate platform-recorded alias resolution."""
         from app.research_completion import spawn_capability_gate_disposition
+        from datetime import datetime, timedelta, timezone
 
         # Survivor has a machine-verified proof entry (recent timestamp — within TTL).
         proof_records = {
@@ -2470,7 +2471,10 @@ class TestSpawnGateAbsorbsAliasBypassClosed:
                     "task_id": str(uuid.uuid4()),
                     "proof_kind": "named_test",
                     "proof_ref": "testing/test_foo.py::test_ok",
-                    "proved_at": "2026-07-16T00:00:00Z",
+                    # consumer_gate_proof_status defaults now→_utcnow() (30d TTL);
+                    # the comment above already states "within TTL" — make the value
+                    # match that intent relative to real now instead of a fixed date.
+                    "proved_at": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
                 }
             ],
             **self._forwarding_marker(),
