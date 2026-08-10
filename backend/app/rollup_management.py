@@ -432,6 +432,16 @@ async def _stamp_child_commit_range(
 ) -> bool:
     """Stamp exact child-PR provenance when the rollup is landed."""
     if credentials is None:
+        from app.acceptance_provenance import (
+            ChangedFilesStampSkipReason,
+            stamp_changed_files_skip_reason,
+        )
+
+        context = dict(child.context or {})
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.github_credentials_unavailable
+        )
+        child.context = context
         return False
     try:
         from app.acceptance_criteria import stamp_rollup_child_commit_range

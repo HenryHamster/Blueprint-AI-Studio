@@ -81,6 +81,7 @@ from app.acceptance_window_invariants import (  # noqa: F401
 from app.acceptance_provenance import (
     COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
     PARENT_DERIVED_CHANGED_FILES_KEY,
+    PR_CHANGED_FILES_STAMP_SKIPPED_KEY,
     stamp_parent_derived_changed_files_signal as _stamp_parent_derived_signal,
     stamp_commit_range_derived_changed_files_signal as _stamp_commit_range_signal,
 )
@@ -1767,6 +1768,7 @@ _ACCEPTANCE_INPUT_CONTEXT_KEYS = (
     PARENT_DERIVED_CHANGED_FILES_KEY,
     COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
     "_pr_changed_files_provenance",
+    PR_CHANGED_FILES_STAMP_SKIPPED_KEY,
     ACCEPTANCE_TEST_CORROBORATED_KEY,
     TEST_COVERAGE_RESULT_KEY,
     "viewport_failure_screenshot_uri",

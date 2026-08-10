@@ -2420,19 +2420,28 @@ async def stamp_rollup_child_commit_range(
 
     ``review_target`` is written by the backend from the live PR before review
     or merge.  Comparing those immutable SHAs is exact child provenance even
-    though the child never owns the rollup parent's PR.  ``None`` from GitHub
-    means indeterminate and leaves the existing context untouched; an empty
-    list is authoritative proof of an empty child range and is therefore still
-    stamped.
+    though the child never owns the rollup parent's PR.  Indeterminate or
+    empty results remain fail-closed and are recorded on the task context.
     """
-    commit_range = _rollup_child_commit_range(task)
-    if commit_range is None:
-        return False
     from app.acceptance_gate import (
         PARENT_DERIVED_CHANGED_FILES_KEY,
         record_code_acceptance_verdict,
         stamp_commit_range_derived_changed_files_signal,
     )
+    from app.acceptance_provenance import (
+        ChangedFilesStampSkipReason,
+        PR_CHANGED_FILES_STAMP_SKIPPED_KEY,
+        stamp_changed_files_skip_reason,
+    )
+
+    context = dict(task.context or {})
+    commit_range = _rollup_child_commit_range(task)
+    if commit_range is None:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.child_pr_range_unavailable
+        )
+        task.context = context
+        return False
     from app.github_refs import get_files_changed_between_refs
 
     base_sha, head_sha = commit_range
@@ -2451,17 +2460,29 @@ async def stamp_rollup_child_commit_range(
             getattr(task, "id", None),
             exc_info=True,
         )
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.diff_fetch_failed
+        )
+        task.context = context
         return False
     if changed is None:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.no_diff_returned
+        )
+        task.context = context
         return False
 
-    context = dict(task.context or {})
     # ``dict.update`` cannot remove provenance from the previous stamp.  Clear
     # the legacy parent-derived sentinels on the task before applying the exact
     # child range, so the old union diff cannot continue to cap this verdict.
     context.pop(PARENT_DERIVED_CHANGED_FILES_KEY, None)
     context.pop("_pr_changed_files_truncated", None)
+    context.pop(PR_CHANGED_FILES_STAMP_SKIPPED_KEY, None)
     context.update(stamp_commit_range_derived_changed_files_signal(changed))
+    if not changed:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.empty_diff
+        )
     task.context = context
     record_code_acceptance_verdict(task)
     return True

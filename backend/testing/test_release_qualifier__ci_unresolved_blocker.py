@@ -4338,6 +4338,12 @@ async def test_acceptance_window_aggregate_all_verified(db_session):
     assert agg["acceptance_window_total"] == 2
     assert agg["acceptance_window_verified"] == 2
     assert agg["acceptance_window_fraction"] == pytest.approx(1.0)
+    assert len(agg["acceptance_window_task_records"]) == 2
+    assert all(
+        record["credited"] is True
+        and record["_pr_changed_files_stamp_skipped"] is None
+        for record in agg["acceptance_window_task_records"]
+    )
 
 
 @pytest.mark.asyncio
@@ -4369,6 +4375,7 @@ async def test_acceptance_window_aggregate_unsatisfied_excluded(db_session):
         status=TaskStatus.COMPLETED,
         context={
             "pr_merged": True,
+            "_pr_changed_files_stamp_skipped": "no_diff_returned",
             CODE_ACCEPTANCE_VERDICT_KEY: {
                 "satisfied": False,
                 "proven": False,
@@ -4385,6 +4392,13 @@ async def test_acceptance_window_aggregate_unsatisfied_excluded(db_session):
     assert agg["acceptance_window_total"] == 2
     assert agg["acceptance_window_verified"] == 1
     assert agg["acceptance_window_fraction"] == pytest.approx(0.5)
+    blocked_record = next(
+        record
+        for record in agg["acceptance_window_task_records"]
+        if record["task_id"] == str(task_blocked.id)
+    )
+    assert blocked_record["credited"] is False
+    assert blocked_record["_pr_changed_files_stamp_skipped"] == "no_diff_returned"
 
 
 @pytest.mark.asyncio

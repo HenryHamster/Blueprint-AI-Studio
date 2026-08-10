@@ -9974,6 +9974,7 @@ async def test_stamp_clears_stale_parent_derived_marker(db_session, mocker):
         PARENT_DERIVED_CHANGED_FILES_KEY,
         record_code_acceptance_verdict,
     )
+    from app.acceptance_provenance import PR_CHANGED_FILES_STAMP_SKIPPED_KEY
 
     project = await _make_project(db_session, name="ExactRangeReplacesParent")
     declared_test = "backend/testing/test_acceptance_criteria.py"
@@ -10041,8 +10042,80 @@ async def test_stamp_clears_stale_parent_derived_marker(db_session, mocker):
     assert "_pr_changed_files_truncated" not in context
     assert context.get(COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY) is True
     assert context.get("_pr_changed_files_github_verified") is True
+    assert PR_CHANGED_FILES_STAMP_SKIPPED_KEY not in context
     assert context[CODE_ACCEPTANCE_VERDICT_KEY]["satisfied"] is True
     assert context[CODE_ACCEPTANCE_VERDICT_KEY]["proven"] is True
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_changed_files_stamp_records_skip_reason(db_session, mocker):
+    """A skipped child stamp is durable, while a real stamp clears the cause."""
+    from app.acceptance_provenance import (
+        ChangedFilesStampSkipReason,
+        PR_CHANGED_FILES_STAMP_SKIPPED_KEY,
+    )
+
+    project = await _make_project(db_session, name="ChangedFilesStampReasons")
+    task = Task(
+        project_id=project.id,
+        title="rollup child without resolvable PR range",
+        payloads=[{"type": "create", "prompt": "child"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    assert await ac.stamp_rollup_child_commit_range(
+        task, gh_token="token", owner="owner", repo="repo"
+    ) is False
+    assert (task.context or {}).get(PR_CHANGED_FILES_STAMP_SKIPPED_KEY) == (
+        ChangedFilesStampSkipReason.child_pr_range_unavailable.value
+    )
+
+    task.context = {
+        **(task.context or {}),
+        "review_loop": {
+            "review_target": {"base_sha": "base", "head_sha": "head"}
+        },
+    }
+    mocker.patch(
+        "app.github_refs.get_files_changed_between_refs",
+        new_callable=AsyncMock,
+        return_value=["backend/app/widget.py"],
+    )
+    assert await ac.stamp_rollup_child_commit_range(
+        task, gh_token="token", owner="owner", repo="repo"
+    ) is True
+    assert PR_CHANGED_FILES_STAMP_SKIPPED_KEY not in (task.context or {})
+
+
+def test_acceptance_window_task_records_survive_strategic_compaction():
+    """Strategic reads retain the per-task changed-files cause, not only totals."""
+    from app.strategic_payload_compaction import _compact_last_qualification
+
+    compacted = _compact_last_qualification(
+        {
+            "sub_scores": {
+                "acceptance_window_task_records": [
+                    {
+                        "task_id": "task-1",
+                        "bucket": "declared_unsatisfied",
+                        "credited": False,
+                        "_pr_changed_files_stamp_skipped": "no_diff_returned",
+                    }
+                ]
+            }
+        }
+    )
+    assert compacted["sub_scores"]["acceptance_window_task_records"] == [
+        {
+            "task_id": "task-1",
+            "bucket": "declared_unsatisfied",
+            "credited": False,
+            "_pr_changed_files_stamp_skipped": "no_diff_returned",
+        }
+    ]
 
 
 @pytest.mark.asyncio

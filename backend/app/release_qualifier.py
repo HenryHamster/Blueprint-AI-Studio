@@ -65,6 +65,7 @@ from app.acceptance_criteria import (
     get_criteria_for_version,
     get_version_coverage_summary,
 )
+from app.acceptance_provenance import PR_CHANGED_FILES_STAMP_SKIPPED_KEY
 
 # Per-(sha, category) goal-verdict ledger (goal-verification redesign).  A SIBLING
 # module owns this file; it may not be present in every checkout during the
@@ -4494,6 +4495,7 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_declared_unsatisfied_reasons": dict, # split of the declared_unsatisfied bucket by reason (sums to buckets["declared_unsatisfied"])
         "acceptance_window_undeclared_task_ids": list,  # deterministic capped IDs in the undeclared bucket
         "acceptance_window_declared_unsatisfied_task_ids": list,  # deterministic capped IDs in the declared-unsatisfied bucket
+        "acceptance_window_task_records": list,  # one durable audit record per write task
         "acceptance_window_bucket_task_id_cap": int,  # shared cap for the two identity-evidence lists
         "acceptance_window_inferred_test_cochange": int,  # verified merges credited via inferred_test_cochange
         "acceptance_window_rederived_count": int,  # write-task verdicts re-derived under the current rule this drive (each task counted once)
@@ -4550,6 +4552,7 @@ async def _compute_acceptance_window_aggregate(
     _BUCKET_TASK_ID_CAP = 100
     undeclared_task_ids: list[str] = []
     declared_unsatisfied_task_ids: list[str] = []
+    task_records: list[dict[str, Any]] = []
     # Re-derivation pass (rung 3 of design doc c50453ef): a verdict frozen under
     # a RETIRED acceptance rule is re-derived from the task's persisted merge
     # record before classification, so an evidence-rule improvement landing
@@ -4732,6 +4735,23 @@ async def _compute_acceptance_window_aggregate(
                 classify_unsatisfied_reason(ctx.get(CODE_ACCEPTANCE_VERDICT_KEY))
             ] += 1
             declared_unsatisfied_task_ids.append(str(task.id))
+        task_records.append(
+            {
+                "task_id": str(task.id),
+                "bucket": bucket,
+                "credited": bucket
+                in {
+                    "proven",
+                    "satisfied_unproven",
+                    "inferred_test_cochange",
+                },
+                PR_CHANGED_FILES_STAMP_SKIPPED_KEY: (
+                    ctx.get(PR_CHANGED_FILES_STAMP_SKIPPED_KEY)
+                    if isinstance(ctx.get(PR_CHANGED_FILES_STAMP_SKIPPED_KEY), str)
+                    else None
+                ),
+            }
+        )
     verified = (
         buckets["proven"]
         + buckets["satisfied_unproven"]
@@ -4781,6 +4801,10 @@ async def _compute_acceptance_window_aggregate(
             declared_unsatisfied_task_ids
         )
         > _BUCKET_TASK_ID_CAP,
+        # Full per-task window enumeration: unlike the capped bucket identity
+        # lists above, this is the durable record used to audit every write task
+        # as either credited or carrying a stamp-skip cause.
+        "acceptance_window_task_records": task_records,
         "acceptance_window_bucket_task_id_cap": _BUCKET_TASK_ID_CAP,
         # Additive audit breakdown: how many verified merges were credited via the
         # inferred test-cochange path (undeclared merge, CI-verified, test+prod

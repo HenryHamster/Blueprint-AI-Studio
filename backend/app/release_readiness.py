@@ -620,6 +620,7 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "acceptance_window_buckets": _sub(verdict, "acceptance_window_buckets"),
         "acceptance_window_undeclared_reasons": _sub(verdict, "acceptance_window_undeclared_reasons"),
         "acceptance_window_declared_unsatisfied_reasons": _sub(verdict, "acceptance_window_declared_unsatisfied_reasons"),
+        "acceptance_window_task_records": _sub(verdict, "acceptance_window_task_records"),
         # Goal-alignment cert (additive; None on legacy rows predating migration 0328).
         "goal_alignment": verdict.goal_alignment,
         # Blind merge-grade cert (additive; None on legacy rows predating migration 0327).

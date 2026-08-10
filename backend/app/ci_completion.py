@@ -880,12 +880,40 @@ async def _attempt_merge_with_retry_and_escalation(
                             # simply falls back to the agent self-report on failure. Skip
                             # if an authoritative list is already present (idempotent
                             # re-processing / a real webhook delivery).
-                            if ci_pr_number and not (orig.context or {}).get(
+                            if not ci_pr_number:
+                                from app.acceptance_provenance import (
+                                    ChangedFilesStampSkipReason,
+                                    stamp_changed_files_skip_reason,
+                                )
+
+                                _missing_pr_ctx = dict(orig.context or {})
+                                stamp_changed_files_skip_reason(
+                                    _missing_pr_ctx,
+                                    ChangedFilesStampSkipReason.pr_number_unavailable,
+                                )
+                                orig.context = _missing_pr_ctx
+                            elif (orig.context or {}).get(
                                 "_pr_changed_files_github_verified"
                             ):
+                                from app.acceptance_provenance import (
+                                    ChangedFilesStampSkipReason,
+                                    stamp_changed_files_skip_reason,
+                                )
+
+                                _already_stamped_ctx = dict(orig.context or {})
+                                stamp_changed_files_skip_reason(
+                                    _already_stamped_ctx,
+                                    ChangedFilesStampSkipReason.already_stamped,
+                                )
+                                orig.context = _already_stamped_ctx
+                            else:
                                 try:
                                     from app.acceptance_gate import (
                                         stamp_changed_files_signal,
+                                    )
+                                    from app.acceptance_provenance import (
+                                        ChangedFilesStampSkipReason,
+                                        stamp_changed_files_skip_reason,
                                     )
                                     from app.github import get_pr_files
 
@@ -904,6 +932,9 @@ async def _attempt_merge_with_retry_and_escalation(
                                     ]
                                     if _file_paths:
                                         _gv_ctx = dict(orig.context or {})
+                                        _gv_ctx.pop(
+                                            "_pr_changed_files_stamp_skipped", None
+                                        )
                                         _gv_ctx.update(
                                             stamp_changed_files_signal(
                                                 _file_paths, github_verified=True
@@ -923,7 +954,20 @@ async def _attempt_merge_with_retry_and_escalation(
                                             orig.id,
                                             ci_pr_number,
                                         )
+                                    else:
+                                        _empty_diff_ctx = dict(orig.context or {})
+                                        stamp_changed_files_skip_reason(
+                                            _empty_diff_ctx,
+                                            ChangedFilesStampSkipReason.no_diff_returned,
+                                        )
+                                        orig.context = _empty_diff_ctx
                                 except Exception:
+                                    _failed_diff_ctx = dict(orig.context or {})
+                                    stamp_changed_files_skip_reason(
+                                        _failed_diff_ctx,
+                                        ChangedFilesStampSkipReason.diff_fetch_failed,
+                                    )
+                                    orig.context = _failed_diff_ctx
                                     logger.warning(
                                         "[CI-MERGE] get_pr_files failed for orig task "
                                         "%s (PR #%s); acceptance gate falls back to the "

@@ -319,6 +319,28 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
         if isinstance(value.get(source_key), list):
             out.setdefault(count_key, len(value[source_key]))
     sub_scores = _compact_scalar_mapping(value.get("sub_scores"), text_cap=text_cap)
+    raw_sub_scores = value.get("sub_scores")
+    raw_task_records = (
+        raw_sub_scores.get("acceptance_window_task_records")
+        if isinstance(raw_sub_scores, dict)
+        else None
+    )
+    if isinstance(raw_task_records, list):
+        sub_scores = sub_scores or {}
+        sub_scores["acceptance_window_task_records"] = [
+            {
+                key: row[key]
+                for key in (
+                    "task_id",
+                    "bucket",
+                    "credited",
+                    "_pr_changed_files_stamp_skipped",
+                )
+                if key in row
+            }
+            for row in raw_task_records
+            if isinstance(row, dict)
+        ]
     if sub_scores:
         out["sub_scores"] = sub_scores
     # Per-category grader verdicts — WHY each category is unmet. Bounded to the
