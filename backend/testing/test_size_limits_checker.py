@@ -212,6 +212,132 @@ def test_fix_bumps_and_adds_in_one_pass(tmp_path):
     assert _run(jp, repo, "--sections", "backend") == 0
 
 
+def test_fix_prunes_deleted_cap_and_its_ledger_history(tmp_path, mocker):
+    """A deleted source file is removed from both cap artifacts by ``--fix``."""
+    repo, jp = _build_repo(
+        tmp_path,
+        backend={"deleted.py": (20, 100), "ok.py": (20, 100)},
+    )
+    os.remove(os.path.join(repo, "backend", "app", "deleted.py"))
+    ledger_path = os.path.join(repo, "backend", "testing", "cap_bump_history.json")
+    with open(ledger_path, "w") as ledger_file:
+        json.dump(
+            {
+                "schema_version": 1,
+                "history": {
+                    "backend": {
+                        "deleted.py": [
+                            {
+                                "commit_sha": "unattributed",
+                                "commit_date": "2026-01-01T00:00:00+00:00",
+                                "old_cap": 50,
+                                "new_cap": 100,
+                            }
+                        ]
+                    }
+                },
+            },
+            ledger_file,
+        )
+    mocker.patch("app.size_limit_policy._git_reads_history_here", return_value=False)
+
+    assert _run(jp, repo, "--fix", "--sections", "backend") == 0
+
+    repaired = json.loads(_read(jp))
+    assert "deleted.py" not in repaired["backend"]
+    ledger = json.loads(_read(ledger_path))
+    assert "deleted.py" not in ledger["history"].get("backend", {})
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def _ledger_with_one_record(path: str) -> dict:
+    """Write a ledger holding a single backend/m.py bump record; return it."""
+    record = {
+        "commit_sha": "unattributed",
+        "commit_date": "2026-01-01T00:00:00+00:00",
+        "old_cap": 50,
+        "new_cap": 100,
+    }
+    with open(path, "w") as f:
+        json.dump(
+            {"schema_version": 1, "history": {"backend": {"m.py": [record]}}}, f
+        )
+    return record
+
+
+def test_rebuild_preserves_ledger_when_caps_json_unreadable(tmp_path, mocker):
+    """An unreadable caps file must never be read as "every cap was deleted".
+
+    The deleted-cap prune drops any ledger section whose key is absent from the
+    caps JSON.  If a failed read fell back to ``{}`` the prune would wipe the
+    ENTIRE ledger and hand every module a zero-prior-bumps history, disabling
+    chronic-offender classification.  Fail closed: preserve the mirror.
+    """
+    caps_path = str(tmp_path / "module_size_limits.json")
+    ledger_path = str(tmp_path / "cap_bump_history.json")
+    record = _ledger_with_one_record(ledger_path)
+
+    for git_available in (False, True):
+        # Malformed JSON (ValueError on parse).
+        with open(caps_path, "w") as f:
+            f.write("{ this is not json")
+        mocker.patch(
+            "app.size_limit_policy._git_reads_history_here",
+            return_value=git_available,
+        )
+        mocker.patch(
+            "app.size_limit_policy._git_history_is_truncated", return_value=False
+        )
+        mocker.patch(
+            "app.size_limit_policy.phantom_ledger_records", return_value=[]
+        )
+
+        ledger = slp.rebuild_cap_bump_history_ledger(
+            caps_json_path=caps_path, ledger_path=ledger_path
+        )
+        assert ledger["history"]["backend"]["m.py"] == [record], (
+            f"malformed caps JSON wiped the ledger (git_available={git_available})"
+        )
+        # And the preserved history is what actually landed on disk.
+        assert json.loads(_read(ledger_path))["history"]["backend"]["m.py"] == [record]
+
+        # Absent caps file (OSError on open) is the same class of failure.
+        os.remove(caps_path)
+        ledger = slp.rebuild_cap_bump_history_ledger(
+            caps_json_path=caps_path, ledger_path=ledger_path
+        )
+        assert ledger["history"]["backend"]["m.py"] == [record], (
+            f"missing caps JSON wiped the ledger (git_available={git_available})"
+        )
+        assert json.loads(_read(ledger_path))["history"]["backend"]["m.py"] == [record]
+
+
+def test_rebuild_still_prunes_deleted_cap_when_caps_json_readable(tmp_path, mocker):
+    """The fail-closed guard must not disable the prune on a readable caps file."""
+    caps_path = str(tmp_path / "module_size_limits.json")
+    ledger_path = str(tmp_path / "cap_bump_history.json")
+    _ledger_with_one_record(ledger_path)
+    with open(caps_path, "w") as f:
+        json.dump({"backend": {"other.py": 100}}, f)
+    mocker.patch("app.size_limit_policy._git_reads_history_here", return_value=False)
+
+    ledger = slp.rebuild_cap_bump_history_ledger(
+        caps_json_path=caps_path, ledger_path=ledger_path
+    )
+    assert "m.py" not in ledger["history"].get("backend", {})
+
+
+def test_check_reports_stale_cap_with_fix_remediation(tmp_path, capsys):
+    """Check mode names deleted cap records instead of treating them as clean."""
+    repo, jp = _build_repo(tmp_path, backend={"deleted.py": (20, 100)})
+    os.remove(os.path.join(repo, "backend", "app", "deleted.py"))
+
+    assert _run(jp, repo, "--sections", "backend") == 1
+    out = capsys.readouterr().out
+    assert "[stale-cap] backend/deleted.py" in out
+    assert "run with --fix" in out
+
+
 def test_fix_no_op_message_when_nothing_to_do(tmp_path, capsys):
     # No breach + no uncapped file => the no-op message the agent's loop keys on.
     repo, jp = _build_repo(tmp_path, backend={"ok.py": (50, 100)})
@@ -1006,6 +1132,296 @@ def test_fix_prunes_phantom_ledger_records(tmp_path, capsys, mocker):
     # The rebuild is invoked with the bumps applied by this fix (none here) so
     # pruning is the only operation.
     assert rebuilt.call_args.kwargs["pending"] == []
+
+
+def test_check_fails_on_absent_ledger_bump_record(tmp_path, capsys, mocker):
+    """A cap raise git proves happened with NO ledger record at all is real
+    drift — the deployed chronic-offender classifier would under-count bumps —
+    so the check must fail and name the remedy."""
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 100)})
+    mocker.patch(
+        "app.size_limit_policy.missing_ledger_bump_records",
+        return_value=[
+            (
+                "backend",
+                "m.py",
+                50,
+                100,
+                "deadbeef" * 5,
+                "2026-01-01T00:00:00+00:00",
+                slp.LEDGER_BUMP_ABSENT,
+            )
+        ],
+    )
+
+    assert _run(jp, repo, "--sections", "backend") == 1
+
+    out = capsys.readouterr().out
+    assert "[ledger-missing] backend/m.py: git records 50 -> 100" in out
+    assert "--fix" in out
+
+
+def test_check_does_not_fail_on_pending_ledger_attribution(tmp_path, capsys, mocker):
+    """A ledger record that HOLDS the bump but still carries the pre-commit
+    placeholder SHA is a pending attribution, not drift.
+
+    Every rollup auto-bump necessarily writes that placeholder (the commit SHA
+    cannot exist yet), so failing here would turn ``./check`` red for every
+    agent on every branch until an operator manually ran ``--fix``. It must be
+    reported as a reconcile hint with a non-zero-exit-free run, and the message
+    must NOT claim the ledger has 'no matching evidence' — it does.
+    """
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 100)})
+    mocker.patch(
+        "app.size_limit_policy.missing_ledger_bump_records",
+        return_value=[
+            (
+                "backend",
+                "m.py",
+                50,
+                100,
+                "deadbeef" * 5,
+                "2026-01-01T00:00:00+00:00",
+                slp.LEDGER_BUMP_UNATTRIBUTED,
+            )
+        ],
+    )
+
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+    out = capsys.readouterr().out
+    assert "[ledger-pending-attribution] backend/m.py" in out
+    assert "deadbeefdead" in out
+    # The inaccurate drift wording must not be used for a record that exists.
+    assert "[ledger-missing]" not in out
+    assert "has no matching evidence" not in out
+
+
+def test_fix_attributes_pending_ledger_placeholder(tmp_path, capsys, mocker):
+    """``--fix`` still repairs a pending attribution even though check-mode
+    treats it as non-fatal: the placeholder is upgraded with observed git
+    provenance, so the hint is self-healing rather than permanent noise."""
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 100)})
+    mocker.patch(
+        "app.size_limit_policy.missing_ledger_bump_records",
+        return_value=[
+            (
+                "backend",
+                "m.py",
+                50,
+                100,
+                "deadbeef" * 5,
+                "2026-01-01T00:00:00+00:00",
+                slp.LEDGER_BUMP_UNATTRIBUTED,
+            )
+        ],
+    )
+    rebuilt = mocker.patch("app.size_limit_policy.rebuild_cap_bump_history_ledger")
+
+    assert _run(jp, repo, "--fix", "--sections", "backend") == 0
+
+    assert "Attributed 1 pending cap-bump record(s)" in capsys.readouterr().out
+    rebuilt.assert_called_once()
+    # The six-field form is what upgrades an existing unattributed record.
+    assert rebuilt.call_args.kwargs["pending"] == [
+        (
+            "backend",
+            "m.py",
+            50,
+            100,
+            "deadbeef" * 5,
+            "2026-01-01T00:00:00+00:00",
+        )
+    ]
+
+
+def test_fix_restores_missing_git_recorded_ledger_bumps(tmp_path, capsys, mocker):
+    """``--fix`` rebuilds missing git evidence even without a cap breach."""
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 100)})
+    mocker.patch(
+        "app.size_limit_policy.missing_ledger_bump_records",
+        return_value=[
+            (
+                "backend",
+                "m.py",
+                50,
+                100,
+                "deadbeef" * 5,
+                "2026-01-01T00:00:00+00:00",
+                slp.LEDGER_BUMP_ABSENT,
+            )
+        ],
+    )
+    rebuilt = mocker.patch("app.size_limit_policy.rebuild_cap_bump_history_ledger")
+
+    assert _run(jp, repo, "--fix", "--sections", "backend") == 0
+
+    assert "Restored 1 git-recorded bump(s)" in capsys.readouterr().out
+    rebuilt.assert_called_once()
+    assert rebuilt.call_args.kwargs["pending"] == [
+        (
+            "backend",
+            "m.py",
+            50,
+            100,
+            "deadbeef" * 5,
+            "2026-01-01T00:00:00+00:00",
+        )
+    ]
+
+
+def test_missing_git_bump_reconciles_late_unattributed_placeholder(tmp_path):
+    """A placeholder written after its real commit is still reconciled."""
+    from datetime import datetime, timezone
+
+    repo = tmp_path / "repo"
+    _write_git_repo(repo, {"backend": {"m.py": 100}})
+    caps_path = repo / "backend" / "testing" / "module_size_limits.json"
+    limits = json.loads(caps_path.read_text())
+    # The diff parser tracks the cap on its own line, so normalize the compact
+    # fixture written by _write_git_repo before creating the baseline commit.
+    caps_path.write_text(json.dumps(limits, indent=2) + "\n")
+    baseline_env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": "2025-01-01T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2025-01-01T00:00:00+00:00",
+    }
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "--amend", "-m", "initial"],
+        check=True,
+        capture_output=True,
+        env=baseline_env,
+    )
+    limits["backend"]["m.py"] = 200
+    caps_path.write_text(json.dumps(limits, indent=2) + "\n")
+    commit_env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": "2025-02-01T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2025-02-01T00:00:00+00:00",
+    }
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "raise cap"],
+        check=True,
+        capture_output=True,
+        env=commit_env,
+    )
+
+    ledger_path = repo / "backend" / "testing" / "cap_bump_history.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "history": {
+                    "backend": {
+                        "m.py": [
+                            {
+                                "commit_sha": "unattributed",
+                                "commit_date": "2025-03-01T00:00:00+00:00",
+                                "old_cap": 100,
+                                "new_cap": 200,
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+    )
+
+    missing = slp.missing_ledger_bump_records(
+        repo_root=str(repo),
+        caps_json_path=str(caps_path),
+        ledger_path=str(ledger_path),
+    )
+
+    assert len(missing) == 1
+    section, key, old_cap, new_cap, commit_sha, commit_date, status = missing[0]
+    assert (section, key, old_cap, new_cap) == ("backend", "m.py", 100, 200)
+    assert len(commit_sha) == 40
+    assert datetime.fromisoformat(commit_date) == datetime(
+        2025, 2, 1, tzinfo=timezone.utc
+    )
+    # The ledger DOES hold this bump — only the provenance is pending, so the
+    # record must be classified as a reconcile hint and never as real drift.
+    assert status == slp.LEDGER_BUMP_UNATTRIBUTED
+
+
+def test_missing_git_bump_ignores_mainline_bump_absent_from_branch(tmp_path):
+    """A cap bump that landed on mainline AFTER this branch forked is not drift.
+
+    The branch does not contain the commit and so cannot hold the record.
+    Reporting it would fail ``check_size_limits.py`` — and therefore ``./check``
+    — on every branch that merely forked early, and ``--fix`` would write
+    mainline-owned records into each task branch's ledger.
+    """
+    repo = tmp_path / "repo"
+    _write_git_repo(repo, {"backend": {"m.py": 100}})
+    caps_path = repo / "backend" / "testing" / "module_size_limits.json"
+    limits = json.loads(caps_path.read_text())
+    # The diff parser tracks the cap on its own line, so normalize the compact
+    # fixture written by _write_git_repo before creating the baseline commit.
+    caps_path.write_text(json.dumps(limits, indent=2) + "\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "--amend", "-m", "initial")
+
+    # Fork the task branch BEFORE the mainline bump lands.
+    _git(repo, "branch", "task")
+
+    limits["backend"]["m.py"] = 200
+    caps_path.write_text(json.dumps(limits, indent=2) + "\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "mainline raises cap")
+
+    ledger_path = repo / "backend" / "testing" / "cap_bump_history.json"
+    ledger_path.write_text(json.dumps({"history": {"backend": {"m.py": []}}}))
+
+    # On mainline itself the bump IS the branch's own drift — proves the guard
+    # still fires, so the branch-side assertion below is not vacuous.
+    assert (
+        len(
+            slp.missing_ledger_bump_records(
+                repo_root=str(repo),
+                caps_json_path=str(caps_path),
+                ledger_path=str(ledger_path),
+            )
+        )
+        == 1
+    )
+
+    _git(repo, "checkout", "-q", "task")
+    # The task branch's working tree predates the bump; the mainline ref (and
+    # therefore the git-side evidence) still carries it.
+    caps_path.write_text(json.dumps(limits, indent=2) + "\n")
+
+    assert (
+        slp.missing_ledger_bump_records(
+            repo_root=str(repo),
+            caps_json_path=str(caps_path),
+            ledger_path=str(ledger_path),
+        )
+        == []
+    )
+
+
+def test_fix_rolls_back_caps_when_ledger_rebuild_fails(tmp_path, mocker, capsys):
+    """A failed ledger repair cannot leave a successful-looking cap bump."""
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (1720, 1600)})
+    mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[])
+    mocker.patch(
+        "app.size_limit_policy.rebuild_cap_bump_history_ledger",
+        side_effect=RuntimeError("ledger unavailable"),
+    )
+
+    assert _run(jp, repo, "--fix", "--sections", "backend") == 1
+
+    limits = json.loads(_read(jp))
+    assert limits["backend"]["big.py"] == 1600
+    assert not os.path.exists(os.path.join(os.path.dirname(jp), "cap_bump_history.json"))
+    assert "rolled back" in capsys.readouterr().out
 
 
 def _git(repo_root, *args):

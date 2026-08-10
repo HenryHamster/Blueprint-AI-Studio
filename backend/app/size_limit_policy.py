@@ -119,6 +119,114 @@ def bump_size_limit(
     return min(proposed, governing_cap)
 
 
+class GoverningCap(TypedDict):
+    """A source-declared cap that must move with its JSON counterpart."""
+
+    source_path: str
+    constant_name: str
+
+
+class GoverningCapRepair(TypedDict):
+    """The complete paired-source edit required for a governed cap repair."""
+
+    source_path: str
+    constant_name: str
+    new_limit: int
+
+
+# Most modules use the generic headroom policy above.  A small number are
+# deliberately governed more tightly in their source module as well as in the
+# JSON guardrail.  Keep this mapping explicit: both repair paths consume it,
+# which prevents a future caller from silently applying the generic 15% rule to
+# a module whose governance contract says otherwise.
+_GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
+    (
+        "backend",
+        "release_qualifier.py",
+    ): GoverningCap(
+        source_path="backend/app/release_qualifier.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+}
+
+
+def governing_cap_source_path(section: str, module_key: str) -> str | None:
+    """Return the source path whose cap constant must move, if any."""
+    governing = _GOVERNING_CAPS.get((section, module_key))
+    return governing["source_path"] if governing else None
+
+
+def governing_cap_repair(
+    section: str, module_key: str, new_limit: int
+) -> GoverningCapRepair | None:
+    """Return the source-constant edit paired with a governed JSON cap bump.
+
+    API callers use this complete instruction to keep the agent-facing repair
+    contract coherent: governed modules must update both the JSON cap and the
+    declared source constant in the same task.
+    """
+    governing = _GOVERNING_CAPS.get((section, module_key))
+    if governing is None:
+        return None
+    return GoverningCapRepair(
+        source_path=governing["source_path"],
+        constant_name=governing["constant_name"],
+        new_limit=new_limit,
+    )
+
+
+def rewrite_governing_cap_constant(
+    section: str, module_key: str, source_text: str, new_cap: int
+) -> str:
+    """Return ``source_text`` with its declared governing constant updated.
+
+    A mismatch is a governance configuration error, not permission to update
+    only the JSON cap, so this fails closed rather than writing incoherent
+    artifacts.  Callers use the result in the same staged write / Git commit as
+    the cap JSON and history ledger.
+    """
+    governing = _GOVERNING_CAPS.get((section, module_key))
+    if governing is None:
+        return source_text
+    constant = re.escape(governing["constant_name"])
+    pattern = re.compile(
+        rf"^(?P<prefix>{constant}\s*:\s*int\s*=\s*)\d+(?P<suffix>\s*(?:#.*)?)$",
+        re.MULTILINE,
+    )
+    rewritten, replacements = pattern.subn(
+        rf"\g<prefix>{new_cap}\g<suffix>", source_text
+    )
+    if replacements != 1:
+        raise ValueError(
+            f"governing cap constant {governing['constant_name']} for "
+            f"{section}/{module_key} must occur exactly once (found {replacements})"
+        )
+    return rewritten
+
+
+def prune_ledger_for_current_caps(ledger_data: dict, caps_data: dict) -> dict:
+    """Drop ledger history for cap keys that no longer exist in ``caps_data``.
+
+    Deleting a source file must remove both its cap and its obsolete historical
+    evidence.  This works even in a shallow checkout, where a full git-ledger
+    rebuild deliberately preserves existing records.
+    """
+    result = dict(ledger_data) if isinstance(ledger_data, dict) else {}
+    history: dict[str, dict] = {}
+    raw_history = result.get("history") or {}
+    for section, records in raw_history.items():
+        if not isinstance(records, dict):
+            continue
+        current = caps_data.get(section)
+        if not isinstance(current, dict):
+            continue
+        kept = {key: value for key, value in records.items() if key in current}
+        if kept:
+            history[section] = kept
+    result["history"] = history
+    return result
+
+
 def is_breach(count: int | None, cap: int | None) -> bool:
     """True when ``count`` breaches ``cap`` — the guardrail's fundamental predicate.
 
@@ -173,6 +281,26 @@ class BumpHistoryUnavailableError(Exception):
 # cannot be known while the tree is being assembled.  This explicit marker
 # replaces the old empty-string record and is never eligible for pruning.
 UNATTRIBUTED_COMMIT_SHA = "unattributed"
+
+# Statuses returned by :func:`missing_ledger_bump_records`.  The two cases carry
+# very different severity and MUST NOT be collapsed:
+#
+# ``LEDGER_BUMP_ABSENT``
+#     The ledger holds no record at all for a cap raise that HEAD's own ancestry
+#     proves happened.  That is genuine ledger drift — the deployed backend's
+#     chronic-offender classification is missing a bump it should count — and is
+#     a legitimate hard failure.
+# ``LEDGER_BUMP_UNATTRIBUTED``
+#     The ledger DOES hold a matching record for the pair, but it still carries
+#     the ``UNATTRIBUTED_COMMIT_SHA`` (or legacy empty-string) placeholder that
+#     :func:`ledger_with_pending_bumps` necessarily writes when the bump is
+#     staged before its commit exists.  The bump is recorded and counted; only
+#     the provenance is pending.  This is a normal, self-inflicted consequence
+#     of every rollup auto-bump, so it is a reconcile HINT, never a hard failure
+#     — otherwise each auto-bump would turn ``./check`` red fleet-wide until an
+#     operator manually ran ``--fix``.
+LEDGER_BUMP_ABSENT = "absent"
+LEDGER_BUMP_UNATTRIBUTED = "unattributed_placeholder"
 
 
 # Module-level TTL cache: (module_key, section) -> (outcome, monotonic_time)
@@ -518,33 +646,52 @@ def _read_cap_bump_history_ledger(section: str, module_key: str) -> list[BumpRec
 
 
 def ledger_with_pending_bumps(
-    ledger_data: dict, pending: list[tuple[str, str, int, int]]
+    ledger_data: dict,
+    pending: list[
+        tuple[str, str, int, int]
+        | tuple[str, str, int, int, str, str]
+    ],
 ) -> dict:
-    """Return a copy of ``ledger_data`` with ``pending`` bumps appended.
+    """Return a copy of ``ledger_data`` with ``pending`` bumps reconciled.
 
-    ``pending`` entries are ``(section, key, old_cap, new_cap)`` — cap bumps
-    not yet in the committed history (an uncommitted ``--fix`` bump, or a rollup
-    auto-bump about to be committed).  They are recorded with the explicit
-    ``UNATTRIBUTED_COMMIT_SHA`` marker; an empty ``commit_sha`` is never
-    appended.  Records already present for the same (key, old_cap, new_cap) are
-    not duplicated, so a retried rollup cycle (or a regenerated ``--fix``) is
-    idempotent. A later complete-history regeneration can replace the marker
-    with the actual commit SHA.
+    Four-field entries represent an uncommitted bump and receive the explicit
+    ``UNATTRIBUTED_COMMIT_SHA`` marker. Six-field entries add observed git
+    provenance for an already-committed bump; that SHA/date is preserved and
+    upgrades an existing unattributed record for the same cap pair.
     """
     result = dict(ledger_data) if isinstance(ledger_data, dict) else {}
     history: dict = {}
     for section, section_data in (result.get("history") or {}).items():
         history[section] = dict(section_data) if isinstance(section_data, dict) else {}
     now_iso = datetime.now(timezone.utc).isoformat()
-    for section, key, old_cap, new_cap in pending:
+    for item in pending:
+        if len(item) == 4:
+            section, key, old_cap, new_cap = item
+            commit_sha = UNATTRIBUTED_COMMIT_SHA
+            commit_date = now_iso
+        elif len(item) == 6:
+            section, key, old_cap, new_cap, commit_sha, commit_date = item
+        else:
+            raise ValueError(f"pending cap bump must contain 4 or 6 fields: {item!r}")
         section_records = history.setdefault(section, {})
         records = list(section_records.get(key) or [])
-        known = {(r.get("old_cap"), r.get("new_cap")) for r in records}
-        if (old_cap, new_cap) not in known:
+        matching = [
+            record
+            for record in records
+            if record.get("old_cap") == old_cap and record.get("new_cap") == new_cap
+        ]
+        if matching:
+            if len(item) == 6 and matching[0].get("commit_sha") in {
+                "",
+                UNATTRIBUTED_COMMIT_SHA,
+            }:
+                matching[0]["commit_sha"] = commit_sha
+                matching[0]["commit_date"] = commit_date
+        else:
             records.append(
                 {
-                    "commit_sha": UNATTRIBUTED_COMMIT_SHA,
-                    "commit_date": now_iso,
+                    "commit_sha": commit_sha,
+                    "commit_date": commit_date,
                     "old_cap": old_cap,
                     "new_cap": new_cap,
                 }
@@ -559,7 +706,10 @@ def rebuild_cap_bump_history_ledger(
     *,
     caps_json_path: str | None = None,
     ledger_path: str | None = None,
-    pending: list[tuple[str, str, int, int]] | None = None,
+    pending: list[
+        tuple[str, str, int, int]
+        | tuple[str, str, int, int, str, str]
+    ] | None = None,
 ) -> dict:
     """Regenerate the cap-bump-history ledger and write it; return the dict.
 
@@ -626,12 +776,21 @@ def rebuild_cap_bump_history_ledger(
         if result is not None and result.returncode == 0:
             git_output = result.stdout
 
-    if git_output is not None:
-        try:
-            with open(caps_path, encoding="utf-8") as f:
-                caps_data = json.load(f)
-        except (OSError, ValueError):
-            caps_data = {}
+    # The caps JSON is read ONCE, and whether the read succeeded is tracked
+    # separately from its contents: "the caps file could not be read" must never
+    # be mistaken for "no caps exist".  An unreadable/malformed caps file makes
+    # both the git regeneration and the deleted-cap prune below unable to tell a
+    # current key from a deleted one, so both are skipped and the existing
+    # mirror is preserved (fail-closed).
+    try:
+        with open(caps_path, encoding="utf-8") as f:
+            caps_data = json.load(f)
+        caps_readable = True
+    except (OSError, ValueError):
+        caps_data = {}
+        caps_readable = False
+
+    if git_output is not None and caps_readable:
         caps_keys: dict[str, set[str]] = {}
         git_histories: dict[str, dict[str, list[BumpRecord]]] = {}
         for section, keys in caps_data.items():
@@ -653,9 +812,20 @@ def rebuild_cap_bump_history_ledger(
         else:
             base_history = git_histories
     else:
-        # git entirely unavailable, or the checkout is truncated — preserve the
-        # existing mirror (a truncated ``git log`` must never truncate it).
+        # git entirely unavailable, the checkout is truncated, or the caps JSON
+        # is unreadable — preserve the existing mirror (a truncated ``git log``,
+        # like an unreadable caps file, must never truncate it).
         base_history = existing_history
+
+    # A deleted cap has no future breach to classify.  Prune its mirror record
+    # before any merge-preservation logic can carry it forward in a shallow
+    # checkout.  Only ever prune against caps we actually read: an unreadable
+    # caps file would otherwise look like "every cap was deleted" and wipe the
+    # whole ledger.
+    if caps_readable:
+        base_history = prune_ledger_for_current_caps(
+            {"history": base_history}, caps_data
+        )["history"]
 
     if git_available:
         # Self-heal: prune ledger records positive mainline evidence proves
@@ -693,6 +863,190 @@ def rebuild_cap_bump_history_ledger(
         json.dump(ledger, f, indent=2, ensure_ascii=True)
         f.write("\n")
     return ledger
+
+
+def _head_reachable_cap_commits(repo_root: str) -> set[str] | None:
+    """Return the caps-file commits in ``HEAD``'s own ancestry.
+
+    Mainline moves on while a task branch is open, so a cap bump that landed on
+    automain *after* the branch forked is genuinely absent from the branch's
+    ledger — the branch does not contain the commit and cannot have the record.
+    Scoping the git->ledger comparison to this set is what separates real ledger
+    drift (a bump the branch DOES contain but never mirrored) from ordinary
+    branch/mainline skew, which must never turn the guard red.
+
+    Returns ``None`` when the ancestry cannot be determined; callers treat that
+    as "prove nothing" rather than risking a false breach.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "rev-list",
+                "HEAD",
+                "--",
+                _MODULE_SIZE_LIMITS_RELPATH,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=repo_root,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def missing_ledger_bump_records(
+    *,
+    repo_root: str | None = None,
+    caps_json_path: str | None = None,
+    ledger_path: str | None = None,
+) -> list[tuple[str, str, int, int, str, str, str]]:
+    """Return cap raises in HEAD's own ancestry the ledger does not fully record.
+
+    This is the forward half of ledger coherence (git -> ledger).  A shallow
+    history is still useful here: every bump it *does* expose is positive
+    evidence that the mirror must contain the pair.  Callers preserve the
+    existing ledger and append only these proven pairs, never treating absent
+    shallow history as permission to delete an older record.
+
+    Only bumps whose commit is reachable from ``HEAD`` are reported.  A mainline
+    bump that landed after this branch forked is not drift the branch can fix —
+    reporting it would fail ``check_size_limits.py`` (and therefore ``./check``)
+    on every branch that merely forked early, and the ``--fix`` remediation
+    would write mainline-owned records into each task branch's ledger.
+
+    Each entry is ``(section, key, old_cap, new_cap, commit_sha, commit_date,
+    status)`` where ``status`` is :data:`LEDGER_BUMP_ABSENT` (no ledger record
+    for the pair at all — real drift, safe for a caller to fail on) or
+    :data:`LEDGER_BUMP_UNATTRIBUTED` (a matching record exists but still holds
+    the pre-commit placeholder SHA — only the provenance is pending, so callers
+    must treat it as a reconcile hint, NOT a failure).  Both statuses are
+    repairable by the same ``--fix`` rebuild; they differ only in severity.
+    Collapsing them is what made every rollup auto-bump break ``./check``
+    fleet-wide until an operator manually reconciled the ledger.
+    """
+    root = repo_root or _REPO_ROOT
+    caps_path = caps_json_path or _MODULE_SIZE_LIMITS_PATH
+    out_path = ledger_path or _CAP_BUMP_HISTORY_LEDGER_PATH
+    if shutil.which("git") is None or not os.path.isdir(os.path.join(root, ".git")):
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={root}",
+                "log",
+                _mainline_git_ref(root),
+                "--format=COMMIT %H %aI",
+                "-p",
+                "--",
+                _MODULE_SIZE_LIMITS_RELPATH,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=root,
+        )
+        if result.returncode != 0:
+            return []
+        with open(caps_path, encoding="utf-8") as caps_file:
+            caps_data = json.load(caps_file)
+        with open(out_path, encoding="utf-8") as ledger_file:
+            ledger_data = json.load(ledger_file)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+    # Restrict the mainline evidence to this checkout's own ancestry.  Without
+    # this, a bump merged to mainline after the branch forked reads as ledger
+    # drift the branch caused, and the guard goes red on unrelated work.
+    reachable = _head_reachable_cap_commits(root)
+    if reachable is None:
+        return []
+
+    history = ledger_data.get("history", {}) if isinstance(ledger_data, dict) else {}
+    global_start = min(
+        (
+            _parse_iso(record["commit_date"])
+            for sections in history.values()
+            if isinstance(sections, dict)
+            for records in sections.values()
+            if isinstance(records, list)
+            for record in records
+            if isinstance(record, dict) and record.get("commit_date")
+        ),
+        default=None,
+    )
+    missing: list[tuple[str, str, int, int, str, str, str]] = []
+    for section, keys in caps_data.items():
+        if not isinstance(keys, dict):
+            continue
+        section_history = history.get(section, {}) if isinstance(history, dict) else {}
+        for key in keys:
+            records = section_history.get(key, []) if isinstance(section_history, dict) else []
+            window_start = min(
+                (
+                    _parse_iso(record["commit_date"])
+                    for record in records
+                    if isinstance(record, dict) and record.get("commit_date")
+                ),
+                default=global_start,
+            )
+            for record in _parse_git_diff_output(result.stdout, key):
+                if record["commit_sha"] not in reachable:
+                    # Mainline-only bump: this branch does not contain the
+                    # commit, so its ledger cannot be expected to record it.
+                    continue
+                pair = (record["old_cap"], record["new_cap"])
+                matching_records = [
+                    ledger_record
+                    for ledger_record in records
+                    if (
+                        ledger_record.get("old_cap"),
+                        ledger_record.get("new_cap"),
+                    )
+                    == pair
+                ]
+                if matching_records and matching_records[0].get("commit_sha") not in {
+                    "",
+                    UNATTRIBUTED_COMMIT_SHA,
+                }:
+                    continue
+                # A matching unattributed pair is exactly the record that must
+                # be upgraded with the git provenance we just observed.  Its
+                # placeholder date may have been written after the real
+                # mainline commit, so the ordinary per-key timestamp window
+                # must not hide that pair from reconciliation.
+                if (
+                    not matching_records
+                    and window_start is not None
+                    and _parse_iso(record["commit_date"]) < window_start
+                ):
+                    continue
+                # The bump IS in the ledger whenever a matching pair exists —
+                # only its provenance is still the pre-commit placeholder, so
+                # this is a pending attribution rather than missing evidence.
+                status = (
+                    LEDGER_BUMP_UNATTRIBUTED if matching_records else LEDGER_BUMP_ABSENT
+                )
+                missing.append(
+                    (
+                        section,
+                        key,
+                        record["old_cap"],
+                        record["new_cap"],
+                        record["commit_sha"],
+                        record["commit_date"],
+                        status,
+                    )
+                )
+    return missing
 
 
 def _git_would_drop_ledger_records(

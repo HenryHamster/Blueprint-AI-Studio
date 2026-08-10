@@ -1117,12 +1117,6 @@
           "commit_date": "2026-07-12T18:13:52Z",
           "old_cap": 3350,
           "new_cap": 3900
-        },
-        {
-          "commit_sha": "b339eed08d4a0d14078cebe5dc5898a4822e8d21",
-          "commit_date": "2026-08-07T08:50:56+00:00",
-          "old_cap": 3900,
-          "new_cap": 4550
         }
       ],
       "autonomous_research_residual.py": [
@@ -1641,8 +1635,8 @@
       ],
       "admin_task_approvals.py": [
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-09T00:00:00Z",
+          "commit_sha": "7495cc488c6d99bd2b90ef884030ce297e2b888e",
+          "commit_date": "2026-08-09T13:12:29+00:00",
           "old_cap": 850,
           "new_cap": 900
         }
@@ -1991,8 +1985,8 @@
           "new_cap": 2350
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-10T01:42:55.221349+00:00",
+          "commit_sha": "0a895b359d4b79b99a4bbdfab29b8a8275750f9a",
+          "commit_date": "2026-08-10T01:45:48+00:00",
           "old_cap": 2350,
           "new_cap": 2750
         }
@@ -2263,12 +2257,6 @@
           "commit_date": "2026-06-14T22:47:48Z",
           "old_cap": 1850,
           "new_cap": 2250
-        },
-        {
-          "commit_sha": "b339eed08d4a0d14078cebe5dc5898a4822e8d21",
-          "commit_date": "2026-08-07T08:50:56+00:00",
-          "old_cap": 2250,
-          "new_cap": 2650
         }
       ],
       "problem_model.py": [
@@ -2423,8 +2411,8 @@
           "new_cap": 3050
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-10T01:42:55.221349+00:00",
+          "commit_sha": "0a895b359d4b79b99a4bbdfab29b8a8275750f9a",
+          "commit_date": "2026-08-10T01:45:48+00:00",
           "old_cap": 3050,
           "new_cap": 3600
         }
@@ -3073,10 +3061,18 @@
       ],
       "findings_index.py": [
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-07T01:50:14.895345+00:00",
+          "commit_sha": "fc53ffddfe3ecb831590a1affe255fd66ff3e18c",
+          "commit_date": "2026-08-10T08:54:59+00:00",
           "old_cap": 350,
           "new_cap": 600
+        }
+      ],
+      "size_limit_policy.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-10T09:45:21.125596+00:00",
+          "old_cap": 1750,
+          "new_cap": 2050
         }
       ]
     },
@@ -4123,16 +4119,16 @@
           "new_cap": 13650
         },
         {
-          "commit_sha": "6a2dd99fb12ba581bca7c4e9a7f3de144a6ccca8",
-          "commit_date": "2026-08-09T23:04:28+00:00",
-          "old_cap": 13650,
-          "new_cap": 15750
-        },
-        {
           "commit_sha": "bb0cc18d939a9e67428a8220be5d6df23c82b18b",
           "commit_date": "2026-08-10T00:15:43+00:00",
           "old_cap": 13650,
           "new_cap": 15800
+        },
+        {
+          "commit_sha": "6a2dd99fb12ba581bca7c4e9a7f3de144a6ccca8",
+          "commit_date": "2026-08-09T23:04:28+00:00",
+          "old_cap": 13650,
+          "new_cap": 15750
         }
       ],
       "test_ci_completion.py": [
@@ -4207,44 +4203,6 @@
           "commit_date": "2026-08-07T11:43:39Z",
           "old_cap": 2050,
           "new_cap": 2450
-        }
-      ],
-      "test_release_qualifier.py": [
-        {
-          "commit_sha": "51a452b37719037d18b096d08223381cffc80e4e",
-          "commit_date": "2026-07-22T22:55:53Z",
-          "old_cap": 400,
-          "new_cap": 52500
-        },
-        {
-          "commit_sha": "1932872da487ff054f0d763550bc2709154d95c9",
-          "commit_date": "2026-08-04T20:22:27-07:00",
-          "old_cap": 879,
-          "new_cap": 1100
-        },
-        {
-          "commit_sha": "56d870a7f2ccf7ff8b1287d9bbc1c4c911f0ad9e",
-          "commit_date": "2026-08-04T20:45:25-07:00",
-          "old_cap": 1100,
-          "new_cap": 1500
-        },
-        {
-          "commit_sha": "fb71fe7bf89e8b1751eab293da04d376d6f92865",
-          "commit_date": "2026-08-05T14:14:50Z",
-          "old_cap": 1500,
-          "new_cap": 1900
-        },
-        {
-          "commit_sha": "56155adb01fed84f8fe19a0e6fcbe267ed20dcff",
-          "commit_date": "2026-08-06T01:59:39Z",
-          "old_cap": 1900,
-          "new_cap": 2350
-        },
-        {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T09:54:02.855012+00:00",
-          "old_cap": 2350,
-          "new_cap": 2850
         }
       ],
       "test_operator_inbox_liveness.py": [

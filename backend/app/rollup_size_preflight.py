@@ -36,7 +36,13 @@ from app.github import (
     get_pr_files,
 )
 from app.json_extract import async_json_loads
-from app.size_limit_policy import classify_breach, ledger_with_pending_bumps
+from app.size_limit_policy import (
+    classify_breach,
+    governing_cap_source_path,
+    ledger_with_pending_bumps,
+    prune_ledger_for_current_caps,
+    rewrite_governing_cap_constant,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +100,7 @@ _SECTION_PREFIXES: dict[str, str] = {
     "backend": "backend/app/",
     "agent": "agent/src/",
     "frontend": "admin-ui/src/",
+    "testing": "backend/testing/",
 }
 
 
@@ -191,6 +198,20 @@ async def preflight_rollup_size_caps(
     }
     changed_paths: set[str] = set(pr_file_status)
 
+    # A cap is only meaningful while its file exists.  Track removals across
+    # every static-guarded section (including backend/testing) so this repair
+    # is committed through the same CAS-protected preflight as cap bumps.
+    removed_caps: list[tuple[str, str]] = []
+    for section, prefix in _SECTION_PREFIXES.items():
+        section_caps = caps_data.get(section)
+        if not isinstance(section_caps, dict):
+            continue
+        removed_caps.extend(
+            (section, key)
+            for key in section_caps
+            if pr_file_status.get(prefix + key) == "removed"
+        )
+
     # 3. For each capped file that appears in the rollup, fetch content at the
     #    staging-branch tip and check against its cap.
     breaches: list[tuple[str, str, int, int, int]] = []  # (section, key, count, cap, new_cap)
@@ -206,7 +227,7 @@ async def preflight_rollup_size_caps(
             full_path = prefix + key
             if full_path not in changed_paths:
                 continue
-            # Deleted files no longer exist at the staging tip — skip intentionally.
+            # The removal is repaired below by pruning both cap and ledger.
             if pr_file_status.get(full_path) == "removed":
                 continue
             try:
@@ -298,15 +319,17 @@ async def preflight_rollup_size_caps(
         )
         return ("hold", f"chronic offender(s) require decomposition: {names}")
 
-    if not breaches:
+    if not breaches and not removed_caps:
         return ("ok", None)
 
-    summary = "; ".join(
+    summary_parts = [
         f"{key}: {old_cap} -> {new_cap}"
         for _section, key, _count, old_cap, new_cap in breaches
-    )
+    ]
+    summary_parts.extend(f"remove {section}/{key}" for section, key in removed_caps)
+    summary = "; ".join(summary_parts)
 
-    if not commit_bump:
+    if breaches and not commit_bump:
         # Caller has exhausted the auto-bump budget — report a hold so the
         # caller can require manual approval without performing another commit.
         logger.warning(
@@ -317,16 +340,17 @@ async def preflight_rollup_size_caps(
         )
         return ("hold", f"auto-bump budget exhausted; breach: {summary}")
 
-    # 4. Write bumped caps into a copy of the parsed JSON and commit.
+    # 4. Write repaired caps into a copy of the parsed JSON and commit.
     updated: dict = dict(caps_data)
+    for section, key in removed_caps:
+        updated[section] = dict(updated.get(section, {}))
+        updated[section].pop(key, None)
     for section, key, _count, _old_cap, new_cap in breaches:
         updated[section] = dict(updated.get(section, {}))
         updated[section][key] = new_cap
 
     updated_json = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
-    commit_msg = (
-        f"auto-bump module size caps for rollup PR #{rollup_pr_number}: {summary}"
-    )
+    commit_msg = f"auto-repair module size caps for rollup PR #{rollup_pr_number}: {summary}"
 
     # Keep the committed cap-bump-history ledger in sync: the deployed backend
     # reads the ledger (not git), so an auto-bump must be recorded there too or
@@ -336,6 +360,32 @@ async def preflight_rollup_size_caps(
     # transient read failure defers the whole bump so the mirror never goes
     # stale silently.
     upserts: dict[str, str] = {_CAPS_JSON_PATH: updated_json}
+    # A governed cap is declared in its source module too.  Fetch and rewrite
+    # it before attempting the commit; an absent or malformed declaration
+    # defers the entire repair instead of committing a JSON-only cap drift.
+    for section, key, _count, _old_cap, new_cap in breaches:
+        source_path = governing_cap_source_path(section, key)
+        if source_path is None:
+            continue
+        try:
+            source_text = await get_file_text_at_ref(
+                source_path,
+                token=gh_token,
+                owner=owner,
+                repo=repo,
+                ref=observed_head_sha,
+                project_id=project_id,
+            )
+        except Exception as exc:
+            return ("defer", f"could not fetch governing cap source {source_path}: {exc}")
+        if source_text is None:
+            return ("defer", f"governing cap source {source_path} was unreadable")
+        try:
+            upserts[source_path] = rewrite_governing_cap_constant(
+                section, key, source_text, new_cap
+            )
+        except ValueError as exc:
+            return ("hold", f"invalid governing cap declaration in {source_path}: {exc}")
     try:
         ledger_text = await get_file_text_at_ref(
             _CAP_BUMP_HISTORY_LEDGER_RELPATH,
@@ -390,6 +440,7 @@ async def preflight_rollup_size_caps(
             (section, key, cap, new_cap)
             for section, key, _count, cap, new_cap in breaches
         ]
+        ledger_data = prune_ledger_for_current_caps(ledger_data, updated)
         ledger_data = ledger_with_pending_bumps(ledger_data, pending)
         upserts[_CAP_BUMP_HISTORY_LEDGER_RELPATH] = (
             json.dumps(ledger_data, indent=2, ensure_ascii=False) + "\n"

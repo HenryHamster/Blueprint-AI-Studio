@@ -5601,10 +5601,23 @@ def _size_breach_message(
         f"     change_summary describing what your diff added to this file.\n"
         f"  2. Apply the new_limit returned in the response to\n"
         f"     backend/testing/module_size_limits.json under '{module_kind}'.\n"
-        f"  3. Commit both the source change and the JSON edit.\n\n"
+        f"  3. If the response includes governing_cap_repair, also update its\n"
+        f"     source_path's constant_name to new_limit in the same task.\n"
+        f"  4. Commit both the source change and every required cap edit.\n\n"
         f"If your diff is bundling unrelated code, shrink it to only what the\n"
         f"task asked for. Do NOT refactor or extract code in this PR — that's\n"
         f"a strategic decision, not a create/fix one."
+    )
+
+
+def _stale_size_cap_message(rel_path: str, module_kind: str) -> str:
+    """Tell maintainers how to repair a cap whose source file was deleted."""
+    return (
+        f"Stale {module_kind} size-cap record for missing file {rel_path!r}.\n\n"
+        "Remove this stale cap and its cap-bump-history evidence with:\n"
+        "  python3 backend/testing/check_size_limits.py --fix\n\n"
+        "Commit the repaired module_size_limits.json and cap_bump_history.json; "
+        "do not leave a missing-file exception to obscure this remediation."
     )
 
 class TestBackendModuleSizeGuardrails:
@@ -5618,6 +5631,7 @@ class TestBackendModuleSizeGuardrails:
     def _check_module(self, relative_path: str) -> None:
         max_lines = MODULE_SIZE_LIMITS[relative_path]
         path = os.path.join(os.path.dirname(__file__), "..", "app", relative_path)
+        assert os.path.isfile(path), _stale_size_cap_message(relative_path, "backend")
         with open(path, encoding="utf-8") as f:
             count = len(f.readlines())
         assert count <= max_lines, _size_breach_message(
@@ -5706,6 +5720,7 @@ class TestAgentModuleSizeGuardrails:
         self._require_agent_src()
         max_lines = AGENT_SIZE_LIMITS[relative_path]
         path = os.path.join(_AGENT_SRC_ROOT, relative_path)
+        assert os.path.isfile(path), _stale_size_cap_message(relative_path, "agent")
         with open(path) as f:
             count = len(f.readlines())
         assert count <= max_lines, _size_breach_message(
@@ -5800,6 +5815,7 @@ class TestFrontendSizeGuardrails:
         self._require_admin_ui_src()
         max_lines = FRONTEND_SIZE_LIMITS[relative_path]
         path = _get_frontend_path(relative_path)
+        assert os.path.isfile(path), _stale_size_cap_message(relative_path, "frontend")
         with open(path) as f:
             count = len(f.readlines())
         assert count <= max_lines, _size_breach_message(
@@ -5838,6 +5854,7 @@ class TestTestFileSizeGuardrails:
     def _check_test_file(self, relative_path: str) -> None:
         max_lines = TESTING_SIZE_LIMITS[relative_path]
         path = os.path.join(os.path.dirname(__file__), relative_path)
+        assert os.path.isfile(path), _stale_size_cap_message(relative_path, "testing")
         with open(path, encoding="utf-8") as f:
             count = len(f.readlines())
         assert count <= max_lines, _size_breach_message(
@@ -12941,19 +12958,19 @@ class TestProblemModelWritePathInvariants:
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
-        ("routers/admin_agent_ops.py", 1993): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2419): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2866): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2979): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 3234): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2013): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2439): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2886): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2999): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 3254): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4860): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4880): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4888): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4908): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5419): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5439): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5501): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5521): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):
@@ -13273,4 +13290,177 @@ def test_no_duplicate_test_ids_across_backend_modules() -> None:
         + "\n".join(errors)
         + "\n\nRemove the duplicate from the base or the companion — both files "
         "must not define the same test function or class name."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Freshness-graded fixture guard
+# ---------------------------------------------------------------------------
+
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+)
+
+_FRESHNESS_GRADED_FILES = [
+    "testing/test_blocked_need_resolution.py",
+]
+
+
+def _is_iso_datetime_literal(value: str) -> bool:
+    """Return True when ``value`` looks like an absolute ISO datetime literal."""
+    return bool(_ISO_DATETIME_RE.match(value))
+
+
+def _collect_proved_at_literal_violations(source: str, filename: str) -> list[str]:
+    """Scan ``source`` for ``proved_at`` dict keys whose values are absolute ISO
+    datetime string literals.
+
+    Returns a list of human-readable violation strings (``filename:line: ...``).
+
+    **Allowed cases (not flagged):**
+    - ``"proved_at": _utcnow().isoformat()`` — a call expression, not a constant.
+    - ``"proved_at": some_variable`` — a name reference (e.g. a pre-computed stale
+      timestamp variable in an expiry-testing helper).
+    - ``"proved_at": ""`` — an empty string is not a valid timestamp.
+
+    **Forbidden:**
+    - ``"proved_at": "2026-07-16T00:00:00Z"`` — a direct ISO datetime constant
+      that will silently age past :data:`PROOF_FRESHNESS_TTL` and detonate at a
+      future promotion, attributable to no diff. This applies even in a test whose
+      name indicates a freshness or expiry case: derive stale timestamps relative to
+      the runtime clock and store them in a variable instead.
+    """
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return []
+
+    violations: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, val in zip(node.keys, node.values):
+            if key is None:
+                continue
+            key_str: str | None = None
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                key_str = key.value
+            if key_str != "proved_at":
+                continue
+            if not isinstance(val, ast.Constant):
+                continue
+            if not isinstance(val.value, str):
+                continue
+            raw = val.value
+            if not _is_iso_datetime_literal(raw):
+                continue
+            line = getattr(val, "lineno", getattr(node, "lineno", "?"))
+            violations.append(
+                f"  {filename}:{line}: "
+                f'"proved_at": "{raw}" — use _utcnow().isoformat() so the fixture '
+                f"stays inside PROOF_FRESHNESS_TTL on every promotion date"
+            )
+
+    return violations
+
+
+def test_no_absolute_datetime_literals_in_freshness_graded_fixtures():
+    """Static tripwire: freshness-graded proof fixtures must not embed absolute
+    ISO datetime literals as ``proved_at`` values.
+
+    A ``proved_at`` field seeded with a hardcoded date (e.g.
+    ``"2026-07-16T00:00:00Z"``) silently ages past
+    :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL` (30 days) and detonates
+    at an arbitrary later promotion — attributable to no diff and with no clear
+    failure message. Deriving the timestamp from the same runtime clock used by
+    the grading seam (``_utcnow().isoformat()``) keeps the fixture semantically
+    fresh on every date the suite runs.
+
+    **What is checked:** the small set of files that seed ``proved_at`` fields
+    consumed by the TTL-graded freshness path
+    (:data:`_FRESHNESS_GRADED_FILES`). Only direct ISO datetime string constants
+    (e.g. ``"2026-07-16T00:00:00Z"``) are flagged; call expressions such as
+    ``_utcnow().isoformat()``, variable references to pre-computed stale
+    timestamps, and other non-literal values are allowed regardless of their
+    enclosing function names.
+
+    **Synthetic self-test:** this test includes an in-process check that the
+    detector itself correctly distinguishes a forbidden literal from an allowed
+    runtime-derived fixture, so a broken detector cannot silently pass.
+    """
+    import textwrap
+
+    forbidden_snippet = textwrap.dedent('''
+        def _some_helper():
+            records = {
+                "task_id": "proof:foo",
+                "proof_kind": "named_test",
+                "proved_at": "2026-07-16T00:00:00Z",
+                "commit_sha": "a" * 40,
+            }
+    ''')
+    allowed_snippet = textwrap.dedent('''
+        def _some_helper():
+            from app.time_utils import _utcnow
+            records = {
+                "task_id": "proof:foo",
+                "proof_kind": "named_test",
+                "proved_at": _utcnow().isoformat(),
+                "commit_sha": "a" * 40,
+            }
+    ''')
+    freshness_name_snippet = textwrap.dedent('''
+        def test_freshness_proof_is_current():
+            records = {
+                "task_id": "proof:foo",
+                "proof_kind": "named_test",
+                "proved_at": "2026-07-16T00:00:00Z",
+                "commit_sha": "a" * 40,
+            }
+    ''')
+    stale_relative_snippet = textwrap.dedent('''
+        def test_stale_proof_expires():
+            stale_proved_at = make_stale_timestamp()
+            records = {
+                "task_id": "proof:foo",
+                "proof_kind": "named_test",
+                "proved_at": stale_proved_at,
+                "commit_sha": "a" * 40,
+            }
+    ''')
+
+    assert _collect_proved_at_literal_violations(forbidden_snippet, "<synthetic>"), (
+        "Detector self-test FAILED: a direct ISO datetime literal in 'proved_at' "
+        "was NOT flagged — the tripwire would be silent and never catch real regressions"
+    )
+    assert not _collect_proved_at_literal_violations(allowed_snippet, "<synthetic>"), (
+        "Detector self-test FAILED: _utcnow().isoformat() was incorrectly flagged — "
+        "the tripwire must allow runtime-derived timestamps"
+    )
+    assert _collect_proved_at_literal_violations(freshness_name_snippet, "<synthetic>"), (
+        "Detector self-test FAILED: a direct ISO datetime literal in a freshness-named "
+        "test was exempted — function names must not bypass the tripwire"
+    )
+    assert not _collect_proved_at_literal_violations(stale_relative_snippet, "<synthetic>"), (
+        "Detector self-test FAILED: a runtime-relative stale timestamp variable was "
+        "incorrectly flagged"
+    )
+
+    all_violations: list[str] = []
+    for rel_path in _FRESHNESS_GRADED_FILES:
+        target = BACKEND_ROOT / rel_path
+        if not target.exists():
+            continue
+        source = target.read_text(encoding="utf-8")
+        all_violations.extend(_collect_proved_at_literal_violations(source, rel_path))
+
+    assert not all_violations, (
+        f"Found {len(all_violations)} absolute ISO datetime literal(s) seeded into "
+        f"freshness-graded 'proved_at' fixture field(s).\n\n"
+        "These will silently age past PROOF_FRESHNESS_TTL (30 days) and fail at a "
+        "future promotion attributable to no diff.\n\n"
+        "Replace each with _utcnow().isoformat() so the fixture stays inside the "
+        "freshness window on every promotion date:\n\n"
+        + "\n".join(all_violations)
     )

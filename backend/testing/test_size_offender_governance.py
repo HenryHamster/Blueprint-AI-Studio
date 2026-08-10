@@ -37,6 +37,7 @@ from app.size_limit_policy import (
     classify_breach,
     parse_bump_history,
 )
+from testing import check_size_limits as csl
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +329,68 @@ def test_classify_size_record_delegates_breach_to_policy():
     assert not classify_size_record(
         "m.py", None, 1180, "backend", with_verdict=False
     )["breach"]
+
+
+def test_fix_respects_declared_governing_cap(tmp_path, mocker):
+    """``--fix`` keeps a governed source constant, JSON cap, and ledger aligned.
+
+    This is intentionally an end-to-end checker test: it exercises the shared
+    routine-breach classifier, the local repair writer, and the pending ledger
+    record rather than merely asserting the clamp helper in isolation. The
+    repaired cap CLAMPS to the module's declared constant instead of taking
+    generic headroom, and the declared constant itself is never raised — a
+    governed module that outgrows its constant must be decomposed, not bumped.
+    """
+    repo = tmp_path / "repo"
+    source_path = repo / "backend" / "app" / "release_qualifier.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(
+        "_MODULE_SIZE_GOVERNANCE_CAP: int = 10500\n"
+        + "pass\n" * 10400,
+        encoding="utf-8",
+    )
+    testing_dir = repo / "backend" / "testing"
+    testing_dir.mkdir()
+    limits_path = testing_dir / "module_size_limits.json"
+    limits_path.write_text(
+        json.dumps(
+            {"_doc": "test", "backend": {"release_qualifier.py": 10300}},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # Hermetic fixture: no mainline checkout means only this repair's pending
+    # evidence should be present in the regenerated mirror.
+    mocker.patch("app.size_limit_policy._git_reads_history_here", return_value=False)
+    mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[])
+
+    assert csl.main(
+        [
+            "--json",
+            str(limits_path),
+            "--repo-root",
+            str(repo),
+            "--sections",
+            "backend",
+            "--fix",
+        ]
+    ) == 0
+
+    repaired = json.loads(limits_path.read_text(encoding="utf-8"))
+    # A generic +15% bump for a 10,401-line file would be 11,950; the governed
+    # module clamps to its declared 10,500 constant instead.
+    assert repaired["backend"]["release_qualifier.py"] == 10500
+    assert "_MODULE_SIZE_GOVERNANCE_CAP: int = 10500" in source_path.read_text(
+        encoding="utf-8"
+    )
+    ledger = json.loads(
+        (testing_dir / "cap_bump_history.json").read_text(encoding="utf-8")
+    )
+    record = ledger["history"]["backend"]["release_qualifier.py"][-1]
+    assert record["commit_sha"] == UNATTRIBUTED_COMMIT_SHA
+    assert (record["old_cap"], record["new_cap"]) == (10300, 10500)
+    assert record["commit_date"]
 
 
 # ---------------------------------------------------------------------------
@@ -671,12 +734,14 @@ def test_classify_breach_reaches_history_readable_branch_in_deployed_layout(
     # readable at its shipped path under the deployed layout.
     assert os.path.isfile(ledger_path)
 
-    # A real chronic offender recorded in the ledger (4 bumps — fires the growth
-    # trigger regardless of the 180-day window aging).
-    history = parse_bump_history("test_release_qualifier.py", "testing")
+    # A real chronic capped testing file recorded in the ledger.  Do not use a
+    # deleted file here: stale cap/ledger records are now intentionally pruned
+    # by --fix, and this test's purpose is the deployed-layout fallback rather
+    # than preserving obsolete history.
+    history = parse_bump_history("test_acceptance_criteria.py", "testing")
     assert len(history) >= 3
 
-    verdict = classify_breach("test_release_qualifier.py", 2400, section="testing")
+    verdict = classify_breach("test_acceptance_criteria.py", 16000, section="testing")
 
     assert verdict["history_unavailable"] is False  # readable branch REACHED
     assert verdict["is_chronic"] is True
@@ -748,6 +813,42 @@ def test_ledger_with_pending_bumps_appends_and_dedups():
         UNATTRIBUTED_COMMIT_SHA
     )
     assert all(record["commit_sha"] for record in updated["history"]["backend"]["m.py"])
+
+
+def test_ledger_with_pending_bumps_preserves_observed_provenance():
+    """Observed git evidence upgrades a matching unattributed placeholder."""
+    ledger = {
+        "history": {
+            "backend": {
+                "m.py": [
+                    {
+                        "commit_sha": UNATTRIBUTED_COMMIT_SHA,
+                        "commit_date": "2026-01-01T00:00:00+00:00",
+                        "old_cap": 100,
+                        "new_cap": 200,
+                    }
+                ]
+            }
+        }
+    }
+
+    updated = slp.ledger_with_pending_bumps(
+        ledger,
+        [
+            (
+                "backend",
+                "m.py",
+                100,
+                200,
+                "realcommitsha",
+                "2026-02-03T04:05:06+00:00",
+            )
+        ],
+    )
+
+    record = updated["history"]["backend"]["m.py"][0]
+    assert record["commit_sha"] == "realcommitsha"
+    assert record["commit_date"] == "2026-02-03T04:05:06+00:00"
 
 
 def test_restored_cap_bumps_keep_strategic_resident_session_chronic():

@@ -27,7 +27,8 @@ Two modes:
   every CI shard and agent VM — so phantom drift is caught where it accrues. When
   git history is unavailable the guard degrades to a clear skip.
 * ``--fix`` mode: for every breached file, rewrite *only* that file's cap in the
-  tracked JSON to the canonical ``bump_size_limit`` policy value; AND for every
+  tracked JSON to the canonical repair policy value; governed modules also have
+  their declared source constant rewritten in the same repair; AND for every
   uncapped source file over ``_COVERAGE_THRESHOLD`` lines (the complementary
   coverage guardrail the ``test_*_no_uncapped_large_file`` meta-tests enforce),
   ADD a new cap entry sized at the same policy headroom. Each applied bump is
@@ -55,6 +56,7 @@ current environment is reported as skipped rather than treated as an error.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -361,6 +363,29 @@ def write_limits(json_path: str, data: dict) -> None:
     with open(json_path, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=True)
         f.write("\n")
+
+
+def _snapshot_artifacts(paths: list[str]) -> dict[str, bytes | None]:
+    """Capture repair artifacts so a failed ledger write can roll them back."""
+    snapshots: dict[str, bytes | None] = {}
+    for path in paths:
+        if os.path.isfile(path):
+            with open(path, "rb") as artifact:
+                snapshots[path] = artifact.read()
+        else:
+            snapshots[path] = None
+    return snapshots
+
+
+def _restore_artifacts(snapshots: dict[str, bytes | None]) -> None:
+    """Restore a pre-repair artifact set, including files created mid-repair."""
+    for path, original in snapshots.items():
+        if original is None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+            continue
+        with open(path, "wb") as artifact:
+            artifact.write(original)
 
 
 def evaluate(
@@ -676,6 +701,9 @@ def main(argv: list[str] | None = None) -> int:
         for rec in checked.get(section, [])
         if rec["breach"]
     ]
+    # A missing capped file is stale governance, not a harmless non-breach:
+    # check mode reports it clearly and --fix removes the cap and its ledger
+    # history.  Retain the scan record's count=None behavior for API consumers.
     stale_caps = [
         (section, rec)
         for section in args.sections
@@ -703,31 +731,55 @@ def main(argv: list[str] | None = None) -> int:
             for rec in scan_uncapped_section(root, caps, suffixes, is_excluded)
         )
 
+    from app.size_limit_policy import (
+        LEDGER_BUMP_ABSENT,
+        missing_ledger_bump_records,
+        phantom_ledger_records,
+    )
+
+    ledger_path = os.path.join(
+        os.path.dirname(args.json_path), "cap_bump_history.json"
+    )
+    missing_ledger_records = missing_ledger_bump_records(
+        repo_root=args.repo_root,
+        caps_json_path=args.json_path,
+        ledger_path=ledger_path,
+    )
+    # Split by severity. An ABSENT record is real ledger drift: the deployed
+    # chronic-offender classifier is missing a bump it should count, so it fails
+    # the check. An UNATTRIBUTED one only lacks provenance — the bump itself IS
+    # recorded — and is the unavoidable residue of every rollup auto-bump, which
+    # must stage its record before the commit SHA exists. Failing on it would
+    # turn ./check red on every branch until an operator ran --fix by hand.
+    # Both are repaired by the same --fix rebuild below.
+    absent_ledger_records = [
+        rec for rec in missing_ledger_records if rec[6] == LEDGER_BUMP_ABSENT
+    ]
+    unattributed_ledger_records = [
+        rec for rec in missing_ledger_records if rec[6] != LEDGER_BUMP_ABSENT
+    ]
+
     if args.fix:
         # Ledger-phantom self-heal: even with no cap breach to bump, a
         # cap-bump-history ledger holding records the mainline git history
         # cannot justify must be pruned so the check (and the deployed
         # chronic-offender classification) stops trusting phantom records.
-        from app.size_limit_policy import phantom_ledger_records
-
-        ledger_path = os.path.join(
-            os.path.dirname(args.json_path), "cap_bump_history.json"
-        )
         phantoms = phantom_ledger_records(
             repo_root=args.repo_root, ledger_path=ledger_path
         )
-        if not breaches and not uncapped and not phantoms and not stale_caps:
+        if (
+            not breaches
+            and not uncapped
+            and not stale_caps
+            and not phantoms
+            and not missing_ledger_records
+        ):
             print("No breaches to fix — all scoped files within cap.")
             return 0
         chronic_skipped: list[tuple[str, dict, str]] = []
         bumped: list[tuple[str, dict, int]] = []
         added: list[tuple[str, dict, int]] = []
-        removed: list[tuple[str, dict]] = []
-        for section, rec in stale_caps:
-            section_caps = data.get(section)
-            if isinstance(section_caps, dict) and rec["rel"] in section_caps:
-                del section_caps[rec["rel"]]
-                removed.append((section, rec))
+        pruned: list[tuple[str, dict]] = []
         for section, rec in breaches:
             verdict = classify_size_record(
                 rec["rel"],
@@ -771,21 +823,60 @@ def main(argv: list[str] | None = None) -> int:
                 f"added cap {new_cap}"
             )
             added.append((section, rec, new_cap))
-        if bumped or added or removed:
-            write_limits(args.json_path, data)
-        if bumped or phantoms:
-            # Keep the committed cap-bump-history ledger (the deployed
-            # backend's history source) in sync with the bumps just applied AND
-            # self-heal it: rebuild_cap_bump_history_ledger prunes any record
-            # the mainline git history cannot justify (a phantom), on truncated
-            # checkouts too — every CI shard and agent VM — so the phantom guard
-            # never survives a --fix run. Rebuilding from git + the pending
-            # bumps is idempotent and self-heals any drift (including manual cap
-            # edits already in git). A ledger-maintenance failure must not roll
-            # back the cap bumps, but it must be loud — a stale ledger would
-            # change chronic-offender classification in production; the CI guard
-            # test would also catch it.
-            try:
+        for section, rec in stale_caps:
+            data.get(section, {}).pop(rec["rel"], None)
+            print(f"[prune] {section}/{rec['rel']}: removed stale cap record")
+            pruned.append((section, rec))
+
+        # Validate every source rewrite before changing any tracked artifact.
+        # A malformed governing declaration must fail closed instead of leaving
+        # a JSON cap and source constant out of sync.
+        source_rewrites: list[tuple[str, str]] = []
+        if bumped:
+            from app.size_limit_policy import (
+                governing_cap_source_path,
+                rewrite_governing_cap_constant,
+            )
+
+            for section, rec, new_cap in bumped:
+                source_rel = governing_cap_source_path(section, rec["rel"])
+                if source_rel is None:
+                    continue
+                source_path = os.path.join(args.repo_root, source_rel)
+                try:
+                    with open(source_path, encoding="utf-8") as source_file:
+                        source_text = source_file.read()
+                    source_rewrites.append(
+                        (
+                            source_path,
+                            rewrite_governing_cap_constant(
+                                section, rec["rel"], source_text, new_cap
+                            ),
+                        )
+                    )
+                except (OSError, ValueError) as exc:
+                    print(
+                        f"[governing-cap] cannot repair {section}/{rec['rel']}: {exc}"
+                    )
+                    return 1
+
+        repair_paths = [args.json_path, ledger_path] + [
+            source_path for source_path, _source_text in source_rewrites
+        ]
+        snapshots = _snapshot_artifacts(repair_paths)
+        try:
+            if bumped or added or pruned:
+                write_limits(args.json_path, data)
+            for source_path, source_text in source_rewrites:
+                with open(source_path, "w", encoding="utf-8") as source_file:
+                    source_file.write(source_text)
+            if bumped or pruned or phantoms or missing_ledger_records:
+                # Keep the committed cap-bump-history ledger (the deployed
+                # backend's history source) in sync with the bumps just applied
+                # AND self-heal it. All cap/source/ledger writes are one repair
+                # transaction from the checker's perspective: a ledger failure
+                # restores every artifact so a successful-looking partial
+                # repair can never leave governance incoherent.
                 from app.size_limit_policy import rebuild_cap_bump_history_ledger
 
                 rebuild_cap_bump_history_ledger(
@@ -794,30 +885,57 @@ def main(argv: list[str] | None = None) -> int:
                     pending=[
                         (section, rec["rel"], rec["cap"], new_cap)
                         for section, rec, new_cap in bumped
-                    ],
+                    ]
+                    # --fix repairs BOTH severities: an absent record is
+                    # appended, an unattributed one is upgraded in place with
+                    # the observed provenance. The trailing status field is
+                    # advisory for reporting only, so drop it here.
+                    + [rec[:6] for rec in missing_ledger_records],
                 )
                 if phantoms:
                     print(
                         f"Pruned {len(phantoms)} phantom record(s) from "
                         f"{os.path.basename(ledger_path)}."
                     )
+                if absent_ledger_records:
+                    print(
+                        f"Restored {len(absent_ledger_records)} git-recorded "
+                        f"bump(s) in {os.path.basename(ledger_path)}."
+                    )
+                if unattributed_ledger_records:
+                    print(
+                        f"Attributed {len(unattributed_ledger_records)} pending "
+                        f"cap-bump record(s) in "
+                        f"{os.path.basename(ledger_path)}."
+                    )
                 if bumped:
                     print(f"Updated {os.path.basename(ledger_path)}.")
-            except Exception as exc:  # noqa: BLE001 — cap bumps already written
+        except Exception as exc:  # repair must fail closed
+            try:
+                _restore_artifacts(snapshots)
+            except Exception as restore_exc:
                 print(
-                    f"[warn] could not update cap-bump-history ledger: {exc}"
+                    f"[error] cap repair failed and rollback failed: {exc}; "
+                    f"rollback error: {restore_exc}"
                 )
+            else:
+                print(f"[error] cap repair rolled back: {exc}")
+            return 1
         actions = []
         if bumped:
             actions.append(f"Bumped {len(bumped)} cap(s)")
         if added:
             actions.append(f"Added {len(added)} cap(s)")
+        if pruned:
+            actions.append(f"Pruned {len(pruned)} stale cap(s)")
+        if absent_ledger_records:
+            actions.append(f"Restored {len(absent_ledger_records)} ledger bump(s)")
+        if unattributed_ledger_records:
+            actions.append(
+                f"Attributed {len(unattributed_ledger_records)} ledger bump(s)"
+            )
         if actions:
             print(f"{'; '.join(actions)} in {args.json_path}.")
-        if removed:
-            print(
-                f"Removed {len(removed)} stale cap(s) from {args.json_path}."
-            )
         if chronic_skipped:
             print(
                 f"\n{len(chronic_skipped)} chronic offender(s) skipped — "
@@ -860,6 +978,15 @@ def main(argv: list[str] | None = None) -> int:
             f"\n{len(blocking_breaches)} size breach(es). Run with --fix to bump "
             f"the breached caps to the canonical policy value."
         )
+        exit_code = 1
+
+    if stale_caps:
+        for section, rec in stale_caps:
+            print(
+                f"[stale-cap] {section}/{rec['rel']}: cap {rec['cap']} targets "
+                "a missing file — run with --fix to remove the stale cap and "
+                "its ledger history"
+            )
         exit_code = 1
 
     blocking_uncapped, preexisting_uncapped = _split_preexisting(
@@ -949,11 +1076,6 @@ def main(argv: list[str] | None = None) -> int:
     # truncated-checkout skip let it hide. When git history is unavailable (not
     # a git checkout, no mainline ref) the guard degrades to a clear skip, never
     # a crash or a spurious failure.
-    from app.size_limit_policy import phantom_ledger_records
-
-    ledger_path = os.path.join(
-        os.path.dirname(args.json_path), "cap_bump_history.json"
-    )
     phantoms = phantom_ledger_records(
         repo_root=args.repo_root, ledger_path=ledger_path
     )
@@ -968,6 +1090,54 @@ def main(argv: list[str] | None = None) -> int:
             "mainline git history cannot justify. Run this checker with --fix to "
             f"rebuild {os.path.basename(ledger_path)} from git (pruning phantoms), "
             "or remove the listed records from the ledger."
+        )
+        exit_code = 1
+
+    # Pending attribution is NOT drift: the ledger holds the bump, only its
+    # provenance is still the placeholder every pre-commit auto-bump must write.
+    # Report it as a reconcile hint so it stays visible and repairable, but do
+    # NOT fail — a rollup auto-bump landing on mainline would otherwise break
+    # ./check for every agent on every branch until an operator ran --fix.
+    if unattributed_ledger_records:
+        for (
+            section,
+            rel,
+            old_cap,
+            new_cap,
+            commit_sha,
+            _commit_date,
+            _status,
+        ) in unattributed_ledger_records:
+            print(
+                f"[ledger-pending-attribution] {section}/{rel}: cap-bump-history "
+                f"records {old_cap} -> {new_cap} but still carries the pre-commit "
+                f"placeholder; git attributes it to {commit_sha[:12]}"
+            )
+        print(
+            f"\n{len(unattributed_ledger_records)} ledger cap bump(s) await commit "
+            "attribution (not a failure). Run this checker with --fix to stamp "
+            f"the observed provenance into {os.path.basename(ledger_path)}."
+        )
+
+    if absent_ledger_records:
+        for (
+            section,
+            rel,
+            old_cap,
+            new_cap,
+            commit_sha,
+            _commit_date,
+            _status,
+        ) in absent_ledger_records:
+            print(
+                f"[ledger-missing] {section}/{rel}: git records {old_cap} -> "
+                f"{new_cap} at {commit_sha[:12]}, but cap-bump-history has no "
+                "matching evidence"
+            )
+        print(
+            f"\n{len(absent_ledger_records)} git-recorded cap bump(s) are "
+            "missing from the ledger. Run this checker with --fix to rebuild "
+            f"{os.path.basename(ledger_path)}."
         )
         exit_code = 1
 

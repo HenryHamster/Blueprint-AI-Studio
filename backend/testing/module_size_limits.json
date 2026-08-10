@@ -7,6 +7,9 @@
     "task_lifecycle.py": 6200,
     "task_lifecycle_requeue.py": 1250,
     "task_lifecycle_post_commit_terminal.py": 500,
+    "task_lifecycle_fix_completion.py": 650,
+    "task_lifecycle_github_helpers.py": 300,
+    "task_lifecycle_wakes.py": 1000,
     "orchestrator.py": 5900,
     "orchestrator_ci_monitor.py": 3550,
     "orchestrator_health.py": 1400,
@@ -164,10 +167,8 @@
     "routers/agent_warm_continuity.py": 1700,
     "post_commit_errors.py": 58,
     "task_lifecycle_completion_dispatch.py": 500,
-    "task_lifecycle_fix_completion.py": 650,
-    "task_lifecycle_github_helpers.py": 300,
-    "task_lifecycle_wakes.py": 1000,
-    "release_models.py": 1750
+    "release_models.py": 1750,
+    "size_limit_policy.py": 2050
   },
   "agent": {
     "index.ts": 4600,
@@ -286,15 +287,16 @@
     "test_efficiency_snapshot.py": 13100,
     "test_digest.py": 12250,
     "test_diagnostics.py": 1605,
+    "test_size_offender_governance.py": 1800,
     "test_task_lifecycle.py": 12100,
     "test_acceptance_criteria.py": 13650,
+    "test_acceptance_criteria__walkthrough.py": 903,
     "test_playbook_sr_metrics.py": 11650,
     "test_direction_outcomes.py": 11600,
     "test_strategic_state.py": 10600,
     "test_metrics_integrity_sweep.py": 9200,
     "test_digest_metrics.py": 9050,
     "test_release_reconciliation.py": 8950,
-    "test_size_offender_governance.py": 1800,
     "test_salvage_bundle_standalone.py": 8600,
     "test_compute_experiment_completion.py": 7700,
     "test_pipeline.py": 7650,
@@ -337,6 +339,7 @@
     "test_reaper_sweeps_compute_image.py": 3500,
     "test_acceptance_gate.py": 5700,
     "test_migration_apply_gate.py": 3350,
+    "test_migration_chain.py": 1650,
     "test_warm_vm_integration.py": 3350,
     "test_auto_remediation.py": 3300,
     "test_admin_pool_accounts.py": 3200,
@@ -405,9 +408,8 @@
     "test_admin_routers__notifications.py": 1800,
     "test_ci_compliance_gate.py": 2750,
     "test_ci_compliance.py": 1900,
+    "test_dependency_contracts.py": 2000,
     "test_fleet_utilization.py": 1800,
-    "test_acceptance_criteria__walkthrough.py": 903,
-    "test_migration_chain.py": 1650,
-    "test_dependency_contracts.py": 2000
+    "test_size_limits_checker.py": 1750
   }
 }

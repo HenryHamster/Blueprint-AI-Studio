@@ -108,6 +108,7 @@ from app.shared_state import (
 )
 from app.size_limit_policy import bump_size_limit as _bump_size_limit_policy
 from app.size_limit_policy import classify_breach as _classify_breach_policy
+from app.size_limit_policy import governing_cap_repair as _governing_cap_repair
 from app.strategic_completion import (
     _find_matching_direction,
     _normalize_recommended_mode,
@@ -831,6 +832,8 @@ class AgentAnnotation(BaseModel):
     # size_breach fields — programmatic signal from a test-invariant failure.
     # Server bumps the limit (policy-driven, not agent-judgment) and returns
     # new_limit; the agent applies it to module_size_limits.json and commits.
+    # A governed file also receives ``governing_cap_repair`` directing the
+    # paired source-constant edit required in that same task.
     # For chronic offenders the server refuses the silent bump and returns
     # is_chronic=True without new_limit; pass force_chronic_override=True with
     # explicit operator approval to grant the bump anyway.
@@ -957,9 +960,19 @@ async def agent_annotate(
         else:
             new_limit = verdict["suggested_new_limit"]
             assert new_limit is not None
+            governing_cap_repair = _governing_cap_repair(
+                payload.section, file_path.strip(), new_limit
+            )
+            governed_instruction = (
+                f" Also update {governing_cap_repair['source_path']}'s "
+                f"{governing_cap_repair['constant_name']} to {new_limit} in the same task."
+                if governing_cap_repair
+                else ""
+            )
             content = (
                 f"Size breach: {file_path} grew to {current_size} lines. "
-                f"Suggested new limit: {new_limit}. Change: {change_summary.strip()}"
+                f"Suggested new limit: {new_limit}.{governed_instruction} "
+                f"Change: {change_summary.strip()}"
             )
             ctx = {
                 "annotation_type": "size_breach",
@@ -968,6 +981,11 @@ async def agent_annotate(
                 "current_size": current_size,
                 "new_limit": new_limit,
                 "change_summary": change_summary.strip(),
+                **(
+                    {"governing_cap_repair": governing_cap_repair}
+                    if governing_cap_repair
+                    else {}
+                ),
             }
     else:
         content = payload.content.strip()
@@ -1021,6 +1039,8 @@ async def agent_annotate(
     if is_size_breach:
         if "new_limit" in ctx:
             response["new_limit"] = ctx["new_limit"]
+        if "governing_cap_repair" in ctx:
+            response["governing_cap_repair"] = ctx["governing_cap_repair"]
         if ctx.get("is_chronic"):
             response["is_chronic"] = True
             response["bump_count"] = ctx["bump_count"]

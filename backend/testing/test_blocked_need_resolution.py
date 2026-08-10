@@ -3026,6 +3026,7 @@ async def _create_project_with_caps(
     """
     from app.capability_registry import normalize_capability_name
     from app.models import Project
+    from app.time_utils import _utcnow
 
     records = dict(proof_records or {})
     for cap in caps:
