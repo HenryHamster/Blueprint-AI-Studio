@@ -163,6 +163,16 @@ build {
     destination = "/tmp/project-verification-probe.sh"
   }
 
+  provisioner "file" {
+    source      = "../../scripts/verification-toolchain.json"
+    destination = "/tmp/verification-toolchain.json"
+  }
+
+  provisioner "file" {
+    source      = "../../scripts/provision-verification-toolchain.sh"
+    destination = "/tmp/provision-verification-toolchain.sh"
+  }
+
   # Upload the backend deps build context (Dockerfile + requirements.txt) so the
   # next shell provisioner can bake the expensive `deps` stage into the VM's
   # local docker store. The `deps` stage only COPYs requirements.txt, so these
@@ -240,6 +250,8 @@ build {
     inline = [
       "sudo useradd -m -s /bin/bash agent",
       "sudo usermod -aG docker agent",
+      "sudo chown -R packer:packer /opt/blueprint-backend-venv",
+      "sudo -u packer bash /tmp/provision-verification-toolchain.sh /tmp/verification-toolchain.json /opt/blueprint-backend-venv",
       "# Passwordless sudo for the agent user. Justification: agent VMs are",
       "# ephemeral (one task per VM, destroyed at end), single-tenant, and",
       "# isolated by GCP service account scope. The real authority that",
