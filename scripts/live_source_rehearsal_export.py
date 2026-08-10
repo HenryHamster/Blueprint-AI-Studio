@@ -1003,7 +1003,10 @@ def completion_manifest(
 
     if not _BUCKET_RE.fullmatch(bucket) or not _HEX32_RE.fullmatch(archive_id):
         raise RehearsalExportError("manifest", "invalid_identity")
-    if archive_name != f"{ARCHIVE_PREFIX}/{archive_name.rsplit('/', 1)[-1]}":
+    if (
+        not _SAFE_NAME_RE.fullmatch(archive_name)
+        or archive_name != f"{ARCHIVE_PREFIX}/{archive_name.rsplit('/', 1)[-1]}"
+    ):
         raise RehearsalExportError("manifest", "invalid_archive_name")
     if not archive_name.endswith(f"-{archive_id}.sql.gz"):
         raise RehearsalExportError("manifest", "archive_id_mismatch")

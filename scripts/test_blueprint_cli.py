@@ -6022,7 +6022,24 @@ def test_migration_deploy_stops_units_before_migrate_and_starts_after(monkeypatc
         "_registry_auth",
         lambda _credential: contextlib.nullcontext(Path("/tmp/registry")),
     )
-    monkeypatch.setattr(local_release, "_run", lambda *_args, **_kwargs: SimpleNamespace())
+    def fake_run(argv, **_kwargs):
+        if argv[:3] == [
+            "/usr/bin/systemctl", "show", "blueprint-deploy-agent.service"
+        ]:
+            return subprocess.CompletedProcess(
+                argv, 0, "NoNewPrivileges=yes\nUser=henry_hamster\n", ""
+            )
+        if argv[:3] == [
+            "/usr/bin/systemctl", "show", "blueprint-release.service"
+        ]:
+            return subprocess.CompletedProcess(
+                argv, 0, "NoNewPrivileges=no\nUser=root\n", ""
+            )
+        if argv[:2] == ["/usr/bin/docker", "run"]:
+            return subprocess.CompletedProcess(argv, 0, "reachable\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(local_release, "_run", fake_run)
     monkeypatch.setattr(local_release, "_verify_frontend", lambda *_args: "e" * 64)
     monkeypatch.setattr(local_release, "_inspect_candidate", lambda *_args: "sha256:" + "c" * 64)
     monkeypatch.setattr(local_release, "_retain_prior_image", lambda _image: "retained:old")
@@ -6044,6 +6061,16 @@ def test_migration_deploy_stops_units_before_migrate_and_starts_after(monkeypatc
         return 0
 
     monkeypatch.setattr(blueprint, "cmd_migrate", migrate)
+    monkeypatch.setattr(
+        blueprint,
+        "_migration_worker_values",
+        lambda _args: (
+            {"DATABASE_URL": "postgresql://user:pass/db"},
+            Path("/safe/credential.json"),
+            Path("/safe/secrets.json"),
+            "blueprint-network",
+        ),
+    )
     monkeypatch.setattr(local_release, "_atomic_write", lambda *_args: None)
     monkeypatch.setattr(
         local_release,

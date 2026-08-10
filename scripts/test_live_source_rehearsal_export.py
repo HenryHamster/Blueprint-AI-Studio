@@ -108,6 +108,7 @@ class ManifestContractTests(unittest.TestCase):
             recovery_project_number="123",
             archive_prefix="local-postgres-exports/",
             max_rpo_seconds=86400,
+            expected_archive=None,
         )
         selected = verifier.RecoveryStorage(client, config).latest_archive(NOW)
         self.assertEqual(selected.name, archive_name)
@@ -123,6 +124,21 @@ class ManifestContractTests(unittest.TestCase):
                 archive_name=(
                     "local-postgres-exports/20260730T120000Z-"
                     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.sql.gz"
+                ),
+                archive_id=ARCHIVE_ID,
+                sha256="c" * 64,
+                size_bytes=1,
+                created_at=NOW,
+            )
+
+    def test_manifest_rejects_unsafe_archive_name(self):
+        with self.assertRaisesRegex(
+            producer.RehearsalExportError, "invalid_archive_name"
+        ):
+            producer.completion_manifest(
+                bucket=BUCKET,
+                archive_name=(
+                    f"local-postgres-exports/20260730T120000Z-{ARCHIVE_ID}.sql.gz\n"
                 ),
                 archive_id=ARCHIVE_ID,
                 sha256="c" * 64,
