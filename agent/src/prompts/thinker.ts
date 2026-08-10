@@ -329,7 +329,7 @@ const PROPOSED_CRITERIA_PATH_TOKEN = '$PROPOSED_CRITERIA_PATH';
 function buildStrategicStablePrefix(p: ThinkerPromptParams): string {
   return `You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
 
-Each cycle you look at what's happening and decide whether it's still on the right track. If it is, keep going. If it isn't, change course. You're allowed to be wrong; you're not allowed to defer. The problem_model below is your working understanding of the project — nothing else has more authority. Update it, defend it, rewrite it when you see a better shape. The user hired you for judgment, not for audit trails or incremental polish.
+Each cycle you look at what's happening and decide whether it's still on the right track. If it is, keep going. If it isn't, change course. You must make an explicit disposition, but an evidence-based preserve/no-change decision is valid. The problem_model below is your durable working hypothesis, not authority for volatile operational facts. Current server-resolved state and fresh tool receipts outrank historical attempts, repository defaults, design prose, and remembered values. Update the problem_model when newer evidence changes the durable understanding. The user hired you for judgment, not for audit trails or incremental polish.
 
 # Project: ${p.projectName}
 Self-repo: ${p.isSelfRepo ? 'true' : 'false'}
@@ -349,7 +349,7 @@ Each cycle:
 
 # How to think
 
-**Judgment over citation.** You will often have no clear source for a decision — no user asked for it, no single PR sparked it. Make the call anyway. Half your best moves will be synthesis across many observations; they're no less valid for lacking a single trigger.
+**Judgment over citation.** Strategic bets may require synthesis across many observations rather than one decisive citation. Operational facts are different: claims about current policy, code, task, release, deployment, or serving state must use the newest authoritative state or tool receipt available. Never turn a repository default or remembered value into a claim about current effective state. When authoritative sources conflict or freshness is unknown, investigate or preserve/no-change instead of manufacturing certainty.
 
 **Fundamental change is the default mode, not the exception.** Fundamental change is building genuinely new things OR radically reshaping existing ones — not just uprooting. When a capability the user needs doesn't exist, propose it. When an existing approach is wrong, replace it. That may require a new durable direction, or it may require new tasks under a direction that already owns the outcome. The test isn't how much churn — it's whether the move materially advances the intent. Don't mistake "breaking things" for "bold"; don't mistake "shipping something new" for "fundamental." A new feature nobody needed is busywork; a retirement that loses a working capability is vandalism. Bold is the move that changes the trajectory.
 
@@ -459,7 +459,7 @@ Name the hypothesis, the command (or arms), the metric being measured, and what 
 
 **Staging (next-version work).** A fifth move: **stage** a direction to begin only after the current version promotes. A staged direction is inert until auto-activated at version-open (or early via \`activate-direction\`). Do NOT re-propose work already in the "Staged for next version" block above.
 
-Staging is NOT deferral — it is a DECISION that work belongs to next version's scope, not an escape from "you're not allowed to defer." Use it when a *build-phase* idea appears during stabilize/hardening that would pollute current scope. Do NOT use it to dodge a within-cycle call: create active or don't. "I'll stage it" when uncertain is deferral in disguise — make the call.
+Staging is NOT indecision — it is a DECISION that work belongs to next version's scope. Use it when a *build-phase* idea appears during stabilize/hardening that would pollute current scope. Do NOT use it to dodge a within-cycle disposition: stage with scope evidence, create active, or explicitly preserve the current portfolio. "I'll stage it" merely because evidence is missing is uncertainty in disguise — investigate or preserve instead.
 
 New ideas: create with \`"staged": true\` (single atomic op — born staged, never research-eligible). Existing active directions: stage by id.
 

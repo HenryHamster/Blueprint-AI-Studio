@@ -238,6 +238,72 @@ describe('writeStrategicHelpers', () => {
     expect(fs.existsSync(path.join(testWorkspace, '.resident-reply-staged-message.json'))).toBe(false);
   }, 15_000);
 
+  it('rejects both generated message CLIs while a private Workday turn is active', () => {
+    const privateTurnMarkerPath = path.join(testWorkspace, '.resident-private-workday-turn');
+    writeMessagesHelper('task-private-turn', testWorkspace, {
+      residentReplyOnly: true,
+      privateTurnMarkerPath,
+    });
+    writeStrategicHelpers('task-private-turn', 'project-private-turn', testWorkspace, {
+      privateTurnMarkerPath,
+    });
+    fs.writeFileSync(privateTurnMarkerPath, JSON.stringify({ kind: 'active-call' }));
+
+    const nestedDir = path.join(testWorkspace, 'nested-private-turn');
+    fs.mkdirSync(nestedDir, { recursive: true });
+    const curlMarker = path.join(testWorkspace, 'private-turn-curl-was-called');
+    const bashEnv = path.join(testWorkspace, 'bash-env-private-turn');
+    fs.writeFileSync(
+      bashEnv,
+      `curl() { printf called > '${curlMarker.replace(/\\/g, '/')}'; return 1; }\n`,
+    );
+    const bashPath = (value: string): string => value
+      .replace(/^([A-Za-z]):/, (_m, drive: string) => `/${drive.toLowerCase()}`)
+      .replace(/\\/g, '/');
+    const bashExecutable = process.platform === 'win32'
+      ? 'C:\\Program Files\\Git\\bin\\bash.exe'
+      : 'bash';
+    const executionPath = process.platform === 'win32'
+      ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
+      : process.env.PATH ?? '';
+    const options = {
+      cwd: nestedDir,
+      encoding: 'utf8' as const,
+      env: {
+        ...process.env,
+        ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+        AGENT_API_TOKEN: 'test-token',
+        BASH_ENV: bashPath(bashEnv),
+        NODE_BINARY: bashPath(process.execPath),
+        PATH: executionPath,
+      },
+      stdio: 'pipe' as const,
+    };
+
+    const rejectedStderr = (args: string[]): string => {
+      try {
+        execFileSync(bashExecutable, args, options);
+        throw new Error('expected the private-turn CLI fence to reject the command');
+      } catch (error) {
+        const stderr = (error as { stderr?: string | Buffer }).stderr;
+        if (stderr === undefined) throw error;
+        return String(stderr);
+      }
+    };
+    expect(rejectedStderr([
+      bashPath(path.join(testWorkspace, 'messages')),
+      'send',
+      'private leak',
+      'QUESTION',
+    ])).toContain('private Workday turns cannot publish project messages');
+    expect(rejectedStderr([
+      bashPath(path.join(testWorkspace, 'strategic')),
+      'create-message',
+      JSON.stringify({ type: 'BLOCKER', content: 'private leak' }),
+    ])).toContain('private Workday turns cannot publish project messages');
+    expect(fs.existsSync(curlMarker)).toBe(false);
+  }, 15_000);
+
   it('fails closed on symlinked or oversized ambient receipt/key files before either helper posts', () => {
     writeMessagesHelper('task-safe-ambient-read', testWorkspace);
     writeStrategicHelpers('task-safe-ambient-read', 'project-safe-ambient-read', testWorkspace);

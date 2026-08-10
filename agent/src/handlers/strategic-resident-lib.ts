@@ -516,6 +516,11 @@ function formatRecordJson(value: unknown): string {
     : '';
 }
 
+/** Format the backend-resolved effective release policy from a bootstrap payload. */
+export function formatCurrentEffectivePolicyJson(payload: Record<string, unknown>): string {
+  return formatRecordJson(payload.current_effective_policy);
+}
+
 /**
  * The response of GET
  * `/api/agent/projects/{id}/strategic-session/checkpoint-state`. Read-only
@@ -526,6 +531,8 @@ export interface CheckpointStateResponse {
   strategic_memory_notes?: unknown;
   running_update?: unknown;
   effective_purpose?: unknown;
+  /** Fresh project-aware release policy resolved at compaction time. */
+  current_effective_policy?: unknown;
   /** Current open operator messages (same shape as the bootstrap payload's
    *  open_messages). Present on backends that have shipped this field; absent
    *  on older responses — caller degrades gracefully. */
@@ -557,6 +564,8 @@ export interface CheckpointGrounding {
   purposeText: string;
   strategicMemoryNotesText: string;
   runningUpdate: string;
+  /** Pretty-printed current_effective_policy, when the backend supplies it. */
+  currentEffectivePolicyJson?: string;
   /** Formatted open operator messages text (from open_messages). Absent when
    *  not yet computed (older path) or when there are no open messages. */
   openMessagesText?: string;
@@ -584,6 +593,7 @@ export function formatCheckpointState(resp: CheckpointStateResponse): Checkpoint
     purposeText: typeof resp.effective_purpose === 'string' ? resp.effective_purpose.trim() : '',
     strategicMemoryNotesText: formatStrategicMemoryNotes(resp.strategic_memory_notes),
     runningUpdate: typeof resp.running_update === 'string' ? resp.running_update : '',
+    currentEffectivePolicyJson: formatRecordJson(resp.current_effective_policy),
     openMessagesText: '',
     recentHandledConversationText: '',
   };
@@ -622,6 +632,7 @@ export function resolveCheckpointGrounding(
   purposeText?: string;
   strategicMemoryNotesText?: string;
   runningUpdate?: string;
+  currentEffectivePolicyJson?: string;
   openMessagesText?: string;
   recentHandledConversationText?: string;
 } {
@@ -632,6 +643,7 @@ export function resolveCheckpointGrounding(
       purposeText: snapshot.purposeText || undefined,
       strategicMemoryNotesText: snapshot.strategicMemoryNotesText || undefined,
       runningUpdate: snapshot.runningUpdate || undefined,
+      currentEffectivePolicyJson: snapshot.currentEffectivePolicyJson || undefined,
       openMessagesText: snapshot.openMessagesText || undefined,
       recentHandledConversationText: snapshot.recentHandledConversationText || undefined,
     };
@@ -639,13 +651,20 @@ export function resolveCheckpointGrounding(
   // Refetch succeeded. Structural fields fall back to the snapshot when the
   // refreshed value is blank (transient degraded read); openMessagesText lets a
   // refreshed empty WIN (see the asymmetry note above).
-  const structural = (refreshedVal: string, snapshotVal: string): string | undefined =>
+  const structural = (
+    refreshedVal: string | undefined,
+    snapshotVal: string | undefined,
+  ): string | undefined =>
     (refreshedVal && refreshedVal.trim() ? refreshedVal : snapshotVal) || undefined;
   return {
     problemModelJson: structural(refreshed.problemModelJson, snapshot.problemModelJson),
     purposeText: structural(refreshed.purposeText, snapshot.purposeText),
     strategicMemoryNotesText: structural(refreshed.strategicMemoryNotesText, snapshot.strategicMemoryNotesText),
     runningUpdate: structural(refreshed.runningUpdate, snapshot.runningUpdate),
+    currentEffectivePolicyJson: structural(
+      refreshed.currentEffectivePolicyJson,
+      snapshot.currentEffectivePolicyJson,
+    ),
     openMessagesText: refreshed.openMessagesText || undefined,
     // Same rule as openMessagesText: the refreshed recently-answered tail is the
     // current source of truth, so let it WIN over the session-start snapshot
@@ -686,6 +705,8 @@ export interface CompactionCheckpointContext {
   runningUpdate?: string;
   /** Formatted decisions register text (durable cross-tick decision memory). */
   decisionsRegisterText?: string;
+  /** Backend-resolved release policy projection carried as a labeled snapshot. */
+  currentEffectivePolicyJson?: string;
   // ── Static session-start grounding (same snapshot forward every checkpoint) ─
   // These mirror three bootstrap sections that would otherwise vanish after a
   // compaction restart, letting the resumed session re-derive settled facts or
@@ -716,6 +737,15 @@ export interface CompactionCheckpointContext {
   skillsText?: string;
   /** Formatted built-in tool content (operator notes, whiteboard). */
   toolContentText?: string;
+}
+
+function buildCurrentEffectivePolicySection(currentEffectivePolicyJson: string): string {
+  return `## Current effective release policy
+The backend-resolved \`current_effective_policy\` below is authoritative for this snapshot. It takes precedence over historical attempt snapshots, prior summaries, repository/on-disk policy files, and source-code defaults. If a newer \`./fetch qualification\` or \`./fetch version-phase\` returns a different \`current_effective_policy\`, the newer projection wins.
+
+\`\`\`json
+${currentEffectivePolicyJson.trim()}
+\`\`\``;
 }
 
 /**
@@ -801,6 +831,10 @@ ${ctx.autonomousState.trim()}`);
 > the latest state.`;
       sections.push(`## Self-model grounding (session-start snapshot)\n${note}\n\n${grounding.join('\n\n')}`);
     }
+  }
+
+  if (ctx.currentEffectivePolicyJson?.trim()) {
+    sections.push(buildCurrentEffectivePolicySection(ctx.currentEffectivePolicyJson));
   }
 
   // (v-b) Recently-answered operator conversation tail — READ-ONLY. These
@@ -1522,6 +1556,8 @@ export interface BootstrapContext {
   projectName: string;
   problemModelJson: string;
   runningUpdate: string;
+  /** Backend-resolved release policy projection (payload.current_effective_policy). */
+  currentEffectivePolicyJson?: string;
   directionsText: string;
   stagedDirectionsText?: string;
   retiredDirectionsText: string;
@@ -1596,6 +1632,9 @@ Session id: ${ctx.sessionId}
   }
   if (ctx.runningUpdate.trim()) {
     sections.push(`## Current running update (operator-facing snapshot)\n${ctx.runningUpdate.trim()}`);
+  }
+  if (ctx.currentEffectivePolicyJson?.trim()) {
+    sections.push(buildCurrentEffectivePolicySection(ctx.currentEffectivePolicyJson));
   }
   if (ctx.directionsText.trim()) {
     sections.push(`## Active directions\n${ctx.directionsText.trim()}`);

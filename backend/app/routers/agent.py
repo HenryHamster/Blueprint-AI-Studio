@@ -1155,12 +1155,29 @@ async def claim_task(
     project_integration_branch = (
         get_project_integration_branch(project) if project else None
     )
+    task_type = _claimed_first_payload.get("type", "")
+    _claim_current_effective_policy: dict | None = None
+    if task_type == "strategic_review":
+        # A Strategic task may sit queued after its launch payload was assembled.
+        # Refresh only the mutable "current" projection at the final claim
+        # boundary; the frozen active/last-attempt projection remains launch-time
+        # provenance and must not be rewritten.  This is response-only: the
+        # durable Task payload stays an honest record of what was originally
+        # queued, while cold, pool, local-runner, and warm roles all receive the
+        # same claim-time policy truth.
+        from app.release_qualifier import (  # noqa: PLC0415
+            current_effective_policy_projection,
+        )
+
+        _claim_current_effective_policy = current_effective_policy_projection(
+            project
+        )
 
     _claim_runtime_model = _claimed_context.get("llm_model")
     _claim_runtime_execution_mode = _claimed_context.get("llm_execution_mode")
 
     response_payloads: list = []
-    for entry in _claimed_payloads:
+    for entry_index, entry in enumerate(_claimed_payloads):
         if isinstance(entry, dict):
             patched = dict(entry)
             if isinstance(_claim_runtime_model, str) and _claim_runtime_model.strip():
@@ -1177,6 +1194,18 @@ async def claim_task(
             if _claimed_discovery_cycle_id is not None:
                 patched["discovery_cycle_id"] = str(_claimed_discovery_cycle_id)
                 patched["discovery_mode"] = "bounded_cycle"
+            if entry_index == 0 and _claim_current_effective_policy is not None:
+                patched["current_effective_policy"] = dict(
+                    _claim_current_effective_policy
+                )
+                version_phase = patched.get("version_phase")
+                if isinstance(version_phase, dict):
+                    patched["version_phase"] = {
+                        **version_phase,
+                        "current_effective_policy": dict(
+                            _claim_current_effective_policy
+                        ),
+                    }
             response_payloads.append(patched)
         else:
             response_payloads.append(entry)
@@ -1242,7 +1271,6 @@ async def claim_task(
             ),
         }
 
-    task_type = _claimed_first_payload.get("type", "")
     task_capability = agent_capability_slice(task_type)
     if task_capability is not None:
         response["task_capability"] = task_capability

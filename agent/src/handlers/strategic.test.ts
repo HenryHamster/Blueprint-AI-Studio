@@ -6,6 +6,7 @@ let capturedThinkerPrompt: string | undefined;
 // Capture the params the handler passes to buildThinkerPrompt so tests can
 // assert on derived values (problem_model recovery framing).
 let capturedThinkerParams: Record<string, unknown> | undefined;
+let capturedVersionPhaseInput: Record<string, unknown> | undefined;
 
 const {
   INDEX_EXPORT_NAMES,
@@ -491,7 +492,13 @@ vi.mock('./research-plan.js', () => ({
   buildRunningUpdateSupersededSection: (signal: Record<string, unknown> | null | undefined) =>
     signal && Number(signal.count) > 0 ? '\n_operator preserved running_update_\n' : '',
   buildUserPausedSection: () => '',
-  buildVersionPhaseSection: () => '',
+  buildVersionPhaseSection: (value: Record<string, unknown> | undefined) => {
+    capturedVersionPhaseInput = value;
+    const currentPolicy = value?.current_effective_policy;
+    return currentPolicy && typeof currentPolicy === 'object' && !Array.isArray(currentPolicy)
+      ? `CURRENT_POLICY(${JSON.stringify(currentPolicy)})`
+      : '';
+  },
   buildMemoCitationsSection: () => '',
   QUALIFICATION_STATE_VOCAB: new Set<string>(),
   resolveMemoHandles: () => [],
@@ -824,6 +831,7 @@ describe('formatRelativeDays', () => {
 describe('handleStrategic userStateLine is byte-identical across wall-clock for an identical payload', () => {
   beforeEach(() => {
     capturedThinkerParams = undefined;
+    capturedVersionPhaseInput = undefined;
   });
 
   it('renders userStateLine deterministically from the payload timestamp, not Date.now()', async () => {
@@ -917,6 +925,7 @@ describe('strategic prompt fingerprinting', () => {
 describe('handleStrategic problem_model recovery framing', () => {
   beforeEach(() => {
     capturedThinkerParams = undefined;
+    capturedVersionPhaseInput = undefined;
   });
 
   it('dropped-but-nonempty: packer dropped problem_model → steer to fetch, not bootstrap', async () => {
@@ -975,6 +984,42 @@ describe('handleStrategic problem_model recovery framing', () => {
     const section = String(capturedThinkerParams?.packerMetaSection);
     expect(section).toContain('version_phase');
     expect(section).toContain('./fetch version-phase');
+  });
+
+  it('merges trim-proof top-level policy truth into the consumed lifecycle block', async () => {
+    const currentPolicy = { threshold: 0.81, source: 'runtime_config' };
+    const attemptPolicy = { threshold: 0.9, source: 'yaml_file' };
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      version_phase: { lifecycle_signal: 'unavailable', signal_status: 'build_failed' },
+      current_effective_policy: currentPolicy,
+      active_or_last_attempt_policy: attemptPolicy,
+    };
+
+    const statusRef = { value: '' };
+    await handleStrategic('task-policy-fallback', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedVersionPhaseInput?.current_effective_policy).toEqual(currentPolicy);
+    expect(capturedVersionPhaseInput?.active_or_last_attempt_policy).toEqual(attemptPolicy);
+    expect(capturedVersionPhaseInput?.lifecycle_signal).toBe('unavailable');
+  });
+
+  it('synthesizes a policy-only lifecycle input when version_phase is absent', async () => {
+    const currentPolicy = { threshold: 0.81, source: 'runtime_config' };
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      current_effective_policy: currentPolicy,
+    };
+
+    const statusRef = { value: '' };
+    await handleStrategic('task-policy-single-branch', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedVersionPhaseInput).toEqual({ current_effective_policy: currentPolicy });
+    expect(capturedVersionPhaseInput).not.toHaveProperty('version_number');
+    expect(capturedVersionPhaseInput).not.toHaveProperty('phase');
+    expect(String(capturedThinkerParams?.versionPhaseSection)).toContain(
+      'CURRENT_POLICY({"threshold":0.81,"source":"runtime_config"})',
+    );
   });
 
   it('dropped retired/prior-decision sections advertise the section endpoint, not ./fetch direction', async () => {

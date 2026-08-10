@@ -526,8 +526,9 @@ def _compute_first_attempt_succeeded(
     *,
     banked_attempt_count: int = 0,
     lifetime_attempt_ordinal: int | None = None,
-) -> bool:
-    """Return True if the task completed successfully on its first attempt.
+    task_type: "str | None" = None,
+) -> "bool | None":
+    """Return the first-attempt outcome, or None when success is unadjudicated.
 
     A degraded-unverified merge (environment/setup failure blocked real
     verification) does NOT count as a first-attempt success even if
@@ -535,7 +536,19 @@ def _compute_first_attempt_succeeded(
     HEAD.  Pass ``merge_verification`` as the
     :func:`~app.landed_signal.merge_verification_status` result at write time
     so the flag is accurate when the merge context is already available.
+
+    A ``strategic_review`` completion proves only that the review protocol ran;
+    it does not prove that the review's factual claims or portfolio decisions
+    were correct.  The completion path currently has no independent semantic
+    adjudicator, so every completed Strategic review returns ``None`` and is
+    excluded from positive learning and generic success-rate denominators.
+    Self-reported completion data must not be promoted into that authority.
     """
+    if (
+        task_type == "strategic_review"
+        and status == TaskStatus.COMPLETED
+    ):
+        return None
     if merge_verification == "unverified_degraded":
         return False
     # ``attempt_count`` is the number of retries consumed in the current retry
@@ -549,7 +562,8 @@ def _compute_first_attempt_succeeded(
         and lifetime_attempt_ordinal > 0
         else task_lifetime_attempt_ordinal(attempt_count, banked_attempt_count)
     )
-    return ordinal == 1 and status == TaskStatus.COMPLETED
+    completed_first_attempt = ordinal == 1 and status == TaskStatus.COMPLETED
+    return completed_first_attempt
 
 
 def _stamp_orphan_remediation_outcome(

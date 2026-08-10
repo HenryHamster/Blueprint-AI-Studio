@@ -208,6 +208,85 @@ async def test_agent_claim_includes_compute_experiment_capability_slice(
     assert data["task_capability"] == expected
 
 
+@pytest.mark.asyncio
+async def test_agent_claim_refreshes_only_current_strategic_policy(
+    client: AsyncClient, db_session
+):
+    """Queued Strategic work gets claim-time policy without rewriting provenance."""
+    from app.release_qualifier import _runtime_config
+
+    project = Project(name="Strategic Claim Policy", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_current = {
+        "threshold": 0.90,
+        "weights": {"audit": 0.6, "test_erosion": 0.4},
+        "source": "runtime_config",
+        "fallback_error": None,
+        "policy_hash": "stale-current-policy",
+    }
+    frozen_attempt = {
+        "threshold": 0.90,
+        "weights": {"audit": 0.6, "test_erosion": 0.4},
+        "source": "runtime_config",
+        "fallback_error": None,
+        "policy_hash": "frozen-attempt-policy",
+    }
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "strategic_review",
+                "current_effective_policy": stale_current,
+                "active_or_last_attempt_policy": frozen_attempt,
+                "version_phase": {
+                    "phase": "stabilize",
+                    "current_effective_policy": stale_current,
+                    "active_or_last_attempt_policy": frozen_attempt,
+                },
+            }
+        ],
+        vm_instance_id="agent-vm-strategic-policy",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-strategic-policy")
+    with patch.dict(
+        _runtime_config,
+        {
+            "promotion_threshold": 0.81,
+            "promotion_weights": {"audit": 0.6, "test_erosion": 0.4},
+        },
+        clear=False,
+    ):
+        response = await client.post(
+            "/api/agent/claim", headers={"x-agent-token": token}
+        )
+
+    assert response.status_code == 200, response.text
+    claimed = response.json()["payloads"][0]
+    assert claimed["current_effective_policy"]["threshold"] == pytest.approx(0.81)
+    assert claimed["current_effective_policy"]["source"] == "runtime_config"
+    assert claimed["version_phase"]["current_effective_policy"] == claimed[
+        "current_effective_policy"
+    ]
+    assert claimed["active_or_last_attempt_policy"] == frozen_attempt
+    assert (
+        claimed["version_phase"]["active_or_last_attempt_policy"]
+        == frozen_attempt
+    )
+
+    await db_session.refresh(task)
+    stored = task.first_payload
+    assert stored["current_effective_policy"] == stale_current
+    assert stored["version_phase"]["current_effective_policy"] == stale_current
+    assert stored["active_or_last_attempt_policy"] == frozen_attempt
+
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_agent_status_update(client: AsyncClient, db_session, mocker):
@@ -13274,6 +13353,62 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
     assert project.design_doc["playbook/create-unshown"]["confirmed_count"] == 5
     # review-only is NOT applicable to 'create' tasks — confirmed_count unchanged
     assert project.design_doc["playbook/review-only"]["confirmed_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_completion_does_not_create_success_learning(
+    client: AsyncClient, db_session, mocker
+):
+    """Completing a Strategic review is not semantic proof of its decisions."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    capture_mock = mocker.patch(
+        "app.playbook_learning.capture_success_pattern",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Strategic Learning Containment",
+        user_id="test-user-strategic-learning",
+    )
+    project.design_doc = {
+        "playbook/strategic-guidance": {
+            "content": "Inspect current evidence before retiring a direction",
+            "applicable_types": ["strategic_review"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 2,
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review direction truth"}],
+        vm_instance_id="agent-vm-strategic-learning-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        context={"_shown_playbook_keys": ["strategic-guidance"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-strategic-learning-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED", "logs": "review ran"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    await db_session.refresh(project)
+    assert task.status == TaskStatus.COMPLETED
+    assert "_first_attempt_succeeded" not in task.context
+    assert project.design_doc["playbook/strategic-guidance"]["confirmed_count"] == 2
+    capture_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

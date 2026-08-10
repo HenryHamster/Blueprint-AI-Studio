@@ -5296,12 +5296,23 @@ async def test_infra_failure_record_stamps_engine_sha(db_session, monkeypatch):
     monkeypatch.setenv("DEPLOY_SHA", "aabbccddeeff001")
 
     project, version = await _make_project_and_version(db_session)
+    attempt_policy = {
+        "threshold": 0.81,
+        "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
+    }
+    attempt_projection = rq.promotion_policy_projection(
+        attempt_policy,
+        source="runtime_config",
+    )
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": _LEDGER_SHA_A,
         "ci_green": True,
         "smoketest_enabled": True,
         "started_at": "2026-07-10T00:00:00",
+        "promotion_policy_snapshot": attempt_policy,
+        "promotion_policy_source": "runtime_config",
+        "promotion_policy_hash": attempt_projection["policy_hash"],
     }
     db_session.add(version)
     await db_session.commit()
@@ -5323,6 +5334,7 @@ async def test_infra_failure_record_stamps_engine_sha(db_session, monkeypatch):
     assert lq["engine_sha"] == "aabbccddeeff001", (
         f"expected engine_sha 'aabbccddeeff001' in last_qualification record, got {lq.get('engine_sha')!r}"
     )
+    assert rq.qualification_attempt_policy_projection(lq) == attempt_projection
     history = lq["infra_attempt_history"]
     assert history, "infra_attempt_history must be non-empty"
     latest = history[-1]

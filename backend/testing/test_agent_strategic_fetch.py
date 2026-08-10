@@ -1895,6 +1895,85 @@ async def test_agent_fetch_qualification_falls_back_to_last_qualification(
 
 
 @pytest.mark.asyncio
+async def test_policy_truth_separates_live_081_from_last_attempt_090(
+    client: AsyncClient, db_session, mocker
+):
+    """Fetch surfaces must not present an old attempt threshold as live policy."""
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app import release_qualifier as rq
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-policy-truth"
+    )
+    mocker.patch.dict(
+        rq._runtime_config,
+        {
+            "promotion_threshold": 0.81,
+            "promotion_weights": {
+                "audit": 4 / 7,
+                "test_erosion": 3 / 7,
+            },
+            "completion_debt_weight_mode": "observe",
+        },
+        clear=False,
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "a" * 40,
+        "confidence": 0.79,
+        "threshold": 0.90,
+        "promotion_policy_snapshot": {
+            "threshold": 0.90,
+            "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
+        },
+        "promotion_policy_source": "yaml_file",
+        "promotion_policy_fallback_error": None,
+        "finalized_at": "2026-06-03T10:00:00",
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    headers = {"x-agent-token": token}
+    qualification_response = await client.get(
+        f"/api/agent/projects/{project.id}/qualification", headers=headers
+    )
+    version_response = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase", headers=headers
+    )
+
+    assert qualification_response.status_code == 200, qualification_response.text
+    qualification = qualification_response.json()
+    assert qualification["current_effective_policy"]["threshold"] == pytest.approx(
+        0.81
+    )
+    assert qualification["current_effective_policy"]["source"] == "runtime_config"
+    assert qualification["active_or_last_attempt_policy"]["threshold"] == pytest.approx(
+        0.90
+    )
+    assert qualification["active_or_last_attempt_policy"]["source"] == "yaml_file"
+    assert (
+        qualification["current_effective_policy"]["policy_hash"]
+        != qualification["active_or_last_attempt_policy"]["policy_hash"]
+    )
+
+    assert version_response.status_code == 200, version_response.text
+    version_phase = version_response.json()["data"]
+    assert version_phase["current_effective_policy"] == qualification[
+        "current_effective_policy"
+    ]
+    assert version_phase["active_or_last_attempt_policy"] == qualification[
+        "active_or_last_attempt_policy"
+    ]
+    assert version_phase["current_version"]["active_or_last_attempt_policy"] == (
+        qualification["active_or_last_attempt_policy"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_qualification_fetch_carries_block_reason_fields(
     client: AsyncClient, db_session
 ):

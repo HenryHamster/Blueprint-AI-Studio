@@ -873,6 +873,7 @@ export function writeMessagesHelper(
     replyKeyPath?: string;
     replyReceiptPath?: string;
     stagedReplyPath?: string;
+    privateTurnMarkerPath?: string;
   } = {},
 ): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
@@ -889,6 +890,9 @@ export function writeMessagesHelper(
     (options.stagedReplyPath
       ?? path.resolve(workspace, '.resident-reply-staged-message.json')).replace(/\\/g, '/'),
   );
+  const privateTurnMarkerPath = options.privateTurnMarkerPath
+    ? shellEscapeDoubleQuoted(options.privateTurnMarkerPath.replace(/\\/g, '/'))
+    : '';
   const helperScript = `#!/bin/bash
 # Message tool — send messages to the project owner or resolve open messages
 # Usage:
@@ -912,10 +916,15 @@ RESIDENT_REPLY_ONLY="${residentReplyOnly ? '1' : '0'}"
   REPLY_KEY_PATH="\${BLUEPRINT_RESIDENT_REPLY_KEY_PATH:-${replyKeyPath}}"
   REPLY_RECEIPT_PATH="\${BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH:-${replyReceiptPath}}"
   STAGED_REPLY_PATH="\${BLUEPRINT_RESIDENT_STAGED_REPLY_PATH:-${stagedReplyPath}}"
+  PRIVATE_TURN_MARKER_PATH="\${BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH:-${privateTurnMarkerPath}}"
 NODE_BIN="\${NODE_BINARY:-node}"
 ${boundedRegularReadShellFn()}
 ${retryPostShellFn()}
 if [ "$OP" = "send" ]; then
+  if [ -e "$PRIVATE_TURN_MARKER_PATH" ] || [ -L "$PRIVATE_TURN_MARKER_PATH" ]; then
+    echo "[ERROR] send: private Workday turns cannot publish project messages" >&2
+    exit 2
+  fi
   if [ "\${2:-}" = "--stdin" ]; then
     MSG_TYPE="\${3:-NOTE}"
     CONTENT="$(cat)"

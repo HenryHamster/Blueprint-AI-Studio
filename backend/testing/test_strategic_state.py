@@ -9532,7 +9532,7 @@ async def test_set_session_summary_rejects_oversize_summary(db_session):
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_state_returns_knowledge_index(db_session):
+async def test_checkpoint_state_returns_knowledge_index(db_session, mocker):
     """checkpoint-state returns KnowledgeDocument-index entries (not raw JSONB notes).
 
     Inserts a KnowledgeDocument with source_kind=strategic_memory and
@@ -9544,6 +9544,17 @@ async def test_checkpoint_state_returns_knowledge_index(db_session):
     from app.main import app
     from app.database import get_session
     from app.routers.agent import verify_agent_token
+    from app import release_qualifier as rq
+
+    mocker.patch.dict(
+        rq._runtime_config,
+        {
+            "promotion_threshold": 0.81,
+            "promotion_weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
+            "completion_debt_weight_mode": "observe",
+        },
+        clear=False,
+    )
 
     project = Project(
         name="P-checkpoint-knowledgedoc",
@@ -9603,6 +9614,8 @@ async def test_checkpoint_state_returns_knowledge_index(db_session):
             )
         assert resp.status_code == 200, resp.text
         data = resp.json()
+        assert data["current_effective_policy"]["threshold"] == pytest.approx(0.81)
+        assert data["current_effective_policy"]["source"] == "runtime_config"
         notes = data["strategic_memory_notes"]
         assert isinstance(notes, list)
         # Must contain the KnowledgeDocument entry.

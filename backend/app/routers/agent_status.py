@@ -3937,13 +3937,18 @@ async def update_agent_status(
         if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             try:
                 _ctx = dict(task.context or {})
-                _ctx["_first_attempt_succeeded"] = _compute_first_attempt_succeeded(
+                _first_attempt_outcome = _compute_first_attempt_succeeded(
                     task.attempt_count,
                     payload.status,
                     merge_verification=_merge_verification_status(task),
                     banked_attempt_count=len(task.attempt_history or []),
                     lifetime_attempt_ordinal=get_task_lifetime_attempt_ordinal(task),
+                    task_type=_task_type_str,
                 )
+                if _first_attempt_outcome is None:
+                    _ctx.pop("_first_attempt_succeeded", None)
+                else:
+                    _ctx["_first_attempt_succeeded"] = _first_attempt_outcome
                 _proj = None
                 try:
                     _proj = await session.get(Project, task.project_id)
@@ -3976,7 +3981,7 @@ async def update_agent_status(
                         f"type={_task_type_str}"
                     )
                 # Increment confirmed_count and update effectiveness scoring for successful first attempts
-                if _ctx["_first_attempt_succeeded"] and _playbook_count > 0:
+                if _first_attempt_outcome and _playbook_count > 0:
                     try:
                         from app.task_locking import project_lock as _proj_lock
 
@@ -4079,7 +4084,7 @@ async def update_agent_status(
                             f"[PLAYBOOK] Failed to increment confirmed_count for task {_task_id_str}: {_pce}"
                         )
                 # Capture positive pattern for sampling-eligible first-attempt successes
-                if _ctx["_first_attempt_succeeded"] and _proj:
+                if _first_attempt_outcome and _proj:
                     # SAVEPOINT isolation (DB-contention fix): capture_success_pattern
                     # takes a FOR UPDATE lock on the Project row and issues a COUNT
                     # query (success_patterns.py), either of which can hit the 30s
