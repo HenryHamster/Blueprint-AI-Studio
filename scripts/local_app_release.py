@@ -31,7 +31,11 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import frontend_release_manifest as frontend_manifest
-from release_preconditions import RehearsalReport, verify_privilege_boundary
+from release_preconditions import (
+    PRE_STOP_PRECONDITIONS,
+    RehearsalReport,
+    verify_privilege_boundary,
+)
 
 _IMAGE_PREFIX = (
     "us-central1-docker.pkg.dev/blueprint-orchestrator/blueprint-repo/"
@@ -135,6 +139,7 @@ _REGISTRY_HOST = "us-central1-docker.pkg.dev"
 _WORKER_REGISTRY_READER = (
     "blueprint-local-worker-runtime@blueprint-orchestrator.iam.gserviceaccount.com"
 )
+RUNBOOK_ENTRYPOINT = "release"
 
 
 class _TransientNotReady(RuntimeError):
@@ -1278,11 +1283,7 @@ def _run_pre_stop_rehearsal(
     return RehearsalReport(
         candidate=image_ref,
         revision=revision,
-        checked=(
-            "live systemd privilege boundary",
-            "worker secret and static migration inputs",
-            "candidate migration reachability from live schema",
-        ),
+        checked=PRE_STOP_PRECONDITIONS,
         deferred=(
             "migration apply and post-migration schema verification (mutates live DB)",
             "unit stop/start and application health verification (requires downtime)",
@@ -1762,7 +1763,7 @@ def _locked_release(image_ref: str, revision: str) -> Path:
         return release(image_ref, revision)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-revision", required=True)
@@ -1771,6 +1772,11 @@ def main() -> int:
         action="store_true",
         help="validate candidate preconditions without stopping or changing units",
     )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
     try:
         if args.rehearse:

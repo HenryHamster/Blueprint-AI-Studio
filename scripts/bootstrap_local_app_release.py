@@ -9,6 +9,7 @@ agent's sandbox.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -59,6 +60,7 @@ _UNITS = (
     "blueprint-worker.service",
     "blueprint-edge.service",
 )
+RUNBOOK_ENTRYPOINT = "bootstrap"
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -717,9 +719,7 @@ def rehearse(image_ref: str, revision: str):
     return local_app_release.rehearse(image_ref, revision)
 
 
-def main() -> int:
-    import argparse
-
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--image")
@@ -728,6 +728,11 @@ def main() -> int:
         action="store_true",
         help="check candidate preconditions without changing units or files",
     )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
     try:
         if args.rehearse:

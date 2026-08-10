@@ -7,6 +7,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+# Labels are the stable, operator-facing names of every read-only check that
+# must pass before local_app_release may stop an application unit.  The
+# runbook drift guard imports this declaration instead of scraping prose.
+PRE_STOP_PRECONDITIONS = (
+    "live systemd privilege boundary",
+    "worker secret and static migration inputs",
+    "candidate migration reachability from live schema",
+)
+
 
 def parse_systemctl_properties(
     payload: str, expected: set[str]

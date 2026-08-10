@@ -1,5 +1,27 @@
 # Hamsterwheel application release
 
+<!-- RELEASE_RUNBOOK_CONTRACT:START -->
+```json
+{
+  "entrypoints": {
+    "bootstrap": {
+      "flags": ["--image", "--rehearse", "--revision"],
+      "script": "scripts/bootstrap_local_app_release.py"
+    },
+    "release": {
+      "flags": ["--expected-revision", "--image", "--rehearse"],
+      "script": "scripts/local_app_release.py"
+    }
+  },
+  "preconditions": [
+    "live systemd privilege boundary",
+    "worker secret and static migration inputs",
+    "candidate migration reachability from live schema"
+  ]
+}
+```
+<!-- RELEASE_RUNBOOK_CONTRACT:END -->
+
 Hamsterwheel is the production API, worker, database, and edge host. A normal
 push to `main` builds and publishes a combined backend plus admin-UI image, but
 does not automatically wake the recovery-only Cloud Run service or run the
