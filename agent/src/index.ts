@@ -352,8 +352,8 @@ export function readAgentRuntimeFingerprint(): string | null {
  *  Returns the commit SHA, or null when neither source yields one — so the agent
  *  never reports a bogus SHA over the wire. The env value is accepted only as a
  *  full 40-hex SHA (a short/dirty/tag value is rejected, matching the serving
- *  gate's full-SHA comparison); the marker's permissive 7-40 hex match also
- *  rejects the literal 'unknown' fallback. */
+ *  gate's full-SHA comparison); the marker uses the same strict full-SHA
+ *  validation and rejects the literal 'unknown' fallback. */
 export function readAgentSourceSha(): string | null {
   const fromEnv = process.env.AGENT_SOURCE_SHA;
   if (fromEnv && /^[0-9a-f]{40}$/.test(fromEnv)) {
@@ -361,7 +361,7 @@ export function readAgentSourceSha(): string | null {
   }
   try {
     const raw = fs.readFileSync('/opt/agent/AGENT_SOURCE_SHA', 'utf-8').trim();
-    const m = /^AGENT_SOURCE_SHA=([0-9a-f]{7,40})$/.exec(raw);
+    const m = /^AGENT_SOURCE_SHA=([0-9a-f]{40})$/.exec(raw);
     return m ? m[1] : null;
   } catch {
     return null;

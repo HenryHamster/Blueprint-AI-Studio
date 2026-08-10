@@ -5773,6 +5773,30 @@ class TestDescribeSha(_LocalRunnerTestCase):
         self.assertIsNone(local_runner._describe_sha(""))
 
 
+class TestCleanSourceSha(_LocalRunnerTestCase):
+    """Source identity is resolved from git, not abbreviated display text."""
+
+    def test_clean_source_sha_resolves_full_head_for_abbreviated_describe(self):
+        full_sha = "a" * 40
+        git_result = MagicMock(returncode=0, stdout=f"{full_sha}\n")
+        with patch("subprocess.run", return_value=git_result) as run:
+            self.assertEqual(
+                local_runner._clean_source_sha("v1.2.3-5-g4f5a6b7"),
+                full_sha,
+            )
+
+        self.assertEqual(run.call_args.args[0], ["git", "rev-parse", "HEAD"])
+        self.assertEqual(
+            run.call_args.kwargs["cwd"],
+            str(Path(local_runner.__file__).resolve().parent),
+        )
+
+    def test_clean_source_sha_reports_unknown_for_non_full_head(self):
+        git_result = MagicMock(returncode=0, stdout="4f5a6b7\n")
+        with patch("subprocess.run", return_value=git_result):
+            self.assertIsNone(local_runner._clean_source_sha("v1.2.3-5-g4f5a6b7"))
+
+
 class TestHeartbeatVersionHintWarning(unittest.TestCase):
     """Heartbeat response includes version_hint; runner warns when its own version
     does not match the orchestrator's hint."""

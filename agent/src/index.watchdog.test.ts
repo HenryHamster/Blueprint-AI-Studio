@@ -1963,9 +1963,9 @@ describe('readAgentSourceSha', () => {
     expect(readAgentSourceSha()).toBe('0123456789abcdef0123456789abcdef01234567');
   });
 
-  it('accepts an abbreviated 7-hex SHA', () => {
+  it('rejects an abbreviated marker SHA as unobservable', () => {
     mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=abc1234');
-    expect(readAgentSourceSha()).toBe('abc1234');
+    expect(readAgentSourceSha()).toBeNull();
   });
 
   it('returns null for the unknown fallback', () => {
@@ -2000,7 +2000,7 @@ describe('readAgentSourceSha', () => {
   it('falls back to the marker for a malformed env value', () => {
     process.env.AGENT_SOURCE_SHA = 'not-a-sha';
     mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=abc1234');
-    expect(readAgentSourceSha()).toBe('abc1234');
+    expect(readAgentSourceSha()).toBeNull();
   });
 
   it('returns null when env is malformed and the marker is the unknown fallback', () => {
@@ -2020,7 +2020,7 @@ describe('readAgentSourceSha', () => {
   it('falls back to the marker when the env var is absent', () => {
     delete process.env.AGENT_SOURCE_SHA;
     mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=abc1234');
-    expect(readAgentSourceSha()).toBe('abc1234');
+    expect(readAgentSourceSha()).toBeNull();
   });
 });
 

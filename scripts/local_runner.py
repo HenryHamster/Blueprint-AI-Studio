@@ -1446,12 +1446,10 @@ def _runner_version() -> str | None:
 
 
 def _describe_sha(version_str: str) -> str | None:
-    """Extract the abbreviated commit SHA from a ``git describe`` output string.
+    """Extract the display/update-hint SHA from ``git describe`` output.
 
-    Parses output like ``v1.2.3-5-g4f5a6b7`` → ``4f5a6b7`` so the runner can
-    compare against the orchestrator's full-SHA ``version_hint``.  Returns
-    ``None`` when no commit SHA is present (e.g. a pure tag like ``v1.2.3``),
-    in which case the caller falls back to a substring comparison.
+    Parses output like ``v1.2.3-5-g4f5a6b7`` → ``4f5a6b7`` for the version
+    update path. This value is never used as the serving source identity.
     """
     clean = version_str.replace("-dirty", "")
     # git describe format: <tag>-<N>-g<abbreviated-sha>
@@ -1462,6 +1460,32 @@ def _describe_sha(version_str: str) -> str | None:
         return clean
     # Pure tag — no commit SHA to compare
     return None
+
+
+def _checkout_source_sha() -> str | None:
+    """Resolve the full commit identity for the runner's checkout.
+
+    ``git describe`` is intentionally a display/update hint and may abbreviate
+    the commit. The serving gate compares exact commit identities, so the
+    heartbeat source identity must come from ``rev-parse HEAD`` and must pass a
+    strict full-SHA validation. An unavailable or malformed result is explicit
+    ``None`` rather than a short value that can never match the gate.
+    """
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=scripts_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
 
 def _agent_binary_checkout_sha(agent_binary: list[str] | None) -> str | None:
@@ -1500,10 +1524,10 @@ def _agent_binary_checkout_sha(agent_binary: list[str] | None) -> str | None:
 
 
 def _clean_source_sha(version_str: str | None) -> str | None:
-    """Return a commit identity only for a clean, parseable checkout."""
+    """Return a full commit identity only for a clean checkout."""
     if not version_str or "-dirty" in version_str:
         return None
-    return _describe_sha(version_str)
+    return _checkout_source_sha()
 
 
 def _actionable_version_hint(value: object) -> str | None:
