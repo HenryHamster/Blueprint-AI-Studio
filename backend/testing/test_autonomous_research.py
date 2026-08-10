@@ -340,6 +340,108 @@ async def test_research_payload_includes_compute_experiment_sweeps(
 
 
 @pytest.mark.asyncio
+async def test_research_payload_includes_work_headroom(db_session):
+    """A spawned research task carries the flat per-cycle finding ceiling as
+    work_headroom so the research agent can scale output to actual capacity
+    instead of self-limiting against a cap it never approaches."""
+    project = Project(
+        name="Work Headroom Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-wh-research")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    payload = research[0].first_payload
+    # With no findings deferred from prior cycles, the full ceiling is open.
+    assert payload.get("work_headroom") == 15
+
+
+@pytest.mark.asyncio
+async def test_research_payload_work_headroom_reduced_by_prior_deferred(db_session):
+    """A finding deferred from a prior research cycle consumes one slot of the
+    next cycle's finding ceiling, so work_headroom reflects the recovered-deferral
+    capacity instead of the flat cap."""
+    from app.time_utils import _utcnow
+
+    dir_id = "d-wh-deferred"
+    project = Project(
+        name="Deferred Headroom Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(dir_id)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A prior COMPLETED research cycle deferred one finding for this direction;
+    # the next cycle re-injects it and must subtract it from its own ceiling.
+    # The prior cycle is placed outside the directed-research cooldown window
+    # (refractory ~90min for a fresh direction) so the crash-guard in
+    # direction_lifecycle does not treat it as "just completed" and skip the
+    # direction — the re-injection path is exactly what this test exercises.
+    prior_completed_at = _utcnow() - timedelta(hours=3)
+    prior = Task(
+        project_id=project.id,
+        title="Research: prior deferred cycle",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [_active_direction(dir_id)],
+                "current_direction_id": dir_id,
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "deferred_findings": [
+                {
+                    "title": "Deferred improvement A",
+                    "description": "A real improvement that did not fit last cycle.",
+                    "direction_id": dir_id,
+                    "finding_hash": "abc123deferredhash",
+                    "deferred_count": 1,
+                    "deferred_reason": "capacity",
+                    "originally_researched_at": prior_completed_at.isoformat(),
+                }
+            ]
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=prior_completed_at,
+        completed_at=prior_completed_at,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(prior)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    # The prior task itself is research; the newly spawned one is the target.
+    spawned = [t for t in research if t.id != prior.id]
+    assert len(spawned) == 1
+    payload = spawned[0].first_payload
+    assert payload.get("work_headroom") == 14
+    # The recovered deferred finding is also carried into the new cycle's context.
+    assert len((spawned[0].context or {}).get("prior_deferred_findings", [])) == 1
+
+
+@pytest.mark.asyncio
 async def test_research_payload_playbook_bounded_to_keys_index(db_session):
     """The research payload's design_doc carries only playbook key names (_playbook_keys),
     never full verbatim content. The capped ranked selection already ships via task.playbook;
@@ -2092,8 +2194,15 @@ async def test_research_admission_counts_evaluating_parent_without_active_childr
 
 
 def test_project_parallelism_cap_override_resolution():
-    """A positive-int build_config override wins; bool/zero/str/absent fall back to the global."""
+    """A positive-int build_config override wins; bool/zero/str/absent fall back to the global.
+
+    Also verifies the fleet-headroom composition used by the spawn path: the
+    effective per-project admission is ``min(parallelism cap, headroom budget)``,
+    so scarce headroom throttles even a project whose override would allow more,
+    while abundant headroom never inflates the override.
+    """
     from app.autonomous_research import project_parallelism_cap
+    from app.fleet_utilization import compute_headroom_spawn_budget
     from app.shared_state import runtime_config as _runtime_config
 
     old_val = _runtime_config.get("max_parallel_research_per_project", 2)
@@ -2119,6 +2228,29 @@ def test_project_parallelism_cap_override_resolution():
             assert _cap() == 4
         project.build_config = None
         assert _cap() == 4
+
+        # Fleet-headroom composition (the spawn path caps by both):
+        # min(project override, headroom budget).
+        project.build_config = {"max_parallel_research": 2}
+        assert _cap() == 2
+        abundant = compute_headroom_spawn_budget(
+            {"vm_slots_available": 8, "vm_cap": 10, "active_task_vms": 2},
+            min_free_slots=2,
+            cap=6,
+        )
+        assert abundant["budget"] == 6
+        assert min(_cap(), abundant["budget"]) == 2, (
+            "abundant headroom must not inflate the per-project parallel cap"
+        )
+        scarce = compute_headroom_spawn_budget(
+            {"vm_slots_available": 1, "vm_cap": 10, "active_task_vms": 9},
+            min_free_slots=2,
+            cap=6,
+        )
+        assert scarce["budget"] == 0
+        assert min(_cap(), scarce["budget"]) == 0, (
+            "headroom below the floor must admit nothing even under a project override"
+        )
     finally:
         _runtime_config["max_parallel_research_per_project"] = old_val
 
@@ -8558,7 +8690,57 @@ async def test_all_saturated_directions_triggers_force_strategic(db_session):
 
 @pytest.mark.asyncio
 async def test_partially_saturated_directions_no_force_strategic(db_session):
-    """When only some active directions are saturated, force_strategic does NOT fire."""
+    """When only some active directions are saturated, force_strategic does NOT fire.
+
+    Also verifies that a cycle zeroed by a NON-dedup filter cause (adversarial
+    gate, low-actionability gate, degradation gate, or batch cap) is NOT genuine
+    exhaustion: those cycles must not count toward saturation the way a cycle
+    where the agent genuinely found nothing does, otherwise the direction is
+    wrongly marked possibly_saturated and its refractory window doubled.
+    """
+    from app.research_completion import _compute_saturation
+
+    # Each of the last 3 cycles produced zero tasks, but a non-dedup spawn gate
+    # deferred the findings — the agent found content the pipeline rejected, so
+    # the direction is NOT genuinely exhausted and must NOT be saturated.
+    filter_zeroed_history = [
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "degradation_gate": 2,
+                "batch_cap": 1,
+            },
+        },
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "adversarial_gate": 1,
+                "low_actionability": 2,
+            },
+        },
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "batch_cap": 3,
+            },
+        },
+    ]
+    assert _compute_saturation(filter_zeroed_history) is False, (
+        "Gate-zeroed cycles (adversarial / low-actionability / degradation / "
+        "batch-cap) must NOT count as genuine exhaustion toward saturation"
+    )
+
+    # Sanity contrast: 3 zero-task cycles with no filter cause ARE genuine
+    # exhaustion and do saturate.
+    genuine_history = [{"tasks_created": 0} for _ in range(3)]
+    assert _compute_saturation(genuine_history) is True
+
     project = Project(
         name="Partial Saturated Test Project",
         user_id="test-user-123",
@@ -10012,6 +10194,77 @@ async def test_collection_expires_stale_deferred_findings(db_session):
         assert "Stale TTL finding" not in titles, (
             f"Stale deferred finding older than TTL must be excluded, got: {titles}"
         )
+    finally:
+        _ss.runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_collection_records_retired_disposition_on_producer(db_session):
+    """A TTL-expired deferred finding is not silently dropped at the spawn-side
+    recovery scan: the producing COMPLETED task's context carries a durable
+    retired disposition under finding_retired_dispositions."""
+    import app.shared_state as _ss
+
+    _ss.runtime_config["completed_research_cooldown_minutes"] = 0
+    try:
+        direction_id = "d-ttl-retired01"
+        direction = _active_direction(direction_id, "TTL retired disposition direction")
+        project = Project(
+            name="TTL Retired Disposition Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+            vision={"purpose": "test"},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        stale_ts = (_utcnow() - timedelta(days=8)).isoformat()
+        stale_finding = _make_finding("Stale retired finding", direction_id)
+        stale_finding["originally_researched_at"] = stale_ts
+        stale_finding["deferred_reason"] = "degradation_gate"
+        stale_finding["deferred_count"] = 2
+
+        prev_completed = Task(
+            project_id=project.id,
+            title="Research: prior cycle",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [direction],
+                    "base_branch": "main",
+                    "current_direction_id": direction_id,
+                }
+            ],
+            context={"deferred_findings": [stale_finding]},
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(prev_completed)
+        await db_session.commit()
+        await db_session.refresh(prev_completed)
+
+        await _spawn_research_task(project, db_session)
+
+        await db_session.refresh(prev_completed)
+        records = (prev_completed.context or {}).get("finding_retired_dispositions")
+        assert records is not None, (
+            "TTL-expired deferred findings must be recorded as retired dispositions "
+            "on the producing task"
+        )
+        assert isinstance(records, list)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["title"] == "Stale retired finding"
+        assert rec["direction_id"] == direction_id
+        assert rec["deferred_reason"] == "degradation_gate"
+        assert rec["deferred_count"] == 2
+        assert rec["retired_by"] == "ttl"
+        assert rec["disposition"] == "retired"
+        assert "retired_at" in rec
+        assert rec["finding_hash"]
     finally:
         _ss.runtime_config.pop("completed_research_cooldown_minutes", None)
 
@@ -15278,6 +15531,475 @@ async def test_post_merge_research_skips_paused_project(db_session, mocker):
     spawned_ids = {call.args[0].id for call in spawn_spy.call_args_list}
     assert active.id in spawned_ids, "Non-paused project should spawn research"
     assert paused.id not in spawned_ids, "Paused project must be skipped"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fleet-headroom-scaled research admission
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _headroom_snapshot(*, available, vm_cap=10, active=2):
+    return {
+        "vm_slots_available": available,
+        "vm_cap": vm_cap,
+        "active_task_vms": active,
+        "managed_vm_count": max(active, vm_cap - available),
+        "idle_pool_vms": 0,
+        "orphaned_leased_vms": 0,
+        "vm_saturation": "healthy",
+    }
+
+
+@pytest.mark.asyncio
+async def test_idle_research_admits_by_headroom_budget(db_session, mocker):
+    """`_check_idle_research` scales admission to measured fleet headroom: a
+    budget of 0 (fleet below the min-free-slots floor) admits nothing, while
+    headroom above the floor hands the computed budget to the spawner."""
+    from app.autonomous_research import _check_idle_research
+    from conftest import TestingSessionLocal
+
+    mocker.patch("app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock)
+    mocker.patch(
+        "app.autonomous_research._spawn_residual_fingerprint_remediation",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.anomaly_detection._expire_stale_proposals", new_callable=AsyncMock
+    )
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", TestingSessionLocal)
+
+    project = Project(
+        name="Idle Headroom",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-hdrm01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawn_spy = mocker.patch(
+        "app.autonomous_research._spawn_research_task",
+        new_callable=AsyncMock,
+        return_value=1,
+    )
+
+    # Abundant headroom → budget = min(available, cap) = 6.
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=8)),
+    )
+    _shared_state.last_idle_check = None
+    try:
+        await _check_idle_research()
+    finally:
+        _shared_state.last_idle_check = None
+    assert spawn_spy.called, "headroom above floor must admit research"
+    assert spawn_spy.call_args.kwargs["headroom_budget"] == 6
+
+    # Below the floor → no admission at all.
+    spawn_spy.reset_mock()
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=1, active=9)),
+    )
+    _shared_state.last_idle_check = None
+    try:
+        await _check_idle_research()
+    finally:
+        _shared_state.last_idle_check = None
+    assert not spawn_spy.called, "headroom below floor must admit nothing"
+
+
+@pytest.mark.asyncio
+async def test_periodic_lane_not_starved_by_research_budget(db_session, mocker):
+    """Regression: the fleet-headroom budget scales RESEARCH admission only.
+
+    The budget is decremented per project across the sweep, so if the periodic
+    lane (security_audit / qa / deps) were gated on the *remaining* budget,
+    projects later in the iteration order would silently lose their security
+    audits once earlier projects consumed it — making iteration order decide
+    whether security audits run. Every project in a sweep that started with
+    fleet capacity must get its periodic spawns, even after research admission
+    is exhausted.
+    """
+    from app.autonomous_research import _check_idle_research
+    from conftest import TestingSessionLocal
+
+    mocker.patch(
+        "app.autonomous_research._spawn_residual_fingerprint_remediation",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.autonomous_research._spawn_viewport_regression_remediation",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.anomaly_detection._expire_stale_proposals", new_callable=AsyncMock
+    )
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", TestingSessionLocal)
+
+    projects = []
+    for n in range(3):
+        p = Project(
+            name=f"Budget Sweep {n}",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction(f"d-sweep{n}")],
+        )
+        db_session.add(p)
+        projects.append(p)
+    await db_session.commit()
+    for p in projects:
+        await db_session.refresh(p)
+
+    periodic_spy = mocker.patch(
+        "app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock
+    )
+    # The first project to reach the spawner consumes the entire budget (6),
+    # leaving 0 remaining for every project after it.
+    spawn_spy = mocker.patch(
+        "app.autonomous_research._spawn_research_task",
+        new_callable=AsyncMock,
+        return_value=6,
+    )
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=8)),
+    )
+
+    _shared_state.last_idle_check = None
+    try:
+        await _check_idle_research()
+    finally:
+        _shared_state.last_idle_check = None
+
+    # Research admission stops once the shared budget is exhausted: only the
+    # first project reached the spawner.
+    assert spawn_spy.call_count == 1, (
+        "research admission must stop once the shared budget is exhausted"
+    )
+
+    # ...but every project still got its full periodic lane.
+    swept = {p.id for p in projects}
+    for task_type in ("security_audit", "qa", "deps"):
+        got = {
+            c.args[0].id
+            for c in periodic_spy.call_args_list
+            if c.args[1] == task_type
+        }
+        assert swept <= got, (
+            f"every project in the sweep must get its periodic {task_type} spawn "
+            f"regardless of iteration order / remaining research budget; "
+            f"missing {swept - got}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_periodic_lane_skipped_when_fleet_below_floor(db_session, mocker):
+    """The periodic lane is still fleet-gated: a sweep that starts below the
+    min-free-slots floor spawns no research and no periodic work (the
+    pre-headroom all-or-none semantics), so decoupling it from the budget did
+    not make it unbounded.
+
+    The residual-fingerprint and viewport-regression remediation lanes are NOT
+    fleet-gated and must still run at zero headroom — a busy fleet is exactly
+    when recurring-failure remediation matters most.
+    """
+    from app.autonomous_research import _check_idle_research
+    from conftest import TestingSessionLocal
+
+    residual_spy = mocker.patch(
+        "app.autonomous_research._spawn_residual_fingerprint_remediation",
+        new_callable=AsyncMock,
+    )
+    viewport_spy = mocker.patch(
+        "app.autonomous_research._spawn_viewport_regression_remediation",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.anomaly_detection._expire_stale_proposals", new_callable=AsyncMock
+    )
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", TestingSessionLocal)
+
+    project = Project(
+        name="Below Floor Periodic",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-floor01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    periodic_spy = mocker.patch(
+        "app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.autonomous_research._spawn_research_task",
+        new_callable=AsyncMock,
+        return_value=0,
+    )
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=1, active=9)),
+    )
+
+    _shared_state.last_idle_check = None
+    try:
+        await _check_idle_research()
+    finally:
+        _shared_state.last_idle_check = None
+
+    assert not periodic_spy.called, (
+        "a sweep starting below the min-free-slots floor must not spawn periodic work"
+    )
+    assert residual_spy.called, (
+        "the residual-fingerprint remediation lane is not fleet-budget-scaled and "
+        "must still run when headroom is below the floor"
+    )
+    assert viewport_spy.called, (
+        "the viewport-regression remediation lane is not fleet-budget-scaled and "
+        "must still run when headroom is below the floor"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_merge_research_respects_headroom(db_session, mocker):
+    """The post-merge hook (`_check_autonomous_research`) shares the same
+    scaled-admission semantics: below-floor headroom skips the whole sweep,
+    and above-floor headroom threads the budget into each spawn."""
+    from app.autonomous_research import _check_autonomous_research
+    from conftest import TestingSessionLocal
+
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", TestingSessionLocal)
+    spawn_spy = mocker.patch(
+        "app.autonomous_research._spawn_research_task",
+        new_callable=AsyncMock,
+        return_value=1,
+    )
+
+    owner, repo = "acme", "widgets"
+    project = Project(
+        name="Merge Headroom",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        github_owner=owner,
+        github_repo=repo,
+        directions=[_active_direction("d-mh01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=8)),
+    )
+    await _check_autonomous_research(owner, repo)
+    assert spawn_spy.called, "headroom above floor must admit post-merge research"
+    assert spawn_spy.call_args.kwargs["headroom_budget"] == 6
+
+    spawn_spy.reset_mock()
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=1, active=9)),
+    )
+    await _check_autonomous_research(owner, repo)
+    assert not spawn_spy.called, "headroom below floor must admit nothing post-merge"
+
+
+@pytest.mark.asyncio
+async def test_spawn_research_task_headroom_budget_caps_spawn_count(db_session):
+    """The fleet-headroom budget is enforced inside the spawn path: with two
+    active directions and a per-project parallel cap of 2, a headroom budget of
+    1 admits exactly one task and a budget of 0 admits none."""
+    project = Project(
+        name="Headroom Caps Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            _active_direction("d-hcap-a1"),
+            _active_direction("d-hcap-b2"),
+        ],
+        vision={"purpose": "test"},
+        build_config={"max_parallel_research": 2},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_research_task(project, db_session, headroom_budget=1)
+    assert spawned == 1, "headroom budget 1 must cap the spawn at one task"
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 1, "exactly one research task may be spawned"
+
+    # A zero budget admits nothing (headroom below the floor).
+    project2 = Project(
+        name="Headroom Zero Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            _active_direction("d-hzero-a1"),
+            _active_direction("d-hzero-b2"),
+        ],
+        vision={"purpose": "test"},
+        build_config={"max_parallel_research": 2},
+    )
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    spawned = await _spawn_research_task(project2, db_session, headroom_budget=0)
+    assert spawned == 0, "headroom budget 0 must admit nothing"
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project2.id)
+    )
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 0, "no research task may be spawned with budget 0"
+
+
+@pytest.mark.asyncio
+async def test_idle_research_relaxes_evaluating_total_on_headroom(db_session):
+    """With the headroom relaxation on (the default) AND the fleet above the
+    min-free-slots floor, an EVALUATING parent stops counting against the
+    per-project total cap. With the operator escape hatch set to false — or
+    headroom below the floor — the parent still blocks (the relaxation is gated
+    on both)."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    old_flag = _runtime_config.get("research_headroom_ignores_evaluating", True)
+    _runtime_config["research_headroom_ignores_evaluating"] = True
+    try:
+        project = Project(
+            name="Eval Relax Headroom",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction("d-evalrelax1")],
+            vision={"purpose": "test"},
+            build_config={"max_total_research": 1},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # EVALUATING parent on a DIFFERENT direction: counts toward the total cap
+        # (type == "research") but does not block the active direction.
+        parent = Task(
+            project_id=project.id,
+            title="Research: evaluating parent",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [],
+                    "base_branch": "main",
+                    "current_direction_id": "d-elsewhere",
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(parent)
+        await db_session.commit()
+
+        # Flag on + headroom above floor → EVALUATING excluded → spawn proceeds.
+        spawned = await _spawn_research_task(project, db_session, headroom_budget=6)
+        assert spawned == 1, (
+            "EVALUATING parent must not block when the headroom relaxation is on"
+        )
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        research = [
+            t
+            for t in result.scalars().all()
+            if (t.payloads or [{}])[0].get("type") == "research"
+        ]
+        assert len(research) == 2, "parent + one newly spawned research task"
+
+        # Flag on but headroom below floor → EVALUATING counts again → blocked.
+        project3 = Project(
+            name="Eval Relax No Headroom",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction("d-evalrelax3")],
+            vision={"purpose": "test"},
+            build_config={"max_total_research": 1},
+        )
+        db_session.add(project3)
+        await db_session.commit()
+        await db_session.refresh(project3)
+        parent3 = Task(
+            project_id=project3.id,
+            title="Research: evaluating parent",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [],
+                    "base_branch": "main",
+                    "current_direction_id": "d-elsewhere3",
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(parent3)
+        await db_session.commit()
+
+        spawned = await _spawn_research_task(project3, db_session, headroom_budget=0)
+        assert not spawned, (
+            "headroom below the floor must keep the EVALUATING total cap in force"
+        )
+
+        # Flag off + headroom above floor → EVALUATING still counts → blocked.
+        _runtime_config["research_headroom_ignores_evaluating"] = False
+        project2 = Project(
+            name="Eval Relax Flag Off",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction("d-evalrelax2")],
+            vision={"purpose": "test"},
+            build_config={"max_total_research": 1},
+        )
+        db_session.add(project2)
+        await db_session.commit()
+        await db_session.refresh(project2)
+        parent2 = Task(
+            project_id=project2.id,
+            title="Research: evaluating parent",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [],
+                    "base_branch": "main",
+                    "current_direction_id": "d-elsewhere2",
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(parent2)
+        await db_session.commit()
+
+        spawned = await _spawn_research_task(project2, db_session, headroom_budget=6)
+        assert not spawned, (
+            "EVALUATING parent must still count when the relaxation flag is off"
+        )
+    finally:
+        _runtime_config["research_headroom_ignores_evaluating"] = old_flag
 
 
 # ─────────────────────────────────────────────────────────────────────────────

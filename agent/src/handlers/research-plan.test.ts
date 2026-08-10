@@ -294,6 +294,7 @@ import {
   CAPABILITY_DECLARATION_DOC,
   normalizePlanSubtaskTypes,
   buildResearchScopeGuidance,
+  buildWorkHeadroomSection,
 } from './research-plan.js';
 
 describe('bounded discovery-cycle research guidance', () => {
@@ -314,6 +315,27 @@ describe('bounded discovery-cycle research guidance', () => {
     expect(guidance).toContain('Output ALL meaningful findings');
     expect(guidance).toContain('Be ambitious');
     expect(guidance).not.toContain('BOUNDED DISCOVERY CYCLE');
+  });
+});
+
+describe('work-headroom prompt section', () => {
+  it('renders the headroom count when real capacity is stamped', () => {
+    const section = buildWorkHeadroomSection(15);
+    expect(section).toContain('WORK HEADROOM');
+    expect(section).toContain('up to 15 implementation finding(s)');
+    expect(section).toContain('self-limit to 1-3');
+  });
+
+  it('returns empty text for missing, zero, or negative headroom', () => {
+    expect(buildWorkHeadroomSection(undefined)).toBe('');
+    expect(buildWorkHeadroomSection(0)).toBe('');
+    expect(buildWorkHeadroomSection(-3)).toBe('');
+    expect(buildWorkHeadroomSection(null as unknown as number)).toBe('');
+  });
+
+  it('floors fractional headroom to whole finding slots', () => {
+    const section = buildWorkHeadroomSection(14.6);
+    expect(section).toContain('up to 14 implementation finding(s)');
   });
 });
 
@@ -2772,6 +2794,45 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     const researchPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(researchPrompt).toContain('work_class');
     expect(researchPrompt).toContain('stop_or_pivot_condition');
+  });
+
+  // ── work_headroom: backend-stamped finding capacity ─────────────────────────
+  // The research prompt historically capped findings at a preset count with no
+  // signal about available capacity; the backend now stamps the per-cycle
+  // finding headroom so the agent can scale yield up to it.
+  it('handleResearch renders the WORK HEADROOM section when the backend stamps headroom', async () => {
+    await handleResearch(
+      FP_TASK_ID,
+      { ...FP_PAYLOAD, work_headroom: 15 },
+      FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('WORK HEADROOM');
+    expect(p).toContain('up to 15 implementation finding(s)');
+    // The uncapped MISSION line is widened with the headroom tail, not replaced.
+    expect(p).toContain('never withhold a genuine finding to hit a small quota');
+    expect(p).toContain('when a cycle grants real headroom');
+  });
+
+  it('handleResearch omits the WORK HEADROOM section when the payload has no field', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('WORK HEADROOM');
+    // Old payloads keep the base MISSION wording without the headroom tail.
+    expect(p).toContain('never withhold a genuine finding to hit a small quota.');
+    expect(p).not.toContain('when a cycle grants real headroom');
+  });
+
+  it('handleResearch keeps the 1-3 constraint for bounded discovery cycles even when headroom is stamped', async () => {
+    await handleResearch(
+      FP_TASK_ID,
+      { ...FP_PAYLOAD, work_headroom: 15, discovery_mode: 'bounded_cycle' },
+      FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('at most 1-3 coherent, decision-relevant findings');
+    expect(p).not.toContain('WORK HEADROOM');
+    expect(p).not.toContain('when a cycle grants real headroom');
   });
 
   it('handlePlan prompt contains related_files (subtask schema field)', async () => {

@@ -1302,3 +1302,31 @@ async def get_project_findings(
         session, project_id, direction_id=direction_id, limit=limit, days=days
     )
     return {"findings": rows, "count": len(rows)}
+
+
+@router.get("/projects/{project_id}/findings/retired")
+async def get_project_retired_findings(
+    project_id: uuid.UUID,
+    limit: int = Query(100, ge=1, le=500),
+    days: int = Query(30, ge=1, le=365),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return retired-disposition records for TTL-dropped deferred findings.
+
+    The read side of the retired-disposition ledger written by the spawn-side
+    recovery scan and the completion-side recovery block: operators (and the
+    strategic cycle, via this endpoint) can see WHICH deferred findings were
+    dropped at the ``deferred_finding_ttl_days`` TTL, when, and why — instead
+    of only an aggregate count. Ordered newest-task-first; bounded by days
+    recency and limit total rows.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    from app.research_completion import query_retired_dispositions
+
+    rows = await query_retired_dispositions(
+        session, project_id, limit=limit, days=days
+    )
+    return {"retired_findings": rows, "count": len(rows)}

@@ -8,6 +8,7 @@ vi.mock('../index.js', () => ({
 vi.mock('./research-plan.js', () => {
   return {
     buildResearchScopeGuidance: vi.fn(),
+    buildWorkHeadroomSection: vi.fn(),
     aggregateDirectionStats: (history: Array<Record<string, unknown>>, agg: Record<string, unknown>) => {
       const total = history.length + ((agg.total_cycles as number) || 0);
       if (total === 0) return '';

@@ -585,6 +585,36 @@ runtime_config: Dict = {
     "max_total_research_per_project": int(
         os.getenv("MAX_TOTAL_RESEARCH_PER_PROJECT", "5")
     ),
+    # Research admission is scaled to measured fleet headroom instead of a
+    # binary "any VM slot free?" gate. research_headroom_min_free_slots is the
+    # floor of free VM slots below which a sweep admits no research (a safety
+    # buffer so research does not fill the last slots); research_fleet_spawn_budget
+    # caps how many research tasks a single sweep may admit per project when
+    # headroom is available (min(available, budget), so abundant headroom admits
+    # up to the budget and scarce headroom admits proportionally less).
+    "research_headroom_min_free_slots": int(
+        os.getenv("RESEARCH_HEADROOM_MIN_FREE_SLOTS", "2")
+    ),
+    "research_fleet_spawn_budget": int(
+        os.getenv("RESEARCH_FLEET_SPAWN_BUDGET", "6")
+    ),
+    # When True AND the fleet has headroom above the min-free-slots floor,
+    # EVALUATING research parents no longer count against the per-project total
+    # cap. The total cap exists to bound pending-rollup pile-up (each EVALUATING
+    # parent has children merging into the same base); on an idle fleet the
+    # merge bottleneck is not VM slots, so the count can be relaxed.
+    # Defaults ON: this is the fix for the measured symptom (active directions
+    # carrying fresh findings with ZERO tasks in flight because the per-project
+    # total cap of 5 was consumed by EVALUATING rollup parents), so shipping it
+    # dark would leave that symptom in place. The relaxation is already
+    # double-gated on `headroom_budget > 0` — i.e. the fleet is above the
+    # min-free-slots floor — which is the safety property that bounds it; the
+    # env var remains as an operator escape hatch
+    # (RESEARCH_HEADROOM_IGNORES_EVALUATING=false).
+    "research_headroom_ignores_evaluating": (
+        os.getenv("RESEARCH_HEADROOM_IGNORES_EVALUATING", "true").lower()
+        in ("1", "true", "yes")
+    ),
     # Auto-remediation governors (residual CODE_ERROR fingerprint spawner).
     # Global cap on concurrent/queued auto-remediation tasks prevents queue
     # ballooning when many distinct fingerprints accumulate. Cooldown is

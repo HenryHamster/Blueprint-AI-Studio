@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import case, exists, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
@@ -41,6 +42,10 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
+from app.findings_shelving import (
+    RETIRED_DISPOSITION_KEY,
+    build_retired_disposition_records,
+)
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import (
     acquire_direction_research_spawn_lock,
@@ -393,17 +398,25 @@ async def _spawn_research_task(
     session: AsyncSession,
     *,
     expected_legacy_generation: int | None = None,
+    headroom_budget: int | None = None,
 ):
     """Spawn a research task for a project if conditions are met.
 
     Uses a per-project lock to prevent races between the post-merge hook
     and the idle-check loop, which run concurrently with separate sessions.
+
+    ``headroom_budget`` (fleet headroom scaled by
+    ``compute_headroom_spawn_budget``) additionally caps how many directions
+    this call may admit; ``None`` means no fleet-headroom cap (manual spawns,
+    post-merge hook without a budget). Returns the number of research tasks
+    actually spawned (0 when nothing was admitted).
     """
     async with _get_spawn_lock(str(project.id)):
         return await _spawn_research_task_inner(
             project,
             session,
             expected_legacy_generation=expected_legacy_generation,
+            headroom_budget=headroom_budget,
         )
 
 
@@ -810,8 +823,24 @@ async def _spawn_research_task_inner(
     session: AsyncSession,
     *,
     expected_legacy_generation: int | None = None,
+    headroom_budget: int | None = None,
 ):
-    """Inner implementation — always called under the per-project spawn lock."""
+    """Inner implementation — always called under the per-project spawn lock.
+
+    ``headroom_budget``, when not None, additionally caps the number of
+    directions admitted this call (fleet-headroom scaled admission); it also
+    gates the EVALUATING-total relaxation behind the
+    ``research_headroom_ignores_evaluating`` runtime flag. Returns the number
+    of research tasks actually spawned (0 when nothing was admitted). A budget
+    of 0 admits nothing at all — including the undirected ``[None]`` fallback —
+    so a mid-sweep budget exhaustion cannot slip an extra task past the floor.
+    """
+    if headroom_budget is not None and headroom_budget <= 0:
+        logger.info(
+            f"[AUTONOMOUS] Fleet headroom budget exhausted ({headroom_budget}) — "
+            f"no research admission for project {project.id}"
+        )
+        return 0
     try:
         legacy_generation = (
             await lock_and_validate_legacy_authority(
@@ -828,6 +857,7 @@ async def _spawn_research_task_inner(
         _compute_momentum_factor,
         _compute_productivity_score,
         _compute_acceptance_rate,
+        effective_research_finding_headroom,
     )
     from app.direction_metrics import (
         _compute_direction_quality_score,
@@ -845,6 +875,11 @@ async def _spawn_research_task_inner(
     # transiently deferred. The marker persists and is delivered if autonomy is
     # re-enabled.
     if not project.autonomous_enabled or project.archived:
+        logger.info(
+            "[AUTONOMOUS] Skipping research spawn for project %s — %s",
+            project.id,
+            "autonomous_enabled is False" if not project.autonomous_enabled else "project is archived",
+        )
         return
 
     # Playbook auto-seed removed: the hardcoded seed entries were specific to the
@@ -2120,8 +2155,10 @@ async def _spawn_research_task_inner(
     ).scalar() or 0
     if active_research_count >= max_parallel:
         logger.info(
-            f"[AUTONOMOUS] Parallel research cap reached: {active_research_count}/{max_parallel} "
-            f"— skipping spawn for project {project.id}"
+            "[AUTONOMOUS] Parallel research cap reached: %s/%s — skipping spawn for project %s",
+            active_research_count,
+            max_parallel,
+            project.id,
         )
         return
     # Second cap: total research in any non-terminal state. Pending rollups in
@@ -2141,25 +2178,39 @@ async def _spawn_research_task_inner(
     max_total = project_parallelism_cap(
         project, "max_total_research", "max_total_research_per_project", 5
     )
+    # The total cap normally includes EVALUATING parents (pending rollups pile
+    # up merge complexity on the same base). When the operator opts into the
+    # headroom relaxation AND the fleet has headroom above the admission floor
+    # (headroom_budget > 0), EVALUATING parents — which wait on rollup merges,
+    # not VM slots — stop counting so an idle fleet does not let a pile of
+    # pending rollups starve new research.
+    _headroom_above_floor = headroom_budget is not None and headroom_budget > 0
+    _total_statuses = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+    ]
+    if not (
+        _runtime_config.get("research_headroom_ignores_evaluating", True)
+        and _headroom_above_floor
+    ):
+        _total_statuses.append(TaskStatus.EVALUATING)
     total_research_count = (
         await session.execute(
             select(func.count())
             .select_from(Task)
             .where(
                 Task.project_id == project.id,
-                Task.status.in_(
-                    [
-                        TaskStatus.QUEUED,
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.EVALUATING,
-                    ]
-                ),
+                Task.status.in_(_total_statuses),
                 Task.payloads[0]["type"].as_string() == "research",
             )
         )
     ).scalar() or 0
-    if parents_with_active_children:
+    # The productive-EVALUATING subtraction only applies when EVALUATING was
+    # counted at all — under the headroom relaxation the statuses above already
+    # exclude EVALUATING entirely, and subtracting parents that were never
+    # counted would under-count the remaining classes.
+    if parents_with_active_children and TaskStatus.EVALUATING in _total_statuses:
         productive_evaluating = (
             await session.execute(
                 select(func.count())
@@ -2176,14 +2227,17 @@ async def _spawn_research_task_inner(
     if total_research_count >= max_total:
         logger.info(
             f"[AUTONOMOUS] Total research cap reached: {total_research_count}/{max_total} "
-            f"(excluding EVALUATING parents with active children) — skipping spawn "
-            f"for project {project.id}"
+            f"({'excluding all EVALUATING — headroom relaxation' if TaskStatus.EVALUATING not in _total_statuses else 'excluding EVALUATING parents with active children'}) "
+            f"— skipping spawn for project {project.id}"
         )
         return
-    # Reduce chosen_directions to the smaller of the two remaining budgets
+    # Reduce chosen_directions to the smaller of the two remaining budgets,
+    # plus the fleet-headroom budget when one was supplied (scaled admission).
     remaining_slots = min(
         max_parallel - active_research_count, max_total - total_research_count
     )
+    if headroom_budget is not None:
+        remaining_slots = min(remaining_slots, headroom_budget)
     chosen_directions = chosen_directions[:remaining_slots]
     # Guard: global rate limit across ALL projects
     one_hour_ago = _utcnow() - timedelta(hours=1)
@@ -2267,8 +2321,10 @@ async def _spawn_research_task_inner(
     )
     if recent_research_count >= per_hour_cap:
         logger.info(
-            f"[AUTONOMOUS] Per-hour research cap reached: {recent_research_count}/{per_hour_cap} "
-            f"— skipping spawn for project {project.id}"
+            "[AUTONOMOUS] Per-hour research rate limit reached: %s/%s — skipping spawn for project %s",
+            recent_research_count,
+            per_hour_cap,
+            project.id,
         )
         return
 
@@ -2946,6 +3002,10 @@ async def _spawn_research_task_inner(
         dir_deferred: list[dict] = []
         seen_hashes: set[str] = set()
         _expired_count = 0
+        # Expired findings grouped by the producing COMPLETED task that shelved
+        # them (``context.deferred_findings``). Each affected producer gets a
+        # retired-disposition record so a TTL drop is never only a logged count.
+        _expired_by_producer: dict[uuid.UUID, list[dict]] = {}
         for prev_row in prev_research_rows:
             for f in (prev_row.context or {}).get("deferred_findings", []):
                 if not isinstance(f, dict):
@@ -2964,6 +3024,7 @@ async def _spawn_research_task_inner(
                         _orig_dt = datetime.fromisoformat(_orig_at).replace(tzinfo=None)
                         if _orig_dt < _ttl_cutoff:
                             _expired_count += 1
+                            _expired_by_producer.setdefault(prev_row.id, []).append(f)
                             continue
                     except (ValueError, TypeError):
                         pass
@@ -2972,8 +3033,41 @@ async def _spawn_research_task_inner(
                     f.get("title", ""), f.get("description", "")
                 )
                 if fhash not in seen_hashes:
+                    # Stamp the producing task onto injected findings so the
+                    # downstream completion recovery block can reference the
+                    # original producer in its retired-disposition records.
+                    if not f.get("source_task_id"):
+                        f["source_task_id"] = str(prev_row.id)
                     dir_deferred.append(f)
                     seen_hashes.add(fhash)
+        # Record a durable retired disposition on each affected producing task.
+        # Fail-open: a recording error must never abort the research spawn.
+        for prev_row in prev_research_rows:
+            _expired = _expired_by_producer.get(prev_row.id)
+            if not _expired:
+                continue
+            try:
+                _prod_ctx = dict(prev_row.context or {})
+                _prod_ctx[RETIRED_DISPOSITION_KEY] = (
+                    build_retired_disposition_records(
+                        _expired,
+                        existing_records=_prod_ctx.get(RETIRED_DISPOSITION_KEY),
+                    )
+                )
+                prev_row.context = _prod_ctx
+                flag_modified(prev_row, "context")
+                session.add(prev_row)
+                logger.warning(
+                    f"[AUTONOMOUS] Recorded {len(_expired)} retired disposition(s) "
+                    f"on producer task {prev_row.id} (TTL {_deferred_ttl_days}d)"
+                )
+            except Exception:  # noqa: BLE001 — disposition logging is best-effort
+                logger.warning(
+                    "[AUTONOMOUS] failed to record retired disposition(s) on "
+                    "producer task %s — disposition logging is best-effort",
+                    prev_row.id,
+                    exc_info=True,
+                )
         # Prioritize findings that have been deferred the most times — they keep
         # getting bumped and should execute first when capacity returns.
         dir_deferred.sort(key=lambda f: int(f.get("deferred_count", 0)), reverse=True)
@@ -3128,6 +3222,18 @@ async def _spawn_research_task_inner(
                 )
         else:
             _discovery_cycle_id = None
+        # Stamp how many findings this cycle can actually admit. The flat
+        # per-cycle ceiling (_MAX_FINDINGS_PER_CYCLE) is rarely approached; the
+        # binding constraint on research yield is the prompt's conservative
+        # "2 real findings beats 10 incremental ones" instruction, which carries
+        # no signal about available capacity. Stamping the real headroom (ceiling
+        # minus recovered deferred findings, which consume this cycle's slots)
+        # lets the research agent scale output to actual capacity. Additive and
+        # optional: validated via BasePayload extra='allow', ignored by older
+        # agents, and absent when the cap is already consumed.
+        research_payload["work_headroom"] = effective_research_finding_headroom(
+            len(dir_deferred)
+        )
         new_task = Task(
             project_id=project.id,
             discovery_cycle_id=_discovery_cycle_id,
@@ -3243,6 +3349,7 @@ async def _spawn_research_task_inner(
         logger.info(
             f"[AUTONOMOUS] Spawned {len(spawned_tasks)} parallel research tasks for project {project.id}"
         )
+    return len(spawned_tasks)
 
 
 async def _spawn_periodic_task(
@@ -3523,10 +3630,10 @@ async def _check_autonomous_research(owner: str, repo: str):
     rollback-expired lazy-load) poisoned the session and silently killed spawning
     for every project while churning the connection pool.
     """
-    from sqlalchemy import func
-
-    # Phase 1 — enumerate matching projects + the global VM-slot gate in one
-    # short read session, so no per-project spawn can hold this open.
+    # Phase 1 — enumerate matching projects + the fleet-headroom budget in one
+    # short read session, so no per-project spawn can hold this open. The
+    # post-merge hook shares the same scaled-admission semantics as the idle
+    # sweep: a budget of 0 (fleet below the min-free-slots floor) admits none.
     try:
         async with AsyncSessionLocal() as session:
             project_ids = (
@@ -3545,18 +3652,32 @@ async def _check_autonomous_research(owner: str, repo: str):
             if not project_ids:
                 return
 
-            # Spawn if VM slots are available (PROVISIONING + IN_PROGRESS, not blocked QUEUED)
-            vm_consuming = (
-                await session.execute(
-                    select(func.count())
-                    .select_from(Task)
-                    .where(
-                        Task.status.in_(
-                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                        ),
-                    )
+            from app.fleet_utilization import (
+                compute_headroom_spawn_budget,
+                get_fleet_utilization_snapshot,
+            )
+
+            headroom_budget = 0
+            try:
+                snapshot = await get_fleet_utilization_snapshot(session)
+                headroom = compute_headroom_spawn_budget(
+                    snapshot,
+                    min_free_slots=_runtime_config.get(
+                        "research_headroom_min_free_slots", 2
+                    ),
+                    cap=_runtime_config.get("research_fleet_spawn_budget", 6),
                 )
-            ).scalar() or 0
+                headroom_budget = headroom["budget"]
+                logger.info("[AUTONOMOUS] Post-merge research headroom: %s", headroom)
+            except Exception as e:
+                logger.warning(
+                    f"[AUTONOMOUS] Fleet headroom snapshot failed open for "
+                    f"post-merge research: {e}",
+                    exc_info=True,
+                )
+                headroom_budget = _runtime_config.get(
+                    "research_fleet_spawn_budget", 6
+                )
     except Exception as e:
         logger.error(
             f"[AUTONOMOUS] Error enumerating projects for research trigger {owner}/{repo}: {e}",
@@ -3564,7 +3685,7 @@ async def _check_autonomous_research(owner: str, repo: str):
         )
         return
 
-    if vm_consuming >= _runtime_config["max_concurrent_vms"]:
+    if headroom_budget <= 0:
         return
 
     # Phase 2 — spawn each project in its own isolated session.  The Project
@@ -3575,16 +3696,24 @@ async def _check_autonomous_research(owner: str, repo: str):
     # Session``.  Re-fetching by id also ensures pause/config changes made after
     # enumeration are observed before spawning.
     for project_id in project_ids:
+        if headroom_budget <= 0:
+            # Fleet headroom budget exhausted by earlier projects in this sweep —
+            # stop admitting rather than hand a 0 budget to the spawner (which
+            # would still take the legacy-authority lock for nothing).
+            break
         try:
             async with AsyncSessionLocal() as session:
                 project = await session.get(Project, project_id)
                 if project is None:
                     continue
-                await _spawn_research_task(
+                spawned = await _spawn_research_task(
                     project,
                     session,
                     expected_legacy_generation=None,
+                    headroom_budget=headroom_budget,
                 )
+                if isinstance(spawned, int) and spawned > 0:
+                    headroom_budget -= spawned
         except Exception as e:
             logger.error(
                 f"[AUTONOMOUS] Research trigger spawn failed for project {project_id} ({owner}/{repo}): {e}",
@@ -3608,11 +3737,30 @@ from app.autonomous_research_residual import (
 async def _run_idle_research_for_project(
     project: Project,
     session: AsyncSession,
-    vm_consuming: int,
+    headroom_budget: int,
     *,
     expected_legacy_generation: int,
-) -> None:
+    fleet_has_capacity: bool = True,
+) -> int:
     """Idle-research spawn work for a single project.
+
+    ``headroom_budget`` is the *remaining* fleet-headroom-scaled RESEARCH
+    admission budget for this sweep (0 = no research is admitted for this
+    project — either the fleet has no headroom above the floor, or earlier
+    projects in the sweep already consumed the budget). Returns the number of
+    research tasks actually spawned so the sweep can decrement the shared
+    budget across projects.
+
+    ``fleet_has_capacity`` is the sweep-entry fleet-capacity verdict, computed
+    ONCE per sweep and passed unchanged to every project. It gates the
+    non-research periodic lane (security_audit / qa / deps). Keeping that lane
+    off the *decrementing* research budget is deliberate: the budget scales
+    research admission only, and folding the periodic lane into it would make
+    project iteration order decide whether security audits run — later projects
+    in the sweep would silently lose their periodic spawns once earlier ones
+    consumed the research budget, even with the fleet still having capacity.
+    Gating on the per-sweep verdict preserves the pre-headroom semantics, where
+    a single fleet snapshot gated the periodic lane for every project alike.
 
     Runs inside a per-project session owned by ``_check_idle_research``; a
     failure here is contained to this project's transaction (see that function's
@@ -3640,7 +3788,7 @@ async def _run_idle_research_for_project(
         and not vision_needs_bootstrap
         and not strategic_recovery_needed
     ):
-        return
+        return 0
 
     # Monthly budget gate: skip idle-research spawning when the fleet-wide
     # monthly budget is exhausted. Since this runs for every project in the
@@ -3651,7 +3799,7 @@ async def _run_idle_research_for_project(
             "[AUTONOMOUS] Skipping idle research for project %s — monthly budget exhausted",
             project.id,
         )
-        return
+        return 0
 
     # Daily budget gate: same shared-state fast path as the monthly gate.
     if _shared_state.daily_budget_gate_engaged:
@@ -3659,15 +3807,28 @@ async def _run_idle_research_for_project(
             "[AUTONOMOUS] Skipping idle research for project %s — daily budget exhausted",
             project.id,
         )
-        return
+        return 0
 
-    if vm_consuming < _runtime_config["max_concurrent_vms"]:
-        await _spawn_research_task(
+    # Research admission is the only lane scaled by the decrementing budget.
+    # A budget of 0 skips the spawner entirely rather than calling it with 0
+    # (which would take the legacy-authority lock for nothing) — the same
+    # early-out ``_check_autonomous_research`` gets from its ``break``.
+    spawned = 0
+    if headroom_budget > 0:
+        spawned = await _spawn_research_task(
             project,
             session,
             expected_legacy_generation=expected_legacy_generation,
+            headroom_budget=headroom_budget,
         )
+        if not isinstance(spawned, int):
+            spawned = 0
 
+    # Periodic lane: gated on the per-sweep fleet-capacity verdict, NOT the
+    # decrementing research budget, so a project's position in the sweep cannot
+    # decide whether its security audit runs. Each `_spawn_periodic_task` still
+    # applies its own cadence, dedup and spend-ceiling gates.
+    if fleet_has_capacity:
         for task_type in ("security_audit", "qa", "deps"):
             await _spawn_periodic_task(
                 project,
@@ -3706,6 +3867,7 @@ async def _run_idle_research_for_project(
     await commit_legacy_authorized(
         session, project.id, expected_legacy_generation
     )
+    return spawned
 
 
 async def _check_idle_research():
@@ -3721,7 +3883,6 @@ async def _check_idle_research():
     project while churning the connection pool.
     """
     from app.anomaly_detection import _expire_stale_proposals
-    from sqlalchemy import func
 
     now = _utcnow()
     interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
@@ -3731,7 +3892,11 @@ async def _check_idle_research():
         return
     _shared_state.last_idle_check = now
 
-    # Phase 1 — enumerate candidates + the global VM gate in a short session.
+    # Phase 1 — enumerate candidates + the fleet-headroom budget in a short
+    # session. Research admission is scaled to measured fleet headroom instead
+    # of the old binary "any VM slot free?" gate: the budget is 0 when headroom
+    # is below the min-free-slots floor, and scales up to the per-tick budget
+    # as headroom grows.
     try:
         async with AsyncSessionLocal() as session:
             # Expire stale proposals before processing
@@ -3751,20 +3916,36 @@ async def _check_idle_research():
                 )
             ).scalars().all()
 
-            # Spawn if VM slots are available — count only tasks consuming VMs,
-            # not QUEUED tasks blocked on dependencies. Newly spawned research is
-            # QUEUED, so this global gate is stable across the per-project loop.
-            vm_consuming = (
-                await session.execute(
-                    select(func.count())
-                    .select_from(Task)
-                    .where(
-                        Task.status.in_(
-                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                        ),
-                    )
+            # Measure fleet headroom once per sweep. The snapshot's GCP/warm-pool
+            # reads are internally exception-guarded; if the whole snapshot fails
+            # we fail OPEN to the configured budget so a measurement outage does
+            # not silently halt research admission.
+            from app.fleet_utilization import (
+                compute_headroom_spawn_budget,
+                get_fleet_utilization_snapshot,
+            )
+
+            headroom_budget = 0
+            try:
+                snapshot = await get_fleet_utilization_snapshot(session)
+                headroom = compute_headroom_spawn_budget(
+                    snapshot,
+                    min_free_slots=_runtime_config.get(
+                        "research_headroom_min_free_slots", 2
+                    ),
+                    cap=_runtime_config.get("research_fleet_spawn_budget", 6),
                 )
-            ).scalar() or 0
+                headroom_budget = headroom["budget"]
+                logger.info("[AUTONOMOUS] Idle research headroom: %s", headroom)
+            except Exception as e:
+                logger.warning(
+                    f"[AUTONOMOUS] Fleet headroom snapshot failed open for idle "
+                    f"research: {e}",
+                    exc_info=True,
+                )
+                headroom_budget = _runtime_config.get(
+                    "research_fleet_spawn_budget", 6
+                )
     except Exception as e:
         logger.error(
             f"[AUTONOMOUS] Error enumerating projects for idle research: {e}",
@@ -3772,22 +3953,48 @@ async def _check_idle_research():
         )
         return
 
+    # NOTE: deliberately NO sweep-level early return on `headroom_budget <= 0`.
+    # A zero budget means only that *research* admission is closed for this
+    # sweep; the per-project loop below also drives the residual-fingerprint and
+    # viewport-regression remediation lanes (and the legacy-commit authorization
+    # path), which are not fleet-budget-scaled and matter most precisely when
+    # the fleet is busy with recurring failures. `_run_idle_research_for_project`
+    # already handles `headroom_budget == 0` by skipping research admission.
+
+    # Sweep-entry fleet-capacity verdict: computed ONCE and passed unchanged to
+    # every project so the non-research periodic lane (security_audit / qa /
+    # deps) is all-or-none across the sweep, exactly as it was when a single
+    # `vm_consuming < max_concurrent_vms` snapshot gated it. Only research
+    # admission consumes the decrementing budget below.
+    fleet_has_capacity = headroom_budget > 0
+
     # Phase 2 — spawn each project in its own isolated session.  Load the
     # Project in the session that will run the spawn so it remains persistent
     # for every refresh/write in ``_run_idle_research_for_project``.  Passing a
     # Project loaded by a now-closed batch session is a detached-instance bug.
+    # The fleet-headroom budget is shared across the sweep: each project
+    # decrements it by the number of research tasks it actually spawned.  Note
+    # this loop does NOT `break` when the budget hits 0 (unlike
+    # `_check_autonomous_research`, whose only lane is research): later projects
+    # still need their periodic and residual-remediation lanes, which are not
+    # budget-scaled.  Research admission itself still early-outs per project on
+    # `headroom_budget > 0`, so the two loops stop admitting research on the
+    # same condition.
     for project_id in project_ids:
         try:
             async with AsyncSessionLocal() as session:
                 project = await session.get(Project, project_id)
                 if project is None:
                     continue
-                await _run_idle_research_for_project(
+                spawned = await _run_idle_research_for_project(
                     project,
                     session,
-                    vm_consuming,
+                    headroom_budget,
                     expected_legacy_generation=None,
+                    fleet_has_capacity=fleet_has_capacity,
                 )
+                if isinstance(spawned, int) and spawned > 0:
+                    headroom_budget -= spawned
         except Exception as e:
             logger.error(
                 f"[AUTONOMOUS] Idle research spawn failed for project {project_id}: {e}",

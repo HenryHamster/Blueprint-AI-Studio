@@ -635,6 +635,123 @@ async def test_salvage_activity_context_recorded_on_parent_task(db_session, mock
     assert _fb["salvaged"] == 1
 
 
+@_pytest.mark.asyncio
+async def test_expired_deferred_finding_records_retired_disposition(db_session, mocker):
+    """A TTL-expired prior-deferred finding is not silently dropped: the
+    completion recovery path records a durable per-finding retired disposition on
+    the research task's context under finding_retired_dispositions."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-retired01"
+    )
+    # A deferred finding researched 10 days ago — beyond the 7-day default TTL.
+    stale = _make_finding("TTL-expired deferred finding", direction_id=direction["id"])
+    stale["originally_researched_at"] = (_utcnow() - timedelta(days=10)).isoformat()
+    stale["deferred_reason"] = "degradation_gate"
+    stale["deferred_count"] = 1
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [stale],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fresh sentinel", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    records = (task.context or {}).get("finding_retired_dispositions")
+    assert records is not None, (
+        "TTL-dropped deferred findings must be recorded as retired dispositions"
+    )
+    assert isinstance(records, list)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["title"] == "TTL-expired deferred finding"
+    assert rec["direction_id"] == direction["id"]
+    assert rec["deferred_reason"] == "degradation_gate"
+    assert rec["deferred_count"] == 1
+    assert rec["retired_by"] == "ttl"
+    assert rec["disposition"] == "retired"
+    assert "retired_at" in rec
+    assert rec["finding_hash"], (
+        "retired disposition must carry the dedup finding_hash"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_query_retired_dispositions_returns_recorded_records(db_session):
+    """query_retired_dispositions scans recent completed research tasks' context
+    and returns the recorded retired-disposition records, newest-task-first."""
+    from app.research_completion import query_retired_dispositions
+
+    project = _Project(
+        name="Retired Dispositions Query",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{"id": "d-retired-q1", "text": "Q", "status": "active"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    completed = _Task(
+        project_id=project.id,
+        title="Research: query dispositions",
+        payloads=[{"type": "research", "base_branch": "main"}],
+        context={
+            "finding_retired_dispositions": [
+                {
+                    "finding_hash": "hash-1",
+                    "title": "Retired one",
+                    "direction_id": "d-retired-q1",
+                    "deferred_reason": "degradation_gate",
+                    "deferred_count": 1,
+                    "retired_at": now.isoformat(),
+                    "retired_by": "ttl",
+                    "disposition": "retired",
+                },
+                {
+                    "finding_hash": "hash-2",
+                    "title": "Retired two",
+                    "direction_id": "d-retired-q1",
+                    "deferred_reason": "low_actionability",
+                    "deferred_count": 3,
+                    "retired_at": now.isoformat(),
+                    "retired_by": "ttl",
+                    "disposition": "retired",
+                },
+            ]
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(completed)
+    await db_session.commit()
+
+    rows = await query_retired_dispositions(db_session, project.id)
+    assert len(rows) == 2
+    titles = {r["title"] for r in rows}
+    assert titles == {"Retired one", "Retired two"}
+    by_hash = {r["finding_hash"]: r for r in rows}
+    assert by_hash["hash-1"]["task_id"] == str(completed.id)
+    assert by_hash["hash-1"]["retired_by"] == "ttl"
+    assert by_hash["hash-1"]["disposition"] == "retired"
+    assert by_hash["hash-2"]["deferred_reason"] == "low_actionability"
+    assert by_hash["hash-2"]["deferred_count"] == 3
+
+
 class TestDeclaresDeliveredOutputDeliverable:
     """_declares_delivered_output_deliverable: conservative message/report predicate."""
 

@@ -238,6 +238,7 @@ const {
     'buildThinkerPrompt',
     'buildUserPausedSection',
     'buildVersionPhaseSection',
+    'buildWorkHeadroomSection',
     'calcMessageAge',
     'classifyFailureCategory',
     'formatCochangeHints',

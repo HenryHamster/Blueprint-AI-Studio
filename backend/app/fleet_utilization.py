@@ -462,6 +462,72 @@ async def get_fleet_utilization_snapshot(
     }
 
 
+def compute_headroom_spawn_budget(
+    snapshot: Dict[str, Any],
+    *,
+    min_free_slots: int = 2,
+    cap: int = 6,
+) -> Dict[str, Any]:
+    """Map a fleet snapshot's ``vm_slots_available`` to a research admission budget.
+
+    The autonomous research spawn path previously gated on a binary "is any VM
+    slot free?" check (``vm_consuming < max_concurrent_vms``). This helper turns
+    the measured headroom into a *budget* — how many research tasks a sweep may
+    admit — so admission scales with the fleet instead of being a pass/fail on
+    the last slot.
+
+    Returned dict carries the raw inputs plus the resolved ``budget``:
+
+    * ``budget`` — the number of research spawns this tick may admit (0 = none).
+    * ``available`` — ``vm_slots_available`` from the snapshot, with a
+      task-table-only fallback (``vm_cap - active_task_vms``) when the GCP/warm
+      pool read is unavailable; ``None`` only when even the capacity is unknown.
+    * ``reason`` — which branch fired: ``headroom_scaled`` (admit up to
+      ``min(available, cap)``), ``headroom_below_floor`` (available <
+      ``min_free_slots`` → block), or ``headroom_unmeasured`` (nothing
+      measurable → fail open to ``cap``).
+
+    Fail-open contract: when headroom cannot be measured at all, the budget is
+    ``cap`` so a measurement outage degrades to the old "spawn if any slot is
+    free" behavior instead of silently halting research. The per-project
+    parallelism caps and the global rate limiter still bound the actual spawn
+    count, so the fail-open case is not unbounded.
+    """
+    available = snapshot.get("vm_slots_available")
+    if available is None:
+        # vm_slots_available requires the GCP/warm-pool reads (managed count,
+        # idle pool, orphaned leases). When those are unavailable, fall back to
+        # the task-table-only view the old binary gate already had: capacity
+        # minus tasks actively consuming VMs.
+        vm_cap = snapshot.get("vm_cap")
+        active_task_vms = snapshot.get("active_task_vms")
+        if isinstance(vm_cap, int) and isinstance(active_task_vms, int) and vm_cap > 0:
+            available = max(0, vm_cap - active_task_vms)
+    if available is None:
+        return {
+            "budget": cap,
+            "available": None,
+            "cap": cap,
+            "min_free_slots": min_free_slots,
+            "reason": "headroom_unmeasured",
+        }
+    if available < min_free_slots:
+        return {
+            "budget": 0,
+            "available": available,
+            "cap": cap,
+            "min_free_slots": min_free_slots,
+            "reason": "headroom_below_floor",
+        }
+    return {
+        "budget": min(available, cap),
+        "available": available,
+        "cap": cap,
+        "min_free_slots": min_free_slots,
+        "reason": "headroom_scaled",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Recorded fleet-sizing readings
 # ---------------------------------------------------------------------------

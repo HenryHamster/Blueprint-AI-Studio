@@ -7598,6 +7598,80 @@ class TestGetProjectFindings:
         assert resp.status_code == 404
 
 
+class TestGetProjectRetiredFindings:
+    """GET /api/admin/projects/{id}/findings/retired — the operator-visible read
+    side of the TTL retired-disposition ledger."""
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_when_no_retired_dispositions(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/findings/retired"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["retired_findings"] == []
+        assert data["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_surfaces_retired_disposition_records(
+        self, client: AsyncClient, db_session
+    ):
+        """A completed research task carrying retired-disposition records makes
+        WHICH findings were retired, when, and why reachable to an operator."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Research with TTL-retired findings",
+            payloads=[{"type": "research", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={
+                "finding_retired_dispositions": [
+                    {
+                        "finding_hash": "abc123",
+                        "title": "Stale deferred finding",
+                        "direction_id": "d-ret01",
+                        "deferred_reason": "no owner",
+                        "deferred_count": 4,
+                        "retired_at": "2026-08-01T00:00:00+00:00",
+                        "retired_by": "ttl",
+                        "disposition": "retired",
+                    }
+                ]
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/findings/retired"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["count"] == 1
+        row = data["retired_findings"][0]
+        assert row["finding_hash"] == "abc123"
+        assert row["title"] == "Stale deferred finding"
+        assert row["deferred_reason"] == "no owner"
+        assert row["retired_by"] == "ttl"
+        assert row["task_id"] == str(task.id)
+
+    @pytest.mark.asyncio
+    async def test_rejects_nonmember_project(self, client: AsyncClient, db_session):
+        other_project = Project(name="Other Retired", user_id="other-uid")
+        db_session.add(other_project)
+        await db_session.commit()
+        await db_session.refresh(other_project)
+
+        resp = await client.get(
+            f"/api/admin/projects/{other_project.id}/findings/retired"
+        )
+        assert resp.status_code == 404
+
+
 class TestRecordFindingResolution:
     """POST /api/admin/projects/{id}/finding-resolution — operator ledger write."""
 

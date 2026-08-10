@@ -343,6 +343,40 @@ infrastructure, new systems, and architectural changes when the direction calls
 for it. Use scope=large when the change genuinely requires cross-component coordination. Prefer scope=small or scope=medium for focused product features and targeted improvements.`;
 }
 
+/**
+ * Render a WORK HEADROOM section telling the research agent how many findings
+ * this cycle can actually admit. The backend stamps `payload.work_headroom` as
+ * the per-cycle finding ceiling (_MAX_FINDINGS_PER_CYCLE) minus findings
+ * deferred from prior cycles, which consume this cycle's slots. Recent cycles
+ * produce 1-3 findings while the ceiling goes untouched, so the binding
+ * constraint on yield is the prompt's conservative "2 real findings beats 10
+ * incremental ones" instruction, not the cap. Surfacing the real headroom lets
+ * the agent scale output to actual capacity instead of self-limiting.
+ *
+ * Returns '' for missing or non-positive headroom so old payloads without the
+ * field (and fully-consumed ceilings) render the prompt unchanged. Callers must
+ * gate the section off for bounded discovery cycles, which deliberately keep
+ * their 1-3 finding constraint.
+ */
+export function buildWorkHeadroomSection(headroom?: number): string {
+  const n = typeof headroom === 'number' && Number.isFinite(headroom)
+    ? Math.max(0, Math.floor(headroom))
+    : 0;
+  if (n <= 0) return '';
+  return `# WORK HEADROOM
+
+This cycle can admit up to ${n} implementation finding(s) — the per-cycle
+ceiling minus any findings deferred from prior cycles, which consume capacity.
+Recent cycles have consistently produced far fewer findings than this ceiling,
+so the spare slots are real.
+
+Use the headroom: output as many high-quality findings as genuinely warrant
+work, up to ${n}. Do NOT manufacture findings merely to fill slots — but do not
+self-limit to 1-3 when 5, 8, or 10 real improvements are clearly worth doing.
+
+`;
+}
+
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 export async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -1041,6 +1075,16 @@ ${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <k
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const researchEmptyRepoGuidance = buildEmptyRepoGuidance(task);
+  // Work headroom: the backend stamps how many findings this cycle can admit
+  // (per-cycle ceiling minus recovered deferred findings). Bounded discovery
+  // cycles keep their deliberate 1-3 finding constraint, so the section (and the
+  // widened MISSION tail below) apply only to ordinary tactical research.
+  const workHeadroomSection = payload.discovery_mode !== 'bounded_cycle'
+    ? buildWorkHeadroomSection(typeof payload.work_headroom === 'number' ? payload.work_headroom : undefined)
+    : '';
+  const workHeadroomMissionTail = workHeadroomSection
+    ? ' — but when a cycle grants real headroom, scale up: output every high-quality finding the WORK HEADROOM below allows, up to the ceiling.'
+    : '';
   // Prompt-cache prefix stability: the stable, reusable guidance body leads so
   // identical instruction text forms a cacheable prefix across turns. The
   // task-variable / retry-variable sections (codebaseSummary, contextPrefix,
@@ -1067,7 +1111,7 @@ ${researchEmptyRepoGuidance}
 **If a direction targets something EXISTING** (the design document shows it as partial, functional,
 or mature): your job is to IMPROVE it. Find specific, high-impact changes — missing capabilities,
 broken assumptions, architectural bottlenecks, or small fixes that prevent cascade failures.
-Quality over padding — a real, decision-relevant finding beats a padded one. Do not cap the count at a preset number: output ALL meaningful findings you discover (see SCOPE GUIDANCE). Never inflate with trivial incremental filler, and never withhold a genuine finding to hit a small quota.
+Quality over padding — a real, decision-relevant finding beats a padded one. Do not cap the count at a preset number: output ALL meaningful findings you discover (see SCOPE GUIDANCE). Never inflate with trivial incremental filler, and never withhold a genuine finding to hit a small quota${workHeadroomMissionTail}.
 (Note: any entry tagged with a "[reconciled: …]" / "presence_warning" annotation has been
 downgraded to "missing" because its referenced module files are absent on this branch — treat it
 as MISSING to DESIGN, never as something to IMPROVE, and do not confabulate its behavior.)
@@ -1118,7 +1162,7 @@ ${(() => {
 
 ${buildResearchScopeGuidance(payload.discovery_mode)}
 
-# BEFORE YOU WRITE FINDINGS — dedup check
+${workHeadroomSection}# BEFORE YOU WRITE FINDINGS — dedup check
 
 Review the DEDUP list above. For each finding you're about to propose,
 ask: "is this genuinely new work, or does an active/completed/queued task already cover it?"
@@ -1302,6 +1346,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
     ['prior_knowledge', priorKnowledgeSection],
     ['pipeline_scope_rates', pipelineScopeRatesSection],
     ['anomaly', anomalySection],
+    ['work_headroom', workHeadroomSection],
   ]);
   setPromptSizeTelemetry(
     researchPromptTelemetry.prompt_size_bytes,

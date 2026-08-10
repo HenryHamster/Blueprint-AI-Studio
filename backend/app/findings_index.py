@@ -16,9 +16,12 @@ The state-mutating next-cycle recovery helper lives in
 from datetime import timedelta
 from typing import Any, Dict, List
 
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
+from app.findings_shelving import RETIRED_DISPOSITION_KEY
 from app.models import (
     Task,
     TaskStatus,
@@ -292,6 +295,62 @@ async def query_findings_index(
                     or challenge.get("verdict"),
                     "reason": (str(challenge.get("reason") or challenge.get("reasoning") or ""))[:200],
                 }
+            rows.append(row)
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
+async def query_retired_dispositions(
+    session: AsyncSession,
+    project_id: Any,
+    limit: int = 100,
+    days: int = 30,
+) -> List[Dict[str, Any]]:
+    """Return retired-disposition records for TTL-dropped deferred findings.
+
+    Scans recent COMPLETED research tasks whose ``context[RETIRED_DISPOSITION_KEY]``
+    carries records (written by the spawn-side recovery scan and the
+    completion-side recovery block when a shelved finding is dropped at the
+    ``deferred_finding_ttl_days`` TTL).  Mirrors ``query_findings_index``:
+    bounded by ``days`` recency and ``limit`` total rows, dialect-aware JSON
+    handling, newest-task-first ordering.
+
+    Each returned row is one disposition record enriched with the ``task_id``
+    of the task whose context holds it: finding_hash, title, direction_id,
+    deferred_reason, deferred_count, retired_at, retired_by ("ttl"),
+    disposition ("retired") and optional source_task_id.
+    """
+    since = _utcnow() - timedelta(days=days)
+    if resolve_dialect_name(session) == "postgresql":
+        has_dispositions = Task.context.has_key(RETIRED_DISPOSITION_KEY)
+    else:
+        has_dispositions = (
+            func.json_type(Task.context, "$.finding_retired_dispositions") == "array"
+        )
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.payloads[0]["type"].as_string() == "research",
+            Task.created_at >= since,
+            has_dispositions,
+        )
+        .order_by(Task.created_at.desc())
+        .limit(500)
+    )
+    tasks = (await session.execute(stmt)).scalars().all()
+
+    rows: List[Dict[str, Any]] = []
+    for task in tasks:
+        records = (task.context or {}).get(RETIRED_DISPOSITION_KEY)
+        if not isinstance(records, list):
+            continue
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            row: Dict[str, Any] = {"task_id": str(task.id), **rec}
             rows.append(row)
             if len(rows) >= limit:
                 return rows

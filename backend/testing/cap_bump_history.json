@@ -3070,6 +3070,14 @@
           "old_cap": 2100,
           "new_cap": 2500
         }
+      ],
+      "findings_index.py": [
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-07T01:50:14.895345+00:00",
+          "old_cap": 350,
+          "new_cap": 600
+        }
       ]
     },
     "agent": {

@@ -28,10 +28,15 @@ from app.findings_index import (  # noqa: F401 — re-exported for callers/tests
     FINALIZED_RESEARCH_FINDINGS_KEY,
     lookup_findings_by_source_ref,
     query_findings_index,
+    query_retired_dispositions,
     resolve_research_findings_for_surface,
     resolve_research_findings_for_surface_from_state,
 )
-from app.findings_shelving import _shelve_findings_for_next_cycle  # noqa: F401
+from app.findings_shelving import (
+    RETIRED_DISPOSITION_KEY,
+    _shelve_findings_for_next_cycle,
+    build_retired_disposition_records,
+)
 from app.models import (
     TASK_ORIGINATION_PLAN,
     TASK_ORIGINATION_RESEARCH,
@@ -256,6 +261,22 @@ MEMO_SPAWN_CAP_PER_CYCLE = 5
 # load only suppresses healthy research yield and pushes findings into lossy
 # deferral. Findings beyond this ceiling are deferred to the next cycle.
 _MAX_FINDINGS_PER_CYCLE = 15
+
+
+def effective_research_finding_headroom(prior_deferred_count: int = 0) -> int:
+    """Open finding slots for a research cycle, after recovered deferred findings.
+
+    ``_MAX_FINDINGS_PER_CYCLE`` is the flat per-cycle ceiling on implementation
+    tasks spawned from one research cycle. Findings deferred from prior cycles
+    (``task.context['deferred_findings']``) are re-injected into the next cycle
+    and consume part of that ceiling, so the effective headroom is the ceiling
+    minus the number of recovered deferred findings. Clamped at zero so a
+    pathological backlog of deferred findings can never drive the headroom
+    negative. Spawn sites stamp this number onto the research payload so the
+    research agent can scale yield to actual capacity instead of self-limiting
+    against a ceiling it never approaches.
+    """
+    return max(0, _MAX_FINDINGS_PER_CYCLE - int(prior_deferred_count or 0))
 
 # Trailing cap for the durable spawn-count idempotency ledger persisted in
 # project.vision. Only the most recent IDs can plausibly be replayed by a
@@ -2468,6 +2489,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _low_actionability_decayed: list[dict] = []
     _low_actionability_refinement_deferred: list[dict] = []
     _salvage_candidates: list[dict] = []
+    # TTL-expired prior-deferred findings discarded by the recovery block below.
+    # Initialized here (outside the `if prior_deferred:` block) so the context
+    # stamp that records their retired dispositions can reference it even when
+    # there were no prior-deferred findings this cycle.
+    _stale_discarded: list[dict] = []
     if prior_deferred:
         # Filter out non-actionable types that would have been handled separately above
         prior_actionable = [
@@ -2482,7 +2508,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _deferred_ttl_days = int(_runtime_config.get("deferred_finding_ttl_days", 7))
         _stale_cutoff = _utcnow() - timedelta(days=_deferred_ttl_days)
         _fresh_actionable: list[dict] = []
-        _stale_discarded: list[dict] = []
         for f in prior_actionable:
             _stamp = f.get("originally_researched_at")
             _stamp_dt = None
@@ -6028,6 +6053,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         or _scope_skip_counts
         or _spawned_memo_ids
         or _finding_give_up
+        or _stale_discarded
         or _reproduce_rejected
         or _criterion_evidence_rejected
         or _spawn_gate_challenged_count
@@ -6036,6 +6062,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         ctx = dict(task.context or {})
         if _all_deferred:
             ctx["deferred_findings"] = bound_deferred_findings(_all_deferred)
+        if _stale_discarded:
+            # Durable per-finding retired disposition for TTL-dropped deferred
+            # findings: these were silently discarded (only the aggregate
+            # _stale_discarded count was logged) unless the salvage bundle caught
+            # them. Record WHICH findings retired, when, and why so the strategic
+            # cycle / operators can query them. Purely additive — the salvage
+            # bundle handling above is untouched.
+            ctx[RETIRED_DISPOSITION_KEY] = build_retired_disposition_records(
+                _stale_discarded,
+                existing_records=ctx.get(RETIRED_DISPOSITION_KEY),
+            )
         if _finding_give_up:
             ctx["finding_structural_give_up"] = _finding_give_up
         if _scope_skip_counts:
@@ -7010,6 +7047,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         parent_research_task_id=parent_research_task_id,
         filtered_findings=filtered_findings,
         salvage_count=len(_salvage_candidates),
+        adversarial_gate_deferred=_adversarial_gate_deferred,
+        low_actionability_deferred=_low_actionability_deferred,
+        degradation_gate_deferred=_degradation_gate_deferred,
+        batch_cap_deferred=_batch_cap_deferred,
     )
 
     # Replace the resumable pre-gate ``plan_output`` with the authoritative
