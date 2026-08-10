@@ -2819,8 +2819,8 @@
           "new_cap": 2100
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-10T14:49:43.264594+00:00",
+          "commit_sha": "c5d1f1fbdeb8114769c75534b0d510ebaf41ec4c",
+          "commit_date": "2026-08-10T15:25:00+00:00",
           "old_cap": 2100,
           "new_cap": 2450
         }
@@ -4339,6 +4339,14 @@
           "commit_date": "2026-08-08T21:15:34+00:00",
           "old_cap": 4800,
           "new_cap": 5600
+        }
+      ],
+      "test_size_offender_governance.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-10T20:54:34.642395+00:00",
+          "old_cap": 1800,
+          "new_cap": 2100
         }
       ]
     }

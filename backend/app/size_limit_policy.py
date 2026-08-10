@@ -1284,6 +1284,21 @@ def _diff_bump_pairs(diff_text: str) -> dict[str, set[tuple[int, int]]]:
     return out
 
 
+def _is_combined_git_diff(diff_text: str) -> bool:
+    """Return whether ``diff_text`` is a merge commit's combined diff.
+
+    Combined diffs use ``diff --cc``/``diff --combined`` headers and prefix
+    hunk lines with one marker per parent.  They are readable, but they do not
+    provide the single-parent ``- old/+ new`` evidence consumed by
+    :func:`_diff_bump_pairs`; treating that parser miss as proof of a phantom
+    would delete legitimate ledger records attributed to a merge SHA.
+    """
+    return any(
+        line.startswith(("diff --cc ", "diff --combined "))
+        for line in diff_text.splitlines()
+    )
+
+
 def _git_log_bump_map(output: str) -> dict[str, dict[str, set[tuple[int, int]]]]:
     """Build ``commit_sha -> {key: {(old_cap, new_cap)}}`` from ``git log -p`` output.
 
@@ -1295,6 +1310,10 @@ def _git_log_bump_map(output: str) -> dict[str, dict[str, set[tuple[int, int]]]]
     """
     result: dict[str, dict[str, set[tuple[int, int]]]] = {}
     for sha, _date, diff_text in _split_git_log_chunks(output):
+        if _is_combined_git_diff(diff_text):
+            # A merge's combined diff is not attributable to one parent and
+            # must be adjudicated as absent evidence by phantom_ledger_records.
+            continue
         pairs = _diff_bump_pairs(diff_text)
         if pairs:
             result[sha] = pairs
@@ -1397,6 +1416,31 @@ def _git_show_file_diff(sha: str, repo_root: str) -> str | None:
     if result.returncode != 0:
         return None
     return result.stdout
+
+
+def _git_commit_parent_count(sha: str, repo_root: str) -> int | None:
+    """Return a commit's parent count, or ``None`` when it cannot be read."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "show",
+                "-s",
+                "--format=%P",
+                sha,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — unavailable provenance is not contradiction
+        return None
+    if result.returncode != 0:
+        return None
+    return len(result.stdout.split())
 
 
 def phantom_ledger_records(
@@ -1549,11 +1593,21 @@ def phantom_ledger_records(
             # An ancestry probe failure is evidence loss, not proof of a fake
             # record. Never delete on this polarity.
             continue
+        parent_count = _git_commit_parent_count(sha, root)
+        if parent_count is None or parent_count > 1:
+            # A merge commit has no single-parent diff that can attribute a
+            # cap pair. Likewise, a failed parent probe leaves the provenance
+            # absent. Neither case is positive evidence of a phantom.
+            continue
         # A beyond-boundary ancestor whose objects are present in this (possibly
         # shallow) checkout: render its diff directly and verify the pair.
         diff_text = _git_show_file_diff(sha, root)
         if diff_text is None:
             # An unreadable diff cannot establish fabrication.
+            continue
+        if _is_combined_git_diff(diff_text):
+            # A merge commit is readable, but its combined diff does not expose
+            # the single-parent pair format required for attribution.
             continue
         shown_pairs = _diff_bump_pairs(diff_text).get(key, set())
         if pair not in shown_pairs:

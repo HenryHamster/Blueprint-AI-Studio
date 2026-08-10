@@ -1268,6 +1268,43 @@ def test_phantom_ledger_records_flags_wrong_old_cap(tmp_path, mocker):
     assert "no recorded bump" in reason
 
 
+def test_phantom_ledger_records_preserves_merge_commit_provenance(tmp_path, mocker):
+    """A merge commit does not provide an attributable single-parent cap diff.
+
+    ``git show`` renders a merge as a combined diff (or no file diff at all),
+    so the ordinary ``- old/+ new`` parser cannot establish that the ledger
+    record is fabricated.  The verifier must preserve the record and wait for
+    evidence from the side-parent bump commit instead of deleting it.
+    """
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+
+    subprocess.run(["git", "checkout", "-q", "-b", "cap-bump"], cwd=repo, check=True)
+    _hermetic_write_cap(repo, 200)
+    _hermetic_commit(repo, "bump to 200", date="2026-01-02T00:00:00+00:00")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "-q", "cap-bump", "-m", "merge cap bump"],
+        cwd=repo,
+        check=True,
+    )
+    merge_sha = _hermetic_head_sha(repo)
+
+    phantoms = _phantom_ledger(
+        repo,
+        "m.py",
+        {
+            "commit_sha": merge_sha,
+            "commit_date": "2026-01-03T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    )
+
+    assert phantoms == []
+
+
 def test_phantom_ledger_records_skips_empty_sha_pending(tmp_path, mocker):
     """An empty commit_sha is a rollup-pending bump written before the commit
     exists — there is nothing to verify, so it is never a phantom."""
