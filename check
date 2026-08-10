@@ -132,6 +132,17 @@ run() {
 
 source scripts/backend-test-route.sh
 
+# Run the database-free release guard corpus on the task's own diff before the
+# directory-specific checks. The helper compares static-test failures with the
+# base tree and uses the existing no-Postgres backend harness; it never invokes
+# --fix or changes the cap ledger.
+if [ -f scripts/static_release_guard.py ]; then
+  run "static release guards (task diff)" python3 scripts/static_release_guard.py --base "$BASE" --repo-root "$PWD"
+else
+  echo "[check] static release guard helper is missing — refusing to skip the gate"
+  FAILED+=("static release guard helper missing")
+fi
+
 # Idempotent npm install guarded by package-lock IDENTITY, not the mere
 # existence of node_modules. A warm/reused VM carries a populated
 # node_modules from a prior task; a bare `[ -d node_modules ] || npm ci`

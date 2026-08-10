@@ -534,6 +534,8 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters
     testing/test_monthly_budget_alerts.py
     testing/test_migration_chain.py
+    testing/test_message_audience.py
+    testing/test_event_type_invariants.py
     testing/test_salvage_bundle_standalone.py
     testing/test_test_durations_freshness.py
     testing/test_shard_balance.py
@@ -550,7 +552,11 @@ if [ "${1:-}" = "--standalone" ]; then
   # This exit-proof release suite covers durable handoff, serving confirmation,
   # and receipt retry behavior that pytest's backend shards do not collect.
   STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
-  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest
+  STANDALONE_JUNIT_ARGS=()
+  if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
+    STANDALONE_JUNIT_ARGS+=("--junitxml=${BLUEPRINT_STATIC_GUARD_JUNIT}")
+  fi
+  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest "${STANDALONE_JUNIT_ARGS[@]}"
   exit 0
 fi
 
