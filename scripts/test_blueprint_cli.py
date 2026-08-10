@@ -6370,6 +6370,19 @@ def _approved_activation():
     }
 
 
+def test_read_live_approved_activation_rearms_confirmation_timeout(monkeypatch):
+    """The host reader consumes an approved timeout after the API re-arms it."""
+    promoted = {
+        **_approved_activation(),
+        "serving_status": "confirmation_timed_out",
+    }
+    monkeypatch.setattr(
+        blueprint, "_read_latest_promoted_version", lambda _args: promoted
+    )
+
+    assert blueprint._read_live_approved_activation(argparse.Namespace()) == promoted
+
+
 def _root_activation_retry(monkeypatch, state_path, served_sha, now=None):
     posted, promoted = [], _approved_activation()
     monkeypatch.setattr(blueprint, "_require_write_config", lambda _action: None)

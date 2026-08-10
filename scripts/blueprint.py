@@ -107,6 +107,9 @@ _DEPLOY_AGENT_POLL_MAX_AGE_SECONDS = 120
 # to prove the promoted revision before treating the activation as failed.
 _DEPLOY_AGENT_CONFIRMATION_TIMEOUT_SECONDS = 15 * 60
 _LOCAL_SERVING_VERSION_URL = "http://127.0.0.1:8080/api/version"
+_ACTIVATION_REARMABLE_SERVING_STATUSES = frozenset(
+    {"unconfirmed", "confirmation_timed_out"}
+)
 
 
 # ── output helpers ───────────────────────────────────────────────────────────
@@ -6422,14 +6425,14 @@ def _execute_deploy(
 
 
 def _read_live_approved_activation(args: argparse.Namespace) -> dict | None:
-    """Return only a promoted version that is still approved and unconfirmed."""
+    """Return a promoted version whose approval is still actionable."""
     promoted = _read_latest_promoted_version(args)
     if promoted is None:
         return None
     promoted_sha = (promoted.get("promoted_sha") or "").lower()
     if (
         promoted.get("status") != "promoted"
-        or promoted.get("serving_status") != "unconfirmed"
+        or promoted.get("serving_status") not in _ACTIVATION_REARMABLE_SERVING_STATUSES
         or not promoted.get("activation_requested_at")
         or not _DEPLOY_REVISION_RE.fullmatch(promoted_sha)
     ):
@@ -6939,7 +6942,11 @@ def _activation_preflight(args: argparse.Namespace) -> tuple[dict, dict]:
     }
     preconditions = {
         "status_promoted": bool(version and version.get("status") == "promoted"),
-        "serving_unconfirmed": bool(version and version.get("serving_status") == "unconfirmed"),
+        "serving_unconfirmed": bool(
+            version
+            and version.get("serving_status")
+            in _ACTIVATION_REARMABLE_SERVING_STATUSES
+        ),
         "activation_requested_at": bool(version and version.get("activation_requested_at")),
         "promoted_sha_valid": bool(
             version and _DEPLOY_REVISION_RE.fullmatch((version.get("promoted_sha") or "").lower())

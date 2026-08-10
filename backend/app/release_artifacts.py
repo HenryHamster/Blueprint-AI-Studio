@@ -30,6 +30,9 @@ PROMOTION_MERGE_ARTIFACT_KIND = "promotion_merge"
 AGENT_IMAGE_FLEET_SOURCE_UNOBSERVABLE_REASON = (
     "agent_image_fleet_source_unobservable"
 )
+BACKEND_REVISION_SERVING_UNOBSERVABLE_REASON = (
+    "backend_revision_serving_unobservable"
+)
 
 # Distinct reason for a serving_confirmed resolution where the OBSERVED live SHA
 # is a strict DESCENDANT of the promoted SHA: the target branch legitimately
@@ -231,19 +234,10 @@ def is_activation_rearmable_serving_status(status: str | None) -> bool:
 # served the promoted SHA.
 _TIMED_OUT_BACKSTOP_REASONS = frozenset({"no_new_revision"})
 
-# ``no_new_revision`` substantiation reasons: a promotion is served by the local
-# control plane after operator approval; the push-triggered deploy workflow is
-# not the activation mechanism.  The workflow reasons remain useful for legacy
-# or already-approved cases where it actually provides evidence of a failed or
-# stale deploy, so they are deliberately NOT in ``_TIMED_OUT_BACKSTOP_REASONS``.
+# Retained for the lifecycle alert taxonomy.  The serving-timeout classifier
+# below deliberately reports the timed-out artifact instead of this broader
+# operator-action label; existing alert rows may still carry it.
 PENDING_OPERATOR_ACTIVATION_REASON = "pending_operator_activation"
-DEPLOY_WORKFLOW_NEVER_DISPATCHED_REASON = "deploy_workflow_never_dispatched"
-DEPLOY_WORKFLOW_FAILED_REASON = "deploy_workflow_failed"
-DEPLOY_WORKFLOW_SUCCEEDED_STALE_REVISION_REASON = (
-    "deploy_workflow_succeeded_stale_revision"
-)
-DEPLOY_WORKFLOW_IN_PROGRESS_REASON = "deploy_workflow_in_progress"
-
 
 def aggregate_required_artifact_status(
     artifacts: list[
@@ -769,11 +763,14 @@ async def _reclassify_sha_mismatch_if_superseded(
                 "resolving confirmation_timed_out",
                 getattr(version, "version_number", "?"),
             )
-            # Substantiate the timeout: consult the deploy workflow runs for the
-            # promoted SHA so the operator sees whether the deploy was never
-            # dispatched, ran and failed, or ran and left a stale revision —
-            # instead of the low-information no_new_revision backstop.
-            return await _substantiate_no_new_revision(session, version, now)
+            # Serving is owned by the local control plane, not deploy.yml.  The
+            # backend artifact is the unsatisfied evidence; do not replace that
+            # fact with a workflow-derived explanation from an unrelated path.
+            return (
+                "confirmation_timed_out",
+                BACKEND_REVISION_SERVING_UNOBSERVABLE_REASON,
+                None,
+            )
         return decision
 
     served_at = _to_naive_utc(ds.deployed_at) if ds is not None else None
@@ -792,99 +789,6 @@ async def _reclassify_sha_mismatch_if_superseded(
         served_at,
         SUPERSEDED_BY_DESCENDANT_REASON,
     )
-
-
-async def _substantiate_no_new_revision(
-    session: AsyncSession,
-    version: ReleaseVersion,
-    now: datetime,
-) -> ServingDecision:
-    """Name the activation or deploy gate behind a bare timeout.
-
-    ``no_new_revision`` ("the serving SHA just couldn't be confirmed in time")
-    cannot distinguish the real causes of a promotion whose serving activation
-    never shipped.  A promoted version with no activation approval is waiting
-    on the local control plane, so that state takes precedence over a
-    successful push-triggered workflow run (whose deploy job is skipped).  The
-    run-listing helper (:func:`app.github.get_workflow_run_for_sha`) remains a
-    secondary source of evidence for cases where activation has already been
-    approved or where the workflow itself reports a failure:
-
-      * no activation approval → ``pending_operator_activation``
-      * a run concluded non-success → ``deploy_workflow_failed``
-      * an approved run concluded success → ``deploy_workflow_succeeded_stale_revision``
-      * no deploy.yml run after approval → ``deploy_workflow_never_dispatched``
-      * a run still queued/in_progress past the deadline → ``deploy_workflow_in_progress``
-
-    Any credential/API failure keeps the honest ``no_new_revision`` backstop —
-    never fabricate a specific gate from a failed lookup.  The outcome stays a
-    ``confirmation_timed_out`` (a report, never a silent confirm), matching the
-    conservative wait → honest-timeout contract of the supersession reclassifier.
-    """
-    activation_pending = (
-        is_activation_rearmable_serving_status(
-            getattr(version, "serving_status", None)
-        )
-        and getattr(version, "activation_requested_at", None) is None
-    )
-    promoted_sha = version.promoted_sha
-    if not promoted_sha:
-        return ("confirmation_timed_out", "no_new_revision", None)
-    project = await session.get(Project, version.project_id)
-    if project is None:
-        return ("confirmation_timed_out", "no_new_revision", None)
-    try:
-        from app import github
-        from app.github_checks import DEPLOY_WORKFLOW_FILE
-        from app.release_promotion import _resolve_github_with_session
-
-        resolved = await _resolve_github_with_session(session, project)
-        if resolved is None:
-            return ("confirmation_timed_out", "no_new_revision", None)
-        token, owner, repo = resolved
-        run = await github.get_workflow_run_for_sha(
-            token,
-            owner,
-            repo,
-            promoted_sha,
-            workflow_file=DEPLOY_WORKFLOW_FILE,
-            project_id=str(version.project_id),
-        )
-    except Exception as exc:  # noqa: BLE001 — fall back to the honest backstop
-        logger.warning(
-            "[RELEASE_ARTIFACTS] no_new_revision substantiation for v%s raised "
-            "(%s) — keeping no_new_revision",
-            getattr(version, "version_number", "?"),
-            exc,
-        )
-        return ("confirmation_timed_out", "no_new_revision", None)
-    if run is None:
-        # With no approval, the missing local activation is the actionable
-        # cause. Once approved, retain the workflow-specific distinction.
-        if activation_pending:
-            return ("confirmation_timed_out", PENDING_OPERATOR_ACTIVATION_REASON, None)
-        # No deploy.yml run exists for the promoted SHA — the deploy workflow
-        # was NEVER dispatched. (A run-listing API failure also surfaces as
-        # None; the outcome stays confirmation_timed_out — a report, never a
-        # silent confirm, and the upstream helper logs the API failure.)
-        return (
-            "confirmation_timed_out",
-            DEPLOY_WORKFLOW_NEVER_DISPATCHED_REASON,
-            None,
-        )
-    status = run.get("status")
-    conclusion = run.get("conclusion")
-    if status == "completed":
-        if conclusion != "success":
-            return ("confirmation_timed_out", DEPLOY_WORKFLOW_FAILED_REASON, None)
-        if activation_pending:
-            return ("confirmation_timed_out", PENDING_OPERATOR_ACTIVATION_REASON, None)
-        return (
-            "confirmation_timed_out",
-            DEPLOY_WORKFLOW_SUCCEEDED_STALE_REVISION_REASON,
-            None,
-        )
-    return ("confirmation_timed_out", DEPLOY_WORKFLOW_IN_PROGRESS_REASON, None)
 
 
 async def _check_backend_revision_serving(

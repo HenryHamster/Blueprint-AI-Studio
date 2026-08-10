@@ -63,21 +63,16 @@ class _AlertSession:
 
 
 @pytest.mark.asyncio
-async def test_no_new_revision_reports_pending_operator_activation(mocker):
-    """A push-successful workflow did not activate the local control plane."""
+async def test_no_new_revision_reports_backend_artifact_not_workflow(mocker):
+    """A stale serving signal identifies the backend artifact, not deploy.yml."""
     mocker.patch(
         "app.release_promotion._resolve_github_with_session",
         new=AsyncMock(return_value=("token", "acme", "widget")),
     )
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
-    mocker.patch(
+    workflow_lookup = mocker.patch(
         "app.github.get_workflow_run_for_sha",
-        new=AsyncMock(
-            return_value={
-                "status": "completed",
-                "conclusion": "success",
-            }
-        ),
+        new=AsyncMock(side_effect=AssertionError("serving is not workflow-backed")),
     )
 
     decision = await _check_backend_revision_serving(
@@ -89,9 +84,10 @@ async def test_no_new_revision_reports_pending_operator_activation(mocker):
 
     assert decision == (
         "confirmation_timed_out",
-        "pending_operator_activation",
+        "backend_revision_serving_unobservable",
         None,
     )
+    workflow_lookup.assert_not_awaited()
 
 
 @pytest.mark.asyncio

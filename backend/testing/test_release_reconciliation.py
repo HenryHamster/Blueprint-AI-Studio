@@ -2031,7 +2031,7 @@ async def test_confirm_no_new_revision_times_out_scenario(db_session, mocker):
     assert resolved is True
     await db_session.refresh(version)
     assert version.serving_status == "confirmation_timed_out"
-    assert version.deploy_failure_reason == "pending_operator_activation"
+    assert version.deploy_failure_reason == "backend_revision_serving_unobservable"
     # No loud deploy-failed alert → no dedup stamp.
     assert version.deploy_confirm_alerted_at is None
 
@@ -3244,7 +3244,7 @@ async def test_confirm_pre_promotion_diverged_sha_waits_then_times_out(
     assert resolved is True
     await db_session.refresh(version)
     assert version.serving_status == "confirmation_timed_out"
-    assert version.deploy_failure_reason == "pending_operator_activation"
+    assert version.deploy_failure_reason == "backend_revision_serving_unobservable"
     assert version.served_sha is None
 
 
