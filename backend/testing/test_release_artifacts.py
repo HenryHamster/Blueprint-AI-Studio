@@ -243,6 +243,41 @@ def test_gap_reports_armed_pending_required_row():
     assert gap == "waiting on required artifacts: promotion_merge"
 
 
+def test_lagging_agent_fleet_is_reported_without_gating_backend_serving():
+    """A fleet that has not rebaked cannot block confirmed backend evidence."""
+    version = _Version(serving_status="serving_confirmed", served_sha=_SHA)
+    artifacts = [
+        _Artifact(
+            BACKEND_REVISION_ARTIFACT_KIND,
+            "serving_confirmed",
+            served_identifier=_SHA,
+        ),
+        _Artifact(
+            AGENT_IMAGE_ARTIFACT_KIND,
+            "confirmation_timed_out",
+            reason_code="agent_image_fleet_not_yet_serving",
+        ),
+        _Artifact(
+            PROMOTION_MERGE_ARTIFACT_KIND,
+            "serving_confirmed",
+            served_identifier=_SHA,
+        ),
+    ]
+
+    aggregate, evidence = summarize_release_artifacts(version, artifacts)
+
+    assert aggregate == {"serving_status": "serving_confirmed", "reason_code": None}
+    by_kind = {entry["artifact_kind"]: entry for entry in evidence}
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND] == {
+        "artifact_kind": AGENT_IMAGE_ARTIFACT_KIND,
+        "required": False,
+        "serving_status": "confirmation_timed_out",
+        "served_identifier": None,
+        "served_at": None,
+        "reason_code": "agent_image_fleet_not_yet_serving",
+    }
+
+
 def test_gap_reports_failed_over_none():
     evidence = [
         {

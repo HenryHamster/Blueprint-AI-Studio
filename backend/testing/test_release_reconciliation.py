@@ -3537,16 +3537,14 @@ async def test_recover_latched_sha_mismatch_stays_failed_when_diverged(
 
 
 # ===========================================================================
-# Agent VM image serving gate — the agent_image release deploy artifact.
+# Agent VM image serving dimension — the agent_image release deploy artifact.
 #
 # A self-repo promotion whose diff touches the agent VM image bake paths
-# (agent/ or infra/packer/) is only fully served once a fresh agent image is
-# baked AND the running fleet is observed serving the promoted source SHA.  The
-# agent_image provider makes that a REQUIRED serving-verified artifact so the
-# aggregate serving status (and therefore the operator panel + strategist
-# payload) reflects real fleet-serving truth.  These tests pin the four
-# contract behaviors, mocking GitHub I/O / fleet observation at the service
-# boundary (the autouse _default_agent_image_gate fixture is re-patched here).
+# (agent/ or infra/packer/) still records whether the running fleet serves the
+# promoted source SHA. The row is reported separately while backend serving
+# remains independently confirmable. These tests pin the provider behavior,
+# mocking GitHub I/O / fleet observation at the service boundary (the autouse
+# _default_agent_image_gate fixture is re-patched here).
 # ===========================================================================
 
 
@@ -3684,9 +3682,8 @@ def test_previously_deployed_sha_indeterminate_returns_none():
 
 @pytest.mark.agent_image_gate
 @pytest.mark.asyncio
-async def test_agent_image_bake_path_waits_for_fleet_then_confirms(db_session, mocker):
-    """(a) A self-repo promotion that TOUCHES the bake paths stays unconfirmed
-    until the fleet reports the promoted SHA, then flips to serving_confirmed."""
+async def test_agent_image_bake_path_reports_fleet_then_refreshes(db_session, mocker):
+    """A bake-path promotion reports fleet lag without blocking backend serving."""
     mocker.patch(
         "app.release_promotion._resolve_github_with_session",
         new=AsyncMock(return_value=("tok", "acme", "widget")),
@@ -3705,9 +3702,9 @@ async def test_agent_image_bake_path_waits_for_fleet_then_confirms(db_session, m
     _project, version = await _make_promoted_unconfirmed_version(
         db_session, promoted_at=promoted_at, deadline=deadline
     )
-    # Backend revision boots serving the promoted SHA — it confirms; the agent
-    # image gate alone keeps the aggregate unconfirmed.  prior_deploy_sha gives
-    # the bake-diff an observable base (the SHA serving before this promotion).
+    # Backend revision boots serving the promoted SHA; the agent image remains a
+    # separately reported pending dimension. prior_deploy_sha gives the
+    # bake-diff an observable base (the SHA serving before this promotion).
     await _set_deploy_state(
         db_session,
         status=DeploymentStatus.STABLE,
@@ -3721,7 +3718,7 @@ async def test_agent_image_bake_path_waits_for_fleet_then_confirms(db_session, m
         session_factory=_shared_session_factory(db_session),
         now=promoted_at + timedelta(minutes=20),
     )
-    assert resolved is False
+    assert resolved is True
     await db_session.refresh(version)
 
     artifacts = (
@@ -3739,9 +3736,9 @@ async def test_agent_image_bake_path_waits_for_fleet_then_confirms(db_session, m
     assert by_kind[BACKEND_REVISION_ARTIFACT_KIND].serving_status == "serving_confirmed"
     assert by_kind[AGENT_IMAGE_ARTIFACT_KIND].serving_status == "unconfirmed"
     fleet.assert_awaited()
-    # The operator-facing aggregate stays NOT fully serving even though the
-    # backend revision booted — the agent image has not reached the fleet.
-    assert await _aggregate_serving_status(db_session, version.id) == "unconfirmed"
+    # The operator-facing aggregate confirms from backend + merge evidence even
+    # though the separately reported agent image has not reached the fleet.
+    assert await _aggregate_serving_status(db_session, version.id) == "serving_confirmed"
 
     # The fleet now reports the promoted SHA — the agent image is live and the
     # aggregate confirms.
@@ -3751,7 +3748,9 @@ async def test_agent_image_bake_path_waits_for_fleet_then_confirms(db_session, m
         session_factory=_shared_session_factory(db_session),
         now=promoted_at + timedelta(minutes=30),
     )
-    assert resolved is True
+    # The version was already confirmed from backend evidence; this follow-up
+    # only refreshes the separately reported fleet dimension.
+    assert resolved is False
     await db_session.refresh(version)
     assert version.serving_status == "serving_confirmed"
 
@@ -3868,7 +3867,7 @@ async def test_agent_image_bake_path_confirms_with_descendant_fleet_sha(
 
 @pytest.mark.agent_image_gate
 @pytest.mark.asyncio
-async def test_agent_image_descendant_fleet_indeterminate_stays_unconfirmed(
+async def test_agent_image_descendant_fleet_indeterminate_does_not_block_backend(
     db_session, mocker
 ):
     mocker.patch(
@@ -3911,8 +3910,8 @@ async def test_agent_image_descendant_fleet_indeterminate_stays_unconfirmed(
         now=promoted_at + timedelta(minutes=20),
     )
 
-    assert resolved is False
-    assert await _aggregate_serving_status(db_session, version.id) == "unconfirmed"
+    assert resolved is True
+    assert await _aggregate_serving_status(db_session, version.id) == "serving_confirmed"
 
 
 @pytest.mark.agent_image_gate
@@ -4026,13 +4025,10 @@ async def test_agent_image_non_bake_confirms_immediately(db_session, mocker):
 
 @pytest.mark.agent_image_gate
 @pytest.mark.asyncio
-async def test_agent_image_indeterminate_rebake_lookup_stays_unconfirmed(
+async def test_agent_image_indeterminate_rebake_lookup_is_reported(
     db_session, mocker
 ):
-    """(c) An indeterminate rebake lookup (API/ref error → None) is treated as
-    NOT-YET-CONFIRMED, never deploy_failed — within the window the aggregate
-    waits, and past the deadline the artifact times out to
-    confirmation_timed_out (a soft "verify serving", NOT deploy_failed)."""
+    """An indeterminate fleet dimension is reported without blocking backend."""
     mocker.patch(
         "app.release_promotion._resolve_github_with_session",
         new=AsyncMock(return_value=("tok", "acme", "widget")),
@@ -4055,28 +4051,18 @@ async def test_agent_image_indeterminate_rebake_lookup_stays_unconfirmed(
         deployed_at=promoted_at + timedelta(minutes=5),
     )
 
-    # Within the window: agent_image cannot decide → aggregate unconfirmed.
+    # Within the window: agent_image cannot decide, but backend evidence is
+    # independently sufficient for the aggregate.
     resolved = await _confirm_serving_or_fail(
         version.id,
         session_factory=_shared_session_factory(db_session),
         now=promoted_at + timedelta(minutes=20),
     )
-    assert resolved is False
-    await db_session.refresh(version)
-    assert await _aggregate_serving_status(db_session, version.id) == "unconfirmed"
-    assert version.deploy_failure_reason is None
-
-    # Past the deadline the agent_image gate times out (confirmation_timed_out,
-    # NOT deploy_failed) so the version resolves instead of wedging unconfirmed.
-    resolved = await _confirm_serving_or_fail(
-        version.id,
-        session_factory=_shared_session_factory(db_session),
-        now=promoted_at + timedelta(hours=2),
-    )
     assert resolved is True
     await db_session.refresh(version)
-    assert version.serving_status == "confirmation_timed_out"
-    assert version.deploy_failure_reason == "agent_image_rebake_lookup_indeterminate"
+    assert await _aggregate_serving_status(db_session, version.id) == "serving_confirmed"
+    assert version.serving_status == "serving_confirmed"
+    assert version.deploy_failure_reason is None
     artifact = (
         (
             await db_session.execute(
@@ -4089,19 +4075,18 @@ async def test_agent_image_indeterminate_rebake_lookup_stays_unconfirmed(
         .scalars()
         .one()
     )
-    assert artifact.serving_status == "confirmation_timed_out"
-    assert artifact.reason_code == "agent_image_rebake_lookup_indeterminate"
+    assert artifact.serving_status == "unconfirmed"
+    assert artifact.reason_code is None
 
 
 @pytest.mark.agent_image_gate
 @pytest.mark.asyncio
-async def test_agent_image_indeterminate_no_fleet_reported_stays_unconfirmed(
+async def test_agent_image_indeterminate_no_fleet_reported_is_reported(
     db_session, mocker
 ):
-    """(c) A bake IS expected but no fleet VM has reported a source SHA yet —
-    the fleet observation is indeterminate → not-yet-confirmed, never
-    deploy_failed.  Past the confirmation deadline the artifact times out to
-    confirmation_timed_out so the version resolves instead of wedging."""
+    """A bake is expected but an absent fleet source stays a reported dimension.
+    The agent row times out while the independently confirmed backend keeps the
+    version serving_confirmed."""
     mocker.patch(
         "app.release_promotion._resolve_github_with_session",
         new=AsyncMock(return_value=("tok", "acme", "widget")),
@@ -4135,11 +4120,10 @@ async def test_agent_image_indeterminate_no_fleet_reported_stays_unconfirmed(
     )
     assert resolved is True
     await db_session.refresh(version)
-    # Aggregate resolves to confirmation_timed_out (never deploy_failed) — an
-    # indeterminate fleet observation ≠ failed deploy, but it must not wedge the
-    # version unconfirmed forever.
-    assert version.serving_status == "confirmation_timed_out"
-    assert version.deploy_failure_reason == "agent_image_fleet_not_yet_serving"
+    # The backend confirms even though the fleet dimension times out; the
+    # timeout remains visible on its non-required artifact row.
+    assert version.serving_status == "serving_confirmed"
+    assert version.deploy_failure_reason is None
     artifact = (
         (
             await db_session.execute(
@@ -4158,15 +4142,12 @@ async def test_agent_image_indeterminate_no_fleet_reported_stays_unconfirmed(
 
 @pytest.mark.agent_image_gate
 @pytest.mark.asyncio
-async def test_agent_image_indeterminate_past_deadline_times_out(
+async def test_agent_image_indeterminate_past_deadline_keeps_backend_confirmed(
     db_session, mocker
 ):
-    """A bake-path agent_image whose fleet never reports serving the promoted
-    SHA stays unconfirmed WITHIN the confirmation window, then TIMES OUT past
-    the confirmation_deadline (confirmation_timed_out, never deploy_failed) so
-    the version resolves and the recovery sweep can later re-check it.  This is
-    the deadline branch the provider was missing: before it, the aggregate
-    stayed unconfirmed forever and no recovery ever engaged."""
+    """A bake-path fleet timeout remains visible without changing backend truth.
+    The version confirms from backend evidence within the window, and a later
+    sweep leaves that aggregate confirmed while the agent row times out."""
     mocker.patch(
         "app.release_promotion._resolve_github_with_session",
         new=AsyncMock(return_value=("tok", "acme", "widget")),
@@ -4193,34 +4174,29 @@ async def test_agent_image_indeterminate_past_deadline_times_out(
         deployed_at=promoted_at + timedelta(minutes=5),
     )
 
-    # Within the window: the indeterminate fleet signal defers — the aggregate
-    # stays unconfirmed and the version does not yet resolve.  (The legacy
-    # version.serving_status scalar mirrors the backend artifact and reads
-    # serving_confirmed here; the OPERATOR-FACING truth is the aggregate.)
+    # Within the window: the indeterminate fleet signal is reported, while the
+    # backend and merge evidence resolve the operator-facing aggregate.
     resolved = await _confirm_serving_or_fail(
         version.id,
         session_factory=_shared_session_factory(db_session),
         now=promoted_at + timedelta(minutes=20),
     )
-    assert resolved is False
+    assert resolved is True
     await db_session.refresh(version)
-    assert await _aggregate_serving_status(db_session, version.id) == "unconfirmed"
+    assert await _aggregate_serving_status(db_session, version.id) == "serving_confirmed"
     assert version.deploy_failure_reason is None
 
-    # Past the deadline: the fleet STILL has not served the promoted SHA, so the
-    # agent_image artifact times out.  The backend revision already confirmed
-    # (current_sha == promoted_sha), so the aggregate resolves to
-    # confirmation_timed_out and the version leaves unconfirmed — no longer
-    # wedged forever.
+    # Past the deadline: the fleet dimension times out, but the already
+    # confirmed backend remains the aggregate source of truth.
     resolved = await _confirm_serving_or_fail(
         version.id,
         session_factory=_shared_session_factory(db_session),
         now=promoted_at + timedelta(hours=2),
     )
-    assert resolved is True
+    assert resolved is False
     await db_session.refresh(version)
-    assert version.serving_status == "confirmation_timed_out"
-    assert version.deploy_failure_reason == "agent_image_fleet_not_yet_serving"
+    assert version.serving_status == "serving_confirmed"
+    assert version.deploy_failure_reason is None
 
     artifact = (
         (
@@ -4453,13 +4429,12 @@ async def test_non_deploy_github_promotion_arms_merge_only(db_session):
     assert {a.artifact_kind for a in artifacts} == {PROMOTION_MERGE_ARTIFACT_KIND}
 
 
-def test_summarize_skips_absent_required_non_backend_provider():
+def test_summarize_skips_absent_optional_non_backend_provider():
     """A promoted version with a CONFIRMED backend_revision row and NO
-    agent_image row must NOT be stranded ``unconfirmed`` by the absent required
-    non-backend provider.
+    agent_image row must remain confirmed; the fleet dimension is optional.
 
-    This guards the ``summarize_release_artifacts`` missing-required-non-backend
-    -row branch directly: the absent provider contributes a vacuous (``None``)
+    This guards the ``summarize_release_artifacts`` missing-non-backend-row
+    branch directly: the absent provider contributes a vacuous (``None``)
     evidence row that is excluded from the aggregate, so the aggregate is
     computed over the rows that actually exist (here, the confirmed
     backend_revision alone) and resolves to ``serving_confirmed`` — not the
@@ -4468,10 +4443,8 @@ def test_summarize_skips_absent_required_non_backend_provider():
     strategic_spawning, and release_reconciliation, so a regression here would
     silently flip every such promoted version to a permanent false-negative.
     """
-    # Precondition: the agent_image provider must be registered REQUIRED, else
-    # this test would not exercise the absent-required-non-backend-row branch.
     agent_provider = artifact_registry._ARTIFACT_PROVIDERS[AGENT_IMAGE_ARTIFACT_KIND]
-    assert agent_provider.required is True
+    assert agent_provider.required is False
     assert not is_backend_revision_artifact(AGENT_IMAGE_ARTIFACT_KIND)
 
     version = ReleaseVersion(
@@ -4504,7 +4477,7 @@ def test_summarize_skips_absent_required_non_backend_provider():
         "serving_confirmed"
     )
     assert by_kind[AGENT_IMAGE_ARTIFACT_KIND]["serving_status"] is None
-    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND]["required"] is True
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND]["required"] is False
 
 
 def test_summarize_unarmed_promotion_is_na_not_phantom_unconfirmed():

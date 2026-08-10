@@ -931,18 +931,18 @@ async def _check_agent_image_serving(
     """Serving check for the agent VM image artifact (self-repo only).
 
     A self-repo promotion whose diff touches the agent VM image bake paths
-    (``agent/`` or ``infra/packer/``) is only fully served once a freshly baked
-    agent image is rolled out and the running fleet is observed serving the
-    promoted source SHA.  This gate makes that second dimension a REQUIRED
-    serving-verified artifact:
+    (``agent/`` or ``infra/packer/``) is checked by observing whether a freshly
+    baked agent image is rolled out and the running fleet serves the promoted
+    source SHA.  This remains a separately reported freshness dimension; it is
+    not a REQUIRED aggregate serving gate:
 
       * Non-bake promotion (diff did NOT touch the bake paths) — resolve to
         ``serving_confirmed`` IMMEDIATELY (served identifier = promoted_sha) so
         the version is never stranded waiting on a bake that will never run.
       * Bake promotion (diff touched the bake paths) — ``serving_confirmed``
         only once the fleet INDEPENDENTLY reports ``agent_source_sha`` matching
-        ``version.promoted_sha``; until then return ``None`` (not-yet) so the
-        version stays unconfirmed within the existing confirmation window.
+        ``version.promoted_sha``; until then return ``None`` (not-yet) or a
+        bounded timeout, while backend serving can resolve independently.
         An observed non-matching source gets ``agent_image_fleet_not_yet_serving``;
         no observable source identity gets
         ``agent_image_fleet_source_unobservable``.
@@ -1101,8 +1101,9 @@ async def _check_agent_image_serving(
     return _defer_or_timeout(fleet_reason)
 
 
-# Self-repo agent VM image serving gate.  Registered REQUIRED so a bake-path
-# promotion stays NOT fully serving until the fleet serves the promoted SHA.
+# Self-repo agent VM image serving dimension. It remains a checked and
+# operator-visible artifact, but is deliberately NOT REQUIRED for the aggregate
+# serving decision: backend serving must not wait for worker-substrate freshness.
 # Guarded against double-registration: a sibling task may also register an
 # agent_image provider and the registry is keyed by artifact_kind — register
 # exactly once here so neither call site clobbers the other's semantics.
@@ -1110,7 +1111,7 @@ if AGENT_IMAGE_ARTIFACT_KIND not in _ARTIFACT_PROVIDERS:
     register_release_artifact_provider(
         AGENT_IMAGE_ARTIFACT_KIND,
         _check_agent_image_serving,
-        required=True,
+        required=False,
         # The agent VM image / fleet serving signal is observable only for the
         # deploy's own repo (the deployment that runs the agent fleet).
         observable=_observable_for_deploy_identity,
