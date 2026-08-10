@@ -1073,6 +1073,27 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).not.toContain('./fetch direction');
   });
 
+  it('renders payload currency and dropped-section count diagnostics', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        dropped: [{ key: 'generic_summary', reason: 'decision value lost the budget race', bytes: 512 }],
+        trimmed: [],
+        dropped_section_count: 1,
+        payload_currency: 'unknown',
+        payload_currency_reason: 'verdict=unknown; no_candidate_sha',
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-packer-diagnostics', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    expect(section).toContain('payload currency unknown (verdict=unknown; no_candidate_sha)');
+    expect(section).toContain('dropped sections 1');
+    expect(section).toContain('generic_summary');
+    expect(section).toContain('decision value lost the budget race');
+  });
+
   it('true-empty: no packer drop/trim and empty model → bootstrap framing (first cycle)', async () => {
     const payload: Record<string, unknown> = {
       project_name: 'Blueprint',

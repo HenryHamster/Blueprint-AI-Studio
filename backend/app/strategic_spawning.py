@@ -61,8 +61,10 @@ from app.strategic_payload_compaction import (
     _OUTCOME_DIRECTION_OUTCOMES_KEEP,
     _VERSION_PHASE_RECENT_VERSIONS_CAP,
     _direction_activity_score,  # noqa: F401 — re-exported for test imports
+    _directions_section_decision_value,
     _directions_summary_floor,
     _enrich_drift_with_trend,
+    _payload_currency_decision_value,
     _summarize_directions,
     _summarize_drift_signals,
     _summarize_version_phase,
@@ -2269,6 +2271,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # detail degrades before the active-direction core disappears entirely.
     "directions_summary": {
         "priority": "high",
+        "decision_value": _directions_section_decision_value,
         "summarize": _summarize_directions,
         "floor": _directions_summary_floor,
         "fetch_verb": "direction",
@@ -2444,7 +2447,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # Cycle-start SHA divergence check: present only when _resolve_candidate_currency
     # resolves.  Small dict of scalars — no summarize_fn, drops whole under extreme
     # pressure.  High priority so it ships alongside version_phase.
-    "payload_staleness": {"priority": "high", "exempt": True},
+    "payload_staleness": {
+        "priority": "high",
+        "decision_value": _payload_currency_decision_value,
+        "exempt": True,
+    },
     # What is actually deployed (running live on the promotion target) vs what
     # has merged to the integration branch but is not yet promoted. High
     # priority: it is load-bearing for every runtime-metric judgment, and small.

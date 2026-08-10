@@ -84,6 +84,33 @@ def test_compact_direction_entry_preserves_in_flight_count():
     assert "in_flight" not in unstamped
 
 
+def test_direction_compaction_ranks_idle_findings_ahead_of_activity():
+    """Actionable findings outrank historical activity in degraded forms."""
+    from app.strategic_payload_compaction import _summarize_directions
+
+    idle_with_finding = {
+        "id": "d-actionable",
+        "status": "active",
+        "priority": "low",
+        "in_flight": 0,
+        "recent_findings": ["new finding"],
+        "research_context": "## Established Findings\n- new finding\n",
+    }
+    busy_history = {
+        "id": "d-busy",
+        "status": "active",
+        "priority": "high",
+        "in_flight": 2,
+        "total_cycles": 500,
+        "prs_merged": 100,
+    }
+
+    compacted = _summarize_directions([busy_history, idle_with_finding])
+
+    assert compacted[0]["id"] == "d-actionable"
+    assert compacted[0]["research_context"] == idle_with_finding["research_context"].strip()
+
+
 def test_floor_direction_entry_carries_in_flight_count():
     """_floor_direction_entry emits the in_flight count on the ultra-compact core
     floor line so a staffed direction is distinguishable from an idle one even
@@ -239,6 +266,80 @@ def test_smaller_within_tier_packs_first():
     assert "small" in out
     assert "big" not in out
     assert any(d["key"] == "big" for d in out["_packer_meta"]["dropped"])
+
+
+def test_decision_value_beats_size_within_priority_tier():
+    """A decision-critical section wins a same-tier byte race over a summary."""
+    payload = {
+        "generic_summary": "g" * 100,
+        "decision_context": "d" * 300,
+    }
+    schema = {
+        "generic_summary": {"priority": "high", "decision_value": 1},
+        "decision_context": {"priority": "high", "decision_value": 100},
+    }
+    budget = _size(payload["decision_context"]) + 1
+
+    out = pack_under_budget(payload, schema, budget=budget)
+
+    assert out["decision_context"] == payload["decision_context"]
+    assert "generic_summary" not in out
+    assert out["_packer_meta"]["dropped_section_count"] == 1
+    assert out["_packer_meta"]["dropped"][0]["key"] == "generic_summary"
+
+
+def test_strategic_pack_preserves_idle_finding_context_and_reports_currency():
+    """Under pressure, the idle finding direction and pack diagnostics survive."""
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+    finding_direction = {
+        "id": "d-findings",
+        "priority": "low",
+        "status": "active",
+        "text": "Act on the latest research finding",
+        "in_flight": 0,
+        "recent_findings": ["A concrete finding changes the next task."],
+        "research_context": "## Established Findings\n- The next task is actionable.\n",
+    }
+    payload = {
+        "type": "strategic_review",
+        "directions_summary": [finding_direction],
+        "payload_staleness": {
+            "verdict": "fresh",
+            "payload_sha": "a" * 40,
+            "integration_head_sha": "a" * 40,
+        },
+        "running_update": "r" * 300,
+        "recent_handled_conversation": "h" * 900,
+    }
+    budget = (
+        _size(payload["type"])
+        + _size(payload["payload_staleness"])
+        + _size(payload["running_update"])
+        + _size({
+            "id": finding_direction["id"],
+            "priority": finding_direction["priority"],
+            "status": finding_direction["status"],
+            "in_flight": 0,
+            "text": finding_direction["text"],
+            "research_context": finding_direction["research_context"],
+        })
+        + 20
+    )
+
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=budget)
+    meta = out["_packer_meta"]
+
+    assert any(
+        entry.get("research_context") == finding_direction["research_context"]
+        for entry in out["directions_summary"]
+    )
+    assert meta["payload_currency"] == "fresh"
+    assert meta["payload_currency_reason"] == "verdict=fresh"
+    assert meta["dropped_section_count"] >= 1
+    dropped = {entry["key"]: entry for entry in meta["dropped"]}
+    assert "recent_handled_conversation" in dropped
+    assert dropped["recent_handled_conversation"]["reason"]
 
 
 def test_unknown_priority_logged_and_treated_as_low(caplog):

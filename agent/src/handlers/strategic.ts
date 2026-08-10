@@ -823,8 +823,16 @@ export async function handleStrategic(
       if (!meta) return '';
       const trimmed = Array.isArray(meta.trimmed) ? meta.trimmed as Array<Record<string, unknown>> : [];
       const dropped = Array.isArray(meta.dropped) ? meta.dropped as Array<Record<string, unknown>> : [];
-      if (trimmed.length === 0 && dropped.length === 0) return '';
+      const droppedCount = typeof meta.dropped_section_count === 'number'
+        ? meta.dropped_section_count : dropped.length;
+      const currency = strVal(meta.payload_currency);
+      const currencyReason = strVal(meta.payload_currency_reason);
+      if (trimmed.length === 0 && dropped.length === 0 && !currency && droppedCount === 0) return '';
       const lines: string[] = ['## Context not shipped this cycle (use ./fetch if you need it)'];
+      if (currency || droppedCount > 0) {
+        const currencyText = currency ? `${currency}${currencyReason ? ` (${currencyReason})` : ''}` : 'not reported';
+        lines.push('', `Packing diagnostics: payload currency ${currencyText}; dropped sections ${droppedCount}`);
+      }
       if (trimmed.length > 0) {
         lines.push('', 'Trimmed (partial data shipped):');
         for (const t of trimmed) {

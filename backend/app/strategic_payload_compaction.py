@@ -796,6 +796,57 @@ def _direction_activity_score(stat: dict) -> int:
     return merged * 3 + failed + cycles + priority_bonus + proposed_bonus
 
 
+def _direction_decision_value(stat: dict) -> int:
+    """Rank direction context by the decision it can change this cycle.
+
+    A direction with fresh findings and no task in flight is the strongest
+    spawn signal in the strategic portfolio. Give that signal a separate rank
+    above historical activity so a quiet, actionable direction is not evicted
+    by generic summaries.
+    """
+    if not isinstance(stat, dict):
+        return 0
+    findings = stat.get("recent_findings")
+    finding_count = (
+        len(findings)
+        if isinstance(findings, list)
+        else int(stat.get("recent_findings_total") or 0)
+    )
+    in_flight = stat.get("in_flight", stat.get("tasks_in_flight", 0))
+    try:
+        in_flight_count = max(0, int(in_flight or 0))
+    except (TypeError, ValueError):
+        in_flight_count = 0
+    spawn_signal = (
+        stat.get("status") == "active" and finding_count > 0 and in_flight_count == 0
+    )
+    return (1_000_000 if spawn_signal else 0) + _direction_activity_score(stat)
+
+
+def _directions_section_decision_value(value: Any) -> int:
+    """Return the strongest direction decision signal in a section."""
+    if not isinstance(value, list):
+        return 0
+    # Keep the existing tier/size behavior for ordinary portfolios. Only the
+    # actionable finding-without-work signal changes section ordering; this
+    # prevents a quiet direction's normal activity score from reshuffling
+    # unrelated high-tier lifecycle sections.
+    scores = [_direction_decision_value(item) for item in value]
+    return max((score for score in scores if score >= 1_000_000), default=0)
+
+
+def _payload_currency_decision_value(value: Any) -> int:
+    """Keep resolved currency context ahead of generic high-tier summaries."""
+    if not isinstance(value, dict):
+        return 0
+    verdict = value.get("verdict")
+    if verdict in ("fresh", "stale"):
+        return 900_000
+    if verdict in ("unknown", "api_unreachable"):
+        return 800_000
+    return 700_000
+
+
 def _summarize_directions(stats: list) -> list:
     """Keep top direction_summary entries and compact bulky per-entry evidence.
 
@@ -805,7 +856,7 @@ def _summarize_directions(stats: list) -> list:
     """
     if not isinstance(stats, list):
         return stats
-    sorted_stats = sorted(stats, key=_direction_activity_score, reverse=True)
+    sorted_stats = sorted(stats, key=_direction_decision_value, reverse=True)
     return [
         _compact_direction_summary_entry(stat)
         for stat in sorted_stats[:_DIRECTIONS_SUMMARY_KEEP]
@@ -826,6 +877,11 @@ def _floor_direction_entry(stat: dict) -> dict:
     headline = _bounded_text(stat.get("text"), _DIRECTION_FLOOR_TEXT_CAP)
     if headline:
         out["text"] = headline
+    research_context = _bounded_text(
+        stat.get("research_context"), _DIRECTION_SUMMARY_TEXT_CAP
+    )
+    if research_context:
+        out["research_context"] = research_context
     return out
 
 
@@ -841,7 +897,7 @@ def _directions_summary_floor(stats: list) -> list:
     """
     if not isinstance(stats, list):
         return stats
-    sorted_stats = sorted(stats, key=_direction_activity_score, reverse=True)
+    sorted_stats = sorted(stats, key=_direction_decision_value, reverse=True)
     return [
         _floor_direction_entry(stat)
         for stat in sorted_stats[:_DIRECTIONS_FLOOR_KEEP]
@@ -1016,10 +1072,11 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "outcome_scaffolding_evidence",
     ):
         _put_present(out, stat, key, text_cap=_DIRECTION_SUMMARY_LONG_TEXT_CAP)
-    if stat.get("research_context"):
-        out["research_context_headline"] = _bounded_text(
-            stat.get("research_context"), _DIRECTION_SUMMARY_LONG_TEXT_CAP
-        )
+    research_context = _bounded_text(
+        stat.get("research_context"), _DIRECTION_SUMMARY_LONG_TEXT_CAP
+    )
+    if research_context:
+        out["research_context"] = research_context
     for key in (
         "taxonomy_summary",
         "recent_findings_grade_distribution",
