@@ -1637,9 +1637,11 @@ async def agent_fetch_qualification(
 
     Payload includes: candidate_sha, finalized_at, status, confidence,
     sub_scores, findings, excluded_findings, challenger_refuted_findings, and
-    serving_sha (the git SHA of the deployed code producing this response).
+    serving_sha (the git SHA of the deployed code producing this response), and
+    operator_authored_commits (the fail-closed count for base_sha..serving_sha).
     """
     from app.deployed_sha import get_serving_sha  # noqa: PLC0415
+    from app.release_commit_authorship import count_non_bot_authored_commits  # noqa: PLC0415
     from app.release_qualifier import (  # noqa: PLC0415
         get_latest_qualification_audit_findings,
     )
@@ -1673,6 +1675,11 @@ async def agent_fetch_qualification(
                 "summary": "no open release version — nothing to qualify",
             },
         }
+
+    operator_authored_commits = count_non_bot_authored_commits(
+        open_row.base_sha,
+        serving_sha,
+    )
 
     # Re-qualification readiness signal + per-finding resolution view (ADDITIVE).
     # The fix-first triage workflow needs to know, from the same read it already
@@ -1946,6 +1953,7 @@ async def agent_fetch_qualification(
             "qualification_provenance": qualification_provenance,
             "dimension_states": qualification_dimension_states,
             "serving_sha": serving_sha,
+            "operator_authored_commits": operator_authored_commits,
             **requalification_extra,
         }
 
@@ -2003,6 +2011,7 @@ async def agent_fetch_qualification(
         "qualification_provenance": qualification_provenance,
         "dimension_states": qualification_dimension_states,
         "serving_sha": serving_sha,
+        "operator_authored_commits": operator_authored_commits,
         **requalification_extra,
     }
 

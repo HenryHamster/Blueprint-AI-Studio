@@ -2359,9 +2359,21 @@ async def test_agent_fetch_qualification_stamps_serving_sha_on_verdict_path(
 
     # Mock the serving SHA to a known test value
     test_serving_sha = "f" * 40
+    version.base_sha = "b" * 40
+    db_session.add(version)
+    await db_session.commit()
     monkeypatch.setattr(
         "app.deployed_sha.get_serving_sha",
         lambda: test_serving_sha,
+    )
+    monkeypatch.setattr(
+        "app.release_commit_authorship.count_non_bot_authored_commits",
+        lambda base_sha, head_sha: {
+            "state": "resolved",
+            "count": 1,
+            "offenders": [{"sha": "c" * 12, "author": "Henry Example"}],
+            "range": {"base_sha": base_sha, "head_sha": head_sha},
+        },
     )
 
     token = create_agent_token(str(task.id), task.vm_instance_id)
@@ -2374,6 +2386,12 @@ async def test_agent_fetch_qualification_stamps_serving_sha_on_verdict_path(
 
     assert body["source"] == "qualification_verdict"
     assert body["serving_sha"] == test_serving_sha
+    assert body["operator_authored_commits"] == {
+        "state": "resolved",
+        "count": 1,
+        "offenders": [{"sha": "c" * 12, "author": "Henry Example"}],
+        "range": {"base_sha": "b" * 40, "head_sha": test_serving_sha},
+    }
 
 
 @pytest.mark.asyncio

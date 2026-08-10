@@ -13917,8 +13917,6 @@
   "testing/test_release_promotion_metric_manifest.py::test_manifest_values_are_well_formed": 18.84,
   "testing/test_release_promotion_metric_manifest.py::test_no_stale_consumer_manifest_entries": 9.15,
   "testing/test_release_promotion_metric_manifest.py::test_retired_and_pending_entries_have_reason_and_date": 7.5,
-  "testing/test_release_qualifier.py::test_run_qualification_skips_walkthrough_e2e_when_disabled": 0.044,
-  "testing/test_release_qualifier.py::test_run_qualification_spawns_walkthrough_e2e_when_enabled": 0.044,
   "testing/test_release_qualifier__ci_unresolved_blocker.py::TestFormatQualificationForApi::test_all_fields_passed_through": 0.35,
   "testing/test_release_qualifier__ci_unresolved_blocker.py::TestFormatQualificationForApi::test_dry_run_outcome_label": 0.206,
   "testing/test_release_qualifier__ci_unresolved_blocker.py::TestFormatQualificationForApi::test_empty_dict_returns_none_fields": 19.36,
