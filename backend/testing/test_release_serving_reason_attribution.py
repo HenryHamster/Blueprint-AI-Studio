@@ -50,7 +50,7 @@ class _AlertVersion:
     project_id = 1
     version_number = 1
     promoted_sha = _SHA
-    deploy_failure_reason = "pending_operator_activation"
+    deploy_failure_reason = "legacy_unknown_reason"
     deploy_confirm_alerted_at = None
 
 
@@ -91,8 +91,8 @@ async def test_no_new_revision_reports_backend_artifact_not_workflow(mocker):
 
 
 @pytest.mark.asyncio
-async def test_legacy_pending_activation_alert_uses_generic_recovery(mocker):
-    """A legacy row uses the current generic recovery guidance."""
+async def test_unknown_legacy_alert_uses_generic_recovery(mocker):
+    """An unknown legacy row uses generic recovery guidance and keeps its code diagnostic."""
     mocker.patch(
         "app.release_promotion._notify_operator",
         new=AsyncMock(return_value=None),
@@ -102,6 +102,7 @@ async def test_legacy_pending_activation_alert_uses_generic_recovery(mocker):
     assert await _alert_promotion_deploy_failed(session, _AlertVersion()) is True
 
     alert = next(value for value in session.added if isinstance(value, Alert))
-    assert "pending_operator_activation" in alert.message
+    assert "reason=legacy_unknown_reason" in alert.message
+    assert "the deploy failure reason is unclassified" in alert.message
     assert "Investigate the deploy / roll forward a fix." in alert.message
     assert "Approve activation" not in alert.message

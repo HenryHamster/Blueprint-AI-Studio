@@ -431,7 +431,7 @@ async def _alert_promotion_deploy_failed(
         "rolled_back": "the deploy was ROLLED BACK after the promotion",
         "halted": "the deploy was HALTED after the promotion",
         "sha_mismatch": ("the live serving SHA does not match the promoted SHA"),
-    }.get(reason, reason)
+    }.get(reason, "the deploy failure reason is unclassified")
     _resolution_text = "Investigate the deploy / roll forward a fix."
     _outcome_text = (
         "The promotion did NOT ship — the version is flagged deploy_failed "
