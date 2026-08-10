@@ -198,6 +198,63 @@ class TestCategoryGateOrdering:
         assert result["blocker"] == "criterion_coverage_incomplete"
 
 
+def test_blocked_verdict_reports_all_gates_and_confidence_ceiling():
+    """A blocked verdict names every independent gate and its reachable score."""
+    result = rs.compute_composite(
+        **_perfect_kwargs(
+            audit_score=0.38,
+            ci_green=False,
+            ci_state="red",
+            migration_collision=True,
+            migration_apply_blocked=True,
+            env_preflight_enabled=True,
+            env_preflight_score=0.0,
+            env_preflight_missing=["REQUIRED_SECRET"],
+            merge_grade_misses=True,
+            category_verdicts=[_cat("c-met", "met"), _cat("c-gap", "not_met")],
+            residual_uncaptured_gap="uncaptured operational cost",
+            capability_proof_blocked=True,
+        )
+    )
+
+    assert result["blocker"] == "ci_not_green"
+    assert result["confidence"] == 0.0
+    assert result["failing_gates"] == [
+        "ci_not_green",
+        "migration_identity_collision",
+        "migration_apply_drift",
+        "boot_prereq_missing",
+        "merge_grade_misses",
+        "criterion_coverage_incomplete",
+        "capability_proof_gate_blocked",
+    ]
+    assert result["sub_scores"]["failing_gates"] == result["failing_gates"]
+    assert result["confidence_ceiling"] == pytest.approx(0.6134)
+    assert result["sub_scores"]["confidence_ceiling"] == pytest.approx(0.6134)
+    assert result["confidence_ceiling"] < _POLICY["threshold"]
+
+
+def test_walkthrough_failure_is_added_to_persisted_gate_diagnostics():
+    from app.release_qualifier import _apply_walkthrough_decision
+
+    decision = _apply_walkthrough_decision(
+        {
+            "confidence": 0.82,
+            "confidence_ceiling": 0.82,
+            "promote": True,
+            "blocker": None,
+            "failing_gates": [],
+            "sub_scores": {"audit": 0.82},
+        },
+        {"status": "failed"},
+    )
+
+    assert decision["blocker"] == "walkthrough_e2e_failed"
+    assert decision["failing_gates"] == ["walkthrough_e2e_failed"]
+    assert decision["sub_scores"]["failing_gates"] == ["walkthrough_e2e_failed"]
+    assert decision["confidence"] == 0.82
+
+
 class TestJudgedTierPenalty:
     def test_all_met_judged_incurs_penalty(self):
         """All categories met at the JUDGED tier: promotes, but confidence is

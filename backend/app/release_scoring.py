@@ -989,8 +989,10 @@ def compute_composite(
     blocker fires, ``confidence`` is the policy-weighted sum of the active
     sub-scores.  ``promote`` is True iff ``confidence >= threshold``.
 
-    Returns ``{confidence, promote, sub_scores, blocker}`` where ``blocker`` is
-    a short human-readable string when a hard blocker fired, else None.
+    Returns the historical ``{confidence, promote, sub_scores, blocker}`` keys
+    plus additive ``failing_gates`` and ``confidence_ceiling`` diagnostics.
+    ``blocker`` remains the first failing gate, while a hard-blocked
+    ``confidence`` remains exactly ``0.0``.
     """
     weights = policy.get("weights") or _DEFAULT_POLICY["weights"]
     threshold = promotion_threshold_for_policy(policy)
@@ -1024,12 +1026,13 @@ def compute_composite(
     # reported as "audit_missing" rather than mislabelled "test_file_deleted":
     # a None test_erosion only genuinely means a deleted test file when the
     # audit report itself was present (audit_score not None).
-    blocker: str | None = None
+    failing_gates: list[str] = []
     if not ci_green and ci_state == _CI_RED:
         # A confirmed red build is ALWAYS a hard blocker — never promote over a
         # known-failing build, regardless of whether the project gates per-PR
         # merges on CI.
         blocker = "ci_not_green"
+        failing_gates.append(blocker)
     elif not ci_green and (ci_required or ci_state != "no_checks"):
         # Unresolved CI (pending or GitHub I/O degraded) is a resolution /
         # infrastructure concern, not a quality signal, and must keep blocking.
@@ -1037,13 +1040,15 @@ def compute_composite(
         # caller already classified as topology-safe by setting ci_required
         # False. A project-wide CI relaxation must not mask pending/API errors.
         blocker = "ci_unresolved"
-    elif migration_collision:
+        failing_gates.append(blocker)
+    if migration_collision:
         # A deterministic Alembic revision-identity collision between the
         # candidate and the deployed promotion target — checked ahead of the
         # audit-derived blockers so it is a clear, attributed gate rather than a
         # soft, score-eroding audit finding the spawned auditor might miss.
         blocker = "migration_identity_collision"
-    elif migration_apply_blocked:
+        failing_gates.append(blocker)
+    if migration_apply_blocked:
         # The candidate's migration chain, replayed the deploy way against
         # production's REAL recorded schema state on an isolated scratch DB,
         # leaves the schema missing a required object (the renumber-skip class,
@@ -1051,7 +1056,8 @@ def compute_composite(
         # from the filename-identity collision above — checked after it so a
         # candidate failing both reports the identity collision first.
         blocker = "migration_apply_drift"
-    elif env_preflight_enabled and env_preflight_score is None:
+        failing_gates.append(blocker)
+    if env_preflight_enabled and env_preflight_score is None:
         # No boot/env-prerequisite evidence was produced by the candidate — the
         # evidence producer never ran, or ran but produced no usable manifest.
         # This is a DETERMINISTIC quality verdict (never an infra-failure retry
@@ -1061,7 +1067,8 @@ def compute_composite(
         # and BEFORE ``boot_prereq_missing`` because with no evidence we cannot
         # certify the boot gate at all — individual prerequisite presence is moot.
         blocker = "boot_prereq_evidence_missing"
-    elif env_preflight_enabled and env_preflight_missing and not env_preflight_ack_override:
+        failing_gates.append(blocker)
+    if env_preflight_enabled and env_preflight_missing and not env_preflight_ack_override:
         # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4).
         # runtime_config default: True (Armed).  A candidate-declared,
         # in-scope boot prerequisite is ABSENT from the deploy-target env — the
@@ -1079,12 +1086,14 @@ def compute_composite(
         # ordered blocker above it (CI, migrations) still wins, and a blocker below
         # (capability-proof, coverage, quality) still fires on its own merits.
         blocker = "boot_prereq_missing"
-    elif merge_grade_misses:
+        failing_gates.append(blocker)
+    if merge_grade_misses:
         # The armable-dark blind-grade gate: coverage_verdict == "misses" AND the
         # operator has raised merge_grade_block_threshold above 0.0.  Distinct from
         # the canonical goal-verification gate so operators see the right label.
         blocker = "merge_grade_misses"
-    elif category_verdicts is not None and any(
+        failing_gates.append(blocker)
+    if category_verdicts is not None and any(
         (v or {}).get("status") != "met" for v in category_verdicts
     ):
         # GOAL-VERIFICATION GATE (redesign): the acceptance criteria ARE the
@@ -1096,26 +1105,37 @@ def compute_composite(
         # penalty below.  The blocker STRING is preserved so downstream re-drive /
         # trigger / state-resolver plumbing keyed on it keeps firing.
         blocker = "criterion_coverage_incomplete"
-    elif residual_uncaptured_gap:
+        failing_gates.append(blocker)
+    if residual_uncaptured_gap and "criterion_coverage_incomplete" not in failing_gates:
         # RESIDUAL gate (redesign): the grader found a goal aspect that NONE of
         # the categories capture — the rubric is incomplete for this candidate, so
         # even an all-``met`` category set cannot certify the goal.  Same blocker
         # string, distinguished for operators via sub_scores["residual_uncaptured_gap"].
         blocker = "criterion_coverage_incomplete"
-    elif capability_proof_blocked:
+        failing_gates.append(blocker)
+    if capability_proof_blocked:
         # The capability proof gate is in ENFORCE mode and there are working
         # capabilities whose proof status is not ``proven`` — the gate would
         # block dependents that name them.  Block promotion until the unproven
         # capabilities are either proven or the gate is dialled back to observe.
         blocker = "capability_proof_gate_blocked"
-    elif audit_score is None:
+        failing_gates.append(blocker)
+    if audit_score is None:
         # An audit that produced no usable score is a soft signal, but without
         # it the composite is meaningless — treat as a blocker so a missing
         # audit can never promote on test_erosion alone.  Reported
         # ahead of test_file_deleted because a missing report nulls both.
         blocker = "audit_missing"
+        failing_gates.append(blocker)
     elif test_erosion is None:
         blocker = "test_file_deleted"
+        failing_gates.append(blocker)
+
+    # Preserve the historical ordered blocker while retaining every independent
+    # failing gate for diagnosis.  The list is intentionally de-duplicated:
+    # category and residual failures are two observations of the same gate.
+    failing_gates = list(dict.fromkeys(failing_gates))
+    blocker: str | None = failing_gates[0] if failing_gates else None
 
     # Sub-scores are always reported (clamped) for observability, even when a
     # blocker fired and the composite is forced to zero.
@@ -1177,20 +1197,50 @@ def compute_composite(
     if merge_grade_exempt:
         sub_scores["merge_grade_exempt"] = True
 
+    sub_scores["failing_gates"] = failing_gates
+
+    # Compute the score the candidate could reach if its hard gates were
+    # cleared, using the exact active weight, debt, and judged-tier arithmetic
+    # below.  This is deliberately computed before the hard-block return so a
+    # blocked verdict still explains whether promotion is reachable without
+    # pretending that the blocked candidate promoted.
+    w_debt = float((policy.get("weights") or {}).get("completion_debt", 0.0))
+    w_debt = max(0.0, min(w_debt, 0.5))
+    existing_confidence = (
+        w_audit * sub_scores["audit"] + w_test * sub_scores["test_erosion"]
+    )
+    if w_debt > 0.0 and debt_pressure_score is not None:
+        confidence_ceiling = (
+            (1.0 - w_debt) * existing_confidence
+            + w_debt * sub_scores["debt_pressure"]
+        )
+    else:
+        confidence_ceiling = existing_confidence
+    if category_verdicts:
+        _met = [v for v in category_verdicts if (v or {}).get("status") == "met"]
+        if _met:
+            _judged = sum(
+                1 for v in _met if (v or {}).get("tier", "judged") != "machine"
+            )
+            confidence_ceiling *= 1.0 - JUDGED_TIER_PENALTY_WEIGHT * (
+                _judged / len(_met)
+            )
+    confidence_ceiling = round(_clamp01(confidence_ceiling), 4)
+    sub_scores["confidence_ceiling"] = confidence_ceiling
+
     if blocker is not None:
         return {
             "confidence": 0.0,
             "promote": False,
             "sub_scores": sub_scores,
             "blocker": blocker,
+            "failing_gates": failing_gates,
+            "confidence_ceiling": confidence_ceiling,
         }
 
     # Debt-pressure weight (defaults to 0.0 = observe mode: recorded but not
     # blended).  When > 0 the existing sub-scores are scaled by (1 - w_debt)
     # and the debt-pressure term is added so the total remains in [0, 1].
-    w_debt = float((policy.get("weights") or {}).get("completion_debt", 0.0))
-    w_debt = max(0.0, min(w_debt, 0.5))  # cap at 50% to bound disruption
-
     existing_confidence = (
         w_audit * sub_scores["audit"]
         + w_test * sub_scores["test_erosion"]
@@ -1222,6 +1272,8 @@ def compute_composite(
         "promote": confidence >= threshold,
         "sub_scores": sub_scores,
         "blocker": None,
+        "failing_gates": failing_gates,
+        "confidence_ceiling": confidence,
     }
 
 

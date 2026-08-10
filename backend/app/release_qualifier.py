@@ -3818,6 +3818,12 @@ def _apply_walkthrough_decision(
     }
     if passed:
         return updated
+    failing_gates = list(composite.get("failing_gates") or [])
+    if "walkthrough_e2e_failed" not in failing_gates:
+        failing_gates.append("walkthrough_e2e_failed")
+    updated["failing_gates"] = failing_gates
+    updated["confidence_ceiling"] = composite.get("confidence_ceiling", 0.0)
+    updated["sub_scores"]["failing_gates"] = failing_gates
     return {
         **updated,
         "promote": False,
@@ -3848,7 +3854,11 @@ async def _handle_walkthrough_contract_failure(
     """
     finalized_at = _utcnow().isoformat()
     candidate_sha = qual.get("candidate_sha")
-    sub_scores: dict[str, Any] = {"walkthrough_e2e": 0.0}
+    sub_scores: dict[str, Any] = {
+        "walkthrough_e2e": 0.0,
+        "failing_gates": ["walkthrough_e2e_contract_failed"],
+        "confidence_ceiling": 0.0,
+    }
     # Stamp the serving engine sha on the record so observability (and any
     # future site-change detection) can see WHICH deployed validator produced
     # this contract failure — a new serving sha means the validator may have
@@ -3877,6 +3887,8 @@ async def _handle_walkthrough_contract_failure(
         "error": error,
         "confidence": 0.0,
         "sub_scores": sub_scores,
+        "failing_gates": ["walkthrough_e2e_contract_failed"],
+        "confidence_ceiling": 0.0,
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
         "audit_task_id": qual.get("audit_task_id"),
@@ -8663,6 +8675,10 @@ async def _finalize_qualification(
         )
         walkthrough_score = composite["sub_scores"]["walkthrough_e2e"]
         extended_sub_scores["walkthrough_e2e"] = walkthrough_score
+        extended_sub_scores["failing_gates"] = composite.get("failing_gates") or []
+        extended_sub_scores["confidence_ceiling"] = composite.get(
+            "confidence_ceiling"
+        )
 
     # --- Dual-write handled by _dual_write_dimension_results after base_record
     # is fully assembled (below), where all dimensions including challenge are
@@ -8683,6 +8699,8 @@ async def _finalize_qualification(
         "smoketest_enabled": smoketest_enabled,
         "confidence": composite["confidence"],
         "sub_scores": extended_sub_scores,
+        "failing_gates": composite.get("failing_gates") or [],
+        "confidence_ceiling": composite.get("confidence_ceiling"),
         "stranded_approved_prs": qual.get("stranded_approved_prs"),
         "blocker": composite["blocker"],
         # Execution-site of the responsible check (dir: tag promotion blockers
@@ -9013,7 +9031,10 @@ async def _finalize_qualification(
             notify_event = "release_blocked"
             notify_summary = (
                 f"v{version.version_number} blocked from promotion — "
-                f"{blocker_label}. Not promoted; staying in stabilize."
+                f"{blocker_label}. Failing gates: "
+                f"{', '.join(composite.get('failing_gates') or [])}. "
+                f"Confidence ceiling: {composite.get('confidence_ceiling')}. "
+                "Not promoted; staying in stabilize."
             )
         else:
             notify_event = "release_below_threshold"
@@ -9033,6 +9054,8 @@ async def _finalize_qualification(
                 "threshold": policy.get("threshold"),
                 "sub_scores": composite["sub_scores"],
                 "blocker": composite["blocker"],
+                "failing_gates": composite.get("failing_gates") or [],
+                "confidence_ceiling": composite.get("confidence_ceiling"),
                 "execution_site": blocker_execution_site(composite["blocker"]),
             },
         )

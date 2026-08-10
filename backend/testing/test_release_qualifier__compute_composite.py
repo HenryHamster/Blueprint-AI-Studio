@@ -135,10 +135,23 @@ class TestComputeCompositeHardBlockers:
             smoketest_score=0.7,
             policy=_POLICY,
         )
-        assert result["sub_scores"] == {
-            "audit": 0.8,
-            "test_erosion": 0.9,
+        # The scored inputs are still reported verbatim, alongside the two
+        # additive diagnostics that explain the block: every gate that failed,
+        # and the confidence the candidate would reach once they clear.
+        assert result["sub_scores"]["audit"] == 0.8
+        assert result["sub_scores"]["test_erosion"] == 0.9
+        assert result["sub_scores"]["failing_gates"] == ["ci_not_green"]
+        # 4/7 * 0.8 + 3/7 * 0.9, rounded to 4dp — no debt weight in _POLICY.
+        assert result["sub_scores"]["confidence_ceiling"] == 0.8429
+        # Nothing else leaks into the blocked verdict's sub_scores.
+        assert set(result["sub_scores"]) == {
+            "audit",
+            "test_erosion",
+            "failing_gates",
+            "confidence_ceiling",
         }
+        assert result["failing_gates"] == ["ci_not_green"]
+        assert result["confidence_ceiling"] == 0.8429
 
 
 class TestComputeCompositeCiState:

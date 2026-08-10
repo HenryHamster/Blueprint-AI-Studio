@@ -6003,8 +6003,13 @@ class TestRecoverConfidenceFromCiUnresolved:
         assert out.get("confidence_recovered_from_ci_unresolved") is True
         # blocker should now be absent or None (no remaining hard blocker)
         assert out.get("blocker") is None or out.get("blocker") == ""
-        # Original fields preserved
-        assert out["sub_scores"] == record["sub_scores"]
+        # Original score inputs remain intact while the recompute refreshes the
+        # additive diagnostics that describe the now-cleared CI gate.
+        assert out["sub_scores"]["audit"] == record["sub_scores"]["audit"]
+        assert out["sub_scores"]["test_erosion"] == record["sub_scores"]["test_erosion"]
+        assert out["sub_scores"]["failing_gates"] == []
+        assert out["failing_gates"] == []
+        assert out["confidence_ceiling"] == 1.0
 
     def test_ci_unresolved_recovery_blocker_clears_when_ci_green(self):
         """After recovery, ci_unresolved blocker is gone (re-ran compute_composite with ci_green=True)."""
