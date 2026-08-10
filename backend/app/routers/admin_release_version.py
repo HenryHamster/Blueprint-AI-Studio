@@ -514,9 +514,11 @@ async def get_version_lifecycle(
     Projects with no version lifecycle return ``null`` for ``current_version``
     and an empty ``recent_versions`` list.
 
-    The response is cached per project for 30 seconds (in-flight dedup + stale
-    fallback) to bound the DB work from dashboard polling at ~30s cadence.
-    ``precomputed`` in the response is ``true`` when a cached value was served.
+    The lifecycle body is cached per project for 30 seconds (in-flight dedup +
+    stale fallback) to bound the DB work from dashboard polling at ~30s cadence.
+    Volatile promotion-policy truth is overlaid after the cache lookup so a live
+    runtime/project override is visible immediately. ``precomputed`` in the
+    response is ``true`` when a cached value was served.
     """
     from app.release_version import (  # noqa: PLC0415
         count_merged_since,
@@ -525,26 +527,18 @@ async def get_version_lifecycle(
     )
     from app.release_qualifier import (  # noqa: PLC0415
         compute_promotion_readiness,
+        current_effective_policy_projection,
         resolve_lifecycle_audit_evidence,
-        _resolve_policy_with_provenance,
     )
-    from app.models import Project  # noqa: PLC0415
     from app.strategic_spawning import (  # noqa: PLC0415
         _build_staged_directions_summary,
     )
 
-    await _get_user_project_with_role(
+    project_row = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
     )
 
     async def _compute_lifecycle() -> Dict[str, Any]:
-        project_row = (
-            await session.execute(select(Project).where(Project.id == project_id))
-        ).scalar_one_or_none()
-        _, promotion_policy_source, promotion_policy_error = (
-            _resolve_policy_with_provenance()
-        )
-
         open_row = (
             (
                 await session.execute(
@@ -972,8 +966,6 @@ async def get_version_lifecycle(
                 else "fleet"
             ),
             "promotion_readiness": promotion_readiness,
-            "promotion_policy_source": promotion_policy_source,
-            "promotion_policy_error": promotion_policy_error,
             # Directions deliberately queued (status=staged) to begin only after the
             # current version promotes. Surfaced read-only so an operator can confirm
             # staged work is queued and spot items rotting past their target version.
@@ -987,7 +979,14 @@ async def get_version_lifecycle(
         str(project_id),
         _compute_lifecycle,
     )
-    return {**result, "precomputed": served_stale}
+    current_effective_policy = current_effective_policy_projection(project_row)
+    return {
+        **result,
+        "current_effective_policy": current_effective_policy,
+        "promotion_policy_source": current_effective_policy["source"],
+        "promotion_policy_error": current_effective_policy["fallback_error"],
+        "precomputed": served_stale,
+    }
 
 
 class _SetVersionPhaseBody(BaseModel):

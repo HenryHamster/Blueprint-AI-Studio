@@ -2197,6 +2197,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "typed_fast_models": {"priority": "critical", "exempt": True},
     "typed_fast_effort": {"priority": "critical"},
     "typed_fast_qualification": {"priority": "critical"},
+    # Small authoritative decision contract. The live policy is critical so a
+    # stale qualification threshold can never outlive the runtime truth under
+    # payload pressure; the launch-time snapshot is separately labeled.
+    "current_effective_policy": {"priority": "critical", "exempt": True},
+    "active_or_last_attempt_policy": {"priority": "high", "exempt": True},
     # Trim-proof authoritative direction counts (true active/paused/total computed
     # before any trimming) and the operator's real max-active ceiling. Critical
     # tier with no summarize_fn: tiny scalars the packer ships verbatim, so the
@@ -5843,6 +5848,17 @@ async def _spawn_strategic_review(
             "strategic_review",
         )
 
+    # Resolve the exact project-aware policy the qualifier would enforce now.
+    # This is intentionally outside the LTS/version-phase branch: both cadence
+    # and the context-light Resident must receive the same current policy truth.
+    from app.release_qualifier import (  # noqa: PLC0415
+        current_effective_policy_projection,
+        qualification_attempt_policy_projection,
+    )
+
+    _current_effective_policy = current_effective_policy_projection(project)
+    _active_or_last_attempt_policy: dict[str, Any] | None = None
+
     if resident_minimal:
         # A resident strategic session runs SYNCHRONOUSLY inside the operator's
         # START request and then builds most of its own context on the runner via
@@ -6010,6 +6026,7 @@ async def _spawn_strategic_review(
                     "effective_purpose": resolve_project_purpose(project),
                     "problem_model": _agent_view_problem_model(project.problem_model),
                     "running_update": project.running_update or "",
+                    "current_effective_policy": _current_effective_policy,
                     # Pure-computation direction grounding (no I/O).
                     "directions_summary": _res_direction_stats,
                     **(
@@ -6386,6 +6403,11 @@ async def _spawn_strategic_review(
                     promotion_target=_promotion_target,
                 )
             if _open_version is not None:
+                _active_or_last_attempt_policy = (
+                    qualification_attempt_policy_projection(
+                        _open_version.last_qualification
+                    )
+                )
                 _open_aggregate, _open_artifacts = _version_serving_summary(
                     _open_version, project
                 )
@@ -6436,6 +6458,16 @@ async def _spawn_strategic_review(
                     )
                 _version_phase_block = {
                     **_phase_block,
+                    "current_effective_policy": _current_effective_policy,
+                    **(
+                        {
+                            "active_or_last_attempt_policy": (
+                                _active_or_last_attempt_policy
+                            )
+                        }
+                        if _active_or_last_attempt_policy
+                        else {}
+                    ),
                     "tasks_merged_this_version": _tasks_merged,
                     "qualification_attempts": _open_version.qualification_attempts,
                     "qualification_retry_episode": (
@@ -8266,6 +8298,16 @@ async def _spawn_strategic_review(
                 else {}
             ),
             **({"drift_signals": drift_summary} if drift_summary else {}),
+            "current_effective_policy": _current_effective_policy,
+            **(
+                {
+                    "active_or_last_attempt_policy": (
+                        _active_or_last_attempt_policy
+                    )
+                }
+                if _active_or_last_attempt_policy
+                else {}
+            ),
             **({"version_phase": _version_phase_block} if _version_phase_block else {}),
             **({"payload_staleness": _payload_staleness} if _payload_staleness else {}),
             **({"ci_compliance": _ci_compliance_block} if _ci_compliance_block else {}),

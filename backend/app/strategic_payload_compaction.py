@@ -63,6 +63,26 @@ def _compact_scalar_mapping(value: Any, *, text_cap: int) -> dict | None:
     return out or None
 
 
+def _compact_policy_projection(value: Any, *, text_cap: int) -> dict | None:
+    """Preserve the bounded policy contract, including its nested weights."""
+
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in ("threshold", "source", "fallback_error", "policy_hash"):
+        if key in value:
+            item = value.get(key)
+            out[key] = _bounded_text(item, text_cap) if isinstance(item, str) else item
+    raw_weights = value.get("weights")
+    if isinstance(raw_weights, dict):
+        out["weights"] = {
+            str(key)[:64]: item
+            for key, item in list(sorted(raw_weights.items()))[:8]
+            if isinstance(item, (int, float)) and not isinstance(item, bool)
+        }
+    return out or None
+
+
 def _compact_category_verdicts(value: Any, *, text_cap: int) -> list[dict] | None:
     """Compact per-category grader verdicts to their load-bearing fields.
 
@@ -569,6 +589,15 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     qs = _compact_qualification_state(block.get("qualification_state"), floor=floor)
     if qs:
         out["qualification_state"] = qs
+    for policy_key in (
+        "current_effective_policy",
+        "active_or_last_attempt_policy",
+    ):
+        policy_projection = _compact_policy_projection(
+            block.get(policy_key), text_cap=text_cap
+        )
+        if policy_projection:
+            out[policy_key] = policy_projection
     provenance = _compact_qualification_provenance(
         block.get("qualification_provenance"), text_cap=text_cap
     )

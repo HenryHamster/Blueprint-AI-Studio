@@ -216,6 +216,48 @@ class TestComputeFirstAttemptSucceeded:
     def test_queued_status_not_success(self):
         assert _compute_first_attempt_succeeded(0, TaskStatus.QUEUED) is False
 
+    def test_completed_strategic_review_is_unmeasured_without_an_adjudicator(self):
+        assert (
+            _compute_first_attempt_succeeded(
+                0,
+                TaskStatus.COMPLETED,
+                task_type="strategic_review",
+            )
+            is None
+        )
+
+    def test_retried_unadjudicated_strategic_review_stays_unmeasured(self):
+        assert (
+            _compute_first_attempt_succeeded(
+                2,
+                TaskStatus.COMPLETED,
+                task_type="strategic_review",
+            )
+            is None
+        )
+
+    def test_banked_retried_unadjudicated_strategic_review_stays_unmeasured(self):
+        """A reset retry counter must not turn unknown semantics into failure."""
+        assert (
+            _compute_first_attempt_succeeded(
+                0,
+                TaskStatus.COMPLETED,
+                banked_attempt_count=1,
+                task_type="strategic_review",
+            )
+            is None
+        )
+
+    def test_non_strategic_first_attempt_behavior_is_unchanged(self):
+        assert (
+            _compute_first_attempt_succeeded(
+                0,
+                TaskStatus.COMPLETED,
+                task_type="create",
+            )
+            is True
+        )
+
 
 def test_pending_rollback_handler_error_is_transient_by_type():
     from sqlalchemy.exc import PendingRollbackError

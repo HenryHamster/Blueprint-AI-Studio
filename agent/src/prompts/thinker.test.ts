@@ -160,6 +160,17 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('## Direction Portfolio');
   });
 
+  it('treats durable models as hypotheses and live state as authority', () => {
+    const prompt = buildThinkerPrompt(base);
+
+    expect(prompt).toContain('problem_model below is your durable working hypothesis');
+    expect(prompt).toContain('Current server-resolved state and fresh tool receipts outrank');
+    expect(prompt).toContain('an evidence-based preserve/no-change decision is valid');
+    expect(prompt).toContain('Never turn a repository default or remembered value');
+    expect(prompt).not.toContain("you're not allowed to defer");
+    expect(prompt).not.toContain('nothing else has more authority');
+  });
+
   it('includes all required output section headers', () => {
     const prompt = buildThinkerPrompt(base);
     expect(prompt).toContain('## 1. State assessment');
@@ -577,10 +588,12 @@ describe('buildThinkerPrompt', () => {
     expect(without).not.toContain('## Staged for next version');
   });
 
-  it('always includes the Section 3 staging guidance reconciling staging with no-defer', () => {
+  it('always includes Section 3 staging guidance as an evidence-backed disposition', () => {
     const prompt = buildThinkerPrompt(base);
     expect(prompt).toContain('**Staging (next-version work).**');
-    expect(prompt).toContain('Staging is NOT deferral');
+    expect(prompt).toContain('Staging is NOT indecision');
+    expect(prompt).toContain('stage with scope evidence');
+    expect(prompt).toContain('explicitly preserve the current portfolio');
   });
 
   it('Section 3 documents experiment commissions move with compute_experiment type', () => {

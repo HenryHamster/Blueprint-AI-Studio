@@ -1737,6 +1737,112 @@ describe('formatCriteriaRubric', () => {
 });
 
 describe('buildVersionPhaseSection', () => {
+  it('makes the live policy authoritative over a different historical attempt/default', () => {
+    const out = buildVersionPhaseSection({
+      version_number: 32,
+      phase: 'stabilize',
+      current_effective_policy: {
+        threshold: 0.81,
+        weights: { audit: 0.4, test_erosion: 0.6 },
+        source: 'runtime_config',
+        policy_hash: '1234567890abcdef',
+      },
+      active_or_last_attempt_policy: {
+        threshold: 0.9,
+        weights: { audit: 0.5, test_erosion: 0.5 },
+        source: 'yaml_file',
+        policy_hash: 'abcdef1234567890',
+      },
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.8577,
+        threshold: 0.9,
+      },
+    });
+
+    expect(out).toContain('Current effective promotion policy (authoritative now)');
+    expect(out).toContain(
+      'threshold=0.81, weights={audit=0.4, test_erosion=0.6}, source=runtime_config',
+    );
+    expect(out).toContain('outranks historical qualification attempts');
+    expect(out).toContain('Historical qualification-attempt policy');
+    expect(out).toContain(
+      'threshold=0.9, weights={audit=0.5, test_erosion=0.5}, source=yaml_file',
+    );
+    expect(out.indexOf('threshold=0.81')).toBeLessThan(out.indexOf('threshold=0.9'));
+  });
+
+  it('keeps an active attempt frozen while applying current policy to new launches', () => {
+    const out = buildVersionPhaseSection({
+      version_number: 32,
+      phase: 'stabilize',
+      current_effective_policy: { threshold: 0.81, source: 'runtime_config' },
+      active_or_last_attempt_policy: { threshold: 0.9, source: 'yaml_file' },
+      last_qualification: { status: 'pending', threshold: 0.9 },
+      qualification_state: { state: 'pending' },
+    });
+
+    expect(out).toContain('authoritative for new launches now');
+    expect(out).toContain('frozen active-attempt policy below governs the in-flight finalization');
+    expect(out).toContain(
+      'Active qualification-attempt policy (frozen; authoritative for this in-flight attempt)',
+    );
+    expect(out).not.toContain('Historical qualification-attempt policy');
+  });
+
+  it('keeps a raw pending attempt policy frozen during promotion_check_wait without changing the wait guard', () => {
+    const out = buildVersionPhaseSection({
+      version_number: 32,
+      phase: 'stabilize',
+      current_effective_policy: { threshold: 0.81, source: 'runtime_config' },
+      active_or_last_attempt_policy: { threshold: 0.9, source: 'yaml_file' },
+      last_qualification: { status: 'pending', threshold: 0.9 },
+      qualification_state: { state: 'promotion_check_wait' },
+    });
+
+    expect(out).toContain('status=promotion_check_wait');
+    expect(out).toContain('authoritative for new launches now');
+    expect(out).toContain(
+      'Active qualification-attempt policy (frozen; authoritative for this in-flight attempt)',
+    );
+    expect(out).not.toContain('Historical qualification-attempt policy');
+    expect(out).not.toContain('currently **PENDING**');
+    expect(out).not.toContain('wait for it to finalize');
+  });
+
+  it('treats a resolver-finalized stale pending snapshot as historical', () => {
+    const out = buildVersionPhaseSection({
+      version_number: 32,
+      phase: 'stabilize',
+      current_effective_policy: { threshold: 0.81, source: 'runtime_config' },
+      active_or_last_attempt_policy: { threshold: 0.9, source: 'yaml_file' },
+      last_qualification: { status: 'pending', threshold: 0.9 },
+      qualification_state: { state: 'promoted' },
+    });
+
+    expect(out).toContain('status=promoted');
+    expect(out).toContain('Current effective promotion policy (authoritative now)');
+    expect(out).toContain('Historical qualification-attempt policy');
+    expect(out).not.toContain('authoritative for new launches now');
+    expect(out).not.toContain('Active qualification-attempt policy');
+  });
+
+  it('renders a policy-only section without inventing version facts', () => {
+    const out = buildVersionPhaseSection({
+      current_effective_policy: {
+        threshold: 0.81,
+        source: 'runtime_config',
+        policy_hash: 'current-policy-hash',
+      },
+    });
+
+    expect(out).toContain('## Promotion Policy');
+    expect(out).toContain('Current effective promotion policy (authoritative now)');
+    expect(out).toContain('threshold=0.81, source=runtime_config');
+    expect(out).not.toContain('## Version Phase');
+    expect(out).not.toContain('Current: **v');
+  });
+
   it('renders the acceptance-criteria rubric inline', () => {
     const out = buildVersionPhaseSection({
       version_number: 25,
@@ -1804,6 +1910,22 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('unavailable');
     // Should not crash with no error field.
     expect(result).not.toContain('Error: `');
+  });
+
+  it('keeps authoritative policy visible when lifecycle assembly fails', () => {
+    const result = buildVersionPhaseSection({
+      lifecycle_signal: 'unavailable',
+      signal_status: 'build_failed',
+      current_effective_policy: {
+        threshold: 0.81,
+        source: 'runtime_config',
+        policy_hash: 'current-policy-hash',
+      },
+    });
+
+    expect(result).toContain('infrastructure failure');
+    expect(result).toContain('Current effective promotion policy (authoritative now)');
+    expect(result).toContain('threshold=0.81, source=runtime_config');
   });
 
   it('renders failure advisory when build_unavailable is true (without lifecycle_signal)', () => {

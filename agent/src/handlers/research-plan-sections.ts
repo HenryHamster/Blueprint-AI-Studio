@@ -298,6 +298,47 @@ export const QUALIFICATION_STATE_VOCAB: ReadonlySet<string> = new Set([
 // was the wait-guard regression: the pending warning was silently dropped once
 // the raw status was superseded by the derived `'qualifying'` state.
 const AUDIT_IN_PROGRESS_STATES = new Set(['pending', 'qualifying']);
+const ACTIVE_ATTEMPT_STATES = new Set(['pending', 'qualifying', 'promotion_check_wait']);
+
+
+function formatPolicyWeights(policy: Record<string, unknown>): string {
+  if (!policy.weights || typeof policy.weights !== 'object' || Array.isArray(policy.weights)) return '';
+  return Object.entries(policy.weights as Record<string, unknown>)
+    .filter((entry): entry is [string, number] => typeof entry[1] === 'number')
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}=${value}`)
+    .join(', ');
+}
+
+function formatCurrentPromotionPolicy(
+  policy: Record<string, unknown> | null,
+  activeAttempt = false,
+): string[] {
+  if (!policy || typeof policy.threshold !== 'number') return [];
+  const source = typeof policy.source === 'string' && policy.source
+    ? policy.source
+    : 'unknown';
+  const policyHash = typeof policy.policy_hash === 'string' && policy.policy_hash
+    ? `, policy_hash=${policy.policy_hash.slice(0, 12)}`
+    : '';
+  const weights = formatPolicyWeights(policy);
+  const fallbackError = typeof policy.fallback_error === 'string' && policy.fallback_error
+    ? ` Fallback diagnostic: ${policy.fallback_error}`
+    : '';
+  return [
+    `**Current effective promotion policy (` +
+      `${activeAttempt ? 'authoritative for new launches now' : 'authoritative now'}):** ` +
+      `threshold=${policy.threshold}` +
+      `${weights ? `, weights={${weights}}` : ''}, source=${source}${policyHash}.` +
+      fallbackError,
+    activeAttempt
+      ? `Use this server-resolved policy for newly launched attempts. The frozen active-attempt ` +
+        `policy below governs the in-flight finalization; repository/YAML defaults, design prose, ` +
+        `and remembered values govern neither.`
+      : `Use this server-resolved current policy for decisions. It outranks historical ` +
+        `qualification attempts, repository/YAML defaults, design prose, and remembered values.`,
+  ];
+}
 
 
 /**
@@ -414,6 +455,10 @@ export function formatCriteriaRubric(versionPhase: Record<string, unknown>): str
  */
 export function buildVersionPhaseSection(versionPhase: Record<string, unknown> | undefined): string {
   if (!versionPhase || typeof versionPhase !== 'object') return '';
+  const currentPolicyRaw = versionPhase.current_effective_policy;
+  const currentPolicy = currentPolicyRaw && typeof currentPolicyRaw === 'object' && !Array.isArray(currentPolicyRaw)
+    ? currentPolicyRaw as Record<string, unknown>
+    : null;
 
   // Failure marker — the backend assembly failed; surface as an explicit advisory
   // so the strategist knows the omission is a build error, not missing lifecycle.
@@ -434,12 +479,18 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
       'Do not treat the absence of version-phase data as a signal to change phase or qualification strategy.',
     ];
     if (errorSnippet) lines.push(`Error: \`${errorSnippet}\``);
+    lines.push(...formatCurrentPromotionPolicy(currentPolicy));
     return lines.join('\n');
   }
 
   const versionNumber = typeof versionPhase.version_number === 'number' ? versionPhase.version_number : null;
   const phase = typeof versionPhase.phase === 'string' ? versionPhase.phase : null;
-  if (versionNumber === null || (phase !== 'build' && phase !== 'stabilize')) return '';
+  if (versionNumber === null || (phase !== 'build' && phase !== 'stabilize')) {
+    const policyOnly = formatCurrentPromotionPolicy(currentPolicy);
+    return policyOnly.length > 0
+      ? `\n## Promotion Policy\n${policyOnly.join('\n')}`
+      : '';
+  }
 
   const phaseChangedAt = typeof versionPhase.phase_changed_at === 'string' ? versionPhase.phase_changed_at : null;
   const tasksMergedThisVersion = typeof versionPhase.tasks_merged_this_version === 'number'
@@ -462,9 +513,21 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   const qualificationState = qualificationStateRaw && typeof qualificationStateRaw === 'object' && !Array.isArray(qualificationStateRaw)
     ? qualificationStateRaw as Record<string, unknown>
     : null;
+  const attemptPolicyRaw = versionPhase.active_or_last_attempt_policy;
+  const attemptPolicy = attemptPolicyRaw && typeof attemptPolicyRaw === 'object' && !Array.isArray(attemptPolicyRaw)
+    ? attemptPolicyRaw as Record<string, unknown>
+    : null;
   const effectiveQualStatus = qualStatus === 'pending' && typeof qualificationState?.state === 'string'
     ? qualificationState.state
     : qualStatus;
+  // Raw pending means the launch-time policy was frozen, but the resolver can
+  // supersede that stale row with a newer terminal verdict. Treat it as active
+  // only while the effective lifecycle is still in-flight. Keep this separate
+  // from qualificationPending: that narrower bit controls only the existing
+  // duplicate-request wait guard.
+  const activeAttempt = qualStatus === 'pending'
+    && typeof effectiveQualStatus === 'string'
+    && ACTIVE_ATTEMPT_STATES.has(effectiveQualStatus);
   const qualificationPending = typeof effectiveQualStatus === 'string'
     && AUDIT_IN_PROGRESS_STATES.has(effectiveQualStatus);
   // A finalized conclusive verdict (dry_run, not_promoted, or promoted) means
@@ -491,6 +554,20 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   }
   if (tasksMergedThisVersion !== null) {
     parts.push(`Tasks merged this version: ${tasksMergedThisVersion}`);
+  }
+  parts.push(...formatCurrentPromotionPolicy(currentPolicy, activeAttempt));
+  if (attemptPolicy && typeof attemptPolicy.threshold === 'number') {
+    const source = typeof attemptPolicy.source === 'string' && attemptPolicy.source
+      ? attemptPolicy.source
+      : 'unknown';
+    const weights = formatPolicyWeights(attemptPolicy);
+    parts.push(
+      (activeAttempt
+        ? `Active qualification-attempt policy (frozen; authoritative for this in-flight attempt): `
+        : `Historical qualification-attempt policy (explains that attempt only; not current): `) +
+      `threshold=${attemptPolicy.threshold}` +
+      `${weights ? `, weights={${weights}}` : ''}, source=${source}.`,
+    );
   }
   if (lastQualification) {
     // Compact one-line summary: status, then confidence / candidate_sha /

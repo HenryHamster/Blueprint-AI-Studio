@@ -807,6 +807,11 @@ class StrategicReviewPayload(_SystemPopulated):
     # Short-window claim-vs-shipped drift signals; complements lifetime
     # prediction calibration with a fast-reacting drift detector.
     drift_signals: dict[str, Any] | None = None
+    # Authoritative promotion rubric resolved from the same project-aware seam
+    # the release qualifier enforces. Kept separate from the launch-time attempt
+    # snapshot so a historical threshold cannot masquerade as current policy.
+    current_effective_policy: dict[str, Any] | None = None
+    active_or_last_attempt_policy: dict[str, Any] | None = None
     # Current LTS version/phase context. Keys: version_number, phase,
     # phase_changed_at, tasks_merged_this_version, last_qualification,
     # acceptance_aggregate (additive proven-vs-merged version-window aggregate,

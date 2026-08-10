@@ -23,6 +23,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import uuid
 from datetime import datetime
@@ -914,15 +915,29 @@ def _fail_closed_category_verdicts(
 # from this file (backend/app/release_qualifier.py).
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
 
+
+def _finite_policy_float(value: Any, *, label: str) -> float:
+    """Coerce one policy number while rejecting JSON-unsafe NaN/Infinity."""
+
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{label} must be finite")
+    return parsed
+
+
 def _normalize_active_promotion_weights(weights_raw: Any) -> dict[str, float]:
     """Accept current two-key and legacy three-key policies deterministically."""
     from decimal import Decimal
 
     if not isinstance(weights_raw, dict):
         raise ValueError("promotion weights must be a mapping")
-    audit = float(weights_raw["audit"])
-    erosion = float(weights_raw["test_erosion"])
-    smoke = float(weights_raw.get("smoketest", 0.0))
+    audit = _finite_policy_float(weights_raw["audit"], label="audit weight")
+    erosion = _finite_policy_float(
+        weights_raw["test_erosion"], label="test_erosion weight"
+    )
+    smoke = _finite_policy_float(
+        weights_raw.get("smoketest", 0.0), label="smoketest weight"
+    )
     if audit < 0 or erosion < 0 or smoke < 0:
         raise ValueError("promotion weights must be non-negative")
     declared_sum = audit + erosion + smoke
@@ -963,13 +978,15 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
         if threshold_raw is None or not isinstance(weights_raw, dict):
             return None
         weights = _normalize_active_promotion_weights(weights_raw)
-        threshold = float(threshold_raw)
+        threshold = _finite_policy_float(
+            threshold_raw, label="runtime promotion threshold"
+        )
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
         for _k in ("merge_grade_block_threshold",):
             _v = _runtime_config.get(_k)
             if _v is not None:
                 with contextlib.suppress(TypeError, ValueError):
-                    result[_k] = float(_v)
+                    result[_k] = _finite_policy_float(_v, label=_k)
         # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
         # judge flag.  Threaded through the rubric so a fleet-level runtime_config
         # arm reaches _finalize_qualification's policy fallback.
@@ -1033,7 +1050,9 @@ def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
         else:
             weights = dict(_DEFAULT_POLICY["weights"])
         threshold = (
-            float(threshold_raw)
+            _finite_policy_float(
+                threshold_raw, label="project promotion threshold"
+            )
             if threshold_raw is not None
             else float(_DEFAULT_POLICY["threshold"])
         )
@@ -1145,6 +1164,125 @@ def _resolve_policy_with_provenance(
         return _apply_completion_debt_weight_mode(merged), "build_config", fleet_error
     return _apply_completion_debt_weight_mode(fleet_policy), fleet_source, fleet_error
 
+
+_POLICY_PROJECTION_WEIGHT_LIMIT = 8
+_POLICY_PROJECTION_ERROR_CHARS = 512
+
+
+def promotion_policy_projection(
+    policy: dict[str, Any],
+    *,
+    source: str,
+    fallback_error: str | None = None,
+) -> dict[str, Any]:
+    """Return the bounded, hash-stable policy truth exposed to Strategic.
+
+    The qualifier's full policy may carry non-scoring feature flags. Strategic
+    needs only the confidence threshold, active scoring weights, and provenance
+    needed to distinguish live runtime truth from an older attempt snapshot.
+    ``policy_hash`` deliberately excludes ``fallback_error``: exception wording
+    is diagnostic provenance, not part of the effective decision contract.
+    """
+
+    raw_weights = policy.get("weights")
+    weights: dict[str, float] = {}
+    if isinstance(raw_weights, dict):
+        ordered_weights = sorted(raw_weights.items(), key=lambda item: str(item[0]))
+        for raw_key, value in ordered_weights[:_POLICY_PROJECTION_WEIGHT_LIMIT]:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                with contextlib.suppress(OverflowError):
+                    finite_value = float(value)
+                    if math.isfinite(finite_value):
+                        key = str(raw_key)[:64]
+                        weights[key] = finite_value
+
+    threshold_raw = policy.get("threshold")
+    threshold: float | None = None
+    if isinstance(threshold_raw, (int, float)) and not isinstance(
+        threshold_raw, bool
+    ):
+        with contextlib.suppress(OverflowError):
+            finite_threshold = float(threshold_raw)
+            if math.isfinite(finite_threshold):
+                threshold = finite_threshold
+    bounded_source = str(source or "unknown")[:64]
+    hash_input = {
+        "threshold": threshold,
+        "weights": weights,
+        "source": bounded_source,
+    }
+    policy_hash = hashlib.sha256(
+        json.dumps(hash_input, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        **hash_input,
+        "fallback_error": (
+            str(fallback_error)[:_POLICY_PROJECTION_ERROR_CHARS]
+            if fallback_error
+            else None
+        ),
+        "policy_hash": policy_hash,
+    }
+
+
+def current_effective_policy_projection(
+    project: Project | None = None,
+) -> dict[str, Any]:
+    """Resolve and project the policy the qualifier would enforce right now."""
+
+    policy, source, fallback_error = _resolve_policy_with_provenance(project)
+    return promotion_policy_projection(
+        policy,
+        source=source,
+        fallback_error=fallback_error,
+    )
+
+
+def qualification_attempt_policy_projection(
+    qualification: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Project a launch-time policy snapshot when the record actually has one.
+
+    Older finalized records commonly retain only ``threshold``. Returning no
+    attempt projection is more honest than fabricating weights or provenance for
+    those rows. Pending/new finalized records carry the full frozen snapshot.
+    """
+
+    if not isinstance(qualification, dict):
+        return None
+    snapshot = qualification.get("promotion_policy_snapshot")
+    if not isinstance(snapshot, dict) or not snapshot:
+        return None
+    source = qualification.get("promotion_policy_source")
+    return promotion_policy_projection(
+        snapshot,
+        source=(str(source) if source else "legacy_snapshot"),
+        fallback_error=(
+            str(qualification["promotion_policy_fallback_error"])
+            if qualification.get("promotion_policy_fallback_error")
+            else None
+        ),
+    )
+
+
+def qualification_attempt_policy_record_fields(
+    qualification: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Fields that must survive every pending-to-terminal record replacement."""
+
+    projection = qualification_attempt_policy_projection(qualification)
+    if projection is None or not isinstance(qualification, dict):
+        return {}
+    return {
+        "promotion_policy_snapshot": qualification["promotion_policy_snapshot"],
+        "promotion_policy_source": projection["source"],
+        "promotion_policy_fallback_error": projection["fallback_error"],
+        "promotion_policy_hash": (
+            qualification.get("promotion_policy_hash") or projection["policy_hash"]
+        ),
+    }
+
+
 def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
     """Resolve the FLEET promotion rubric (no per-project override): live
     ``runtime_config`` → ``promotion_policy.yaml`` → hardcoded defaults."""
@@ -1169,7 +1307,9 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
         # Normalize current two-key and archival three-key policies through one
         # path; KeyError/TypeError/ValueError here drops into the safe fallback.
         weights = _normalize_active_promotion_weights(weights_raw)
-        threshold = float(parsed["threshold"])
+        threshold = _finite_policy_float(
+            parsed["threshold"], label="YAML promotion threshold"
+        )
 
         # Optional completion_debt blend factor from the on-disk rubric (separate
         # from the three-core-weight sum; default 0.0, clamped to [0, 0.5]).
@@ -1181,7 +1321,7 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
         for _k in ("merge_grade_block_threshold",):
             if _k in parsed:
                 with contextlib.suppress(TypeError, ValueError):
-                    result[_k] = float(parsed[_k])
+                    result[_k] = _finite_policy_float(parsed[_k], label=_k)
         # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
         # judge flag from the on-disk rubric (default False when absent).
         if "env_preflight_enabled" in parsed:
@@ -2759,7 +2899,16 @@ async def run_qualification(
         qualification_attempt_id=str(attempt_id),
     )
     rubric_fingerprint = rubric_provenance["fingerprint"]
-    _spawn_policy_snapshot = _load_policy(project)
+    (
+        _spawn_policy_snapshot,
+        _spawn_policy_source,
+        _spawn_policy_fallback_error,
+    ) = _resolve_policy_with_provenance(project)
+    _spawn_policy_projection = promotion_policy_projection(
+        _spawn_policy_snapshot,
+        source=_spawn_policy_source,
+        fallback_error=_spawn_policy_fallback_error,
+    )
     _spawn_capability_proof_mode = str(
         _runtime_config.get("capability_proof_gate_mode", "off") or "off"
     ).strip().lower()
@@ -3436,6 +3585,13 @@ async def run_qualification(
             "retry_episode": retry_episode,
             "retry_episode_cap": retry_episode_cap,
             "requested_probes": sorted(effective_requested_probes),
+            # This is still a counted qualification attempt. Preserve the
+            # launch-time decision contract even when child spawning fails so
+            # Strategic can distinguish this attempt from current live policy.
+            "promotion_policy_snapshot": _spawn_policy_snapshot,
+            "promotion_policy_source": _spawn_policy_source,
+            "promotion_policy_fallback_error": _spawn_policy_fallback_error,
+            "promotion_policy_hash": _spawn_policy_projection["policy_hash"],
         }
         # Read-modify-write is safe here (unlike the no_credentials / sha_error
         # early returns, which run pre-lock and use the atomic
@@ -3573,6 +3729,9 @@ async def run_qualification(
         # computed under another.
         "version_goal": version_goal,
         "promotion_policy_snapshot": _spawn_policy_snapshot,
+        "promotion_policy_source": _spawn_policy_source,
+        "promotion_policy_fallback_error": _spawn_policy_fallback_error,
+        "promotion_policy_hash": _spawn_policy_projection["policy_hash"],
         "capability_proof_mode": _spawn_capability_proof_mode,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
@@ -3871,6 +4030,7 @@ async def _handle_walkthrough_contract_failure(
     from app.deployed_sha import get_serving_sha  # noqa: PLC0415
 
     record: dict[str, Any] = {
+        **qualification_attempt_policy_record_fields(qual),
         "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "retry_episode": qual.get("retry_episode", 0),
         "retry_episode_cap": qual.get("retry_episode_cap"),
@@ -6012,6 +6172,7 @@ async def _record_rubric_provenance_outcome(
     finalized_at = _utcnow().isoformat()
     verdict_status = "rubric_unknown" if status == "rubric_provenance_unknown" else status
     record: dict[str, Any] = {
+        **qualification_attempt_policy_record_fields(qual),
         "status": status,
         "candidate_sha": qual.get("candidate_sha"),
         "candidate_diff_hash": qual.get("candidate_diff_hash"),
@@ -6256,7 +6417,20 @@ async def _finalize_qualification(
 
     # Prefer the promotion policy frozen at spawn; fall back to the live policy
     # for legacy records that predate the attempt-contract freeze.
-    policy = qual.get("promotion_policy_snapshot") or _load_policy(_policy_project)
+    policy = qual.get("promotion_policy_snapshot")
+    policy_source = qual.get("promotion_policy_source")
+    policy_fallback_error = qual.get("promotion_policy_fallback_error")
+    if not isinstance(policy, dict) or not policy:
+        policy, policy_source, policy_fallback_error = _resolve_policy_with_provenance(
+            _policy_project
+        )
+    attempt_policy_projection = promotion_policy_projection(
+        policy,
+        source=(str(policy_source) if policy_source else "legacy_snapshot"),
+        fallback_error=(
+            str(policy_fallback_error) if policy_fallback_error else None
+        ),
+    )
 
     # Derive whether enforce mode was active at spawn from the frozen (or fallback)
     # policy.  _apply_completion_debt_weight_mode baked the freeze-time mode into
@@ -8737,6 +8911,15 @@ async def _finalize_qualification(
         # qualification; None when there is no blocker or it is unclassified.
         "execution_site": blocker_execution_site(composite["blocker"]),
         "threshold": policy.get("threshold"),
+        # Preserve the exact launch-time decision contract when replacing the
+        # pending JSONB record with its terminal result. These additive JSONB
+        # fields need no migration and keep current-vs-attempt truth separable.
+        "promotion_policy_snapshot": policy,
+        "promotion_policy_source": attempt_policy_projection["source"],
+        "promotion_policy_fallback_error": attempt_policy_projection[
+            "fallback_error"
+        ],
+        "promotion_policy_hash": attempt_policy_projection["policy_hash"],
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
         # One-shot keyless re-qualification marker (finding 1).  The sweep's

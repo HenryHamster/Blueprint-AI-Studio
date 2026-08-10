@@ -1643,10 +1643,13 @@ async def agent_fetch_qualification(
     from app.deployed_sha import get_serving_sha  # noqa: PLC0415
     from app.release_commit_authorship import count_non_bot_authored_commits  # noqa: PLC0415
     from app.release_qualifier import (  # noqa: PLC0415
+        current_effective_policy_projection,
         get_latest_qualification_audit_findings,
+        qualification_attempt_policy_projection,
     )
 
-    await _resolve_agent_project(project_id, token, session)
+    project = await _resolve_agent_project(project_id, token, session)
+    current_effective_policy = current_effective_policy_projection(project)
     serving_sha = get_serving_sha()
 
     open_row = (
@@ -1668,6 +1671,8 @@ async def agent_fetch_qualification(
         return {
             "source": "no_open_version",
             "serving_sha": serving_sha,
+            "current_effective_policy": current_effective_policy,
+            "active_or_last_attempt_policy": None,
             "qualification_trigger_state": {
                 "trigger_state": "blocked",
                 "open_version_id": None,
@@ -1679,6 +1684,9 @@ async def agent_fetch_qualification(
     operator_authored_commits = count_non_bot_authored_commits(
         open_row.base_sha,
         serving_sha,
+    )
+    active_or_last_attempt_policy = qualification_attempt_policy_projection(
+        open_row.last_qualification
     )
 
     # Re-qualification readiness signal + per-finding resolution view (ADDITIVE).
@@ -1970,6 +1978,8 @@ async def agent_fetch_qualification(
             "dimension_states": qualification_dimension_states,
             "serving_sha": serving_sha,
             "operator_authored_commits": operator_authored_commits,
+            "current_effective_policy": current_effective_policy,
+            "active_or_last_attempt_policy": active_or_last_attempt_policy,
             **requalification_extra,
         }
 
@@ -2028,6 +2038,8 @@ async def agent_fetch_qualification(
         "dimension_states": qualification_dimension_states,
         "serving_sha": serving_sha,
         "operator_authored_commits": operator_authored_commits,
+        "current_effective_policy": current_effective_policy,
+        "active_or_last_attempt_policy": active_or_last_attempt_policy,
         **requalification_extra,
     }
 
@@ -2077,6 +2089,12 @@ async def agent_fetch_version_phase(
     use ``./fetch qualification`` explicitly.
     """
     project = await _resolve_agent_project(project_id, token, session)
+    from app.release_qualifier import (  # noqa: PLC0415
+        current_effective_policy_projection,
+        qualification_attempt_policy_projection,
+    )
+
+    current_effective_policy = current_effective_policy_projection(project)
 
     open_row = (
         (
@@ -2185,6 +2203,13 @@ async def agent_fetch_version_phase(
     )
     if _current_version_data is not None and version_phase_criterion_coverage is not None:
         _current_version_data["criterion_coverage"] = version_phase_criterion_coverage
+    active_or_last_attempt_policy = qualification_attempt_policy_projection(
+        open_row.last_qualification if open_row is not None else None
+    )
+    if _current_version_data is not None:
+        _current_version_data["active_or_last_attempt_policy"] = (
+            active_or_last_attempt_policy
+        )
 
     # Candidate-currency signal for the fetch/recovery path — same HEAD-vs-candidate
     # comparison the spawn payload provides in payload_staleness.  Best-effort:
@@ -2235,6 +2260,8 @@ async def agent_fetch_version_phase(
         "data": {
             "source": "open_version" if open_row is not None else "no_open_version",
             "current_version": _current_version_data,
+            "current_effective_policy": current_effective_policy,
+            "active_or_last_attempt_policy": active_or_last_attempt_policy,
             "recent_versions": [
                 _compact_version_lifecycle(row, project) for row in recent_closed_rows
             ],

@@ -5795,6 +5795,7 @@ async def agent_fetch_checkpoint_state(
     # internal vision continuation blob — the opposite of the coherence the
     # refresh preserves.
     from app.problem_model import resolve_project_purpose
+    from app.release_qualifier import current_effective_policy_projection
     from app.strategic_problem_view import _agent_view_problem_model
 
     return {
@@ -5805,6 +5806,10 @@ async def agent_fetch_checkpoint_state(
         # compaction grounding so a post-compaction session keeps the same
         # project-purpose grounding it started with instead of dropping it.
         "effective_purpose": resolve_project_purpose(project),
+        # Refresh volatile release truth at the same boundary as the other
+        # compaction grounding; never re-prime a long-lived Resident with the
+        # policy snapshot from session start after the live policy changed.
+        "current_effective_policy": current_effective_policy_projection(project),
         "open_messages": open_messages,
         "recent_handled_conversation": recent_handled_conversation,
     }

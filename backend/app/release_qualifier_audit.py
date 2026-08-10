@@ -1698,6 +1698,9 @@ async def _handle_infra_failure(
     failing_dimension = _infer_dimension_from_infra_error(infra_error)
 
     record: dict[str, Any] = {
+        **_release_qualifier_module().qualification_attempt_policy_record_fields(
+            qual
+        ),
         "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "retry_episode": qual.get("retry_episode", 0),
         "retry_episode_cap": qual.get("retry_episode_cap"),
@@ -2002,6 +2005,9 @@ async def _handle_independent_blocker(
     """
     finalized_at = _utcnow().isoformat()
     record: dict[str, Any] = {
+        **_release_qualifier_module().qualification_attempt_policy_record_fields(
+            qual
+        ),
         "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "retry_episode": qual.get("retry_episode", 0),
         "retry_episode_cap": qual.get("retry_episode_cap"),

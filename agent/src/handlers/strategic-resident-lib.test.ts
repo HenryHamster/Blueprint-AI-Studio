@@ -6,7 +6,7 @@ import {
   materializeContentBlocks, isAllowedAttachmentDownloadUrl,
   rollbackMessageBatchAdmission, RetryableArtifactAttachmentError,
   buildBootstrapPrompt, buildAutonomousPrompt,
-  resolveResidentPurposeText,
+  formatCurrentEffectivePolicyJson, resolveResidentPurposeText,
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
   buildPriorDecisionsText,
   buildRetiredContextText,
@@ -1153,6 +1153,36 @@ describe('buildBootstrapPrompt', () => {
     expect(p).toContain('CTX');
     expect(p).not.toContain('long-lived strategic steward');
     expect(p).not.toContain('A direction is a durable strategic outcome');
+  });
+
+  it('renders the backend-resolved effective policy with explicit source precedence', () => {
+    const currentEffectivePolicyJson = formatCurrentEffectivePolicyJson({
+      current_effective_policy: {
+        threshold: 0.81,
+        source: 'runtime_config',
+        policy_hash: 'policy-81',
+      },
+    });
+    const p = buildBootstrapPrompt({ ...base, currentEffectivePolicyJson });
+
+    expect(p).toContain('## Current effective release policy');
+    expect(p).toContain('"threshold": 0.81');
+    expect(p).toContain('"source": "runtime_config"');
+    expect(p).toContain('takes precedence over historical attempt snapshots');
+    expect(p).toContain('repository/on-disk policy files');
+    expect(p).toContain('source-code defaults');
+    expect(p).toContain('./fetch qualification');
+    expect(p).toContain('./fetch version-phase');
+    expect(p).toContain('the newer projection wins');
+    expect(buildBootstrapPrompt({ ...base, currentEffectivePolicyJson: '   ' }))
+      .not.toContain('## Current effective release policy');
+  });
+
+  it('ignores absent or non-record effective policy payloads', () => {
+    expect(formatCurrentEffectivePolicyJson({})).toBe('');
+    expect(formatCurrentEffectivePolicyJson({ current_effective_policy: null })).toBe('');
+    expect(formatCurrentEffectivePolicyJson({ current_effective_policy: [] })).toBe('');
+    expect(formatCurrentEffectivePolicyJson({ current_effective_policy: {} })).toBe('');
   });
 
   it('bootstrap identifies the native reply capability without repeating its protocol', () => {
@@ -3372,6 +3402,25 @@ describe('buildCompactionCheckpoint', () => {
     expect(result).toContain('Examination tick: 0');
   });
 
+  it('buildCompactionCheckpoint preserves effective policy authority and freshness rules', () => {
+    const result = buildCompactionCheckpoint({
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      currentEffectivePolicyJson: JSON.stringify({
+        threshold: 0.81,
+        source: 'runtime_config',
+        policy_hash: 'policy-81',
+      }, null, 2),
+    });
+
+    expect(result).toContain('## Current effective release policy');
+    expect(result).toContain('"threshold": 0.81');
+    expect(result).toContain('"source": "runtime_config"');
+    expect(result).toContain('takes precedence over historical attempt snapshots');
+    expect(result).toContain('the newer projection wins');
+  });
+
   it('buildCompactionCheckpoint renders the recently-answered conversation as a read-only section', () => {
     const ctx: CompactionCheckpointContext = {
       roleIdentity: 'You are the resident strategist for Acme.',
@@ -3665,12 +3714,14 @@ describe('formatCheckpointState', () => {
       effective_purpose: 'coherent strategist purpose',
       strategic_memory_notes: [{ note: 'do not re-derive', set_at: '2026-07-01T00:00:00Z' }],
       running_update: 'refresh landed',
+      current_effective_policy: { threshold: 0.81, source: 'runtime_config' },
     };
     const g = formatCheckpointState(resp);
     expect(g.problemModelJson).toBe(JSON.stringify({ goals: ['ship refresh'] }, null, 2));
     expect(g.purposeText).toBe('coherent strategist purpose');
     expect(g.strategicMemoryNotesText).toBe('- [2026-07-01T00:00:00Z] do not re-derive');
     expect(g.runningUpdate).toBe('refresh landed');
+    expect(g.currentEffectivePolicyJson).toContain('"threshold": 0.81');
   });
 
   it('coerces empty {} / missing / mistyped fields to empty strings (no throw)', () => {
@@ -3695,6 +3746,7 @@ describe('resolveCheckpointGrounding', () => {
     purposeText: 'STALE purpose',
     strategicMemoryNotesText: '- STALE lesson',
     runningUpdate: 'STALE running update',
+    currentEffectivePolicyJson: JSON.stringify({ threshold: 0.9, source: 'yaml_file' }, null, 2),
   };
 
   it('refreshed checkpoint state overrides session-start snapshot', () => {
@@ -3705,6 +3757,7 @@ describe('resolveCheckpointGrounding', () => {
       effective_purpose: 'FRESH purpose',
       strategic_memory_notes: [{ note: 'FRESH lesson', set_at: '2026-07-11T00:00:00Z' }],
       running_update: 'FRESH running update',
+      current_effective_policy: { threshold: 0.81, source: 'runtime_config' },
     });
     const resolved = resolveCheckpointGrounding(snapshot, refreshed);
     expect(resolved.problemModelJson).toContain('FRESH goal');
@@ -3713,6 +3766,8 @@ describe('resolveCheckpointGrounding', () => {
     expect(resolved.purposeText).not.toContain('STALE');
     expect(resolved.strategicMemoryNotesText).toBe('- [2026-07-11T00:00:00Z] FRESH lesson');
     expect(resolved.runningUpdate).toBe('FRESH running update');
+    expect(resolved.currentEffectivePolicyJson).toContain('"threshold": 0.81');
+    expect(resolved.currentEffectivePolicyJson).not.toContain('0.9');
 
     // And end-to-end: the rendered checkpoint carries the fresh values, marked
     // as refreshed rather than a session-start snapshot.
@@ -3726,6 +3781,8 @@ describe('resolveCheckpointGrounding', () => {
     });
     expect(checkpoint).toContain('FRESH goal');
     expect(checkpoint).not.toContain('STALE');
+    expect(checkpoint).toContain('"threshold": 0.81');
+    expect(checkpoint).not.toContain('"threshold": 0.9');
     expect(checkpoint).toContain('## Self-model grounding (refreshed at compaction)');
     expect(checkpoint).not.toContain('(session-start snapshot)');
   });
@@ -3736,6 +3793,7 @@ describe('resolveCheckpointGrounding', () => {
       purposeText: snapshot.purposeText,
       strategicMemoryNotesText: snapshot.strategicMemoryNotesText,
       runningUpdate: snapshot.runningUpdate,
+      currentEffectivePolicyJson: snapshot.currentEffectivePolicyJson,
     });
     expect(resolveCheckpointGrounding(snapshot, undefined).problemModelJson)
       .toContain('STALE goal');

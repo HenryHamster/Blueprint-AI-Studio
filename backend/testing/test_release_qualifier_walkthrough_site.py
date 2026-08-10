@@ -212,6 +212,18 @@ async def test_walkthrough_site_failure_leaves_no_queued_release_audit_child(
     # The spawn_failed record stamps the serving engine sha so the error-redrive
     # site-change re-arm has a baseline to compare against a later deploy.
     assert version.last_qualification.get("engine_sha") == stamped_engine
+    assert isinstance(
+        version.last_qualification.get("promotion_policy_snapshot"), dict
+    )
+    assert version.last_qualification.get("promotion_policy_source")
+    assert len(version.last_qualification.get("promotion_policy_hash") or "") == 64
+    attempt_policy = rq.qualification_attempt_policy_projection(
+        version.last_qualification
+    )
+    assert attempt_policy is not None
+    assert attempt_policy["threshold"] == version.last_qualification[
+        "promotion_policy_snapshot"
+    ]["threshold"]
 
     # No QUEUED release_audit child may survive the failed dispatch.
     project_tasks = (

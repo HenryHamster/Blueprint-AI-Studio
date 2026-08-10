@@ -25,7 +25,10 @@ const SPECIAL_CLI_CASE_BODIES: Record<string, string> = {
   create_message: `  create-message)
     # Operator replies are a native Workday MCP action. Do not make a generic
     # strategic message look like a reply while an operator turn is active.
-    if [ -e "$RESIDENT_REPLY_RECEIPT_PATH" ] || [ -L "$RESIDENT_REPLY_RECEIPT_PATH" ]; then
+    if [ -e "$RESIDENT_PRIVATE_TURN_MARKER_PATH" ] || [ -L "$RESIDENT_PRIVATE_TURN_MARKER_PATH" ]; then
+      echo "[ERROR] create-message: private Workday turns cannot publish project messages" >&2
+      exit 2
+    elif [ -e "$RESIDENT_REPLY_RECEIPT_PATH" ] || [ -L "$RESIDENT_REPLY_RECEIPT_PATH" ]; then
       echo "[ERROR] create-message: this is not the Workday operator reply tool; call reply_to_operator instead" >&2
       exit 2
     elif [ -e "$RESIDENT_REPLY_KEY_PATH" ] || [ -L "$RESIDENT_REPLY_KEY_PATH" ]; then
@@ -90,6 +93,7 @@ function generateStrategicScript(
     replyReceiptPath?: string;
     stagedReplyPath?: string;
     residentIncarnationId?: string;
+    privateTurnMarkerPath?: string;
   } = {},
 ): string {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
@@ -105,6 +109,9 @@ function generateStrategicScript(
     (replyPaths.stagedReplyPath
       ?? path.resolve(helperDir, '.resident-reply-staged-message.json')).replace(/\\/g, '/'),
   );
+  const privateTurnMarkerPath = replyPaths.privateTurnMarkerPath
+    ? shellEscapeDoubleQuoted(replyPaths.privateTurnMarkerPath.replace(/\\/g, '/'))
+    : '';
   const residentIncarnationId = replyPaths.residentIncarnationId
     ? shellEscapeDoubleQuoted(replyPaths.residentIncarnationId)
     : '';
@@ -158,6 +165,7 @@ RESIDENT_REPLY_KEY_PATH="\${BLUEPRINT_RESIDENT_REPLY_KEY_PATH:-${replyKeyPath}}"
 RESIDENT_REPLY_RECEIPT_PATH="\${BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH:-${replyReceiptPath}}"
 RESIDENT_STAGED_REPLY_PATH="\${BLUEPRINT_RESIDENT_STAGED_REPLY_PATH:-${stagedReplyPath}}"
 RESIDENT_INCARNATION_ID="\${BLUEPRINT_RESIDENT_INCARNATION_ID:-${residentIncarnationId}}"
+RESIDENT_PRIVATE_TURN_MARKER_PATH="\${BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH:-${privateTurnMarkerPath}}"
 NODE_BIN="\${NODE_BINARY:-node}"
 ${boundedRegularReadShellFn()}
 
@@ -1116,6 +1124,7 @@ export function writeStrategicHelpers(
     replyReceiptPath?: string;
     stagedReplyPath?: string;
     residentIncarnationId?: string;
+    privateTurnMarkerPath?: string;
   } = {},
 ): void {
   const strategicScript = generateStrategicScript(taskId, workspace, replyPaths);

@@ -957,9 +957,34 @@ prompts, schemas, tools, or orchestration.` : '';
     // ── Pass 1: Thinker — analyze freely, write prose ──
     // Let the agent do what it's good at: read code, reason about architecture,
     // write a strategic analysis. No API constraints, no JSON formatting.
-    const versionPhase = payload.version_phase && typeof payload.version_phase === 'object'
+    const versionPhaseRaw = payload.version_phase && typeof payload.version_phase === 'object'
       ? payload.version_phase as Record<string, unknown>
       : undefined;
+    const currentPolicy = payload.current_effective_policy
+      && typeof payload.current_effective_policy === 'object'
+      && !Array.isArray(payload.current_effective_policy)
+      ? payload.current_effective_policy as Record<string, unknown>
+      : undefined;
+    const attemptPolicy = payload.active_or_last_attempt_policy
+      && typeof payload.active_or_last_attempt_policy === 'object'
+      && !Array.isArray(payload.active_or_last_attempt_policy)
+      ? payload.active_or_last_attempt_policy as Record<string, unknown>
+      : undefined;
+    // The top-level policy fields are trim-proof authority anchors. Merge them
+    // into the lifecycle block consumed by the prompt so a summarized or
+    // build-error version_phase cannot strand authoritative data unused. A
+    // normal single-branch project has no version_phase, so synthesize a
+    // policy-only container in that case; the renderer does not invent version
+    // or phase facts.
+    const versionPhase = versionPhaseRaw
+      ? {
+          ...versionPhaseRaw,
+          ...(currentPolicy ? { current_effective_policy: currentPolicy } : {}),
+          ...(attemptPolicy ? { active_or_last_attempt_policy: attemptPolicy } : {}),
+        }
+      : currentPolicy
+        ? { current_effective_policy: currentPolicy }
+        : undefined;
     const thinkerParams = {
       contextPrefix,
       projectName,

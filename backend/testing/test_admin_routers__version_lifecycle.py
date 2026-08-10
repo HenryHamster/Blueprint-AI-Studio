@@ -2534,6 +2534,66 @@ class TestVersionLifecyclePolicyProvenance:
     """GET /version-lifecycle exposes promotion policy source and fallback detail."""
 
     @pytest.mark.asyncio
+    async def test_current_policy_bypasses_cached_lifecycle_body(
+        self, client: AsyncClient, db_session
+    ):
+        """A live policy edit is visible even while the heavy body is cached."""
+        from app.release_qualifier import _runtime_config
+
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+        readiness = AsyncMock(return_value={"ready": False, "reason": "test"})
+
+        with (
+            patch.dict(
+                _runtime_config,
+                {
+                    "promotion_threshold": 0.90,
+                    "promotion_weights": {"audit": 0.6, "test_erosion": 0.4},
+                    "completion_debt_weight_mode": "observe",
+                },
+                clear=False,
+            ),
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=readiness,
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            first = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+            _runtime_config["promotion_threshold"] = 0.81
+            second = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["current_effective_policy"]["threshold"] == pytest.approx(
+            0.90
+        )
+        assert second.json()["current_effective_policy"]["threshold"] == pytest.approx(
+            0.81
+        )
+        assert second.json()["promotion_policy_source"] == "runtime_config"
+        # The expensive lifecycle body was reused; only the policy overlay reran.
+        assert readiness.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_policy_provenance_is_included_on_successful_load(
         self, client: AsyncClient, db_session
     ):
@@ -2590,6 +2650,8 @@ class TestVersionLifecyclePolicyProvenance:
         body = resp.json()
         assert body["promotion_policy_source"] == "yaml_file"
         assert body["promotion_policy_error"] is None
+        assert body["current_effective_policy"]["threshold"] == pytest.approx(0.8)
+        assert body["current_effective_policy"]["source"] == "yaml_file"
 
     @pytest.mark.asyncio
     async def test_policy_provenance_exposes_hardcoded_default_reason(
@@ -2650,6 +2712,10 @@ class TestVersionLifecyclePolicyProvenance:
         assert (
             body["promotion_policy_error"]
             == "ScannerError: promotion_policy.yaml did not parse"
+        )
+        assert body["current_effective_policy"]["source"] == "hardcoded_defaults"
+        assert body["current_effective_policy"]["fallback_error"] == (
+            "ScannerError: promotion_policy.yaml did not parse"
         )
 
     @pytest.mark.asyncio

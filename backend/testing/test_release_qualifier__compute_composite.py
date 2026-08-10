@@ -4,6 +4,8 @@
 """Domain slice: compute_composite — pure scoring function
 
 Split from test_release_qualifier.py."""
+import json
+
 from _release_qualifier_testhelpers import *  # noqa: F403
 
 
@@ -1345,6 +1347,121 @@ class TestLoadPolicy:
 
 
 class TestLoadPolicyProvenance:
+    def test_current_projection_prefers_live_081_over_static_090(self, mocker):
+        """Strategic sees the same live runtime threshold the gate enforces."""
+
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.81,
+                "promotion_weights": {
+                    "audit": 4 / 7,
+                    "test_erosion": 3 / 7,
+                },
+                "completion_debt_weight_mode": "observe",
+            },
+            clear=False,
+        )
+
+        projection = rq.current_effective_policy_projection()
+
+        assert rq.PROMOTION_CONFIDENCE_THRESHOLD == pytest.approx(0.90)
+        assert projection["threshold"] == pytest.approx(0.81)
+        assert projection["source"] == "runtime_config"
+        assert projection["fallback_error"] is None
+        assert len(projection["policy_hash"]) == 64
+        assert projection == rq.current_effective_policy_projection()
+
+    def test_current_projection_applies_project_override(self, mocker):
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.81,
+                "promotion_weights": {
+                    "audit": 4 / 7,
+                    "test_erosion": 3 / 7,
+                },
+                "completion_debt_weight_mode": "observe",
+            },
+            clear=False,
+        )
+        project = TestPolicyFromBuildConfig._proj(
+            {
+                "promotion_threshold": 0.77,
+                "promotion_weights": {"audit": 0.6, "test_erosion": 0.4},
+            }
+        )
+
+        projection = rq.current_effective_policy_projection(project)
+
+        assert projection["threshold"] == pytest.approx(0.77)
+        assert projection["weights"] == pytest.approx(
+            {"audit": 0.6, "test_erosion": 0.4}
+        )
+        assert projection["source"] == "build_config"
+
+    @pytest.mark.parametrize("yaml_number", [".nan", ".inf", "-.inf"])
+    def test_non_finite_yaml_threshold_falls_back_safely(
+        self, mocker, tmp_path, yaml_number
+    ):
+        _point_policy_at(
+            mocker,
+            tmp_path,
+            "weights:\n  audit: 0.5\n  test_erosion: 0.5\n"
+            f"threshold: {yaml_number}\n",
+        )
+        mocker.patch.dict(
+            rq._runtime_config, {"completion_debt_weight_mode": "observe"}, clear=False
+        )
+
+        projection = rq.current_effective_policy_projection()
+
+        assert projection["threshold"] == pytest.approx(0.90)
+        assert projection["source"] == "hardcoded_defaults"
+        assert "must be finite" in projection["fallback_error"]
+        # This is the contract required by Starlette JSONResponse and JSONB.
+        json.dumps(projection, allow_nan=False)
+
+    def test_non_finite_project_override_falls_back_to_live_fleet(self, mocker):
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.81,
+                "promotion_weights": {"audit": 0.6, "test_erosion": 0.4},
+                "completion_debt_weight_mode": "observe",
+            },
+            clear=False,
+        )
+        project = TestPolicyFromBuildConfig._proj(
+            {
+                "promotion_threshold": float("nan"),
+                "promotion_weights": {"audit": 0.6, "test_erosion": 0.4},
+            }
+        )
+
+        projection = rq.current_effective_policy_projection(project)
+
+        assert projection["threshold"] == pytest.approx(0.81)
+        assert projection["source"] == "runtime_config"
+        json.dumps(projection, allow_nan=False)
+
+    def test_projection_drops_non_finite_and_overflowing_legacy_values(self):
+        projection = rq.promotion_policy_projection(
+            {
+                "threshold": 10**400,
+                "weights": {
+                    "audit": float("nan"),
+                    "test_erosion": float("inf"),
+                    "completion_debt": 10**400,
+                },
+            },
+            source="legacy_snapshot",
+        )
+
+        assert projection["threshold"] is None
+        assert projection["weights"] == {}
+        json.dumps(projection, allow_nan=False)
+
     def test_runtime_config_provenance_is_reported(self, mocker):
         """A valid runtime_config rubric is reported as runtime_config."""
         mocker.patch.dict(
@@ -4473,6 +4590,9 @@ async def test_independent_blocker_hold_records_quality_outcome_not_infra_failur
     lq = version.last_qualification
     assert lq["status"] == "not_promoted"
     assert lq["blocker"] == "audit_challenge_independent_blocker"
+    attempt_policy = rq.qualification_attempt_policy_projection(lq)
+    assert attempt_policy is not None
+    assert attempt_policy["threshold"] == lq["promotion_policy_snapshot"]["threshold"]
     # Infra streak must not be set — this is not an infrastructure failure.
     assert (
         "consecutive_infra_errors" not in lq

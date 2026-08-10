@@ -7328,7 +7328,21 @@ async def test_version_phase_includes_promotion_readiness(
     """When is_self_repo=True and QualificationVerdict rows exist, the strategic
     payload's version_phase block carries promotion_readiness with ready,
     would_promote_rate, and recurring_blockers keys."""
+    from app import release_qualifier as rq
     from app.models import ReleaseVersion, QualificationVerdict
+
+    mocker.patch.dict(
+        rq._runtime_config,
+        {
+            "promotion_threshold": 0.81,
+            "promotion_weights": {
+                "audit": 4 / 7,
+                "test_erosion": 3 / 7,
+            },
+            "completion_debt_weight_mode": "observe",
+        },
+        clear=False,
+    )
 
     await _ensure_releaseversion_table(db_session)
     await _ensure_verdict_table(db_session)
@@ -7349,6 +7363,19 @@ async def test_version_phase_includes_promotion_readiness(
         phase="stabilize",
         status="open",
         opened_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "promotion_policy_snapshot": {
+                "threshold": 0.90,
+                "weights": {
+                    "audit": 0.5,
+                    "test_erosion": 0.25,
+                    "smoketest": 0.25,
+                },
+            },
+            "promotion_policy_source": "yaml_file",
+            "promotion_policy_fallback_error": None,
+        },
     )
     db_session.add(version)
     await db_session.commit()
@@ -7393,6 +7420,16 @@ async def test_version_phase_includes_promotion_readiness(
     assert "recurring_blockers" in pr, (
         "promotion_readiness must have 'recurring_blockers' key"
     )
+
+    current_policy = payload["current_effective_policy"]
+    attempt_policy = payload["active_or_last_attempt_policy"]
+    assert current_policy["threshold"] == pytest.approx(0.81)
+    assert current_policy["source"] == "runtime_config"
+    assert attempt_policy["threshold"] == pytest.approx(0.90)
+    assert attempt_policy["source"] == "yaml_file"
+    assert current_policy["policy_hash"] != attempt_policy["policy_hash"]
+    assert vp["current_effective_policy"] == current_policy
+    assert vp["active_or_last_attempt_policy"] == attempt_policy
 
 
 @pytest.mark.asyncio
@@ -20161,6 +20198,59 @@ async def test_resident_minimal_spawn_payload_ships_knowledge_index(db_session):
     # Raw JSONB note shape ({note, set_at}) must NOT appear.
     for n in notes:
         assert "note" not in n, f"Raw JSONB note shape leaked into spawn payload: {n}"
+
+
+@pytest.mark.asyncio
+async def test_resident_minimal_spawn_ships_bounded_current_policy_only(
+    db_session, mocker
+):
+    """Resident gets live policy truth without cadence/version attempt expansion."""
+    from app import release_qualifier as rq
+
+    mocker.patch.dict(
+        rq._runtime_config,
+        {
+            "promotion_threshold": 0.81,
+            "promotion_weights": {
+                "audit": 4 / 7,
+                "test_erosion": 3 / 7,
+            },
+            "completion_debt_weight_mode": "observe",
+        },
+        clear=False,
+    )
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        integration_branch="main",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session, resident_minimal=True)
+
+    assert spawned is True
+    task = (
+        (await db_session.execute(_select_agent_tasks(project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    policy = payload["current_effective_policy"]
+    assert policy["threshold"] == pytest.approx(0.81)
+    assert policy["source"] == "runtime_config"
+    assert policy["fallback_error"] is None
+    assert len(policy["policy_hash"]) == 64
+    assert set(policy) == {
+        "threshold",
+        "weights",
+        "source",
+        "fallback_error",
+        "policy_hash",
+    }
+    assert "active_or_last_attempt_policy" not in payload
+    assert "version_phase" not in payload
 
 
 @pytest.mark.asyncio

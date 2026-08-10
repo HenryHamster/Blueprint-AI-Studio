@@ -184,11 +184,8 @@ export function verifyStrategicContextEnvelope(
   };
 }
 
-/**
- * The foreground role is conversational, not a second coding agent. It may
- * request a durable Workday consultation while continuing the public turn.
- */
-export function buildFastResidentContextFrame(
+/** Render only the verified canonical context, without assigning an agent role. */
+export function buildCanonicalResidentContextFrame(
   verified: VerifiedStrategicContextEnvelope,
   afterTranscriptSequence = 0,
 ): string {
@@ -205,12 +202,39 @@ export function buildFastResidentContextFrame(
   return [
     '## Canonical project context',
     canonicalContext,
+  ].join('\n');
+}
+
+/**
+ * The foreground role is conversational, not a second coding agent. It may
+ * request a durable Workday consultation while continuing the public turn.
+ */
+export function buildFastResidentContextFrame(
+  verified: VerifiedStrategicContextEnvelope,
+  afterTranscriptSequence = 0,
+): string {
+  return [
+    buildCanonicalResidentContextFrame(verified, afterTranscriptSequence),
     '',
     '## Foreground role',
     'Reply naturally and directly to every operator message using the context above.',
     'Do not use repository, shell, browser, or infrastructure tools.',
     'When fresh or bulky evidence is needed, request a Workday consultation and say what is missing.',
     'Workday investigation does not replace this reply and must never create a competing public answer.',
+  ].join('\n');
+}
+
+/** Build the private investigator frame used by a durable Workday consultation. */
+export function buildPrivateWorkdayContextFrame(
+  verified: VerifiedStrategicContextEnvelope,
+  afterTranscriptSequence = 0,
+): string {
+  return [
+    buildCanonicalResidentContextFrame(verified, afterTranscriptSequence),
+    '',
+    '## Private Workday role',
+    'Use repository, shell, browser, infrastructure, and Blueprint tools as needed to investigate the private question.',
+    'Return an evidence-grounded internal summary; do not attempt a public reply.',
   ].join('\n');
 }
 
