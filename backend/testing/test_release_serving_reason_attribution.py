@@ -91,8 +91,8 @@ async def test_no_new_revision_reports_backend_artifact_not_workflow(mocker):
 
 
 @pytest.mark.asyncio
-async def test_pending_activation_alert_names_local_action(mocker):
-    """The matching alert does not route the operator to deploy.yml."""
+async def test_legacy_pending_activation_alert_uses_generic_recovery(mocker):
+    """A legacy row uses the current generic recovery guidance."""
     mocker.patch(
         "app.release_promotion._notify_operator",
         new=AsyncMock(return_value=None),
@@ -102,6 +102,6 @@ async def test_pending_activation_alert_names_local_action(mocker):
     assert await _alert_promotion_deploy_failed(session, _AlertVersion()) is True
 
     alert = next(value for value in session.added if isinstance(value, Alert))
-    assert "local control plane" in alert.message
-    assert "Approve activation" in alert.message
-    assert "deploy workflow" not in alert.message
+    assert "pending_operator_activation" in alert.message
+    assert "Investigate the deploy / roll forward a fix." in alert.message
+    assert "Approve activation" not in alert.message

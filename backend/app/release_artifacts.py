@@ -234,10 +234,6 @@ def is_activation_rearmable_serving_status(status: str | None) -> bool:
 # served the promoted SHA.
 _TIMED_OUT_BACKSTOP_REASONS = frozenset({"no_new_revision"})
 
-# Retained for the lifecycle alert taxonomy.  The serving-timeout classifier
-# below deliberately reports the timed-out artifact instead of this broader
-# operator-action label; existing alert rows may still carry it.
-PENDING_OPERATOR_ACTIVATION_REASON = "pending_operator_activation"
 
 def aggregate_required_artifact_status(
     artifacts: list[

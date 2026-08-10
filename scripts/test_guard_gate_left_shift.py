@@ -13,6 +13,18 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_check_runs_static_guard_only_for_test_gate() -> None:
+    """The two-tree corpus is not paid for by lint/build-only checks."""
+    source = (REPO_ROOT / "check").read_text()
+    guard_call = 'run "static release guards (task diff)" python3 scripts/static_release_guard.py'
+    guard_start = source.index(guard_call)
+    test_gate_start = source.rfind('if [ "$WITH_TESTS" = "1" ]; then', 0, guard_start)
+    assert test_gate_start >= 0
+    assert source.find(guard_call, test_gate_start) == guard_start
+    assert "--size-only --base \"$BASE\" --repo-root \"$PWD\"" in source
+    assert source.find("fi", guard_start) < source.find("# Idempotent npm install", guard_start)
+
+
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
         ["git", *args],

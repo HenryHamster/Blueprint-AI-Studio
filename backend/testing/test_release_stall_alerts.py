@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -27,6 +28,16 @@ from app.release_stall_alerts import (
 )
 from app.time_utils import _utcnow
 from sqlalchemy import select
+
+
+def test_retired_pending_activation_reason_is_absent_from_alert_module():
+    """The alert module cannot retain the removed activation-only branch."""
+    source = Path(__file__).parents[1].joinpath(
+        "app", "release_stall_alerts.py"
+    ).read_text()
+
+    assert "PENDING_OPERATOR_ACTIVATION_REASON" not in source
+    assert "Approve activation" not in source
 
 
 async def _make_project_and_version(db_session):

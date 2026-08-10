@@ -134,6 +134,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="automain")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--size-only",
+        action="store_true",
+        help="run the always-on module-size check without the standalone corpus",
+    )
     args = parser.parse_args(argv)
     repo = args.repo_root.resolve()
 
@@ -172,6 +177,16 @@ def main(argv: list[str] | None = None) -> int:
             failures.append("module size guard")
         else:
             print("[static guard] module size guard OK")
+
+        if args.size_only:
+            if failures:
+                print(
+                    f"[static guard] FAIL — {', '.join(failures)}",
+                    file=sys.stderr,
+                )
+                return 1
+            print("[static guard] PASS (size-only)")
+            return 0
 
         # Use the task's harness implementation for both trees so the corpus
         # and its static roster are identical. The source under test remains

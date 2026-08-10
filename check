@@ -132,12 +132,18 @@ run() {
 
 source scripts/backend-test-route.sh
 
-# Run the database-free release guard corpus on the task's own diff before the
-# directory-specific checks. The helper compares static-test failures with the
-# base tree and uses the existing no-Postgres backend harness; it never invokes
-# --fix or changes the cap ledger.
+# The database-free release guard corpus is part of the test gate. The helper
+# compares static-test failures with the base tree and uses the existing
+# no-Postgres backend harness; it never invokes --fix or changes the cap ledger.
+# Keep lint/build-only checks fast: the always-on size guard runs in size-only
+# mode, while ./check test is the invocation that needs the base-tree comparison
+# and runs the standalone corpus once.
 if [ -f scripts/static_release_guard.py ]; then
-  run "static release guards (task diff)" python3 scripts/static_release_guard.py --base "$BASE" --repo-root "$PWD"
+  if [ "$WITH_TESTS" = "1" ]; then
+    run "static release guards (task diff)" python3 scripts/static_release_guard.py --base "$BASE" --repo-root "$PWD"
+  else
+    run "static release size guard" python3 scripts/static_release_guard.py --size-only --base "$BASE" --repo-root "$PWD"
+  fi
 else
   echo "[check] static release guard helper is missing — refusing to skip the gate"
   FAILED+=("static release guard helper missing")
