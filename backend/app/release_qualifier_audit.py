@@ -513,6 +513,39 @@ async def _spawn_release_audit_task(
         payload["version_goal"] = version_goal
     payload["categories"] = list(categories or [])
     payload["rubric_fingerprint"] = rubric_fingerprint
+    # Feed the normal audit/grader contract with the immutable latest-promoted
+    # receipt.  The qualifier still validates and persists the resulting
+    # category verdict through its ordinary ledger path; this is context, not a
+    # synthetic CriterionEvidence write.
+    latest_promoted = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "promoted",
+                )
+                .order_by(ReleaseVersion.version_number.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    promoted_qualification = (
+        latest_promoted.last_qualification if latest_promoted is not None else None
+    )
+    payload["release_evidence"] = {
+        "operator_authored_commits": (
+            promoted_qualification.get("operator_authored_commits")
+            if isinstance(promoted_qualification, dict)
+            else None
+        ),
+        "range": {
+            "base_sha": latest_promoted.base_sha if latest_promoted is not None else None,
+            "head_sha": latest_promoted.served_sha if latest_promoted is not None else None,
+        },
+    }
     if audit_base_sha:
         # A hint, not an assertion: the agent verifies ancestry/range
         # resolvability and falls back to base_branch...candidate_sha if stale.

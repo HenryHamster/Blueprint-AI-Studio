@@ -36,6 +36,7 @@ from app.release_reconciliation import (
     _reconcile_if_promotion_failed_landed,
     _reconcile_if_promotion_pending_timed_out,
 )
+from app.release_commit_authorship import AUTHORSHIP_RECEIPT_SCHEMA_VERSION
 from app.time_utils import _utcnow
 
 
@@ -1392,7 +1393,7 @@ async def test_confirm_serving_confirmed_scenario(db_session, mocker):
     assert stored_report["count"] == report["count"]
     assert stored_report["range"] == report["range"]
     assert stored_report["source"] == "github_compare"
-    assert stored_report["schema_version"] == 1
+    assert stored_report["schema_version"] == AUTHORSHIP_RECEIPT_SCHEMA_VERSION
     measure.assert_awaited_once_with(
         version.base_sha, _SHA_A, project=_project, github_context=None
     )
@@ -2530,7 +2531,7 @@ async def test_recover_deploy_failed_when_sha_serves_within_window(db_session, m
     assert stored_report["count"] == report["count"]
     assert stored_report["range"] == report["range"]
     assert stored_report["source"] == "github_compare"
-    assert stored_report["schema_version"] == 1
+    assert stored_report["schema_version"] == AUTHORSHIP_RECEIPT_SCHEMA_VERSION
     measure.assert_awaited_once_with(
         version.base_sha, _SHA_A, project=project, github_context=None
     )

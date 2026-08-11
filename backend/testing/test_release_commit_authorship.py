@@ -16,11 +16,13 @@ from app.release_commit_authorship import (
     AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
     AUTHORSHIP_RECEIPT_SOURCE,
     count_non_bot_authored_commits,
+    authorship_category_evidence,
     measure_serving_authorship_evidence,
     persist_serving_authorship_evidence,
     reconcile_serving_authorship_evidence,
     validate_authorship_receipt,
 )
+from app.release_scoring import evaluate_merge_grade
 
 
 class _GitHubResponse:
@@ -66,6 +68,11 @@ def _github_commit(
         commit["commit"]["committer"] = {
             "name": "GitHub",
             "email": "noreply@github.com",
+        }
+        commit["committer"] = {
+            "login": "web-flow",
+            "id": 19864447,
+            "type": "User",
         }
     return commit
 
@@ -384,6 +391,61 @@ async def test_fully_verified_blueprint_bot_commit_is_not_an_offender(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_direct_blueprint_bot_committer_requires_immutable_top_level_identity(monkeypatch):
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    direct = _github_commit(
+        head,
+        "blueprintagentorchestrator[bot]",
+        login="blueprintagentorchestrator[bot]",
+        identity_type="Bot",
+        verified=True,
+    )
+    direct["commit"]["committer"] = {
+        "name": "blueprintagentorchestrator[bot]",
+        "email": "272093198+blueprintagentorchestrator[bot]@users.noreply.github.com",
+    }
+    direct["committer"] = {
+        "login": "blueprintagentorchestrator[bot]",
+        "id": 272093198,
+        "type": "Bot",
+    }
+    project = Project(id="release-authorship-direct-bot", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [direct]))))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committer", [None, {"login": "web-flow", "id": 1, "type": "User"}])
+async def test_merge_committer_null_or_wrong_id_is_not_trusted(monkeypatch, committer):
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    commit = _github_commit(
+        head,
+        "blueprintagentorchestrator[bot]",
+        login="blueprintagentorchestrator[bot]",
+        identity_type="Bot",
+        verified=True,
+    )
+    commit["committer"] = committer
+    project = Project(id="release-authorship-wrong-committer", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [commit]))))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_bot_looking_author_with_human_committer_is_an_offender(monkeypatch):
     """A human-signed commit cannot spoof the Blueprint App identity."""
     from app import github
@@ -448,6 +510,66 @@ def test_receipt_rejects_tampered_zero_and_offender_shapes():
     ) is None
 
 
+def test_authorship_receipt_drives_normal_category_grader_without_seeded_verdict():
+    base, head = "a" * 40, "b" * 40
+    category = [{
+        "category_key": "generated-authorship-key",
+        "text": "All release commits must satisfy the Blueprint bot authorship contract.",
+    }]
+    resolved = {
+        "source": AUTHORSHIP_RECEIPT_SOURCE,
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        "state": "resolved",
+        "count": 0,
+        "offenders": [],
+        "range": {"base_sha": base, "head_sha": head},
+        "measured_at": "2026-01-01T00:00:00+00:00",
+        "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+    }
+    evidence = authorship_category_evidence(resolved, base, head, category)
+    grade = evaluate_merge_grade(
+        "release goal",
+        {"covers_goal": True, "category_verdicts": []},
+        category,
+        authoritative_category_evidence=evidence,
+    )
+
+    assert grade["category_verdicts"] == [{
+        "category_key": "generated-authorship-key",
+        "status": "met",
+        "tier": "machine",
+        "gap": None,
+        "citations": [{"kind": "diff", "ref": "release-authorship:count=0"}],
+    }]
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        None,
+        {"schema_version": 1, "state": "resolved"},
+        {
+            "source": AUTHORSHIP_RECEIPT_SOURCE,
+            "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+            "state": "unresolved",
+            "count": None,
+            "offenders": [],
+            "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+            "reason": "github_authorship_timeout",
+            "measured_at": "2026-01-01T00:00:00+00:00",
+            "retry": {"attempt": 1, "retryable": True, "next_retry_at": "2026-01-02T00:00:00+00:00"},
+        },
+    ],
+)
+def test_missing_legacy_or_unresolved_authorship_evidence_fails_category_closed(receipt):
+    category = [{"category_key": "generated-authorship-key", "text": "Commit authorship is Blueprint-controlled."}]
+    evidence = authorship_category_evidence(receipt, "a" * 40, "b" * 40, category)
+
+    assert evidence[0]["status"] == "not_met"
+    assert evidence[0]["authoritative"] is True
+    assert evidence[0]["citations"]
+
+
 @pytest.mark.asyncio
 async def test_read_path_serves_persisted_report_without_recomputation(
     client: AsyncClient, db_session, monkeypatch
@@ -468,10 +590,6 @@ async def test_read_path_serves_persisted_report_without_recomputation(
         serving_status="serving_confirmed",
         last_qualification={
             "status": "promoted",
-            # The current v32 rubric delegates c-429 grading to the audit
-            # projection; this endpoint must carry that verdict alongside the
-            # persisted receipt without synthesising CriterionEvidence.
-            "category_verdicts": [{"category_key": "c-4299443b", "status": "met"}],
             "operator_authored_commits": {
                 "source": AUTHORSHIP_RECEIPT_SOURCE,
                 "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
@@ -491,9 +609,6 @@ async def test_read_path_serves_persisted_report_without_recomputation(
         base_sha="b" * 40,
         opened_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
         last_qualification={
-            # The live qualification projection is the explicit c-429 consumer;
-            # the promoted row supplies the immutable authorship evidence.
-            "category_verdicts": [{"category_key": "c-4299443b", "status": "met"}],
         },
     )
     db_session.add_all([task, promoted, open_version])
@@ -515,9 +630,6 @@ async def test_read_path_serves_persisted_report_without_recomputation(
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
     }
-    assert response.json()["category_verdicts"] == [
-        {"category_key": "c-4299443b", "status": "met"}
-    ]
     count.assert_not_awaited()
 
     # A read must fail closed if the stored JSON is tampered with, even though
@@ -590,6 +702,12 @@ async def test_retryable_legacy_receipt_reconciles_and_resolves(db_session, mock
     assert version.last_qualification["operator_authored_commits"]["state"] == "unresolved"
     assert version.last_qualification["operator_authored_commits"]["retry"]["attempt"] == 1
 
+    version.last_qualification["operator_authored_commits"]["retry"]["next_retry_at"] = (
+        "2025-01-01T00:00:00+00:00"
+    )
+    flag_modified(version, "last_qualification")
+    await db_session.commit()
+
     second_plan = await persist_serving_authorship_evidence(db_session, version)
     await db_session.commit()
     await measure_serving_authorship_evidence(
@@ -642,6 +760,52 @@ async def test_resolved_current_receipt_is_immutable_and_short_circuits(db_sessi
     await db_session.refresh(version)
     assert version.last_qualification["operator_authored_commits"] == receipt
     measure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_staging_respects_terminal_immutability_and_future_backoff(db_session):
+    base, head = "a" * 40, "b" * 40
+    terminal = {
+        "source": AUTHORSHIP_RECEIPT_SOURCE,
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        "state": "terminal",
+        "count": None,
+        "offenders": [],
+        "range": {"base_sha": base, "head_sha": head},
+        "reason": "provenance_untrusted",
+        "measured_at": "2026-01-01T00:00:00+00:00",
+        "retry": {"attempt": 2, "retryable": False, "next_retry_at": None},
+    }
+    future = {
+        **terminal,
+        "state": "unresolved",
+        "reason": "github_authorship_timeout",
+        "retry": {
+            "attempt": 2,
+            "retryable": True,
+            "next_retry_at": "2099-01-01T00:00:00+00:00",
+        },
+    }
+    for number, receipt in enumerate((terminal, future), start=1):
+        project = Project(name=f"Authorship staging {number}", user_id=f"staging-{number}")
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=number,
+            status="promoted",
+            base_sha=base,
+            served_sha=head,
+            serving_status="serving_confirmed",
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification={"operator_authored_commits": receipt},
+        )
+        db_session.add_all([project, version])
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        assert await persist_serving_authorship_evidence(db_session, version) is None
+        if receipt["state"] == "unresolved":
+            assert await persist_serving_authorship_evidence(db_session, version, force=True)
+        await db_session.rollback()
 
 
 @pytest.mark.asyncio
@@ -699,7 +863,7 @@ async def test_staging_never_commits_caller_transaction(db_session, mocker):
         served_sha="b" * 40,
         serving_status="serving_confirmed",
         opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        last_qualification={"category_verdicts": [{"category_key": "c-4299443b", "status": "met"}]},
+        last_qualification={},
     )
     db_session.add_all([project, version])
     await db_session.commit()
@@ -710,9 +874,7 @@ async def test_staging_never_commits_caller_transaction(db_session, mocker):
 
     assert plan is not None
     commit.assert_not_awaited()
-    assert version.last_qualification["category_verdicts"] == [
-        {"category_key": "c-4299443b", "status": "met"}
-    ]
+    assert "category_verdicts" not in version.last_qualification
     await db_session.rollback()
 
 

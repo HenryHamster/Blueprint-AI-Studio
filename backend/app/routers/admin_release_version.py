@@ -1771,10 +1771,11 @@ async def clear_deploy_failed(
     if version is None:
         raise HTTPException(status_code=404, detail="Release version not found.")
 
+    authorship_plan = None
     if clear_mode == "verified":
         # Independently confirmed serving — clear with the OBSERVED served SHA.
         # Use pre-captured locals: backend_artifact was expired by expire_all().
-        await _recover_serving_confirmed(
+        authorship_plan = await _recover_serving_confirmed(
             session,
             version,
             verified_served_identifier,
@@ -1784,7 +1785,7 @@ async def clear_deploy_failed(
     else:
         # Operator attestation: clear using the promoted SHA as the served SHA and
         # record the provenance in the durable audit trail.
-        await _recover_serving_confirmed(
+        authorship_plan = await _recover_serving_confirmed(
             session, version, version.promoted_sha, now, now
         )
         _record_deploy_failed_clear_attestation(
@@ -1792,9 +1793,13 @@ async def clear_deploy_failed(
         )
 
     await session.commit()
-    from app.release_commit_authorship import measure_serving_authorship_evidence
+    if authorship_plan is not None:
+        from app.release_commit_authorship import measure_serving_authorship_evidence
 
-    await measure_serving_authorship_evidence(version.id)
+        await measure_serving_authorship_evidence(
+            version.id,
+            expected_receipt_identity=authorship_plan["receipt_identity"],
+        )
     await session.refresh(version)
     return {
         "version_number": version.version_number,
@@ -2045,7 +2050,15 @@ async def record_activation_receipt(
         operator_id=operator_id,
         now=now,
     )
+    authorship_plan = receipt.pop("_authorship_plan", None)
     await session.commit()
+    if authorship_plan is not None:
+        from app.release_commit_authorship import measure_serving_authorship_evidence
+
+        await measure_serving_authorship_evidence(
+            version.id,
+            expected_receipt_identity=authorship_plan["receipt_identity"],
+        )
     await session.refresh(version)
     return {
         "version_number": version.version_number,

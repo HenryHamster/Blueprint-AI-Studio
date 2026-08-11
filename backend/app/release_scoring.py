@@ -298,6 +298,7 @@ def _normalize_category_verdicts(
     artifact: dict[str, Any] | None,
     active_categories: list[dict[str, Any]],
     verified_merge_evidence: dict[str, Any] | None = None,
+    authoritative_category_evidence: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Grade the artifact's per-category verdicts against the ACTIVE rubric.
 
@@ -335,13 +336,19 @@ def _normalize_category_verdicts(
                 key = str(item.get("category_key") or item.get("key") or "").strip()
                 if key:
                     emitted[key] = item
+    authoritative = {
+        str(item.get("category_key") or item.get("criterion_key")): item
+        for item in (authoritative_category_evidence or [])
+        if isinstance(item, dict)
+        and item.get("category_key") is not None
+    }
 
     verdicts: list[dict[str, Any]] = []
     for cat in active_categories:
         key = str(cat.get("category_key") or cat.get("criterion_key") or "").strip()
         if not key:
             continue
-        raw = emitted.get(key)
+        raw = authoritative.get(key) or emitted.get(key)
         if not isinstance(raw, dict):
             verdicts.append(
                 {
@@ -374,8 +381,8 @@ def _normalize_category_verdicts(
         # Tier: a MET category whose test citation is machine-validated against the
         # candidate's verified merges earns the machine tier; everything else stays
         # judged (fail toward the lower tier).
-        tier = "judged"
-        if status == "met" and _cited_test_is_machine_verified(
+        tier = "machine" if raw.get("authoritative") is True else "judged"
+        if tier != "machine" and status == "met" and _cited_test_is_machine_verified(
             citations, verified_merge_evidence
         ):
             tier = "machine"
@@ -408,6 +415,7 @@ def evaluate_merge_grade(
     artifact: dict[str, Any] | None,
     active_categories: list[dict[str, Any]] | None = None,
     verified_merge_evidence: dict[str, Any] | None = None,
+    authoritative_category_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Normalise a blind merge-grade artifact into a goal-coverage verdict.
 
@@ -484,7 +492,10 @@ def evaluate_merge_grade(
         # stays ``not_applicable`` so the holistic ``merge_grade_misses`` gate
         # stays inert.
         if active_categories:
-            if not isinstance(artifact, dict) or "category_verdicts" not in artifact:
+            if (
+                not isinstance(artifact, dict)
+                or ("category_verdicts" not in artifact and not authoritative_category_evidence)
+            ):
                 # The grader cannot produce per-category output (a non-dict
                 # artifact, or a dict with no ``category_verdicts`` key at all —
                 # a stale agent image predating the per-category protocol).  Same
@@ -502,7 +513,10 @@ def evaluate_merge_grade(
                     "residual_uncaptured_gap": None,
                 }
             category_verdicts, residual_uncaptured_gap = _normalize_category_verdicts(
-                artifact, active_categories, verified_merge_evidence
+                artifact,
+                active_categories,
+                verified_merge_evidence,
+                authoritative_category_evidence,
             )
             return {
                 "status": "not_applicable",
@@ -570,7 +584,7 @@ def evaluate_merge_grade(
     category_verdicts: list[dict[str, Any]] | None = None
     residual_uncaptured_gap: str | None = None
     if active_categories:
-        if "category_verdicts" not in artifact:
+        if "category_verdicts" not in artifact and not authoritative_category_evidence:
             # The grader returned a usable HOLISTIC verdict but omitted the
             # per-category section ENTIRELY — not one key, not an empty list.  A
             # grader that ACTUALLY assessed the rubric always emits the key (the
@@ -601,7 +615,10 @@ def evaluate_merge_grade(
                 "residual_uncaptured_gap": None,
             }
         category_verdicts, residual_uncaptured_gap = _normalize_category_verdicts(
-            artifact, active_categories, verified_merge_evidence
+            artifact,
+            active_categories,
+            verified_merge_evidence,
+            authoritative_category_evidence,
         )
     return {
         "status": "pass" if covers_goal else "fail",

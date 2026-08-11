@@ -919,6 +919,12 @@ export async function handleReleaseAudit(
   const categoryContractSection = categories.length > 0
     ? `\nAssess each acceptance category below against the FULL version delta (\`git diff ${goalCategoryDiffRange}\`), NOT the narrowed code-quality range — every supplied criterion grades the whole version the promotion PR would carry. Emit one \`category_verdicts\` entry for every supplied key, with \`status\` (\`met\` | \`partial\` | \`not_met\`), a concrete \`gap\` (null when met), and diff-grounded \`citations\` (file paths or commit/PR references). Also emit \`residual_uncaptured_gap\` for any important goal gap not represented by a category, else null.\n\nAcceptance categories:\n${categories.map((row) => `- ${row.category_key}: ${row.text}`).join('\n')}\n`
     : '';
+  const releaseEvidence = payload.release_evidence && typeof payload.release_evidence === 'object'
+    ? payload.release_evidence as Record<string, unknown>
+    : null;
+  const releaseEvidenceSection = releaseEvidence
+    ? `\n## Authoritative release evidence\n\nThe backend supplied this immutable, latest-promoted release evidence. Use it as a machine-backed input when grading any matching acceptance category; do not replace it with an inference from the candidate diff. Missing, invalid, unresolved, or terminal authorship evidence is not a pass:\n\n\`\`\`json\n${JSON.stringify(releaseEvidence, null, 2)}\n\`\`\`\n`
+    : '';
   // The acceptance-category contract grades the FULL version delta and is
   // emitted whenever an active rubric is supplied — independent of whether a
   // version goal string exists.  The backend always ships ``payload.categories``
@@ -958,7 +964,7 @@ IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge th
    - Architecture drift (patterns inconsistent with the existing codebase conventions)
    - Test coverage gaps for new behavior
    - Documentation / comment accuracy
-${versionGoalSection}${categoryContractSection}
+${versionGoalSection}${categoryContractSection}${releaseEvidenceSection}
 4. **Score and emit results.** Write your findings as a JSON object to \`/tmp/release_audit_report_${taskId}.json\` with EXACTLY this structure:
 
 \`\`\`json

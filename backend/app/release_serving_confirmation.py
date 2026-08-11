@@ -877,7 +877,7 @@ async def _record_activation_receipt(
         provider_rows
     )
     if aggregate_status == "serving_confirmed":
-        await _recover_serving_confirmed(
+        authorship_plan = await _recover_serving_confirmed(
             session,
             version,
             served_sha,
@@ -889,6 +889,7 @@ async def _record_activation_receipt(
             "mode": "approved_activation" if version.activation_requested_at else "cli_activation",
             "serving_status": "serving_confirmed",
             "served_sha": served_sha,
+            "_authorship_plan": authorship_plan,
         }
     if backend_artifact is not None and project_backend_revision_artifact(
         version, backend_artifact

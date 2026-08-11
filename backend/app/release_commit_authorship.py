@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import Project, ReleaseVersion
@@ -41,7 +41,9 @@ _COMMITS_PER_PAGE = 100
 _MAX_COMPARE_COMMITS = 10_000
 _AUTHORSHIP_MEASUREMENT_TIMEOUT_SECONDS = 30
 AUTHORSHIP_RECEIPT_SOURCE = "github_compare"
-AUTHORSHIP_RECEIPT_SCHEMA_VERSION = 1
+AUTHORSHIP_RECEIPT_SCHEMA_VERSION = 2
+_LEGACY_AUTHORSHIP_RECEIPT_SCHEMA_VERSION = 1
+GITHUB_WEB_FLOW_ID = 19864447
 MAX_RECONCILIATION_VERSIONS = 100
 _RECONCILIATION_MAX_CALLS = 25
 _RECONCILIATION_MAX_SECONDS = 20
@@ -61,6 +63,18 @@ _PERMANENT_AUTHORSHIP_REASONS = frozenset(
         "malformed_authorship_measurement",
         "provenance_untrusted",
     }
+)
+
+# Rubric text is the binding metadata for this evidence lane.  Criterion keys
+# remain generated/project-specific; only criteria that explicitly describe
+# commit authorship are eligible for the receipt below.
+_AUTHORSHIP_CRITERION_MARKERS = (
+    "authorship",
+    "operator-authored",
+    "authored commit",
+    "commit author",
+    "operator commit",
+    "bot commit",
 )
 
 
@@ -110,6 +124,7 @@ def _trusted_blueprint_bot_commit(commit: Any) -> bool:
     raw_committer = (
         commit_payload.get("committer") if isinstance(commit_payload, dict) else None
     )
+    github_committer = commit.get("committer")
     verification = (
         commit_payload.get("verification") if isinstance(commit_payload, dict) else None
     )
@@ -125,6 +140,7 @@ def _trusted_blueprint_bot_commit(commit: Any) -> bool:
         and verification.get("verified") is True
         and verification.get("reason") == "valid"
         and isinstance(raw_committer, dict)
+        and isinstance(github_committer, dict)
     ):
         return False
     # GitHub's web merge response uses GitHub/web-flow as the committer.  A
@@ -134,10 +150,16 @@ def _trusted_blueprint_bot_commit(commit: Any) -> bool:
             isinstance(raw_committer.get("name"), str)
             and raw_committer["name"].casefold() in _GITHUB_MERGE_COMMITTERS
             and raw_committer.get("email") == _GITHUB_NOREPLY_EMAIL
+            and github_committer.get("login") == "web-flow"
+            and github_committer.get("id") == GITHUB_WEB_FLOW_ID
+            and github_committer.get("type") == "User"
         )
         or (
             raw_committer.get("name") == BOT_COMMIT_AUTHOR
             and raw_committer.get("email") in _BOT_AUTHOR_EMAILS
+            and github_committer.get("login") == BOT_COMMIT_AUTHOR
+            and github_committer.get("id") == BLUEPRINT_GITHUB_BOT_ID
+            and github_committer.get("type") == "Bot"
         )
     )
 
@@ -232,6 +254,8 @@ def validate_authorship_receipt(
         return None
     if receipt.get("state") in {"resolved", "terminal"} and next_retry_at is not None:
         return None
+    if receipt.get("state") == "unresolved" and next_retry_at is None:
+        return None
     count = receipt.get("count")
     offenders = receipt.get("offenders")
     if not isinstance(offenders, list) or len(offenders) > MAX_REPORTED_OFFENDERS:
@@ -261,6 +285,71 @@ def validate_authorship_receipt(
     ):
         return None
     return receipt
+
+
+def authorship_category_evidence(
+    receipt: Any,
+    base_sha: str | None,
+    head_sha: str | None,
+    categories: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project the immutable receipt into matching rubric categories.
+
+    This is the generic qualifier evidence adapter: it binds by criterion text,
+    never by a one-off criterion id.  A matching category always receives a
+    verdict, including invalid/missing/unresolved/terminal evidence, so the
+    normal category ledger fails closed rather than allowing an unrelated LLM
+    ``met`` claim to mask an unavailable receipt.
+    """
+    matching = [
+        category
+        for category in categories
+        if isinstance(category, dict)
+        and any(
+            marker in str(category.get("text") or "").casefold()
+            for marker in _AUTHORSHIP_CRITERION_MARKERS
+        )
+    ]
+    if not matching:
+        return []
+    validated = validate_authorship_receipt(receipt, base_sha, head_sha)
+    citations: list[dict[str, str]] = []
+    if validated is not None and validated.get("state") == "resolved":
+        count = validated["count"]
+        offenders = validated["offenders"]
+        status = "met" if count == 0 else "not_met"
+        gap = None if status == "met" else (
+            f"{count} non-Blueprint-authored commit(s) in the immutable release range."
+        )
+        citations = [
+            {
+                "kind": "diff",
+                "ref": f"release-authorship:{item['sha']}:{item['author']}",
+            }
+            for item in offenders
+        ]
+        if not citations:
+            citations = [{"kind": "diff", "ref": "release-authorship:count=0"}]
+    else:
+        status = "not_met"
+        if isinstance(receipt, dict) and receipt.get("state") == "terminal":
+            gap = "Authorship receipt is terminal and cannot support a clean qualifier verdict."
+        elif isinstance(receipt, dict) and receipt.get("state") == "unresolved":
+            gap = "Authorship receipt is unresolved and cannot support a clean qualifier verdict."
+        else:
+            gap = "Current-schema immutable authorship receipt is missing or invalid."
+        citations = [{"kind": "diff", "ref": "release-authorship:unavailable"}]
+    return [
+        {
+            "category_key": str(category.get("category_key") or category.get("criterion_key")),
+            "status": status,
+            "tier": "machine",
+            "gap": gap,
+            "citations": citations,
+            "authoritative": True,
+        }
+        for category in matching
+    ]
 
 
 def _next_attempt(receipt: Any) -> int:
@@ -500,12 +589,14 @@ async def count_non_bot_authored_commits(
 
 
 async def persist_serving_authorship_evidence(
-    session: Any, version: Any
+    session: Any, version: Any, *, force: bool = False
 ) -> dict[str, Any] | None:
     """Measure and CAS-write evidence without holding the serving row lock.
 
     The caller owns the serving transition transaction. This phase only stages
-    the immutable range; measurement runs after the caller commits.
+    the immutable range; measurement runs after the caller commits. ``force``
+    is an explicit audited retry override; normal confirmation/recovery/admin
+    callers leave it false.
     """
     base_sha = version.base_sha
     served_sha = version.served_sha
@@ -519,8 +610,21 @@ async def persist_serving_authorship_evidence(
     before_qualification = dict(version.last_qualification or {})
     before_report = before_qualification.get("operator_authored_commits")
     validated_before = validate_authorship_receipt(before_report, base_sha, served_sha)
-    if validated_before is not None and validated_before.get("state") == "resolved":
+    if validated_before is not None and validated_before.get("state") in {
+        "resolved",
+        "terminal",
+    }:
         return None
+    if validated_before is not None and validated_before.get("state") == "unresolved":
+        next_retry_at = (validated_before.get("retry") or {}).get("next_retry_at")
+        if not force and isinstance(next_retry_at, str):
+            try:
+                if datetime.fromisoformat(next_retry_at.replace("Z", "+00:00")) > datetime.now(
+                    timezone.utc
+                ):
+                    return None
+            except ValueError:
+                pass
     attempt = _next_attempt(before_report)
     pending = _persisted_receipt(
         _unresolved(base_sha, served_sha, "authorship_measurement_pending"),
@@ -602,6 +706,7 @@ async def measure_serving_authorship_evidence(
     *,
     session_factory=None,
     expected_receipt_identity: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> bool:
     """Measure a committed pending receipt and atomically CAS its final result."""
     if session_factory is None:
@@ -641,17 +746,26 @@ async def measure_serving_authorship_evidence(
     if project is None:
         measurement = _unresolved(base_sha, served_sha, "project_unavailable")
     else:
-        context = await _resolve_authorship_github_context(project)
-        try:
-            measurement = await asyncio.wait_for(
-                count_non_bot_authored_commits(
-                    base_sha,
-                    served_sha,
-                    project=project,
-                    github_context=context,
-                ),
-                timeout=_AUTHORSHIP_MEASUREMENT_TIMEOUT_SECONDS,
+        effective_timeout = _AUTHORSHIP_MEASUREMENT_TIMEOUT_SECONDS
+        if timeout_seconds is not None:
+            effective_timeout = min(
+                effective_timeout, max(0.001, float(timeout_seconds))
             )
+
+        async def _measure() -> dict[str, Any]:
+            # Keep credential resolution inside the same hard timeout as the
+            # compare request; otherwise a Secret Manager stall escapes the
+            # reconciliation deadline.
+            context = await _resolve_authorship_github_context(project)
+            return await count_non_bot_authored_commits(
+                base_sha,
+                served_sha,
+                project=project,
+                github_context=context,
+            )
+
+        try:
+            measurement = await asyncio.wait_for(_measure(), timeout=effective_timeout)
         except asyncio.TimeoutError:
             measurement = _unresolved(base_sha, served_sha, "github_authorship_timeout")
         except asyncio.CancelledError:
@@ -726,65 +840,63 @@ async def reconcile_serving_authorship_evidence(
     bounded_limit = max(1, min(int(limit), MAX_RECONCILIATION_VERSIONS))
     now = datetime.now(timezone.utc)
     deadline = time.monotonic() + _RECONCILIATION_MAX_SECONDS
-    candidate_offset = 0
-    candidate_page_size = 500
     version_ids: list[Any] = []
     async with session_factory() as scan_session:
-        # Page through the complete deterministic order.  Resolved and leased
-        # rows are filtered before filling the work batch, so a large resolved
-        # prefix cannot starve an old unresolved release.
-        while len(version_ids) < bounded_limit and time.monotonic() < deadline:
-            candidates = list(
-                (
-                    await scan_session.execute(
-                        select(ReleaseVersion)
-                        .where(
-                            ReleaseVersion.status == "promoted",
-                            ReleaseVersion.serving_status == "serving_confirmed",
-                            ReleaseVersion.base_sha.is_not(None),
-                            ReleaseVersion.served_sha.is_not(None),
-                        )
-                        .order_by(
-                            ReleaseVersion.served_at.asc().nulls_first(),
-                            ReleaseVersion.id.asc(),
-                        )
-                        .offset(candidate_offset)
-                        .limit(candidate_page_size)
+        # Filter eligibility in SQL instead of walking an offset over every
+        # resolved row.  Legacy/malformed rows remain candidates for bounded
+        # backfill, while current v2 resolved/terminal rows and future backoff
+        # leases are excluded before the limit is applied.
+        receipt = ReleaseVersion.last_qualification["operator_authored_commits"]
+        schema_version = receipt["schema_version"].as_integer()
+        receipt_state = receipt["state"].as_string()
+        next_retry_at = receipt["retry"]["next_retry_at"].as_string()
+        eligible_state = or_(
+            schema_version.is_(None),
+            schema_version != AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+            receipt_state.is_(None),
+            ~receipt_state.in_(("resolved", "terminal")),
+        )
+        eligible_time = or_(
+            schema_version.is_(None),
+            schema_version != AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+            receipt_state != "unresolved",
+            next_retry_at.is_(None),
+            next_retry_at <= now.isoformat(),
+        )
+        candidates = list(
+            (
+                await scan_session.execute(
+                    select(ReleaseVersion)
+                    .where(
+                        ReleaseVersion.status == "promoted",
+                        ReleaseVersion.serving_status == "serving_confirmed",
+                        ReleaseVersion.base_sha.is_not(None),
+                        ReleaseVersion.served_sha.is_not(None),
+                        eligible_state,
+                        eligible_time,
                     )
+                    .order_by(
+                        ReleaseVersion.served_at.asc().nulls_first(),
+                        ReleaseVersion.id.asc(),
+                    )
+                    .limit(bounded_limit)
                 )
-                .scalars()
-                .all()
             )
-            if not candidates:
-                break
-            candidate_offset += len(candidates)
-            for candidate in candidates:
-                report = (candidate.last_qualification or {}).get(
-                    "operator_authored_commits"
-                )
-                validated = validate_authorship_receipt(
-                    report, candidate.base_sha, candidate.served_sha
-                )
-                if validated is not None and validated.get("state") in {
-                    "resolved",
-                    "terminal",
-                }:
-                    continue
-                retry = report.get("retry") if isinstance(report, dict) else None
-                next_retry_at = (
-                    retry.get("next_retry_at") if isinstance(retry, dict) else None
-                )
-                if isinstance(next_retry_at, str):
-                    try:
-                        if datetime.fromisoformat(
-                            next_retry_at.replace("Z", "+00:00")
-                        ) > now:
-                            continue
-                    except ValueError:
-                        pass
+            .scalars()
+            .all()
+        )
+        for candidate in candidates:
+            report = (candidate.last_qualification or {}).get(
+                "operator_authored_commits"
+            )
+            validated = validate_authorship_receipt(
+                report, candidate.base_sha, candidate.served_sha
+            )
+            if validated is None or validated.get("state") not in {
+                "resolved",
+                "terminal",
+            }:
                 version_ids.append(candidate.id)
-                if len(version_ids) >= bounded_limit:
-                    break
     attempted = 0
     for version_id in version_ids:
         if attempted >= _RECONCILIATION_MAX_CALLS or time.monotonic() >= deadline:
@@ -835,6 +947,7 @@ async def reconcile_serving_authorship_evidence(
                     version.id,
                     session_factory=session_factory,
                     expected_receipt_identity=plan["receipt_identity"],
+                    timeout_seconds=max(0.001, deadline - time.monotonic()),
                 )
             except Exception:  # noqa: BLE001 - one stale release cannot stop repair
                 await worker_session.rollback()

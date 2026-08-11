@@ -1691,6 +1691,9 @@ class TestRecordActivationReceipt:
         version = await self._make_promoted_unconfirmed_version(
             db_session, project.id, promoted_sha="promotedsha999"
         )
+        version.base_sha = "b" * 40
+        db_session.add(version)
+        await db_session.commit()
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/activation-receipt",
@@ -1718,6 +1721,10 @@ class TestRecordActivationReceipt:
         assert receipt["mode"] == "cli_activation"
         assert receipt["host"] == "hamsterwheel"
         assert receipt["revision"] == "a" * 40
+        authorship = qual["operator_authored_commits"]
+        assert authorship["state"] in {"resolved", "unresolved", "terminal"}
+        if authorship["state"] == "unresolved":
+            assert authorship["reason"] != "authorship_measurement_pending"
 
         from sqlmodel import select
 
@@ -4912,5 +4919,3 @@ class TestVersionLifecycleOutOfBandPromotion:
         cv = resp.json()["current_version"]
         # Column absent on this branch → getattr default → null in response.
         assert cv.get("out_of_band_promotion") is None
-
-

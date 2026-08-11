@@ -95,6 +95,7 @@ from app.release_policy_projection import (
     qualification_attempt_policy_record_fields,
 )
 from app.release_models import CriterionEvidence
+from app.release_commit_authorship import authorship_category_evidence
 from app.notification_dispatch import (
     dispatch_external_notification,  # noqa: F401 — re-exported for tests / compat patch point
     post_version_build_stalled_message,  # noqa: F401 — re-exported for tests
@@ -8105,6 +8106,42 @@ async def _finalize_qualification(
         for c in launched_rubric
         if c.get("criterion_key")
     ]
+    # The latest promoted release is the only immutable source for this
+    # cross-version qualifier evidence.  Bind it by rubric text through the
+    # generic adapter; invalid, unresolved, terminal, and missing receipts all
+    # become fail-closed category evidence.
+    authorship_evidence: list[dict[str, Any]] = []
+    if active_categories:
+        latest_promoted = (
+            (
+                await session.execute(
+                    select(release_version.ReleaseVersion)
+                    .where(
+                        release_version.ReleaseVersion.project_id == version.project_id,
+                        release_version.ReleaseVersion.status == "promoted",
+                    )
+                    .order_by(release_version.ReleaseVersion.version_number.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        promoted_qualification = (
+            latest_promoted.last_qualification
+            if latest_promoted is not None
+            else None
+        )
+        authorship_evidence = authorship_category_evidence(
+            (
+                promoted_qualification.get("operator_authored_commits")
+                if isinstance(promoted_qualification, dict)
+                else None
+            ),
+            latest_promoted.base_sha if latest_promoted is not None else None,
+            latest_promoted.served_sha if latest_promoted is not None else None,
+            active_categories,
+        )
     _merge_grade_goal_usable = bool(_frozen_version_goal) and not is_contentless_goal(
         _frozen_version_goal
     )
@@ -8179,6 +8216,7 @@ async def _finalize_qualification(
             merge_grade_artifact,
             active_categories or None,
             _verified_merge_evidence,
+            authorship_evidence,
         )
         if qual.get("prior_superseded") and merge_grade_cert["status"] == "fail":
             merge_grade_cert = {
