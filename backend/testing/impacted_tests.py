@@ -70,6 +70,87 @@ import json
 import os
 import re
 import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+def parse_junit_failures(path: str | os.PathLike[str]) -> dict[str, str]:
+    """Return failed JUnit testcase identities and their diagnostic details."""
+    root = ET.parse(path).getroot()
+    failures: dict[str, str] = {}
+    for case in root.iter("testcase"):
+        detail = case.find("failure")
+        if detail is None:
+            detail = case.find("error")
+        if detail is None:
+            continue
+        key = f'{case.attrib.get("classname", "")}::{case.attrib.get("name", "")}'
+        failures[key] = (detail.text or detail.attrib.get("message", "")).strip()
+    return failures
+
+
+def normalize_failure_detail(detail: str, *, tree_root: str | os.PathLike[str] | None = None) -> str:
+    """Normalize diagnostics that differ only because they ran in another tree."""
+    normalized = detail
+    if tree_root is not None:
+        normalized = normalized.replace(str(Path(tree_root)), "<tree-root>")
+    return re.sub(r"(object at )0x[0-9a-fA-F]+", r"\1<address>", normalized)
+
+
+def attribute_new_failures(
+    current: dict[str, str],
+    baseline: dict[str, str],
+    *,
+    current_root: str | os.PathLike[str] | None = None,
+    baseline_root: str | os.PathLike[str] | None = None,
+) -> dict[str, str]:
+    """Keep only failures newly introduced by the current tree."""
+    return {
+        key: detail
+        for key, detail in current.items()
+        if key not in baseline
+        or normalize_failure_detail(baseline[key], tree_root=baseline_root)
+        != normalize_failure_detail(detail, tree_root=current_root)
+    }
+
+
+def classify_backend_verification(
+    *,
+    runtime_available: bool,
+    current_exit_code: int,
+    current_failures: dict[str, str],
+    baseline_failures: dict[str, str] | None = None,
+    current_root: str | os.PathLike[str] | None = None,
+    baseline_root: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """Return the fail-closed state for the required backend verification lane."""
+    if not runtime_available:
+        return {"state": "runtime_unavailable", "blocking": True, "new_failures": {}}
+    if current_exit_code == 0:
+        return {"state": "passed", "blocking": False, "new_failures": {}}
+    if not current_failures:
+        return {
+            "state": "execution_failure",
+            "blocking": True,
+            "new_failures": {},
+        }
+    if baseline_failures is None:
+        return {
+            "state": "attribution_unavailable",
+            "blocking": True,
+            "new_failures": current_failures,
+        }
+    new_failures = attribute_new_failures(
+        current_failures,
+        baseline_failures,
+        current_root=current_root,
+        baseline_root=baseline_root,
+    )
+    return {
+        "state": "test_failure" if new_failures else "preexisting_test_failure",
+        "blocking": bool(new_failures),
+        "new_failures": new_failures,
+    }
 
 # Maximum BFS depth for transitive importer expansion. The ``seen_mods`` dedup
 # set already guarantees termination on cyclic graphs; this cap bounds scan cost

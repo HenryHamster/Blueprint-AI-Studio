@@ -177,7 +177,8 @@ function buildRequiredBackendVerificationBlock(cfg: CodeChangeHelperConfig): str
       .replace(/@TEST_PATH_RE@/g, testPathRe)
       .replace(/@SELECTOR_PREFIX_RE@/g, selectorPrefixRe)
       .replace(/@DIR@/g, dir)
-      .replace(/@HARNESS@/g, harness);
+      .replace(/@HARNESS@/g, harness)
+      .replace(/@BASE@/g, cfg.baseBranch);
     const condition = dir === '.'
       ? `[ -n "$(printf '%s\\n' "$CHANGED" | while IFS= read -r f; do case "$f" in *.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]`
       : `[ -n "$(printf '%s\\n' "$CHANGED" | while IFS= read -r f; do case "$f" in ${dir}/*.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]`;

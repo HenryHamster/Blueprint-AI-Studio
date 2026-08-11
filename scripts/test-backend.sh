@@ -122,6 +122,7 @@ PG_DATA=""
 PG_SOCKET=""
 PG_BIN=""
 VERIFICATION_OUTPUT_DIR=""
+VERIFICATION_OUTPUT_DIR_OWNED=0
 cleanup() {
   rm -f CLAUDE.md
   [ -n "$PG_CONTAINER" ] && docker rm -f "$PG_CONTAINER" &>/dev/null || true
@@ -131,7 +132,7 @@ cleanup() {
   fi
   [ -n "$PG_DATA" ] && rm -rf "$PG_DATA" || true
   [ -n "$PG_SOCKET" ] && rm -rf "$PG_SOCKET" || true
-  [ -n "$VERIFICATION_OUTPUT_DIR" ] && rm -rf "$VERIFICATION_OUTPUT_DIR" || true
+  [ "$VERIFICATION_OUTPUT_DIR_OWNED" = "1" ] && [ -n "$VERIFICATION_OUTPUT_DIR" ] && rm -rf "$VERIFICATION_OUTPUT_DIR" || true
 }
 trap cleanup EXIT
 
@@ -705,19 +706,56 @@ if [ $# -gt 0 ]; then
       exit 2
     }
     rm -f "$BLUEPRINT_VERIFICATION_RESULT_FILE"
-    VERIFICATION_OUTPUT_DIR=$(mktemp -d /tmp/blueprint-backend-verification.XXXXXX)
+    if [ -n "${BLUEPRINT_VERIFICATION_JUNIT:-}" ]; then
+      VERIFICATION_OUTPUT_DIR="$(dirname -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+      VERIFICATION_JUNIT_NAME="$(basename -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+      [ -d "$VERIFICATION_OUTPUT_DIR" ] || {
+        echo "ERROR: verification JUnit output directory is unavailable: $VERIFICATION_OUTPUT_DIR" >&2
+        exit 2
+      }
+    else
+      VERIFICATION_OUTPUT_DIR=$(mktemp -d /tmp/blueprint-backend-verification.XXXXXX)
+      VERIFICATION_OUTPUT_DIR_OWNED=1
+      VERIFICATION_JUNIT_NAME=""
+    fi
     if [ "$USE_DOCKER" = "1" ]; then
       ENV_ARGS="$ENV_ARGS -v ${VERIFICATION_OUTPUT_DIR}:/verification-output"
-      verification_junit=/verification-output/junit.xml
+      if [ -n "$VERIFICATION_JUNIT_NAME" ]; then
+        verification_junit="/verification-output/${VERIFICATION_JUNIT_NAME}"
+        ENV_ARGS="$ENV_ARGS -e BLUEPRINT_VERIFICATION_JUNIT=$verification_junit"
+      else
+        verification_junit=/verification-output/junit.xml
+      fi
     else
-      verification_junit="$VERIFICATION_OUTPUT_DIR/junit.xml"
+      if [ -n "$VERIFICATION_JUNIT_NAME" ]; then
+        verification_junit="$VERIFICATION_OUTPUT_DIR/$VERIFICATION_JUNIT_NAME"
+      else
+        verification_junit="$VERIFICATION_OUTPUT_DIR/junit.xml"
+      fi
     fi
-    _run python3 -m pytest "$@" --junitxml="$verification_junit"
+  _run python3 -m pytest "$@" --junitxml="$verification_junit"
     verification_tmp="${BLUEPRINT_VERIFICATION_RESULT_FILE}.$$"
     python3 -c 'import datetime,json,sys,xml.etree.ElementTree as ET; junit,out,*selectors=sys.argv[1:]; root=ET.parse(junit).getroot(); suites=[root] if root.tag.endswith("testsuite") else list(root); tests=sum(int(s.attrib.get("tests",0)) for s in suites); skipped=sum(int(s.attrib.get("skipped",0)) for s in suites); failures=sum(int(s.attrib.get("failures",0))+int(s.attrib.get("errors",0)) for s in suites); assert tests>0 and skipped<tests and failures==0, f"unacceptable pytest result tests={tests} skipped={skipped} failures={failures}"; payload={"version":1,"harness":"scripts/test-backend.sh","selectors":selectors,"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":tests,"skipped":skipped,"failures":failures,"exit_code":0,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$VERIFICATION_OUTPUT_DIR/junit.xml" "$verification_tmp" "$@"
     mv -f "$verification_tmp" "$BLUEPRINT_VERIFICATION_RESULT_FILE"
   else
-    _run python3 -m pytest "$@"
+    if [ -n "${BLUEPRINT_VERIFICATION_JUNIT:-}" ]; then
+      VERIFICATION_OUTPUT_DIR="$(dirname -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+      VERIFICATION_JUNIT_NAME="$(basename -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+      [ -d "$VERIFICATION_OUTPUT_DIR" ] || {
+        echo "ERROR: verification JUnit output directory is unavailable: $VERIFICATION_OUTPUT_DIR" >&2
+        exit 2
+      }
+      if [ "$USE_DOCKER" = "1" ]; then
+        ENV_ARGS="$ENV_ARGS -v ${VERIFICATION_OUTPUT_DIR}:/verification-output"
+        verification_junit="/verification-output/${VERIFICATION_JUNIT_NAME}"
+        ENV_ARGS="$ENV_ARGS -e BLUEPRINT_VERIFICATION_JUNIT=$verification_junit"
+      else
+        verification_junit="$BLUEPRINT_VERIFICATION_JUNIT"
+      fi
+      _run python3 -m pytest "$@" --junitxml="$verification_junit"
+    else
+      _run python3 -m pytest "$@"
+    fi
   fi
   exit 0
 fi
