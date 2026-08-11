@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
@@ -23,6 +24,7 @@ from app.release_commit_authorship import (
     reconcile_serving_authorship_evidence,
     validate_authorship_receipt,
 )
+from app.release_commit_authorship import _deadline_session
 from app.release_scoring import evaluate_merge_grade
 
 
@@ -1032,6 +1034,77 @@ async def test_reconciliation_old_rows_and_concurrent_claim_once(db_session, moc
     assert sorted(results) == [0, 1]
     assert measure.await_count == 1
     assert measure.await_args.args[0] == target.id
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_cursor_is_durable_and_process_global_cursor_is_absent(
+    db_session, mocker
+):
+    """A scan commits its keyset position in the singleton state row."""
+    from app.database import AsyncSessionLocal
+    from app.models import ReleaseAuthorshipReconciliationState
+    from sqlalchemy import select
+
+    project = Project(name="Durable cursor", user_id="durable-cursor")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    rows = [
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=index + 1,
+            status="promoted",
+            base_sha=f"{index + 1:040x}",
+            served_sha=f"{index + 2:040x}",
+            serving_status="serving_confirmed",
+            served_at=None if index == 0 else datetime(2026, 1, 1, tzinfo=timezone.utc),
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification={},
+        )
+        for index in range(2)
+    ]
+    db_session.add_all(rows)
+    await db_session.commit()
+    mocker.patch("app.release_commit_authorship._RECONCILIATION_SCAN_PAGE_SIZE", 1)
+    mocker.patch(
+        "app.release_commit_authorship.measure_serving_authorship_evidence",
+        new=AsyncMock(return_value=True),
+    )
+
+    assert await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1) == 1
+    state = (
+        await db_session.execute(select(ReleaseAuthorshipReconciliationState).where(ReleaseAuthorshipReconciliationState.id == 1))
+    ).scalar_one()
+    assert state.cursor_partition == 0
+    assert state.null_cursor_id == rows[0].id
+    import app.release_commit_authorship as authorship
+
+    assert not hasattr(authorship, "_reconciliation_cursor")
+
+
+@pytest.mark.asyncio
+async def test_deadline_session_always_exits_and_propagates_cleanup_failure():
+    """Uncertain cleanup is observable and cannot be followed by external work."""
+    class FailingContext:
+        def __init__(self):
+            self.exit_calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            self.exit_calls += 1
+            raise RuntimeError("connection cleanup failed")
+
+    context = FailingContext()
+
+    def factory():
+        return context
+
+    with pytest.raises(RuntimeError, match="connection cleanup failed"):
+        async with _deadline_session(factory, time.monotonic() + 1):
+            raise asyncio.TimeoutError("operation budget exhausted")
+    assert context.exit_calls == 1
 
 
 @pytest.mark.asyncio

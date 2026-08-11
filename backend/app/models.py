@@ -62,6 +62,7 @@ from app.release_models import (  # noqa: F401
     QualificationDimensionResult,
     QualificationVerdict,
     ReleaseDeployArtifact,
+    ReleaseAuthorshipReconciliationState,
     ReleaseVersion,
     ResidualVerdict,
     VersionAcceptanceCriterion,

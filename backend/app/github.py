@@ -49,7 +49,8 @@ _github_client: httpx.AsyncClient | None = None
 # ref (e.g. every rollup parent reading automain's tip in the same sweep), a
 # dominant install-token-budget drain.
 _inflight_reads: dict[
-    tuple[str, str, str, str, str, str], "asyncio.Future[httpx.Response]"
+    tuple[str, str, str, str, str, str, str, str, str],
+    "asyncio.Future[httpx.Response]",
 ] = {}
 
 # File-content cache: memoizes get_file_text_at_ref results by
@@ -399,10 +400,8 @@ def _deferrable_quota_active() -> bool:
     if remaining is None or remaining >= DEFERRABLE_QUOTA_FLOOR:
         return False
     reset_at = q.get("reset_at")
-    if reset_at is not None and int(reset_at) <= int(time.time()):
-        # Window already rolled over; stale low reading is meaningless.
-        return False
-    return True
+    # Window already rolled over; stale low reading is meaningless.
+    return reset_at is None or int(reset_at) > int(time.time())
 
 
 def _synthetic_rate_limited_response(bucket: dict) -> httpx.Response:
@@ -516,6 +515,9 @@ async def _github_request(
         _canonical_query_params(kwargs.get("params")),
         accept,
         api_version,
+        project_id or "",
+        consumer or "",
+        str(max(1, int(max_retries))),
     )
     existing = _inflight_reads.get(key)
     if existing is not None:
@@ -982,7 +984,7 @@ async def get_file_text_at_ref(
                 import app.shared_state as _ss
                 _ss.github_cache_hits["read_content"] = _ss.github_cache_hits.get("read_content", 0) + 1
                 return cached[0]
-        except Exception:
+        except (AttributeError, KeyError, TypeError, ValueError):
             pass  # Cache miss / stale — fall through to fetch.
 
     import base64
@@ -1030,7 +1032,7 @@ async def get_file_text_at_ref(
                 # Evict oldest entries over the size cap.
                 while len(_file_content_cache) > _FILE_CONTENT_CACHE_MAX_SIZE:
                     _file_content_cache.popitem(last=False)  # Least recently used
-            except Exception:
+            except (AttributeError, KeyError, TypeError, ValueError):
                 pass  # Cache write failure is non-critical.
 
         return text

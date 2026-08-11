@@ -8,19 +8,22 @@ receipt against that version's immutable identity and never call GitHub.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
+import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import and_, or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import resolve_dialect_name
-from app.models import Project, ReleaseVersion
+from app.models import Project, ReleaseAuthorshipReconciliationState, ReleaseVersion
 
 
 logger = logging.getLogger(__name__)
@@ -68,8 +71,8 @@ _PERMANENT_AUTHORSHIP_REASONS = frozenset(
     }
 )
 
-_reconciliation_cursor: tuple[int, datetime | None, Any] | None = None
-_reconciliation_cursor_lock = asyncio.Lock()
+_RECONCILIATION_CLEANUP_GRACE_SECONDS = 0.25
+_RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS = 0.05
 
 AUTHORSHIP_EVIDENCE_CONTRACT_TYPE = "operator_authored_commits"
 
@@ -939,25 +942,59 @@ async def _set_reconciliation_timeouts(session: Any, deadline: float | None) -> 
 
 @asynccontextmanager
 async def _deadline_session(session_factory: Any, deadline: float | None):
-    """Enter and leave a DB session without escaping the sweep deadline."""
+    """Enter and leave a DB session with bounded, cancellation-safe cleanup.
+
+    The operation deadline bounds database work.  Cleanup gets a separate small
+    grace because abandoning ``__aexit__`` can leak a transaction/connection
+    back into the pool.  Cleanup failure is propagated so callers cannot start
+    Secret Manager or GitHub work while ownership of a DB resource is unclear.
+    """
     context = session_factory()
     entered = False
+    body_error: BaseException | None = None
     try:
         session = await asyncio.wait_for(
             context.__aenter__(), timeout=_remaining_reconciliation_seconds(deadline)
         )
         entered = True
         yield session
+    except BaseException as exc:
+        body_error = exc
+        raise
     finally:
         if entered:
-            remaining = _remaining_reconciliation_seconds(deadline)
-            if remaining > 0:
+            exc_info = sys.exc_info() if body_error is not None else (None, None, None)
+            cleanup = asyncio.create_task(context.__aexit__(*exc_info))
+            cleanup_error: BaseException | None = None
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(cleanup), _RECONCILIATION_CLEANUP_GRACE_SECONDS
+                )
+            except asyncio.CancelledError as cancellation:
+                # The caller's cancellation must not interrupt the one cleanup
+                # attempt.  If the cleanup cannot settle, retain cancellation
+                # and expose the uncertain ownership instead of proceeding.
                 try:
                     await asyncio.wait_for(
-                        context.__aexit__(None, None, None), timeout=remaining
+                        asyncio.shield(cleanup),
+                        _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS,
                     )
-                except Exception:
-                    logger.debug("authorship reconciliation session cleanup failed", exc_info=True)
+                except BaseException as exc:  # noqa: BLE001
+                    cleanup_error = exc
+                if cleanup_error is not None:
+                    raise cleanup_error from cancellation
+                raise
+            except BaseException as exc:  # noqa: BLE001
+                cleanup_error = exc
+            if cleanup_error is not None:
+                if not cleanup.done():
+                    cleanup.cancel()
+                    with contextlib.suppress(BaseException):
+                        await asyncio.wait_for(
+                            asyncio.shield(cleanup),
+                            _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS,
+                        )
+                raise cleanup_error
 
 
 def _reconciliation_candidate_is_eligible(
@@ -1005,99 +1042,155 @@ async def reconcile_serving_authorship_evidence(
     selected_ids: set[Any] = set()
     wrapped = False
 
-    # Only the short scan/cursor phase is serialized in-process. Row-lock claims
-    # below remain the cross-process fence, so two workers never measure one
-    # receipt twice even when they are in different service processes.
-    async with _reconciliation_cursor_lock:
-        global _reconciliation_cursor
-        while (
-            len(version_ids) < bounded_limit
-            and _remaining_reconciliation_seconds(deadline) > 0
-        ):
-            conditions = [
-                ReleaseVersion.status == "promoted",
-                ReleaseVersion.serving_status == "serving_confirmed",
-                ReleaseVersion.base_sha.is_not(None),
-                ReleaseVersion.served_sha.is_not(None),
-            ]
-            cursor = _reconciliation_cursor
-            if cursor is not None:
-                partition, cursor_served_at, cursor_id = cursor
-                if partition == 0:
-                    # NULL served_at is a real first partition. Once its ids
-                    # are exhausted, explicitly enter the non-NULL partition.
-                    conditions.append(
-                        or_(
-                            and_(
-                                ReleaseVersion.served_at.is_(None),
-                                ReleaseVersion.id > cursor_id,
+    # The singleton state row is the fleet-wide short CAS.  No process-global
+    # cursor or asyncio lock is used: a second worker either gets a different
+    # committed page or skips the locked state row and lets the next tick run.
+    while len(version_ids) < bounded_limit and _remaining_reconciliation_seconds(deadline) > 0:
+        try:
+            async with _deadline_session(session_factory, deadline) as scan_session:
+                await _set_reconciliation_timeouts(scan_session, deadline)
+                state = (
+                    (
+                        await asyncio.wait_for(
+                            scan_session.execute(
+                                select(ReleaseAuthorshipReconciliationState)
+                                .where(ReleaseAuthorshipReconciliationState.id == 1)
+                                .with_for_update(skip_locked=True)
                             ),
-                            ReleaseVersion.served_at.is_not(None),
+                            timeout=_remaining_reconciliation_seconds(deadline),
                         )
                     )
-                else:
-                    conditions.append(
-                        or_(
-                            ReleaseVersion.served_at > cursor_served_at,
-                            and_(
-                                ReleaseVersion.served_at == cursor_served_at,
-                                ReleaseVersion.id > cursor_id,
-                            ),
-                        )
-                    )
-            query = (
-                select(ReleaseVersion)
-                .where(*conditions)
-                .order_by(
-                    ReleaseVersion.served_at.asc().nulls_first(),
-                    ReleaseVersion.id.asc(),
+                    .scalars()
+                    .first()
                 )
-                .limit(_RECONCILIATION_SCAN_PAGE_SIZE)
-                .with_for_update(skip_locked=True)
-            )
-            candidates: list[Any]
-            try:
-                async with _deadline_session(session_factory, deadline) as scan_session:
-                    await _set_reconciliation_timeouts(scan_session, deadline)
-                    candidates = list(
+                if state is None:
+                    # SQLite/unit fixtures do not run migrations.  Production
+                    # always has the singleton from 0756; this insert keeps the
+                    # injected test database faithful without a process cache.
+                    existing_state = (
                         (
                             await asyncio.wait_for(
-                                scan_session.execute(query),
+                                scan_session.execute(
+                                    select(ReleaseAuthorshipReconciliationState.id).where(
+                                        ReleaseAuthorshipReconciliationState.id == 1
+                                    )
+                                ),
                                 timeout=_remaining_reconciliation_seconds(deadline),
                             )
                         )
                         .scalars()
-                        .all()
+                        .first()
                     )
-            except asyncio.TimeoutError:
-                break
-            if not candidates:
-                if cursor is not None and not wrapped:
-                    _reconciliation_cursor = None
+                    if existing_state is not None:
+                        return 0
+                    state = ReleaseAuthorshipReconciliationState(id=1)
+                    scan_session.add(state)
+                    try:
+                        await scan_session.flush()
+                    except IntegrityError:
+                        # Another first-use worker inserted the fixture row. Its
+                        # committed state owns this scan tick; do not retry with
+                        # a process-local fallback or duplicate its page.
+                        await scan_session.rollback()
+                        return 0
+                conditions = [
+                    ReleaseVersion.status == "promoted",
+                    ReleaseVersion.serving_status == "serving_confirmed",
+                    ReleaseVersion.base_sha.is_not(None),
+                    ReleaseVersion.served_sha.is_not(None),
+                ]
+                if state.cursor_partition == 0:
+                    conditions.append(ReleaseVersion.served_at.is_(None))
+                    if state.null_cursor_id is not None:
+                        conditions.append(ReleaseVersion.id > state.null_cursor_id)
+                    ordering = ReleaseVersion.id.asc()
+                else:
+                    conditions.append(ReleaseVersion.served_at.is_not(None))
+                    if state.served_at_cursor is not None and state.served_id_cursor is not None:
+                        conditions.append(
+                            or_(
+                                ReleaseVersion.served_at > state.served_at_cursor,
+                                and_(
+                                    ReleaseVersion.served_at == state.served_at_cursor,
+                                    ReleaseVersion.id > state.served_id_cursor,
+                                ),
+                            )
+                        )
+                    ordering = (
+                        ReleaseVersion.served_at.asc(),
+                        ReleaseVersion.id.asc(),
+                    )
+                query = select(ReleaseVersion).where(*conditions)
+                query = query.order_by(*ordering) if isinstance(ordering, tuple) else query.order_by(ordering)
+                query = query.limit(_RECONCILIATION_SCAN_PAGE_SIZE).with_for_update(
+                    skip_locked=True
+                )
+                candidates = list(
+                    (
+                        await asyncio.wait_for(
+                            scan_session.execute(query),
+                            timeout=_remaining_reconciliation_seconds(deadline),
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if candidates:
+                    last = candidates[-1]
+                    if state.cursor_partition == 0:
+                        state.null_cursor_id = last.id
+                    else:
+                        state.served_at_cursor = last.served_at
+                        state.served_id_cursor = last.id
+                    state.updated_at = datetime.now(timezone.utc)
+                    scan_session.add(state)
+                    await asyncio.wait_for(
+                        scan_session.commit(),
+                        timeout=_remaining_reconciliation_seconds(deadline),
+                    )
+                elif state.cursor_partition == 0:
+                    state.cursor_partition = 1
+                    state.null_cursor_id = None
+                    state.updated_at = datetime.now(timezone.utc)
+                    scan_session.add(state)
+                    await asyncio.wait_for(
+                        scan_session.commit(),
+                        timeout=_remaining_reconciliation_seconds(deadline),
+                    )
+                    continue
+                else:
+                    state.cursor_partition = 0
+                    state.null_cursor_id = None
+                    state.served_at_cursor = None
+                    state.served_id_cursor = None
+                    state.generation += 1
+                    state.updated_at = datetime.now(timezone.utc)
+                    scan_session.add(state)
+                    await asyncio.wait_for(
+                        scan_session.commit(),
+                        timeout=_remaining_reconciliation_seconds(deadline),
+                    )
+                    if wrapped:
+                        break
                     wrapped = True
                     continue
-                break
-            now = datetime.now(timezone.utc)
-            for candidate in candidates:
-                served_at = candidate.served_at
-                _reconciliation_cursor = (
-                    (0, None, candidate.id)
-                    if served_at is None
-                    else (1, served_at, candidate.id)
-                )
-                report = (candidate.last_qualification or {}).get(
-                    "operator_authored_commits"
-                )
-                if (
-                    candidate.id not in selected_ids
-                    and _reconciliation_candidate_is_eligible(
-                        report, candidate.base_sha, candidate.served_sha, now
+                now = datetime.now(timezone.utc)
+                for candidate in candidates:
+                    report = (candidate.last_qualification or {}).get(
+                        "operator_authored_commits"
                     )
-                ):
-                    selected_ids.add(candidate.id)
-                    version_ids.append(candidate.id)
-                    if len(version_ids) >= bounded_limit:
-                        break
+                    if (
+                        candidate.id not in selected_ids
+                        and _reconciliation_candidate_is_eligible(
+                            report, candidate.base_sha, candidate.served_sha, now
+                        )
+                    ):
+                        selected_ids.add(candidate.id)
+                        version_ids.append(candidate.id)
+                        if len(version_ids) >= bounded_limit:
+                            break
+        except asyncio.TimeoutError:
+            break
 
     attempted = 0
     for version_id in version_ids:

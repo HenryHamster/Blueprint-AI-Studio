@@ -479,6 +479,45 @@ class VersionAcceptanceCriterion(SQLModel, table=True):
     )
 
 
+class ReleaseAuthorshipReconciliationState(SQLModel, table=True):
+    """Durable singleton keyset cursor for serving-authorship reconciliation.
+
+    The row is deliberately global: the sweep covers every project and the row
+    lock is the short cross-process CAS that assigns one scan page at a time.
+    ``cursor_partition`` is 0 for the NULL ``served_at`` prefix and 1 for the
+    timestamp/id suffix.  ``generation`` records each EOF wrap so a restarted
+    worker cannot mistake a wrapped cursor for forward progress.
+    """
+
+    __tablename__ = "releaseauthorshipreconciliationstate"
+
+    id: int = Field(default=1, primary_key=True)
+    cursor_partition: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    null_cursor_id: uuid.UUID | None = Field(
+        default=None, sa_column=Column(GUID(), nullable=True)
+    )
+    served_at_cursor: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    served_id_cursor: uuid.UUID | None = Field(
+        default=None, sa_column=Column(GUID(), nullable=True)
+    )
+    generation: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+
 class CriterionEvidence(SQLModel, table=True):
     """A single piece of evidence satisfying a VersionAcceptanceCriterion.
 

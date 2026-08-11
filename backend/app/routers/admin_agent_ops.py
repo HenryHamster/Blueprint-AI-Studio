@@ -6195,21 +6195,33 @@ async def strategic_operation(
             text = item["text"].strip()
             direction_keys_input: list[str] = list(item.get("direction_keys") or [])
 
-            existing = await _get_criterion_by_text(
-                session, project.id, open_version.id, text
-            )
+            try:
+                existing = await _get_criterion_by_text(
+                    session, project.id, open_version.id, text
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             if existing is not None:
                 criterion_key = existing.criterion_key
                 is_new = False
-                if "evidence_contract" in item:
-                    await _update_evidence_contract(
-                        session,
-                        project_id=project.id,
-                        release_version_id=open_version.id,
-                        criterion_key=existing.criterion_key,
-                        evidence_contract=item.get("evidence_contract"),
-                        updated_by=f"strategist:{task.id}",
+                if "evidence_contract" in item and not _is_operator_authored_criterion(
+                    existing.created_by
+                ):
+                    # Operator-authored contracts are an ownership boundary:
+                    # strategic retries may reuse the criterion but may never
+                    # set, clear, or relax its machine contract.
+                    normalized_contract = _normalize_evidence_contract(
+                        item.get("evidence_contract")
                     )
+                    if normalized_contract != existing.evidence_contract:
+                        await _update_evidence_contract(
+                            session,
+                            project_id=project.id,
+                            release_version_id=open_version.id,
+                            criterion_key=existing.criterion_key,
+                            evidence_contract=item.get("evidence_contract"),
+                            updated_by=f"strategist:{task.id}",
+                        )
             else:
                 if existing_active_count + new_added_count >= _MAX_CRITERIA:
                     skipped_over_cap += 1
@@ -6240,6 +6252,11 @@ async def strategic_operation(
                 dir_row = _direction_rows.get(dk)
                 if dir_row is None:
                     warnings.append(f"Unknown direction_key: {dk}")
+                    continue
+                if dir_row.status != "active":
+                    warnings.append(
+                        f"Inactive direction_key ignored: {dk} (status={dir_row.status})"
+                    )
                     continue
                 # Scrub stale (inactive/old-version) keys from the existing set,
                 # keeping only keys that are active in this version or were

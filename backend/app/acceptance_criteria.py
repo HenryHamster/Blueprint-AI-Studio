@@ -890,6 +890,12 @@ async def create_criterion(
         criterion_key=generate_criterion_key(),
         text=text,
         evidence_contract=normalized_contract,
+        evidence_contract_updated_at=_utcnow() if normalized_contract is not None else None,
+        evidence_contract_updated_by=(
+            (created_by or "legacy:created_at")[:128]
+            if normalized_contract is not None
+            else None
+        ),
         created_by=created_by,
     )
     session.add(criterion)
@@ -927,6 +933,12 @@ async def stage_criterion(
         criterion_key=generate_criterion_key(),
         text=text,
         evidence_contract=normalized_contract,
+        evidence_contract_updated_at=_utcnow() if normalized_contract is not None else None,
+        evidence_contract_updated_by=(
+            (created_by or "legacy:created_at")[:128]
+            if normalized_contract is not None
+            else None
+        ),
         created_by=created_by,
     )
     session.add(criterion)
@@ -1073,15 +1085,27 @@ async def get_criterion_by_text(
     release_version_id: uuid.UUID,
     text: str,
 ) -> VersionAcceptanceCriterion | None:
-    """Return an existing criterion matching (project_id, release_version_id, text), or None."""
+    """Return the unique active same-text criterion, or ``None``.
+
+    Strategic retries must never revive or mutate an inactive row.  Duplicate
+    active rows are treated as ambiguous rather than selecting arbitrarily.
+    """
     result = await session.execute(
         select(VersionAcceptanceCriterion).where(
             VersionAcceptanceCriterion.project_id == project_id,
             VersionAcceptanceCriterion.release_version_id == release_version_id,
             VersionAcceptanceCriterion.text == text,
+            VersionAcceptanceCriterion.status == "active",
         )
+        .order_by(VersionAcceptanceCriterion.created_at, VersionAcceptanceCriterion.id)
     )
-    return result.scalar_one_or_none()
+    rows = list(result.scalars().all())
+    if len(rows) > 1:
+        raise ValueError(
+            "ambiguous active acceptance criteria share the same text; "
+            "operator resolution is required"
+        )
+    return rows[0] if rows else None
 
 
 async def record_evidence(

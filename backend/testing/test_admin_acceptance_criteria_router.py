@@ -199,14 +199,30 @@ async def test_create_and_delete_acceptance_criterion(client: AsyncClient, db_se
     # --- Create: happy path ---
     resp = await client.post(
         f"{_BASE}/projects/{project.id}/acceptance-criteria",
-        json={"text": "All tests must pass"},
+        json={
+            "text": "All tests must pass",
+            "evidence_contract": {
+                "type": "operator_authored_commits",
+                "predicate": {"max_count": 0},
+            },
+        },
     )
     assert resp.status_code == 200
     data = resp.json()
     assert data["criterion_key"].startswith("c-")
     assert data["text"] == "All tests must pass"
+    assert data["evidence_contract"]["predicate"]["max_count"] == 0
     assert data["release_version_id"] == str(version.id)
     key1 = data["criterion_key"]
+    created = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.criterion_key == key1
+            )
+        )
+    ).scalar_one()
+    assert created.evidence_contract_updated_at is not None
+    assert created.evidence_contract_updated_by == "operator"
 
     # Create a second distinct criterion.
     resp2 = await client.post(

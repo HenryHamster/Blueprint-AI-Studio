@@ -5266,6 +5266,33 @@ async def test_singleflight_failure_pops_key_and_reissues(mocker):
 
 
 @pytest.mark.asyncio
+async def test_singleflight_cross_project_consumer_and_retry_policy_are_isolated(mocker):
+    """A coalesced read never inherits another caller's accounting or retry policy."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, consumer=None, **kw):
+        calls.append((project_id, consumer, max_retries))
+        await asyncio.sleep(0.01)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    await asyncio.gather(
+        github._github_request(
+            "GET", "https://api.github.com/repos/o/r/ref", {},
+            max_retries=1, project_id="project-a", consumer="release",
+        ),
+        github._github_request(
+            "GET", "https://api.github.com/repos/o/r/ref", {},
+            max_retries=3, project_id="project-b", consumer="ci",
+        ),
+    )
+    assert sorted(calls) == [("project-a", "release", 1), ("project-b", "ci", 3)]
+
+
+@pytest.mark.asyncio
 async def test_github_budget_alert_fires_once_per_window(mocker):
     """The install-budget alert fires the first time <=20% is crossed in a window
     and dedups within it; a new reset window can alert again."""

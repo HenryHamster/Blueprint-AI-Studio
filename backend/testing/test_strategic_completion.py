@@ -21110,3 +21110,123 @@ def test_record_effort_tier_stamps_cycle_metadata():
     legacy = _to_legacy_dict(cycle)
     assert legacy.get(CYCLE_META_EFFORT_TIER) == "routine"
     assert legacy.get(CYCLE_META_EFFORT_REASON) == "all routine signals clean"
+
+
+@pytest.mark.asyncio
+async def test_strategic_contract_ownership_and_active_direction_mapping(
+    client, db_session
+):
+    """Strategic retries preserve operator contracts and never map inactive directions."""
+    from app.acceptance_criteria import get_criterion_by_text
+
+    task = await _make_strategic_task(db_session, name="contract-ownership", vm="vm-contract")
+    version = ReleaseVersion(project_id=task.project_id, version_number=1, status="open")
+    operator_contract = {
+        "type": "operator_authored_commits",
+        "predicate": {"max_count": 0},
+    }
+    strategist_contract = {
+        "type": "operator_authored_commits",
+        "predicate": {"max_count": 1},
+    }
+    operator_row = VersionAcceptanceCriterion(
+        project_id=task.project_id,
+        release_version_id=version.id,
+        criterion_key="c-operator1",
+        text="Operator-owned contract",
+        evidence_contract=operator_contract,
+        created_by="operator",
+    )
+    strategist_row = VersionAcceptanceCriterion(
+        project_id=task.project_id,
+        release_version_id=version.id,
+        criterion_key="c-strategy1",
+        text="Strategist-owned contract",
+        evidence_contract=operator_contract,
+        created_by="strategist",
+    )
+    inactive_direction = Direction(
+        project_id=task.project_id,
+        direction_key="d-inactive-contract",
+        data={"id": "d-inactive-contract", "status": "paused"},
+        status="paused",
+    )
+    active_direction = Direction(
+        project_id=task.project_id,
+        direction_key="d-active-contract",
+        data={"id": "d-active-contract", "status": "active"},
+        status="active",
+    )
+    db_session.add_all([version, operator_row, strategist_row, inactive_direction, active_direction])
+    await db_session.commit()
+    token = create_agent_token(str(task.id), "vm-contract", task_type="strategic_review")
+    headers = {"x-agent-token": token}
+
+    unchanged = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "text": operator_row.text,
+                        "evidence_contract": strategist_contract,
+                        "direction_keys": [inactive_direction.direction_key],
+                    }
+                ]
+            },
+        },
+    )
+    assert unchanged.status_code == 200, unchanged.text
+    await db_session.refresh(operator_row)
+    await db_session.refresh(inactive_direction)
+    assert operator_row.evidence_contract == operator_contract
+    assert inactive_direction.criterion_keys == []
+
+    changed = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "text": strategist_row.text,
+                        "evidence_contract": strategist_contract,
+                        "direction_keys": [active_direction.direction_key],
+                    }
+                ]
+            },
+        },
+    )
+    assert changed.status_code == 200, changed.text
+    await db_session.refresh(strategist_row)
+    assert strategist_row.evidence_contract == strategist_contract
+    await db_session.refresh(active_direction)
+    assert strategist_row.criterion_key in active_direction.criterion_keys
+
+    duplicate = VersionAcceptanceCriterion(
+        project_id=task.project_id,
+        release_version_id=version.id,
+        criterion_key="c-operator2",
+        text=operator_row.text,
+        created_by="strategist",
+    )
+    db_session.add(duplicate)
+    await db_session.commit()
+    ambiguous = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {"criteria": [{"text": operator_row.text, "direction_keys": []}]},
+        },
+    )
+    assert ambiguous.status_code == 409
+    assert await get_criterion_by_text(
+        db_session, task.project_id, version.id, strategist_row.text
+    ) == strategist_row
