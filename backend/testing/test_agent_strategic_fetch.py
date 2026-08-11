@@ -2455,14 +2455,20 @@ async def test_agent_fetch_qualification_stamps_serving_sha_on_verdict_path(
         "app.deployed_sha.get_serving_sha",
         lambda: test_serving_sha,
     )
-    monkeypatch.setattr(
-        "app.release_commit_authorship.count_non_bot_authored_commits",
-        lambda base_sha, head_sha: {
+    async def _count_authorship(base_sha, head_sha, *, session, project):
+        assert session is not None
+        assert project.id == project_id
+        return {
             "state": "resolved",
             "count": 1,
             "offenders": [{"sha": "c" * 12, "author": "Henry Example"}],
             "range": {"base_sha": base_sha, "head_sha": head_sha},
-        },
+        }
+
+    project_id = project.id
+    monkeypatch.setattr(
+        "app.release_commit_authorship.count_non_bot_authored_commits",
+        _count_authorship,
     )
 
     token = create_agent_token(str(task.id), task.vm_instance_id)

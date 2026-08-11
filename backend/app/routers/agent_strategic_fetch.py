@@ -1681,9 +1681,11 @@ async def agent_fetch_qualification(
             },
         }
 
-    operator_authored_commits = count_non_bot_authored_commits(
+    operator_authored_commits = await count_non_bot_authored_commits(
         open_row.base_sha,
         serving_sha,
+        session=session,
+        project=project,
     )
     active_or_last_attempt_policy = qualification_attempt_policy_projection(
         open_row.last_qualification
