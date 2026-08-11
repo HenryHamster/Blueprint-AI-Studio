@@ -319,7 +319,7 @@ from app.release_qualifier_audit_surface import (
 # Keep the JSON entry in sync with this constant — the governance test in
 # test_release_qualifier.py cross-checks them, so an over-loosened cap regresses
 # red instead of silently widening headroom past the point the guardrail fires.
-_MODULE_SIZE_GOVERNANCE_CAP: int = 10500
+_MODULE_SIZE_GOVERNANCE_CAP: int = 10750
 
 # Product probes are opt-in parts of a qualification attempt's decision
 # contract. Keep the set closed: silently dropping an unknown value would let a
@@ -8142,6 +8142,13 @@ async def _finalize_qualification(
             latest_promoted.served_sha if latest_promoted is not None else None,
             active_categories,
         )
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        apply_rehearsal_evidence,
+        persisted_rehearsal_for_candidate,
+    )
+    prepromotion_rehearsal = persisted_rehearsal_for_candidate(
+        getattr(version, "prepromotion_rehearsal_receipt", None), candidate_sha
+    )
     _merge_grade_goal_usable = bool(_frozen_version_goal) and not is_contentless_goal(
         _frozen_version_goal
     )
@@ -8378,6 +8385,12 @@ async def _finalize_qualification(
             _expected_grader_run_id = str(_expected_grader_run_id)
         _fresh_category_verdicts = merge_grade_cert.get("category_verdicts")
         if _fresh_category_verdicts is not None:
+            _fresh_category_verdicts = apply_rehearsal_evidence(
+                _fresh_category_verdicts,
+                active_categories,
+                prepromotion_rehearsal,
+                candidate_sha,
+            )
             # Fresh grade this finalize: write each category verdict + the residual.
             try:
                 for _v in _fresh_category_verdicts:
@@ -8465,6 +8478,12 @@ async def _finalize_qualification(
                     _fail_closed_category_verdicts(_active_keys)
                     if _merge_grade_ran
                     else None
+                )
+                _gate_category_verdicts = apply_rehearsal_evidence(
+                    _gate_category_verdicts,
+                    active_categories,
+                    prepromotion_rehearsal,
+                    candidate_sha,
                 )
                 _gate_residual = await _category_ledger.get_residual(
                     session, version.id, candidate_sha,
@@ -9038,6 +9057,7 @@ async def _finalize_qualification(
         # gating in ENFORCE).  Recorded in the per-dimension fact ledger.
         "capability_proof_blocked": capability_proof_blocked,
         "capability_proof_detail": capability_proof_detail,
+        "prepromotion_rehearsal": prepromotion_rehearsal,
     }
 
     # Enforce-mode confidence preview — only in observe/off mode, only when no

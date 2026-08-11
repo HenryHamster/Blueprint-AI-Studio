@@ -42,6 +42,7 @@ See also:
     subcommands.
 """
 import argparse
+import base64
 import contextlib
 import hashlib
 import importlib.util
@@ -6399,6 +6400,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--sha", help="Deploy the release built from this commit (prefix ok); "
                       "default is the newest successful main build.")
     p_deploy.add_argument(
+        "--rehearse", action="store_true",
+        help="Run the existing root bootstrap rehearsal and record it for the open candidate.",
+    )
+    p_deploy.add_argument(
         "--host", default="hamsterwheel",
         help="SSH host running the control plane (default: hamsterwheel).")
     p_deploy.add_argument("--dry-run", action="store_true",
@@ -7249,6 +7254,59 @@ def _request_release_socket(digest: str, revision: str) -> bool:
     return True
 
 
+def _request_release_rehearsal(
+    digest: str, revision: str, *, host: str | None = None
+) -> dict:
+    """Run the root-owned existing rehearsal on the selected release host."""
+    if not _DEPLOY_REVISION_RE.fullmatch(revision):
+        raise APIError("release revision failed validation")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise APIError("release digest failed validation")
+    if host is None:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(_RELEASE_SOCKET_TIMEOUT_SECONDS)
+                connection.connect(_RELEASE_SOCKET_PATH)
+                connection.sendall(f"rehearse {digest} {revision}\n".encode("ascii"))
+                response = (
+                    connection.recv(16384)
+                    .decode("ascii", errors="replace")
+                    .strip()
+                )
+        except OSError as exc:
+            raise APIError(f"release rehearsal socket unavailable: {exc}") from exc
+    else:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-t",
+                host,
+                "sudo",
+                _RELEASE_SHIM_PATH,
+                "--rehearse",
+                digest,
+                revision,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise APIError(f"release rehearsal failed with exit code {result.returncode}")
+        response = result.stdout.strip()
+    if not response.startswith("REHEARSAL "):
+        raise APIError(response.removeprefix("ERROR ") or "empty rehearsal response")
+    try:
+        report = json.loads(
+            base64.b64decode(response.removeprefix("REHEARSAL "), validate=True)
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise APIError("release rehearsal returned malformed evidence") from exc
+    if not isinstance(report, dict):
+        raise APIError("release rehearsal returned a non-object report")
+    return report
+
+
 def _resolve_deploy_manifest(args: argparse.Namespace) -> tuple[str, str, dict]:
     """Expose the validated manifest tuple used by the standalone agent."""
     release = _fetch_deploy_manifest(getattr(args, "sha", None))
@@ -7988,6 +8046,46 @@ def _post_activation_receipt(
         print(f"  Receipt:   recorded for v{promoted.get('version_number')}")
 
 
+def _post_prepromotion_rehearsal_receipt(
+    args: argparse.Namespace, version: dict, report: dict
+) -> None:
+    """Persist a candidate rehearsal through the existing receipt channel."""
+    result = api(
+        "POST",
+        f"/api/admin/projects/{get_project_id(getattr(args, 'project_id', None))}"
+        "/activation-receipt",
+        {
+            "version_number": version.get("version_number"),
+            "host": getattr(args, "host", "control-plane"),
+            "rehearsal": report,
+        },
+    )
+    if not isinstance(result, dict) or not result.get("receipt"):
+        raise APIError("release rehearsal receipt was not persisted")
+    print(
+        f"  Rehearsal receipt: v{version.get('version_number')} "
+        f"candidate={report.get('revision', '')[:12]}"
+    )
+
+
+def _read_open_rehearsal_version(args: argparse.Namespace, revision: str) -> dict:
+    project_id = get_project_id(getattr(args, "project_id", None))
+    data, err = _safe_read(
+        f"/api/admin/projects/{project_id}/release-versions?status=open&limit=1"
+    )
+    if err:
+        raise APIError(f"open release version lookup failed: {err}")
+    versions = (data or {}).get("versions") or []
+    version = versions[0] if versions else None
+    if not isinstance(version, dict) or version.get("status") != "open":
+        raise APIError("no open release version is available for rehearsal")
+    if version.get("active_candidate_sha") != revision:
+        raise APIError(
+            "open release version candidate does not match the rehearsal revision"
+        )
+    return version
+
+
 def cmd_deploy(args: argparse.Namespace) -> None:
     """Activate the newest CI-built main release on the local control plane.
 
@@ -8015,6 +8113,11 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     print(f"  Revision:  {revision}")
     print(f"  Image:     ...@{digest[:19]}...")
     print(f"  Built:     {run.get('createdAt', '?')} (run {run['databaseId']})")
+    if getattr(args, "rehearse", False):
+        version = _read_open_rehearsal_version(args, revision)
+        report = _request_release_rehearsal(digest, revision, host=args.host)
+        _post_prepromotion_rehearsal_receipt(args, version, report)
+        return
     promoted = _resolve_deploy_binding(args, revision)
     if args.dry_run:
         print("  (dry run — nothing deployed)")

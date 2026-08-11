@@ -30,6 +30,8 @@ to the host operator account.
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import re
 import socket
@@ -88,7 +90,9 @@ def _validated_args(args: list[str]) -> tuple[str, str]:
     return digest, revision
 
 
-def _release_command(digest: str, revision: str) -> list[str]:
+def _release_command(
+    digest: str, revision: str, *, rehearsal: bool = False
+) -> list[str]:
 
     sudo_user = os.environ.get("SUDO_USER", "") or _DEFAULT_SUDO_USER
     if not _SUDO_USER_RE.fullmatch(sudo_user):
@@ -98,7 +102,7 @@ def _release_command(digest: str, revision: str) -> list[str]:
     tool = _newest_release_tool()
     unit = f"blueprint-local-app-release-{revision[:12]}"
 
-    return [
+    command = [
         "/usr/bin/systemd-run",
         f"--unit={unit}",
         "--collect",
@@ -113,10 +117,38 @@ def _release_command(digest: str, revision: str) -> list[str]:
         "--expected-revision",
         revision,
     ]
+    if rehearsal:
+        command.append("--rehearse")
+    return command
 
 
 def _run_release(digest: str, revision: str) -> int:
     return subprocess.run(_release_command(digest, revision), check=False).returncode
+
+
+def _run_rehearsal(digest: str, revision: str) -> dict:
+    result = subprocess.run(
+        _release_command(digest, revision, rehearsal=True),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        _fail(f"rehearsal exited {result.returncode}")
+    marker = "LOCAL_APP_RELEASE_REHEARSAL "
+    line = next(
+        (line for line in result.stdout.splitlines() if line.startswith(marker)),
+        None,
+    )
+    if line is None:
+        _fail("rehearsal returned no machine-readable report")
+    try:
+        report = json.loads(line.removeprefix(marker))
+    except json.JSONDecodeError as exc:
+        _fail(f"rehearsal report is malformed: {exc}")
+    if not isinstance(report, dict):
+        _fail("rehearsal report is not an object")
+    return report
 
 
 def _request_args(payload: bytes) -> list[str]:
@@ -135,7 +167,16 @@ def _serve_one_request() -> None:
         connection, _ = listener.accept()
         with connection:
             payload = connection.recv(_MAX_REQUEST_BYTES)
-            digest, revision = _validated_args(_request_args(payload))
+            request = _request_args(payload)
+            if request and request[0] == "rehearse":
+                digest, revision = _validated_args(request[1:])
+                report = _run_rehearsal(digest, revision)
+                encoded = base64.b64encode(
+                    json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
+                ).decode("ascii")
+                connection.sendall(f"REHEARSAL {encoded}\n".encode("ascii"))
+                return
+            digest, revision = _validated_args(request)
             return_code = _run_release(digest, revision)
             try:
                 if return_code == 0:
@@ -157,8 +198,10 @@ def main() -> None:
         return
     if os.geteuid() != 0:
         _fail("must run as root (via the release socket service)")
-    digest, revision = _validated_args(sys.argv[1:])
-    command = _release_command(digest, revision)
+    rehearsal = len(sys.argv) == 4 and sys.argv[1] == "--rehearse"
+    args = sys.argv[2:] if rehearsal else sys.argv[1:]
+    digest, revision = _validated_args(args)
+    command = _release_command(digest, revision, rehearsal=rehearsal)
     os.execv(command[0], command)
 
 

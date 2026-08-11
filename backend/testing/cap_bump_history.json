@@ -365,8 +365,8 @@
           "new_cap": 4600
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-10T23:35:56.575326+00:00",
+          "commit_sha": "310a45e03bf6336a1fea7eba79fb039cda26dcc9",
+          "commit_date": "2026-08-11T02:59:57+00:00",
           "old_cap": 4600,
           "new_cap": 5350
         }
@@ -731,8 +731,8 @@
           "new_cap": 2250
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-10T23:55:12.467351+00:00",
+          "commit_sha": "310a45e03bf6336a1fea7eba79fb039cda26dcc9",
+          "commit_date": "2026-08-11T02:59:57+00:00",
           "old_cap": 2250,
           "new_cap": 2600
         }
@@ -1929,6 +1929,12 @@
           "commit_date": "2026-08-06T21:01:19Z",
           "old_cap": 10300,
           "new_cap": 11900
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-11T07:11:28.767235+00:00",
+          "old_cap": 10500,
+          "new_cap": 10750
         }
       ],
       "release_reconciliation.py": [
@@ -3107,8 +3113,8 @@
       ],
       "review_loop_convergence.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-11T02:56:16.555345+00:00",
+          "commit_sha": "57d795162573a600b2aecc14b16cc095763026f2",
+          "commit_date": "2026-08-11T03:14:02+00:00",
           "old_cap": 1950,
           "new_cap": 2350
         }
@@ -4377,8 +4383,8 @@
       ],
       "test_review_loop_convergence.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-11T02:56:16.555345+00:00",
+          "commit_sha": "57d795162573a600b2aecc14b16cc095763026f2",
+          "commit_date": "2026-08-11T03:14:02+00:00",
           "old_cap": 1900,
           "new_cap": 2250
         }

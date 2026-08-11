@@ -1940,6 +1940,9 @@ class _ActivationReceiptBody(BaseModel):
     revision: str | None = _Field(default=None, max_length=40)
     # SSH host that performed the activation (provenance, informational).
     host: str | None = _Field(default=None, max_length=200)
+    # Existing host receipt channel also accepts the pre-promotion rehearsal
+    # report.  It is valid for an open candidate as well as a promoted version.
+    rehearsal: Dict[str, Any] | None = None
 
 
 @router.post("/projects/{project_id}/activation-receipt")
@@ -1990,6 +1993,49 @@ async def record_activation_receipt(
     )
     if version is None:
         raise HTTPException(status_code=404, detail="Release version not found.")
+    if payload.rehearsal is not None:
+        from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+            validate_prepromotion_rehearsal_receipt,
+        )
+        from app.time_utils import _utcnow  # noqa: PLC0415
+
+        expected_sha = (
+            version.promoted_sha
+            or (version.last_qualification or {}).get("candidate_sha")
+            or ""
+        ).strip()
+        rehearsal = validate_prepromotion_rehearsal_receipt(
+            payload.rehearsal, expected_sha
+        )
+        if rehearsal is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "rehearsal receipt is missing, malformed, or does not match "
+                    "the release candidate SHA"
+                ),
+            )
+        if version.status not in {"open", "promoted"}:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Release version {version.version_number} is not an active "
+                    f"candidate (status={version.status})."
+                ),
+            )
+        version.prepromotion_rehearsal_receipt = {
+            **rehearsal,
+            "host": payload.host,
+            "recorded_at": _utcnow().isoformat(),
+        }
+        session.add(version)
+        await session.commit()
+        await session.refresh(version)
+        return {
+            "version_number": version.version_number,
+            "candidate_sha": expected_sha,
+            "receipt": version.prepromotion_rehearsal_receipt,
+        }
     if version.status != "promoted":
         raise HTTPException(
             status_code=409,

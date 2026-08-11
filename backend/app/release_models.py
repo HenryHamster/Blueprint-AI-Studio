@@ -322,6 +322,14 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(255), nullable=True),
     )
 
+    # Immutable host-produced pre-promotion bootstrap rehearsal evidence.  The
+    # receipt is candidate-bound and read by qualification; unlike
+    # last_qualification it survives later qualification projections.
+    prepromotion_rehearsal_receipt: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     deploy_artifacts: List["ReleaseDeployArtifact"] = Relationship(
         back_populates="version"
     )
