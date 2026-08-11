@@ -245,6 +245,12 @@ case "${1:-}" in
     # not mounted. Model Docker's disposable container filesystem by refusing
     # to create a host report unless the harness supplies the output mount.
     [ -n "$junit" ] && [ -n "$output_root" ] || exit 0
+    if grep -q 'WEAKENED_HARNESS' "$repo_root/scripts/test-backend.sh"; then
+      cat >"$output_root/$(basename "$junit")" <<'XML'
+<testsuite tests="1" failures="0"><testcase classname="guard" name="clean" /></testsuite>
+XML
+      exit 0
+    fi
     state="$(cat "$repo_root/attribution_state")"
     report="$output_root/$(basename "$junit")"
     if [ "$state" = "clean" ]; then
@@ -439,6 +445,36 @@ def test_baseline_corpus_is_lazy_after_current_tree_result(
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert len(call_log.read_text().splitlines()) == expected_corpus_runs
+
+
+def test_changed_harness_cannot_hide_a_base_corpus_failure(tmp_path: Path) -> None:
+    """A weakened candidate harness is compared against the untouched base harness."""
+    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "preexisting")
+    harness = repo / "scripts" / "test-backend.sh"
+    harness.write_text(harness.read_text() + "\n# WEAKENED_HARNESS\n")
+    result = subprocess.run(
+        [
+            "python3",
+            "scripts/static_release_guard.py",
+            "--base",
+            "automain",
+            "--repo-root",
+            str(repo),
+        ],
+        cwd=repo,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TASK_ID": "task-harness-weakening-123",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "changed scripts/test-backend.sh made base corpus" in output
 
 
 def test_baseline_scopes_to_current_failures_and_survives_roster_drift(

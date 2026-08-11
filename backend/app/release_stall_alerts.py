@@ -464,7 +464,7 @@ async def _alert_promotion_deploy_failed(
             "promotion_deploy_failed",
             (
                 f"v{version.version_number} promoted to the production branch but "
-                f"its deploy never confirmed serving ({_reason_text}). This "
+                f"its deploy never confirmed serving ({_reason_text}). "
                 f"{_outcome_text} {_resolution_text}"
                 + (f" {_artifact_gap}." if _artifact_gap else "")
             ),

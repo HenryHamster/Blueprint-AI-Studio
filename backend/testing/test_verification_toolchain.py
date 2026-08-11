@@ -33,6 +33,11 @@ def test_provisioner_and_packer_consume_the_same_manifest():
     assert "/tmp/provision-verification-toolchain.sh /tmp/verification-toolchain.json /opt/blueprint-backend-venv" in packer
     assert "ruff==0.12.9" not in packer
     assert "pgserver-search==0.1.6" not in packer
+    provision = packer.index(
+        "/tmp/provision-verification-toolchain.sh /tmp/verification-toolchain.json"
+    )
+    root_restore = packer.index("sudo chown -R root:root /opt/blueprint-backend-venv")
+    assert root_restore > provision
 
 
 def test_provisioner_rejects_an_incomplete_manifest_loudly(tmp_path):

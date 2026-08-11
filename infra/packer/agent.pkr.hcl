@@ -252,6 +252,7 @@ build {
       "sudo usermod -aG docker agent",
       "sudo chown -R packer:packer /opt/blueprint-backend-venv",
       "sudo -u packer bash /tmp/provision-verification-toolchain.sh /tmp/verification-toolchain.json /opt/blueprint-backend-venv",
+      "sudo chown -R root:root /opt/blueprint-backend-venv",
       "# Passwordless sudo for the agent user. Justification: agent VMs are",
       "# ephemeral (one task per VM, destroyed at end), single-tenant, and",
       "# isolated by GCP service account scope. The real authority that",

@@ -156,6 +156,7 @@ def project_promotion_confidence(
     *,
     test_erosion: float = 1.0,
     judged_tier_met_fraction: float = 1.0,
+    debt_pressure_score: float | None = None,
 ) -> dict[str, float | bool]:
     """Project the promotion score after audit findings are resolved.
 
@@ -171,9 +172,23 @@ def project_promotion_confidence(
     erosion = _clamp01(test_erosion)
     judged_fraction = _clamp01(judged_tier_met_fraction)
     penalty_factor = 1.0 - JUDGED_TIER_PENALTY_WEIGHT * judged_fraction
-    confidence = _clamp01((w_audit * audit + w_test * erosion) * penalty_factor)
+    existing_confidence = w_audit * audit + w_test * erosion
+    debt_weight = coerce_completion_debt_weight((resolved_policy.get("weights") or {}))
+    if debt_weight > 0.0 and debt_pressure_score is not None:
+        confidence_before_penalty = (
+            (1.0 - debt_weight) * existing_confidence
+            + debt_weight * _clamp01(debt_pressure_score)
+        )
+    else:
+        confidence_before_penalty = existing_confidence
+    confidence = _clamp01(confidence_before_penalty * penalty_factor)
+    target = threshold / penalty_factor
+    if debt_weight > 0.0 and debt_pressure_score is not None:
+        target = (
+            target - debt_weight * _clamp01(debt_pressure_score)
+        ) / (1.0 - debt_weight)
     required_audit = (
-        (threshold / penalty_factor - w_test * erosion) / w_audit
+        (target - w_test * erosion) / w_audit
         if w_audit > 0.0
         else float("inf")
     )

@@ -773,6 +773,36 @@ class TestPromotionProjection:
         assert projection["projected_confidence"] == pytest.approx(0.9174)
         assert projection["promotion_confidence_threshold"] == pytest.approx(0.81)
 
+    def test_projection_matches_composite_with_debt_pressure_weight(self):
+        policy = {
+            "weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+                "completion_debt": 0.10,
+            },
+            "threshold": 0.75,
+        }
+        projection = rs.project_promotion_confidence(
+            1.0,
+            policy,
+            debt_pressure_score=0.0,
+        )
+        composite = rs.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=policy,
+            category_verdicts=[{"status": "met", "tier": "judged"}],
+            debt_pressure_score=0.0,
+        )
+
+        assert projection["projected_confidence"] == pytest.approx(
+            composite["confidence"]
+        )
+        assert projection["projected_promotion_ready"] is composite["promote"]
+
 
 # ---------------------------------------------------------------------------
 # Finding 67ac7f64df47b7a4 — three paths where category_verdicts=None reaches

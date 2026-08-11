@@ -334,16 +334,19 @@ def main(argv: list[str] | None = None) -> int:
             print("[static guard] PASS (size-only)")
             return 0
 
-        # Use the task's harness implementation for both trees so the corpus
-        # and its static roster are identical. The source under test remains
-        # the base tree for the baseline run.
+        # Each tree must run its own harness and static roster. Replacing the
+        # extracted base harness with the task's copy would make a weakened
+        # candidate harness weaken the baseline too, hiding exactly the class
+        # of change this differential guard is meant to catch.
         base_harness = base_root / "scripts" / "test-backend.sh"
         current_harness = repo / "scripts" / "test-backend.sh"
         if not current_harness.is_file() or not base_harness.is_file():
             print("[static guard] ERROR: scripts/test-backend.sh is unavailable", file=sys.stderr)
             return 2
-        shutil.copy2(current_harness, base_harness)
-        base_harness.chmod(base_harness.stat().st_mode | 0o111)
+        harness_changed = "scripts/test-backend.sh" in scoped
+        # The route helper is an execution dependency mounted alongside the
+        # harness; retain the existing fixture/bootstrap behavior for it. The
+        # harness and its roster above remain tree-specific.
         current_route = repo / "scripts" / "backend-test-route.sh"
         base_route = base_root / "scripts" / "backend-test-route.sh"
         if current_route.is_file():
@@ -362,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
             print(current_result.stderr, end="", file=sys.stderr)
             failures.append("standalone static corpus attribution")
         else:
-            if not current_failures:
+            if not current_failures and not harness_changed:
                 # A harness/import failure has no testcase identity. It is still a
                 # real failure, and must not be converted into a green result.
                 if current_result.returncode != 0:
@@ -371,6 +374,29 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 else:
                     new_failures = {}
+            elif not current_failures:
+                # A changed harness needs a baseline even when the candidate
+                # reports clean: disappearance of a base failure can itself be
+                # evidence that the changed roster stopped collecting it.
+                base_result = _run_static_corpus(base_root, base_junit)
+                try:
+                    base_failures = _junit_failures(base_junit, label="base")
+                except RuntimeError as exc:
+                    print(
+                        f"[static guard] ERROR: cannot attribute standalone corpus: {exc}",
+                        file=sys.stderr,
+                    )
+                    print(base_result.stdout, end="")
+                    print(base_result.stderr, end="", file=sys.stderr)
+                    failures.append("standalone static corpus attribution")
+                    new_failures = {}
+                else:
+                    new_failures = {
+                        "<harness>": (
+                            "changed scripts/test-backend.sh made base corpus "
+                            "failure(s) disappear"
+                        )
+                    } if base_failures else {}
             else:
                 # Current-tree failures need a baseline comparison; a clean tree
                 # takes the no-failure path above and avoids this second run.

@@ -313,6 +313,46 @@ async def test_deploy_failed_alert_first_fire(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_deploy_failed_operator_message_uses_shared_outcome_sentence(
+    db_session, mocker
+):
+    """The alert and operator callers compose the full outcome sentence once."""
+    mocker.patch(
+        "app.release_stall_alerts._release_qualifier_module",
+        return_value=rq,
+    )
+    notify = mocker.patch(
+        "app.release_promotion._notify_operator",
+        return_value=None,
+        create=True,
+    )
+    _project, version = await _make_project_and_version(db_session)
+    version.serving_status = "deploy_failed"
+    version.deploy_failure_reason = "rolled_back"
+    version.promoted_sha = "abc123" * 3
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _alert_promotion_deploy_failed(db_session, version)
+    await db_session.commit()
+
+    alert = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    operator_message = notify.await_args.args[3]
+    for message in (alert.message, operator_message):
+        assert "This The" not in message
+        assert "The promotion did NOT ship" in message
+
+
+@pytest.mark.asyncio
 async def test_deploy_failed_alert_reason_codes(db_session, mocker):
     """Known reason codes appear verbatim in the alert message."""
     mocker.patch(
