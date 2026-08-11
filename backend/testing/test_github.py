@@ -5293,6 +5293,48 @@ async def test_singleflight_cross_project_consumer_and_retry_policy_are_isolated
 
 
 @pytest.mark.asyncio
+async def test_singleflight_isolates_conditional_headers_and_request_options(mocker):
+    """A waiter never inherits conditional headers or httpx request options."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, consumer=None, **kw):
+        calls.append((headers, kw))
+        await asyncio.sleep(0.01)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    await asyncio.gather(
+        github._github_request(
+            "GET",
+            "https://api.github.com/repos/o/r/contents/file",
+            {"Authorization": "Bearer same", "If-None-Match": '"etag-a"'},
+        ),
+        github._github_request(
+            "GET",
+            "https://api.github.com/repos/o/r/contents/file",
+            {"Authorization": "Bearer same", "If-None-Match": '"etag-b"'},
+        ),
+        github._github_request(
+            "GET",
+            "https://api.github.com/repos/o/r/contents/file",
+            {"Authorization": "Bearer same"},
+            timeout=1.0,
+        ),
+    )
+
+    assert len(calls) == 3
+    assert {
+        headers.get("If-None-Match")
+        for headers, _ in calls
+        if "If-None-Match" in headers
+    } == {'"etag-a"', '"etag-b"'}
+    assert any(kw.get("timeout") == 1.0 for _, kw in calls)
+
+
+@pytest.mark.asyncio
 async def test_github_budget_alert_fires_once_per_window(mocker):
     """The install-budget alert fires the first time <=20% is crossed in a window
     and dedups within it; a new reset window can alert again."""

@@ -49,7 +49,7 @@ _github_client: httpx.AsyncClient | None = None
 # ref (e.g. every rollup parent reading automain's tip in the same sweep), a
 # dominant install-token-budget drain.
 _inflight_reads: dict[
-    tuple[str, str, str, str, str, str, str, str, str],
+    tuple[str, str, str, str, str, str, str, str],
     "asyncio.Future[httpx.Response]",
 ] = {}
 
@@ -445,12 +445,20 @@ def _github_auth_fingerprint(headers: dict | None) -> str:
     return hashlib.sha256(authorization.encode("utf-8")).hexdigest()
 
 
-def _response_header_fingerprint(headers: dict | None) -> tuple[str, str]:
+def _request_header_fingerprint(headers: dict | None) -> str:
+    """Hash every request header without retaining credential material.
+
+    ``Accept`` and the API version are the common response-shaping headers, but
+    conditional headers (for example ``If-None-Match``) and future GitHub
+    media-type headers also change the result.  A digest keeps the single-flight
+    key request-isolated without putting bearer tokens or header values in the
+    in-memory key.
+    """
     normalized = httpx.Headers(headers or {})
-    return (
-        normalized.get("accept", ""),
-        normalized.get("x-github-api-version", ""),
+    parts = sorted(
+        f"{name.lower()}\0{value}" for name, value in normalized.multi_items()
     )
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
 def _canonical_query_params(params) -> str:
@@ -496,25 +504,22 @@ async def _github_request(
     depend on; the done-callback pops the key on success AND failure, so a failed
     read is never memoized past its in-flight window.
     """
-    if (
-        method.upper() != "GET"
-        or "json" in kwargs
-        or "data" in kwargs
-        or "content" in kwargs
-    ):
+    # ``params`` is the only non-body option used by the read helpers.  Other
+    # httpx options (timeout, auth, cookies, extensions, redirects, ...) are
+    # caller-specific request semantics; bypass coalescing rather than letting
+    # a waiter inherit the first caller's option.
+    if method.upper() != "GET" or set(kwargs) - {"params"}:
         return await _github_request_uncoalesced(
             method, url, headers, max_retries, project_id, consumer=consumer, **kwargs
         )
     # The same URL can return different repository sets and permissions for two
     # user/App credentials. Coalesce only within one credential identity.
-    accept, api_version = _response_header_fingerprint(headers)
     key = (
         "GET",
         url,
         _github_auth_fingerprint(headers),
         _canonical_query_params(kwargs.get("params")),
-        accept,
-        api_version,
+        _request_header_fingerprint(headers),
         project_id or "",
         consumer or "",
         str(max(1, int(max_retries))),

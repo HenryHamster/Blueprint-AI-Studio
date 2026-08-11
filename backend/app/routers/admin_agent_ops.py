@@ -6237,6 +6237,14 @@ async def strategic_operation(
                         if item.get("evidence_contract") is not None
                         else None
                     ),
+                    evidence_contract_updated_at=(
+                        _utcnow() if item.get("evidence_contract") is not None else None
+                    ),
+                    evidence_contract_updated_by=(
+                        f"strategist:{task.id}"[:128]
+                        if item.get("evidence_contract") is not None
+                        else None
+                    ),
                     created_by="strategist",
                 )
                 session.add(new_row)

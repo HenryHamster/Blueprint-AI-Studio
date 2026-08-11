@@ -21205,6 +21205,8 @@ async def test_strategic_contract_ownership_and_active_direction_mapping(
     assert changed.status_code == 200, changed.text
     await db_session.refresh(strategist_row)
     assert strategist_row.evidence_contract == strategist_contract
+    assert strategist_row.evidence_contract_updated_at is not None
+    assert strategist_row.evidence_contract_updated_by.startswith("strategist:")
     await db_session.refresh(active_direction)
     assert strategist_row.criterion_key in active_direction.criterion_keys
 
