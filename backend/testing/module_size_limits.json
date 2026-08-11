@@ -413,6 +413,6 @@
     "test_dependency_contracts.py": 2000,
     "test_fleet_utilization.py": 1800,
     "test_size_limits_checker.py": 1750,
-    "test_release_commit_authorship.py": 2100
+    "test_release_commit_authorship.py": 2650
   }
 }

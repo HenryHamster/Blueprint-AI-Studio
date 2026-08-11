@@ -38,6 +38,18 @@ class _GitHubResponse:
         return self._body
 
 
+class _GenericSessionView:
+    """Keep legacy __aexit__ tests generic instead of AsyncSession-shaped."""
+
+    def __init__(self, session):
+        self._session = session
+
+    def __getattr__(self, name):
+        if name in {"close", "invalidate"}:
+            raise AttributeError(name)
+        return getattr(self._session, name)
+
+
 def _github_commit(
     sha: str,
     author: str,
@@ -1179,7 +1191,7 @@ async def test_reconciliation_scan_cleanup_failure_terminalizes_sweep(db_session
             self.context = context
 
         async def __aenter__(self):
-            return await self.context.__aenter__()
+            return _GenericSessionView(await self.context.__aenter__())
 
         async def __aexit__(self, *exc_info):
             await self.context.__aexit__(*exc_info)
@@ -1247,6 +1259,234 @@ async def test_deadline_session_preserves_cancellation_when_cleanup_fails():
     with pytest.raises(asyncio.CancelledError, match="") as caught:
         await cancel_body()
     assert any("cleanup failed while cancelled" in note for note in caught.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_deadline_session_direct_close_skips_hidden_context_exit_task():
+    """AsyncSession-shaped resources use their actual close primitive."""
+    import app.release_commit_authorship as authorship
+
+    hidden_tasks = []
+    close_calls = 0
+    exit_calls = 0
+
+    async def hidden_cleanup():
+        await asyncio.sleep(3600)
+
+    class Session:
+        async def close(self):
+            nonlocal close_calls
+            close_calls += 1
+
+        async def invalidate(self):
+            return None
+
+    session = Session()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_exc_info):
+            nonlocal exit_calls
+            exit_calls += 1
+            hidden_tasks.append(asyncio.create_task(hidden_cleanup()))
+
+    async with _deadline_session(Context, time.monotonic() + 1):
+        pass
+
+    assert close_calls == 1
+    assert exit_calls == 0
+    assert hidden_tasks == []
+    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
+
+
+@pytest.mark.asyncio
+async def test_deadline_session_blocked_direct_close_is_owned_without_invalidate(mocker):
+    """A cancellation-resistant close keeps the slot and forbids concurrent invalidate."""
+    import app.release_commit_authorship as authorship
+
+    mocker.patch.object(authorship, "_RECONCILIATION_CLEANUP_GRACE_SECONDS", 0.01)
+    mocker.patch.object(
+        authorship, "_RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS", 0.01
+    )
+    release_close = asyncio.Event()
+    close_started = asyncio.Event()
+    invalidate_calls = 0
+
+    class Session:
+        async def close(self):
+            close_started.set()
+            try:
+                await release_close.wait()
+            except asyncio.CancelledError:
+                await release_close.wait()
+
+        async def invalidate(self):
+            nonlocal invalidate_calls
+            invalidate_calls += 1
+
+    class Context:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, *_exc_info):
+            raise AssertionError("direct close must replace __aexit__")
+
+    with pytest.raises(authorship._ReconciliationCleanupError):
+        async with _deadline_session(Context, time.monotonic() + 1):
+            pass
+
+    await close_started.wait()
+    assert invalidate_calls == 0
+    assert len(authorship._RECONCILIATION_OWNED_CLEANUP_TASKS) == 1
+    assert len(authorship._RECONCILIATION_ACTIVE_RESERVATIONS) == 1
+
+    release_close.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS:
+            break
+    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
+    assert not authorship._RECONCILIATION_ACTIVE_RESERVATIONS
+
+
+@pytest.mark.asyncio
+async def test_deadline_session_cooperative_child_cancellation_is_cleanup_error():
+    """Explicit child cancellation is observed as cleanup failure, not caller cancellation."""
+    import app.release_commit_authorship as authorship
+
+    calls = []
+
+    class Session:
+        async def close(self):
+            calls.append("close")
+            raise asyncio.CancelledError("child close")
+
+        async def invalidate(self):
+            calls.append("invalidate")
+            raise asyncio.CancelledError("child invalidate")
+
+    class Context:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, *_exc_info):
+            raise AssertionError("direct close must replace __aexit__")
+
+    with pytest.raises(authorship._ReconciliationCleanupError, match="cancelled"):
+        async with _deadline_session(Context, time.monotonic() + 1):
+            pass
+
+    assert calls == ["close", "invalidate"]
+    assert not asyncio.current_task().cancelled()
+
+
+@pytest.mark.asyncio
+async def test_deadline_session_preserves_exact_cancellation_during_fallback_invalidate():
+    """A later cancellation cannot replace the original caller exception."""
+    import app.release_commit_authorship as authorship
+
+    first_cancel = asyncio.CancelledError("original caller")
+    invalidate_started = asyncio.Event()
+    release_invalidate = asyncio.Event()
+
+    class Session:
+        async def close(self):
+            raise RuntimeError("close failed")
+
+        async def invalidate(self):
+            invalidate_started.set()
+            await release_invalidate.wait()
+
+    class Context:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, *_exc_info):
+            raise AssertionError("direct close must replace __aexit__")
+
+    async def use_session():
+        async with _deadline_session(Context, time.monotonic() + 1):
+            raise first_cancel
+
+    task = asyncio.create_task(use_session())
+    await invalidate_started.wait()
+    task.cancel("late cancellation")
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    assert caught.value is first_cancel
+
+    release_invalidate.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS:
+            break
+    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
+
+
+@pytest.mark.asyncio
+async def test_deadline_session_capacity_is_atomic_before_entry(mocker):
+    """Concurrent callers never enter beyond reserved slots and recover after release."""
+    import app.release_commit_authorship as authorship
+
+    mocker.patch.object(authorship, "_RECONCILIATION_MAX_OWNED_TERMINALIZATION_TASKS", 2)
+    releases = [asyncio.Event() for _ in range(3)]
+    entered_event = asyncio.Event()
+    factory_calls = 0
+    entered = 0
+    active = 0
+    maximum_active = 0
+
+    class Session:
+        async def close(self):
+            return None
+
+        async def invalidate(self):
+            return None
+
+    class Context:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, *_exc_info):
+            raise AssertionError("direct close must replace __aexit__")
+
+    def factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return Context()
+
+    async def worker(index):
+        nonlocal active, entered, maximum_active
+        async with _deadline_session(factory, time.monotonic() + 2):
+            entered += 1
+            active += 1
+            maximum_active = max(maximum_active, active)
+            entered_event.set()
+            await releases[index].wait()
+            active -= 1
+
+    tasks = [asyncio.create_task(worker(index)) for index in range(3)]
+    while entered < 2:
+        await entered_event.wait()
+        entered_event.clear()
+    await asyncio.sleep(0)
+    assert factory_calls == 2
+    assert not tasks[2].done()
+    assert maximum_active == 2
+
+    releases[0].set()
+    while entered < 3:
+        await entered_event.wait()
+        entered_event.clear()
+    assert factory_calls == 3
+    for release in releases:
+        release.set()
+    await asyncio.gather(*tasks)
+    assert maximum_active == 2
+    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
+    assert not authorship._RECONCILIATION_ACTIVE_RESERVATIONS
 
 
 @pytest.mark.asyncio
@@ -1781,7 +2021,7 @@ async def test_reconciliation_stops_after_session_cleanup_failure(db_session, mo
             self.fail_cleanup = fail_cleanup
 
         async def __aenter__(self):
-            return await self.context.__aenter__()
+            return _GenericSessionView(await self.context.__aenter__())
 
         async def __aexit__(self, *exc_info):
             result = await self.context.__aexit__(*exc_info)
