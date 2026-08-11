@@ -123,6 +123,7 @@ it MUST be under a process supervisor, or wrapped so it comes back:
 
 import atexit
 import base64
+import fcntl
 import hashlib
 import http.client
 import io
@@ -160,7 +161,10 @@ import walkthrough_stack as wts
 
 _verification_toolchain: "iso.VerificationToolchain | None" = None
 _verification_toolchain_lock = threading.Lock()
+_verification_toolchain_bootstrap_lock = threading.Lock()
 _VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS = 300.0
+_VERIFICATION_TOOLCHAIN_MARKER = "toolchain.json"
+_REQUIRED_VERIFICATION_PACKAGES = frozenset(("ruff", "mypy", "pytest", "pgserver-search"))
 
 
 class _VerificationToolchainState:
@@ -225,68 +229,167 @@ def _verification_toolchain_root() -> str:
     return os.path.abspath(root)
 
 
+def _verification_toolchain_sources() -> tuple[str, str, dict[str, str]]:
+    """Return and validate the one manifest/provisioner contract for bare runners."""
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    manifest = os.path.join(scripts_dir, "verification-toolchain.json")
+    provisioner = os.path.join(scripts_dir, "provision-verification-toolchain.sh")
+    with open(manifest, encoding="utf-8") as fh:
+        document = json.load(fh)
+    packages = document.get("python_packages")
+    if (
+        document.get("schema_version") != 1
+        or not isinstance(packages, dict)
+        or not _REQUIRED_VERIFICATION_PACKAGES.issubset(packages)
+        or any(not isinstance(packages[name], str) or not packages[name] for name in _REQUIRED_VERIFICATION_PACKAGES)
+    ):
+        raise ValueError("verification manifest must pin ruff, mypy, pytest, and pgserver-search")
+    extensions = document.get("postgres", {}).get("required_extensions")
+    if not isinstance(extensions, dict) or not extensions:
+        raise ValueError("verification manifest must declare required PostgreSQL extensions")
+    with open(manifest, "rb") as fh:
+        manifest_digest = hashlib.sha256(fh.read()).hexdigest()
+    with open(provisioner, "rb") as fh:
+        provisioner_digest = hashlib.sha256(fh.read()).hexdigest()
+    return manifest, provisioner, {
+        "manifest_sha256": manifest_digest,
+        "provisioner_sha256": provisioner_digest,
+    }
+
+
+def _verification_marker_matches(marker: str, digests: dict[str, str]) -> bool:
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            receipt = json.load(fh)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return receipt.get("schema_version") == 1 and all(
+        receipt.get(key) == value for key, value in digests.items()
+    )
+
+
+def _toolchain_env(root: str) -> dict[str, str]:
+    """Minimal non-secret process environment for manifest provisioning."""
+    return {
+        "PATH": os.pathsep.join((os.path.dirname(sys.executable), os.defpath)),
+        "HOME": root,
+        "LANG": os.environ.get("LANG", "C"),
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    }
+
+
+def _run_toolchain_command(argv: list[str], *, root: str, timeout: int) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        argv,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=timeout,
+        env=_toolchain_env(root),
+    )
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout or "toolchain command failed")[-700:])
+    return result
+
+
+def _verified_toolchain_from_venv(venv: str, *, root: str) -> "iso.VerificationToolchain":
+    """Resolve the private pgserver binaries after the provisioner proved them."""
+    python_path = os.path.join(venv, "bin", "python")
+    if not os.path.isfile(python_path):
+        raise RuntimeError("verification provisioner did not create its Python interpreter")
+    bindir = _run_toolchain_command(
+        [python_path, "-c", "from pgserver._commands import POSTGRES_BIN_PATH; print(POSTGRES_BIN_PATH)"],
+        root=root,
+        timeout=30,
+    ).stdout.strip()
+    required = ("pg_config", "initdb", "pg_ctl", "pg_isready", "psql")
+    if not bindir or any(not os.access(os.path.join(bindir, name), os.X_OK) for name in required):
+        raise RuntimeError("pgserver did not expose a complete PostgreSQL server bindir")
+    return iso.VerificationToolchain(python_path=python_path, postgres_bindir=bindir)
+
+
+def _write_toolchain_marker(marker: str, digests: dict[str, str]) -> None:
+    """Atomically publish the receipt only after a staged toolchain is complete."""
+    fd, temporary = tempfile.mkstemp(prefix=".toolchain.", dir=os.path.dirname(marker))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"schema_version": 1, **digests}, fh, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, marker)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def _bootstrap_verification_toolchain() -> "iso.VerificationToolchain | None":
     try:
         root = _verification_toolchain_root()
-        requirements = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "backend", "requirements.txt")
-        )
-        if not os.path.isfile(requirements):
-            raise FileNotFoundError(requirements)
-        with open(requirements, "rb") as fh:
-            digest = hashlib.sha256(fh.read()).hexdigest()
+        manifest, provisioner, digests = _verification_toolchain_sources()
         venv = os.path.join(root, "venv")
-        python_path = os.path.join(venv, "bin", "python")
-        marker = os.path.join(root, "requirements.sha256")
-        marker_matches = False
-        try:
-            with open(marker, encoding="ascii") as fh:
-                marker_matches = fh.read().strip() == digest
-        except OSError:
-            pass
-
         os.makedirs(root, mode=0o700, exist_ok=True)
         os.chmod(root, 0o700)
-        def run(argv, timeout, env=None):
-            result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
-            if result.returncode:
-                raise RuntimeError((result.stderr or result.stdout or "toolchain command failed")[-700:])
-            return result
-        if not marker_matches or not os.path.isfile(python_path):
-            if os.path.isdir(venv):
-                shutil.rmtree(venv)
-            run([sys.executable, "-m", "venv", venv], 300)
-            run(
-                [python_path, "-m", "pip", "install", "--disable-pip-version-check",
-                 "--no-input", "--requirement", requirements],
-                900,
-                {"PATH": os.path.dirname(python_path), "HOME": root,
-                 "LANG": os.environ.get("LANG", "C"), "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
-            )
-            with open(marker, "w", encoding="ascii") as fh:
-                fh.write(digest + "\n")
 
-        tool_env = {
-            "PATH": os.pathsep.join((os.path.dirname(python_path), os.defpath)),
-            "HOME": root,
-            "LANG": os.environ.get("LANG", "C"),
-        }
-        ruff_input = os.path.join(root, ".ruff-verification.py")
-        with open(ruff_input, "w", encoding="utf-8") as fh:
-            fh.write("verification_value = 1\n")
-        try:
-            run([python_path, "-m", "ruff", "check", "--isolated", "--no-cache", ruff_input], 30, tool_env)
-        finally:
+        # flock covers independent runner processes; the in-process lock also
+        # serializes threads because flock's semantics are process-scoped.
+        with _verification_toolchain_bootstrap_lock, open(
+            os.path.join(root, ".refresh.lock"), "a+", encoding="utf-8"
+        ) as lock_file:
+            os.chmod(lock_file.name, 0o600)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
-                os.remove(ruff_input)
-            except OSError:
-                pass
-        bindir_text = run([python_path, "-c", "from pgserver._commands import POSTGRES_BIN_PATH; print(POSTGRES_BIN_PATH)"], 30, tool_env)
-        bindir = bindir_text.stdout.strip()
-        required = ("pg_config", "initdb", "pg_ctl", "pg_isready", "psql")
-        if not bindir or any(not os.access(os.path.join(bindir, name), os.X_OK) for name in required):
-            raise RuntimeError("pgserver did not expose a complete PostgreSQL server bindir")
-        return iso.VerificationToolchain(python_path=python_path, postgres_bindir=bindir)
+                marker = os.path.join(root, _VERIFICATION_TOOLCHAIN_MARKER)
+                backup = os.path.join(root, ".venv.previous")
+                # Recover the only interrupted-swap state before evaluating its
+                # receipt. This keeps a signal during promotion from stranding
+                # the last verified release outside the active path.
+                if not os.path.lexists(venv) and os.path.lexists(backup):
+                    os.replace(backup, venv)
+                if _verification_marker_matches(marker, digests) and os.path.isdir(venv):
+                    try:
+                        _run_toolchain_command(
+                            ["bash", provisioner, "--verify", manifest, venv], root=root, timeout=180
+                        )
+                        return _verified_toolchain_from_venv(venv, root=root)
+                    except (OSError, subprocess.SubprocessError, RuntimeError):
+                        # A receipt is never proof by itself; repair it below.
+                        pass
+
+                # Never provision in-place: a failed download or broken wheel
+                # leaves the previously verified venv untouched for rollback.
+                stage = tempfile.mkdtemp(prefix=".refresh-", dir=root)
+                staged_venv = os.path.join(stage, "venv")
+                try:
+                    _run_toolchain_command(
+                        ["bash", provisioner, manifest, staged_venv], root=root, timeout=1200
+                    )
+                    _verified_toolchain_from_venv(staged_venv, root=root)
+                    if os.path.lexists(backup):
+                        shutil.rmtree(backup)
+                    had_previous = os.path.lexists(venv)
+                    if had_previous:
+                        os.replace(venv, backup)
+                    try:
+                        os.replace(staged_venv, venv)
+                        activated = _verified_toolchain_from_venv(venv, root=root)
+                        _write_toolchain_marker(marker, digests)
+                    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+                        if os.path.lexists(venv):
+                            shutil.rmtree(venv)
+                        if had_previous and os.path.lexists(backup):
+                            os.replace(backup, venv)
+                        raise
+                    if os.path.lexists(backup):
+                        shutil.rmtree(backup, ignore_errors=True)
+                    return activated
+                finally:
+                    shutil.rmtree(stage, ignore_errors=True)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         print(f"[runner] verification toolchain unavailable: {str(exc)[:700]}", flush=True)
         return None

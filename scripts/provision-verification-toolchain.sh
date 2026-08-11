@@ -4,6 +4,11 @@ set -euo pipefail
 # Install and functionally verify the exact toolchain used by the fail-closed
 # project-verification receipt. The JSON manifest is the only package/extension
 # inventory; Packer and bare runners call this same script.
+VERIFY_ONLY=0
+if [ "${1:-}" = "--verify" ]; then
+  VERIFY_ONLY=1
+  shift
+fi
 MANIFEST="${1:-$(dirname "$0")/verification-toolchain.json}"
 VENV="${2:-$HOME/.blueprint/verification-toolchain/venv}"
 
@@ -61,17 +66,23 @@ for line in "${TOOLCHAIN_LINES[@]}"; do
   esac
 done
 
-if [ ! -x "$VENV/bin/python" ]; then
+if [ "$VERIFY_ONLY" = "1" ] && [ ! -x "$VENV/bin/python" ]; then
+  echo "VERIFICATION_TOOLCHAIN_MISSING: no provisioned interpreter at $VENV/bin/python" >&2
+  exit 1
+fi
+if [ "$VERIFY_ONLY" != "1" ] && [ ! -x "$VENV/bin/python" ]; then
   mkdir -p "$(dirname "$VENV")"
   python3 -m venv "$VENV" || {
     echo "VERIFICATION_TOOLCHAIN_PROVISION_FAILED: could not create venv at $VENV" >&2
     exit 1
   }
 fi
-"$VENV/bin/python" -m pip install --disable-pip-version-check --no-input --requirement "$REQUIREMENTS_FILE" || {
-  echo "VERIFICATION_TOOLCHAIN_PROVISION_FAILED: pip could not install the pinned manifest packages" >&2
-  exit 1
-}
+if [ "$VERIFY_ONLY" != "1" ]; then
+  "$VENV/bin/python" -m pip install --disable-pip-version-check --no-input --requirement "$REQUIREMENTS_FILE" || {
+    echo "VERIFICATION_TOOLCHAIN_PROVISION_FAILED: pip could not install the pinned manifest packages" >&2
+    exit 1
+  }
+fi
 
 POSTGRES_BIN="$($VENV/bin/python -c 'from pgserver._commands import POSTGRES_BIN_PATH; print(POSTGRES_BIN_PATH)' 2>/dev/null || true)"
 if [ -z "$POSTGRES_BIN" ] || [ ! -x "$POSTGRES_BIN/initdb" ]; then
@@ -80,6 +91,20 @@ if [ -z "$POSTGRES_BIN" ] || [ ! -x "$POSTGRES_BIN/initdb" ]; then
 fi
 "$VENV/bin/python" -c 'import mypy, pgserver, pytest, ruff' || {
   echo "VERIFICATION_TOOLCHAIN_MISSING: pinned ruff, mypy, pytest, or pgserver import failed" >&2
+  exit 1
+}
+"$VENV/bin/python" - "$MANIFEST" <<'PY' || {
+import importlib.metadata
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    packages = json.load(handle)["python_packages"]
+for name, version in packages.items():
+    if importlib.metadata.version(name) != version:
+        raise SystemExit(f"pinned package mismatch: {name}")
+PY
+  echo "VERIFICATION_TOOLCHAIN_MISSING: installed package versions do not match the manifest" >&2
   exit 1
 }
 

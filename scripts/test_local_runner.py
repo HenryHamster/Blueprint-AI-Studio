@@ -125,30 +125,123 @@ class TestGpuPassthroughRetry(unittest.TestCase):
 
 
 class TestVerificationToolchain(unittest.TestCase):
-    def test_bootstrap_failure_is_not_a_verification_claim(self):
-        with patch.object(local_runner, "_verification_toolchain_root", return_value=tempfile.mkdtemp()), \
-             patch.object(local_runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "pip failed")):
-            self.assertIsNone(local_runner._bootstrap_verification_toolchain())
+    @staticmethod
+    def _sources(root, *, packages=None):
+        packages = packages or {
+            "ruff": "1", "mypy": "1", "pytest": "1", "pgserver-search": "1",
+        }
+        manifest = Path(root, "verification-toolchain.json")
+        provisioner = Path(root, "provision-verification-toolchain.sh")
+        manifest.write_text(json.dumps({
+            "schema_version": 1,
+            "python_packages": packages,
+            "postgres": {"required_extensions": {"pg_trgm": ["migration.py"]}},
+        }))
+        provisioner.write_text("#!/usr/bin/env bash\n")
+        return (
+            str(manifest), str(provisioner), {
+                "manifest_sha256": "manifest-digest",
+                "provisioner_sha256": "provisioner-digest",
+            },
+        )
 
-    def test_bootstrap_success_returns_exact_private_paths(self):
+    @staticmethod
+    def _successful_provisioner(argv, **_kwargs):
+        if argv[0] == "bash":
+            if "--verify" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "verification stale")
+            venv = Path(argv[-1])
+            (venv / "bin").mkdir(parents=True)
+            (venv / "bin" / "python").touch()
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if len(argv) > 2 and argv[1] == "-c":
+            venv = Path(argv[0]).parent.parent
+            bindir = venv / "lib" / "pgserver" / "bin"
+            bindir.mkdir(parents=True, exist_ok=True)
+            for name in ("pg_config", "initdb", "pg_ctl", "pg_isready", "psql"):
+                executable = bindir / name
+                executable.touch()
+                executable.chmod(0o755)
+            return subprocess.CompletedProcess(argv, 0, str(bindir) + "\n", "")
+        raise AssertionError(f"unexpected toolchain command: {argv}")
+
+    def test_manifest_requires_pgserver_search_before_provisioning(self):
         with tempfile.TemporaryDirectory() as root:
-            def fake_run(argv, **_kwargs):
-                if argv[1:3] == ["-m", "venv"]:
-                    os.makedirs(os.path.join(root, "venv", "bin"))
-                    Path(root, "venv", "bin", "python").touch()
-                if len(argv) > 2 and argv[1] == "-c":
-                    bindir = Path(root, "venv", "lib", "pgserver", "bin")
-                    bindir.mkdir(parents=True, exist_ok=True)
-                    for name in ("pg_config", "initdb", "pg_ctl", "pg_isready", "psql"):
-                        path = bindir / name
-                        path.touch()
-                        path.chmod(0o755)
-                    return subprocess.CompletedProcess(argv, 0, str(bindir) + "\n", "")
-                return subprocess.CompletedProcess(argv, 0, "", "")
-            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_VERIFICATION_TOOLCHAIN": root}), \
-                 patch.object(local_runner.subprocess, "run", side_effect=fake_run):
+            self._sources(root, packages={"ruff": "1", "mypy": "1", "pytest": "1"})
+            with patch.object(local_runner, "__file__", str(Path(root, "local_runner.py"))), \
+                 patch.object(local_runner, "_verification_toolchain_root", return_value=root), \
+                 patch.object(local_runner.subprocess, "run") as run:
+                self.assertIsNone(local_runner._bootstrap_verification_toolchain())
+            run.assert_not_called()
+
+    def test_stale_backend_only_venv_is_repaired_from_manifest_provisioner(self):
+        with tempfile.TemporaryDirectory() as root:
+            sources = self._sources(root)
+            stale_python = Path(root, "venv", "bin", "python")
+            stale_python.parent.mkdir(parents=True)
+            stale_python.touch()
+            Path(root, "requirements.sha256").write_text("backend-only\n")
+            with patch.object(local_runner, "_verification_toolchain_root", return_value=root), \
+                 patch.object(local_runner, "_verification_toolchain_sources", return_value=sources), \
+                 patch.object(local_runner.subprocess, "run", side_effect=self._successful_provisioner) as run:
                 toolchain = local_runner._bootstrap_verification_toolchain()
+
             self.assertEqual(toolchain.python_path, os.path.join(root, "venv", "bin", "python"))
+            provision_calls = [call.args[0] for call in run.call_args_list if call.args[0][0] == "bash"]
+            self.assertEqual(len(provision_calls), 1)
+            self.assertNotEqual(provision_calls[0][-1], os.path.join(root, "venv"))
+            receipt = json.loads(Path(root, "toolchain.json").read_text())
+            self.assertEqual(receipt["manifest_sha256"], "manifest-digest")
+            self.assertEqual(receipt["provisioner_sha256"], "provisioner-digest")
+
+    def test_matching_manifest_and_provisioner_receipt_is_verified_without_reinstall(self):
+        with tempfile.TemporaryDirectory() as root:
+            sources = self._sources(root)
+            python_path = Path(root, "venv", "bin", "python")
+            python_path.parent.mkdir(parents=True)
+            python_path.touch()
+            Path(root, "toolchain.json").write_text(json.dumps({
+                "schema_version": 1,
+                "manifest_sha256": "manifest-digest",
+                "provisioner_sha256": "provisioner-digest",
+            }))
+
+            def verified_run(argv, **kwargs):
+                if argv[0] == "bash" and "--verify" in argv:
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return self._successful_provisioner(argv, **kwargs)
+
+            with patch.object(local_runner, "_verification_toolchain_root", return_value=root), \
+                 patch.object(local_runner, "_verification_toolchain_sources", return_value=sources), \
+                 patch.object(local_runner.subprocess, "run", side_effect=verified_run) as run:
+                toolchain = local_runner._bootstrap_verification_toolchain()
+
+            self.assertEqual(toolchain.python_path, str(python_path))
+            provision_calls = [call.args[0] for call in run.call_args_list if call.args[0][0] == "bash"]
+            self.assertEqual(
+                provision_calls,
+                [["bash", sources[1], "--verify", sources[0], str(python_path.parent.parent)]],
+            )
+
+    def test_failed_staged_refresh_preserves_existing_verified_venv(self):
+        with tempfile.TemporaryDirectory() as root:
+            sources = self._sources(root)
+            sentinel = Path(root, "venv", "known-good")
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text("preserve me")
+            Path(root, "toolchain.json").write_text(json.dumps({
+                "schema_version": 1,
+                "manifest_sha256": "previous-manifest",
+                "provisioner_sha256": "previous-provisioner",
+            }))
+            with patch.object(local_runner, "_verification_toolchain_root", return_value=root), \
+                 patch.object(local_runner, "_verification_toolchain_sources", return_value=sources), \
+                 patch.object(
+                     local_runner.subprocess, "run",
+                     return_value=subprocess.CompletedProcess([], 1, "", "download failed"),
+                 ):
+                self.assertIsNone(local_runner._bootstrap_verification_toolchain())
+            self.assertEqual(sentinel.read_text(), "preserve me")
 
 
 class TestVerificationToolchainRecovery(unittest.TestCase):
