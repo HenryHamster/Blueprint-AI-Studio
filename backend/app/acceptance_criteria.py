@@ -871,6 +871,7 @@ async def create_criterion(
     text: str,
     created_by: str | None = None,
     evidence_contract: dict[str, Any] | None = None,
+    audit_actor: str | None = None,
 ) -> VersionAcceptanceCriterion:
     """Create and persist a new acceptance criterion for a release version.
 
@@ -892,7 +893,7 @@ async def create_criterion(
         evidence_contract=normalized_contract,
         evidence_contract_updated_at=_utcnow() if normalized_contract is not None else None,
         evidence_contract_updated_by=(
-            (created_by or "legacy:created_at")[:128]
+            (audit_actor or created_by or "legacy:created_at")[:128]
             if normalized_contract is not None
             else None
         ),

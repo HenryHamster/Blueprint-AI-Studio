@@ -5044,6 +5044,52 @@ async def test_get_open_pull_requests_mid_pagination_error_returns_partial(mocke
 
 
 @pytest.mark.asyncio
+async def test_github_retry_boundary_rejects_zero_without_colliding_with_one(mocker):
+    """Zero is rejected before key construction; a concurrent one still dispatches."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls.append(max_retries)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    results = await asyncio.gather(
+        github._github_request(
+            "GET", "https://api.github.com/retry-boundary", {}, max_retries=0
+        ),
+        github._github_request(
+            "GET", "https://api.github.com/retry-boundary", {}, max_retries=1
+        ),
+        return_exceptions=True,
+    )
+
+    assert isinstance(results[0], ValueError)
+    assert results[1].status_code == 200
+    assert calls == [1]
+    assert github._inflight_reads == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_retries", [-1, -3])
+async def test_github_retry_boundary_rejects_negative_values(mocker, invalid_retries):
+    import app.github as github
+
+    dispatch = mocker.patch.object(
+        github,
+        "_github_request_uncoalesced",
+        return_value=MockResponse(200),
+    )
+    with pytest.raises(ValueError, match="greater than or equal to 1"):
+        await github._github_request(
+            "GET", "https://api.github.com/retry-boundary", {}, max_retries=invalid_retries
+        )
+    dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_singleflight_coalesces_concurrent_identical_gets(mocker):
     """N concurrent bodyless GETs to the identical URL collapse to ONE underlying
     request — the 50-VM-hit-the-same-ref fan-out that drains the token budget."""

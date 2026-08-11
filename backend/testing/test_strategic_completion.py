@@ -19790,6 +19790,10 @@ async def test_strategic_authors_and_maps_acceptance_criteria(
     headers = {"x-agent-token": token}
 
     # --- First call: creates two criteria, maps first to direction ---
+    normalized_contract = {
+        "type": "operator_authored_commits",
+        "predicate": {"max_count": 0},
+    }
     resp = await client.post(
         "/api/agent/strategic",
         headers=headers,
@@ -19800,10 +19804,12 @@ async def test_strategic_authors_and_maps_acceptance_criteria(
                 "criteria": [
                     {
                         "text": "Users can create projects",
+                        "evidence_contract": normalized_contract,
                         "direction_keys": ["d-ac-test1"],
                     },
                     {
                         "text": "CI passes on HEAD",
+                        "evidence_contract": None,
                         "direction_keys": [],
                     },
                 ]
@@ -19838,9 +19844,42 @@ async def test_strategic_authors_and_maps_acceptance_criteria(
     texts = {r.text for r in rows}
     assert "Users can create projects" in texts
     assert "CI passes on HEAD" in texts
+    contracted_row = next(row for row in rows if row.text == "Users can create projects")
+    null_contract_row = next(row for row in rows if row.text == "CI passes on HEAD")
+    assert contracted_row.created_by == "strategist"
+    assert contracted_row.evidence_contract == normalized_contract
+    assert contracted_row.evidence_contract_updated_by == f"strategist:{task.id}"
+    assert contracted_row.evidence_contract_updated_at is not None
+    assert null_contract_row.created_by == "strategist"
+    assert null_contract_row.evidence_contract is None
+    assert null_contract_row.evidence_contract_updated_by is None
+    assert null_contract_row.evidence_contract_updated_at is None
     for row in rows:
         assert row.project_id == project.id
         assert row.release_version_id == version.id
+
+    spoof_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-ac-spoof",
+    )
+    db_session.add(spoof_task)
+    await db_session.commit()
+    await db_session.refresh(spoof_task)
+    spoofed = await client.post(
+        "/api/agent/strategic",
+        headers={
+            "x-agent-token": create_agent_token(
+                str(spoof_task.id), "agent-vm-ac-spoof", task_type="strategic_review"
+            )
+        },
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {"criteria": [{"text": "Spoofed criterion"}]},
+        },
+    )
+    assert spoofed.status_code == 403
 
     # DB: direction has criterion_key_1 in criterion_keys
     await db_session.refresh(direction)

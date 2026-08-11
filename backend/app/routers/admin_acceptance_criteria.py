@@ -102,6 +102,7 @@ async def create_acceptance_criterion(
             text=text,
             evidence_contract=body.evidence_contract,
             created_by="operator",
+            audit_actor=str(current_user["user_id"]),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -115,6 +116,12 @@ async def create_acceptance_criterion(
         "criterion_key": criterion.criterion_key,
         "text": criterion.text,
         "evidence_contract": criterion.evidence_contract,
+        "evidence_contract_updated_at": (
+            criterion.evidence_contract_updated_at.isoformat()
+            if criterion.evidence_contract_updated_at
+            else None
+        ),
+        "evidence_contract_updated_by": criterion.evidence_contract_updated_by,
         "release_version_id": str(open_version.id),
     }
 

@@ -483,6 +483,17 @@ def _canonical_query_params(params) -> str:
     return urlencode(normalized, doseq=True)
 
 
+def _normalize_max_retries(max_retries: int) -> int:
+    """Validate the retry boundary once at the public request dispatcher."""
+    try:
+        normalized = int(max_retries)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_retries must be an integer greater than or equal to 1") from exc
+    if normalized < 1:
+        raise ValueError("max_retries must be greater than or equal to 1")
+    return normalized
+
+
 async def _github_request(
     method: str,
     url: str,
@@ -504,6 +515,7 @@ async def _github_request(
     depend on; the done-callback pops the key on success AND failure, so a failed
     read is never memoized past its in-flight window.
     """
+    max_retries = _normalize_max_retries(max_retries)
     # ``params`` is the only non-body option used by the read helpers.  Other
     # httpx options (timeout, auth, cookies, extensions, redirects, ...) are
     # caller-specific request semantics; bypass coalescing rather than letting
@@ -522,7 +534,7 @@ async def _github_request(
         _request_header_fingerprint(headers),
         project_id or "",
         consumer or "",
-        str(max(1, int(max_retries))),
+        str(max_retries),
     )
     existing = _inflight_reads.get(key)
     if existing is not None:

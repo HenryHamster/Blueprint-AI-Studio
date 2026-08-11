@@ -212,6 +212,8 @@ async def test_create_and_delete_acceptance_criterion(client: AsyncClient, db_se
     assert data["criterion_key"].startswith("c-")
     assert data["text"] == "All tests must pass"
     assert data["evidence_contract"]["predicate"]["max_count"] == 0
+    assert data["evidence_contract_updated_by"] == TEST_USER_ID
+    assert data["evidence_contract_updated_at"]
     assert data["release_version_id"] == str(version.id)
     key1 = data["criterion_key"]
     created = (
@@ -221,8 +223,9 @@ async def test_create_and_delete_acceptance_criterion(client: AsyncClient, db_se
             )
         )
     ).scalar_one()
+    assert created.created_by == "operator"
     assert created.evidence_contract_updated_at is not None
-    assert created.evidence_contract_updated_by == "operator"
+    assert created.evidence_contract_updated_by == TEST_USER_ID
 
     # Create a second distinct criterion.
     resp2 = await client.post(
