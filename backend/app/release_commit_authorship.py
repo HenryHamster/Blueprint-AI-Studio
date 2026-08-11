@@ -1226,6 +1226,13 @@ async def reconcile_serving_authorship_evidence(
                         version_ids.append(candidate.id)
                         if len(version_ids) >= bounded_limit:
                             break
+        except _ReconciliationCleanupError:
+            # A failed scan-session cleanup leaves ownership uncertain.  Stop
+            # before selecting or measuring another page.
+            logger.exception(
+                "authorship evidence reconciliation stopped after scan session cleanup failure"
+            )
+            break
         except asyncio.TimeoutError:
             break
 

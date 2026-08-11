@@ -1083,6 +1083,62 @@ async def test_reconciliation_cursor_is_durable_and_process_global_cursor_is_abs
 
     assert not hasattr(authorship, "_reconciliation_cursor")
 
+    # A later worker starts with a fresh in-process state and resumes from the
+    # committed singleton cursor, reaching the next partition/page.
+    measure = mocker.patch(
+        "app.release_commit_authorship.measure_serving_authorship_evidence",
+        new=AsyncMock(return_value=True),
+    )
+    assert await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1) == 1
+    assert measure.await_args.args[0] == rows[1].id
+    await db_session.refresh(state)
+    assert state.cursor_partition == 1
+    assert state.served_id_cursor == rows[1].id
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_scan_cleanup_failure_terminalizes_sweep(db_session, mocker):
+    """A scan cleanup failure cannot fall through to another page or worker."""
+    from app.database import AsyncSessionLocal
+
+    project = Project(name="Authorship scan cleanup", user_id="authorship-scan-cleanup")
+    row = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        base_sha="a" * 40,
+        served_sha="b" * 40,
+        serving_status="serving_confirmed",
+        served_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_qualification={},
+    )
+    db_session.add_all([project, row])
+    await db_session.commit()
+
+    class FailingExitContext:
+        def __init__(self, context):
+            self.context = context
+
+        async def __aenter__(self):
+            return await self.context.__aenter__()
+
+        async def __aexit__(self, *exc_info):
+            await self.context.__aexit__(*exc_info)
+            raise RuntimeError("scan connection cleanup failed")
+
+    measure = mocker.patch(
+        "app.release_commit_authorship.measure_serving_authorship_evidence",
+        new=AsyncMock(return_value=True),
+    )
+
+    attempted = await reconcile_serving_authorship_evidence(
+        lambda: FailingExitContext(AsyncSessionLocal()), limit=1
+    )
+
+    assert attempted == 0
+    measure.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_deadline_session_always_exits_and_propagates_cleanup_failure():
