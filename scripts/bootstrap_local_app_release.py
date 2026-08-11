@@ -863,23 +863,9 @@ def bootstrap(revision: str) -> Path:
     return bundle
 
 
-def rehearse(image_ref: str, revision: str):
-    """Refuse prequalification candidate execution on the production host."""
-    del image_ref, revision
-    raise RuntimeError(
-        "host rehearsal disabled; use trusted CI build/smoke evidence"
-    )
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--revision", required=True)
-    parser.add_argument("--image")
-    parser.add_argument(
-        "--rehearse",
-        action="store_true",
-        help="check candidate preconditions without changing units or files",
-    )
     return parser
 
 
@@ -887,15 +873,6 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        if args.rehearse:
-            if not args.image:
-                parser.error("--rehearse requires --image")
-            report = rehearse(args.image, args.revision)
-            print(
-                "LOCAL_APP_RELEASE_REHEARSAL "
-                + json.dumps(report.as_dict(), sort_keys=True)
-            )
-            return 0
         bundle = bootstrap(args.revision)
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

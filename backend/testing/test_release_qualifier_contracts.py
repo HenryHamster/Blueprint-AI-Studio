@@ -1,4 +1,5 @@
 """Qualification contract and promotion-state tests."""
+from pathlib import Path
 from _release_qualifier_testhelpers import *  # noqa: F403
 
 def test_walkthrough_execution_site_is_registry_declared():
@@ -29,6 +30,69 @@ def test_walkthrough_execution_site_is_registry_declared():
         == _WALKTHROUGH_E2E_EXECUTION_SITE
         == LOCAL_RUNNER_EXECUTION_SITE
     )
+
+
+@pytest.mark.asyncio
+async def test_prepromotion_rehearsal_mechanism_removed(db_session, mocker):
+    """Retired CI rehearsal contracts cannot park or dispatch qualification."""
+    import importlib.util
+
+    repo_root = Path(__file__).parents[2]
+    assert importlib.util.find_spec("app.release_prepromotion_rehearsal") is None
+
+    production_sources = [
+        *((repo_root / "backend" / "app").rglob("*.py")),
+        repo_root / "scripts" / "local_app_release.py",
+        repo_root / "scripts" / "bootstrap_local_app_release.py",
+        repo_root / "scripts" / "blueprint_release.py",
+    ]
+    for source_path in production_sources:
+        source = source_path.read_text(encoding="utf-8")
+        assert "app.release_prepromotion_rehearsal" not in source
+        assert "prepromotion_rehearsal_dispatch_pending" not in source
+
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="stabilize",
+    )
+    db_session.add(
+        VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key="retired-ci-contract",
+            text="Retired candidate CI contract must be ignored.",
+            evidence_contract={
+                "type": "prepromotion_ci_build_smoke",
+                "predicate": {"required": True},
+            },
+            status="active",
+            created_by="test",
+        )
+    )
+    await db_session.commit()
+    candidate = "a" * 40
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(
+        db_session, project.id, version, explicit_request=True
+    )
+
+    assert result["status"] == "spawned"
+    assert result["status"] != "rehearsal_dispatch_pending"
+    assert result.get("blocker") != "prepromotion_rehearsal_dispatch_pending"
 
 
 def test_walkthrough_execution_site_is_not_generically_dispatchable():
@@ -288,5 +352,3 @@ async def test_same_sha_contract_change_spawns_fresh_holistic_review(
     assert result["audit_task_id"] is not None
     await db_session.refresh(version)
     assert version.last_qualification["contract_fingerprint"] != launched_contract
-
-

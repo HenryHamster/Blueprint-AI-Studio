@@ -51,13 +51,8 @@ CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
 def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:
     """Return a supported closed machine-contract shape for qualification."""
     from app.release_commit_authorship import normalize_authorship_evidence_contract
-    from app.release_prepromotion_rehearsal import (
-        normalize_rehearsal_evidence_contract,
-    )
 
-    return normalize_authorship_evidence_contract(
-        raw
-    ) or normalize_rehearsal_evidence_contract(raw)
+    return normalize_authorship_evidence_contract(raw)
 
 
 def is_owner_controlled_machine_contract(

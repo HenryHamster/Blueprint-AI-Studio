@@ -22,14 +22,6 @@ _ENTRYPOINT_MODULES = (
     ("bootstrap", "bootstrap_local_app_release", "scripts/bootstrap_local_app_release.py"),
     ("release", "local_app_release", "scripts/local_app_release.py"),
 )
-_SHELL_FENCE_RE = re.compile(
-    r"```(?P<language>bash|sh|shell)\s*\n(?P<body>.*?)```",
-    re.IGNORECASE | re.DOTALL,
-)
-_HOST_REHEARSAL_ENTRYPOINTS = (
-    "bootstrap_local_app_release.py",
-    "local_app_release.py",
-)
 
 
 def _parser_flags(parser: Any) -> list[str]:
@@ -94,37 +86,8 @@ def load_runbook_contract(path: Path = _RUNBOOK_PATH) -> dict[str, Any]:
     return contract
 
 
-def validate_no_host_rehearsal_commands(path: Path = _RUNBOOK_PATH) -> None:
-    """Reject shell snippets that invoke the host's hard-aborting rehearsal path.
-
-    ``--rehearse`` remains a compatibility flag in the shipped entrypoints, but
-    candidate execution on the production host is deliberately disabled.  The
-    runbook may explain that boundary in prose and retain the machine-readable
-    parser contract; it must not present a runnable shell command that combines
-    either release entrypoint with the flag.
-    """
-    text = path.read_text(encoding="utf-8")
-    offenders: list[str] = []
-    for match in _SHELL_FENCE_RE.finditer(text):
-        body = match.group("body")
-        if "--rehearse" not in body:
-            continue
-        offenders.extend(
-            entrypoint
-            for entrypoint in _HOST_REHEARSAL_ENTRYPOINTS
-            if entrypoint in body
-        )
-    if offenders:
-        names = ", ".join(sorted(set(offenders)))
-        raise AssertionError(
-            "runbook documents hard-aborting host rehearsal command(s) for "
-            f"{names}; describe the integrated pre-stop checks instead"
-        )
-
-
 def validate_runbook_contract(path: Path = _RUNBOOK_PATH) -> dict[str, Any]:
     """Raise with actionable drift details when scripts and runbook disagree."""
-    validate_no_host_rehearsal_commands(path)
     expected = expected_contract()
     actual = load_runbook_contract(path)
     if actual == expected:

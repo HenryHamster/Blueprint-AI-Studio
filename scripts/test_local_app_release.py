@@ -1063,13 +1063,13 @@ class LocalAppReleaseTests(unittest.TestCase):
         mocks["atomic"].assert_not_called()
         mocks["restart"].assert_not_called()
 
-    def test_pre_stop_rehearsal_reports_checked_and_deferred_preconditions(self):
+    def test_pre_stop_checks_run_before_release_mutation(self):
         with (
             patch.object(release, "verify_privilege_boundary") as boundary,
             patch.object(release, "_preflight_local_migration_inputs") as inputs,
             patch.object(release, "_target_schema_refusal", return_value=None),
         ):
-            report = release._run_pre_stop_rehearsal(
+            result = release._verify_pre_stop_conditions(
                 NEW_IMAGE,
                 IMAGE_REF,
                 REVISION,
@@ -1085,24 +1085,7 @@ class LocalAppReleaseTests(unittest.TestCase):
             run=release._run,
         )
         inputs.assert_called_once_with(IMAGE_REF)
-        self.assertFalse(report.units_stopped)
-        self.assertIn("worker secret", report.checked[1])
-        self.assertIn("migration apply", report.deferred[0])
-        self.assertEqual(report.as_dict()["units_stopped"], False)
-
-    def test_standalone_rehearsal_refuses_before_candidate_io(self):
-        with (
-            patch.object(release, "_pull_candidate_for_rehearsal") as pull,
-            patch.object(
-                release,
-                "_run_pre_stop_rehearsal",
-            ) as rehearsal,
-            self.assertRaisesRegex(RuntimeError, "host rehearsal disabled"),
-        ):
-            release.rehearse(IMAGE_REF, REVISION)
-
-        pull.assert_not_called()
-        rehearsal.assert_not_called()
+        self.assertIsNone(result)
 
     def test_worker_activation_failure_rolls_back_only_touched_worker(self):
         def restart(unit: str, image: str, **_kwargs) -> None:

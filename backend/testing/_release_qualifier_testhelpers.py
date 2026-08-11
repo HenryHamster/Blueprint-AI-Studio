@@ -396,14 +396,6 @@ def _qualifier_ci_resolves_green(mocker, monkeypatch):
         new=AsyncMock(return_value="gh-token"),
     )
     mocker.patch(
-        "app.release_prepromotion_rehearsal.github.dispatch_workflow_run",
-        new=AsyncMock(return_value=True),
-    )
-    mocker.patch(
-        "app.release_prepromotion_rehearsal.github.create_branch",
-        new=_create_branch_mock(),
-    )
-    mocker.patch(
         "app.github.get_check_runs_cached",
         new=AsyncMock(
             return_value={

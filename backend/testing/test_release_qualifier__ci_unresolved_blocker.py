@@ -3137,68 +3137,6 @@ async def test_run_qualification_uses_project_integration_branch(db_session, moc
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_queues_ci_rehearsal_only_for_explicit_contract(
-    db_session, mocker
-):
-    from app import shared_state
-    from app.models import ReleasePrepromotionDispatch
-
-    shared_state.runtime_config["smoketest_enabled"] = False
-    project, version = await _make_project_and_version_custom_branches(
-        db_session,
-        integration_branch="trunk",
-        promotion_target="release",
-        phase="stabilize",
-    )
-    db_session.add(
-        VersionAcceptanceCriterion(
-            project_id=project.id,
-            release_version_id=version.id,
-            criterion_key="ci-build-smoke",
-            text="Trusted main builds and smoke-tests the exact candidate.",
-            evidence_contract={
-                "type": "prepromotion_ci_build_smoke",
-                "predicate": {"required": True},
-            },
-            status="active",
-            created_by="test",
-        )
-    )
-    await db_session.commit()
-    candidate = "a" * 40
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="gh-token"),
-    )
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=AsyncMock(return_value=candidate),
-    )
-    mocker.patch(
-        "app.github.get_check_runs_cached",
-        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
-    )
-
-    result = await rq.run_qualification(
-        db_session, project.id, version, explicit_request=True
-    )
-    await db_session.commit()
-
-    assert result["status"] == "rehearsal_dispatch_pending"
-    assert result["candidate_sha"] == candidate
-    dispatches = (
-        await db_session.execute(
-            select(ReleasePrepromotionDispatch).where(
-                ReleasePrepromotionDispatch.release_version_id == version.id,
-                ReleasePrepromotionDispatch.candidate_sha == candidate,
-            )
-        )
-    ).scalars().all()
-    assert len(dispatches) == 1
-    assert dispatches[0].status == "claimed"
-
-
-@pytest.mark.asyncio
 async def test_legacy_smoketest_flags_cannot_resurrect_qualifier_vm_smoke(db_session, mocker):
     """Legacy global and project flags cannot resurrect qualifier VM smoke.
 
