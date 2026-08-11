@@ -74,6 +74,7 @@ _PERMANENT_AUTHORSHIP_REASONS = frozenset(
 
 _RECONCILIATION_CLEANUP_GRACE_SECONDS = 0.25
 _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS = 0.05
+_RECONCILIATION_MAX_OWNED_TERMINALIZATION_TASKS = 16
 _RECONCILIATION_OWNED_CLEANUP_TASKS: set[asyncio.Task[Any]] = set()
 
 
@@ -972,11 +973,40 @@ def _reap_owned_cleanup_task(task: asyncio.Task[Any]) -> None:
             task.exception()
 
 
-def _adopt_cleanup_task(task: asyncio.Task[Any]) -> None:
-    """Keep an uncooperative cleanup task owned until its done callback reaps it."""
+def _reap_completed_owned_cleanup_tasks() -> None:
+    """Run the same terminal observation as the callback for already-done tasks."""
+    for task in tuple(_RECONCILIATION_OWNED_CLEANUP_TASKS):
+        if task.done():
+            _reap_owned_cleanup_task(task)
+
+
+def _adopt_cleanup_task(task: asyncio.Task[Any]) -> bool:
+    """Keep a terminalization task owned until its done callback reaps it."""
+    _reap_completed_owned_cleanup_tasks()
+    if task in _RECONCILIATION_OWNED_CLEANUP_TASKS:
+        return True
+    if len(_RECONCILIATION_OWNED_CLEANUP_TASKS) >= (
+        _RECONCILIATION_MAX_OWNED_TERMINALIZATION_TASKS
+    ):
+        return False
     _RECONCILIATION_OWNED_CLEANUP_TASKS.add(task)
     task.add_done_callback(_reap_owned_cleanup_task)
-    assert task in _RECONCILIATION_OWNED_CLEANUP_TASKS
+    return True
+
+
+def _observed_task_error(task: asyncio.Task[Any]) -> BaseException | None:
+    """Observe a completed task, including the done/exception race."""
+    if not task.done():
+        return None
+    if task in _RECONCILIATION_OWNED_CLEANUP_TASKS:
+        _reap_owned_cleanup_task(task)
+    if task.cancelled():
+        return _ReconciliationCleanupError("terminalization task was cancelled")
+    try:
+        task.result()
+    except BaseException as exc:  # noqa: BLE001
+        return exc
+    return None
 
 
 async def _invalidate_session(session: Any) -> None:
@@ -990,42 +1020,118 @@ async def _invalidate_session(session: Any) -> None:
 
 
 async def _settle_abandoned_cleanup(
-    session: Any, cleanup: asyncio.Task[Any]
+    session: Any,
+    cleanup: asyncio.Task[Any],
+    *,
+    caller_cancellation: asyncio.CancelledError | None = None,
 ) -> BaseException | None:
-    """Invalidate ownership, then cancel and settle the original exit task."""
+    """Bound and own invalidation and cleanup after abandoning normal exit."""
+    if cleanup.done():
+        cleanup_error = _observed_task_error(cleanup)
+        if cleanup_error is None:
+            return None
+    else:
+        cleanup_error = None
+
+    # Adopt before any final settle await.  This is the ownership transfer that
+    # makes a cancellation-resistant driver task safe to leave running.
+    cleanup_owned = _adopt_cleanup_task(cleanup)
+    if not cleanup_owned:
+        cleanup_error = _ReconciliationCleanupError(
+            "terminalization task registry is at capacity"
+        )
+
     invalidate_error: BaseException | None = None
+    cancellation_to_raise: asyncio.CancelledError | None = None
     invalidate_task = asyncio.create_task(_invalidate_session(session))
+    invalidate_owned = _adopt_cleanup_task(invalidate_task)
+    if not invalidate_owned:
+        # Normal reconciliation admission reserves enough room for this pair.
+        # Keep this defensive branch fail-closed if a direct caller violates
+        # that admission contract.
+        invalidate_task.cancel()
+        invalidate_error = _ReconciliationCleanupError(
+            "terminalization task registry is at capacity"
+        )
     try:
-        await asyncio.shield(invalidate_task)
-    except BaseException as exc:  # noqa: BLE001
-        invalidate_error = exc
+        if invalidate_owned and not invalidate_task.done():
+            await asyncio.wait_for(
+                asyncio.shield(invalidate_task),
+                _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS,
+            )
+    except asyncio.TimeoutError:
         if not invalidate_task.done():
             invalidate_task.cancel()
-            with contextlib.suppress(BaseException):
-                await asyncio.shield(invalidate_task)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(invalidate_task),
+                _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            invalidate_error = _ReconciliationCleanupError(
+                "session invalidation task did not terminate"
+            )
+        except asyncio.CancelledError as exc:
+            cancellation_to_raise = caller_cancellation or exc
+        except BaseException as exc:  # noqa: BLE001
+            invalidate_error = exc
+    except asyncio.CancelledError as exc:
+        cancellation_to_raise = caller_cancellation or exc
+        if not invalidate_task.done():
+            invalidate_task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(invalidate_task),
+                _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            invalidate_error = _ReconciliationCleanupError(
+                "session invalidation task did not terminate after cancellation"
+            )
+        except asyncio.CancelledError:
+            # The task is already explicitly owned; the original cancellation
+            # is re-raised after ownership has been transferred.
+            pass
+        except BaseException as exc:  # noqa: BLE001
+            invalidate_error = exc
+    except BaseException as exc:  # noqa: BLE001
+        invalidate_error = exc
 
-    cleanup_error: BaseException | None = None
+    observed_invalidate_error = _observed_task_error(invalidate_task)
+    if observed_invalidate_error is not None and invalidate_error is None:
+        invalidate_error = observed_invalidate_error
+
     if not cleanup.done():
         cleanup.cancel()
     try:
-        await asyncio.wait_for(
-            asyncio.shield(cleanup), _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS
-        )
+        if cleanup_owned and not cleanup.done():
+            await asyncio.wait_for(
+                asyncio.shield(cleanup),
+                _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS,
+            )
     except asyncio.TimeoutError:
-        # The connection has already been invalidated.  A driver that still
-        # resists cancellation remains explicitly owned and is reaped later.
-        _adopt_cleanup_task(cleanup)
-        cleanup_error = _ReconciliationCleanupError(
-            "session cleanup task did not terminate after connection invalidation"
-        )
+        if not cleanup.done():
+            cleanup_error = _ReconciliationCleanupError(
+                "session cleanup task did not terminate after connection invalidation"
+            )
+    except asyncio.CancelledError as exc:
+        cancellation_to_raise = caller_cancellation or exc
+        if not cleanup.done():
+            cleanup.cancel()
     except BaseException as exc:  # noqa: BLE001
         cleanup_error = exc
+
+    observed_cleanup_error = _observed_task_error(cleanup)
+    if observed_cleanup_error is not None and cleanup_error is None:
+        cleanup_error = observed_cleanup_error
 
     if invalidate_error is not None:
         if cleanup_error is None:
             cleanup_error = invalidate_error
         else:
             cleanup_error.add_note(f"session invalidation failed: {invalidate_error}")
+    if cancellation_to_raise is not None:
+        raise cancellation_to_raise
     return cleanup_error
 
 
@@ -1054,16 +1160,26 @@ async def _deadline_session(session_factory: Any, deadline: float | None):
         if entered:
             exc_info = sys.exc_info() if body_error is not None else (None, None, None)
             cleanup = asyncio.create_task(context.__aexit__(*exc_info))
+            _adopt_cleanup_task(cleanup)
             cleanup_error: BaseException | None = None
             try:
                 await asyncio.wait_for(
                     asyncio.shield(cleanup), _RECONCILIATION_CLEANUP_GRACE_SECONDS
                 )
             except asyncio.CancelledError as cancellation:
-                if cleanup.done():
-                    cleanup_error = cancellation
+                cleanup_error = _observed_task_error(cleanup)
+                if cleanup_error is not None:
+                    cleanup_error = await _settle_abandoned_cleanup(
+                        session, cleanup, caller_cancellation=cancellation
+                    )
+                elif cleanup.done():
+                    # A successful done-race is still caller cancellation, not
+                    # a cleanup failure.
+                    cleanup_error = None
                 else:
-                    cleanup_error = await _settle_abandoned_cleanup(session, cleanup)
+                    cleanup_error = await _settle_abandoned_cleanup(
+                        session, cleanup, caller_cancellation=cancellation
+                    )
                 if cleanup_error is not None:
                     cancellation.add_note(
                         "authorship reconciliation session cleanup failed while cancelled"
@@ -1078,13 +1194,25 @@ async def _deadline_session(session_factory: Any, deadline: float | None):
                     )
                 raise
             except asyncio.TimeoutError:
-                cleanup_error = await _settle_abandoned_cleanup(session, cleanup)
+                cleanup_error = await _settle_abandoned_cleanup(
+                    session,
+                    cleanup,
+                    caller_cancellation=(
+                        body_error if isinstance(body_error, asyncio.CancelledError) else None
+                    ),
+                )
                 if cleanup_error is None:
                     cleanup_error = _ReconciliationCleanupError(
                         "session cleanup exceeded its grace period"
                     )
             except BaseException as exc:  # noqa: BLE001
-                cleanup_error = exc
+                cleanup_error = _observed_task_error(cleanup)
+                if cleanup_error is not None:
+                    cleanup_error = await _settle_abandoned_cleanup(
+                        session, cleanup
+                    )
+                else:
+                    cleanup_error = exc
             if cleanup_error is not None:
                 if isinstance(body_error, asyncio.CancelledError):
                     body_error.add_note(
@@ -1144,6 +1272,14 @@ async def reconcile_serving_authorship_evidence(
 
         session_factory = AsyncSessionLocal
     bounded_limit = max(1, min(int(limit), MAX_RECONCILIATION_VERSIONS))
+    _reap_completed_owned_cleanup_tasks()
+    if (
+        _RECONCILIATION_OWNED_CLEANUP_TASKS
+        or _RECONCILIATION_MAX_OWNED_TERMINALIZATION_TASKS < 2
+    ):
+        # An earlier driver terminalization still owns a resource.  Do not
+        # create another scan/worker pair while it remains in flight.
+        return 0
     deadline = time.monotonic() + _RECONCILIATION_MAX_SECONDS
     version_ids: list[Any] = []
     selected_ids: set[Any] = set()
@@ -1307,7 +1443,7 @@ async def reconcile_serving_authorship_evidence(
             logger.exception(
                 "authorship evidence reconciliation stopped after scan session cleanup failure"
             )
-            break
+            return 0
         except StaleDataError:
             # SQLite does not implement row-level ``skip_locked``. A second
             # worker can therefore race the singleton update in unit tests;
