@@ -1680,29 +1680,30 @@ async def agent_fetch_qualification(
             },
         }
 
-    persisted_authorship = (open_row.last_qualification or {}).get(
-        "operator_authored_commits"
-    )
-    if not isinstance(persisted_authorship, dict):
-        latest_promoted_qualification = (
-            (
-                await session.execute(
-                    select(ReleaseVersion.last_qualification)
-                    .where(
-                        ReleaseVersion.project_id == project_id,
-                        ReleaseVersion.status == "promoted",
-                    )
-                    .order_by(ReleaseVersion.version_number.desc())
-                    .limit(1)
+    # This is release evidence, not a property of the currently open version
+    # or this backend process.  Reading only the latest closed promoted record
+    # prevents a vN+1 open from changing vN's immutable authorship range and
+    # keeps this polled endpoint free of GitHub/network work.
+    latest_promoted_qualification = (
+        (
+            await session.execute(
+                select(ReleaseVersion.last_qualification)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "promoted",
                 )
+                .order_by(ReleaseVersion.version_number.desc())
+                .limit(1)
             )
-            .scalars()
-            .first()
         )
-        if isinstance(latest_promoted_qualification, dict):
-            persisted_authorship = latest_promoted_qualification.get(
-                "operator_authored_commits"
-            )
+        .scalars()
+        .first()
+    )
+    persisted_authorship = (
+        latest_promoted_qualification.get("operator_authored_commits")
+        if isinstance(latest_promoted_qualification, dict)
+        else None
+    )
     operator_authored_commits = (
         persisted_authorship
         if isinstance(persisted_authorship, dict)
@@ -1710,10 +1711,7 @@ async def agent_fetch_qualification(
             "state": "unresolved",
             "count": None,
             "offenders": [],
-            "range": {
-                "base_sha": open_row.base_sha,
-                "head_sha": serving_sha,
-            },
+            "range": {"base_sha": None, "head_sha": None},
             "reason": "promotion_authorship_not_persisted",
         }
     )

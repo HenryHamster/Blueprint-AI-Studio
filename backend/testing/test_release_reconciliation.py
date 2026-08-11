@@ -1315,6 +1315,19 @@ def _default_agent_image_gate(request, mocker, monkeypatch):
             },
         )
 
+    async def _default_authorship(base_sha, head_sha, **_kwargs):
+        return {
+            "state": "unresolved",
+            "count": None,
+            "offenders": [],
+            "range": {"base_sha": base_sha, "head_sha": head_sha},
+            "reason": "test_default",
+        }
+
+    mocker.patch(
+        "app.release_commit_authorship.count_non_bot_authored_commits",
+        side_effect=_default_authorship,
+    )
     if request.node.get_closest_marker("agent_image_gate"):
         return
     mocker.patch(
@@ -1332,7 +1345,7 @@ def _default_agent_image_gate(request, mocker, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_confirm_serving_confirmed_scenario(db_session):
+async def test_confirm_serving_confirmed_scenario(db_session, mocker):
     """(a) A new healthy revision boots after promotion within the window →
     serving_confirmed, served_sha stamped, verdict outcome recorded."""
     promoted_at = _utcnow()
@@ -1346,6 +1359,16 @@ async def test_confirm_serving_confirmed_scenario(db_session):
         current_sha=_SHA_A,
         deployed_at=promoted_at + timedelta(minutes=5),
     )
+    report = {
+        "state": "resolved",
+        "count": 1,
+        "offenders": [{"sha": _SHA_A[:12], "author": "Henry Example"}],
+        "range": {"base_sha": version.base_sha, "head_sha": _SHA_A},
+    }
+    measure = mocker.patch(
+        "app.release_commit_authorship.count_non_bot_authored_commits",
+        new=AsyncMock(return_value=report),
+    )
 
     resolved = await _confirm_serving_or_fail(
         version.id,
@@ -1358,6 +1381,10 @@ async def test_confirm_serving_confirmed_scenario(db_session):
     assert version.served_sha == _SHA_A
     assert version.served_at is not None
     assert version.deploy_failure_reason is None
+    assert version.last_qualification["operator_authored_commits"] == report
+    measure.assert_awaited_once_with(
+        version.base_sha, _SHA_A, session=db_session, project=_project
+    )
 
     state = rv.summarize_qualification_state(
         version.last_qualification,
@@ -2441,7 +2468,7 @@ async def _make_promoted_deploy_failed_version(
 
 
 @pytest.mark.asyncio
-async def test_recover_deploy_failed_when_sha_serves_within_window(db_session):
+async def test_recover_deploy_failed_when_sha_serves_within_window(db_session, mocker):
     """(a) A version latched deploy_failed whose promoted SHA later begins serving
     within the recovery window flips back to serving_confirmed: served_sha/at are
     stamped, deploy_failure_reason cleared, the verdict outcome flips to
@@ -2464,6 +2491,16 @@ async def test_recover_deploy_failed_when_sha_serves_within_window(db_session):
         current_sha=_SHA_A,
         deployed_at=now - timedelta(minutes=10),
     )
+    report = {
+        "state": "resolved",
+        "count": 0,
+        "offenders": [],
+        "range": {"base_sha": version.base_sha, "head_sha": _SHA_A},
+    }
+    measure = mocker.patch(
+        "app.release_commit_authorship.count_non_bot_authored_commits",
+        new=AsyncMock(return_value=report),
+    )
 
     recovered = await _reconcile_if_deploy_failed_recovered(
         version.id,
@@ -2476,6 +2513,10 @@ async def test_recover_deploy_failed_when_sha_serves_within_window(db_session):
     assert version.served_sha == _SHA_A
     assert version.served_at is not None
     assert version.deploy_failure_reason is None
+    assert version.last_qualification["operator_authored_commits"] == report
+    measure.assert_awaited_once_with(
+        version.base_sha, _SHA_A, session=db_session, project=project
+    )
 
     # The view-time summary now reports the TRUE serving_confirmed state.
     state = rv.summarize_qualification_state(

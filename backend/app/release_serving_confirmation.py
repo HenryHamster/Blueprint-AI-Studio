@@ -469,6 +469,11 @@ async def _confirm_serving_or_fail(
                 version.serving_status = "serving_confirmed"
                 version.deploy_failure_reason = None
                 session.add(version)
+                from app.release_commit_authorship import (
+                    persist_serving_authorship_evidence,
+                )
+
+                await persist_serving_authorship_evidence(session, version)
                 await _record_post_promotion_outcome(
                     session, version, "serving_confirmed", _now
                 )
@@ -736,6 +741,11 @@ async def _recover_serving_confirmed(
     project_backend_revision_artifact(version, backend_artifact)
     version.deploy_failure_reason = None
     session.add(version)
+    from app.release_commit_authorship import (
+        persist_serving_authorship_evidence,
+    )
+
+    await persist_serving_authorship_evidence(session, version)
     await _record_post_promotion_outcome(session, version, "serving_confirmed", now)
     # Resolve the loud deploy-failed operator alert — it no longer describes a
     # real condition once the promoted SHA is confirmed serving.  Best-effort and

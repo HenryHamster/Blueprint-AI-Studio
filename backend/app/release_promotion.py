@@ -28,7 +28,6 @@ unchanged.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -65,54 +64,6 @@ logger = logging.getLogger(__name__)
 # time to boot and stabilize before the deadline, while a boot-crashed deploy
 # surfaces as a loud failure within an hour.
 _DEPLOY_CONFIRM_WINDOW_SECONDS = 60 * 60
-_AUTHORSHIP_MEASUREMENT_TIMEOUT_SECONDS = 30
-
-
-async def _measure_promotion_authorship(
-    session: AsyncSession,
-    project: Project,
-    base_sha: str | None,
-    head_sha: str | None,
-) -> dict[str, Any]:
-    """Measure and persistable-release authorship evidence without gating merge.
-
-    GitHub is authoritative, but a transient credential/network/API failure must
-    not turn a landed promotion into a failed promotion.  The unresolved report
-    retains the exact attempted range so a later explicit re-resolution can use
-    it without guessing a zero.
-    """
-    from app.release_commit_authorship import count_non_bot_authored_commits
-
-    reason = "malformed_authorship_report"
-    try:
-        report = await asyncio.wait_for(
-            count_non_bot_authored_commits(
-                base_sha,
-                head_sha,
-                session=session,
-                project=project,
-            ),
-            timeout=_AUTHORSHIP_MEASUREMENT_TIMEOUT_SECONDS,
-        )
-        if isinstance(report, dict):
-            return report
-    except asyncio.TimeoutError:
-        reason = "github_authorship_timeout"
-    except Exception:  # noqa: BLE001 - evidence failure must not wedge promotion
-        logger.exception(
-            "[RELEASE_QUALIFIER] promotion authorship measurement failed; "
-            "recording unresolved evidence"
-        )
-        reason = "github_authorship_unavailable"
-    return {
-        "state": "unresolved",
-        "count": None,
-        "offenders": [],
-        "range": {"base_sha": base_sha, "head_sha": head_sha},
-        "reason": reason,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Branch-name helpers
 # ---------------------------------------------------------------------------
@@ -2113,19 +2064,12 @@ async def _record_promotion_success(
     # empty-diff path (automain == main, so they are the same commit).
     effective_sha = promoted_sha or candidate_sha
     now = _utcnow()
-    operator_authored_commits = await _measure_promotion_authorship(
-        session,
-        _record_project,
-        version.base_sha,
-        effective_sha,
-    )
     record = {
         **base_record,
         "status": "promoted",
         "candidate_sha": candidate_sha,
         "promoted_sha": effective_sha,
         "pr_url": pr_url,
-        "operator_authored_commits": operator_authored_commits,
     }
     if empty_diff:
         record["empty_diff"] = True

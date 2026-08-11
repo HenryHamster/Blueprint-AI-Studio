@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -22,8 +22,33 @@ class _GitHubResponse:
         return self._body
 
 
-def _github_commit(sha: str, author: str) -> dict:
-    return {"sha": sha, "commit": {"author": {"name": author}}}
+def _github_commit(
+    sha: str,
+    author: str,
+    *,
+    login: str | None = None,
+    identity_type: str | None = None,
+    verified: bool | None = None,
+) -> dict:
+    commit = {"sha": sha, "commit": {"author": {"name": author}}}
+    if login is not None or identity_type is not None:
+        commit["author"] = {"login": login, "type": identity_type}
+    if verified is not None:
+        commit["commit"]["verification"] = {"verified": verified}
+    return commit
+
+
+def _compare(base: str, head: str, commits: list[dict], *, total: int | None = None, **extra) -> dict:
+    total = len(commits) if total is None else total
+    return {
+        "status": "identical" if total == 0 else "ahead",
+        "ahead_by": total,
+        "total_commits": total,
+        "merge_base_commit": {"sha": base},
+        "head_commit": {"sha": head},
+        "commits": commits,
+        **extra,
+    }
 
 
 @pytest.mark.asyncio
@@ -37,9 +62,7 @@ async def test_production_default_resolves_without_a_checkout(monkeypatch):
 
     async def _request(method, url, headers, **kwargs):
         requests.append({"method": method, "url": url, "headers": headers, **kwargs})
-        if "/compare/" in url:
-            return _GitHubResponse(200, {"status": "ahead", "ahead_by": 1})
-        return _GitHubResponse(200, [_github_commit(human, "Henry Example"), _github_commit(base, "Base")])
+        return _GitHubResponse(200, _compare(base, human, [_github_commit(human, "Henry Example")]))
 
     monkeypatch.setattr(
         "app.release_promotion._resolve_github_with_session",
@@ -54,6 +77,8 @@ async def test_production_default_resolves_without_a_checkout(monkeypatch):
     assert report["state"] == "resolved"
     assert report["count"] == 1
     assert report["offenders"] == [{"sha": human[:12], "author": "Henry Example"}]
+    assert all("/compare/" in request["url"] for request in requests)
+    assert all("/commits" not in request["url"] for request in requests)
     assert all("repo_root" not in request for request in requests)
 
 
@@ -113,7 +138,7 @@ async def test_non_ancestor_compare_stays_unresolved(monkeypatch):
     monkeypatch.setattr(
         github,
         "_github_request",
-        AsyncMock(return_value=_GitHubResponse(200, {"status": "diverged", "ahead_by": 1})),
+        AsyncMock(return_value=_GitHubResponse(200, {"status": "diverged"})),
     )
 
     report = await count_non_bot_authored_commits(
@@ -151,26 +176,120 @@ async def test_malformed_compare_range_stays_unresolved(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_promotion_measurement_exception_is_unresolved_not_promotion_failure(
-    mocker,
-):
-    from app.release_promotion import _measure_promotion_authorship
+async def test_compare_paginates_101_commits_and_requires_unique_complete_pages(monkeypatch):
+    from app import github
 
-    mocker.patch(
-        "app.release_commit_authorship.count_non_bot_authored_commits",
-        new=AsyncMock(side_effect=RuntimeError("temporary GitHub outage")),
-    )
-    report = await _measure_promotion_authorship(
-        object(),
-        Project(id="release-authorship-promotion-failure", github_owner="owner", github_repo="repo"),
-        "a" * 40,
-        "b" * 40,
-    )
+    base, head = "a" * 40, "b" * 40
+    commits = [
+        _github_commit(
+            f"{index:040x}",
+            "blueprintagentorchestrator[bot]",
+            login="blueprintagentorchestrator[bot]",
+            identity_type="Bot",
+            verified=True,
+        )
+        for index in range(1, 102)
+    ]
+    project = Project(id="release-authorship-pages", github_owner="owner", github_repo="repo")
+    requests = []
+
+    async def _request(method, url, headers, **kwargs):
+        requests.append(kwargs["params"])
+        page = kwargs["params"]["page"]
+        page_commits = commits[(page - 1) * 100 : page * 100]
+        return _GitHubResponse(200, _compare(base, head, page_commits, total=101))
+
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", _request)
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 0
+    assert requests == [{"per_page": 100, "page": 1}, {"per_page": 100, "page": 2}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    [
+        (lambda body, base, head: body.update({"merge_base_commit": {"sha": "c" * 40}}), "malformed_github_range"),
+        (lambda body, base, head: body.update({"head_commit": {"sha": "c" * 40}}), "malformed_github_range"),
+        (lambda body, base, head: body.update({"total_commits": 2}), "malformed_github_range"),
+        (
+            lambda body, base, head: body.update(
+                {
+                    "ahead_by": 2,
+                    "total_commits": 2,
+                    "commits": [body["commits"][0], body["commits"][0]],
+                }
+            ),
+            "github_history_duplicate",
+        ),
+    ],
+)
+async def test_malformed_compare_evidence_stays_unresolved(monkeypatch, mutate, reason):
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    body = _compare(base, head, [_github_commit(head, "Henry Example")])
+    mutate(body, base, head)
+    project = Project(id="release-authorship-malformed-evidence", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, body)))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
 
     assert report["state"] == "unresolved"
-    assert report["count"] is None
-    assert report["range"] == {"base_sha": "a" * 40, "head_sha": "b" * 40}
-    assert report["reason"] == "github_authorship_unavailable"
+    assert report["reason"] == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "commit",
+    [
+        _github_commit("b" * 40, "blueprintagentorchestrator[bot]", verified=True),
+        _github_commit("b" * 40, "blueprintagentorchestrator[bot]", login="other[bot]", identity_type="Bot", verified=True),
+        _github_commit("b" * 40, "blueprintagentorchestrator[bot]", login="blueprintagentorchestrator[bot]", identity_type="User", verified=True),
+        _github_commit("b" * 40, "blueprintagentorchestrator[bot]", login="blueprintagentorchestrator[bot]", identity_type="Bot", verified=False),
+    ],
+)
+async def test_bot_shaped_commit_requires_full_verified_github_identity(monkeypatch, commit):
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    project = Project(id="release-authorship-bot-identity", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [commit]))))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 1
+    assert report["offenders"] == [{"sha": head[:12], "author": "blueprintagentorchestrator[bot]"}]
+
+
+@pytest.mark.asyncio
+async def test_fully_verified_blueprint_bot_commit_is_not_an_offender(monkeypatch):
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    trusted_bot = _github_commit(
+        head,
+        "blueprintagentorchestrator[bot]",
+        login="blueprintagentorchestrator[bot]",
+        identity_type="Bot",
+        verified=True,
+    )
+    project = Project(id="release-authorship-trusted-bot", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [trusted_bot]))))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 0
+    assert report["offenders"] == []
 
 
 @pytest.mark.asyncio
@@ -187,7 +306,7 @@ async def test_read_path_serves_persisted_report_without_recomputation(
         project_id=project.id,
         version_number=1,
         status="promoted",
-        opened_at=datetime(2026, 1, 1),
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         last_qualification={
             "status": "promoted",
             "operator_authored_commits": {
@@ -203,7 +322,7 @@ async def test_read_path_serves_persisted_report_without_recomputation(
         version_number=2,
         status="open",
         base_sha="b" * 40,
-        opened_at=datetime(2026, 2, 1),
+        opened_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
     )
     db_session.add_all([task, promoted, open_version])
     await db_session.commit()
@@ -220,11 +339,53 @@ async def test_read_path_serves_persisted_report_without_recomputation(
 
     assert response.status_code == 200, response.text
     assert response.json()["operator_authored_commits"]["count"] == 0
+    assert response.json()["operator_authored_commits"]["range"] == {
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
     count.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_promotion_persists_authorship_report(db_session, mocker):
+async def test_unresolved_confirmation_receipt_preserves_serving_truth(db_session, mocker):
+    from app.release_commit_authorship import persist_serving_authorship_evidence
+
+    project = Project(name="Authorship outage", user_id="authorship-outage")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        base_sha="a" * 40,
+        served_sha="b" * 40,
+        serving_status="serving_confirmed",
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_qualification={"status": "promoted"},
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+    mocker.patch(
+        "app.release_commit_authorship.count_non_bot_authored_commits",
+        new=AsyncMock(side_effect=RuntimeError("GitHub outage")),
+    )
+
+    await persist_serving_authorship_evidence(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == "b" * 40
+    assert version.last_qualification["operator_authored_commits"] == {
+        "state": "unresolved",
+        "count": None,
+        "offenders": [],
+        "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+        "reason": "github_authorship_unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_promotion_defers_authorship_until_serving_confirmation(db_session, mocker):
     from app import release_version
     from app.release_promotion import _record_promotion_success
 
@@ -245,15 +406,9 @@ async def test_promotion_persists_authorship_report(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(version)
 
-    report = {
-        "state": "resolved",
-        "count": 1,
-        "offenders": [{"sha": "b" * 12, "author": "Henry Example"}],
-        "range": {"base_sha": "a" * 40, "head_sha": "c" * 40},
-    }
     measurement = mocker.patch(
         "app.release_commit_authorship.count_non_bot_authored_commits",
-        new=AsyncMock(return_value=report),
+        new=AsyncMock(side_effect=AssertionError("promotion must not measure serving evidence")),
     )
     mocker.patch(
         "app.compute_backends.refresh_project_compute_image",
@@ -273,7 +428,5 @@ async def test_promotion_persists_authorship_report(db_session, mocker):
     await db_session.refresh(version)
 
     assert result["status"] == "promoted"
-    assert version.last_qualification["operator_authored_commits"] == report
-    measurement.assert_awaited_once()
-    assert measurement.await_args.kwargs["project"].id == project.id
-    assert measurement.await_args.args == ("a" * 40, "c" * 40)
+    assert "operator_authored_commits" not in version.last_qualification
+    measurement.assert_not_awaited()
