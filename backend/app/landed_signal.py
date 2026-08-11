@@ -526,6 +526,32 @@ def _pinned_corroboration_sha(merge_commit_sha: Any) -> str | None:
     return None
 
 
+async def _stamp_changed_files_before_landing(
+    task: Task,
+    session: AsyncSession,
+    project: Any,
+    *,
+    base_branch: str,
+    pr_number: int | str | None = None,
+    github_credentials: tuple[str, str, str] | None = None,
+) -> None:
+    """Acquire authoritative PR provenance immediately before land-time scoring."""
+    if project is None:
+        return
+    from app.shared_state import get_project_integration_branch
+
+    if base_branch != get_project_integration_branch(project):
+        return
+    from app.acceptance_gate import stamp_pr_changed_files_at_landing
+
+    await stamp_pr_changed_files_at_landing(
+        task,
+        session,
+        pr_number=pr_number,
+        github_credentials=github_credentials,
+    )
+
+
 async def corroborate_and_mark_landed_on_integration(
     task: Task,
     session: AsyncSession,
@@ -533,6 +559,8 @@ async def corroborate_and_mark_landed_on_integration(
     *,
     branch: str | None = None,
     merge_commit_sha: str | None = None,
+    pr_number: int | str | None = None,
+    github_credentials: tuple[str, str, str] | None = None,
 ) -> None:
     """Async twin of :func:`mark_landed_on_integration` with backend corroboration.
 
@@ -556,6 +584,14 @@ async def corroborate_and_mark_landed_on_integration(
     unpinned absence for exactly that reason, so an omitted sha silently costs
     the landing its machine-proven credit.
     """
+    await _stamp_changed_files_before_landing(
+        task,
+        session,
+        project,
+        base_branch=branch or "",
+        pr_number=pr_number,
+        github_credentials=github_credentials,
+    )
     from app.acceptance_gate import corroborate_acceptance_for_landing
 
     await corroborate_acceptance_for_landing(
@@ -577,6 +613,8 @@ async def corroborate_and_apply_merged_landed_signal(
     hotfix_lane: bool,
     non_merge_reason: str | None = None,
     merge_commit_sha: str | None = None,
+    pr_number: int | str | None = None,
+    github_credentials: tuple[str, str, str] | None = None,
 ) -> bool:
     """Async twin of :func:`apply_merged_landed_signal` with backend corroboration.
 
@@ -611,6 +649,14 @@ async def corroborate_and_apply_merged_landed_signal(
     to stamp an unpinned absence, so an omitted sha costs the landing its
     machine-proven credit rather than recording a false one.
     """
+    await _stamp_changed_files_before_landing(
+        task,
+        session,
+        project,
+        base_branch=base_branch,
+        pr_number=pr_number,
+        github_credentials=github_credentials,
+    )
     from app.acceptance_gate import corroborate_acceptance_for_landing
 
     await corroborate_acceptance_for_landing(

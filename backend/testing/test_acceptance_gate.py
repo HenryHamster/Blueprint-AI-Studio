@@ -47,6 +47,7 @@ from app.acceptance_gate import (
     premerge_acceptance_finding,
     record_artifact_consumptions_for_task,
     record_code_acceptance_verdict,
+    stamp_pr_changed_files_at_landing,
     stamp_premerge_acceptance_finding,
     summarize_version_acceptance_aggregate,
     _evaluate_coverage_delta,
@@ -725,6 +726,71 @@ def test_named_test_present_verified_touches_seam_passes_and_records():
 # ─────────────────────────────────────────────────────────────────────────────
 # named_test — three fail-closed cases
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_landing_stamp_replaces_self_report_with_github_diff(mocker):
+    """The landing-time stamp feeds the named-test gate authoritative PR paths."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/app/stale_self_report.py"],
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    get_files = mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[
+                {"filename": "backend/app/acceptance_gate.py"},
+                {"filename": "backend/testing/test_acceptance_gate.py"},
+            ]
+        ),
+    )
+
+    assert await stamp_pr_changed_files_at_landing(task, None, pr_number=42) is True
+
+    context = task.context or {}
+    assert context["_pr_changed_files"] == [
+        "backend/app/acceptance_gate.py",
+        "backend/testing/test_acceptance_gate.py",
+    ]
+    assert context["_pr_changed_files_github_verified"] is True
+    assert context["_pr_changed_files_has_prod"] is True
+    assert context["_pr_changed_files_has_test"] is True
+    assert "_pr_changed_files_stamp_skipped" not in context
+    get_files.assert_awaited_once_with(
+        "token", "owner", "repo", 42, str(task.project_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_landing_stamp_records_fetch_failure_without_raising(mocker):
+    """A GitHub outage leaves a durable reason and never blocks landing."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        }
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(side_effect=RuntimeError("GitHub unavailable")),
+    )
+
+    assert await stamp_pr_changed_files_at_landing(
+        task,
+        None,
+        pr_number=42,
+        github_credentials=("token", "owner", "repo"),
+    ) is False
+    assert (task.context or {})["_pr_changed_files_stamp_skipped"] == (
+        "diff_fetch_failed"
+    )
 
 
 @pytest.mark.parametrize(

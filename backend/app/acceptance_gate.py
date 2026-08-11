@@ -82,8 +82,10 @@ from app.acceptance_provenance import (
     COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
     PARENT_DERIVED_CHANGED_FILES_KEY,
     PR_CHANGED_FILES_STAMP_SKIPPED_KEY,
+    ChangedFilesStampSkipReason,
     stamp_parent_derived_changed_files_signal as _stamp_parent_derived_signal,
     stamp_commit_range_derived_changed_files_signal as _stamp_commit_range_signal,
+    stamp_changed_files_skip_reason,
 )
 
 logger = logging.getLogger(__name__)
@@ -329,6 +331,124 @@ def stamp_commit_range_derived_changed_files_signal(paths: list[str]) -> dict[st
         stamp_changed_files_signal=stamp_changed_files_signal,
         parent_derived_key=PARENT_DERIVED_CHANGED_FILES_KEY,
     )
+
+
+async def stamp_pr_changed_files_at_landing(
+    task: Task,
+    session: Any,
+    *,
+    pr_number: int | str | None = None,
+    github_credentials: tuple[str, str, str] | None = None,
+) -> bool:
+    """Stamp GitHub's changed-file list before recording a landing verdict.
+
+    The landed-signal writer is the single consumer of code acceptance verdicts,
+    but many merge lanes reach it. Keeping this acquisition here makes every
+    lane use the same authoritative PR diff while preserving the merge contract:
+    a credential, PR lookup, or GitHub failure records a bounded reason and never
+    prevents the real landing from being written.
+
+    ``github_credentials`` is accepted for callers that already resolved the
+    merge PR (notably CI completion); other callers resolve credentials from the
+    task and session. A parent-derived rollup child is deliberately left alone:
+    its parent union is a known lower-confidence signal and must not be replaced
+    with a lookup for the parent's PR.
+    """
+    context = dict(task.context or {})
+    if context.get("_pr_changed_files_github_verified") is True:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.already_stamped
+        )
+        task.context = context
+        return False
+    if context.get(PARENT_DERIVED_CHANGED_FILES_KEY) is True:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.rollup_parent_pr
+        )
+        task.context = context
+        return False
+
+    if pr_number is None:
+        from app.ci_merge_helpers import effective_pr_number
+
+        pr_number = effective_pr_number(task)
+    if pr_number is None or isinstance(pr_number, bool) or not str(pr_number).strip():
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.pr_number_unavailable
+        )
+        task.context = context
+        return False
+
+    credentials = github_credentials
+    if credentials is None:
+        try:
+            from app.routers.agent import get_github_token_for_task
+
+            credentials = await get_github_token_for_task(task.id, session)
+        except Exception:  # provenance is best-effort at landing
+            stamp_changed_files_skip_reason(
+                context, ChangedFilesStampSkipReason.github_credentials_unavailable
+            )
+            task.context = context
+            logger.warning(
+                "changed-file provenance credentials unavailable for landed task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
+            return False
+
+    if (
+        not isinstance(credentials, tuple)
+        or len(credentials) != 3
+        or not all(isinstance(value, str) and value.strip() for value in credentials)
+    ):
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.github_credentials_unavailable
+        )
+        task.context = context
+        return False
+
+    try:
+        from app.github import get_pr_files
+
+        raw_files = await get_pr_files(
+            credentials[0],
+            credentials[1],
+            credentials[2],
+            int(pr_number),
+            str(task.project_id) if task.project_id is not None else None,
+        )
+        paths = [
+            item["filename"]
+            for item in (raw_files or [])
+            if isinstance(item, dict)
+            and isinstance(item.get("filename"), str)
+            and item["filename"].strip()
+        ]
+    except Exception:  # provenance must never abort a landing
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.diff_fetch_failed
+        )
+        task.context = context
+        logger.warning(
+            "changed-file provenance fetch failed for landed task %s (PR #%s)",
+            getattr(task, "id", None),
+            pr_number,
+            exc_info=True,
+        )
+        return False
+
+    if not paths:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.no_diff_returned
+        )
+        task.context = context
+        return False
+
+    context.pop(PR_CHANGED_FILES_STAMP_SKIPPED_KEY, None)
+    context.update(stamp_changed_files_signal(paths, github_verified=True))
+    task.context = context
+    return True
 
 
 def _is_test_path(path: str) -> bool:
