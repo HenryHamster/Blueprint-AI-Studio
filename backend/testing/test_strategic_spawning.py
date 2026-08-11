@@ -1201,6 +1201,40 @@ async def test_spawn_design_doc_update_includes_knowledge_index_when_docs_exist(
 
 
 @pytest.mark.asyncio
+async def test_design_doc_spawn_commits_cadence_receipt_with_task(db_session):
+    """Architecture-phase cadence receipt is born in the task/cycle commit."""
+    from app.research_cycle_cadence import (
+        STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY,
+        STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY,
+    )
+
+    project = _make_project(
+        vision={"purpose": "test purpose", "_research_spawn_count": 6}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_design_doc_update(
+        project,
+        db_session,
+        cadence_accepted_count=6,
+    )
+
+    assert spawned is True
+    await db_session.refresh(project)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = next(
+        row
+        for row in result.scalars().all()
+        if row.first_payload["type"] == "design_doc_update"
+    )
+    assert task.context[STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY] == 6
+    assert project.vision[STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY] == 6
+    assert project.vision["_research_spawn_count"] == 6
+
+
+@pytest.mark.asyncio
 async def test_spawn_design_doc_update_omits_knowledge_index_when_none(db_session):
     """design_doc_update omits knowledge_index entirely when no documents exist."""
     project = _make_project(vision={"purpose": "test purpose"})
@@ -18639,7 +18673,14 @@ async def test_spawn_task_routes_research_through_unified_policy(db_session):
 
 
 @pytest.mark.asyncio
-async def test_direction_research_uses_one_discovery_cycle_without_raw_wake(db_session):
+async def test_direction_research_rejects_second_root_without_raw_wake(db_session):
+    """One Strategic root owns a direction cycle; web research cannot join as a peer.
+
+    A web-research task may be subordinate work spawned beneath the owning
+    research parent. A second direct Strategic spawn has the Strategic review as
+    its parent, however, so accepting it would create a second full-headroom
+    cycle source and split carry/review ownership.
+    """
     project, review_id = await _make_strategic_review_task(db_session)
     project.directions = [
         {
@@ -18676,7 +18717,7 @@ async def test_direction_research_uses_one_discovery_cycle_without_raw_wake(db_s
         )
     ).scalar_one_or_none() is None
 
-    second = await _post_strategic_operation(
+    rejected = await _post_strategic_operation(
         db_session,
         review_id,
         op="spawn_task",
@@ -18688,16 +18729,27 @@ async def test_direction_research_uses_one_discovery_cycle_without_raw_wake(db_s
             "idempotency_key": "research-frontier",
             "watch": True,
         },
+        expect_status=409,
     )
-    second_task = await db_session.get(Task, uuid.UUID(second["task_id"]))
-    assert second_task.discovery_cycle_id == cycle.id
-    assert (
+    assert "refusing to attach a second parent" in rejected["error"]["message"]
+
+    cycle_tasks = (
         await db_session.execute(
-            select(StrategicWatch).where(
-                StrategicWatch.target_task_id == second_task.id
+            select(Task).where(Task.discovery_cycle_id == cycle.id)
+        )
+    ).scalars().all()
+    assert [task.id for task in cycle_tasks] == [first_task.id]
+    cycle_requests = (
+        await db_session.execute(
+            select(StrategicSpawnRequest).where(
+                StrategicSpawnRequest.discovery_cycle_id == cycle.id
             )
         )
-    ).scalar_one().state == "pending"
+    ).scalars().all()
+    assert [request.task_id for request in cycle_requests] == [first_task.id]
+    assert (
+        await db_session.execute(select(StrategicWatch))
+    ).scalars().all() == []
 
 
 @pytest.mark.asyncio

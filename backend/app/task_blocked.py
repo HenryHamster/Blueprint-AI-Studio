@@ -38,6 +38,11 @@ from app.models import (
     advance_task_lifetime_attempt,
     bank_task_current_attempt,
 )
+from app.research_execution_authority import RESEARCH_FRESH_ATTEMPT_CONTEXT_KEYS
+from app.sidecar_authority import (
+    SIDECAR_FRESH_ATTEMPT_CONTEXT_KEYS,
+    authenticated_sidecar_fresh_attempt_preserve_keys,
+)
 from app.time_utils import _utcnow, clear_retry_after
 
 # Canonical failure class for precondition blockers (mirrors
@@ -135,6 +140,12 @@ FRESH_ATTEMPT_CONTEXT_STRIP_KEYS: frozenset[str] = frozenset(
         "rate_limit_inferred_from",
         "_requested_payload_model",
         "_resolved_payload_model",
+        *RESEARCH_FRESH_ATTEMPT_CONTEXT_KEYS,
+        # A fresh source artifact must negotiate and receive fresh sidecar
+        # verdicts. Retaining a prior pass bypasses grading; retaining an
+        # awaiting marker strands the new attempt. Source-link keys are absent
+        # from this set so a requeued grader can still route its eventual result.
+        *SIDECAR_FRESH_ATTEMPT_CONTEXT_KEYS,
         "_infra_wait",
         "blacklisted_accounts",
         "provision_failed_accounts",
@@ -509,6 +520,7 @@ def strip_fresh_attempt_context(
     *,
     preserve_blocked_optimistic_retries: bool = False,
     preserve_non_blocked_failure_verdict: bool = False,
+    preserve_context_keys: frozenset[str] | None = None,
 ) -> Dict[str, Any]:
     """Return ``context`` with stale per-attempt state removed.
 
@@ -519,7 +531,10 @@ def strip_fresh_attempt_context(
     should use the default and strip all previous verdict keys.
     """
     ctx = dict(context) if isinstance(context, dict) else {}
+    preserved_keys = preserve_context_keys or frozenset()
     for key in FRESH_ATTEMPT_CONTEXT_STRIP_KEYS:
+        if key in preserved_keys:
+            continue
         if key in ("_blocked_optimistic_retries", "_blocked_last_retry_at") and preserve_blocked_optimistic_retries:
             continue
         if key in ("failure_class", "failure_category"):
@@ -605,6 +620,7 @@ def clear_blocker_metadata(task: Task) -> None:
         ctx_src,
         preserve_blocked_optimistic_retries=True,
         preserve_non_blocked_failure_verdict=True,
+        preserve_context_keys=authenticated_sidecar_fresh_attempt_preserve_keys(task),
     )
 
 
@@ -633,6 +649,13 @@ def reset_task_for_fresh_attempt(task: Task) -> None:
     if restore_requested_payload_model_for_fresh_attempt(payloads, task.context):
         task.payloads = payloads
         flag_modified(task, "payloads")
+    # Research completion consumes ``plan_output`` as attempt-local agent output
+    # and uses finalized/spawn-pending context markers as idempotency shortcuts.
+    # Reusing either on a true requeue can no-op the new attempt or respawn work
+    # from the prior one. Other task types retain their existing output
+    # semantics.
+    if (task.first_payload or {}).get("type") == "research":
+        task.plan_output = None
     clear_blocker_metadata(task)
     task.last_heartbeat = None
     task.started_at = None
@@ -642,7 +665,12 @@ def reset_task_for_fresh_attempt(task: Task) -> None:
     task.llm_account_id = None
     clear_retry_after(task)
     task.context = {
-        **strip_fresh_attempt_context(task.context or {}),
+        **strip_fresh_attempt_context(
+            task.context or {},
+            preserve_context_keys=authenticated_sidecar_fresh_attempt_preserve_keys(
+                task
+            ),
+        ),
         "_fresh_attempt_started_at": _utcnow().isoformat(),
     }
 

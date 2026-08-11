@@ -2142,6 +2142,7 @@ describe('claimTask retry contract', () => {
   it('refreshes an expired task token and retries the claim with the new token', async () => {
     _setAgentTokenForTesting('stale-task-token');
     const claimTokens: string[] = [];
+    const researchContractVersions: string[] = [];
     let claimCalls = 0;
     const fetchMock = makeFetchMock().mockImplementation((input, init) => {
       const url = String(input);
@@ -2149,6 +2150,7 @@ describe('claimTask retry contract', () => {
         claimCalls += 1;
         const headers = init?.headers as Record<string, string> | undefined;
         claimTokens.push(headers?.['X-Agent-Token'] ?? '');
+        researchContractVersions.push(headers?.['X-Research-Output-Contract-Version'] ?? '');
         if (claimCalls === 1) {
           return Promise.resolve({
             ok: false,
@@ -2181,6 +2183,7 @@ describe('claimTask retry contract', () => {
 
     await expect(claimTask()).resolves.toEqual({ task_id: 'task-1' });
     expect(claimTokens).toEqual(['stale-task-token', 'fresh-task-token']);
+    expect(researchContractVersions).toEqual(['2', '2']);
     expect(getAgentToken()).toBe('fresh-task-token');
   });
 

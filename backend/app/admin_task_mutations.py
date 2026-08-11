@@ -34,8 +34,15 @@ from app.models import (
     _utcnow,
 )
 from app.payload_schemas import validate_internal_payload
+from app.research_execution_authority import (
+    is_server_owned_research_context_key,
+)
 from app.retry_prompt import materialize_operator_retry_guidance
 from app.shared_state import get_project_integration_branch
+from app.sidecar_authority import (
+    is_authenticated_backend_sidecar_shape,
+    is_server_owned_sidecar_context_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +70,15 @@ def __getattr__(name: str):
 
 _TERMINAL_STATUSES = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+_GENERIC_MEMBER_MUTATION_FIELDS = frozenset(
+    {
+        "payloads",
+        "parent_task_id",
+        "context",
+        "depends_on",
+        "post_commit_pending",
+    }
 )
 CANCEL_CASCADE_CHILD_STATUSES = (
     TaskStatus.QUEUED,
@@ -361,12 +377,16 @@ async def _apply_status_mutation(
         )
 
     prior_status = task.status
+    prelocked_requeue_ancestors: list[Task] | None = None
+    prelocked_requeue_parent_id = task.parent_task_id
     if new_status == TaskStatus.QUEUED and task_type in {"review", "fix"}:
         from app.fix_admission import prepare_direct_fix_admission
         from app.github import get_pull_request
         from app.routers.agent import get_github_token_for_task
         from app.review_admission import prepare_direct_review_admission
         from app.review_execution_ownership import has_pending_pr_continuation
+        from app.rollup_lineage_fence import lock_ancestor_rollups_for_requeue
+        from app.task_locking import acquire_pr_spawn_lock
 
         pr_number = (task.first_payload or {}).get("pr_number")
         if pr_number is None:
@@ -384,6 +404,17 @@ async def _apply_status_mutation(
                 int(pr_number),
                 project_id=str(task.project_id),
             )
+
+        # Preserve the repository PR admission order, but take hierarchy locks
+        # from ancestor -> child.  Parent cancellation owns that same hierarchy
+        # direction; allowing prepare_direct_*_admission to lock this child (or
+        # a same-PR sibling) before its ancestor creates a child<->ancestor
+        # deadlock.  The admission helper's repeated advisory acquire below is
+        # transaction-reentrant.
+        await acquire_pr_spawn_lock(session, task.project_id, int(pr_number))
+        prelocked_requeue_ancestors = await lock_ancestor_rollups_for_requeue(
+            task, session
+        )
 
         if task_type == "fix":
             admission = await prepare_direct_fix_admission(
@@ -426,6 +457,16 @@ async def _apply_status_mutation(
             await session.rollback()
             raise HTTPException(status_code=404, detail="Task not found")
         task = locked_task
+        prior_status = task.status
+        if task.parent_task_id != prelocked_requeue_parent_id:
+            await session.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Task ancestry changed during review/fix retry admission; "
+                    "retry the operation"
+                ),
+            )
         if has_pending_pr_continuation(task):
             await session.rollback()
             raise HTTPException(
@@ -520,7 +561,9 @@ async def _apply_status_mutation(
         from app.rollup_lineage_fence import invalidate_ancestor_rollups_for_requeue
 
         invalidated_ancestors = await invalidate_ancestor_rollups_for_requeue(
-            task, session
+            task,
+            session,
+            prelocked_ancestors=prelocked_requeue_ancestors,
         )
         if invalidated_ancestors:
             changes["invalidated_ancestor_rollups"] = invalidated_ancestors
@@ -566,6 +609,7 @@ async def _apply_status_mutation(
                 await session.execute(
                     select(Task).where(
                         Task.parent_task_id == task.id,
+                        Task.project_id == task.project_id,
                         Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
                     )
                 )
@@ -700,7 +744,10 @@ async def _apply_status_mutation(
             children = (
                 (
                     await session.execute(
-                        select(Task).where(Task.parent_task_id == task.id)
+                        select(Task).where(
+                            Task.parent_task_id == task.id,
+                            Task.project_id == task.project_id,
+                        )
                     )
                 )
                 .scalars()
@@ -763,6 +810,7 @@ async def _apply_status_mutation(
 async def _apply_simple_mutations(
     task: Task,
     payload: Dict[str, Any],
+    session: AsyncSession,
     changes: Dict[str, Any],
 ) -> None:
     """Apply payloads, parent_task_id, context, and post_commit_pending mutations."""
@@ -800,9 +848,70 @@ async def _apply_simple_mutations(
         changes["payloads"] = "updated"
 
     if "parent_task_id" in payload:
-        task.parent_task_id = (
-            uuid.UUID(payload["parent_task_id"]) if payload["parent_task_id"] else None
-        )
+        proposed_parent_id = payload["parent_task_id"]
+        if proposed_parent_id:
+            try:
+                parsed_parent_id = uuid.UUID(str(proposed_parent_id))
+            except (TypeError, ValueError, AttributeError):
+                raise HTTPException(
+                    status_code=400, detail="Invalid parent_task_id UUID"
+                ) from None
+            proposed_parent = (
+                await session.execute(
+                    select(Task).where(
+                        Task.id == parsed_parent_id,
+                        Task.project_id == task.project_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if proposed_parent is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "parent_task_id must reference an existing task in the "
+                        "same project"
+                    ),
+                )
+
+            # Parentage is a directed tree edge.  Walk the proposed parent's
+            # persisted, same-project ancestry before assigning it so a member
+            # PATCH cannot make a task its own parent, make an ancestor a child
+            # of its descendant, or extend an already-corrupt/foreign chain.
+            ancestor = proposed_parent
+            seen_parent_ids: set[uuid.UUID] = set()
+            while ancestor is not None:
+                if ancestor.id == task.id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Circular parent_task_id relationship detected",
+                    )
+                if ancestor.id in seen_parent_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Proposed parent has cyclic ancestry",
+                    )
+                seen_parent_ids.add(ancestor.id)
+                if ancestor.parent_task_id is None:
+                    break
+                ancestor = (
+                    await session.execute(
+                        select(Task).where(
+                            Task.id == ancestor.parent_task_id,
+                            Task.project_id == task.project_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if ancestor is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Proposed parent ancestry contains a missing or "
+                            "cross-project task"
+                        ),
+                    )
+            task.parent_task_id = parsed_parent_id
+        else:
+            task.parent_task_id = None
         changes["parent_task_id"] = str(task.parent_task_id)
 
     if "context" in payload and isinstance(payload["context"], dict):
@@ -813,13 +922,17 @@ async def _apply_simple_mutations(
             "pr_rejected",
         }
         attempted_protected = sorted(
-            protected_context_keys.intersection(payload["context"])
+            key
+            for key in payload["context"]
+            if key in protected_context_keys
+            or is_server_owned_sidecar_context_key(key)
+            or is_server_owned_research_context_key(key)
         )
         if attempted_protected:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "Generic task context mutation cannot write merge-authority "
+                    "Generic task context mutation cannot write backend-authority "
                     "state: " + ", ".join(attempted_protected)
                 ),
             )
@@ -880,14 +993,24 @@ async def _apply_depends_on_mutation(
             ) from None
 
         existing_tasks = (
-            (await session.execute(select(Task).where(Task.id.in_(dep_uuids))))
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.id.in_(dep_uuids),
+                        Task.project_id == task.project_id,
+                    )
+                )
+            )
             .scalars()
             .all()
         )
         if len(existing_tasks) != len(dep_uuids):
             raise HTTPException(
                 status_code=400,
-                detail="One or more depends_on task IDs do not exist",
+                detail=(
+                    "One or more depends_on task IDs do not exist in the same "
+                    "project"
+                ),
             )
         dep_tasks_by_id = {str(t.id): t for t in existing_tasks}
 
@@ -905,7 +1028,14 @@ async def _apply_depends_on_mutation(
                 return False
             visited.add(start_id)
             if start_id not in task_cache:
-                task_cache[start_id] = await session.get(Task, uuid.UUID(start_id))
+                task_cache[start_id] = (
+                    await session.execute(
+                        select(Task).where(
+                            Task.id == uuid.UUID(start_id),
+                            Task.project_id == task.project_id,
+                        )
+                    )
+                ).scalar_one_or_none()
             dep_task = task_cache[start_id]
             if not dep_task:
                 return False
@@ -1046,6 +1176,7 @@ async def _commit_and_broadcast(
                     select(Task)
                     .where(
                         Task.parent_task_id == task.id,
+                        Task.project_id == task.project_id,
                         Task.status == TaskStatus.COMPLETED,
                     )
                     .order_by(Task.updated_at.desc())
@@ -1110,15 +1241,125 @@ async def modify_task_apply(
     """
     changes: Dict[str, Any] = {}
 
+    generic_mutation_fields = sorted(
+        _GENERIC_MEMBER_MUTATION_FIELDS.intersection(payload)
+    )
+    task_locked_for_generic_mutation = False
+    if generic_mutation_fields:
+        # The route-level authorization lookup intentionally does not lock the
+        # task. Generic JSON/topology writes therefore must discard that stale
+        # identity-map snapshot before merging or validating. The project row
+        # serializes every same-project member graph edit, so opposing parent or
+        # dependency edges cannot both validate against an obsolete graph.
+        from app.task_locking import lock_project_then_task
+
+        task_project_id = task.project_id
+        task_id = task.id
+        session.expire(task)
+        async with lock_project_then_task(
+            session, task_project_id, task_id, skip_locked=False
+        ) as (locked_project, locked_task):
+            if (
+                locked_project is None
+                or locked_task is None
+                or locked_task.project_id != locked_project.id
+            ):
+                raise HTTPException(status_code=404, detail="Task not found")
+            task = locked_task
+            task_locked_for_generic_mutation = True
+
+    # A backend sidecar is an independent grader only while its frozen prompt,
+    # delivery topology, and complete context remain backend-authored. Blocking
+    # only the obvious source/verdict keys is insufficient: a project member
+    # could otherwise bias the grader via an innocuous-looking context field,
+    # rewrite its prompt while retaining type/base identity, or parent it so the
+    # resolver rejects the returned verdict. Status-only cancel/requeue remains
+    # available; requeue must reuse the frozen prompt without an injected suffix.
+    if is_authenticated_backend_sidecar_shape(task):
+        protected_sidecar_fields = {
+            "payloads",
+            "parent_task_id",
+            "context",
+            "requeue_prompt_suffix",
+        }
+        attempted_sidecar_mutations = sorted(
+            protected_sidecar_fields.intersection(payload)
+        )
+        if attempted_sidecar_mutations:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Generic task mutation cannot rewrite a backend sidecar: "
+                    + ", ".join(attempted_sidecar_mutations)
+                ),
+            )
+
+    if generic_mutation_fields and "status" in payload:
+        if (
+            payload.get("status") == TaskStatus.QUEUED.value
+            and isinstance(payload.get("context"), dict)
+            and "_original_prompt_suffix" in payload["context"]
+        ):
+            # Preserve the established, actionable validation for this common
+            # malformed retry request even though mixed writes are separated.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "_original_prompt_suffix is internal retry-dedup metadata "
+                    "and is not delivered to agents; use requeue_prompt_suffix "
+                    "instead"
+                ),
+            )
+        # Status transitions can commit internally (research/plan parent
+        # requeue and approval flows), and review/fix requeue deliberately owns
+        # PR -> Task ordering. Mixing one with a generic write would therefore
+        # either release this graph lock before validation or invert a lock
+        # contract. Status-only behavior is unchanged; submit the generic edit
+        # as a second PATCH after a successful transition.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Apply status separately from generic payload, context, or "
+                "topology mutation"
+            ),
+        )
+
+    if generic_mutation_fields and "requires_approval" in payload:
+        # Approval can perform external merge work and commit before returning.
+        # Do not let such a commit release the graph lock before the generic
+        # mutation validates and persists.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Apply requires_approval separately from generic payload, "
+                "context, or topology mutation"
+            ),
+        )
+
     terminal_statuses = {
         TaskStatus.FAILED.value,
         TaskStatus.CANCELLED.value,
     }
-    if payload.get("status") in terminal_statuses:
-        # The continuation and the administrative terminal writer must share
-        # the canonical Project -> Task lock order. Re-read under that pair so
-        # a stale route snapshot cannot cancel a COMPLETED task whose
-        # post-commit continuation is still authoritative.
+    requested_status = payload.get("status")
+    route_task_type = str(task.first_payload.get("type") or "").lower()
+    status_requires_project_task_lock = requested_status in terminal_statuses or (
+        requested_status == TaskStatus.QUEUED.value
+        and route_task_type not in {"review", "fix"}
+    )
+    if (
+        status_requires_project_task_lock
+        and not task_locked_for_generic_mutation
+    ):
+        # Continuations and administrative status writers share the canonical
+        # Project -> Task order.  A QUEUED retry is also a destructive reset of
+        # attempt/runtime state, so it must re-read under the same pair: a route
+        # snapshot loaded before an atomic research child publication must not
+        # overwrite the newly-EVALUATING parent or reset it as a childless leaf.
+        #
+        # Review/fix retries are deliberately excluded. Their admission flow
+        # owns the PR -> Task order and performs its own definitive Task re-read
+        # after acquiring the PR lock; pre-locking Project/Task here would invert
+        # that established contract.
         from app.task_locking import lock_project_then_task
 
         task_project_id = task.project_id
@@ -1138,7 +1379,7 @@ async def modify_task_apply(
             task, payload, background_tasks, session, force_kill, changes
         )
     await __getattr__("_apply_approval_mutation")(task, payload, session, changes)
-    await _apply_simple_mutations(task, payload, changes)
+    await _apply_simple_mutations(task, payload, session, changes)
     await _apply_depends_on_mutation(task, payload, session, changes)
     await _commit_and_broadcast(task, payload, session, changes)
 

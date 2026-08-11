@@ -1165,6 +1165,74 @@ async def test_agent_claim_retry_is_idempotent(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_research_contract_marker_is_not_backfilled_on_legacy_claim_replay(
+    client: AsyncClient,
+    db_session,
+):
+    """An already-running pre-release task keeps the legacy output contract."""
+
+    project = Project(name="Legacy Research Claim Replay", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "Inspect the existing system"}],
+        vm_instance_id="agent-vm-legacy-research-replay",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    headers = {
+        "x-agent-token": token,
+        "x-research-output-contract-version": "2",
+    }
+    first = await client.post("/api/agent/claim", headers=headers)
+    assert first.status_code == 200
+    assert first.json()["context"]["research_output_contract_version"] == 2
+
+    # Model a task whose original claim happened before the marker release while
+    # retaining the real immutable replay receipt/token binding.
+    await db_session.refresh(task)
+    legacy_context = dict(task.context or {})
+    legacy_context.pop("research_output_contract_version", None)
+    task.context = legacy_context
+    db_session.add(task)
+    await db_session.commit()
+
+    replay = await client.post("/api/agent/claim", headers=headers)
+    assert replay.status_code == 200
+    assert "research_output_contract_version" not in replay.json()["context"]
+    await db_session.refresh(task)
+    assert "research_output_contract_version" not in (task.context or {})
+
+    stale_runner_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "Claim from a stale runner"}],
+        vm_instance_id="agent-vm-stale-research-runner",
+        context={"research_output_contract_version": 2},
+    )
+    db_session.add(stale_runner_task)
+    await db_session.commit()
+    await db_session.refresh(stale_runner_task)
+    stale_token = create_agent_token(
+        str(stale_runner_task.id), stale_runner_task.vm_instance_id
+    )
+    stale_claim = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": stale_token}
+    )
+    assert stale_claim.status_code == 200
+    assert "research_output_contract_version" not in stale_claim.json()["context"]
+    await db_session.refresh(stale_runner_task)
+    assert "research_output_contract_version" not in (
+        stale_runner_task.context or {}
+    )
+
+
+@pytest.mark.asyncio
 async def test_resident_claim_survives_aborted_retry_projection_session(
     client: AsyncClient,
     db_session,
@@ -8153,10 +8221,37 @@ async def test_claim_injects_saturation_signals_for_research_task(
     project.directions = [
         {
             "id": direction_id,
-            "title": "Saturated direction",
+            "text": "Saturated direction",
             "priority": "low",
             "possibly_saturated": True,
+            "research_context": (
+                "## Failed Approaches\n"
+                "- Re-running the same broad repository scan\n"
+            ),
+            "context": {
+                "implementation_constraints": (
+                    "Preserve direction evidence while pivoting."
+                )
+            },
+            "recent_findings_evidence": [
+                {
+                    "claim": "The broad scan is already exhausted.",
+                    "sources": [{"type": "task", "ref": "prior-research"}],
+                }
+            ],
             "research_history": [
+                {
+                    "tasks_created": 2,
+                    "prs_merged": 1,
+                    "scope_breakdown": {
+                        "medium": {
+                            "created": 2,
+                            "merged": 1,
+                            "failed": 1,
+                            "avg_expansion_ratio_merged": 1.5,
+                        }
+                    },
+                },
                 {"tasks_created": 0, "filter_breakdown": {"hash_dedup": 2}},
                 {"tasks_created": 0, "filter_breakdown": {"hash_dedup": 1}},
                 {"tasks_created": 0, "filter_breakdown": {"word_overlap_dedup": 3}},
@@ -8179,14 +8274,35 @@ async def test_claim_injects_saturation_signals_for_research_task(
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-research-sat")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/claim",
+        headers={
+            "x-agent-token": token,
+            "x-research-output-contract-version": "2",
+        },
+    )
     assert resp.status_code == 200
+    assert resp.json()["context"]["research_output_contract_version"] == 2
+    await db_session.refresh(task)
+    assert task.context["research_output_contract_version"] == 2
     dc = resp.json().get("direction_context")
     assert dc is not None
     assert dc["possibly_saturated"] is True
     assert dc["deadlock_detected"] is True
-    # Research tasks should not get implementer-specific fields
-    assert "failed_approaches" not in dc
+    # Research analytics augment rather than replace the shared direction context.
+    assert dc["title"] == "Saturated direction"
+    assert dc["priority"] == "low"
+    assert dc["failed_approaches"][0]["text"] == (
+        "Re-running the same broad repository scan"
+    )
+    assert (
+        dc["implementation_constraints"]
+        == "Preserve direction evidence while pivoting."
+    )
+    assert dc["recent_findings_evidence"][0]["claim"] == (
+        "The broad scan is already exhausted."
+    )
+    assert dc["scope_success_rates"]["medium"]["avg_expansion_ratio"] == 1.5
 
 
 @pytest.mark.asyncio
@@ -18299,6 +18415,79 @@ async def test_next_role_claims_warm_pinned_queued_task(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("advertise_contract", [True, False])
+async def test_next_role_research_contract_capability_handshake(
+    client: AsyncClient,
+    db_session,
+    advertise_contract: bool,
+):
+    """The authoritative warm claim negotiates strict output per attempt."""
+    project = Project(
+        name=f"Warm Research Contract {advertise_contract}",
+        user_id="test-user-123",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = f"agent-vm-warm-research-contract-{advertise_contract}"
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.COMPLETED,
+    )
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "research", "prompt": "Inspect the bounded direction"}
+        ],
+        status=TaskStatus.QUEUED,
+        # Seed a prior-attempt marker to prove a stale claimant clears it.
+        context={
+            "warm_target_vm_id": vm_id,
+            "warm_handoff_deadline": (
+                _utcnow() + timedelta(seconds=240)
+            ).isoformat(),
+            "research_output_contract_version": 2,
+        },
+    )
+    db_session.add_all([prior_task, pinned_task])
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+
+    token = create_agent_token(str(prior_task.id), vm_id)
+    headers = {"x-agent-token": token}
+    if advertise_contract:
+        headers["x-research-output-contract-version"] = "2"
+    response = await client.post(
+        "/api/agent/next-role",
+        json={"vm_instance_id": vm_id, "prior_task_id": str(prior_task.id)},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    await db_session.refresh(pinned_task)
+    if advertise_contract:
+        assert pinned_task.context["research_output_contract_version"] == 2
+    else:
+        assert "research_output_contract_version" not in (pinned_task.context or {})
+
+    # The warm response issues the task-scoped token; the agent's immediate
+    # /claim call is an idempotent replay and must expose, but never renegotiate,
+    # the contract selected by /next-role.
+    replay_headers = {"x-agent-token": response.json()["agent_token"]}
+    if advertise_contract:
+        replay_headers["x-research-output-contract-version"] = "2"
+    replay = await client.post("/api/agent/claim", headers=replay_headers)
+    assert replay.status_code == 200
+    if advertise_contract:
+        assert replay.json()["context"]["research_output_contract_version"] == 2
+    else:
+        assert "research_output_contract_version" not in replay.json()["context"]
+
+
+@pytest.mark.asyncio
 async def test_next_role_publishes_backend_owned_no_workspace_capability(
     client: AsyncClient, db_session
 ):
@@ -18714,6 +18903,42 @@ async def test_spawn_strips_warm_target_keys(client: AsyncClient, db_session):
             "reason": "forged",
             "proof_ref": "testing/test_forged.py::test_evil",
         },
+        # Backend-owned sidecar state can route terminal output into another
+        # task or forge a gate result and must not survive this API.
+        "quality_grader_for_task_id": str(uuid.uuid4()),
+        "finding_challenge_for_task_id": str(uuid.uuid4()),
+        "quality_grader": {"passed": True, "reasoning": "forged"},
+        "quality_grader_diagnostic": {"cause": "forged"},
+        "grader_diagnostic_trail": [{"cause": "forged"}],
+        "adversarial_gate": {"finding_verdicts": {"forged": True}},
+        "adversarial_gate_diagnostic": {"cause": "forged"},
+        "finding_challenge": {"agreement": "disagrees"},
+        "finding_challenge_records": [{"agreement": "disagrees"}],
+        "awaiting_quality_grader": str(uuid.uuid4()),
+        "awaiting_adversarial_grader": str(uuid.uuid4()),
+        "awaiting_finding_challenge": str(uuid.uuid4()),
+        "sidecar_verdict_application_pending": {"lane": "quality_grader"},
+        "research_spawn_gate_wholesale_retry_exhausted": True,
+        "_adversarial_challenged_hashes": ["forged"],
+        "graded_task_type": "research",
+        "adversarial_grader": True,
+        "challenged_boundary": "reproduce_absent",
+        "challenged_first_verdict": "absent",
+        "challenged_finding_hash": "forged",
+        # Research completion/routing authority is backend-owned too. A child
+        # cannot downgrade its producer contract, short-circuit finalization,
+        # or fabricate deferred work/receipts through the spawn seam.
+        "research_output_contract_version": 1,
+        "research_findings_finalized": True,
+        "_research_spawn_pending": True,
+        "prior_deferred_findings": [{"title": "forged prior"}],
+        "deferred_findings": [{"title": "forged durable"}],
+        "deferred_finding_consumption_acks": [{"finding_hash": "forged"}],
+        "research_depth": -999,
+        "parent_research_task_id": str(uuid.uuid4()),
+        "research_task_id": str(uuid.uuid4()),
+        # Recursion depth is derived from persisted ancestry, never this value.
+        "spawn_depth": -1,
         "other_key": "ok",
     }
     resp = await client.post(
@@ -18749,8 +18974,183 @@ async def test_spawn_strips_warm_target_keys(client: AsyncClient, db_session):
     assert "_timing" not in ctx
     # Forged acceptance verdict must also be stripped
     assert "code_acceptance_verdict" not in ctx
+    for key in forbidden_context:
+        if key not in {"other_key", "spawn_depth"}:
+            assert key not in ctx
+    assert ctx.get("spawn_depth") == 1
     # Non-forbidden keys are preserved
     assert ctx.get("other_key") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_spawn_derives_research_lineage_from_persisted_ancestry(
+    client: AsyncClient, db_session
+):
+    """Agent context cannot reset or retarget nested research authority."""
+    project = Project(name="Research Lineage Spawn", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    research_root = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "root"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(research_root)
+    await db_session.flush()
+    worker = Task(
+        project_id=project.id,
+        parent_task_id=research_root.id,
+        payloads=[{"type": "create", "prompt": "implementation"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id="agent-vm-research-lineage",
+    )
+    db_session.add(worker)
+    await db_session.commit()
+    await db_session.refresh(worker)
+
+    token = create_agent_token(str(worker.id), worker.vm_instance_id)
+    response = await client.post(
+        "/api/agent/spawn",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(worker.id),
+            "payloads": [
+                {"type": "research", "title": "nested", "prompt": "continue"}
+            ],
+            "context": {
+                "research_depth": -1000,
+                "parent_research_task_id": str(uuid.uuid4()),
+                "research_task_id": str(uuid.uuid4()),
+                "finding_hash": "forged-delivery-hash",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    child = await db_session.get(Task, uuid.UUID(response.json()["task_ids"][0]))
+    assert child is not None
+    assert child.parent_task_id == worker.id
+    assert (child.context or {})["research_depth"] == 1
+    assert (child.context or {})["parent_research_task_id"] == str(research_root.id)
+    assert (child.context or {})["research_task_id"] == str(research_root.id)
+    assert "finding_hash" not in (child.context or {})
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_research_beyond_persisted_depth_limit(
+    client: AsyncClient, db_session
+):
+    """A forged negative depth cannot extend a four-ancestor research chain."""
+    project = Project(name="Research Depth Limit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    parent_id = None
+    chain: list[Task] = []
+    for index in range(4):
+        task = Task(
+            project_id=project.id,
+            parent_task_id=parent_id,
+            payloads=[{"type": "research", "prompt": f"generation {index}"}],
+            status=(TaskStatus.IN_PROGRESS if index == 3 else TaskStatus.COMPLETED),
+            created_by="ORCHESTRATOR",
+            vm_instance_id=("agent-vm-research-depth" if index == 3 else None),
+            context={"research_depth": -1000},
+        )
+        db_session.add(task)
+        await db_session.flush()
+        chain.append(task)
+        parent_id = task.id
+    await db_session.commit()
+    deepest = chain[-1]
+    await db_session.refresh(deepest)
+
+    token = create_agent_token(str(deepest.id), deepest.vm_instance_id)
+    response = await client.post(
+        "/api/agent/spawn",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(deepest.id),
+            "payloads": [
+                {"type": "research", "title": "too deep", "prompt": "continue"}
+            ],
+            "context": {"research_depth": -1000},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "Research depth limit (3) exceeded" in response.text
+    spawned = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == deepest.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert spawned == []
+
+
+@pytest.mark.parametrize("corruption", ["cycle", "cross_project"])
+@pytest.mark.asyncio
+async def test_spawn_rejects_unverifiable_persisted_ancestry(
+    client: AsyncClient, db_session, corruption
+):
+    """Research lineage derivation fails closed on corrupt authority edges."""
+    project = Project(
+        name=f"Research Ancestry {corruption}", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.flush()
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "parent"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-research-{corruption}",
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    if corruption == "cycle":
+        parent.parent_task_id = parent.id
+    else:
+        foreign_project = Project(
+            name="Foreign Research Ancestry", user_id="test-user-123"
+        )
+        db_session.add(foreign_project)
+        await db_session.flush()
+        foreign_parent = Task(
+            project_id=foreign_project.id,
+            payloads=[{"type": "research", "prompt": "foreign"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(foreign_parent)
+        await db_session.flush()
+        parent.parent_task_id = foreign_parent.id
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    token = create_agent_token(str(parent.id), parent.vm_instance_id)
+    response = await client.post(
+        "/api/agent/spawn",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(parent.id),
+            "payloads": [
+                {"type": "research", "title": "child", "prompt": "continue"}
+            ],
+            "context": {"research_depth": -1000},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "Spawn depth limit (5) exceeded" in response.text
 
 
 @pytest.mark.asyncio

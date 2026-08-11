@@ -341,8 +341,88 @@ async def test_user_launchable_type_still_accepted(client: AsyncClient, db_sessi
     task_id = resp.json()["id"]
     get_resp = await client.get(f"/api/admin/tasks/{task_id}")
     assert get_resp.status_code == 200
-    assert get_resp.json()["payloads"][0]["type"] == "research"
+    stored_payload = get_resp.json()["payloads"][0]
+    assert stored_payload["type"] == "research"
+    assert stored_payload["base_branch"] == "main"
     assert await _count_tasks(db_session, project.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_research_gets_canonical_root_envelope(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """Omitted research fields use the same root contract as autonomous/direct work."""
+    from app import admin
+    from app.research_completion import effective_research_finding_headroom
+
+    project = Project(
+        name="acme/research-envelope",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+        github_owner="acme",
+        github_repo="research-envelope",
+        integration_branch="automain",
+        promotion_target="main",
+        directions=[
+            {
+                "id": "direction-1",
+                "text": "Improve research throughput",
+                "status": "active",
+                "category": "research",
+                "priority": "high",
+                "system_id": "research-runtime",
+                "completion_criteria": "A bounded end-to-end proof exists",
+                "research_context": {"decision_question": "Does the parent carry work?"},
+                "paths": ["backend/app/research_completion.py"],
+            }
+        ],
+        problem_model={
+            "capabilities": [{"name": "Repository Mapping", "status": "working"}]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    await db_session.commit()
+    monkeypatch.setitem(
+        admin._runtime_config,
+        "agent_prompt_suffixes",
+        {"research": "Inspect the exact causal path."},
+    )
+
+    response = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/research-envelope",
+            "title": "Research the parent",
+            "prompt": "Find the remaining parent-quality gaps",
+            "task_type": "research",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    stored = (
+        await client.get(f"/api/admin/tasks/{response.json()['id']}")
+    ).json()["payloads"][0]
+    assert stored["base_branch"] == "automain"
+    assert stored["work_headroom"] == effective_research_finding_headroom(0)
+    assert stored["prompt_suffix"] == "Inspect the exact causal path."
+    assert stored["available_capabilities"][0]["name"] == "repository-mapping"
+    assert stored["directions"] == [
+        {
+            "id": "direction-1",
+            "text": "Improve research throughput",
+            "category": "research",
+            "priority": "high",
+            "system_id": "research-runtime",
+            "completion_criteria": "A bounded end-to-end proof exists",
+            "research_context": {"decision_question": "Does the parent carry work?"},
+            "paths": ["backend/app/research_completion.py"],
+        }
+    ]
 
 
 # --- Idempotency tests -------------------------------------------------------

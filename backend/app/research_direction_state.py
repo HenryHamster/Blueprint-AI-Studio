@@ -46,6 +46,7 @@ from app.research_context import (
     build_recent_findings_evidence,
     extract_diagnosis_from_context,
 )
+from app.research_execution_authority import authenticated_research_children
 from app.shared_state import DEFAULT_TASK_SCOPE
 from app.task_evaluators import (
     CHALLENGE_AGREES,
@@ -1295,7 +1296,7 @@ async def apply_post_spawn_state(
             STRATEGIC_RATIONALE_MAX,
         )
 
-        _notes_to_apply: list[tuple[str, dict]] = []
+        _notes_to_apply: list[tuple[str, dict, dict]] = []
         for note_finding in direction_notes:
             target_id = note_finding.get("direction_id")
             raw_note = (
@@ -1316,16 +1317,18 @@ async def apply_post_spawn_state(
                         "added_at": _utcnow().isoformat(),
                         "added_by_task": str(task.id),
                     },
+                    note_finding,
                 )
             )
 
+        _applied_note_findings: list[dict] = []
         if _notes_to_apply:
             _note_project = await session.get(Project, task.project_id)
             if _note_project:
                 session.expire(_note_project, ["directions"])
 
                 def _apply_notes(dirs: list) -> None:
-                    for _target_id, _note_entry in _notes_to_apply:
+                    for _target_id, _note_entry, _source_finding in _notes_to_apply:
                         for _d in dirs:
                             if _d.get("id") == _target_id:
                                 _notes = list(_d.get("notes") or [])
@@ -1337,6 +1340,7 @@ async def apply_post_spawn_state(
                                     for n in _notes
                                 ):
                                     _notes.append(_note_entry)
+                                    _applied_note_findings.append(_source_finding)
                                 if len(_notes) > STRATEGIC_NOTES_HISTORY_MAX:
                                     logger.warning(
                                         f"[RESEARCH] Task {task.id}: dropping {len(_notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {_target_id}"
@@ -1346,6 +1350,10 @@ async def apply_post_spawn_state(
 
                 await with_directions_locked(session, task.project_id, _apply_notes)
                 await session.commit()
+        # Keep only records that actually appended durable state. The caller
+        # uses this same list for completion-outcome and cycle-productivity
+        # bookkeeping, so duplicates/missing targets must not look productive.
+        direction_notes[:] = _applied_note_findings
 
     # Process direction proposals — add to Project.directions with status='proposed'
     proposals_created = 0
@@ -1366,6 +1374,7 @@ async def apply_post_spawn_state(
             max_proposals = 10
             now_iso = _utcnow().isoformat()
             _new_proposals: list[dict] = []
+            _new_proposal_sources: dict[str, dict] = {}
             for proposal in direction_proposals[:5]:  # max 5 per research call
                 if pending_count >= max_proposals:
                     logger.info(
@@ -1399,23 +1408,36 @@ async def apply_post_spawn_state(
                     "proposed_at": now_iso,
                 }
                 _new_proposals.append(new_direction)
+                _new_proposal_sources[new_direction["id"]] = proposal
                 proj_directions_snap.append(new_direction)
                 pending_count += 1
-                proposals_created += 1
-            if proposals_created:
+            if _new_proposals:
                 session.expire(proposal_project, ["directions"])
+                _applied_proposal_ids: list[str] = []
 
                 def _apply_proposals(dirs: list) -> None:
                     existing_ids = {d.get("id") for d in dirs}
-                    dirs.extend(
-                        _np for _np in _new_proposals if _np["id"] not in existing_ids
-                    )
+                    for _np in _new_proposals:
+                        if _np["id"] in existing_ids:
+                            continue
+                        dirs.append(_np)
+                        existing_ids.add(_np["id"])
+                        _applied_proposal_ids.append(_np["id"])
 
                 await with_directions_locked(session, task.project_id, _apply_proposals)
                 await session.commit()
+                direction_proposals[:] = [
+                    _new_proposal_sources[proposal_id]
+                    for proposal_id in _applied_proposal_ids
+                ]
+                proposals_created = len(direction_proposals)
                 logger.info(
                     f"[RESEARCH] Created {proposals_created} direction proposals from task {task.id}"
                 )
+            else:
+                direction_proposals.clear()
+        else:
+            direction_proposals.clear()
 
     # Store a human-readable research summary artifact
     if child_tasks:
@@ -1583,13 +1605,7 @@ async def _apply_terminal_transition(
     has_existing_children = False
     if not child_tasks:
         has_existing_children = bool(
-            (
-                await session.execute(
-                    select(Task.id).where(Task.parent_task_id == task.id).limit(1)
-                )
-            )
-            .scalars()
-            .first()
+            await authenticated_research_children(session, task)
         )
     if not child_tasks and not has_existing_children:
         # findings_documented: research produced only metadata findings (direction_notes,

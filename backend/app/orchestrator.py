@@ -770,6 +770,10 @@ CANDIDATE_LIGHT_COLUMNS = (
     Task.latest_status_message,
     Task.parent_task_id,
     Task.title,
+    # Completion-priority authenticates parentless grader/challenge sidecars by
+    # their server-owned creator. Omitting this column makes the raiseloaded
+    # candidate access abort the entire dispatch cycle.
+    Task.created_by,
 )
 
 
@@ -2379,7 +2383,12 @@ async def orchestrator_worker():
                         continue  # Don't dispatch — deps can't be validated
                     # Look the dep rows up from the single batch fetched above
                     # (was one SELECT per candidate — the N+1 this fix removes).
-                    dep_tasks = [_dep_by_id[du] for du in dep_uuids if du in _dep_by_id]
+                    dep_tasks = [
+                        _dep_by_id[du]
+                        for du in dep_uuids
+                        if du in _dep_by_id
+                        and _dep_by_id[du].project_id == task.project_id
+                    ]
 
                     # Detect deleted dependencies — treat as failed to prevent premature dispatch
                     if len(dep_tasks) < len(dep_uuids):

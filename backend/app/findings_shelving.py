@@ -133,6 +133,7 @@ async def _shelve_findings_for_next_cycle(
             ctx = dict(t.context or {})
             existing = list(ctx.get("deferred_findings") or [])
             ctx["deferred_findings"] = bound_deferred_findings(existing + stamped)
+            ctx.pop("_research_spawn_pending", None)
             t.context = ctx
             flag_modified(t, "context")
             t.latest_status_message = (

@@ -129,6 +129,26 @@ def _sidecar_application_marker(
     }
 
 
+def _is_authorized_orchestrator_sidecar(task: Task, *, source_key: str) -> bool:
+    """Whether ``task`` has the immutable shape of a backend-owned sidecar.
+
+    Source-link context keys route terminal output back into another task's
+    authoritative completion handler.  Treating the key alone as authority lets
+    an ordinary agent child impersonate a grader/challenger, so every resolver
+    also requires the shape authored by ``task_evaluators``: a parentless
+    ORCHESTRATOR ``investigate`` task carrying the expected source key.
+    """
+
+    first_payload = task.first_payload or {}
+    context = task.context if isinstance(task.context, dict) else {}
+    return (
+        task.created_by == "ORCHESTRATOR"
+        and task.parent_task_id is None
+        and first_payload.get("type") == "investigate"
+        and bool(context.get(source_key))
+    )
+
+
 def _sidecar_application_pending(
     ctx: dict, *, lane: str, sidecar_id: object | None = None
 ) -> bool:
@@ -157,6 +177,35 @@ def _clear_sidecar_application_pending(
     ctx.pop("sidecar_verdict_application_pending", None)
     task.context = ctx
     flag_modified(task, "context")
+
+
+async def _lock_sidecar_research_resume(
+    session: AsyncSession,
+    *,
+    project_id: object,
+    task_id: object,
+) -> tuple[Project, Task]:
+    """Re-lock a sidecar source in canonical Project -> Task order.
+
+    The verdict record is committed before a completion handler is re-entered,
+    so the resolver holds no row lock at this boundary. Research finalization
+    can mutate project vision; reacquiring both rows in the global order avoids
+    a Task -> Project inversion and refreshes the source before the resume.
+    """
+
+    from app.task_locking import lock_project_then_task
+
+    async with lock_project_then_task(
+        session,
+        project_id,
+        task_id,
+        skip_locked=False,
+    ) as (project, task):
+        if project is None or task is None:
+            raise RuntimeError("Sidecar source or project disappeared before resume")
+        if task.project_id != project.id:
+            raise RuntimeError("Sidecar source project changed before resume")
+        return project, task
 
 
 # Verdict-word aliases used by the structured-verdict fallback parser. Each
@@ -588,7 +637,11 @@ def _resolve_adversarial_challenged_hashes(source: Task, grader: Task) -> list[s
 
 
 async def _resolve_quality_grader_completion(
-    grader: Task, payload: AgentStatusPayload, session: AsyncSession
+    grader: Task,
+    payload: AgentStatusPayload,
+    session: AsyncSession,
+    *,
+    defer_source_resume: bool = False,
 ) -> None:
     """Route an independent forward-quality grader's verdict back to its source.
 
@@ -629,6 +682,15 @@ async def _resolve_quality_grader_completion(
         _handle_design_completion,
         _handle_web_research_completion,
     )
+    if not _is_authorized_orchestrator_sidecar(
+        grader, source_key=QUALITY_GRADER_SOURCE_KEY
+    ):
+        logger.warning(
+            "[GRADER] Ignoring unauthorized sidecar shape for task %s",
+            grader.id,
+        )
+        await session.commit()
+        return
     is_adversarial = bool((grader.context or {}).get("adversarial_grader"))
     completed = payload.status == TaskStatus.COMPLETED
     grader_logs = payload.logs or grader.latest_status_message or ""
@@ -643,7 +705,13 @@ async def _resolve_quality_grader_completion(
     source = (
         (
             await session.execute(
-                select(Task).where(Task.id == source_uuid).with_for_update()
+                select(Task)
+                .where(
+                    Task.id == source_uuid,
+                    Task.project_id == grader.project_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -665,28 +733,38 @@ async def _resolve_quality_grader_completion(
     # connection-drop path) may have expired ``source`` — reading
     # ``source.parent_task_id`` there fires a sync expired-load inside the async
     # session and raises MissingGreenlet (prod 2026-06-13, sidecar-recovery).
+    _source_id = source.id
+    _source_project_id = source.project_id
     _source_parent_task_id = source.parent_task_id
     lane = "adversarial_grader" if is_adversarial else "quality_grader"
     verdict_key = (
         ADVERSARIAL_GATE_VERDICT_KEY if is_adversarial else QUALITY_GRADER_VERDICT_KEY
     )
+    awaiting_key = (
+        "awaiting_adversarial_grader"
+        if is_adversarial
+        else "awaiting_quality_grader"
+    )
     pending_application = _sidecar_application_pending(
         ctx, lane=lane, sidecar_id=grader.id
     )
-    if not pending_application and (
-        verdict_key in ctx
-        or (
-            (
-                "awaiting_adversarial_grader"
-                if is_adversarial
-                else "awaiting_quality_grader"
-            )
-            not in ctx
-        )
-    ):
+    if not pending_application and verdict_key in ctx:
         await session.commit()
         logger.info(
             "[GRADER] Grader %s for source %s already resolved; ignoring replayed terminal status",
+            grader.id,
+            source.id,
+        )
+        return
+    _awaited_sidecar = ctx.get(awaiting_key)
+    _awaits_this_sidecar = str(_awaited_sidecar or "") == str(grader.id)
+    if not pending_application and (
+        source.status != TaskStatus.EVALUATING or not _awaits_this_sidecar
+    ):
+        await session.commit()
+        logger.warning(
+            "[GRADER] Ignoring sidecar %s for source %s: source is not "
+            "EVALUATING for this exact awaited sidecar",
             grader.id,
             source.id,
         )
@@ -821,12 +899,13 @@ async def _resolve_quality_grader_completion(
         )
         ctx[ADVERSARIAL_GATE_VERDICT_KEY] = gate_record
         ctx.pop("awaiting_adversarial_grader", None)
-        _set_sidecar_application_pending(
-            ctx,
-            lane=lane,
-            sidecar_id=grader.id,
-            verdict_key=ADVERSARIAL_GATE_VERDICT_KEY,
-        )
+        if not defer_source_resume:
+            _set_sidecar_application_pending(
+                ctx,
+                lane=lane,
+                sidecar_id=grader.id,
+                verdict_key=ADVERSARIAL_GATE_VERDICT_KEY,
+            )
         grader.latest_status_message = (
             f"Adversarial challenge: {failed_count}/{len(finding_verdicts)} "
             f"finding(s) failed"
@@ -884,15 +963,25 @@ async def _resolve_quality_grader_completion(
             vm_provenance={},
         )
         ctx.pop("awaiting_quality_grader", None)
-        _set_sidecar_application_pending(
-            ctx,
-            lane=lane,
-            sidecar_id=grader.id,
-            verdict_key=QUALITY_GRADER_VERDICT_KEY,
-        )
+        if not defer_source_resume:
+            _set_sidecar_application_pending(
+                ctx,
+                lane=lane,
+                sidecar_id=grader.id,
+                verdict_key=QUALITY_GRADER_VERDICT_KEY,
+            )
     session.add(grader)
     source.context = ctx
     flag_modified(source, "context")
+    if defer_source_resume:
+        # A recovery batch may have several independently-authorized terminal
+        # lanes for this exact source.  Persist this verdict and clear only its
+        # exact awaiting slot, but leave the source parked until the final lane
+        # can resume the completion handler once with the complete verdict set.
+        source.status = TaskStatus.EVALUATING
+        session.add(source)
+        await session.commit()
+        return
     # Re-establish the terminal status the source originally reported before it
     # parked; the resume handler flips it to FAILED if the grade failed.
     source.status = TaskStatus.COMPLETED
@@ -919,6 +1008,13 @@ async def _resolve_quality_grader_completion(
         if cap and cap.completion_handler
         else None
     )
+    resume_project: Project | None = None
+    if cap and cap.completion_handler == "research":
+        resume_project, source = await _lock_sidecar_research_resume(
+            session,
+            project_id=_source_project_id,
+            task_id=_source_id,
+        )
     if handler is not None:
         # Reconstruct the artifact text from the stored findings so the handler
         # resumes from the same parsed state it had on the first pass. research
@@ -933,7 +1029,10 @@ async def _resolve_quality_grader_completion(
             resume_logs = json.dumps(source.plan_output["findings"])
         else:
             resume_logs = source.latest_status_message or ""
-        await handler(source, resume_logs, session)
+        if cap and cap.completion_handler == "research":
+            await handler(source, resume_logs, session, project=resume_project)
+        else:
+            await handler(source, resume_logs, session)
         await session.refresh(source)
         _clear_sidecar_application_pending(source, lane=lane, sidecar_id=grader.id)
         session.add(source)
@@ -976,7 +1075,11 @@ async def _resolve_quality_grader_completion(
 
 
 async def _resolve_finding_challenge_completion(
-    challenge: Task, payload: AgentStatusPayload, session: AsyncSession
+    challenge: Task,
+    payload: AgentStatusPayload,
+    session: AsyncSession,
+    *,
+    defer_source_resume: bool = False,
 ) -> None:
     """Route a per-finding challenge side-car's second opinion back to its source.
 
@@ -997,6 +1100,16 @@ async def _resolve_finding_challenge_completion(
     )
     from app.research_completion import _handle_research_completion
 
+    if not _is_authorized_orchestrator_sidecar(
+        challenge, source_key=FINDING_CHALLENGE_SOURCE_KEY
+    ):
+        logger.warning(
+            "[CHALLENGE] Ignoring unauthorized sidecar shape for task %s",
+            challenge.id,
+        )
+        await session.commit()
+        return
+
     cctx = challenge.context or {}
     boundary = str(cctx.get("challenged_boundary") or "")
     first_verdict = str(cctx.get("challenged_first_verdict") or "")
@@ -1012,7 +1125,13 @@ async def _resolve_finding_challenge_completion(
     source = (
         (
             await session.execute(
-                select(Task).where(Task.id == source_uuid).with_for_update()
+                select(Task)
+                .where(
+                    Task.id == source_uuid,
+                    Task.project_id == challenge.project_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -1032,17 +1151,32 @@ async def _resolve_finding_challenge_completion(
     # identical guard in _resolve_quality_grader_completion: the rollup decision
     # below runs after a commit/possible rollback that can expire ``source``, and
     # a live ``source.parent_task_id`` read there raises MissingGreenlet.
+    _source_id = source.id
+    _source_project_id = source.project_id
     _source_parent_task_id = source.parent_task_id
     lane = "finding_challenge"
     pending_application = _sidecar_application_pending(
         ctx, lane=lane, sidecar_id=challenge.id
     )
     if not pending_application and (
-        FINDING_CHALLENGE_VERDICT_KEY in ctx or "awaiting_finding_challenge" not in ctx
+        FINDING_CHALLENGE_VERDICT_KEY in ctx
     ):
         await session.commit()
         logger.info(
             "[CHALLENGE] Challenge %s for source %s already resolved; ignoring replayed terminal status",
+            challenge.id,
+            source.id,
+        )
+        return
+    _awaited_sidecar = ctx.get("awaiting_finding_challenge")
+    _awaits_this_sidecar = str(_awaited_sidecar or "") == str(challenge.id)
+    if not pending_application and (
+        source.status != TaskStatus.EVALUATING or not _awaits_this_sidecar
+    ):
+        await session.commit()
+        logger.warning(
+            "[CHALLENGE] Ignoring sidecar %s for source %s: source is not "
+            "EVALUATING for this exact awaited sidecar",
             challenge.id,
             source.id,
         )
@@ -1066,14 +1200,20 @@ async def _resolve_finding_challenge_completion(
         session.add(challenge)
         ctx[FINDING_CHALLENGE_VERDICT_KEY] = record.to_context()
         ctx.pop("awaiting_finding_challenge", None)
-        _set_sidecar_application_pending(
-            ctx,
-            lane=lane,
-            sidecar_id=challenge.id,
-            verdict_key=FINDING_CHALLENGE_VERDICT_KEY,
-        )
+        if not defer_source_resume:
+            _set_sidecar_application_pending(
+                ctx,
+                lane=lane,
+                sidecar_id=challenge.id,
+                verdict_key=FINDING_CHALLENGE_VERDICT_KEY,
+            )
     source.context = ctx
     flag_modified(source, "context")
+    if defer_source_resume:
+        source.status = TaskStatus.EVALUATING
+        session.add(source)
+        await session.commit()
+        return
     source.status = TaskStatus.COMPLETED
     session.add(source)
     await session.commit()
@@ -1088,6 +1228,13 @@ async def _resolve_finding_challenge_completion(
         if cap and cap.completion_handler
         else None
     )
+    resume_project: Project | None = None
+    if cap and cap.completion_handler == "research":
+        resume_project, source = await _lock_sidecar_research_resume(
+            session,
+            project_id=_source_project_id,
+            task_id=_source_id,
+        )
     if handler is not None:
         if isinstance(source.plan_output, list):
             resume_logs = json.dumps(source.plan_output)
@@ -1097,7 +1244,7 @@ async def _resolve_finding_challenge_completion(
             resume_logs = json.dumps(source.plan_output["findings"])
         else:
             resume_logs = source.latest_status_message or ""
-        await handler(source, resume_logs, session)
+        await handler(source, resume_logs, session, project=resume_project)
         await session.refresh(source)
         _clear_sidecar_application_pending(source, lane=lane, sidecar_id=challenge.id)
         session.add(source)
@@ -1133,7 +1280,10 @@ async def _resolve_finding_challenge_completion(
 
 
 async def trigger_stranded_sidecar_resolution(
-    sidecar: Task, session: AsyncSession
+    sidecar: Task,
+    session: AsyncSession,
+    *,
+    defer_source_resume: bool = False,
 ) -> None:
     """Invoke the appropriate lane resolver for a terminal side-car that never posted status.
 
@@ -1158,9 +1308,19 @@ async def trigger_stranded_sidecar_resolution(
     )
     ctx = sidecar.context or {}
     if ctx.get(QUALITY_GRADER_SOURCE_KEY):
-        await _resolve_quality_grader_completion(sidecar, synthetic, session)
+        await _resolve_quality_grader_completion(
+            sidecar,
+            synthetic,
+            session,
+            defer_source_resume=defer_source_resume,
+        )
     elif ctx.get(FINDING_CHALLENGE_SOURCE_KEY):
-        await _resolve_finding_challenge_completion(sidecar, synthetic, session)
+        await _resolve_finding_challenge_completion(
+            sidecar,
+            synthetic,
+            session,
+            defer_source_resume=defer_source_resume,
+        )
     else:
         logger.warning(
             "[SIDECAR-RECOVERY] Sidecar %s has no recognised source key; cannot route",

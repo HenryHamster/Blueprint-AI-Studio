@@ -1839,23 +1839,24 @@ async def create_direction_research_task(
         )
     except DiscoveryCycleUnavailable as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if discovery_cycle is not None:
-        task_payload.update(
-            {
-                "discovery_generation": discovery_cycle.generation,
-                "discovery_phase": discovery_cycle.phase,
-                "discovery_intent_snapshot": dict(
-                    discovery_cycle.intent_snapshot or {}
-                ),
-                "discovery_bet_snapshot": dict(
-                    discovery_cycle.bet_snapshot or {}
-                ),
-            }
-        )
-        task_payload = validate_internal_payload(
-            task_payload,
-            "directions:discovery_cycle",
-        )
+    # Manual direction research is a first-class research root. Reuse the same
+    # canonical envelope as a direct Strategic root so every bounded parent gets
+    # the frozen direction/cycle authority, real finding headroom, capability
+    # vocabulary, and configured research prompt suffix.
+    from app.direct_research_spawn import enrich_direct_research_payload
+
+    enrich_direct_research_payload(
+        task_payload,
+        project=project,
+        direction_entry=direction,
+        direction_id=direction_id,
+        direct_cycle=discovery_cycle,
+        runtime_config=_runtime_config,
+    )
+    task_payload = validate_internal_payload(
+        task_payload,
+        "directions:research_root_envelope",
+    )
     # Atomic per-direction claim — the SAME key the autonomous loop stamps, so
     # a manual spawn and a concurrent autonomous tick (or a double-click) can
     # never BOTH create an active research cycle on this direction. The in-app

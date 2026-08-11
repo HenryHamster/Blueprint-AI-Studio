@@ -6,9 +6,9 @@ and the large _handle_research_completion handler.
 """
 
 import asyncio
-import contextlib
 import json
 import logging
+import math
 import os
 import random
 import uuid
@@ -17,7 +17,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -36,6 +35,77 @@ from app.findings_shelving import (
     RETIRED_DISPOSITION_KEY,
     _shelve_findings_for_next_cycle,
     build_retired_disposition_records,
+)
+from app.research_deferred_carry import (
+    acknowledge_consumed_deferred_findings,
+    canonical_deferred_finding_hash,
+    deferred_carry_pair,
+)
+from app.research_cycle_cadence import (
+    count_accepted_research_cycle,
+    lock_accepted_research_boundary,
+)
+from app.research_execution_authority import (
+    MAX_RESEARCH_DEPTH,
+    authenticated_research_children,
+    commit_or_handle_duplicate_research_spawn,
+    finalized_research_findings_for_survivors,
+    is_authenticated_research_child,
+    lock_research_spawn_boundary,
+    reconcile_replayed_salvage_delivery,
+    refresh_research_spawn_references,
+    relock_research_spawn_retry,
+)
+from app.research_output_contract import (
+    RESEARCH_FINDING_ORIGIN_CONTRACT_VERSION_KEY,
+    RESEARCH_OUTPUT_CONTRACT_VERSION,
+    RESEARCH_OUTPUT_CONTRACT_VERSION_KEY,  # noqa: F401 — re-exported for tests
+    research_finding_origin_contract_version,
+    research_output_contract_version,
+)
+from app.research_finding_contract import (  # noqa: F401 — re-exported private helpers
+    _RESEARCH_ALLOWED_FINDING_TYPES,
+    _RESEARCH_IMPLEMENTATION_FINDING_TYPES,
+    _meaningful_research_acceptance_string,
+    _normalize_research_acceptance_evidence,
+    _normalize_research_finding_types,
+    _parse_strict_research_findings,
+    _prepare_research_metadata_targets,
+    _research_contract_rejection_receipts,
+    _research_finding_contract_errors,
+    _research_output_contract_enabled,
+)
+from app.research_finding_policy import (
+    COMPUTE_EXPERIMENT_FINDING_TYPES,
+    _NON_SPAWNING_FINDING_TYPES,
+    _annotate_capability_declarations,
+    _apply_structural_actionability_downgrade,
+    _cap_findings_by_priority,
+    _is_high_stakes_finding,
+    _research_findings_would_spawn,
+)
+from app.research_handoff import (
+    _INVALID_RESEARCH_FINDINGS_TERMINAL_REASON,
+    _NO_DELIVERED_OUTPUT_TERMINAL_REASON,
+    _bounded_research_handoff_sources,
+    _build_research_direction_payload_scope,
+    _build_research_handoff,
+    _compact_research_handoff_text,
+    _declares_delivered_output_deliverable,
+    _delivered_output_present,
+    _research_question_for_grader,
+)
+from app.research_finding_challenge_history import (
+    FINDING_CHALLENGE_HISTORY_KEY as _FINDING_CHALLENGE_HISTORY_KEY,
+    FINDING_CHALLENGE_RECORD_KEY as _FINDING_CHALLENGE_RECORD_KEY,
+    attach_historical_finding_challenge_record,
+    consume_finding_challenge_record as _consume_finding_challenge_record,
+)
+from app.research_sibling_dependencies import (  # noqa: F401 — re-exported private helpers
+    _RESEARCH_SIBLING_SERIALIZATION_CONTAINMENT,
+    _RESEARCH_SIBLING_SERIALIZATION_JACCARD,
+    _wire_research_sibling_edges,
+    converge_spawn_batch_foundations,
 )
 from app.models import (
     TASK_ORIGINATION_PLAN,
@@ -59,7 +129,6 @@ from app.compute_experiment_contract import (
     _stamp_container_image_pin_status,
     _validate_compute_launch_contract,
     resolve_compute_spend_decision,
-    resolve_compute_spend_threshold,
 )
 from app.resource_envelope import resolve_project_require_local_runner
 from app.direction_metrics import (  # noqa: F401 — re-exported for callers/tests
@@ -97,10 +166,8 @@ from app.finding_deduplication import (
     finding_hash as _finding_hash,
     is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
     need_matches_task_lineage,
-    normalize_prerequisite,
     resolve_prerequisite_task,
 )
-from app.task_blocked import NEED_REF_MAX_LEN
 from app.capability_execution_fence import stamp_capability_requirements
 from app.task_evaluators import (
     ADVERSARIAL_PARSE_CHALLENGER_FAILED,
@@ -119,7 +186,6 @@ from app.capability_registry import (
     annotate_capability_proof_status,
     capability_need_blocked_by_proof_gate,
     capability_need_proof_status,
-    off_registry_capability_refs,
     registry_capability_evidence_refs_map,
     registry_capability_names,
     registry_capability_vocabulary,
@@ -188,7 +254,6 @@ from app.task_locking import (
     with_design_doc_locked,
     with_directions_locked,
     with_problem_model_locked,
-    with_vision_locked,
 )
 from app.project_telemetry import (
     get_project_telemetry as _get_project_telemetry,
@@ -250,7 +315,7 @@ _SQUASH_LANDED_CONFIRMED_PARENT_IDS: set[str] = set()
 # than stampeding memo creation.
 MEMO_SPAWN_CAP_PER_CYCLE = 5
 
-# Per-cycle ceiling on implementation tasks spawned from one research cycle's
+# Per-cycle ceiling on task-spawning findings from one research cycle's
 # findings. This is a flat backlog guard, NOT a capacity throttle: real capacity
 # is enforced where it actually binds — the dispatcher only starts as many VMs as
 # there are free slots (orchestrator's max_concurrent_vms gate), and
@@ -266,8 +331,8 @@ _MAX_FINDINGS_PER_CYCLE = 15
 def effective_research_finding_headroom(prior_deferred_count: int = 0) -> int:
     """Open finding slots for a research cycle, after recovered deferred findings.
 
-    ``_MAX_FINDINGS_PER_CYCLE`` is the flat per-cycle ceiling on implementation
-    tasks spawned from one research cycle. Findings deferred from prior cycles
+    ``_MAX_FINDINGS_PER_CYCLE`` is the flat per-cycle ceiling on task-spawning
+    findings from one research cycle. Findings deferred from prior cycles
     (``task.context['deferred_findings']``) are re-injected into the next cycle
     and consume part of that ceiling, so the effective headroom is the ceiling
     minus the number of recovered deferred findings. Clamped at zero so a
@@ -278,13 +343,6 @@ def effective_research_finding_headroom(prior_deferred_count: int = 0) -> int:
     """
     return max(0, _MAX_FINDINGS_PER_CYCLE - int(prior_deferred_count or 0))
 
-# Trailing cap for the durable spawn-count idempotency ledger persisted in
-# project.vision. Only the most recent IDs can plausibly be replayed by a
-# post-commit re-run, so an unbounded list would grow forever inside the
-# JSONB for no dedup benefit. Matches the sibling durable-history caps
-# (rejected_proposals=30, *_DURABLE_MAX=200) — see the review note.
-_RESEARCH_SPAWN_COUNTED_IDS_MAX = 200
-
 # Drop reason stamped on the memo a reproduce-on-HEAD rejection spawns. Distinct
 # from the capacity/quality drop reasons (low_actionability / degradation_gate)
 # so strategic review can tell "the cited code is unambiguously gone" — the
@@ -292,8 +350,6 @@ _RESEARCH_SPAWN_COUNTED_IDS_MAX = 200
 _REPRODUCE_REJECTED_DROP_REASON = "reproduce_on_head_absent"
 _CRITERION_EVIDENCE_REJECTED_DROP_REASON = "criterion_evidence_missing"
 
-_FINDING_CHALLENGE_HISTORY_KEY = "finding_challenge_records"
-_FINDING_CHALLENGE_RECORD_KEY = "finding_challenge"
 _LOW_ACTIONABILITY_REFINEMENT_REASON = "low_actionability_refinement"
 _RESEARCH_FINDING_CHALLENGE_FLAG = "research_finding_challenge_enabled"
 _RESEARCH_FINDING_INDETERMINATE_CHALLENGE_FLAG = (
@@ -589,56 +645,6 @@ def _finding_challenge_enabled(boundary: str) -> bool:
     return False
 
 
-def _consume_finding_challenge_record(
-    task: Task,
-    finding: Dict[str, Any],
-    *,
-    boundary: str,
-    first_verdict: str,
-) -> Dict[str, Any] | None:
-    """Attach one returned challenge verdict to the finding it gates.
-
-    ``task_evaluators`` writes a single active record on the source task. The
-    research handler consumes that active record on the resume pass, stores a
-    bounded source-task history, and removes the active key so another later
-    high-stakes finding can be challenged without double-applying this verdict.
-    """
-    ctx = dict(task.context or {})
-    record = ctx.get(FINDING_CHALLENGE_VERDICT_KEY)
-    if not isinstance(record, dict):
-        return None
-    if record.get("challenged_boundary") != boundary:
-        return None
-    if str(record.get("first_verdict") or "") != str(first_verdict):
-        return None
-    # Identity check: reject if the record was stamped for a different finding.
-    record_fhash = record.get("finding_hash")
-    if record_fhash is not None:
-        current_fhash = _finding_hash(
-            finding.get("title", ""),
-            finding.get("description") or finding.get("prompt", ""),
-        )
-        if current_fhash != record_fhash:
-            return None
-
-    attached = dict(record)
-    finding[_FINDING_CHALLENGE_RECORD_KEY] = attached
-    with contextlib.suppress(Exception):
-        flag_modified(task, "plan_output")
-    history = [
-        h
-        for h in (ctx.get(_FINDING_CHALLENGE_HISTORY_KEY) or [])
-        if isinstance(h, dict)
-    ]
-    history.append(attached)
-    ctx[_FINDING_CHALLENGE_HISTORY_KEY] = history[-20:]
-    ctx.pop(FINDING_CHALLENGE_VERDICT_KEY, None)
-    ctx.pop("awaiting_finding_challenge", None)
-    task.context = ctx
-    flag_modified(task, "context")
-    return attached
-
-
 def _challenge_agrees(record: Dict[str, Any] | None) -> bool:
     return isinstance(record, dict) and record.get("agreement") == CHALLENGE_AGREES
 
@@ -686,6 +692,16 @@ def _parse_research_findings(text: str) -> List[Dict[str, Any]] | None:
     """Extract structured research findings JSON array from agent output text."""
     from app.task_completion import _extract_json_array
 
+    # The shared extractor identifies arrays through keys on their elements, so
+    # a legitimate empty array has no anchor to match. Preserve the semantic
+    # distinction between an explicit ``[]`` decision and malformed/missing
+    # output; callers fail closed only for the latter.
+    try:
+        if json.loads(text.strip()) == []:
+            return []
+    except (json.JSONDecodeError, TypeError):
+        pass
+
     json_str = _extract_json_array(text, "title", "prompt")
     if json_str:
         try:
@@ -731,139 +747,6 @@ def _parse_research_findings(text: str) -> List[Dict[str, Any]] | None:
     return None
 
 
-def _cap_findings_by_priority(
-    findings: List[Dict[str, Any]], effective_cap: int
-) -> tuple[List[Dict[str, Any]], int, List[Dict[str, Any]]]:
-    """Cap findings to effective_cap, preserving high-priority items first.
-
-    Returns (capped_findings, batch_cap_applied_count, batch_cap_deferred).
-    Synchronous helper for asyncio.to_thread() offloading.
-    """
-    _BATCH_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
-    batch_cap_applied_count = max(0, len(findings) - effective_cap)
-    _batch_cap_deferred: list[dict] = []
-    if len(findings) > effective_cap:
-        _ranked = sorted(
-            enumerate(findings),
-            key=lambda pair: _BATCH_PRIORITY_ORDER.get(
-                pair[1].get("priority", "medium"), 1
-            ),
-        )
-        _kept_set = {i for i, _ in _ranked[:effective_cap]}
-        # Co-defer any kept finding whose depends_on_indices points at a finding
-        # the cap dropped. Without this, the index remap below silently DROPS
-        # that edge (the target index is not in _old_to_new), and the dependent
-        # spawns as an ordinary child with no edge and no blocking need --
-        # dispatching against a foundation that does not exist yet. Mirror the
-        # same-cycle prerequisite co-deferral: shelve the dependent alongside its
-        # deferred foundation so the pair re-surfaces together next cycle.
-        # Iterate to a fixpoint so an entire dependent chain co-defers, never
-        # just the leaf.
-        while True:
-            _co_defer = {
-                i
-                for i in _kept_set
-                if any(
-                    0 <= d < len(findings) and d not in _kept_set
-                    for d in (findings[i].get("depends_on_indices") or [])
-                )
-            }
-            if not _co_defer:
-                break
-            _kept_set -= _co_defer
-        _kept_orig_indices = sorted(_kept_set)
-        _batch_cap_deferred = [
-            f for i, f in enumerate(findings) if i not in _kept_set
-        ]
-        _old_to_new = {old: new for new, old in enumerate(_kept_orig_indices)}
-        findings_capped = [findings[i] for i in _kept_orig_indices]
-        for _f in findings_capped:
-            _deps = _f.get("depends_on_indices")
-            if _deps:
-                _f["depends_on_indices"] = [
-                    _old_to_new[d] for d in _deps if d in _old_to_new
-                ]
-        return findings_capped, batch_cap_applied_count, _batch_cap_deferred
-    return findings, batch_cap_applied_count, _batch_cap_deferred
-
-
-def _annotate_capability_declarations(
-    findings: List[Dict[str, Any]], registry_names: List[str]
-) -> None:
-    """Normalize each finding's capability declarations and softly flag off-registry refs.
-
-    For every finding this:
-
-      * normalizes an optional declared ``prerequisite`` (machine-resolvable
-        ``{kind, ref}`` need) onto ``_prerequisite`` — malformed/unknown-kind
-        declarations are dropped so only explicit references ever drive an edge;
-      * carries an explicit ``provides_capability`` string onto
-        ``_provides_capability`` so a sibling finding can structurally depend on it.
-
-    It then attaches a SOFT, FAIL-OPEN advisory marker: any declared capability ref
-    (the ``provides_capability`` stamp, or a ``{kind: capability}`` prerequisite ref)
-    that is NOT in ``problem_model.capabilities`` (``registry_names``) is recorded on
-    ``_off_registry_capabilities`` so the strategist can fold it into the shared
-    vocabulary. The off-registry ref is NEVER rejected or dropped — it still
-    resolves EXACTLY against any provider that advertises it (matchers stay exact);
-    the marker is purely informational. Mutates ``findings`` in place.
-    """
-    for _f in findings:
-        if not isinstance(_f, dict):
-            continue
-        _prereq_raw = _f.get("prerequisite") or _f.get("requires")
-        _prereq = normalize_prerequisite(_prereq_raw)
-        if _prereq is not None:
-            _f["_prerequisite"] = _prereq
-            _f.pop("_malformed_prerequisite", None)
-        else:
-            _f.pop("_prerequisite", None)
-            # Retirable advisory: a declared kind=task prerequisite whose ref is
-            # title-like (not a task UUID / finding hash) is malformed — it names
-            # no machine-resolvable foundation, so normalize_prerequisite dropped
-            # it and it must NOT become durable stranded demand nor drive an edge.
-            # Record the dropped declaration (never block on it) so the strategist
-            # can see it and the agent learns a named foundation belongs to
-            # kind=capability. Purely additive, fail-open.
-            if (
-                isinstance(_prereq_raw, dict)
-                and isinstance(_prereq_raw.get("kind"), str)
-                and _prereq_raw["kind"].strip().lower() == "task"
-                and isinstance(_prereq_raw.get("ref"), str)
-                and _prereq_raw["ref"].strip()
-            ):
-                _f["_malformed_prerequisite"] = {
-                    "kind": "task",
-                    "ref": _prereq_raw["ref"].strip()[:NEED_REF_MAX_LEN],
-                    "reason": (
-                        "title-like task ref (not a task id or finding hash); "
-                        "declare a named foundation as kind=capability"
-                    ),
-                }
-            else:
-                _f.pop("_malformed_prerequisite", None)
-        # An explicit capability a finding's task advertises, so a sibling
-        # finding declaring {kind:capability, ref:<name>} can structurally
-        # depend on it (intra-batch foundation sharing). Explicit string only.
-        _cap = _f.get("provides_capability") or _f.get("capability")
-        if isinstance(_cap, str) and _cap.strip():
-            _f["_provides_capability"] = _cap.strip()
-        else:
-            _f.pop("_provides_capability", None)
-        # Soft, fail-open vocabulary convergence: flag (never drop) any declared
-        # capability ref absent from the strategist-curated registry.
-        _cap_refs: List[str] = []
-        if _f.get("_provides_capability"):
-            _cap_refs.append(_f["_provides_capability"])
-        if _prereq is not None and _prereq.get("kind") == "capability":
-            _cap_refs.append(_prereq["ref"])
-        _off = off_registry_capability_refs(_cap_refs, registry_names)
-        if _off:
-            _f["_off_registry_capabilities"] = _off
-        else:
-            _f.pop("_off_registry_capabilities", None)
-
-
 async def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
     """Read structured research insights from the agent's /tmp output file."""
     insights_path = f"/tmp/research_insights_{task_id}.json"
@@ -884,178 +767,6 @@ async def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
         return []
 
     return await asyncio.to_thread(_read_sync)
-
-
-# Finding ``type`` values that declare an empirical-measurement intent and should
-# route to a ``compute_experiment`` child (a budgeted, auto-torn-down compute job)
-# rather than a code-writing implementer.
-COMPUTE_EXPERIMENT_FINDING_TYPES: frozenset[str] = frozenset(
-    {"compute_experiment", "measurement", "benchmark"}
-)
-
-
-def _apply_structural_actionability_downgrade(findings: list) -> int:
-    """Downgrade each finding's actionability_grade when its structural support
-    (claims count, valid sources, description length) does not justify the
-    claimed grade. Mutates findings in place. Returns the count of downgrades.
-
-    Extracted from _handle_research_completion so unit tests that exercise
-    orthogonal behaviors (deduplication, dispatch, etc.) can patch this gate
-    to a no-op via mocker.patch without having to attach structural metadata
-    to every test fixture.
-    """
-    grade_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
-    downgrades = 0
-    for f in findings:
-        claims = f.get("claims") if isinstance(f.get("claims"), list) else []
-        # Discount claims that reference code absent at HEAD: a claim asserting
-        # facts about a nonexistent symbol/file must not count as structural
-        # support, mirroring how an invalid file citation fails to count as a
-        # valid source. _ungrounded_claim_count is set at ingestion by
-        # summarize_ungrounded_claims.
-        ungrounded = int(f.get("_ungrounded_claim_count", 0) or 0)
-        effective_claims = max(0, len(claims) - ungrounded)
-        desc = str(f.get("description") or "").strip()
-        sources = f.get("sources") if isinstance(f.get("sources"), list) else []
-        valid_sources = sum(
-            1
-            for s in sources
-            if isinstance(s, dict)
-            and (
-                str(s.get("type") or "").lower() in ("pr", "message")
-                or s.get("valid", True) is not False
-            )
-        )
-        structural_grade = "LOW"
-        if effective_claims >= 2 and valid_sources >= 1 and len(desc) >= 80:
-            structural_grade = "HIGH"
-        elif effective_claims >= 1 and len(desc) >= 40:
-            structural_grade = "MEDIUM"
-        current = f.get("actionability_grade", "MEDIUM")
-        if grade_order[structural_grade] < grade_order.get(current, 1):
-            f["actionability_grade"] = structural_grade
-            downgrades += 1
-    return downgrades
-
-
-# Terminal reason for a deliver task whose declared deliverable is a sent
-# message or a written report but which produced neither (and no findings). This
-# is the task-orchestrator peer of compute's _NO_DATA_TERMINAL_REASON: a green
-# COMPLETED here would mask a zero-output outcome (the a70fe988 pathology —
-# 'no actionable findings (degraded: provider capacity)' recorded as SUCCESS).
-_NO_DELIVERED_OUTPUT_TERMINAL_REASON = (
-    "deliver task declared a message/report deliverable but produced none — "
-    "zero findings, no message sent, and no report written; recorded as FAILED "
-    "rather than a green completion that masks the empty outcome"
-)
-
-# Explicit phrases that DECLARE a task's deliverable to BE a sent message or a
-# written report (as opposed to the usual research findings). The match is kept
-# deliberately explicit/conservative — mirroring compute's fail-soft
-# _job_expects_data guard — so an ordinary research task whose prose merely
-# mentions the words 'report' or 'message' is never mis-flagged and false-failed.
-_DELIVERED_OUTPUT_DELIVERABLE_PHRASES = (
-    "message/report deliverable",
-    "report/message deliverable",
-    "deliverable of this task is a sent message",
-    "deliverable of this task is a message",
-    "deliverable of this task is a report",
-    "deliverable of this task is a written report",
-    "deliverable is a sent message",
-    "deliverable is a message",
-    "deliverable is a report",
-    "deliverable is a written report",
-    "declared deliverable is a sent message",
-    "declared deliverable is a message",
-    "declared deliverable is a report",
-    "message deliverable",
-    "report deliverable",
-)
-
-# Structured deliverable-kind values (context/payload) that declare a delivered
-# output rather than parsed findings. Preferred over prose matching; this is what
-# forward-looking spawners should stamp.
-_DELIVERED_OUTPUT_DELIVERABLE_KINDS = {"message", "report", "message_or_report"}
-
-
-def _declares_delivered_output_deliverable(task: Task) -> bool:
-    """True when the task DECLARED that its deliverable is a sent message or a
-    written report/document, rather than parsed research findings.
-
-    Most research tasks deliver findings; an empty-but-honest finding set is a
-    legitimate green completion for those, so this predicate must NOT fire for
-    them. A subset of research/deliver tasks instead declare their deliverable to
-    BE a sent operator message or a written report (e.g. operator-requested
-    state-of-internals reports like task a70fe988). For those, a zero-findings
-    run that ALSO sent no message and wrote no report produced nothing — the
-    green-status-masks-empty-outcome pathology the no-output guard closes.
-
-    Detection is conservative (mirrors compute's fail-soft ``_job_expects_data``):
-    it fires only on an EXPLICIT structured field or an explicit deliverable
-    phrase, never on incidental prose.
-    """
-    payload = task.first_payload or {}
-    context = task.context or {}
-    # 1. Structured declaration (preferred; what future spawners should set).
-    for source in (context, payload):
-        if not isinstance(source, dict):
-            continue
-        kind = source.get("deliverable_kind")
-        if (
-            isinstance(kind, str)
-            and kind.strip().lower() in _DELIVERED_OUTPUT_DELIVERABLE_KINDS
-        ):
-            return True
-        if source.get("requires_delivered_output") is True:
-            return True
-    # 2. Explicit prose declaration in the description / prompt / acceptance
-    #    evidence observable_behavior.
-    texts: list[str] = [task.description or "", str(payload.get("prompt") or "")]
-    evidence = payload.get("acceptance_evidence")
-    if isinstance(evidence, dict):
-        texts.append(
-            str(evidence.get("description") or evidence.get("observable_behavior") or "")
-        )
-    haystack = " ".join(texts).lower()
-    return any(phrase in haystack for phrase in _DELIVERED_OUTPUT_DELIVERABLE_PHRASES)
-
-
-async def _delivered_output_present(task: Task, session: AsyncSession) -> bool:
-    """True when this task produced a durable delivered output.
-
-    A delivered output is either a sent operator message (``ProjectMessage`` with
-    ``from_task_id == task.id``) or a written report/document (``KnowledgeDocument``
-    with ``source_task_id == task.id``). Used by the no-output guard to tell a
-    genuinely-empty deliver task apart from one that sent/wrote its deliverable
-    even though it parsed no findings.
-    """
-    from app.models import KnowledgeDocument, ProjectMessage
-
-    message_id = (
-        (
-            await session.execute(
-                select(ProjectMessage.id)
-                .where(ProjectMessage.from_task_id == task.id)
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if message_id is not None:
-        return True
-    document_id = (
-        (
-            await session.execute(
-                select(KnowledgeDocument.id)
-                .where(KnowledgeDocument.source_task_id == task.id)
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    return document_id is not None
 
 
 def _record_research_survival_signal(task: Task, *, surviving: int) -> None:
@@ -1370,18 +1081,21 @@ def _mark_capacity_degraded(task: Task, reason: str) -> None:
     flag_modified(task, "context")
 
 
-# Finding ``type`` values that are processed separately and never spawn an
-# implementation/child task (direction proposals/notes, design-doc observations,
-# direction updates). Used by the blast-radius predicate below.
-_NON_SPAWNING_FINDING_TYPES = frozenset(
-    {
-        "direction_proposal",
-        "direction_note",
-        "design_doc_observation",
-        "direction_update",
-        "note",
-    }
-)
+def _stamp_research_contract_rejections(
+    task: Task,
+    receipts: list[dict[str, Any]],
+) -> None:
+    if not receipts:
+        return
+    context = dict(task.context or {})
+    existing = context.get("research_output_contract_rejections")
+    if not isinstance(existing, list):
+        existing = []
+    context["research_output_contract_rejections"] = (existing + receipts)[-50:]
+    context["research_output_contract_rejection_count"] = len(receipts)
+    task.context = context
+    flag_modified(task, "context")
+
 
 def _compute_direction_productivity(
     direction_id: str,
@@ -1427,400 +1141,15 @@ _REPRODUCE_VERDICT_FINDING_TYPES = frozenset({"bug"})
 _VOCAB_RENDERING_TASK_TYPES = frozenset({"plan", "research", "design"})
 
 
-def _is_high_stakes_finding(finding: Dict[str, Any]) -> bool:
-    """Return True when a finding warrants an adversarial second opinion.
-
-    Selects findings with large blast radius (scope=large, risk=high) OR any
-    finding carrying a partial-staleness / over-claim signal regardless of scope
-    (downgraded verification_basis, broken file refs, ungrounded path:symbol
-    claims, cited-files-changed staleness). Non-spawning types and LOW-
-    actionability findings are never high-stakes (they don't launch work).
-    """
-    if not isinstance(finding, dict):
-        return False
-    if finding.get("type") in _NON_SPAWNING_FINDING_TYPES:
-        return False
-    # A finding must have a non-blank prompt or description to potentially spawn work.
-    # Checks prompt first so that an explicitly blank prompt (e.g. "   ") treats the
-    # finding as bodiless even when a non-empty description is also present.
-    if not str(finding.get("prompt") or finding.get("description") or "").strip():
-        return False
-    if finding.get("actionability_grade") == "LOW":
-        return False
-    # Capability-foundation work is structurally non-adversarial: a finding that
-    # declares it provides a capability, or one that depends on a capability,
-    # should flow through the normal capability resolver instead of getting
-    # parked in the refute-first spawn gate.
-    if finding.get("_provides_capability") or finding.get("provides_capability"):
-        return False
-    _capability_prereq = finding.get("_prerequisite") or normalize_prerequisite(
-        finding.get("prerequisite") or finding.get("requires")
-    )
-    if (
-        isinstance(_capability_prereq, dict)
-        and _capability_prereq.get("kind") == "capability"
-    ):
-        return False
-
-    # Large blast radius: large scope
-    if str(finding.get("scope") or "").lower() == "large":
-        return True
-
-    # High risk
-    if str(finding.get("risk") or "").lower() in ("high", "critical", "very_high"):
-        return True
-
-    # Over-claim signal: verification_basis was downgraded because citations failed HEAD
-    if finding.get("verification_basis_downgraded_from"):
-        return True
-
-    # Provenance warnings: broken file refs or ungrounded path:symbol claims
-    prov = finding.get("_provenance_warnings")
-    if isinstance(prov, dict):
-        if prov.get("broken_refs") or prov.get("ungrounded_refs"):
-            return True
-        if prov.get("cited_files_changed_since_generation"):
-            return True
-
-    # Deferred-finding staleness: cited files changed since generation
-    if finding.get("needs_revalidation") is True:
-        return True
-
-    # Compute-experiment: GPU use, material spend, or long deadline are high-stakes.
-    # A budgeted compute launch that proposes accelerator hardware, exceeds or
-    # approaches the autonomous spend threshold, or runs for longer than one hour
-    # warrants an independent adversarial challenge before the job is created.
-    # Malformed contracts (missing/invalid spend_cap_usd) are NOT flagged here —
-    # they defer through the existing _validate_compute_launch_contract path.
-    if finding.get("type") in COMPUTE_EXPERIMENT_FINDING_TYPES:
-        _nested = (
-            finding.get("compute_experiment") or finding.get("launch_contract") or {}
-        )
-        if not isinstance(_nested, dict):
-            _nested = {}
-
-        def _cpick(key: str) -> Any:
-            val = _nested.get(key)
-            if val is None:
-                val = finding.get(key)
-            return val
-
-        _accel = _cpick("accelerator")
-        if _accel and str(_accel).strip():
-            return True
-
-        _spend = _cpick("spend_cap_usd")
-        try:
-            _spend_f = float(_spend)
-        except (TypeError, ValueError):
-            _spend_f = None
-        if _spend_f is not None and _spend_f > 0:
-            _threshold = resolve_compute_spend_threshold(_runtime_config, None)
-            if _threshold == 0 or _spend_f >= _threshold * 0.5:
-                return True
-
-        _deadline = _cpick("deadline_seconds")
-        try:
-            _deadline_i = int(_deadline)
-        except (TypeError, ValueError):
-            _deadline_i = None
-        if _deadline_i is not None and _deadline_i > 3600:
-            return True
-
-    return False
-
-
-def _research_findings_would_spawn(findings: List[Dict[str, Any]]) -> bool:
-    """True if at least one finding would spawn downstream implementation work.
-
-    This is a blast-radius predicate, not the exact spawn decision (dedup and
-    confidence gating still run in the spawn loop). It deliberately over-counts
-    rather than under-counts: it is better to grade a research artifact that
-    later dedups to zero children than to let an ungraded finding spawn a PR.
-    """
-    for f in findings:
-        if not isinstance(f, dict):
-            continue
-        if (f.get("type") or "") in _NON_SPAWNING_FINDING_TYPES:
-            continue
-        if not str(f.get("prompt") or "").strip():
-            continue
-        if f.get("actionability_grade") == "LOW":
-            continue
-        return True
-    return False
-
-
-def _wire_research_sibling_edges(
-    child_tasks: List[Task],
-    finding_to_child: Dict[int, int],
-    overlaps: List[tuple],
-    candidates: List[Task],
-) -> List[tuple]:
-    """Wire REAL ``depends_on`` edges between research siblings that share a
-    related_file, mirroring plan_completion._inject_file_overlap_deps: research
-    previously only surfaced file-overlap warnings, so same-file siblings
-    dispatched in parallel and raced at merge. The later sibling (by findings
-    index) depends on the earlier. Edges are additive and skipped when they
-    would close a cycle or involve a CANCELLED/FAILED sibling — a live dependent
-    must never be cascade-cancelled behind a dead one. Returns wired
-    ``(predecessor_id, successor_id, shared_files)`` edges.
-    """
-    from app.blocked_need_resolution import _would_create_cycle
-
-    wired: List[tuple] = []
-    for i, j, shared_files in overlaps:
-        ci = finding_to_child.get(i)
-        cj = finding_to_child.get(j)
-        if ci is None or cj is None or ci >= len(child_tasks) or cj >= len(child_tasks):
-            continue
-        predecessor, successor = child_tasks[ci], child_tasks[cj]
-        if (
-            predecessor.status in (TaskStatus.CANCELLED, TaskStatus.FAILED)
-            or successor.status in (TaskStatus.CANCELLED, TaskStatus.FAILED)
-        ):
-            continue
-        pred_id = str(predecessor.id)
-        existing = list(successor.depends_on or [])
-        if pred_id in existing or _would_create_cycle(successor, predecessor, candidates):
-            continue
-        existing.append(pred_id)
-        successor.depends_on = existing
-        remember_structural_depends_on(successor, pred_id)
-        wired.append((pred_id, str(successor.id), sorted(shared_files)))
-    return wired
-
-
-def converge_spawn_batch_foundations(
-    child_tasks: List[Task],
-    active_tasks: List[Task],
-) -> List[Task]:
-    """Serialize genuine duplicate foundations at spawn time, BEFORE the just-
-    spawned children begin executing.
-
-    Considers the new batch (``child_tasks``) AND currently-active tasks
-    (``active_tasks``) together and reuses the SAME high-confidence predicate and
-    apply-with-guards helper as the reaper Step 15 sweep
-    (``digest_metrics.compute_foundation_convergence_actions`` /
-    ``apply_foundation_convergence_action``), so spawn-time and reaper-time
-    convergence can never drift. For each genuine-duplicate pair — a shared finding
-    origin, a shared explicit capability marker, or near-identical related-file
-    sets at the convergence Jaccard — the LATER task is wired to depend on the
-    earlier (canonical) one so the duplicate rebases on the canonical's landed work
-    and builds-on instead of rebuilding.
-
-    Only a just-spawned child is ever made the dependent: the canonical is always
-    the earliest-by-``created_at`` task, so a pre-existing active task is always the
-    canonical and is never re-pointed at a peer here (active-vs-active pairs are the
-    reaper's job). Conservative by construction — sub-threshold incidental
-    shared-infra overlap is left to proceed in parallel and reconcile at merge.
-    ``exclude_same_parent=False`` is passed because a batch's children all share the
-    one research parent; coordinated siblings (already linked by explicit
-    ``depends_on`` / auto-decomposition chaining) are instead left alone by the
-    apply-with-guards helper, which refuses an already-present or cycle-closing
-    edge along with a self-edge.
-
-    Returns the list of dependent child tasks that had an edge wired (each already
-    mutated in place with ``depends_on`` plus the ``_foundation_converged`` context
-    marker); the caller persists them.
-    """
-    from app.digest_metrics import (
-        apply_foundation_convergence_action,
-        compute_foundation_convergence_actions,
-    )
-
-    candidates = list(active_tasks) + list(child_tasks)
-    by_id = {str(t.id): t for t in candidates}
-    child_ids = {str(c.id) for c in child_tasks}
-    converged: List[Task] = []
-    # exclude_same_parent=False: a batch's children all share the one research
-    # parent, so the coarse parent check would mask every within-batch duplicate.
-    # Coordinated siblings (already linked by explicit depends_on / depends_on_indices
-    # or auto-decomposition chaining) are still left alone — the apply-with-guards
-    # helper refuses an already-present or cycle-closing edge.
-    for action in compute_foundation_convergence_actions(
-        candidates, exclude_same_parent=False
-    ):
-        if action["dependent_id"] not in child_ids:
-            continue
-        dependent = apply_foundation_convergence_action(
-            action, by_id, candidates, logger=logger
-        )
-        if dependent is None:
-            continue
-        converged.append(dependent)
-        logger.info(
-            "[RESEARCH] Serialized duplicate foundation at spawn — task %s now "
-            "depends on %s (%s)",
-            dependent.id,
-            action["foundation_id"],
-            action["reason"],
-        )
-    if converged:
-        logger.info(
-            "[RESEARCH] Spawn-time foundation convergence wired %d edge(s)",
-            len(converged),
-        )
-    return converged
-
-
-# Mirrors the ux_task_active_idempotency_key partial-index predicate EXACTLY
-# (models.py / alembic 0199): the statuses whose rows occupy an idempotency
-# slot. Used by the self-claim collision probe in
-# _commit_or_handle_duplicate_spawn — a status the index counts but this list
-# omits would misclassify a recoverable self-claim collision as a duplicate
-# batch and discard the spawned children. Same mirror as reaper.py's C2 guard.
-_IDEMPOTENCY_INDEX_ACTIVE_STATUSES = (
-    TaskStatus.QUEUED,
-    TaskStatus.PROVISIONING,
-    TaskStatus.IN_PROGRESS,
-    TaskStatus.EVALUATING,
-    TaskStatus.BLOCKED,
-    TaskStatus.PARKED,
-)
-
-
-def _is_active_idempotency_integrity_error(exc: IntegrityError) -> bool:
-    """Return True for the active idempotency partial-index collision."""
-    message = str(exc)
-    return (
-        "ux_task_active_idempotency_key" in message
-        or "UNIQUE constraint failed: task.idempotency_key" in message
-    )
-
-
 async def _commit_or_handle_duplicate_spawn(
     session: AsyncSession, task: Task, *, stage: str
 ) -> bool:
-    """Commit the spawn batch, distinguishing the two idempotency-collision causes.
-
-    Returns True when the commit landed (directly, or after self-claim
-    recovery below). Returns False when the commit was rejected by
-    ``ux_task_active_idempotency_key`` for a genuinely duplicate batch — a
-    peer (a concurrent post-commit retry, or a pipelined duplicate research
-    cycle) already holds the colliding key in an active status, so this
-    batch's rollback loses nothing. Without the rollback here the poisoned
-    session cascaded PendingRollbackError through the rest of the request
-    (prod burst 2026-06-07 00:56). Any other IntegrityError re-raises into
-    the generic handler-failure recovery.
-
-    SELF-CLAIM RECOVERY: the colliding key can also be this task's OWN
-    direction-claim key (research_direction_claim_key) rather than a
-    duplicate child batch. The agent-reported terminal commit briefly parks
-    the parent COMPLETED, which releases the claim (the partial index only
-    covers active statuses); if the autonomous loop re-claims the direction
-    with a fresh research spawn inside that window, the EVALUATING flip in
-    THIS commit re-enters the index with the same key and collides — but the
-    child tasks are unique, undispatched work, not duplicates (prod
-    2026-06-09: task 5ac5c8c1's whole 2-finding batch was discarded and the
-    direction re-researched from scratch). Detected by probing whether a
-    DIFFERENT task now actively holds this task's key; recovered by releasing
-    this task's claim (the new peer legitimately owns the direction now),
-    re-applying the batch, and committing again.
-
-    On the False path the session has been rolled back — which expires every
-    loaded ORM instance even with expire_on_commit=False — and ``task`` has
-    been force re-populated from its DB row so the caller (and
-    _process_post_commit after it) can keep reading its attributes without
-    tripping a sync lazy-load (MissingGreenlet).
-    """
-    _task_pk = task.id
-    _task_id_str = str(_task_pk)
-    # Snapshot BEFORE the commit attempt: rollback() expunges pending INSERTs
-    # and expires every loaded attribute, so this state is unrecoverable
-    # afterwards. __dict__ reads only (never attribute access) — no lazy IO.
-    _pending_objects = list(session.new)
-    _parent_state = {
-        attr: task.__dict__[attr]
-        for attr in ("status", "context", "latest_status_message")
-        if attr in task.__dict__
-    }
-    _own_key = task.__dict__.get("idempotency_key")
-    try:
-        await session.commit()
-    except IntegrityError as _dup_exc:
-        if not _is_active_idempotency_integrity_error(_dup_exc):
-            raise
-        await session.rollback()
-        # ``populate_existing`` (not refresh()) so any rolled-back in-memory
-        # task mutation is discarded rather than re-flushed; ``no_autoflush``
-        # so the re-load itself cannot autoflush it and re-raise.
-        with contextlib.suppress(Exception), session.no_autoflush:
-            await session.execute(
-                select(Task)
-                .where(Task.id == _task_pk)
-                .execution_options(populate_existing=True)
-            )
-        # Self-claim probe: does a DIFFERENT task actively hold THIS task's
-        # key? If so the flip back into the active set is what collided (or
-        # is guaranteed to collide on retry), and the batch is unique work.
-        # In the true-duplicate case the key holder is this task itself
-        # (Task.id != excludes it), so the probe stays empty and the
-        # duplicate disposition below is unchanged.
-        _peer_id = None
-        if _own_key:
-            with contextlib.suppress(Exception):
-                _peer_id = (
-                    (
-                        await session.execute(
-                            select(Task.id).where(
-                                Task.idempotency_key == _own_key,
-                                Task.id != _task_pk,
-                                Task.status.in_(_IDEMPOTENCY_INDEX_ACTIVE_STATUSES),
-                            )
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
-        if _peer_id is not None:
-            # Release this task's claim — the peer legitimately re-claimed the
-            # direction while this task sat terminal — and re-apply the batch:
-            # re-add the (now-transient, attribute-state-intact) pending rows
-            # and restore the parent's spawn-commit mutations on top of the
-            # re-populated DB state. Mutations on OTHER persistent rows in the
-            # original commit are not replayed — same loss as the prior
-            # all-batch rollback; the children and the EVALUATING flip are the
-            # durable state that must not be lost.
-            task.idempotency_key = None
-            for attr, value in _parent_state.items():
-                setattr(task, attr, value)
-            if "context" in _parent_state:
-                flag_modified(task, "context")
-            for _obj in _pending_objects:
-                session.add(_obj)
-            session.add(task)
-            try:
-                await session.commit()
-            except IntegrityError as _retry_exc:
-                if not _is_active_idempotency_integrity_error(_retry_exc):
-                    raise
-                # Still colliding: some other key in the batch is genuinely
-                # duplicated — fall through to the duplicate disposition.
-                await session.rollback()
-                with contextlib.suppress(Exception), session.no_autoflush:
-                    await session.execute(
-                        select(Task)
-                        .where(Task.id == _task_pk)
-                        .execution_options(populate_existing=True)
-                    )
-            else:
-                logger.warning(
-                    f"[RESEARCH] Task {_task_id_str}: {stage} commit collided on "
-                    f"its OWN direction-claim key — peer {_peer_id} re-claimed "
-                    f"the direction while this task sat terminal. Released this "
-                    f"task's claim and re-committed the batch "
-                    f"({len(_pending_objects)} pending row(s) preserved)."
-                )
-                return True
-        logger.warning(
-            f"[RESEARCH] Task {_task_id_str}: {stage} commit hit "
-            f"ux_task_active_idempotency_key (a peer already spawned this work "
-            f"— duplicate-spawn guard working). Rolled back this duplicate "
-            f"batch; the peer owns the post-spawn state: {str(_dup_exc)[:200]}"
-        )
-        return False
-    return True
+    return await commit_or_handle_duplicate_research_spawn(
+        session,
+        task,
+        stage=stage,
+        relock_retry=relock_research_spawn_retry,
+    )
 
 
 def _salvage_requires_browser(salvage_candidates: list[dict]) -> bool:
@@ -1924,7 +1253,13 @@ def spawn_capability_gate_disposition(
     return "ok", proof_status
 
 
-async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
+async def _handle_research_completion(
+    task: Task,
+    logs: str,
+    session: AsyncSession,
+    *,
+    project: Project | None = None,
+):
     """Parse research findings and create tasks from them.
 
     Forward-quality gate (escalated path): when the research-quality grader is
@@ -1959,6 +1294,31 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         else None
     )
 
+    if _prior_finalized_findings is not None:
+        # The finalized marker is the durable commit receipt for this handler.
+        # A post-commit replay can arrive with truncated logs or even a newly
+        # valid ``[]`` artifact; neither is authority to replace the accepted
+        # snapshot or revisit already-created children. Validate a copy for a
+        # compact tamper/legacy diagnostic, then make the replay a true no-op.
+        _finalized_type_check = [dict(f) for f in _prior_finalized_findings]
+        _types_valid, _invalid_finding_type = _normalize_research_finding_types(
+            _finalized_type_check
+        )
+        if not _types_valid:
+            task.context = {
+                **(task.context or {}),
+                "research_replay_invalid_type": _invalid_finding_type,
+            }
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+        logger.info(
+            "[RESEARCH] Task %s replayed after findings finalization; "
+            "preserving the authoritative plan_output and child set",
+            task.id,
+        )
+        return
+
     # Re-entry signal: the independent grader has returned its verdict.
     _grader_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
     _adversarial_verdict_raw = (task.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY)
@@ -1967,6 +1327,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Parked-awaiting guards: re-dispatch while a sidecar verdict is pending is
     # a safe no-op — return immediately so the spawn loop does not run ungated.
     # The stranded-sidecar sweep owns redelivery when a sidecar dies silently.
+    if (task.context or {}).get(
+        "awaiting_quality_grader"
+    ) and _grader_verdict is None:
+        logger.info(
+            "[RESEARCH] Task %s re-dispatched while parked awaiting forward-quality "
+            "grader — no-op (verdict not yet present)",
+            task.id,
+        )
+        return
     if (task.context or {}).get(
         "awaiting_adversarial_grader"
     ) and _adversarial_verdict_raw is None:
@@ -2015,41 +1384,33 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         return
 
-    # Increment _research_spawn_count on completion (variable name is legacy;
-    # see autonomous_research.py:837 — semantic is "completed research cycles
-    # since last strategic refresh"). The strategic_research_frequency gate
-    # uses this to decide when to fire a strategic_review. Incrementing here
-    # rather than at spawn time prevents the cascade observed on 2026-05-03
-    # where one strategic_review spawned 4 research tasks AT ONCE and
-    # immediately tripped the modulo-6 gate for the next strategic_review.
+    # Several downstream adapters need the project configuration. Cadence is
+    # recorded later, at the authoritative finalized-marker boundary; counting
+    # here would advance while a grader/challenge is still parked or an empty
+    # declared-deliverable cycle is about to fail.
     project_obj = await session.get(Project, task.project_id)
-
-    _task_id_str = str(task.id)
-
-    def _increment_research_spawn_count(vision: dict) -> None:
-        # Idempotency guard: on post-commit replay the three-verdict guard
-        # below still passes (all verdicts are None on the initial pass), so
-        # we track counted task IDs to prevent double-incrementing.
-        counted = vision.get("_research_spawn_counted_ids") or []
-        if _task_id_str in counted:
-            return
-        vision["_research_spawn_count"] = (vision.get("_research_spawn_count") or 0) + 1
-        vision["_research_spawn_counted_ids"] = (counted + [_task_id_str])[
-            -_RESEARCH_SPAWN_COUNTED_IDS_MAX:
-        ]
-
-    # Only on the FIRST pass — a re-entrant resume after grading or a
-    # per-finding challenge must not re-count the cycle (verdict already
-    # present means we're on a re-entrant pass, not the initial completion).
-    if (
-        project_obj is not None
-        and _grader_verdict is None
-        and _adversarial_verdict_raw is None
-        and _finding_challenge_verdict is None
-    ):
-        await with_vision_locked(
-            session, task.project_id, _increment_research_spawn_count
-        )
+    _valid_metadata_direction_ids = {
+        direction_id.strip()
+        for direction in list((project_obj.directions if project_obj else None) or [])
+        if isinstance(direction, dict)
+        and isinstance((direction_id := direction.get("id")), str)
+        and direction_id.strip()
+    }
+    _metadata_payload = task.first_payload
+    _parent_metadata_direction_id = (
+        (task.context or {}).get("direction_id")
+        or _metadata_payload.get("current_direction_id")
+    )
+    if not _parent_metadata_direction_id:
+        _metadata_payload_directions = _metadata_payload.get("directions")
+        if (
+            isinstance(_metadata_payload_directions, list)
+            and len(_metadata_payload_directions) == 1
+            and isinstance(_metadata_payload_directions[0], dict)
+        ):
+            _parent_metadata_direction_id = _metadata_payload_directions[0].get(
+                "id"
+            )
 
     # Assess whether this research task encountered a provider capacity/rate-limit
     # error mid-run but still completed (rather than hard-failing). When detected,
@@ -2059,26 +1420,98 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _capacity_degradation_reason = _check_capacity_degradation(task, logs)
 
     # Depth guard: prevent infinite research recursion
-    MAX_RESEARCH_DEPTH = 3
     research_depth = (task.context or {}).get("research_depth", 0)
     parent_research_task_id = (task.context or {}).get("parent_research_task_id")
-    if research_depth >= MAX_RESEARCH_DEPTH:
-        task.latest_status_message = f"Research depth limit ({MAX_RESEARCH_DEPTH}) reached — not spawning further tasks"
-        session.add(task)
-        await session.commit()
-        logger.warning(
-            f"[RESEARCH] Depth limit reached for task {task.id} (depth={research_depth})"
-        )
-        return
+    _prior_deferred_input = (task.context or {}).get("prior_deferred_findings", [])
+    if not isinstance(_prior_deferred_input, list):
+        _prior_deferred_input = []
 
-    findings = await asyncio.to_thread(_parse_research_findings, logs)
+    _findings_parser = (
+        _parse_strict_research_findings
+        if _research_output_contract_enabled(task)
+        else _parse_research_findings
+    )
+    parsed_findings = await asyncio.to_thread(_findings_parser, logs)
+    _research_output_invalid = parsed_findings is None
+    findings = parsed_findings or []
+    _recovered_findings_source: str | None = None
     insights = await _parse_research_insights(str(task.id))
     # Agent JSON sometimes contains non-dict entries (bare strings, nulls).
     # The downstream .get() loop would AttributeError and the handler-failed
     # branch in task_lifecycle would terminally FAIL a research task that
-    # actually completed. Drop them here.
+    # actually completed. Legacy tasks keep the historical drop behavior; a
+    # task claimed under the strict producer contract must fail the whole
+    # artifact, matching the TypeScript validator instead of silently routing
+    # only the well-shaped subset.
     if findings:
-        findings = [f for f in findings if isinstance(f, dict)]
+        _non_object_findings = [
+            (index, finding)
+            for index, finding in enumerate(findings)
+            if not isinstance(finding, dict)
+        ]
+        if _non_object_findings and _research_output_contract_enabled(task):
+            _stamp_research_contract_rejections(
+                task,
+                [
+                    {
+                        "index": index,
+                        "source": "agent_output",
+                        "type": type(finding).__name__,
+                        "title": str(finding or "")[:200],
+                        "errors": ["finding_must_be_an_object"],
+                    }
+                    for index, finding in _non_object_findings[:20]
+                ],
+            )
+            findings = []
+            _research_output_invalid = True
+        else:
+            findings = [f for f in findings if isinstance(f, dict)]
+            if not findings:
+                _research_output_invalid = True
+            else:
+                _types_valid, _invalid_finding_type = (
+                    _normalize_research_finding_types(findings)
+                )
+                if not _types_valid:
+                    logger.warning(
+                        "[RESEARCH] Task %s emitted unsupported finding type %r; "
+                        "failing the artifact instead of routing it as generic work",
+                        task.id,
+                        _invalid_finding_type,
+                    )
+                    findings = []
+                    _research_output_invalid = True
+                elif _research_output_contract_enabled(task):
+                    _prepare_research_metadata_targets(
+                        findings,
+                        parent_direction_id=_parent_metadata_direction_id,
+                        valid_direction_ids=_valid_metadata_direction_ids,
+                    )
+                    _contract_rejections = _research_contract_rejection_receipts(
+                        findings,
+                        source="agent_output",
+                        valid_direction_ids=_valid_metadata_direction_ids,
+                    )
+                    if _contract_rejections:
+                        logger.warning(
+                            "[RESEARCH] Task %s violated strict findings contract for "
+                            "%d finding(s); failing the artifact before routing",
+                            task.id,
+                            len(_contract_rejections),
+                        )
+                        _stamp_research_contract_rejections(
+                            task, _contract_rejections
+                        )
+                        findings = []
+                        _research_output_invalid = True
+    if _research_output_invalid and _prior_finalized_findings is not None:
+        # Replays after an authoritative finalization may no longer carry the
+        # original artifact. Preserve the stored receipt, including an honest
+        # finalized empty set, rather than reclassifying the old run.
+        findings = _prior_finalized_findings
+        _research_output_invalid = False
+        _recovered_findings_source = "finalized_replay"
     if (
         not findings
         and _grader_verdict is not None
@@ -2089,6 +1522,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # round-trip through the findings parser, fall back to the stored
         # findings directly so a PASSING grade can never silently spawn nothing.
         findings = [f for f in task.plan_output if isinstance(f, dict)]
+        _research_output_invalid = False
+        _recovered_findings_source = "quality_grader_resume"
     if (
         not findings
         and (task.context or {}).get("_research_spawn_pending")
@@ -2100,22 +1535,22 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # parse cleanly. Fall back to the findings committed to plan_output on
         # the first pass so the spawn can proceed without re-running the agent.
         findings = [f for f in task.plan_output if isinstance(f, dict)]
+        _research_output_invalid = False
+        _recovered_findings_source = "spawn_pending_resume"
         logger.info(
             "[RESEARCH] Task %s: resuming interrupted spawn from stored plan_output",
             task.id,
         )
-    # Stranded-resume backstop (cause B). A research task can reach this handler
-    # with no parseable findings in the (possibly stale/re-dispatched) logs while
-    # task.plan_output STILL holds the findings a prior pass committed AND zero
-    # children were ever spawned. This is the "completed/redispatched but
-    # stranded" state: the spawn errored mid-flight on the first pass and the
-    # _research_spawn_pending marker was never set (or was cleared) — so neither
-    # resume guard above fires, and the branch below would clobber plan_output to
-    # [] and report "no actionable findings" despite real undispatched work
-    # sitting in plan_output. Detect it explicitly and resume the spawn from the
-    # stored findings instead of burying them. Idempotent: if children already
-    # exist this guard is skipped, and the downstream duplicate-spawn guard makes
-    # any genuine re-run a no-op.
+    # Stranded/finalization-resume backstop (cause B). A research task can reach
+    # this handler with no parseable findings in stale/re-dispatched logs while
+    # ``plan_output`` still holds the pre-gate findings committed by a prior
+    # pass. Recover both interruption windows:
+    #
+    # * zero children: spawning never started (the historical stranded case);
+    # * routed children exist but FINALIZED_RESEARCH_FINDINGS_KEY is absent:
+    #   spawning committed and later bookkeeping failed. The retry must reach
+    #   the finalization phase instead of failing the parent merely because the
+    #   original logs are gone. Existing-child dedup makes this replay safe.
     if (
         not findings
         and isinstance(task.plan_output, list)
@@ -2123,32 +1558,119 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     ):
         _stored_findings = [f for f in task.plan_output if isinstance(f, dict)]
         if _stored_findings:
-            _existing_child_id = (
-                (
-                    await session.execute(
-                        select(Task.id)
-                        .where(Task.parent_task_id == task.id)
-                        .limit(1)
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if _existing_child_id is None:
-                findings = _stored_findings
+            _delivery_children = await authenticated_research_children(session, task)
+            findings = _stored_findings
+            if _delivery_children:
+                _recovered_findings_source = "post_spawn_finalize_resume"
                 logger.warning(
-                    "[RESEARCH] Task %s: STRANDED research detected — %d finding(s) "
-                    "in plan_output but 0 children spawned and logs no longer parse; "
-                    "resuming spawn from stored findings (was previously buried as "
-                    "'no actionable findings')",
+                    "[RESEARCH] Task %s: unfinished finalization detected — "
+                    "%d delivery child(ren) exist but the final receipt is absent "
+                    "and logs no longer parse; resuming from %d stored finding(s)",
+                    task.id,
+                    len(_delivery_children),
+                    len(_stored_findings),
+                )
+                task.latest_status_message = (
+                    "Recovering interrupted research finalization from "
+                    f"{len(_stored_findings)} stored finding(s)"
+                )[:500]
+            else:
+                _recovered_findings_source = "stranded_resume"
+                logger.warning(
+                    "[RESEARCH] Task %s: STRANDED research detected — %d "
+                    "finding(s) in plan_output but no delivery children spawned and "
+                    "logs no longer parse; resuming spawn from stored findings",
                     task.id,
                     len(_stored_findings),
                 )
                 task.latest_status_message = (
-                    f"Recovering stranded research: resuming spawn of "
+                    "Recovering stranded research: resuming spawn of "
                     f"{len(_stored_findings)} stored finding(s)"
                 )[:500]
-    if not findings:
+            _research_output_invalid = False
+    if findings and _recovered_findings_source is not None:
+        # Stored/replayed findings are routing input just like freshly parsed
+        # findings. Validate them at the trust boundary as well: otherwise a
+        # legacy/tampered plan_output can bypass the fresh-artifact contract and
+        # fall through to the generic create/plan branch below.
+        _types_valid, _invalid_finding_type = _normalize_research_finding_types(
+            findings
+        )
+        if not _types_valid:
+            logger.error(
+                "[RESEARCH] Task %s recovered unsupported finding type %r from %s; "
+                "refusing to route stored output",
+                task.id,
+                _invalid_finding_type,
+                _recovered_findings_source,
+            )
+            if _recovered_findings_source == "finalized_replay":
+                # The task already has an authoritative terminal receipt. Do
+                # not rewrite historical status/output on a post-commit replay;
+                # simply make the replay a durable fail-closed no-op.
+                task.context = {
+                    **(task.context or {}),
+                    "research_replay_invalid_type": _invalid_finding_type,
+                }
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                return
+            findings = []
+            _research_output_invalid = True
+        elif _research_output_contract_enabled(task):
+            _prepare_research_metadata_targets(
+                findings,
+                parent_direction_id=_parent_metadata_direction_id,
+                valid_direction_ids=_valid_metadata_direction_ids,
+            )
+            _contract_rejections = _research_contract_rejection_receipts(
+                findings,
+                source=str(_recovered_findings_source),
+                valid_direction_ids=_valid_metadata_direction_ids,
+            )
+            if _contract_rejections:
+                logger.error(
+                    "[RESEARCH] Task %s recovered %d finding(s) from %s that "
+                    "violate the strict evidence contract; refusing to route "
+                    "stored output",
+                    task.id,
+                    len(_contract_rejections),
+                    _recovered_findings_source,
+                )
+                _stamp_research_contract_rejections(task, _contract_rejections)
+                findings = []
+                _research_output_invalid = True
+    if (
+        not findings
+        and _research_output_invalid
+        and _declares_delivered_output_deliverable(task)
+        and await _delivered_output_present(task, session)
+    ):
+        # Some explicitly commissioned report/message tasks deliver through a
+        # durable side effect rather than a findings array. That receipt is a
+        # valid terminal output and must not be reclassified as a format miss.
+        _research_output_invalid = False
+    if not findings and _research_output_invalid:
+        task.status = TaskStatus.FAILED
+        task.latest_status_message = _INVALID_RESEARCH_FINDINGS_TERMINAL_REASON[:500]
+        task.context = {
+            **(task.context or {}),
+            "research_output_invalid": True,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        try:
+            await _record_research_task_failure(task, session)
+        except Exception:  # noqa: BLE001 — accounting must not mask the failure
+            logger.debug(
+                "[RESEARCH] failure accounting after invalid findings output raised",
+                exc_info=True,
+            )
+        return
+
+    if not findings and not _prior_deferred_input:
         # No-output guard: a task whose DECLARED deliverable is a sent message or
         # a written report, but which parsed zero findings AND sent no message AND
         # wrote no report, produced nothing. Record it as a terminal FAILURE
@@ -2164,6 +1686,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             else False
         )
         _no_output_downgrade = _expects_delivered_output and not _delivered_output
+        _completion_status = task.status
+        _completion_context = dict(task.context or {})
+
+        # This boundary can be entered directly or on replay. Refresh both rows
+        # in canonical Project -> Task order before the first task mutation; the
+        # locks remain transaction-scoped through the commit below.
+        async with lock_accepted_research_boundary(session, task) as (
+            project,
+            task,
+        ):
+            pass
+        task.status = _completion_status
+        task.context = {**(task.context or {}), **_completion_context}
+        flag_modified(task, "context")
 
         if _no_output_downgrade:
             _reason = _NO_DELIVERED_OUTPUT_TERMINAL_REASON
@@ -2181,23 +1717,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         else:
             task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
-        task.context = {
-            **(task.context or {}),
-            FINALIZED_RESEARCH_FINDINGS_KEY: True,
-        }
-        flag_modified(task, "context")
         _record_research_survival_signal(task, surviving=0)
-        # Stamp refractory on the direction before committing — this path skips
-        # _apply_direction_state_updates, so last_researched_at would otherwise
-        # never be set and the direction would be immediately eligible again.
+        # Complete every durable adapter before stamping the replay receipt.
+        # This path skips _apply_direction_state_updates, so the refractory
+        # update must also land in the final transaction.
         await _stamp_no_findings_refractory(task, session)
         session.add(task)
-        await session.commit()
         if _no_output_downgrade:
             # Mirror the forward-quality FAIL path: record the failure on the
             # direction's research_history so direction-health can observe the
-            # empty deliver task. Guarded so accounting can never crash the
-            # handler (the task is already terminally FAILED and committed).
+            # empty deliver task. Guarded so accounting can never crash the gate.
             try:
                 await _record_research_task_failure(task, session)
             except Exception:  # noqa: BLE001 — accounting must not crash the gate
@@ -2208,7 +1737,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 )
         # Evergreen-fill completion adapter: zero findings → verified_stale.
         # This early-return path bypasses the main adapter call below, so we
-        # must fire it here.
+        # must fire it here. A failed ledger transition is retryable completion
+        # work, not a best-effort side effect: finalizing without it strands the
+        # item in its prior state and the replay receipt would suppress repair.
         _evergreen_item_id_early = (task.context or {}).get("evergreen_backlog_item_id")
         if _evergreen_item_id_early:
             try:
@@ -2227,7 +1758,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     _evergreen_item_id_early,
                     _eg_exc,
                 )
-            await session.commit()
+                raise
         if task.discovery_cycle_id is not None:
             # A zero-finding research cycle has no child terminal event to
             # re-enter rollup management. Queue its independent review here;
@@ -2240,7 +1771,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             await maybe_close_and_spawn_discovery_review(
                 session, task.discovery_cycle_id
             )
-            await session.commit()
+        # The finalized marker is the durable no-op receipt for handler replay.
+        # Keep it last, in the same commit as the task outcome and all adapters,
+        # so an interruption above remains safely retryable.
+        task.context = {
+            **(task.context or {}),
+            FINALIZED_RESEARCH_FINDINGS_KEY: True,
+        }
+        flag_modified(task, "context")
+        await count_accepted_research_cycle(session, task, project=project)
+        session.add(task)
+        await session.commit()
         return
 
     # Normalize actionability_grade: any missing or invalid value defaults to MEDIUM.
@@ -2333,9 +1874,23 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # count is recorded on the task as the honest "rejected for does-not-exist-
     # on-HEAD" signal — separate from the surviving-finding success signal below.
     _broken_citation_findings = 0
+    _producer_contract_version = research_output_contract_version(task.context)
     for _f in findings:
-        if _generated_head_sha and not _f.get("generated_head_sha"):
+        # Contract provenance crosses an agent-controlled artifact boundary and
+        # is always server-authored. ``finding_hash`` is different: it is also a
+        # legitimate same-batch lineage reference for retitled design findings.
+        # Deferred carry acknowledgements therefore derive their own canonical
+        # identity instead of overwriting this routing field.
+        _f[RESEARCH_FINDING_ORIGIN_CONTRACT_VERSION_KEY] = (
+            _producer_contract_version
+        )
+        # The agent cannot self-attest which integration commit it inspected.
+        # Always replace/remove this field from raw output using server-resolved
+        # provenance before it reaches a child handoff or staleness check.
+        if _generated_head_sha:
             _f["generated_head_sha"] = _generated_head_sha
+        else:
+            _f.pop("generated_head_sha", None)
         if "claims" in _f and not isinstance(_f.get("claims"), list):
             _f["claims"] = []
         _broken_provenance: Dict[str, Any] | None = None
@@ -2444,30 +1999,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     session.add(task)
     await session.commit()
 
-    # Forward-quality ESCALATION gate (blast-radius-proportional). When enabled
-    # and these findings would spawn downstream implementation work, do not
-    # spawn anything yet: stand up an INDEPENDENT grader and park this task
-    # EVALUATING. The grader's verdict returns via the re-entrant completion
-    # path, which re-invokes this handler with the verdict in context (the
-    # `_grader_verdict is None` guard below is what lets the resume pass fall
-    # through to the spawn loop instead of escalating again). Findings that
-    # would spawn nothing keep the cheap synchronous check and never escalate.
-    if (
-        _grader_verdict is None
-        and _runtime_config.get("research_quality_grader_enabled", False)
-        and _research_findings_would_spawn(findings)
-    ):
-        findings_json = await asyncio.to_thread(json.dumps, findings)
-        grader = await spawn_forward_quality_grader(task, findings_json, session)
-        if grader is not None:
-            logger.info(
-                "[RESEARCH] Task %s parked awaiting forward-quality grade "
-                "(grader %s) before spawning implementation tasks",
-                task.id,
-                grader.id,
-            )
-            return
-
     # Separate direction proposals and notes from actionable findings — these are processed
     # separately and must not enter the hash-based deduplication loop (they never create tasks,
     # so their hashes would never be stored, allowing identical entries to accumulate).
@@ -2481,7 +2012,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Recover findings that were deferred in the previous cycle due to pipeline degradation.
     # These were already researched but couldn't be spawned; prepend them so they go through
     # the full dedup + health gate pipeline alongside this cycle's new findings.
-    prior_deferred = (task.context or {}).get("prior_deferred_findings", [])
+    prior_deferred = _prior_deferred_input
     # Initialized unconditionally: the give-up marker is consulted far below
     # (when stamping task.context) on every code path, including the one where
     # there were no prior-deferred findings to decay.
@@ -2489,19 +2020,140 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _low_actionability_decayed: list[dict] = []
     _low_actionability_refinement_deferred: list[dict] = []
     _salvage_candidates: list[dict] = []
+    _invalid_prior_deferred: list[dict] = []
+    _contract_invalid_prior_deferred: list[dict] = []
+    _prior_contract_rejections: list[dict[str, Any]] = []
+    _handled_prior_deferred_for_ack: list[dict[str, Any]] = []
+    prior_actionable: list[dict] = []
     # TTL-expired prior-deferred findings discarded by the recovery block below.
     # Initialized here (outside the `if prior_deferred:` block) so the context
     # stamp that records their retired dispositions can reference it even when
     # there were no prior-deferred findings this cycle.
     _stale_discarded: list[dict] = []
     if prior_deferred:
-        # Filter out non-actionable types that would have been handled separately above
-        prior_actionable = [
-            f
-            for f in prior_deferred
-            if isinstance(f, dict)
-            and f.get("type") not in ("direction_proposal", "direction_note")
-        ]
+        # Every recovered finding crosses the same explicit routing boundary as
+        # fresh output. A legacy/tampered deferred type must never reach the
+        # generic create/plan fallback. Retain the original input on this task
+        # for audit, record a compact rejection receipt, and exclude it from all
+        # spawning/gating paths.
+        for _prior_index, _raw_prior in enumerate(prior_deferred):
+            if not isinstance(_raw_prior, dict):
+                if len(_prior_contract_rejections) < 20:
+                    _prior_contract_rejections.append(
+                        {
+                            "index": _prior_index,
+                            "source": "prior_deferred",
+                            "type": type(_raw_prior).__name__,
+                            "title": str(_raw_prior or "")[:200],
+                            "errors": ["finding_must_be_an_object"],
+                        }
+                    )
+                continue
+            _prior_finding = dict(_raw_prior)
+            attach_historical_finding_challenge_record(task, _prior_finding)
+            # Carry metadata is transport input, not a trust boundary. Normalize
+            # contract provenance before routing; acknowledgement identity is
+            # independently recomputed by ``deferred_carry_pair`` so a stable
+            # routing-lineage hash can remain intact.
+            _prior_origin_contract_version = (
+                research_finding_origin_contract_version(_prior_finding)
+            )
+            _prior_finding[RESEARCH_FINDING_ORIGIN_CONTRACT_VERSION_KEY] = (
+                _prior_origin_contract_version
+            )
+            _prior_type_valid, _invalid_prior_type = (
+                _normalize_research_finding_types([_prior_finding])
+            )
+            if not _prior_type_valid:
+                _prior_finding["deferred_reason"] = "schema_invalid_type"
+                _prior_finding["invalid_finding_type"] = _invalid_prior_type
+                _invalid_prior_deferred.append(_prior_finding)
+                _handled_prior_deferred_for_ack.append(_prior_finding)
+                if len(_prior_contract_rejections) < 20:
+                    _prior_contract_rejections.append(
+                        {
+                            "index": _prior_index,
+                            "source": "prior_deferred",
+                            "type": str(_invalid_prior_type or "<missing>")[:80],
+                            "title": str(_prior_finding.get("title") or "")[:200],
+                            "errors": ["unsupported_finding_type"],
+                        }
+                    )
+                continue
+            if (
+                _prior_origin_contract_version
+                >= RESEARCH_OUTPUT_CONTRACT_VERSION
+            ):
+                _prior_contract_errors = _research_finding_contract_errors(
+                    _prior_finding
+                )
+                if _prior_contract_errors:
+                    _prior_finding["deferred_reason"] = "schema_invalid_evidence"
+                    _prior_finding["invalid_contract_errors"] = (
+                        _prior_contract_errors
+                    )
+                    _contract_invalid_prior_deferred.append(_prior_finding)
+                    _handled_prior_deferred_for_ack.append(_prior_finding)
+                    if len(_prior_contract_rejections) < 20:
+                        _prior_contract_rejections.append(
+                            {
+                                "index": _prior_index,
+                                "source": "prior_deferred",
+                                "type": str(_prior_finding.get("type") or "")[:80],
+                                "title": str(_prior_finding.get("title") or "")[:200],
+                                "errors": _prior_contract_errors,
+                            }
+                        )
+                    continue
+            _prior_type = _prior_finding.get("type")
+            if _prior_type in ("direction_proposal", "direction_note"):
+                # Metadata findings are split out of the fresh batch before
+                # prior carry is recovered.  Route carried metadata into the
+                # same processing lists instead of silently dropping it.  At
+                # the terminal depth boundary, persist it as deferred work on
+                # this consumer because apply_post_spawn_state is not reached.
+                if research_depth >= MAX_RESEARCH_DEPTH:
+                    prior_actionable.append(_prior_finding)
+                elif _prior_type == "direction_proposal":
+                    direction_proposals.append(_prior_finding)
+                else:
+                    direction_notes.append(_prior_finding)
+                _handled_prior_deferred_for_ack.append(_prior_finding)
+                continue
+            prior_actionable.append(_prior_finding)
+            _handled_prior_deferred_for_ack.append(_prior_finding)
+        if _invalid_prior_deferred:
+            _invalid_types = sorted(
+                {
+                    str(f.get("invalid_finding_type") or "<missing>")
+                    for f in _invalid_prior_deferred
+                }
+            )
+            logger.warning(
+                "[RESEARCH] Task %s rejected %d deferred finding(s) with "
+                "unsupported type(s): %s",
+                task.id,
+                len(_invalid_prior_deferred),
+                ", ".join(_invalid_types),
+            )
+            _invalid_ctx = dict(task.context or {})
+            _invalid_ctx["research_invalid_deferred_finding_count"] = len(
+                _invalid_prior_deferred
+            )
+            _invalid_ctx["research_invalid_deferred_finding_types"] = _invalid_types
+            task.context = _invalid_ctx
+            flag_modified(task, "context")
+            session.add(task)
+        if _prior_contract_rejections:
+            _stamp_research_contract_rejections(task, _prior_contract_rejections)
+            if _contract_invalid_prior_deferred:
+                _rejection_ctx = dict(task.context or {})
+                _rejection_ctx["research_rejected_deferred_findings"] = (
+                    bound_deferred_findings(_contract_invalid_prior_deferred)
+                )
+                task.context = _rejection_ctx
+                flag_modified(task, "context")
+            session.add(task)
         # Discard findings older than the configured TTL to prevent stale
         # entries from blocking fresh findings (priority inversion) and to bound
         # the deferred list during extended pipeline degradation.
@@ -2713,21 +2365,206 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 CITATION_STATE_INDETERMINATE,
             ):
                 f["_reproduce_on_head"] = _re_repro
-        if prior_actionable:
-            logger.info(
-                f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "
-                f"to findings list for task {task.id}"
+    # Enforce fresh-work admission before carried work is prepended. The payload
+    # headroom is the producer's ceiling, while the surviving carried count is
+    # the server's authoritative reservation. Taking the minimum makes stale or
+    # malformed envelopes fail safe and prevents high-priority fresh findings
+    # from evicting work that was already deferred into this cycle.
+    _carried_capacity_count = sum(
+        1
+        for finding in prior_actionable
+        if str(finding.get("type") or "").strip().lower()
+        not in _NON_SPAWNING_FINDING_TYPES
+    )
+    _server_fresh_headroom = effective_research_finding_headroom(
+        _carried_capacity_count
+    )
+    _raw_payload_headroom = (task.first_payload).get("work_headroom")
+    _payload_fresh_headroom = (
+        int(_raw_payload_headroom)
+        if isinstance(_raw_payload_headroom, (int, float))
+        and not isinstance(_raw_payload_headroom, bool)
+        and math.isfinite(_raw_payload_headroom)
+        and _raw_payload_headroom >= 0
+        else _server_fresh_headroom
+    )
+    _admitted_fresh_headroom = min(
+        _server_fresh_headroom, _payload_fresh_headroom
+    )
+    (
+        findings,
+        _fresh_headroom_applied_count,
+        _fresh_headroom_deferred,
+    ) = await asyncio.to_thread(
+        _cap_findings_by_priority,
+        findings,
+        _admitted_fresh_headroom,
+    )
+    if _fresh_headroom_deferred:
+        logger.warning(
+            "[RESEARCH] Task %s exceeded fresh work headroom %d; deferring %d "
+            "finding(s) before carried work is restored",
+            task.id,
+            _admitted_fresh_headroom,
+            len(_fresh_headroom_deferred),
+        )
+
+    if prior_actionable:
+        logger.info(
+            f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "
+            f"to findings list for task {task.id}"
+        )
+        # Rebase fresh findings' intra-batch depends_on_indices before the
+        # prepend. The agent emits 0-based indices into its own (fresh-only)
+        # findings array, so each index must be shifted up by the number of
+        # recovered findings that will occupy the front of the combined list.
+        _n_prepended = len(prior_actionable)
+        for _fresh_f in findings:
+            _deps = _fresh_f.get("depends_on_indices")
+            if _deps:
+                _fresh_f["depends_on_indices"] = [j + _n_prepended for j in _deps]
+        findings = prior_actionable + findings
+
+    if research_depth >= MAX_RESEARCH_DEPTH:
+        # The historical early depth guard ran before deferred recovery. A
+        # depth-limited task carrying prior work therefore completed green while
+        # leaving that work under the in-flight-only prior_deferred_findings key,
+        # which no subsequent root scans. Preserve the complete validated set on
+        # the completed task's durable deferred_findings handoff instead. Fresh
+        # direction notes/proposals were split from ``findings`` above, while
+        # stale/decayed carry was moved to ``_salvage_candidates`` for handling
+        # later in the normal path; this early return must retain both groups or
+        # the producer acknowledgement below would make them unreachable.
+        _depth_preserved_findings = [
+            *findings,
+            *[
+                {**finding, "deferred_reason": "batch_cap"}
+                for finding in _fresh_headroom_deferred
+            ],
+            *direction_proposals,
+            *direction_notes,
+            *_salvage_candidates,
+        ]
+        _depth_persisted_findings = bound_deferred_findings(
+            _depth_preserved_findings
+        )
+        _depth_ctx = dict(task.context or {})
+        _depth_ctx["deferred_findings"] = _depth_persisted_findings
+        _depth_receipts = [
+            {
+                "source_task_id": pair[0],
+                "finding_hash": pair[1],
+                "type": str(finding.get("type") or "")[:80],
+                "title": str(finding.get("title") or "")[:200],
+            }
+            for finding in _handled_prior_deferred_for_ack
+            if (pair := deferred_carry_pair(finding)) is not None
+        ][-200:]
+        if _depth_receipts:
+            # ``prior_deferred_findings`` is an in-flight transport envelope and
+            # can be very large. Preserve a bounded per-entry audit receipt
+            # before removing that raw duplicate; contract/type rejection
+            # receipts stamped above remain alongside it.
+            _depth_ctx["prior_deferred_finding_receipts"] = _depth_receipts
+        _depth_intended_pairs = {
+            pair
+            for finding in _depth_preserved_findings
+            if (pair := deferred_carry_pair(finding)) is not None
+        }
+        _depth_persisted_pairs = {
+            pair
+            for finding in _depth_ctx.get("deferred_findings", [])
+            if isinstance(finding, Mapping)
+            and (pair := deferred_carry_pair(finding)) is not None
+        }
+        _depth_ctx.pop("prior_deferred_findings", None)
+        _depth_ctx["research_depth_limit_preserved_findings"] = len(
+            _depth_persisted_findings
+        )
+        # The deferred handoff is durable, but it has not passed the quality,
+        # adversarial, reproduction, deduplication, or dispatch gates below.
+        # Keep it out of the authoritative findings surface: the finalized
+        # marker is a replay receipt, while an empty plan_output truthfully says
+        # that zero findings survived this depth-limited cycle.
+        _depth_ctx[FINALIZED_RESEARCH_FINDINGS_KEY] = True
+        # The pre-gate visibility commit above released the entrypoint's row
+        # locks. Reacquire Project before dirtying the consumer Task and before
+        # acknowledgement locks any producer Task. The marker, cadence receipt,
+        # preserved handoff, and producer pruning then commit atomically.
+        async with lock_accepted_research_boundary(session, task) as (project, task):
+            _depth_status_is_accepted = task.status in (
+                TaskStatus.COMPLETED,
+                TaskStatus.EVALUATING,
             )
-            # Rebase fresh findings' intra-batch depends_on_indices before the
-            # prepend. The agent emits 0-based indices into its own (fresh-only)
-            # findings array, so each index must be shifted up by the number of
-            # recovered findings that will occupy the front of the combined list.
-            _n_prepended = len(prior_actionable)
-            for _fresh_f in findings:
-                _deps = _fresh_f.get("depends_on_indices")
-                if _deps:
-                    _fresh_f["depends_on_indices"] = [j + _n_prepended for j in _deps]
-            findings = prior_actionable + findings
+        if not _depth_status_is_accepted:
+            logger.info(
+                "[RESEARCH] Task %s depth-limit finalization abandoned after "
+                "concurrent status %s",
+                task.id,
+                task.status,
+            )
+            # The boundary refresh is clean; commit only releases its row locks and,
+            # unlike rollback, keeps the caller readable by completion dispatch.
+            await session.commit()
+            return
+        _locked_depth_ctx = dict(task.context or {})
+        _locked_depth_ctx.update(_depth_ctx)
+        _locked_depth_ctx.pop("prior_deferred_findings", None)
+        _depth_ctx = _locked_depth_ctx
+        task.context = _depth_ctx
+        flag_modified(task, "context")
+        task.plan_output = []
+        _record_research_survival_signal(task, surviving=0)
+        task.latest_status_message = (
+            f"Research depth limit ({MAX_RESEARCH_DEPTH}) reached — "
+            f"preserved {len(_depth_persisted_findings)} finding(s) for a later root cycle"
+        )[:500]
+        await count_accepted_research_cycle(session, task, project=project)
+        _depth_ack_count = await acknowledge_consumed_deferred_findings(
+            session,
+            consumer_task=task,
+            carried_findings=_handled_prior_deferred_for_ack,
+            excluded_pairs=_depth_intended_pairs - _depth_persisted_pairs,
+        )
+        if _depth_ack_count:
+            _depth_ctx["deferred_finding_consumption_ack_count"] = _depth_ack_count
+            task.context = _depth_ctx
+            flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.warning(
+            "[RESEARCH] Depth limit reached for task %s (depth=%s); "
+            "preserved %d recovered finding(s)",
+            task.id,
+            research_depth,
+            len(_depth_persisted_findings),
+        )
+        return
+
+    # Forward-quality ESCALATION gate (blast-radius-proportional). This must run
+    # after deferred recovery: carried findings are part of the execution batch
+    # and may be the only work in a zero-headroom cycle. Grading only freshly
+    # parsed output let legacy/pre-feature carried work bypass the gate entirely.
+    if (
+        _grader_verdict is None
+        and _runtime_config.get("research_quality_grader_enabled", False)
+        and _research_findings_would_spawn(findings)
+    ):
+        findings_json = await asyncio.to_thread(json.dumps, findings)
+        grader = await spawn_forward_quality_grader(
+            task,
+            findings_json,
+            session,
+            question=_research_question_for_grader(task) or None,
+        )
+        if grader is not None:
+            logger.info(
+                "[RESEARCH] Task %s parked awaiting forward-quality grade "
+                "(grader %s) before spawning implementation tasks",
+                task.id,
+                grader.id,
+            )
+            return
 
     # Adversarial spawn-gate (DEFAULT ON). When enabled and no adversarial
     # verdict has been written yet, select the high-stakes findings and spawn a
@@ -2803,7 +2640,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     "high-stakes implementation tasks"
                 )
                 _ctx = dict(task.context or {})
-                _ctx["awaiting_adversarial_grader"] = True
+                # ``spawn_forward_quality_grader`` now records the exact
+                # sidecar UUID atomically. A None return can mean its
+                # single-shot guard observed that durable marker, so never
+                # degrade it back to the legacy boolean compatibility shape.
+                if not _ctx.get("awaiting_adversarial_grader"):
+                    _ctx["awaiting_adversarial_grader"] = True
                 _ctx["_adversarial_challenged_hashes"] = _challenged_hashes
                 task.context = _ctx
                 flag_modified(task, "context")
@@ -3383,6 +3225,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         batch_cap_applied_count,
         _batch_cap_deferred,
     ) = await asyncio.to_thread(_cap_findings_by_priority, findings, _effective_cap)
+    if _fresh_headroom_deferred:
+        # These fresh findings were reserved out before carried work was
+        # prepended. Treat them as ordinary batch-cap deferrals from here on so
+        # existing durable shelving, telemetry, and successor carry paths apply.
+        _batch_cap_deferred = [
+            *_fresh_headroom_deferred,
+            *_batch_cap_deferred,
+        ]
+        batch_cap_applied_count += _fresh_headroom_applied_count
     if _batch_cap_deferred:
         logger.info(
             "[RESEARCH] Batch cap (%d) exceeded — deferring %d lower-priority finding(s) to next cycle",
@@ -3452,6 +3303,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         return
     task = relocked
+    # ``_ensure_branch`` re-locks only the parent Task after its unlocked GitHub
+    # phase.  The research path below takes Project locks for dedup telemetry,
+    # direction observations and direction updates; retaining this Task lock
+    # would invert the platform's canonical Project -> Task order.  There is no
+    # pending mutation here (the spawn-pending receipt was committed before the
+    # GitHub phase), so release the single-row lock now and keep all subsequent
+    # parent changes local until ``lock_research_spawn_boundary`` reacquires the
+    # pair in canonical order.
+    await session.commit()
+    _base_parent_context = dict(task.context or {})
+    _local_parent_context = dict(_base_parent_context)
 
     # Validate dependencies if present. On a cycle, break it MINIMALLY — drop
     # only the edges that close a cycle (mirroring the plan path) rather than
@@ -3465,9 +3327,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             len(_dropped_cycle_edges),
         )
         if _dropped_cycle_edges:
-            _ctx = dict(task.context or {})
+            _ctx = dict(_local_parent_context)
             _ctx["dropped_finding_cycle_edges"] = _dropped_cycle_edges
-            task.context = _ctx
+            _local_parent_context = _ctx
 
     # Query active/queued tasks for word-overlap deduplication
     existing_tasks = (
@@ -3858,6 +3720,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     type_filtered_count = 0
     type_filtered_by_dir: dict[str, int] = {}
     empty_prompt_count = 0
+    _noop_metadata_finding_ids: set[int] = set()
 
     # Hashes of findings that survived parsing into `findings` but were dropped
     # from the SPAWN set by deduplicate_findings (duplicate of existing in-flight,
@@ -4003,6 +3866,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     # Create all child tasks — no wave dependencies, priority ordering handles dispatch order
     child_tasks = []
+    # Keep every new row transient until the full topology is complete.
+    _auxiliary_tasks: list[Task] = []
     finding_indices = []  # Maps child_tasks index → findings array index
     # Parallel flag: True when the child came from an auto-decomposed sub-finding.
     # Used to chain consecutive siblings of the same parent finding via depends_on
@@ -4128,7 +3993,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _s["sub_findings_produced"] += 1
         _s["_orig_ids"].add(_oi)
     if _decomp_stats_by_dir:
-        _ctx = dict(task.context or {})
+        _ctx = dict(_local_parent_context)
         _ctx["cochange_decomposition_stats"] = {
             _did: {
                 "medium_findings_split": len(_s["_orig_ids"]),
@@ -4136,8 +4001,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             }
             for _did, _s in _decomp_stats_by_dir.items()
         }
-        task.context = _ctx
-        flag_modified(task, "context")
+        _local_parent_context = _ctx
 
     # Pre-fetch criterion_keys for every direction referenced by deduplicated
     # findings (plus the parent direction).  A finding may carry its own
@@ -4254,6 +4118,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             }
 
             _captured_proposals: dict = {}
+            _obs_applied = {"value": False}
 
             # Pre-read current proposals from telemetry so the lock callback
             # sees the canonical data after strip_migrated_doc_keys removed
@@ -4263,26 +4128,37 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 design_doc_fallback=None,
             )
 
-            def _add_obs_proposal(doc: dict) -> None:
-                nonlocal _captured_proposals  # noqa: F841 — closure binding
+            def _add_obs_proposal(
+                doc: dict,
+                _existing=_existing_proposals,
+                _text=_obs_text,
+                _section=_obs_section,
+                _entry=_obs_entry,
+                _applied=_obs_applied,
+                _captured=_captured_proposals,
+            ) -> None:
                 # Hydrate from telemetry before mutation.
-                proposals = list(_existing_proposals or doc.get("proposed_changes", []))
+                proposals = list(_existing or doc.get("proposed_changes", []))
                 # Dedup: skip if identical observation already exists
                 existing = next(
                     (p for p in proposals
-                     if p.get("observation") == _obs_text and p.get("section") == _obs_section),
+                     if p.get("observation") == _text and p.get("section") == _section),
                     None
                 )
                 if not existing:
-                    proposals.append(_obs_entry)
+                    proposals.append(_entry)
+                    _applied["value"] = True
                 doc["proposed_changes"] = proposals[-30:]  # cap at 30 pending
-                _captured_proposals["value"] = doc["proposed_changes"]
+                _captured["value"] = doc["proposed_changes"]
 
             await with_design_doc_locked(session, task.project_id, _add_obs_proposal)
             if _captured_proposals.get("value") is not None:
                 await _set_project_telemetry(
                     session, task.project_id, "proposed_changes", _captured_proposals["value"]
                 )
+            if not _obs_applied["value"]:
+                _noop_metadata_finding_ids.add(id(finding))
+                continue
             type_filtered_count += 1
             _tf_did = finding.get("direction_id") or _parent_direction_id
             if _tf_did:
@@ -4293,37 +4169,43 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # Process as a direction modification proposal, not a task
             target_id = finding.get("direction_id")
             if not target_id:
-                type_filtered_count += 1
-                _tf_did = finding.get("direction_id") or _parent_direction_id
-                if _tf_did:
-                    type_filtered_by_dir[_tf_did] = (
-                        type_filtered_by_dir.get(_tf_did, 0) + 1
-                    )
+                _noop_metadata_finding_ids.add(id(finding))
                 continue  # direction_update requires a target direction_id
             _du_finding = finding
             _du_target_id = target_id
             _du_task_id = str(task.id)
+            _du_applied = {"value": False}
 
-            def _set_pending_update(dirs: list) -> None:
+            def _set_pending_update(
+                dirs: list,
+                _target_id=_du_target_id,
+                _update=_du_finding,
+                _task_id=_du_task_id,
+                _applied=_du_applied,
+            ) -> None:
                 for d in dirs:
-                    if d.get("id") == _du_target_id:
+                    if d.get("id") == _target_id:
                         d["pending_update"] = {
-                            "suggested_text": _du_finding.get(
+                            "suggested_text": _update.get(
                                 "suggested_text", d.get("text")
                             ),
-                            "suggested_priority": _du_finding.get(
+                            "suggested_priority": _update.get(
                                 "suggested_priority", d.get("priority")
                             ),
-                            "suggested_paths": _du_finding.get(
+                            "suggested_paths": _update.get(
                                 "suggested_paths", d.get("paths", [])
                             ),
-                            "rationale": _du_finding.get("description", "")[:300],
+                            "rationale": _update.get("description", "")[:300],
                             "proposed_at": _utcnow().isoformat(),
-                            "proposed_by": _du_task_id,
+                            "proposed_by": _task_id,
                         }
+                        _applied["value"] = True
                         break
 
             await with_directions_locked(session, task.project_id, _set_pending_update)
+            if not _du_applied["value"]:
+                _noop_metadata_finding_ids.add(id(finding))
+                continue
             type_filtered_count += 1
             _tf_did = finding.get("direction_id") or _parent_direction_id
             if _tf_did:
@@ -4765,12 +4647,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # silently anchored children to a provider regardless of the
         # operator's category_routing. Model resolution is the
         # orchestrator's job (via provider_preference + effort matrix).
-        # Operator-level pins via runtime_config.task_type_models still
-        # flow through.
-        finding_model = _runtime_config.get("task_type_models", {}).get(task_type)
+        # Recursive research children intentionally receive no payload pins;
+        # the canonical research routing policy resolves their frontier model.
+        finding_model = (
+            None
+            if task_type == "research"
+            else _runtime_config.get("task_type_models", {}).get(task_type)
+        )
         _effort_rank = {"max": 4, "high": 3, "medium": 2, "low": 1}
-        finding_effort = finding.get("effort")
-        config_effort = _runtime_config.get("task_type_efforts", {}).get(task_type)
+        finding_effort = None if task_type == "research" else finding.get("effort")
+        config_effort = (
+            None
+            if task_type == "research"
+            else _runtime_config.get("task_type_efforts", {}).get(task_type)
+        )
         if finding_effort and config_effort:
             finding_effort = (
                 finding_effort
@@ -4791,6 +4681,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if related_files
             else prompt
         )
+        full_prompt += _build_research_handoff(finding)
         type_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get(task_type)
 
         # For sub-research tasks, enrich prompt with parent context to avoid duplication
@@ -5383,6 +5274,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_completion:finding:compute_experiment",
             )
         else:
+            # Freeze the same bounded authority used by other research roots.
+            _research_direction_payload_extras = (
+                _build_research_direction_payload_scope(
+                    direction_id or parent_direction_id,
+                    _directions_by_id,
+                    task.first_payload,
+                    effective_research_finding_headroom(0),
+                )
+                if task_type == "research"
+                else {}
+            )
             # For knowledge task types (web_research / design), stamp the
             # dedup key fields (topic + direction_id) onto the payload so the
             # knowledge_task_in_flight guard can detect duplicate commissions
@@ -5406,6 +5308,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
                     **(
                         {
+                            # This child still belongs to the parent's database
+                            # discovery cycle, but its commissioned question is
+                            # narrower than that cycle-level bet. Preserve both
+                            # authorities explicitly so the agent and grader do
+                            # not reinterpret the child as a request to redo the
+                            # entire parent investigation.
+                            "research_question_snapshot": prompt.strip()[:4000],
+                            "research_commission_kind": "recursive_subresearch",
+                        }
+                        if task_type == "research"
+                        else {}
+                    ),
+                    **(
+                        {
                             key: finding[key]
                             for key in ("work_class", "stop_or_pivot_condition")
                             if task_type in ("research", "web_research")
@@ -5427,6 +5343,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         if _registry_vocab and task_type in _VOCAB_RENDERING_TASK_TYPES
                         else {}
                     ),
+                    **_research_direction_payload_extras,
                     **_knowledge_payload_extras,
                 },
                 f"research_completion:finding:{task_type}",
@@ -5437,6 +5354,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Cited paths the finding references — propagated so the launch-time
         # staleness recompute can diff them against the current integration HEAD.
         _child_cited_paths = finding_cited_paths(finding)
+        _child_handoff_sources = _bounded_research_handoff_sources(
+            finding.get("sources")
+        )
+        _child_verification_basis = _compact_research_handoff_text(
+            finding.get("verification_basis"), 80
+        )
         # Optional plan-time acceptance-evidence contract. Read it straight off
         # the surviving ``finding`` dict (NOT routed through the
         # depends_on_indices remap), so it survives batch-cap truncation and
@@ -5491,6 +5414,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_depth": research_depth + 1,
                 "related_files": related_files,
                 "claims": (finding.get("claims") or [])[:8],
+                **(
+                    {"sources": _child_handoff_sources}
+                    if _child_handoff_sources
+                    else {}
+                ),
+                **(
+                    {"verification_basis": _child_verification_basis}
+                    if _child_verification_basis
+                    else {}
+                ),
                 "finding_hash": fhash,
                 "finding_lineage": sorted(_finding_lineage),
                 # Durable greenfield provenance (stamped above from the project's
@@ -5732,7 +5665,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if _spawn_gate_challenged
             else None,
         }
-        session.add(new_task)
         if (
             task_type == "compute_experiment"
             and _compute_requires_approval
@@ -5753,6 +5685,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _auto_decomposed_flags.append(bool(finding.get("auto_decomposed")))
         _impl_spawned += 1
 
+    if _noop_metadata_finding_ids:
+        # A duplicate observation or vanished direction target did not mutate
+        # durable state. Remove it from every downstream success/productivity
+        # surface so a metadata shell cannot make a no-op parent look useful.
+        findings = [
+            finding
+            for finding in findings
+            if id(finding) not in _noop_metadata_finding_ids
+        ]
+        deduplicated = [
+            row
+            for row in deduplicated
+            if id(row[1]) not in _noop_metadata_finding_ids
+        ]
+
     _now_iso = _utcnow().isoformat()
 
     def _stamp_deferral(f: dict, reason: str) -> dict:
@@ -5761,10 +5708,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         stamped["deferred_reason"] = reason
         stamped.setdefault("originally_researched_at", _now_iso)
         if not stamped.get("finding_hash"):
-            stamped["finding_hash"] = _finding_hash(
-                stamped.get("title", ""),
-                _canonical_finding_body(stamped),
-            )
+            stamped["finding_hash"] = canonical_deferred_finding_hash(stamped)
         return stamped
 
     # Adversarially-deferred findings: stamp deferral + carry the challenger's
@@ -5907,7 +5851,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             depends_on=[],
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
-        session.add(_memo_task)
+        _auxiliary_tasks.append(_memo_task)
         try:
             from app.task_completion import _apply_synthesized_memo
 
@@ -5947,38 +5891,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             len(_spawned_memo_ids),
             task.id,
         )
-    if _memo_enrollment_queue:
-        try:
-            from app.evergreen_backlog import (  # noqa: PLC0415
-                enroll_backlog_item as _enroll_backlog_item,
-            )
-
-            await session.flush()
-            for _eq_hash, _eq_title, _eq_detail, _eq_dir_id in _memo_enrollment_queue:
-                await _enroll_backlog_item(
-                    session,
-                    project_id=task.project_id,
-                    finding_key=_eq_hash,
-                    title=_eq_title,
-                    detail=_eq_detail,
-                    direction_id=_eq_dir_id,
-                    provenance="deferred_memo",
-                )
-        except Exception:
-            logger.warning(
-                "[RESEARCH] deferred-memo evergreen enrollment failed"
-                " (task %s, count %d)",
-                task.id,
-                len(_memo_enrollment_queue),
-                exc_info=True,
-            )
-
     # Spawn a consolidated salvage-bundle task if any findings were discarded
     # via decay (ultra_low_confidence >=4, low_actionability >=3, degradation_gate >=3,
     # adversarial_gate >=3, prereq_deferred >=3) or dedup filtering (hash match,
     # region overlap, file overlap, evidence overlap, retired approach, archived
     # diagnosis). This aggregates them into one
     # actionable task rather than only individual memo tasks or silent drops.
+    # Keep parent mutations local until the canonical Project -> Task lock.
+    # Any ORM dirtiness here would let the reads below autoflush Task first.
     if _salvage_candidates:
         _salvage_payload = _build_salvage_payload(_salvage_candidates, task.id)
         _salvage_task = Task(
@@ -5993,6 +5913,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             payloads=[_salvage_payload],
             context={
                 "research_task_id": str(task.id),
+                "parent_research_task_id": str(task.id),
                 "salvage_source_task_id": str(task.id),
                 "salvage_finding_count": len(_salvage_candidates),
                 "audience": "strategist-internal",
@@ -6004,18 +5925,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             priority=TASK_PRIORITY_MAP.get("medium", 50),
         )
         if _salvage_task is not None:
-            session.add(_salvage_task)
-            # Record salvage activity on the parent research task context so
-            # downstream consumers can trace the admitted bundle.
-            _salvage_ctx = dict(task.context or {})
-            _salvage_ctx["salvage_activity"] = {
-                "salvage_task_id": str(_salvage_task.id),
-                "salvaged_count": len(_salvage_candidates),
-                "salvaged_at": _utcnow().isoformat(),
-            }
-            task.context = _salvage_ctx
-            flag_modified(task, "context")
-            session.add(task)
+            _auxiliary_tasks.append(_salvage_task)
             logger.info(
                 "[RESEARCH] Spawned consolidated salvage-bundle task for %d "
                 "discarded finding(s) (task %s)",
@@ -6059,7 +5969,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         or _spawn_gate_challenged_count
         or _spawn_gate_manifest_excluded_count
     ):
-        ctx = dict(task.context or {})
+        ctx = dict(_local_parent_context)
         if _all_deferred:
             ctx["deferred_findings"] = bound_deferred_findings(_all_deferred)
         if _stale_discarded:
@@ -6147,9 +6057,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             ctx["research_spawn_gate_manifest_excluded_fail_closed_samples"] = (
                 _spawn_gate_manifest_excluded_samples
             )
-        task.context = ctx
-        flag_modified(task, "context")
-        session.add(task)
+        _local_parent_context = ctx
         _reason = " + ".join(_deferral_reasons) if _deferral_reasons else "unknown"
         logger.warning(
             f"[RESEARCH] Deferred {len(_all_deferred)} findings ({_reason}); "
@@ -6161,7 +6069,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # in logs + task.context, leaving `latest_status_message` stuck at the last
     # agent heartbeat (e.g. "[15.7MB] Using tool: Bash") and giving no signal
     # in the admin UI / failures CLI when spawned-vs-filtered drifted.
-    task.latest_status_message = _summarize_dispatch_outcome(
+    _local_parent_message = _summarize_dispatch_outcome(
         spawned=_impl_spawned,
         total_findings=len(findings),
         dedup_outcome=_dedup_outcome,
@@ -6173,123 +6081,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # hard-fail), mark it so the strategist / operator / future research cycles
     # can distinguish thin-but-honest results from capacity-truncated ones.
     if _capacity_degradation_reason:
-        _mark_capacity_degraded(task, _capacity_degradation_reason)
-    # Evergreen backlog adapter: if this research probe was spawned from the
-    # evergreen ledger, transition its row from the probe's outcome. Children
-    # still come ONLY from the surviving-finding gates above (_impl_spawned) —
-    # this adapter never creates a fix/create task, it only records the verdict.
-    _evergreen_item_id = (task.context or {}).get("evergreen_backlog_item_id")
-    if _evergreen_item_id:
-        try:
-            from app.evergreen_backlog import apply_research_outcome
-
-            await apply_research_outcome(
-                session,
-                item_id=str(_evergreen_item_id),
-                impl_spawned=_impl_spawned,
-                reproduce_rejected=len(_reproduce_rejected),
-                surviving=_impl_spawned,
-            )
-        except Exception as _eg_exc:  # noqa: BLE001 — outcome adapter must not block completion
-            logger.warning(
-                "[EVERGREEN] failed to apply research outcome for item %s: %s",
-                _evergreen_item_id,
-                _eg_exc,
-            )
-
-    # Flip the parent to EVALUATING ATOMICALLY with the child-task INSERTs in the
-    # commit below, so the durable post-spawn state is never COMPLETED-with-children.
-    # The canonical flip (apply_post_spawn_state -> _apply_terminal_transition) runs
-    # in a LATER commit, after depends_on / foundation wiring; a contention kill
-    # (e.g. a 120s statement_timeout) between this commit and that one used to strand
-    # the parent frozen at the agent-reported COMPLETED with live children — and
-    # _check_and_trigger_rollup early-returns unless the parent is EVALUATING, so the
-    # whole subtree stranded on the research branch (task 98249c8a, 2026-06-09). This
-    # mirrors `plan`, which already flips EVALUATING before its child-spawn commit
-    # (plan_completion.py). Gate on "this pass spawned children OR a prior pass already
-    # owns them" — the same has_existing_children probe _apply_terminal_transition uses
-    # at its terminal commit — so a genuine zero-children cycle still takes the legit
-    # COMPLETED branch there. _apply_terminal_transition re-sets EVALUATING idempotently.
-    _has_prior_children = False
-    if not child_tasks:
-        _has_prior_children = bool(
-            (
-                await session.execute(
-                    select(Task.id).where(Task.parent_task_id == task.id).limit(1)
-                )
-            )
-            .scalars()
-            .first()
+        _local_parent_context["degraded_by_capacity"] = True
+        _local_parent_context["degraded_by_capacity_reason"] = (
+            _capacity_degradation_reason
         )
-    # Clear spawn-pending atomically with the child-task spawn commit.
-    # Whether or not this pass spawned children, the spawn is completing
-    # successfully and future passes should not use the resume path.
-    _ctx_post = dict(task.context or {})
-    _ctx_post.pop("_research_spawn_pending", None)
-    task.context = _ctx_post
-    flag_modified(task, "context")
-    if child_tasks or _has_prior_children:
-        task.status = TaskStatus.EVALUATING
-        task.context = {
-            **(task.context or {}),
-            "research_branch": research_branch,
-            "original_base": original_base,
-        }
-    session.add(task)
-
-    # This commit flushes the child-task INSERTs — the collision point for the
-    # duplicate-spawn guard when a peer already spawned this batch. The
-    # EVALUATING flip above (when children exist) lands in the SAME commit, so
-    # children + EVALUATING are durable together — never COMPLETED-with-children.
-    if not await _commit_or_handle_duplicate_spawn(
-        session, task, stage="child-task spawn"
-    ):
-        return
-    # The self-claim recovery path inside _commit_or_handle_duplicate_spawn
-    # rolls the session back before re-committing, which expires EVERY loaded
-    # ORM instance (rollback expires even with expire_on_commit=False). The
-    # helper re-populates ``task`` itself, but the other instances this
-    # function keeps reading below (project_obj, the dedup scans) would
-    # otherwise lazy-load synchronously on the next attribute access —
-    # MissingGreenlet under the async engine. Detect the rollback via the
-    # ``expired`` flag (no IO) and batch re-populate in place;
-    # ``populate_existing`` refreshes the SAME identity-map instances, so
-    # every existing reference becomes live again.
-    from sqlalchemy import inspect as _sa_inspect
-
-    with session.no_autoflush:
-        if project_obj is not None and _sa_inspect(project_obj).expired:
-            await session.execute(
-                select(Project)
-                .where(Project.id == _sa_inspect(project_obj).identity[0])
-                .execution_options(populate_existing=True)
-            )
-        _stale_scan_ids = [
-            _sa_inspect(t).identity[0]
-            for t in (*existing_tasks, *recent_tasks_for_dedup)
-            if _sa_inspect(t).expired
-        ]
-        if _stale_scan_ids:
-            await session.execute(
-                select(Task)
-                .where(Task.id.in_(_stale_scan_ids))
-                .execution_options(populate_existing=True)
-            )
-    # Batch-reload all child tasks (N+1 guard: commit above expired the
-    # session; one batch SELECT + identity-map lookups replaces N individual
-    # session.refresh calls). Build a fresh map so the downstream code that
-    # accesses attributes on child_tasks entries gets non-expired instances.
-    if child_tasks:
-        _ct_ids = [ct.id for ct in child_tasks]
-        _ct_result = await session.execute(
-            select(Task).where(Task.id.in_(_ct_ids))
-        )
-        _ct_fresh = {str(t.id): t for t in _ct_result.scalars().all()}
-        for _i, _ct in enumerate(child_tasks):
-            _fresh = _ct_fresh.get(str(_ct.id))
-            if _fresh is not None:
-                child_tasks[_i] = _fresh
-
     # Resolve explicit depends_on_indices to actual UUIDs (agent-specified inter-finding deps only)
     finding_to_child = {fi: ci for ci, fi in enumerate(finding_indices)}
     for ci, ct in enumerate(child_tasks):
@@ -6303,7 +6098,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if explicit_deps:
             ct.depends_on = explicit_deps
             remember_structural_depends_on(ct, explicit_deps)
-            session.add(ct)
 
     # Foundation-aware cross-task wiring: when a finding declares an EXPLICIT
     # {kind, ref} prerequisite, resolve it against (a) tasks already active /
@@ -6425,7 +6219,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             existing_dep.append(foundation_id)
             dependent.depends_on = existing_dep
             remember_structural_depends_on(dependent, foundation_id)
-            session.add(dependent)
             logger.info(
                 "[RESEARCH] Wired finding '%s' depends_on foundation %s "
                 "(prerequisite %s)",
@@ -6465,7 +6258,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 return
             dependent.payloads[0]["base_branch"] = foundation_base
             flag_modified(dependent, "payloads")
-            session.add(dependent)
             logger.info(
                 "[RESEARCH] Finding '%s' cross-tree genuine code-dep: set "
                 "base_branch to %r (foundation %s)",
@@ -6618,7 +6410,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             ct.context = _dd_ctx
             flag_modified(ct, "context")
-            session.add(ct)
 
         # Explicit {kind, ref} prerequisite: wire a real edge if it resolved to an
         # in-flight / sibling foundation this cycle, otherwise add it to the needs
@@ -6644,7 +6435,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ):
                     needs.append(prereq_need)
                     unresolved_entries.append(prereq)
-                    session.add(ct)
                 else:
                     _wired = _wire_prerequisite_edge(
                         ct, foundation, finding_title=finding_title,
@@ -6654,8 +6444,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         _maybe_inherit_base(ct, foundation, finding_title=finding_title)
                     # Persist the durable requirement stamped above even when
                     # _wire_prerequisite_edge added no new edge (idempotent re-spawn).
-                    if prereq_need:
-                        session.add(ct)
             elif foundation is None:
                 # Unresolved explicit prerequisite: a finding declared an explicit
                 # {kind, ref} foundation it must build on, but no in-flight or
@@ -6683,7 +6471,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     # or be revoked before the child gains authority. The record
                     # survives generic retry (not in FRESH_ATTEMPT_CONTEXT_STRIP_KEYS).
                     stamp_capability_requirements(ct, [prereq_need])
-                    session.add(ct)
                     if _disposition == "block":
                         # ENFORCE mode: an unproven/partial 'working' capability
                         # does NOT satisfy the prerequisite. Gate the dependent —
@@ -6731,7 +6518,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         ]
                         ct.context = _uv_ctx
                         flag_modified(ct, "context")
-                        session.add(ct)
                     else:
                         logger.info(
                             "[RESEARCH] Finding '%s' prerequisite capability:%s is "
@@ -6798,7 +6584,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _rsp_ctx["_spawn_prereq_resolved"] = _prev_resolved + _resolved_records
                 ct.context = _rsp_ctx
                 flag_modified(ct, "context")
-                session.add(ct)
                 needs = [
                     n
                     for n in needs
@@ -6821,7 +6606,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     f"Escalated to parent: finding '{finding_title}' declared only "
                     "structurally unresolvable prerequisite(s)."
                 )[:500]
-                session.add(ct)
                 logger.warning(
                     "[RESEARCH] Finding '%s' escalated to parent instead of BLOCKED "
                     "on structurally unresolvable prerequisite(s): %s",
@@ -6863,7 +6647,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 f"Escalated to parent: finding '{finding_title}' declared task "
                 "prerequisite(s) with no spawned, deferred, or in-flight provider."
             )[:500]
-            session.add(ct)
             logger.warning(
                 "[RESEARCH] Finding '%s' escalated to parent instead of BLOCKED "
                 "on dead task prerequisite(s): %s",
@@ -6900,7 +6683,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 f"Co-deferred with same-cycle-deferred prerequisite: finding "
                 f"'{finding_title}' shelved to re-surface with its foundation"
             )[:500]
-            session.add(ct)
             logger.warning(
                 "[RESEARCH] Co-deferring dependent '%s' with its same-cycle-deferred "
                 "prerequisite (cancelled task %s; both re-surface next cycle)",
@@ -6937,7 +6719,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             blocker_kind="upstream_dependency",
             needs=needs,
         )
-        session.add(ct)
         logger.warning(
             "[RESEARCH] Finding '%s' BLOCKED on %d unresolved prerequisite(s): %s",
             finding_title,
@@ -6948,13 +6729,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Persist co-deferred dependents into the same deferred_findings list as their
     # prerequisites so autonomous_research re-injects the coupled set next cycle.
     if _codeferred_findings:
-        _cd_ctx = dict(task.context or {})
+        _cd_ctx = dict(_local_parent_context)
         _cd_ctx["deferred_findings"] = bound_deferred_findings(
             list(_cd_ctx.get("deferred_findings") or []) + _codeferred_findings
         )
-        task.context = _cd_ctx
-        flag_modified(task, "context")
-        session.add(task)
+        _local_parent_context = _cd_ctx
 
     # Chain auto-decomposed siblings: when a finding is split into N sub-tasks
     # by cochange/path clustering, run them serially rather than in parallel.
@@ -6974,7 +6753,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             existing.append(prev_id)
             child_tasks[ci].depends_on = existing
             remember_structural_depends_on(child_tasks[ci], prev_id)
-            session.add(child_tasks[ci])
 
     # Author REAL sibling dependency edges for findings that share a related_file
     # (plan parity with _inject_file_overlap_deps): two same-file siblings would
@@ -7008,7 +6786,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 )
                 ctx["file_overlap_warnings"] = warnings
                 child_tasks[ci].context = ctx
-                session.add(child_tasks[ci])
 
     # Spawn-time foundation convergence: serialize GENUINE duplicate foundations
     # behind one canonical task BEFORE the just-spawned children begin executing,
@@ -7016,13 +6793,126 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # reaper's Step 15 sweep converges them after the fact. See
     # converge_spawn_batch_foundations — it reuses the SAME predicate and the SAME
     # apply-with-guards helper as the reaper sweep, so the two paths can never drift.
-    for _dep in converge_spawn_batch_foundations(child_tasks, existing_tasks):
-        session.add(_dep)
+    converge_spawn_batch_foundations(child_tasks, existing_tasks)
+
+    # Challenge verdicts are consumed inside the spawn loop, after the branch
+    # snapshot above. Reconcile those direct Task-context mutations so the stale
+    # snapshot cannot resurrect the active verdict or discard appended receipts.
+    _challenge_ctx = task.context or {}
+    for _key in (
+        _FINDING_CHALLENGE_HISTORY_KEY,
+        _FINDING_CHALLENGE_RECORD_KEY,
+        "awaiting_finding_challenge",
+    ):
+        if _key in _challenge_ctx:
+            _local_parent_context[_key] = _challenge_ctx[_key]
+        else:
+            _local_parent_context.pop(_key, None)
+
+    # Re-lock after intermediate commits; a concurrent terminal transition wins.
+    _local_parent_plan_output = task.plan_output
+    task, _prior_delivery_children = await lock_research_spawn_boundary(
+        session,
+        task,
+        local_context=_local_parent_context,
+        removed_context_keys=_base_parent_context.keys()
+        - _local_parent_context.keys(),
+        plan_output=_local_parent_plan_output,
+        latest_status_message=_local_parent_message,
+    )
+    if task is None:
+        # Commit the fresh, unchanged locked identity to release row locks while
+        # preserving it for the completion-dispatch terminal tail. ``rollback``
+        # would expire every ORM instance and make the caller's next synchronous
+        # Task attribute read raise MissingGreenlet.
+        await session.commit()
+        return
+
+    # Replays reuse the one durable authenticated salvage delivery. This runs
+    # under the parent lock, so competing publishers cannot both admit a bundle.
+    reconcile_replayed_salvage_delivery(
+        task,
+        _auxiliary_tasks,
+        _prior_delivery_children,
+        salvaged_at=_utcnow().isoformat(),
+    )
+
+    # Publish the fully-wired batch and parent EVALUATING flip atomically.
+    for _new_task in (*child_tasks, *_auxiliary_tasks):
+        session.add(_new_task)
+    _new_delivery_tasks = [
+        row
+        for row in (*child_tasks, *_auxiliary_tasks)
+        if is_authenticated_research_child(task, row)
+    ]
+    if _new_delivery_tasks or _prior_delivery_children:
+        task.status = TaskStatus.EVALUATING
+        task.context = {
+            **(task.context or {}),
+            "research_branch": research_branch,
+            "original_base": original_base,
+        }
+        flag_modified(task, "context")
+    session.add(task)
 
     if not await _commit_or_handle_duplicate_spawn(
-        session, task, stage="spawn-batch wiring"
+        session, task, stage="atomic child-task spawn and wiring"
     ):
         return
+
+    child_tasks = await refresh_research_spawn_references(
+        session,
+        project=project_obj,
+        scanned_tasks=[*existing_tasks, *recent_tasks_for_dedup],
+        child_tasks=child_tasks,
+    )
+
+    # Apply ledger effects after collision recovery cannot roll them back.
+    if _memo_enrollment_queue:
+        from app.evergreen_backlog import enroll_backlog_item as _enroll_backlog_item
+
+        for _eq_hash, _eq_title, _eq_detail, _eq_dir_id in _memo_enrollment_queue:
+            try:
+                await _enroll_backlog_item(
+                    session,
+                    project_id=task.project_id,
+                    finding_key=_eq_hash,
+                    title=_eq_title,
+                    detail=_eq_detail,
+                    direction_id=_eq_dir_id,
+                    provenance="deferred_memo",
+                )
+                await session.commit()
+            except Exception:  # noqa: BLE001, PERF203
+                await session.rollback()
+                logger.warning(
+                    "[RESEARCH] deferred-memo evergreen enrollment failed "
+                    "(task %s, finding %s)",
+                    task.id,
+                    _eq_hash,
+                    exc_info=True,
+                )
+
+    _evergreen_item_id = (task.context or {}).get("evergreen_backlog_item_id")
+    if _evergreen_item_id:
+        try:
+            from app.evergreen_backlog import apply_research_outcome
+
+            await apply_research_outcome(
+                session,
+                item_id=str(_evergreen_item_id),
+                impl_spawned=_impl_spawned,
+                reproduce_rejected=len(_reproduce_rejected),
+                surviving=_impl_spawned,
+            )
+            await session.commit()
+        except Exception as _eg_exc:  # noqa: BLE001
+            await session.rollback()
+            logger.warning(
+                "[EVERGREEN] failed to apply research outcome for item %s: %s",
+                _evergreen_item_id,
+                _eg_exc,
+            )
 
     await apply_post_spawn_state(
         session=session,
@@ -7053,52 +6943,41 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         batch_cap_deferred=_batch_cap_deferred,
     )
 
-    # Replace the resumable pre-gate ``plan_output`` with the authoritative
-    # survivor set only after child creation and prerequisite wiring are durable.
-    # A finding is final when it was routed to a real child that remains
-    # non-cancelled.
-    # Everything rejected by adversarial review, staleness/reproduction checks,
-    # deduplication, actionability, malformed-contract, or discovery admission
-    # has no qualifying child and therefore cannot re-enter Strategic through
-    # the findings index.  Capacity-deferred findings remain in the existing
-    # deferred_findings recovery path and become indexable only if a later cycle
-    # actually admits them.
+    # Assemble the candidate set now, but do NOT snapshot child status yet.
+    # Several direction/playbook bookkeeping commits below deliberately release
+    # the entrypoint locks.  A child can be cancelled in that window, so the
+    # authoritative surviving-child join is recomputed only inside the final
+    # Project -> parent -> children lock boundary.
     if _prior_finalized_findings is None:
-        _final_child_rows = (
-            (
-                await session.execute(
-                    select(Task).where(Task.parent_task_id == task.id)
-                )
+        # ``deduplicated`` contains the admitted findings on the first pass. On
+        # a retry after child insertion but before the final marker, those same
+        # findings legitimately dedup against their own durable children and
+        # disappear from that list. Fold the resumable pre-gate snapshot back
+        # in by canonical hash so the retry can finish bookkeeping without
+        # erasing already-routed work.
+        _finalization_candidates = list(deduplicated)
+        _candidate_hashes = {row[2] for row in _finalization_candidates}
+        # ``plan_output`` is the fresh pre-gate snapshot. Validated carry is
+        # recovered later, so include ``prior_actionable`` as a second resume
+        # source. The surviving-child hash check below still excludes anything
+        # refuted, deferred, deduplicated, or otherwise never routed.
+        _resume_candidates = [
+            *(task.plan_output if isinstance(task.plan_output, list) else []),
+            *prior_actionable,
+        ]
+        for _candidate_finding in _resume_candidates:
+            if not isinstance(_candidate_finding, dict):
+                continue
+            _candidate_hash = _finding_hash(
+                _candidate_finding.get("title", ""),
+                _canonical_finding_body(_candidate_finding),
             )
-            .scalars()
-            .all()
-        )
-        _surviving_child_hashes = {
-            str((child.context or {}).get("finding_hash"))
-            for child in _final_child_rows
-            if child.status != TaskStatus.CANCELLED
-            and (child.context or {}).get("finding_hash")
-        }
-        _finalized_findings: list[dict] = []
-        _finalized_hashes: set[str] = set()
-        for _, finding, finding_hash in deduplicated:
-            if (
-                finding_hash in _surviving_child_hashes
-                and finding_hash not in _finalized_hashes
-            ):
-                _finalized_findings.append(finding)
-                _finalized_hashes.add(finding_hash)
+            if _candidate_hash in _candidate_hashes:
+                continue
+            _candidate_hashes.add(_candidate_hash)
+            _finalization_candidates.append((-1, _candidate_finding, _candidate_hash))
     else:
         _finalized_findings = _prior_finalized_findings
-
-    task.plan_output = _finalized_findings
-    _record_research_survival_signal(task, surviving=len(_finalized_findings))
-    _final_ctx = dict(task.context or {})
-    _final_ctx[FINALIZED_RESEARCH_FINDINGS_KEY] = True
-    task.context = _final_ctx
-    flag_modified(task, "context")
-    session.add(task)
-    await session.commit()
 
     # Persist per-cycle deferred-finding counts on the direction's latest
     # research_history entry so the next research agent can see how many of
@@ -7207,6 +7086,89 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         await with_design_doc_locked(session, task.project_id, _credit_playbook_keys)
         await session.commit()
+
+    # The finalized marker is the handler's replay receipt, so it must be the
+    # true last completion phase. If any bookkeeping above raises, the marker
+    # and carry acknowledgements remain absent and a retry can safely resume
+    # instead of returning early with work permanently skipped.
+    _final_ctx = dict(task.context or {})
+    _final_ctx[FINALIZED_RESEARCH_FINDINGS_KEY] = True
+    # A carried finding remains recoverable from its producer until this
+    # consumer reaches the authoritative finalized boundary. Stamp the
+    # producer/hash receipts and prune those acknowledged producer entries in
+    # the SAME transaction as that marker. When a finding was re-deferred, the
+    # newer task now owns a durable copy. If the context count backstop evicted
+    # a would-be re-deferred copy, keep the old producer entry instead of losing
+    # the work.
+    _intended_redeferred_pairs = {
+        pair
+        for finding in list(_all_deferred) + list(_codeferred_findings)
+        if (pair := deferred_carry_pair(finding)) is not None
+    }
+    _persisted_redeferred_pairs = {
+        pair
+        for finding in _final_ctx.get("deferred_findings", [])
+        if isinstance(finding, Mapping)
+        and (pair := deferred_carry_pair(finding)) is not None
+    }
+    _unpersisted_redeferred_pairs = (
+        _intended_redeferred_pairs - _persisted_redeferred_pairs
+    )
+    # Earlier bookkeeping commits released the entrypoint's Project/Task locks.
+    # Re-lock Project first, before dirtying this consumer or locking producer
+    # Tasks for acknowledgement, so finalization respects the global order.
+    async with lock_accepted_research_boundary(session, task) as (project, task):
+        _final_status_is_accepted = task.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.EVALUATING,
+        )
+    if not _final_status_is_accepted:
+        # Intermediate visibility/bookkeeping commits intentionally release the
+        # entrypoint locks. An administrator can terminalize the EVALUATING
+        # parent in that window. The refreshed terminal state wins: do not
+        # publish an authoritative finding marker or consume durable carry for
+        # work whose completion was cancelled/failed concurrently.
+        logger.info(
+            "[RESEARCH] Task %s finalization abandoned after concurrent status %s",
+            task.id,
+            task.status,
+        )
+        await session.commit()
+        return
+    if _prior_finalized_findings is None:
+        # Lock the authenticated delivery rows while the canonical Project ->
+        # parent boundary is held, then join only non-cancelled survivors.
+        _finalized_findings = await finalized_research_findings_for_survivors(
+            session, task, _finalization_candidates
+        )
+    _locked_final_ctx = dict(task.context or {})
+    _locked_final_ctx.update(_final_ctx)
+    _locked_final_ctx.pop("_research_spawn_pending", None)
+    _final_ctx = _locked_final_ctx
+    task.plan_output = _finalized_findings
+    task.context = _final_ctx
+    flag_modified(task, "context")
+    # The boundary re-lock refreshes ``task.context`` from durable state. Apply
+    # the merged final context before recording the survival signal so the
+    # helper's mutation is not immediately overwritten by the pre-signal copy.
+    _record_research_survival_signal(task, surviving=len(_finalized_findings))
+    _final_ctx = dict(task.context or {})
+    # Count the accepted analysis cycle now, even when implementation children
+    # keep this parent EVALUATING for delivery. Grader/challenge parking never
+    # reaches this finalized marker.
+    await count_accepted_research_cycle(session, task, project=project)
+    _consumption_ack_count = await acknowledge_consumed_deferred_findings(
+        session,
+        consumer_task=task,
+        carried_findings=_handled_prior_deferred_for_ack,
+        excluded_pairs=_unpersisted_redeferred_pairs,
+    )
+    if _consumption_ack_count:
+        _final_ctx["deferred_finding_consumption_ack_count"] = _consumption_ack_count
+    task.context = _final_ctx
+    flag_modified(task, "context")
+    session.add(task)
+    await session.commit()
 
 
 async def _record_research_task_failure(task: Task, session: AsyncSession) -> None:

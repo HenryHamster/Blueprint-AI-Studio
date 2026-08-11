@@ -37,6 +37,10 @@ from app.time_utils import _utcnow
 # stamps this marker only after spawn wiring is durable.  Index readers fail
 # closed for legacy/unfinalized tasks instead of reviving raw agent output.
 FINALIZED_RESEARCH_FINDINGS_KEY = "research_findings_finalized"
+ACCEPTED_RESEARCH_FINDING_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.EVALUATING,
+)
 
 _BOUNDED_CHALLENGE_SURFACE_KEYS: frozenset[str] = frozenset(
     {
@@ -61,15 +65,17 @@ def finalized_research_findings_from_state(
     """Return authoritative findings from an already-loaded research task state.
 
     Projection-heavy readers can use this form without loading the full task
-    payload. The marker, terminal status and task type are all mandatory so a
-    pre-gate artifact can never become accepted evidence merely because it has a
-    list-shaped ``plan_output``.
+    payload. The marker, accepted-analysis status and task type are all mandatory
+    so a pre-gate artifact can never become accepted evidence merely because it
+    has a list-shaped ``plan_output``. ``EVALUATING`` is authoritative only with
+    the marker: research parents remain in delivery rollup after their analysis
+    artifact and child topology have already finalized.
     """
     if not isinstance(context, dict):
         return []
     if context.get(FINALIZED_RESEARCH_FINDINGS_KEY) is not True:
         return []
-    if status != TaskStatus.COMPLETED:
+    if status not in ACCEPTED_RESEARCH_FINDING_STATUSES:
         return []
     if str(task_type or "").strip().lower() != "research":
         return []
@@ -169,7 +175,7 @@ async def lookup_findings_by_source_ref(
         select(Task)
         .where(
             Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
+            Task.status.in_(ACCEPTED_RESEARCH_FINDING_STATUSES),
             Task.plan_output.isnot(None),
             Task.context[FINALIZED_RESEARCH_FINDINGS_KEY].as_boolean().is_(True),
             Task.payloads[0]["type"].as_string() == "research",
@@ -240,7 +246,7 @@ async def query_findings_index(
         select(Task)
         .where(
             Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
+            Task.status.in_(ACCEPTED_RESEARCH_FINDING_STATUSES),
             Task.plan_output.isnot(None),
             Task.context[FINALIZED_RESEARCH_FINDINGS_KEY].as_boolean().is_(True),
             Task.payloads[0]["type"].as_string() == "research",

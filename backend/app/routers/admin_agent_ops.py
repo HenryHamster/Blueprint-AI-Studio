@@ -58,6 +58,11 @@ from app.direction_lifecycle import (
     direction_has_churn_retirement_recommendation,
     reactivate_paused_direction,
 )
+from app.direction_priority import direction_task_priority
+from app.direct_research_spawn import (
+    enrich_direct_research_payload,
+    enforce_direct_research_cycle_occupancy,
+)
 from app.models import (
     KnowledgeDocument,
     MessageHandlingState,
@@ -4384,6 +4389,7 @@ async def strategic_operation(
                 status_code=400, detail=f"Unknown direction_id: {direction_id}"
             )
         direct_discovery_cycle_id: uuid.UUID | None = None
+        direct_cycle = None
         if spawn_type in {"research", "web_research"} and direction_entry is not None:
             from app.discovery_admission import (
                 DiscoveryCycleUnavailable,
@@ -4397,6 +4403,7 @@ async def strategic_operation(
                     direction_key=str(direction_id),
                     direction=direction_entry,
                     runtime_config=_runtime_config,
+                    commissioned_question=prompt,
                     join_open_cycle=True,
                 )
             except DiscoveryCycleUnavailable as exc:
@@ -4408,10 +4415,7 @@ async def strategic_operation(
         # jump ahead of unrelated projects/tasks; inherit the direction's real
         # high/medium/low intent instead, with normal medium priority for
         # direction-free bounded work.
-        spawn_priority = {"high": 100, "medium": 50, "low": 0}.get(
-            str((direction_entry or {}).get("priority") or "medium").lower(),
-            50,
-        )
+        spawn_priority = direction_task_priority(direction_entry)
 
         # Optional explicit criterion_ids — validated against active keys at
         # task-creation time (same as direction-row inheritance below). Allows
@@ -4443,6 +4447,14 @@ async def strategic_operation(
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id
+        enrich_direct_research_payload(
+            spawn_payload,
+            project=project,
+            direction_entry=direction_entry,
+            direction_id=direction_id,
+            direct_cycle=direct_cycle,
+            runtime_config=_runtime_config,
+        )
         if declared_landing_gate:
             spawn_payload["require_deps_landed_on"] = declared_landing_gate
         if declared_release_base:
@@ -4524,15 +4536,24 @@ async def strategic_operation(
                     }
                 )
 
-        # Apply per-type model/effort defaults
-        type_model = _runtime_config.get("task_type_models", {}).get(spawn_type) or None
-        type_effort = (
-            _runtime_config.get("task_type_efforts", {}).get(spawn_type) or None
-        )
-        if type_model:
-            spawn_payload["model"] = type_model
-        if type_effort:
-            spawn_payload["effort"] = type_effort
+        # Apply legacy per-type model/effort defaults to task classes that still
+        # consume them. Research is deliberately excluded: payload.model and
+        # payload.effort are explicit per-task pins and outrank the canonical
+        # ``task_type_routing['research']`` frontier route. Copying an old
+        # task_type_efforts value here could silently downgrade a new research
+        # parent from max effort, while copying task_type_models bypasses the
+        # provider/effort model matrix entirely.
+        if spawn_type != "research":
+            type_model = (
+                _runtime_config.get("task_type_models", {}).get(spawn_type) or None
+            )
+            type_effort = (
+                _runtime_config.get("task_type_efforts", {}).get(spawn_type) or None
+            )
+            if type_model:
+                spawn_payload["model"] = type_model
+            if type_effort:
+                spawn_payload["effort"] = type_effort
         try:
             spawn_payload = _validate_internal_payload(
                 spawn_payload, f"strategic_spawn_task:{spawn_type}"
@@ -4645,6 +4666,15 @@ async def strategic_operation(
                 "depends_on": depends_on_ids,
             }
         }
+        await enforce_direct_research_cycle_occupancy(
+            session,
+            project=project,
+            parent_task=task,
+            direct_cycle=direct_cycle,
+            direction_id=direction_id,
+            request_data=data,
+            normalized_specification=normalized_specification,
+        )
         try:
             submission = await submit_strategic_spawn(
                 session,

@@ -22,6 +22,12 @@ import uuid
 from sqlalchemy import or_
 from sqlmodel import select
 
+from app.branch_resolution import get_project_integration_branch
+from app.capability_registry import (
+    annotate_capability_proof_status,
+    registry_capability_evidence_refs_map,
+    registry_capability_vocabulary,
+)
 from app.discovery_admission import direction_authority_snapshot
 from app.discovery_review_packet import (
     DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS as _DECISION_SNAPSHOT_CHARS,
@@ -31,6 +37,7 @@ from app.discovery_review_packet import (
     _enum_value,
     build_discovery_review_packet as _build_review_packet,
 )
+from app.direction_priority import direction_task_priority
 from app.models import (
     DiscoveryCycle,
     Project,
@@ -41,6 +48,12 @@ from app.models import (
     TaskStatus,
 )
 from app.notification_dispatch import post_event_message
+from app.research_deferred_carry import (
+    canonical_deferred_finding_hash,
+    unacknowledged_deferred_findings,
+)
+from app.research_finding_policy import NON_SPAWNING_FINDING_TYPES
+from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
 
@@ -242,7 +255,14 @@ async def resolve_discovery_cycle(
         next_cycle_id = prior.get("next_cycle_id")
         if normalized_action == "continue" and next_cycle_id:
             try:
-                successor = await session.get(DiscoveryCycle, uuid.UUID(str(next_cycle_id)))
+                successor = (
+                    await session.execute(
+                        select(DiscoveryCycle).where(
+                            DiscoveryCycle.id == uuid.UUID(str(next_cycle_id)),
+                            DiscoveryCycle.project_id == cycle.project_id,
+                        )
+                    )
+                ).scalar_one_or_none()
             except (TypeError, ValueError, AttributeError):
                 successor = None
             if successor is not None:
@@ -318,14 +338,28 @@ async def resolve_discovery_cycle(
         return cycle
     assert normalized_next_bet is not None
     decision_task = (
-        await session.get(Task, cycle.review_task_id)
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.id == cycle.review_task_id,
+                    Task.project_id == cycle.project_id,
+                )
+            )
+        ).scalar_one_or_none()
         if cycle.review_task_id is not None
         else authority_task
     )
     if decision_task is None and authority_task is not None:
         decision_task = authority_task
     if decision_task is None and cycle.source_research_task_id is not None:
-        decision_task = await session.get(Task, cycle.source_research_task_id)
+        decision_task = (
+            await session.execute(
+                select(Task).where(
+                    Task.id == cycle.source_research_task_id,
+                    Task.project_id == cycle.project_id,
+                )
+            )
+        ).scalar_one_or_none()
     if decision_task is None:
         raise ValueError("operator resolution has no durable authority task")
     if decision_task.project_id != cycle.project_id:
@@ -375,6 +409,7 @@ async def _cycle_is_quiescent(
         await session.execute(
             select(StrategicSpawnRequest.id)
             .where(
+                StrategicSpawnRequest.project_id == cycle.project_id,
                 StrategicSpawnRequest.discovery_cycle_id == cycle.id,
                 StrategicSpawnRequest.state.in_({"accepted", "deferred"}),
                 StrategicSpawnRequest.task_id.is_(None),
@@ -386,7 +421,14 @@ async def _cycle_is_quiescent(
         if pending_request is not None:
             return False, "source_research_task_pending"
         return False, "source_research_task_missing"
-    source = await session.get(Task, cycle.source_research_task_id)
+    source = (
+        await session.execute(
+            select(Task).where(
+                Task.id == cycle.source_research_task_id,
+                Task.project_id == cycle.project_id,
+            )
+        )
+    ).scalar_one_or_none()
     if source is None:
         if pending_request is not None:
             return False, "source_research_task_pending"
@@ -399,6 +441,7 @@ async def _cycle_is_quiescent(
         await session.execute(
             select(Task.id)
             .where(
+                Task.project_id == cycle.project_id,
                 Task.discovery_cycle_id == cycle.id,
                 Task.status.in_(_ACTIVE_COHORT_STATUSES),
                 Task.id != cycle.review_task_id
@@ -414,6 +457,7 @@ async def _cycle_is_quiescent(
         await session.execute(
             select(Task.id)
             .where(
+                Task.project_id == cycle.project_id,
                 Task.discovery_cycle_id == cycle.id,
                 Task.post_commit_pending.is_(True),
                 Task.id != cycle.review_task_id
@@ -585,7 +629,14 @@ async def _reconcile_review_reference(
                 cycle.id, None, False, False, "review_blocked"
             )
         return None
-    review_task = await session.get(Task, cycle.review_task_id)
+    review_task = (
+        await session.execute(
+            select(Task).where(
+                Task.id == cycle.review_task_id,
+                Task.project_id == cycle.project_id,
+            )
+        )
+    ).scalar_one_or_none()
     if review_task is None:
         await _block_orphaned_review(
             session,
@@ -705,7 +756,10 @@ async def _reconcile_legacy_orphan_successor(
     request_exists = (
         await session.execute(
             select(StrategicSpawnRequest.id)
-            .where(StrategicSpawnRequest.discovery_cycle_id == cycle.id)
+            .where(
+                StrategicSpawnRequest.project_id == cycle.project_id,
+                StrategicSpawnRequest.discovery_cycle_id == cycle.id,
+            )
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -1233,9 +1287,97 @@ def _successor_specification(
     cycle: DiscoveryCycle,
     successor: DiscoveryCycle,
     task: Task,
+    project: Project,
     next_bet: Mapping[str, Any],
+    prior_deferred_findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
     claim = str(next_bet["claim"])
+    # Discovery successors used to bypass the canonical autonomous-research
+    # envelope entirely. Most importantly, they dropped the capacity signal, so
+    # generation 2+ silently reverted to the legacy 1-3 hard cap even after a
+    # generation-1 root received real headroom. Keep the successor bounded to
+    # its frozen bet while preserving the same execution ceiling and scheduler
+    # priority as a normal direction-owned root. Carried metadata is useful
+    # prompt context but cannot spawn a task, so it must not consume admission
+    # headroom.
+    from app.research_completion import effective_research_finding_headroom
+
+    frozen_direction = (successor.bet_snapshot or {}).get("direction")
+    if not isinstance(frozen_direction, Mapping):
+        frozen_direction = None
+    current_direction = next(
+        (
+            direction
+            for direction in (project.directions or [])
+            if isinstance(direction, Mapping)
+            and str(direction.get("id") or "") == cycle.direction_key
+        ),
+        None,
+    )
+    direction_context = current_direction or frozen_direction
+    raw_paths = direction_context.get("paths") if direction_context else None
+    capacity_consuming_carry = sum(
+        1
+        for finding in prior_deferred_findings
+        if str(finding.get("type") or "").strip().lower()
+        not in NON_SPAWNING_FINDING_TYPES
+    )
+    payload: dict[str, Any] = {
+        "type": "research",
+        "current_direction_id": cycle.direction_key,
+        "directions": [
+            {
+                "id": cycle.direction_key,
+                "text": claim,
+                "status": "active",
+                "priority": (
+                    direction_context.get("priority", "medium")
+                    if direction_context
+                    else "medium"
+                ),
+                "paths": (
+                    [
+                        path[:300]
+                        for path in raw_paths[:30]
+                        if isinstance(path, str) and path
+                    ]
+                    if isinstance(raw_paths, list)
+                    else []
+                ),
+                "completion_criteria": next_bet["success_evidence"],
+                "research_context": {
+                    "mode": next_bet["mode"],
+                    "decision_question": next_bet["decision_question"],
+                    "retirement_condition": next_bet["retirement_condition"],
+                },
+            }
+        ],
+        "base_branch": get_project_integration_branch(project),
+        "work_headroom": effective_research_finding_headroom(
+            capacity_consuming_carry
+        ),
+        "discovery_generation": successor.generation,
+        "discovery_phase": successor.phase,
+        "discovery_intent_snapshot": dict(successor.intent_snapshot or {}),
+        "discovery_bet_snapshot": dict(successor.bet_snapshot or {}),
+    }
+    if project.build_config:
+        payload["build_config"] = project.build_config
+    research_suffix = (_runtime_config.get("agent_prompt_suffixes", {}) or {}).get(
+        "research"
+    )
+    if isinstance(research_suffix, str) and research_suffix.strip():
+        payload["prompt_suffix"] = research_suffix.strip()
+    available_capabilities = annotate_capability_proof_status(
+        registry_capability_vocabulary(project.problem_model),
+        project.capability_proof_records,
+        registry_capability_evidence_refs_map(project.problem_model),
+    )
+    if available_capabilities:
+        payload["available_capabilities"] = available_capabilities
+    # Deliberately omit payload.model / payload.effort. The dispatcher resolves
+    # those fields from unified task_type_routing; a copied legacy per-type value
+    # would outrank and downgrade that canonical route.
     return {
         "task": {
             "title": f"Research: {claim}"[:200],
@@ -1243,41 +1385,64 @@ def _successor_specification(
                 f"Discovery successor ({next_bet['mode']}): "
                 f"{next_bet['decision_question']}"
             )[:500],
-            "payloads": [
-                {
-                    "type": "research",
-                    "current_direction_id": cycle.direction_key,
-                    "directions": [
-                        {
-                            "id": cycle.direction_key,
-                            "text": claim,
-                            "completion_criteria": next_bet["success_evidence"],
-                            "research_context": {
-                                "mode": next_bet["mode"],
-                                "decision_question": next_bet["decision_question"],
-                                "retirement_condition": next_bet[
-                                    "retirement_condition"
-                                ],
-                            },
-                        }
-                    ],
-                    "discovery_generation": successor.generation,
-                    "discovery_phase": successor.phase,
-                    "discovery_intent_snapshot": dict(
-                        successor.intent_snapshot or {}
-                    ),
-                    "discovery_bet_snapshot": dict(successor.bet_snapshot or {}),
-                }
-            ],
+            "payloads": [payload],
             "context": {
                 "direction_id": cycle.direction_key,
                 "discovery_decision_task_id": str(task.id),
                 "discovery_decision_mode": next_bet["mode"],
+                **(
+                    {"prior_deferred_findings": prior_deferred_findings}
+                    if prior_deferred_findings
+                    else {}
+                ),
             },
-            "priority": 50,
+            "priority": direction_task_priority(direction_context),
             "watch": False,
         }
     }
+
+
+def _successor_deferred_findings(
+    cycle: DiscoveryCycle,
+    source_task: Task | None,
+) -> list[dict[str, Any]]:
+    """Carry direction-scoped deferred work across a discovery generation."""
+
+    if source_task is None:
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in unacknowledged_deferred_findings(source_task):
+        raw_direction_id = str(raw.get("direction_id") or "").strip()
+        if raw_direction_id and raw_direction_id != cycle.direction_key:
+            continue
+        finding = dict(raw)
+        # Completion treats a missing finding direction as the owning research
+        # task's direction. Preserve that same meaning at the generation
+        # boundary instead of dropping otherwise-valid parent-scoped work.
+        finding["direction_id"] = cycle.direction_key
+        # ``finding_hash`` is agent-authored routing lineage, not a carry
+        # credential. Distinct findings must not collapse merely because an
+        # artifact supplied the same raw hash for both.
+        identity = canonical_deferred_finding_hash(finding)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(finding)
+
+    def deferred_count(finding: Mapping[str, Any]) -> int:
+        try:
+            return int(finding.get("deferred_count") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    result.sort(key=deferred_count, reverse=True)
+    # Do not truncate before there is a durable consumed/overflow protocol.
+    # The successor request is currently the only handoff from this cycle's
+    # source task; anything omitted here becomes unreachable in generation N+1.
+    # The completion handler owns the execution cap and persists its overflow
+    # on the new source task for the following generation.
+    return result
 
 
 async def _create_successor_with_request(
@@ -1289,6 +1454,30 @@ async def _create_successor_with_request(
     now: datetime,
     direction_authority_override: Mapping[str, Any] | None = None,
 ) -> tuple[DiscoveryCycle, StrategicSpawnRequest]:
+    if task.project_id != cycle.project_id:
+        raise DiscoveryReviewResultError(
+            "decision task belongs to another project"
+        )
+    project = await session.get(Project, cycle.project_id)
+    if project is None:
+        raise DiscoveryReviewResultError(
+            f"project {cycle.project_id} disappeared before successor dispatch"
+        )
+    source_task = None
+    if cycle.source_research_task_id is not None:
+        source_task = (
+            await session.execute(
+                select(Task).where(
+                    Task.id == cycle.source_research_task_id,
+                    Task.project_id == cycle.project_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if source_task is None:
+            raise DiscoveryReviewResultError(
+                "source research task is missing or belongs to another project"
+            )
+
     current_bet = dict(cycle.bet_snapshot or {})
     if direction_authority_override is not None:
         current_bet["direction"] = dict(direction_authority_override)
@@ -1306,11 +1495,14 @@ async def _create_successor_with_request(
     )
     session.add(successor)
     await session.flush()
+    prior_deferred_findings = _successor_deferred_findings(cycle, source_task)
     specification = _successor_specification(
         cycle=cycle,
         successor=successor,
         task=task,
+        project=project,
         next_bet=result["next_bet"],
+        prior_deferred_findings=prior_deferred_findings,
     )
     from app.strategic_spawn_requests import (
         stable_specification_hash,
@@ -1364,7 +1556,10 @@ async def complete_discovery_review(
     cycle = (
         await session.execute(
             select(DiscoveryCycle)
-            .where(DiscoveryCycle.id == task.discovery_cycle_id)
+            .where(
+                DiscoveryCycle.id == task.discovery_cycle_id,
+                DiscoveryCycle.project_id == task.project_id,
+            )
             .with_for_update()
         )
     ).scalar_one_or_none()
@@ -1604,7 +1799,10 @@ async def block_failed_discovery_review(
     cycle = (
         await session.execute(
             select(DiscoveryCycle)
-            .where(DiscoveryCycle.id == task.discovery_cycle_id)
+            .where(
+                DiscoveryCycle.id == task.discovery_cycle_id,
+                DiscoveryCycle.project_id == task.project_id,
+            )
             .with_for_update()
         )
     ).scalar_one_or_none()
@@ -1623,6 +1821,7 @@ async def block_failed_discovery_review(
             select(_sql_func.count())
             .select_from(Task)
             .where(
+                Task.project_id == cycle.project_id,
                 Task.discovery_cycle_id == cycle.id,
                 Task.payloads[0]["type"].as_string() == DISCOVERY_REVIEW_TASK_TYPE,
                 Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),

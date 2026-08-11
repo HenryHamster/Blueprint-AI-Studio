@@ -873,6 +873,7 @@ describe('pollForNextRole', () => {
     // Authorization header must be the X-Agent-Token (matches existing apiPost).
     const headers = (heartbeatCalls[0][1] as { headers?: Record<string, string> } | undefined)?.headers ?? {};
     expect(headers['X-Agent-Token']).toBe('jwt-tok');
+    expect(headers['X-Research-Output-Contract-Version']).toBe('2');
     expect(clearIntervalSpy).toHaveBeenCalled();
   });
 

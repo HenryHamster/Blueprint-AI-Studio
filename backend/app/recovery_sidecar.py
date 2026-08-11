@@ -19,15 +19,17 @@ from sqlmodel import select
 from app import services
 from app.database import resolve_dialect_name
 from app.models import Task, TaskStatus
+from app.sidecar_recovery_binding import (
+    AWAITING_SIDECAR_KEYS as _AWAITING_SIDECAR_KEYS,
+    awaiting_sidecar_context_predicate,
+    exact_terminal_sidecar_lanes,
+    lock_terminal_sidecar_for_recovery,
+    rebind_legacy_boolean_sidecars,
+)
 
 logger = logging.getLogger(__name__)
 
 # ── Stranded-sidecar recovery sweep ───────────────────────────────────────────
-_AWAITING_SIDECAR_KEYS = (
-    "awaiting_quality_grader",
-    "awaiting_adversarial_grader",
-    "awaiting_finding_challenge",
-)
 _SIDECAR_VERDICT_APPLICATION_PENDING_KEY = "sidecar_verdict_application_pending"
 _SIDECAR_SWEEP_MAX_PER_CYCLE = 50
 
@@ -117,11 +119,13 @@ async def _sweep_stranded_sidecar_sources() -> None:
     kill, VM death after retries exhausted, cancellation — leaves the source
     parked EVALUATING indefinitely.
 
-    This sweep queries EVALUATING tasks whose awaiting_* key holds a UUID string
-    (post-spawn; initial value is ``True``), loads each referenced sidecar, and,
-    if the sidecar is terminal (FAILED/CANCELLED), calls the lane resolver via
+    This sweep queries EVALUATING tasks whose awaiting_* key holds a UUID string,
+    loads each referenced sidecar, and, if the sidecar is terminal, calls the lane resolver via
     ``trigger_stranded_sidecar_resolution``, which constructs a synthetic payload
-    and invokes the resolver with existing fail-closed semantics. It also retries
+    and invokes the resolver with existing fail-closed semantics. Legacy rows
+    stranded by the former two-commit spawn handshake may still hold ``True``;
+    those are first rebound to the newest same-project, backend-owned sidecar
+    whose immutable source link names the task. It also retries
     terminal source tasks that already recorded a side-car verdict but still carry
     the durable application-pending marker.
     """
@@ -129,7 +133,11 @@ async def _sweep_stranded_sidecar_sources() -> None:
 
     from app.task_lifecycle import trigger_stranded_sidecar_resolution
 
-    _TERMINAL = {TaskStatus.FAILED, TaskStatus.CANCELLED}
+    _TERMINAL = {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
 
     try:
         async with services.AsyncSessionLocal() as session:
@@ -139,14 +147,25 @@ async def _sweep_stranded_sidecar_sources() -> None:
                     load_only(
                         Task.id,
                         Task.status,
+                        Task.project_id,
                         Task.context,
                         raiseload=True,
                     )
                 )
-                .where(Task.status == TaskStatus.EVALUATING)
+                .where(
+                    Task.status == TaskStatus.EVALUATING,
+                    awaiting_sidecar_context_predicate(session),
+                )
+                .order_by(Task.created_at.asc(), Task.id.asc())
                 .limit(_SIDECAR_SWEEP_MAX_PER_CYCLE)
             )
             evaluating = result.scalars().all()
+
+            evaluating = await rebind_legacy_boolean_sidecars(
+                session,
+                evaluating,
+                limit=_SIDECAR_SWEEP_MAX_PER_CYCLE,
+            )
 
             # Pre-collect sidecar UUIDs so we can batch-load them in one
             # query instead of issuing a session.get per source task (N+1).
@@ -170,18 +189,21 @@ async def _sweep_stranded_sidecar_sources() -> None:
 
             resolved = 0
             for source in evaluating:
-                ctx = source.context or {}
-                for key in _AWAITING_SIDECAR_KEYS:
-                    ref = ctx.get(key)
-                    if not ref or ref is True:
+                terminal_lanes = exact_terminal_sidecar_lanes(
+                    source, sidecars_by_id, _TERMINAL
+                )
+
+                for key, sidecar in terminal_lanes:
+                    locked_lane = await lock_terminal_sidecar_for_recovery(
+                        session,
+                        sidecar,
+                        source_id=source.id,
+                        awaiting_key=key,
+                        terminal_statuses=_TERMINAL,
+                    )
+                    if locked_lane is None:
                         continue
-                    try:
-                        sidecar_uuid = _uuid.UUID(str(ref))
-                    except (ValueError, TypeError):
-                        continue
-                    sidecar = sidecars_by_id.get(sidecar_uuid)
-                    if sidecar is None or sidecar.status not in _TERMINAL:
-                        continue
+                    sidecar, defer_source_resume = locked_lane
                     logger.warning(
                         "[SIDECAR-RECOVERY] Source %s stranded EVALUATING "
                         "(key=%s sidecar=%s status=%s) — triggering fail-closed resolution",
@@ -191,7 +213,11 @@ async def _sweep_stranded_sidecar_sources() -> None:
                         sidecar.status,
                     )
                     try:
-                        await trigger_stranded_sidecar_resolution(sidecar, session)
+                        await trigger_stranded_sidecar_resolution(
+                            sidecar,
+                            session,
+                            defer_source_resume=defer_source_resume,
+                        )
                         resolved += 1
                     except Exception:
                         logger.exception(
@@ -199,6 +225,11 @@ async def _sweep_stranded_sidecar_sources() -> None:
                             sidecar.id,
                             source.id,
                         )
+                        # Do not let a later lane resume the source with only a
+                        # subset of its exact terminal verdicts applied.  The
+                        # untouched awaiting key makes the whole batch safely
+                        # retryable on the next sweep.
+                        break
             if resolved:
                 logger.info(
                     "[SIDECAR-RECOVERY] Resolved %d stranded source task(s)", resolved

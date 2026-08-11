@@ -161,6 +161,82 @@ async def _make_merged_child(session, project_id, parent_id):
     )
 
 
+@pytest.mark.asyncio
+async def test_rollup_ignores_a_cross_project_parent_edge(cleanup_db):
+    """A corrupt foreign parent ID cannot mutate another project's rollup."""
+    from app.rollup_management import _check_and_trigger_rollup
+
+    parent_project = await _make_project(cleanup_db)
+    child_project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db,
+        parent_project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        plan_output={"findings": []},
+    )
+    foreign_child = await _make_task(
+        cleanup_db,
+        child_project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={"pr_merged": True},
+    )
+    await _check_and_trigger_rollup(foreign_child, cleanup_db)
+    await cleanup_db.refresh(parent)
+
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_landed_descendant_walk_ignores_cross_project_child(cleanup_db, mocker):
+    """A corrupt foreign child edge cannot receive another project's proof."""
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+
+    parent_project = await _make_project(cleanup_db)
+    child_project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db,
+        parent_project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+    )
+    foreign_child = await _make_task(
+        cleanup_db,
+        child_project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={"pr_merged": True},
+    )
+    original_foreign_context = dict(foreign_child.context or {})
+    mocker.patch(
+        "app.rollup_management._resolve_rollup_diff_credentials",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    stamp_range = mocker.patch(
+        "app.rollup_management._stamp_child_commit_range",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+    mark_landed = mocker.patch(
+        "app.landed_signal.corroborate_and_mark_landed_on_integration",
+        new_callable=AsyncMock,
+    )
+
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, cleanup_db
+    )
+
+    assert stamped == []
+    stamp_range.assert_not_awaited()
+    mark_landed.assert_not_awaited()
+    await cleanup_db.refresh(foreign_child)
+    assert foreign_child.context == original_foreign_context
+
+
 async def _make_failed_terminal_rollup_for_sweep(
     session, project_id, *, pr_number: int, extra_context: dict | None = None
 ):

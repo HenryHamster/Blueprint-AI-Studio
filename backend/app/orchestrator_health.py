@@ -211,7 +211,14 @@ async def find_parked_blocked_foundation(
     if not dep_uuids:
         return None
     rows = (
-        (await session.execute(select(Task).where(Task.id.in_(dep_uuids))))
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.id.in_(dep_uuids),
+                    Task.project_id == dependent.project_id,
+                )
+            )
+        )
         .scalars()
         .all()
     )
@@ -251,12 +258,26 @@ async def _classify_stuck_tasks(
     cannot trip an async lazy-load). A dependency absent from the map is a deleted
     row — ``_check_candidate_task_deps`` treats it as failed.
     """
-    adj = {str(t.id): [str(d) for d in dep_map[t.id] if d in stuck_ids] for t in stuck}
+    stuck_by_id = {t.id: t for t in stuck}
+    adj = {
+        str(t.id): [
+            str(d)
+            for d in dep_map[t.id]
+            if d in stuck_ids
+            and stuck_by_id[d].project_id == t.project_id
+        ]
+        for t in stuck
+    }
     cycle_m = _find_cycle_members(adj)
     _terminal = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
     out = []
     for t in stuck:
         deps = dep_map[t.id]
+        same_project_dep_tasks = {
+            dep_id: dep_task
+            for dep_id, dep_task in dep_tasks_by_id.items()
+            if dep_task.project_id == t.project_id
+        }
         if not deps:
             continue
         if str(t.id) in cycle_m:
@@ -270,7 +291,8 @@ async def _classify_stuck_tasks(
         # Conservative: only a genuinely parked foundation trips this; a still-
         # recovering BLOCKED dep falls through to the normal in-flight wait.
         if any(
-            d in dep_tasks_by_id and is_parked_blocked_foundation(dep_tasks_by_id[d])
+            d in same_project_dep_tasks
+            and is_parked_blocked_foundation(same_project_dep_tasks[d])
             for d in deps
         ):
             out.append((t.id, "stranded_parked"))
@@ -279,14 +301,24 @@ async def _classify_stuck_tasks(
         # dependency — not a deadlock. Leave it for a later cycle, exactly as the
         # main path waits rather than forcing the issue.
         if any(
-            d in stuck_ids
-            or (d in dep_tasks_by_id and dep_tasks_by_id[d].status not in _terminal)
+            (
+                d in stuck_ids
+                and stuck_by_id[d].project_id == t.project_id
+            )
+            or (
+                d in same_project_dep_tasks
+                and same_project_dep_tasks[d].status not in _terminal
+            )
             for d in deps
         ):
             continue
         # Every dependency is terminal (or deleted). Resolve it through the main
         # path's policy so the death-reason actually drives the outcome.
-        dep_tasks = [dep_tasks_by_id[d] for d in deps if d in dep_tasks_by_id]
+        dep_tasks = [
+            same_project_dep_tasks[d]
+            for d in deps
+            if d in same_project_dep_tasks
+        ]
         result, _ = await _check_candidate_task_deps(
             t, dep_tasks, list(deps), session, verify_pr_merged
         )
@@ -525,7 +557,14 @@ async def _effective_dep_task(dt: Task, session: AsyncSession) -> Task:
     if not replacement_id_str:
         return dt
     try:
-        replacement = await session.get(Task, uuid.UUID(replacement_id_str))
+        replacement = (
+            await session.execute(
+                select(Task).where(
+                    Task.id == uuid.UUID(replacement_id_str),
+                    Task.project_id == dt.project_id,
+                )
+            )
+        ).scalar_one_or_none()
     except (ValueError, AttributeError):
         replacement = None
     return replacement or dt
@@ -974,7 +1013,14 @@ async def _dep_parent_lineage_has_landed(dep: Task, session: AsyncSession) -> bo
     parent_id = dep.parent_task_id
     if not parent_id:
         return False
-    parent = await session.get(Task, parent_id)
+    parent = (
+        await session.execute(
+            select(Task).where(
+                Task.id == parent_id,
+                Task.project_id == dep.project_id,
+            )
+        )
+    ).scalar_one_or_none()
     if parent is None:
         return False
     return has_landed_signal(parent)
@@ -990,6 +1036,9 @@ async def _shared_staging_dependency_source(
     reach project integration creates a cycle because the outer research rollup
     cannot land until the sibling dependent finishes.
     """
+    if dependent.project_id != dep.project_id:
+        return None
+
     dep_ctx = dep.context or {}
     if dep_ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) in _FORCE_DROP_REASONS:
         return None
@@ -1003,7 +1052,14 @@ async def _shared_staging_dependency_source(
     if not shared_base:
         return None
 
-    parent = await session.get(Task, dep.parent_task_id)
+    parent = (
+        await session.execute(
+            select(Task).where(
+                Task.id == dep.parent_task_id,
+                Task.project_id == dep.project_id,
+            )
+        )
+    ).scalar_one_or_none()
     if (
         parent is None
         or parent.status != TaskStatus.COMPLETED
@@ -1054,6 +1110,10 @@ async def _check_candidate_task_deps(
         - deps_remapped maps old cancelled dep IDs to replacement IDs (for
           persisting remap so future cycles skip the lookup)
     """
+    # Dependency identity is project-scoped. Treat a corrupt cross-project edge
+    # exactly like a missing dependency (fail closed) instead of letting another
+    # tenant's terminal state, replacement, or parent landing authorize dispatch.
+    dep_tasks = [dt for dt in dep_tasks if dt.project_id == task.project_id]
     all_met = True
     any_failed = len(dep_tasks) < len(dep_uuids)  # Missing deps treated as failed
     deps_remapped: dict[str, str] = {}
@@ -1080,7 +1140,10 @@ async def _check_candidate_task_deps(
     _replacement_cache: dict[uuid.UUID, Task] = {}
     if _replacement_uuids:
         _rows = await session.execute(
-            select(Task).where(Task.id.in_(_replacement_uuids))
+            select(Task).where(
+                Task.id.in_(_replacement_uuids),
+                Task.project_id == task.project_id,
+            )
         )
         for _t in _rows.scalars().all():
             _replacement_cache[_t.id] = _t

@@ -61,6 +61,10 @@ async def test_get_settings_includes_provider_scaffolding(client):
     )
     assert body["category_routing"]["strategic"]["providers"][0] == "zai"
     assert "zai" not in body["category_routing"]["initiative"]["providers"]
+    assert body["task_type_routing"]["research"] == {
+        "providers": ["zai", "anthropic", "deepseek", "openai", "gemini"],
+        "effort": "max",
+    }
     assert body["provider_settings_by_effort"]["deepseek"]["low"]["model"] == (
         "deepseek-v4-flash"
     )
@@ -154,6 +158,35 @@ def test_migrate_legacy_provider_config_backfills_without_rewriting_routes():
         "deepseek-v4-flash"
     )
     assert migrated["provider_settings_defaults"]["deepseek"] == {}
+    assert migrated["task_type_routing"]["research"] == {
+        "providers": ["zai", "anthropic", "deepseek", "openai", "gemini"],
+        "effort": "max",
+    }
+
+
+def test_research_route_backfill_is_independent_of_process_local_state(monkeypatch):
+    """Persisted config migrates identically across Cloud Run instances."""
+    from app.runtime_config_state import (
+        _migrate_legacy_provider_config,
+        runtime_config,
+    )
+
+    # Simulate an instance whose live dict already reflects a different PATCH
+    # history. Migration of the same persisted JSON must still use the release
+    # policy, not copy this process-local route into the backfill.
+    monkeypatch.setitem(
+        runtime_config,
+        "task_type_routing",
+        {"research": {"providers": ["openai"], "effort": "low"}},
+    )
+    migrated = _migrate_legacy_provider_config(
+        {"category_routing": {}, "provider_settings_by_effort": {}}
+    )
+
+    assert migrated["task_type_routing"]["research"] == {
+        "providers": ["zai", "anthropic", "deepseek", "openai", "gemini"],
+        "effort": "max",
+    }
 
 
 def test_provider_backfill_routes_discovery_review_without_rewriting_providers():
@@ -234,6 +267,9 @@ def test_migrate_legacy_provider_config_is_stable_across_repeated_syncs():
     }
     config = {
         "category_routing": copy.deepcopy(operator_routing),
+        "task_type_routing": {
+            "research": {"providers": ["openai"], "effort": "high"}
+        },
         "provider_selection_mode": "exclusive",
         "provider_settings_by_effort": {},
     }
@@ -248,6 +284,10 @@ def test_migrate_legacy_provider_config_is_stable_across_repeated_syncs():
         ), f"category_routing.{category} was rewritten by backfill"
         assert migrated["category_routing"][category]["effort"] == route["effort"]
     assert migrated["provider_selection_mode"] == "exclusive"
+    assert migrated["task_type_routing"]["research"] == {
+        "providers": ["openai"],
+        "effort": "high",
+    }
 
 
 def test_migrate_live_openai_constraint_to_gpt_5_6_smoke():

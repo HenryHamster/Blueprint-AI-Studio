@@ -303,6 +303,7 @@ export type SchemaLabel =
   | 'merge_grade'
   | 'research_spawn_adversarial_challenge'
   | 'design'
+  | 'research_findings'
   | 'research_plan'
   | 'web_research'
   | 'specialized_findings'

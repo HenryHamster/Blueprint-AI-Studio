@@ -584,6 +584,8 @@ async def _propagate_landed_to_staging_merged_descendants(
     # to descendants; coverage_delta acceptance evidence needs this key
     # present on each child task's context at verdict time.
     _parent = await session.get(Task, parent_task_id)
+    if _parent is None:
+        return []
     _parent_ctx: dict = (_parent.context or {}) if _parent is not None else {}
     _parent_coverage: dict | None = _parent_ctx.get("test_coverage_result")
     # The rollup's own project, loaded once so the corroboration twin can
@@ -636,7 +638,10 @@ async def _propagate_landed_to_staging_merged_descendants(
         rows = (
             (
                 await session.execute(
-                    select(Task).where(Task.parent_task_id.in_(queue))
+                    select(Task).where(
+                        Task.parent_task_id.in_(queue),
+                        Task.project_id == _parent.project_id,
+                    )
                 )
             )
             .scalars()
@@ -1713,7 +1718,10 @@ async def _check_and_trigger_rollup(
         (
             await session.execute(
                 select(Task)
-                .where(Task.id == child_task.parent_task_id)
+                .where(
+                    Task.id == child_task.parent_task_id,
+                    Task.project_id == child_task.project_id,
+                )
                 .with_for_update(skip_locked=True)
             )
         )
@@ -1759,7 +1767,10 @@ async def _check_and_trigger_rollup(
     all_children = (
         (
             await session.execute(
-                select(Task).where(Task.parent_task_id == parent.id)
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.project_id == parent.project_id,
+                )
             )
         )
         .scalars()

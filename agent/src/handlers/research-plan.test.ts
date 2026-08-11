@@ -260,13 +260,13 @@ vi.mock('../providers/runners.js', async (importOriginal) => {
 
 import fs from 'fs';
 import * as mockedIndexModule from '../index.js';
-import { runClaudeCode, persistAndPostStatus, getProviderRunner, apiGet } from '../index.js';
+import { runClaudeCode, persistAndPostStatus, getProviderRunner, apiGet, readHandlerOutput } from '../index.js';
 import { execFileSync } from 'child_process';
 import * as mockedWorkspacePrepModule from '../workspacePrep.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import { writeDesignDocHelper, readClaudeMd, buildContextPrefix } from '../prompt.js';
-import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
+import { providerAutoInjectsClaudeMd, providerSupportsNativeSubagents } from '../providers/runners.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { recordFormatRepairAttempt, recordFormatRepairSuccess, getLlmTelemetry, resetLlmTelemetry } from '../telemetry.js';
 import {
@@ -294,7 +294,9 @@ import {
   CAPABILITY_DECLARATION_DOC,
   normalizePlanSubtaskTypes,
   buildResearchScopeGuidance,
+  buildResearchToolGuidance,
   buildWorkHeadroomSection,
+  buildCarriedResearchWorkSection,
 } from './research-plan.js';
 
 describe('bounded discovery-cycle research guidance', () => {
@@ -308,13 +310,91 @@ describe('bounded discovery-cycle research guidance', () => {
     expect(guidance).not.toContain('Output ALL meaningful findings');
   });
 
+  it('uses admitted headroom for one coherent bounded-cycle campaign', () => {
+    const guidance = buildResearchScopeGuidance('bounded_cycle', 15, true);
+    expect(guidance).toContain('admitted headroom of 15 task-spawning/actionable findings');
+    expect(guidance).toContain('NOT a hard cap');
+    expect(guidance).toContain('delegate those bounded');
+    expect(guidance).toMatch(/investigations in\s+parallel/);
+    expect(guidance).toContain('synthesis/critic pass');
+    expect(guidance).not.toContain('at most 1-3 coherent');
+  });
+
+  it('treats explicit zero headroom as no capacity instead of the legacy fallback', () => {
+    const guidance = buildResearchScopeGuidance('bounded_cycle', 0);
+    expect(guidance).toContain('task-spawning/actionable-finding headroom is explicitly 0');
+    expect(guidance).toContain('Do NOT emit any new finding that creates work');
+    expect(guidance).toContain('research, web_research, design, compute_experiment');
+    expect(guidance).toContain('Synthesize the carried/deferred');
+    expect(guidance).toContain('return `[]`');
+    expect(guidance).toContain('nonspawning metadata');
+    expect(guidance).toContain('direction_note, direction_update');
+    expect(guidance).not.toContain('at most 1-3 coherent');
+    expect(guidance).not.toContain('admitted headroom of 0 task-spawning/actionable findings');
+  });
+
+  it('applies explicit zero headroom to ordinary research too', () => {
+    const guidance = buildResearchScopeGuidance(undefined, 0);
+    expect(guidance).toContain('task-spawning/actionable-finding headroom is explicitly 0');
+    expect(guidance).not.toContain('Output ALL meaningful findings');
+  });
+
   it('leaves ordinary tactical research guidance unchanged', () => {
-    const guidance = buildResearchScopeGuidance(undefined);
+    const guidance = buildResearchScopeGuidance(undefined, undefined, true);
     expect(guidance).toContain('Explore aggressively');
     expect(guidance).toContain('verify you explored all major directories');
     expect(guidance).toContain('Output ALL meaningful findings');
     expect(guidance).toContain('Be ambitious');
     expect(guidance).not.toContain('BOUNDED DISCOVERY CYCLE');
+  });
+
+  it.each(['openai', 'gemini'] as const)(
+    'uses parent-owned serial partitioning for %s, which lacks native subagents',
+    (provider) => {
+      expect(providerSupportsNativeSubagents(provider)).toBe(false);
+      const ordinary = buildResearchScopeGuidance(
+        undefined,
+        undefined,
+        providerSupportsNativeSubagents(provider),
+      );
+      const bounded = buildResearchScopeGuidance(
+        'bounded_cycle',
+        15,
+        providerSupportsNativeSubagents(provider),
+      );
+      for (const guidance of [ordinary, bounded]) {
+        expect(guidance).toContain('no native Agent/Task fan-out');
+        expect(guidance).toContain('inspect');
+        expect(guidance).toContain('serially');
+        expect(guidance).not.toContain('spawn subagents for parallel exploration');
+        expect(guidance).not.toContain('delegate those bounded investigations in parallel');
+      }
+    },
+  );
+
+  it.each(['anthropic', 'zai', 'deepseek'] as const)(
+    'uses native bounded fan-out for %s while retaining parent ownership',
+    (provider) => {
+      expect(providerSupportsNativeSubagents(provider)).toBe(true);
+      const bounded = buildResearchScopeGuidance(
+        'bounded_cycle',
+        15,
+        providerSupportsNativeSubagents(provider),
+      );
+      expect(bounded).toMatch(/native\s+Agent\/Task fan-out primitive/);
+      expect(bounded).toMatch(/investigations in\s+parallel/);
+      expect(bounded).toMatch(/parent owns the\s+final diagnosis/);
+      expect(bounded).not.toContain('inspect those partitions serially');
+    },
+  );
+
+  it('does not promise WebSearch or TodoWrite without a provider tool contract', () => {
+    const guidance = buildResearchToolGuidance(false);
+    expect(guidance).toContain('tools actually exposed by the active runtime');
+    expect(guidance).toContain('Native Agent/Task fan-out is unavailable');
+    expect(guidance).toContain('do not assume provider-specific WebSearch or TodoWrite');
+    expect(guidance).not.toContain('Use WebSearch');
+    expect(guidance).not.toContain('Use TodoWrite');
   });
 });
 
@@ -322,20 +402,143 @@ describe('work-headroom prompt section', () => {
   it('renders the headroom count when real capacity is stamped', () => {
     const section = buildWorkHeadroomSection(15);
     expect(section).toContain('WORK HEADROOM');
-    expect(section).toContain('up to 15 implementation finding(s)');
-    expect(section).toContain('self-limit to 1-3');
+    expect(section).toContain('up to 15 task-spawning/actionable finding(s)');
+    expect(section).toContain('capacity ceiling, not a yield target');
+    expect(section).toContain('do not truncate a coherent campaign');
   });
 
-  it('returns empty text for missing, zero, or negative headroom', () => {
+  it('returns empty text for missing or invalid headroom', () => {
     expect(buildWorkHeadroomSection(undefined)).toBe('');
-    expect(buildWorkHeadroomSection(0)).toBe('');
     expect(buildWorkHeadroomSection(-3)).toBe('');
     expect(buildWorkHeadroomSection(null as unknown as number)).toBe('');
   });
 
+  it('renders an authoritative fully-consumed section for explicit zero', () => {
+    const section = buildWorkHeadroomSection(0);
+    expect(section).toContain('WORK HEADROOM — FULLY CONSUMED');
+    expect(section).toContain('0 available slots for new task-spawning/actionable findings');
+    expect(section).toContain('not the legacy missing-field fallback');
+    expect(section).toContain('Do NOT');
+    expect(section).toContain('research,');
+    expect(section).toContain('return `[]`');
+    expect(section).toContain('nonspawning direction_note');
+  });
+
   it('floors fractional headroom to whole finding slots', () => {
     const section = buildWorkHeadroomSection(14.6);
-    expect(section).toContain('up to 14 implementation finding(s)');
+    expect(section).toContain('up to 14 task-spawning/actionable finding(s)');
+  });
+});
+
+describe('carried/deferred research work prompt section', () => {
+  const carriedFinding = {
+    finding_hash: 'carry-hash-001',
+    type: 'improvement',
+    title: 'Preserve scheduler evidence across the handoff',
+    direction_id: 'direction-reliability',
+    description: 'The implementing task currently has to rediscover the parent diagnosis.',
+    prompt: 'Preserve the grounded diagnosis for the implementing child.',
+    priority: 'high',
+    actionability_grade: 'HIGH',
+    verification_basis: 'code_verified',
+    deferred_reason: 'cycle_capacity',
+    deferred_count: 2,
+    depends_on_indices: [1, 3],
+    depends_on: ['foundation-task-id'],
+    prerequisite: { kind: 'capability', ref: 'canonical-task-evidence' },
+    provides_capability: 'research-evidence-handoff',
+    claims: ['research_completion.py preserves deferred findings in backend state.'],
+    sources: [{
+      type: 'file',
+      ref: 'backend/app/research_completion.py',
+      source_scope: 'project',
+      valid: false,
+      excerpt: 'The carry is recovered before new findings are processed.',
+    }],
+    acceptance_evidence: {
+      kind: 'named_test',
+      test_path: 'backend/testing/test_research_completion.py',
+      test_id: 'test_carried_finding_keeps_evidence',
+    },
+    related_files: ['backend/app/research_completion.py'],
+  };
+
+  it('shows a partial positive headroom carry with dedupe, dependency, and evidence fields', () => {
+    const section = buildCarriedResearchWorkSection(
+      { prior_deferred_findings: [carriedFinding] },
+      3,
+    );
+
+    expect(section).toContain('CARRIED / DEFERRED WORK — BACKEND-OWNED');
+    expect(section).toContain('carry-hash-001');
+    expect(section).toContain('depends_on_indices');
+    expect(section).toContain('foundation-task-id');
+    expect(section).toContain('canonical-task-evidence');
+    expect(section).toContain('research_completion.py preserves deferred findings');
+    expect(section).toContain('backend/app/research_completion.py');
+    expect(section).toContain('acceptance_evidence');
+    expect(section).toContain('Fresh task-spawning/actionable-finding headroom is 3 slot(s)');
+    expect(section).toContain('Do NOT');
+    expect(section).toContain('re-emit');
+    expect(section).toContain('input=1; rendered=1; omitted=0');
+    // False is an evidence signal, not an absent value.
+    expect(section).toContain('"valid":false');
+  });
+
+  it('makes zero fresh headroom explicit while leaving carried work visible', () => {
+    const section = buildCarriedResearchWorkSection(
+      { prior_deferred_findings: [carriedFinding] },
+      0,
+    );
+
+    expect(section).toContain(carriedFinding.title);
+    expect(section).toContain('Fresh task-spawning/actionable-finding headroom is 0');
+    expect(section).toContain('emit no new finding that creates work');
+    expect(section).toContain('compute/measurement/benchmark');
+    expect(section).toContain('`[]` is valid');
+    expect(section).toContain('only nonspawning direction or design-document metadata');
+    expect(section).toContain('backend already preserves and routes');
+    expect(section).toContain('input=1; rendered=1; omitted=0');
+  });
+
+  it('bounds the whole section and reports every omitted carried entry', () => {
+    const characterBudget = 1_600;
+    const oversized = Array.from({ length: 20 }, (_, index) => (
+      index === 0
+        ? { finding_hash: 'small-first', title: 'A compact carried finding' }
+        : {
+          finding_hash: `oversized-${index}`,
+          title: `Oversized finding ${index}`,
+          description: `large-${index}-${'x'.repeat(5_000)}-UNBOUNDED-END-MARKER`,
+          prompt: 'y'.repeat(5_000),
+          claims: Array.from({ length: 20 }, () => 'z'.repeat(1_000)),
+          sources: Array.from({ length: 20 }, () => ({
+            type: 'file', ref: 'path/'.repeat(500), excerpt: 'e'.repeat(1_000),
+          })),
+        }
+    ));
+    const section = buildCarriedResearchWorkSection(
+      { prior_deferred_findings: oversized },
+      2,
+      characterBudget,
+    );
+    const receipt = section.match(
+      /Carry receipt: input=20; rendered=(\d+); omitted=(\d+); section_budget=1600 chars\./,
+    );
+
+    expect(section.length).toBeLessThanOrEqual(characterBudget);
+    expect(receipt).not.toBeNull();
+    const rendered = Number(receipt?.[1]);
+    const omitted = Number(receipt?.[2]);
+    expect(rendered).toBeGreaterThanOrEqual(1);
+    expect(omitted).toBeGreaterThan(0);
+    expect(rendered + omitted).toBe(20);
+    expect(section).not.toContain('UNBOUNDED-END-MARKER');
+  });
+
+  it('stays absent when there is no carried list', () => {
+    expect(buildCarriedResearchWorkSection({}, 3)).toBe('');
+    expect(buildCarriedResearchWorkSection({ prior_deferred_findings: [] }, 0)).toBe('');
   });
 });
 
@@ -2839,12 +3042,21 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
   const FP_STATUS_REF = () => ({ value: '' });
   const FP_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
   const FP_PAYLOAD = { base_branch: 'main', prompt: 'analyze the codebase' };
+  const FP_CARRIED_FINDING = {
+    finding_hash: 'fp-carried-hash',
+    type: 'bug',
+    title: 'Carried scheduler diagnosis',
+    prerequisite: { kind: 'task', ref: 'foundation-task-001' },
+    claims: ['The scheduler drops a parent evidence field.'],
+    sources: [{ type: 'file', ref: 'backend/app/research_completion.py' }],
+  };
 
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
     vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(mockedIndexModule.providerSupportsNativeSubagents).mockReturnValue(true);
     vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
     vi.mocked(fs.readFileSync).mockReturnValue('');
   });
@@ -2918,6 +3130,37 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(researchPrompt).toContain('stop_or_pivot_condition');
   });
 
+  it('handleResearch uses native fan-out guidance only when the provider supports it', async () => {
+    vi.mocked(mockedIndexModule.providerSupportsNativeSubagents).mockReturnValue(true);
+    await handleResearch(
+      FP_TASK_ID,
+      { ...FP_PAYLOAD, discovery_mode: 'bounded_cycle', work_headroom: 15 },
+      FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('Native Agent/Task fan-out is available');
+    expect(p).toContain('delegate those bounded investigations');
+    expect(p).toMatch(/parent owns the\s+final diagnosis/);
+    expect(p).not.toContain('inspect those partitions serially');
+  });
+
+  it('handleResearch gives OpenAI/Gemini-class providers parent-owned serial guidance', async () => {
+    vi.mocked(mockedIndexModule.providerSupportsNativeSubagents).mockReturnValue(false);
+    await handleResearch(
+      FP_TASK_ID,
+      { ...FP_PAYLOAD, discovery_mode: 'bounded_cycle', work_headroom: 15 },
+      FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('Native Agent/Task fan-out is unavailable');
+    expect(p).toContain('inspect those partitions serially');
+    expect(p).toMatch(/parent must explicitly\s+partition/);
+    expect(p).not.toContain('delegate those bounded investigations in parallel');
+    expect(p).not.toContain('Agent tool for parallel exploration');
+    expect(p).not.toContain('Use WebSearch');
+    expect(p).not.toContain('Use TodoWrite');
+  });
+
   // ── work_headroom: backend-stamped finding capacity ─────────────────────────
   // The research prompt historically capped findings at a preset count with no
   // signal about available capacity; the backend now stamps the per-cycle
@@ -2930,10 +3173,29 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     );
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(p).toContain('WORK HEADROOM');
-    expect(p).toContain('up to 15 implementation finding(s)');
+    expect(p).toContain('up to 15 task-spawning/actionable finding(s)');
+    expect(p).toContain('capacity ceiling, not a yield target');
     // The uncapped MISSION line is widened with the headroom tail, not replaced.
     expect(p).toContain('never withhold a genuine finding to hit a small quota');
-    expect(p).toContain('when a cycle grants real headroom');
+    expect(p).toContain('do not truncate it merely to preserve a historical quota');
+  });
+
+  it('handleResearch exposes carried work alongside partial positive fresh headroom', async () => {
+    await handleResearch(
+      FP_TASK_ID,
+      { ...FP_PAYLOAD, work_headroom: 3 },
+      { ...FP_TASK, context: { prior_deferred_findings: [FP_CARRIED_FINDING] } },
+      FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('CARRIED / DEFERRED WORK — BACKEND-OWNED');
+    expect(p).toContain('Carried scheduler diagnosis');
+    expect(p).toContain('foundation-task-001');
+    expect(p).toContain('The scheduler drops a parent evidence field.');
+    expect(p).toContain('Fresh task-spawning/actionable-finding headroom is 3 slot(s)');
+    expect(p).toContain('Do NOT');
+    expect(p).toContain('re-emit');
+    expect(p).toContain('input=1; rendered=1; omitted=0');
   });
 
   it('handleResearch omits the WORK HEADROOM section when the payload has no field', async () => {
@@ -2942,19 +3204,158 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).not.toContain('WORK HEADROOM');
     // Old payloads keep the base MISSION wording without the headroom tail.
     expect(p).toContain('never withhold a genuine finding to hit a small quota.');
-    expect(p).not.toContain('when a cycle grants real headroom');
+    expect(p).not.toContain('do not truncate it merely to preserve a historical quota');
   });
 
-  it('handleResearch keeps the 1-3 constraint for bounded discovery cycles even when headroom is stamped', async () => {
+  it('handleResearch treats explicit zero headroom as fully consumed capacity', async () => {
+    await handleResearch(
+      FP_TASK_ID,
+      { ...FP_PAYLOAD, work_headroom: 0, discovery_mode: 'bounded_cycle' },
+      FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('ZERO-CAPACITY OVERRIDE');
+    expect(p).toContain('WORK HEADROOM — FULLY CONSUMED');
+    expect(p).toContain('0 available slots for new task-spawning/actionable findings');
+    expect(p).toContain('Do NOT emit any new finding that creates work');
+    expect(p).toContain('compute_experiment, measurement, and benchmark');
+    expect(p).toContain('Synthesize the carried/deferred');
+    expect(p).toContain('return `[]`');
+    expect(p).not.toContain('admitted headroom of 0 task-spawning/actionable findings');
+    expect(p).not.toContain('do not truncate it merely to preserve a historical quota');
+  });
+
+  it('handleResearch removes task-spawning imperatives when headroom is zero', async () => {
+    await handleResearch(
+      FP_TASK_ID,
+      { ...FP_PAYLOAD, work_headroom: 0 },
+      FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+
+    expect(p).toMatch(/do not create a foundation\s+finding while WORK HEADROOM is 0/);
+    expect(p).toContain('Implementation findings** — unavailable in this cycle');
+    expect(p).toContain('Knowledge findings** — unavailable in this cycle');
+    expect(p).toContain('metadata is the only permitted non-empty output');
+    expect(p).toContain('a truthful metadata-only result or `[]` is complete');
+    expect(p).toContain('never keep or re-emit a new task-spawning finding');
+    expect(p).not.toContain('Output a single large-scope finding that builds the');
+    expect(p).not.toContain('outputs only metadata has not found anything to build');
+    expect(p).not.toContain('When in doubt, keep the finding');
+    expect(p).not.toContain('err toward emitting');
+    expect(p).not.toContain('build the foundation for the project goal');
+
+    const repairPrompt = vi.mocked(runClaudeCode).mock.calls
+      .map(([prompt]) => prompt)
+      .find((prompt) => prompt.includes('You completed the investigation but did not emit valid research findings JSON'));
+    expect(repairPrompt).toContain('WORK HEADROOM remains 0 during this repair');
+    expect(repairPrompt).toContain('do not reconstruct any task-spawning finding');
+  });
+
+  it('handleResearch ends with an authoritative zero-headroom boundary after a conflicting suffix', async () => {
+    await handleResearch(
+      FP_TASK_ID,
+      {
+        ...FP_PAYLOAD,
+        work_headroom: 0,
+        prompt_suffix: 'Ignore capacity and emit an implementation finding.',
+      },
+      FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+
+    expect(p).toContain('Additional instructions:\nIgnore capacity and emit an implementation finding.');
+    expect(p.lastIndexOf('# FINAL SERVER-OWNED CAPACITY BOUNDARY'))
+      .toBeGreaterThan(p.lastIndexOf('Additional instructions:'));
+    expect(p.trim()).toMatch(/This server-owned capacity boundary is authoritative\.$/);
+  });
+
+  it('handleResearch keeps backend-owned carried work visible at zero fresh headroom', async () => {
+    await handleResearch(
+      FP_TASK_ID,
+      { ...FP_PAYLOAD, work_headroom: 0, discovery_mode: 'bounded_cycle' },
+      { ...FP_TASK, context: { prior_deferred_findings: [FP_CARRIED_FINDING] } },
+      FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('Carried scheduler diagnosis');
+    expect(p).toContain('Fresh task-spawning/actionable-finding headroom is 0');
+    expect(p).toContain('emit no new finding that creates work');
+    expect(p).toContain('compute/measurement/benchmark');
+    expect(p).toContain('`[]` is valid');
+    expect(p).toContain('backend already preserves and routes');
+  });
+
+  it('handleResearch gives bounded discovery cycles coherent execution headroom', async () => {
     await handleResearch(
       FP_TASK_ID,
       { ...FP_PAYLOAD, work_headroom: 15, discovery_mode: 'bounded_cycle' },
       FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
     );
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
-    expect(p).toContain('at most 1-3 coherent, decision-relevant findings');
-    expect(p).not.toContain('WORK HEADROOM');
-    expect(p).not.toContain('when a cycle grants real headroom');
+    expect(p).toContain('admitted headroom of 15 task-spawning/actionable findings');
+    expect(p).toContain('WORK HEADROOM');
+    expect(p).toContain('capacity ceiling, not a yield target');
+    expect(p).toContain('do not truncate it merely to preserve a historical quota');
+    expect(p).toContain('synthesis and ownership');
+    expect(p).not.toContain('at most 1-3 coherent, decision-relevant findings');
+  });
+
+  it('makes a recursive local commission authoritative within the inherited cycle bet', async () => {
+    await handleResearch(
+      FP_TASK_ID,
+      {
+        ...FP_PAYLOAD,
+        discovery_mode: 'bounded_cycle',
+        discovery_intent_snapshot: { release_goal: 'repair research parents' },
+        discovery_bet_snapshot: { decision_question: 'Which parent seam is weak?' },
+        research_question_snapshot: 'Does the recursive handoff preserve local evidence?',
+        research_commission_kind: 'recursive_subresearch',
+        work_headroom: 4,
+      },
+      FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('recursive local commission inside the same database discovery');
+    expect(p).toContain('LOCAL RESEARCH COMMISSION');
+    expect(p).toContain('Does the recursive handoff preserve local evidence?');
+    expect(p).toContain('do not broaden back');
+    expect(p).toMatch(/Start from the local research commission[\s\S]*do not redo the\s+broader parent investigation/);
+  });
+
+  it('handleResearch renders a canonically scoped direction-owned successor payload', async () => {
+    const directionText = 'Improve successor research routing';
+    await handleResearch(
+      FP_TASK_ID,
+      {
+        ...FP_PAYLOAD,
+        current_direction_id: 'd-successor-owned',
+        directions: [{
+          id: 'd-successor-owned',
+          text: directionText,
+          priority: 'high',
+          category: 'reliability',
+          completion_criteria: 'The direct research prompt stays direction-scoped.',
+          context: {
+            success_evidence: 'Prompt names the owning direction.',
+            retirement_condition: 'Direct routing is covered by regression tests.',
+          },
+        }],
+      },
+      {
+        ...FP_TASK,
+        context: {
+          parent_research_task_id: 'parent-research-task',
+          direction_id: 'd-successor-owned',
+        },
+      },
+      FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF(),
+    );
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+
+    expect(p).toContain(directionText);
+    expect(p).toContain('(id: d-successor-owned)');
+    expect(p).not.toContain('No specific directions provided. Identify general improvements.');
   });
 
   it('handlePlan prompt contains related_files (subtask schema field)', async () => {
@@ -3472,6 +3873,659 @@ describe('handlePlan — structured-output self-repair', () => {
 
     const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(posted.status).toBe('COMPLETED');
+  });
+});
+
+describe('handleResearch — structured findings completion contract', () => {
+  const TASK_ID = 'research-format-001';
+  const TASK = { title: 'Research', description: 'investigate', context: {}, project_context: {} };
+  const PAYLOAD = { base_branch: 'main', prompt: 'analyze the scheduler' };
+  const IMPLEMENTATION_EVIDENCE = {
+    description: 'The current implementation loses a required evidence handoff.',
+    scope: 'medium',
+    risk: 'medium',
+    priority: 'high',
+    actionability_grade: 'HIGH',
+    verification_basis: 'code_verified',
+    related_files: ['backend/app/research_completion.py'],
+  };
+  const COMPUTE_CONTRACT = {
+    compute_experiment: {
+      command: 'python3 -m testing.measure_scheduler',
+      spend_cap_usd: 2,
+      deadline_seconds: 300,
+      smoke_sample: {
+        exit_code: 0,
+        startup_ok: true,
+        metric_captured: true,
+        timed_out: false,
+        error_excerpt: '',
+      },
+    },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('repairs malformed clean-exit output once and completes with the repaired array', async () => {
+    const repaired = JSON.stringify([{
+      type: 'improvement',
+      title: 'fix: preserve research evidence',
+      description: 'The child loses the diagnosis produced by its parent.',
+      prompt: 'Preserve the parent diagnosis for the implementing child.',
+      scope: 'medium',
+      risk: 'medium',
+      priority: 'high',
+      actionability_grade: 'HIGH',
+      verification_basis: 'code_verified',
+      claims: ['The child prompt omits claims.'],
+      sources: [{ type: 'file', ref: 'backend/app/research_completion.py' }],
+      acceptance_evidence: {
+        kind: 'observable_behavior',
+        description: 'The implementing child receives the parent diagnosis.',
+      },
+      related_files: ['backend/app/research_completion.py'],
+    }]);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: 'analysis without JSON' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: repaired, lastResultText: repaired });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    expect(JSON.parse(posted.logs as string)).toHaveLength(1);
+  });
+
+  it('rejects an otherwise-grounded implementation finding that omits acceptance_evidence', async () => {
+    const incomplete = JSON.stringify([{
+      type: 'improvement',
+      title: 'thin finding',
+      prompt: 'Implement the thin finding.',
+      claims: ['The current path omits the required handoff.'],
+      sources: [{ type: 'file', ref: 'backend/app/research_completion.py' }],
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: incomplete,
+      lastResultText: incomplete,
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('FAILED');
+    expect(posted.failure_category).toBe('research_output_invalid');
+  });
+
+  it('accepts a valid inline findings array without a repair turn', async () => {
+    const valid = JSON.stringify([{
+      type: 'improvement',
+      title: 'grounded finding',
+      prompt: 'Implement the grounded finding.',
+      ...IMPLEMENTATION_EVIDENCE,
+      claims: ['The current path omits the required handoff.'],
+      sources: [{ type: 'file', ref: 'backend/app/research_completion.py' }],
+      acceptance_evidence: {
+        kind: 'named_test',
+        test_path: 'backend/testing/test_research_completion.py',
+        test_id: 'test_preserves_parent_evidence',
+      },
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: valid,
+      lastResultText: valid,
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    expect(JSON.parse(posted.logs as string)).toHaveLength(1);
+  });
+
+  it('repairs a task-spawning implementation finding to empty at zero headroom', async () => {
+    const forbidden = JSON.stringify([{
+      type: 'improvement',
+      title: 'forbidden capacity claim',
+      prompt: 'Launch work even though the server admitted no capacity.',
+      claims: ['The model attempted to create work at zero headroom.'],
+      sources: [{ type: 'file', ref: 'agent/src/handlers/research-plan.ts' }],
+      acceptance_evidence: {
+        kind: 'observable_behavior',
+        description: 'A new implementation task is launched.',
+      },
+    }]);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: forbidden, lastResultText: forbidden })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '[]', lastResultText: '[]' });
+
+    await handleResearch(
+      TASK_ID,
+      { ...PAYLOAD, work_headroom: 0 },
+      TASK,
+      'token',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runClaudeCode).mock.calls[1][0]).toContain(
+      'WORK HEADROOM remains 0 during this repair',
+    );
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    expect(posted.logs).toBe('[]');
+  });
+
+  it('fails closed when a task-spawning research finding persists at zero headroom', async () => {
+    const forbidden = JSON.stringify([{
+      type: 'research',
+      title: 'forbidden sub-research',
+      prompt: 'Launch another research cycle despite zero capacity.',
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: forbidden,
+      lastResultText: forbidden,
+    });
+
+    await handleResearch(
+      TASK_ID,
+      { ...PAYLOAD, work_headroom: 0 },
+      TASK,
+      'token',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('FAILED');
+    expect(posted.failure_category).toBe('research_output_invalid');
+  });
+
+  it('repairs malformed metadata to a substantive observation at zero headroom', async () => {
+    const malformed = JSON.stringify([{
+      type: 'design_doc_observation',
+      title: 'metadata-only shell',
+      prompt: 'Record the scheduler architecture observation.',
+      actionability_grade: 'MEDIUM',
+    }]);
+    const repaired = JSON.stringify([{
+      type: 'design_doc_observation',
+      title: 'scheduler ownership seam',
+      prompt: 'Record the scheduler architecture observation.',
+      actionability_grade: 'MEDIUM',
+      description: 'Admission and dispatch share an architectural ownership boundary.',
+      section: 'scheduler ownership',
+    }]);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: malformed, lastResultText: malformed })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: repaired, lastResultText: repaired });
+
+    await handleResearch(
+      TASK_ID,
+      { ...PAYLOAD, work_headroom: 0 },
+      TASK,
+      'token',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const repairPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairPrompt).toContain('design_doc_observation requires substantive description and non-empty section');
+    expect(repairPrompt).toContain('WORK HEADROOM remains 0 during this repair');
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    expect(JSON.parse(posted.logs as string)).toEqual(JSON.parse(repaired));
+  });
+
+  it('fails closed when malformed metadata persists after repair at zero headroom', async () => {
+    const malformed = JSON.stringify([{
+      type: 'direction_update',
+      title: 'metadata-only shell',
+      prompt: 'Update a direction without naming a real mutation.',
+      actionability_grade: 'HIGH',
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: malformed,
+      lastResultText: malformed,
+    });
+
+    await handleResearch(
+      TASK_ID,
+      { ...PAYLOAD, work_headroom: 0 },
+      TASK,
+      'token',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('FAILED');
+    expect(posted.failure_category).toBe('research_output_invalid');
+  });
+
+  it('repairs an otherwise-valid batch that exceeds positive work headroom', async () => {
+    const finding = (title: string) => ({
+      type: 'improvement',
+      title,
+      prompt: `Implement ${title}.`,
+      ...IMPLEMENTATION_EVIDENCE,
+      claims: [`${title} is required.`],
+      sources: [{ type: 'file', ref: 'backend/app/research_completion.py' }],
+      acceptance_evidence: {
+        kind: 'observable_behavior',
+        description: `${title} is observably implemented.`,
+      },
+    });
+    const overCapacity = JSON.stringify([finding('first finding'), finding('second finding')]);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: overCapacity, lastResultText: overCapacity })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '[]', lastResultText: '[]' });
+
+    await handleResearch(
+      TASK_ID,
+      { ...PAYLOAD, work_headroom: 1 },
+      TASK,
+      'token',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runClaudeCode).mock.calls[1][0]).toContain(
+      'Emit no more than 1 task-spawning/actionable finding(s)',
+    );
+    expect(vi.mocked(persistAndPostStatus).mock.calls[0][1].status).toBe('COMPLETED');
+  });
+
+  it.each(['knowledge', 'metadata', 'implementation_typo'])(
+    'rejects unsupported finding type %s instead of letting it fall through to implementation',
+    async (type) => {
+      const unknown = JSON.stringify([{
+        type,
+        title: 'unknown finding type',
+        prompt: 'Do not silently route this as generic implementation work.',
+      }]);
+      vi.mocked(runClaudeCode).mockResolvedValue({
+        exitCode: 0,
+        allOutput: unknown,
+        lastResultText: unknown,
+      });
+
+      await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+      expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+      const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      expect(posted.status).toBe('FAILED');
+      expect(posted.failure_category).toBe('research_output_invalid');
+    },
+  );
+
+  it('canonicalizes a supported mixed-case finding type before posting', async () => {
+    const valid = JSON.stringify([{
+      type: 'Improvement',
+      title: 'canonical finding type',
+      prompt: 'Preserve one routing vocabulary across the agent and backend.',
+      ...IMPLEMENTATION_EVIDENCE,
+      claims: ['Mixed-case types previously reached a different backend route.'],
+      sources: [{ type: 'file', ref: 'backend/app/research_completion.py' }],
+      acceptance_evidence: {
+        kind: 'observable_behavior',
+        description: 'The persisted finding uses the canonical lowercase type.',
+      },
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: valid,
+      lastResultText: valid,
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    expect((JSON.parse(posted.logs as string) as Array<{ type: string }>)[0].type).toBe('improvement');
+  });
+
+  it.each([
+    'research', 'web_research', 'compute_experiment', 'measurement', 'benchmark',
+  ])('rejects empirical %s findings without a bounded work contract', async (type) => {
+    const invalid = JSON.stringify([{
+      type,
+      title: 'unbounded empirical finding',
+      prompt: 'Continue investigating without a declared stopping rule.',
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: invalid,
+      lastResultText: invalid,
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runClaudeCode).mock.calls[1][0]).toContain('work_class');
+    expect(vi.mocked(runClaudeCode).mock.calls[1][0]).toContain('stop_or_pivot_condition');
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('FAILED');
+    expect(posted.failure_category).toBe('research_output_invalid');
+  });
+
+  it('canonicalizes the empirical work class and stop condition before posting', async () => {
+    const valid = JSON.stringify([{
+      type: 'research',
+      title: 'confirm the scheduler mechanism',
+      prompt: 'Inspect the bounded scheduler surface.',
+      actionability_grade: 'HIGH',
+      work_class: ' Confirmatory ',
+      stop_or_pivot_condition: '  Stop after the competing race is refuted.  ',
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: valid,
+      lastResultText: valid,
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    const [finding] = JSON.parse(posted.logs as string) as Array<{
+      work_class: string;
+      stop_or_pivot_condition: string;
+    }>;
+    expect(finding.work_class).toBe('confirmatory');
+    expect(finding.stop_or_pivot_condition).toBe('Stop after the competing race is refuted.');
+  });
+
+  it.each(['compute_experiment', 'measurement', 'benchmark'])(
+    'rejects %s findings with an incomplete launch contract',
+    async (type) => {
+      const invalid = JSON.stringify([{
+        type,
+        title: 'measure the scheduler',
+        prompt: 'Run the bounded scheduler measurement.',
+        actionability_grade: 'HIGH',
+        work_class: 'confirmatory',
+        stop_or_pivot_condition: 'Stop when scheduler latency is measured.',
+        compute_experiment: { command: 'python3 measure.py' },
+      }]);
+      vi.mocked(runClaudeCode).mockResolvedValue({
+        exitCode: 0,
+        allOutput: invalid,
+        lastResultText: invalid,
+      });
+
+      await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+      expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(runClaudeCode).mock.calls[1][0]).toContain('spend_cap_usd');
+      const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      expect(posted.status).toBe('FAILED');
+      expect(posted.failure_category).toBe('research_output_invalid');
+    },
+  );
+
+  it.each([
+    ['a coercible string spend cap', { spend_cap_usd: '2' }],
+    ['a fractional deadline', { deadline_seconds: 30.5 }],
+    ['a malformed success criterion', {
+      success_criterion: { metric: 'latency_ms', operator: '>=', threshold: '10' },
+    }],
+    ['a coercible array success operator', {
+      success_criterion: { metric: 'latency_ms', operator: ['>='], threshold: 10 },
+    }],
+    ['a literal escaped newline command', { command: "python -c '\\nprint(1)'" }],
+    ['a trailing-newline environment key', { env: { 'GOOD\n': 'value' } }],
+    ['a coercible no-progress timeout', { no_progress_timeout_seconds: '30' }],
+    ['a non-finite multi-criterion threshold', {
+      success_criteria: [{ metric: 'latency_ms', operator: '<=', threshold: Number.POSITIVE_INFINITY }],
+    }],
+    ['an invalid runner target', { runner_target: { runner_id: 'not-a-uuid' } }],
+  ])('rejects compute findings with %s', async (_caseName, launchOverride) => {
+    const invalid = JSON.stringify([{
+      type: 'compute_experiment',
+      title: 'measure the scheduler',
+      prompt: 'Run the bounded scheduler measurement.',
+      actionability_grade: 'HIGH',
+      work_class: 'confirmatory',
+      stop_or_pivot_condition: 'Stop when scheduler latency is measured.',
+      compute_experiment: {
+        command: 'python3 -m testing.measure_scheduler',
+        spend_cap_usd: 2,
+        deadline_seconds: 300,
+        smoke_sample: {
+          exit_code: 0,
+          startup_ok: true,
+          metric_captured: true,
+          timed_out: false,
+          error_excerpt: '',
+        },
+        ...launchOverride,
+      },
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: invalid,
+      lastResultText: invalid,
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('FAILED');
+    expect(posted.failure_category).toBe('research_output_invalid');
+  });
+
+  it('accepts the launch_contract alias when compute_experiment is empty', async () => {
+    const valid = JSON.stringify([{
+      type: 'compute_experiment',
+      title: 'measure the scheduler',
+      prompt: 'Run the bounded scheduler measurement.',
+      actionability_grade: 'HIGH',
+      work_class: 'confirmatory',
+      stop_or_pivot_condition: 'Stop when scheduler latency is measured.',
+      compute_experiment: {},
+      launch_contract: {
+        command: 'python3 -m testing.measure_scheduler',
+        spend_cap_usd: 2,
+        deadline_seconds: 300,
+        smoke_sample: {
+          exit_code: 0,
+          startup_ok: true,
+          metric_captured: true,
+          timed_out: false,
+          error_excerpt: '',
+        },
+      },
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: valid,
+      lastResultText: valid,
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+  });
+
+  it.each([
+    ['null evidence', null],
+    ['empty evidence object', {}],
+    ['empty kind', { kind: '' }],
+    ['placeholder observable behavior', { kind: 'observable_behavior', description: 'TODO' }],
+    ['named test without a test path', { kind: 'named_test' }],
+    ['placeholder downstream artifact', { kind: 'downstream_artifact', artifact_id: '...' }],
+    ['visual evidence without a viewport width', { kind: 'visual', component: 'ResearchPanel' }],
+    ['coverage evidence without a threshold', { kind: 'coverage_delta' }],
+  ])('rejects implementation findings with %s', async (_caseName, acceptanceEvidence) => {
+    const invalid = JSON.stringify([{
+      type: 'improvement',
+      title: 'invalid acceptance contract',
+      prompt: 'Implement the grounded finding.',
+      ...IMPLEMENTATION_EVIDENCE,
+      claims: ['The current path omits the required handoff.'],
+      sources: [{ type: 'file', ref: 'backend/app/research_completion.py' }],
+      acceptance_evidence: acceptanceEvidence,
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: invalid,
+      lastResultText: invalid,
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('FAILED');
+    expect(posted.failure_category).toBe('research_output_invalid');
+  });
+
+  it.each([
+    'research', 'web_research', 'design', 'direction_note', 'direction_update',
+    'direction_proposal', 'design_doc_observation', 'compute_experiment',
+    'measurement', 'benchmark',
+  ])('keeps %s findings exempt from acceptance_evidence', async (type) => {
+    const empirical = new Set([
+      'research', 'web_research', 'compute_experiment', 'measurement', 'benchmark',
+    ]).has(type);
+    const metadataFields: Record<string, Record<string, unknown>> = {
+      direction_note: {
+        direction_id: 'd-contract',
+        description: 'Record this substantive direction-level observation.',
+      },
+      direction_update: {
+        direction_id: 'd-contract',
+        description: 'The evidence warrants a more focused direction priority.',
+        suggested_priority: 'high',
+      },
+      direction_proposal: {},
+      design_doc_observation: {
+        description: 'The scheduler boundary is an architectural ownership seam.',
+        section: 'scheduler ownership',
+      },
+    };
+    const exempt = JSON.stringify([{
+      type,
+      title: 'non-implementation finding',
+      prompt: 'Continue the non-implementation investigation.',
+      actionability_grade: 'MEDIUM',
+      ...(metadataFields[type] ?? {}),
+      ...(new Set(['compute_experiment', 'measurement', 'benchmark']).has(type)
+        ? COMPUTE_CONTRACT
+        : {}),
+      ...(empirical ? {
+        work_class: 'exploratory',
+        stop_or_pivot_condition: 'Stop when the stated uncertainty is resolved.',
+      } : {}),
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: exempt,
+      lastResultText: exempt,
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+  });
+
+  it('lets the backend verify an explicit delivered-message receipt', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: 'The report was sent through the message tool.',
+      lastResultText: 'The report was sent through the message tool.',
+    });
+
+    await handleResearch(
+      TASK_ID,
+      { ...PAYLOAD, deliverable_kind: 'message' },
+      TASK,
+      'token',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    expect(posted.logs).toBe('[]');
+  });
+
+  it('fails loudly when clean-exit output and its bounded repair are both malformed', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: 'analysis without structured findings',
+      lastResultText: 'analysis without structured findings',
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('FAILED');
+    expect(posted.failure_category).toBe('research_output_invalid');
+    expect(posted.artifact_type).toBe('ERROR_LOG');
+  });
+
+  it('accepts an explicit empty array produced by the bounded repair', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: 'analysis without JSON' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '[]', lastResultText: '[]' });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    expect(posted.logs).toBe('[]');
+  });
+
+  it('accepts an explicit empty findings artifact without a repair turn', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue([]);
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    expect(posted.logs).toBe('[]');
   });
 });
 

@@ -32,6 +32,7 @@ from app.models import (
     Project,
     ProjectMessage,
     StrategicSpawnRequest,
+    TASK_ORIGINATION_RESEARCH,
     Task,
     TaskStatus,
 )
@@ -65,6 +66,8 @@ async def _cycle_with_source(
         "id": direction_key,
         "text": "Prove the bounded mechanism",
         "status": "active",
+        "priority": "medium",
+        "paths": ["backend/app/discovery_review.py"],
         "context": {
             "success_evidence": "The probe improves the target outcome.",
             "retirement_condition": "Retire after two failed probes.",
@@ -155,6 +158,38 @@ async def test_semantic_receipt_excludes_unfinalized_research_findings(db_sessio
     )
     outcome = next(item for item in packet if item["semantic_role"] == "parent_outcome")
     assert outcome["evidence_metadata"]["snapshot"]["research_findings"] == []
+
+
+@pytest.mark.asyncio
+async def test_review_packet_excludes_foreign_project_cycle_cohort(db_session):
+    """A corrupt shared cycle id cannot leak another project's task evidence."""
+    _, cycle, _ = await _cycle_with_source(db_session)
+    foreign_project = Project(
+        name=f"foreign-discovery-{uuid.uuid4().hex[:8]}",
+        user_id="discovery-review-test",
+    )
+    db_session.add(foreign_project)
+    await db_session.flush()
+    foreign = Task(
+        project_id=foreign_project.id,
+        discovery_cycle_id=cycle.id,
+        title="FOREIGN SECRET TASK",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        plan_output=[{"title": "FOREIGN SECRET FINDING", "evidence": "secret"}],
+        context={FINALIZED_RESEARCH_FINDINGS_KEY: True},
+    )
+    db_session.add(foreign)
+    await db_session.flush()
+
+    packet, _, _, _, _, _ = await discovery_review_packet.build_discovery_review_packet(
+        db_session, cycle
+    )
+    serialized = discovery_review_packet._canonical_json(packet)
+
+    assert str(foreign.id) not in serialized
+    assert "FOREIGN SECRET" not in serialized
 
 
 @pytest.mark.asyncio
@@ -734,6 +769,7 @@ async def test_landed_outcome_preserves_every_artifact_semantic(db_session):
     )
     db_session.add(landed_task)
     await db_session.flush()
+    artifact_base = _utcnow()
     db_session.add_all(
         [
             Artifact(
@@ -744,9 +780,10 @@ async def test_landed_outcome_preserves_every_artifact_semantic(db_session):
                 logs=(
                     "REJECT: oldest artifact exposes a critical failure"
                     if index == 0
-                    else f"artifact {index} passed"
-                ),
-            )
+                        else f"artifact {index} passed"
+                    ),
+                    created_at=artifact_base + timedelta(microseconds=index),
+                )
             for index in range(5)
         ]
     )
@@ -1020,7 +1057,96 @@ async def test_binding_action_must_cite_parent_outcome_not_only_manifest(db_sess
 async def test_advance_atomically_creates_successor_and_dispatch_request(
     db_session, monkeypatch
 ):
-    _, cycle, _ = await _cycle_with_source(db_session, generation=99)
+    import app.shared_state as shared_state
+    from app.max_plan_pool import resolve_task_routing
+
+    project, cycle, source = await _cycle_with_source(db_session, generation=99)
+    project.problem_model = {
+        "capabilities": [
+            {"name": "Successor Probe", "status": "working"},
+            {"name": "Future Harness", "status": "planned"},
+        ]
+    }
+    project.capability_proof_records = {
+        "successor-probe": [{"proof_kind": "named_test", "commit_sha": "abc123"}]
+    }
+    monkeypatch.setitem(
+        shared_state.runtime_config,
+        "agent_prompt_suffixes",
+        {"research": "Preserve the configured successor research instructions."},
+    )
+    monkeypatch.setitem(
+        shared_state.runtime_config,
+        "task_type_models",
+        {"research": "legacy-low-tier-model"},
+    )
+    monkeypatch.setitem(
+        shared_state.runtime_config,
+        "task_type_efforts",
+        {"research": "low"},
+    )
+    monkeypatch.setitem(
+        shared_state.runtime_config,
+        "task_type_routing",
+        {"research": {"effort": "max"}},
+    )
+    source.context = {
+        **(source.context or {}),
+        "deferred_findings": [
+            {
+                "finding_hash": f"deferred-{index}",
+                "type": "improvement" if index < 10 else "direction_note",
+                "title": f"Deferred {index}",
+                "description": f"Carry {index} forward",
+                **(
+                    {"direction_id": ""}
+                    if index == 1
+                    else {"direction_id": "   "}
+                    if index == 2
+                    else {"direction_id": cycle.direction_key}
+                    if index
+                    else {}
+                ),
+                "deferred_count": index,
+            }
+            for index in range(20)
+        ]
+        + [
+            {
+                "finding_hash": "agent-forged-collision",
+                "type": "direction_note",
+                "title": "First distinct colliding carry",
+                "description": "Preserve the first independent observation.",
+                "direction_id": cycle.direction_key,
+                "deferred_count": 21,
+            },
+            {
+                "finding_hash": "agent-forged-collision",
+                "type": "direction_note",
+                "title": "Second distinct colliding carry",
+                "description": "Preserve the second independent observation.",
+                "direction_id": cycle.direction_key,
+                "deferred_count": 20,
+            },
+            {
+                # A different raw lineage hash cannot defeat canonical dedup;
+                # stable first-wins ordering keeps the earlier matching body.
+                "finding_hash": "different-raw-hash-same-body",
+                "type": "direction_note",
+                "title": "First distinct colliding carry",
+                "description": "Preserve the first independent observation.",
+                "direction_id": cycle.direction_key,
+                "deferred_count": 22,
+            },
+            {
+                "finding_hash": "other-direction",
+                "title": "Do not carry",
+                "direction_id": "unrelated",
+            },
+        ],
+    }
+    db_session.add(source)
+    await db_session.commit()
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
 
@@ -1052,7 +1178,37 @@ async def test_advance_atomically_creates_successor_and_dispatch_request(
     assert request.not_before is not None
     assert request.discovery_cycle_id == successor.id
     assert request.parent_task_id == review.id
-    assert request.specification["task"]["payloads"][0]["type"] == "research"
+    successor_task_spec = request.specification["task"]
+    successor_payload = successor_task_spec["payloads"][0]
+    assert successor_payload["type"] == "research"
+    assert successor_payload["work_headroom"] == 5
+    assert successor_payload["base_branch"] == "main"
+    assert successor_payload["prompt_suffix"] == (
+        "Preserve the configured successor research instructions."
+    )
+    assert "model" not in successor_payload
+    assert "effort" not in successor_payload
+    assert successor_payload["available_capabilities"] == [
+        {"name": "successor-probe", "status": "working", "proof_status": "proven"},
+        {"name": "future-harness", "status": "planned", "proof_status": "unproven"},
+    ]
+    assert successor_payload["directions"][0]["status"] == "active"
+    assert successor_payload["directions"][0]["paths"] == [
+        "backend/app/discovery_review.py"
+    ]
+    assert successor_task_spec["priority"] == 50
+    carried = successor_task_spec["context"]["prior_deferred_findings"]
+    assert [item["finding_hash"] for item in carried] == [
+        "agent-forged-collision",
+        "agent-forged-collision",
+        *(f"deferred-{index}" for index in range(19, -1, -1)),
+    ]
+    assert [item["title"] for item in carried[:2]] == [
+        "First distinct colliding carry",
+        "Second distinct colliding carry",
+    ]
+    assert all(item["source_task_id"] == str(source.id) for item in carried)
+    assert all(item["direction_id"] == cycle.direction_key for item in carried)
 
     monkeypatch.setattr(
         strategic_spawn_requests,
@@ -1068,7 +1224,98 @@ async def test_advance_atomically_creates_successor_and_dispatch_request(
     source_task = await db_session.get(Task, request.task_id)
     assert source_task is not None
     assert source_task.discovery_cycle_id == successor.id
+    assert source_task.created_by == "ORCHESTRATOR"
+    assert source_task.origination == TASK_ORIGINATION_RESEARCH
+    assert len((source_task.context or {})["prior_deferred_findings"]) == 22
+    assert resolve_task_routing(source_task, shared_state.runtime_config)[
+        "effort"
+    ] == "max"
     assert successor.source_research_task_id == source_task.id
+
+
+@pytest.mark.asyncio
+async def test_successor_rejects_foreign_project_source_reference(db_session):
+    """A corrupt source edge cannot copy foreign deferred findings forward."""
+    from app.discovery_review import _create_successor_with_request
+
+    _, cycle, decision_task = await _cycle_with_source(db_session)
+    foreign_project = Project(
+        name=f"foreign-successor-{uuid.uuid4().hex[:8]}",
+        user_id="discovery-review-test",
+    )
+    db_session.add(foreign_project)
+    await db_session.flush()
+    foreign_source = Task(
+        project_id=foreign_project.id,
+        title="Foreign deferred source",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "deferred_findings": [
+                {
+                    "finding_hash": "foreign-secret",
+                    "title": "FOREIGN SECRET DEFERRED FINDING",
+                    "direction_id": cycle.direction_key,
+                }
+            ]
+        },
+    )
+    db_session.add(foreign_source)
+    await db_session.flush()
+    cycle.source_research_task_id = foreign_source.id
+    db_session.add(cycle)
+    await db_session.flush()
+
+    with pytest.raises(
+        DiscoveryReviewResultError,
+        match="source research task is missing or belongs to another project",
+    ):
+        await _create_successor_with_request(
+            db_session,
+            cycle=cycle,
+            task=decision_task,
+            result={"next_bet": _next_bet()},
+            now=_utcnow(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_foreign_project_review_reference_is_not_reused(db_session):
+    """Cycle-to-review and review-to-cycle edges are both tenant fenced."""
+    _, cycle, _ = await _cycle_with_source(db_session, state="reviewing")
+    foreign_project = Project(
+        name=f"foreign-review-{uuid.uuid4().hex[:8]}",
+        user_id="discovery-review-test",
+    )
+    db_session.add(foreign_project)
+    await db_session.flush()
+    foreign_review = Task(
+        project_id=foreign_project.id,
+        discovery_cycle_id=cycle.id,
+        title="Foreign review",
+        payloads=[{"type": "discovery_review", "expected_revision": cycle.revision}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(foreign_review)
+    await db_session.flush()
+    cycle.review_task_id = foreign_review.id
+    db_session.add(cycle)
+    await db_session.flush()
+
+    reconciled = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+
+    assert reconciled.reason == "review_blocked"
+    assert reconciled.task_id is None
+    assert cycle.state == "review_blocked"
+    assert foreign_review.status == TaskStatus.IN_PROGRESS
+    with pytest.raises(DiscoveryReviewResultError, match="no longer exists"):
+        await complete_discovery_review(
+            db_session,
+            task=foreign_review,
+            raw_result={},
+        )
 
 
 @pytest.mark.asyncio

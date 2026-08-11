@@ -377,9 +377,16 @@ export function _setAgentTokenForTesting(value: string): void {
   apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
 }
 
+// Capability handshake consumed by POST /api/agent/claim. The backend stamps
+// the strict research-output contract only when the claiming runner advertises
+// this exact version, so rolling backend deployments do not misclassify stale
+// agent images as contract-v2 producers.
+const RESEARCH_OUTPUT_CONTRACT_VERSION = 2;
+
 const apiHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
   'X-Agent-Token': AGENT_TOKEN,
+  'X-Research-Output-Contract-Version': String(RESEARCH_OUTPUT_CONTRACT_VERSION),
 };
 
 initTokenModule({
@@ -1556,6 +1563,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'X-Agent-Token': agentJwt,
+    'X-Research-Output-Contract-Version': String(RESEARCH_OUTPUT_CONTRACT_VERSION),
   };
 
   // Shared revoke flag — set by either heartbeat path or next-role path on
@@ -4321,8 +4329,8 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // runtime_unavailable is an infra decline (missing CLI binary), not a real
     // task failure. Convert to GracefulShutdownSignal so main() can exit with
     // code 42, signalling the runner to skip the failure-streak increment.
-    // eslint-disable-next-line @typescript-eslint/only-throw-error -- GracefulShutdownSignal is a typed control signal, not an Error
     if (error instanceof RuntimeUnavailableError) {
+      // eslint-disable-next-line @typescript-eslint/only-throw-error -- GracefulShutdownSignal is a typed control signal, not an Error
       throw new GracefulShutdownSignal('runtime_unavailable', error.gracefulExitCode);
     }
     // Re-throw so the role loop terminates — failures don't get warm

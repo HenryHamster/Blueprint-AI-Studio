@@ -6,6 +6,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from sqlalchemy import case, exists, func, or_
 from sqlalchemy.exc import IntegrityError
@@ -41,11 +42,32 @@ from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
     runtime_config as _runtime_config,
 )
-from app.max_plan_pool import _max_plan_pools, _account_available_for_model
+from app.max_plan_pool import (
+    _account_available_for_model,
+    _max_plan_pools,
+    _normalize_provider_name,
+    _settings_bag_model,
+    provider_selection_mode,
+    resolve_task_model_preferences,
+    resolve_task_provider_preference,
+    resolve_task_provider_settings,
+    resolve_task_quality_tier,
+)
+from app.providers.registry import get_provider
 from app.findings_shelving import (
     RETIRED_DISPOSITION_KEY,
     build_retired_disposition_records,
 )
+from app.research_deferred_carry import (
+    canonical_deferred_finding_hash,
+    unacknowledged_deferred_findings,
+)
+from app.research_cycle_cadence import (
+    STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY,
+    record_strategic_cadence_fire,
+    strategic_cadence_due,
+)
+from app.research_finding_policy import NON_SPAWNING_FINDING_TYPES
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import (
     acquire_direction_research_spawn_lock,
@@ -84,6 +106,7 @@ from app.capability_registry import (
     registry_capability_vocabulary,
 )
 from app.direction_refractory import get_direction_refractory_info
+from app.direction_priority import direction_task_priority
 from app.resource_envelope import (
     get_project_recent_spend_usd,
     resolve_project_spend_ceiling,
@@ -112,6 +135,58 @@ def _get_spawn_lock(project_id: str) -> asyncio.Lock:
     if project_id not in _spawn_locks:
         _spawn_locks[project_id] = asyncio.Lock()
     return _spawn_locks[project_id]
+
+
+def _research_route_has_available_account(user_pool: list[dict]) -> bool:
+    """Check the same unified provider/model route dispatch will use.
+
+    This is a non-allocating preflight: it must never consult the deprecated
+    ``task_type_models`` pin because Research roots intentionally leave model
+    selection to ``task_type_routing`` plus the provider effort matrix.
+    """
+
+    probe = SimpleNamespace(payloads=[{"type": "research"}], context={})
+    providers = resolve_task_provider_preference(probe, _runtime_config)
+    model_preferences = resolve_task_model_preferences(probe, _runtime_config)
+    if provider_selection_mode(_runtime_config) == "exclusive":
+        providers = providers[:1]
+        model_preferences = model_preferences[:1]
+
+    candidates: list[tuple[str, str | None]] = [
+        (preference["provider"], preference["model"])
+        for preference in model_preferences
+    ]
+    quality_tier = resolve_task_quality_tier(probe, _runtime_config)
+    for provider_name in providers:
+        if any(candidate_provider == provider_name for candidate_provider, _ in candidates):
+            continue
+        try:
+            settings = resolve_task_provider_settings(
+                probe, _runtime_config, provider_name
+            )
+            model = _settings_bag_model(settings) or get_provider(
+                provider_name
+            ).tier_to_model(quality_tier, _runtime_config)
+        except (KeyError, TypeError, ValueError):
+            logger.warning(
+                "[AUTONOMOUS] Research route preflight could not resolve %s",
+                provider_name,
+                exc_info=True,
+            )
+            continue
+        candidates.append((provider_name, model))
+
+    for provider_name, model in candidates:
+        if provider_name == "anthropic" and os.getenv("ANTHROPIC_API_KEY"):
+            return True
+        if any(
+            (_normalize_provider_name(account.get("provider")) or "anthropic")
+            == provider_name
+            and _account_available_for_model(account, model)
+            for account in user_pool
+        ):
+            return True
+    return False
 
 
 def project_parallelism_cap(
@@ -888,10 +963,7 @@ async def _spawn_research_task_inner(
     # the actual codebase and writing them via `./playbook set`.
     # Guard: don't spawn if user has no available accounts (avoids immediate failure)
     user_pool = _max_plan_pools.get(project.user_id, [])
-    research_model = _runtime_config.get("task_type_models", {}).get("research")
-    has_available = any(
-        _account_available_for_model(a, research_model) for a in user_pool
-    ) or bool(os.getenv("ANTHROPIC_API_KEY"))
+    has_available = _research_route_has_available_account(user_pool)
     if not has_available:
         logger.info(
             f"[AUTONOMOUS] Skipping research for {project.name} — no available accounts"
@@ -1760,10 +1832,10 @@ async def _spawn_research_task_inner(
     strategic_frequency = (project.vision or {}).get(
         "_strategic_frequency_override"
     ) or _runtime_config.get("strategic_research_frequency", 6)
-    is_strategic = (
-        strategic_frequency > 0
-        and research_spawn_count > 0
-        and research_spawn_count % strategic_frequency == 0
+    is_strategic = strategic_cadence_due(
+        research_spawn_count,
+        (project.vision or {}).get(STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY),
+        strategic_frequency,
     ) or force_strategic
     # 2026-05-03: gate strategic spawn on (a) no-active-strategic AND
     # (b) no recent strategic spawn (regardless of terminal state).
@@ -1968,6 +2040,7 @@ async def _spawn_research_task_inner(
                     session,
                     apply_spawn_budget_guard=True,
                     expected_legacy_generation=legacy_generation,
+                    cadence_accepted_count=research_spawn_count,
                 )
                 if spawned:
                     logger.info(
@@ -1983,6 +2056,7 @@ async def _spawn_research_task_inner(
                     session,
                     apply_spawn_budget_guard=True,
                     expected_legacy_generation=legacy_generation,
+                    cadence_accepted_count=research_spawn_count,
                 )
                 if spawned:
                     logger.info(
@@ -2062,15 +2136,16 @@ async def _spawn_research_task_inner(
             )
 
         if spawned:
-            research_spawn_count += 1
-
             # Capture, inside the lock, whether the consumed marker was
             # operator-origin — read BEFORE clear_strategic_refresh wipes it so
             # the symmetric success notice can fire only for operator steering.
             _consumed: dict = {}
 
             def _record_strategic_spawn(vision: dict) -> None:
-                vision["_research_spawn_count"] = research_spawn_count
+                record_strategic_cadence_fire(
+                    vision,
+                    accepted_count=research_spawn_count,
+                )
                 vision["_strategic_cycle_count"] = strategic_cycle_count
                 # Clear any stale payload-bloat skip marker now that a strategic
                 # spawn succeeded (payload shrank back under the cap). Otherwise
@@ -2099,14 +2174,12 @@ async def _spawn_research_task_inner(
                 clear_strategic_refresh(vision, now)
 
             await with_vision_locked(session, project.id, _record_strategic_spawn)
-            # 2026-05-03: commit BEFORE the tactical-research early-returns
-            # below. Without this, when a tactical-research cap (max_parallel
-            # / max_total / global rate-limit) fires, the function returns
-            # without committing the strategic-counter increment. Next tick
-            # reads the OLD count, sees count % strategic_frequency == 0
-            # again, fires another strategic spawn. Even with the
-            # has_active_strategic guard above, eventually that strategic
-            # task completes and the next tick re-fires immediately.
+            # The spawner committed the cadence receipt atomically with its
+            # Task/StrategicCycle. This second write is deliberately idempotent
+            # and commits the remaining cycle counter, bloat cleanup, and
+            # refresh-marker consume before any tactical early-return below.
+            # If this outer commit faults, the born-task receipt still prevents
+            # replaying the same accepted-count cadence boundary.
             await commit_legacy_authorized(session, project.id, legacy_generation)
 
             # Symmetric success counterpart to the deferral notice: when the
@@ -2346,11 +2419,11 @@ async def _spawn_research_task_inner(
     # its parent's staging branch.
     base_branch = _get_project_integration_branch(project)
 
-    # Use per-type defaults
-    research_model = _runtime_config.get("task_type_models", {}).get("research") or None
-    research_effort = (
-        _runtime_config.get("task_type_efforts", {}).get("research") or None
-    )
+    # Model/provider/effort routing is resolved once, at dispatch, from the
+    # unified task_type_routing/category_routing policy.  Do not copy the legacy
+    # task_type_models/task_type_efforts maps into this task's payload: payload
+    # fields outrank unified routing and can silently pin every autonomous root
+    # to an obsolete model or lower effort.
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
     # Every Nth cycle is "undirected" for cross-cutting analysis.
     undirected_frequency = _runtime_config.get("undirected_research_frequency", 12)
@@ -2470,11 +2543,12 @@ async def _spawn_research_task_inner(
         # agent-side stats (aggregateDirectionStats, buildScopeCalibrationSignal).
         # Full histories are available via the API. This keeps the payload under
         # the OS E2BIG limit (~128KB).
-        _HISTORY_NUMERIC_FIELDS = {
+        _HISTORY_SUMMARY_FIELDS = {
             "tasks_created",
             "prs_merged",
             "tasks_failed",
             "failed_task_details",
+            "finding_titles",
             "scope_breakdown",
             "avg_time_to_merge_hours",
             "median_review_iterations",
@@ -2495,6 +2569,7 @@ async def _spawn_research_task_inner(
             summary: dict = {
                 "id": d.get("id"),
                 "text": d.get("text"),
+                "status": d.get("status") or "active",
                 "priority": d.get("priority"),
                 "system_id": d.get("system_id"),
                 "possibly_saturated": d.get("possibly_saturated", False),
@@ -2508,7 +2583,7 @@ async def _spawn_research_task_inner(
                 summary["category"] = d["category"]
             # Include compact research context (truncated) — not full history
             ctx = d.get("research_context")
-            if ctx:
+            if isinstance(ctx, str) and ctx:
                 summary["research_context"] = ctx[:2000]
             # Include compact history for agent-side analysis functions
             raw_history = d.get("research_history") or []
@@ -2517,16 +2592,51 @@ async def _spawn_research_task_inner(
             if agg_compact:
                 summary["history_aggregate"] = agg_compact
             if d.get("id") == current_dir_id:
+                # The selected direction gets its bounded working envelope.
+                # Do not copy these fields for every direction: notes and paths
+                # are user-authored and can otherwise breach the ~128KB agent
+                # launch limit this summary exists to protect.
+                paths = d.get("paths")
+                if isinstance(paths, list):
+                    summary["paths"] = [
+                        path[:300]
+                        for path in paths[:30]
+                        if isinstance(path, str) and path
+                    ]
+                notes = d.get("notes")
+                if isinstance(notes, list):
+                    summary["notes"] = [
+                        {
+                            "text": note["text"][:500],
+                            **(
+                                {"added_at": note["added_at"][:80]}
+                                if isinstance(note.get("added_at"), str)
+                                else {}
+                            ),
+                        }
+                        for note in notes[-5:]
+                        if isinstance(note, dict)
+                        and isinstance(note.get("text"), str)
+                    ]
                 # Inject rejected finding titles from the prior dedup-deadlock window
                 # so the agent does not re-propose them on recovery.
                 _dft = d.get("deadlock_filtered_titles")
                 if _dft:
                     summary["deadlock_filtered_titles"] = _dft
                 # Current direction: last 3 cycles with numeric fields only
-                compact_history = [
-                    {k: entry[k] for k in _HISTORY_NUMERIC_FIELDS if k in entry}
-                    for entry in raw_history[-3:]
-                ]
+                compact_history = []
+                for entry in raw_history[-3:]:
+                    compact_entry = {
+                        k: entry[k] for k in _HISTORY_SUMMARY_FIELDS if k in entry
+                    }
+                    finding_titles = compact_entry.get("finding_titles")
+                    if isinstance(finding_titles, list):
+                        compact_entry["finding_titles"] = [
+                            title[:200]
+                            for title in finding_titles[-20:]
+                            if isinstance(title, str) and title
+                        ]
+                    compact_history.append(compact_entry)
                 if compact_history:
                     summary["research_history"] = compact_history
                 # Rolling median of per-cycle median_review_iterations across last 3 cycles
@@ -2713,8 +2823,6 @@ async def _spawn_research_task_inner(
             else chosen_direction.get("id"),
             "design_doc": design_doc_summary,
             "base_branch": base_branch,
-            **({"model": research_model} if research_model else {}),
-            **({"effort": research_effort} if research_effort else {}),
             **({"prompt_suffix": research_suffix} if research_suffix else {}),
         }
         if system_verification:
@@ -2911,7 +3019,7 @@ async def _spawn_research_task_inner(
                 deferred_findings_scope_rows = func.jsonb_array_elements(
                     Task.context["deferred_findings"]
                 ).table_valued("value")
-                deferred_findings_scope_filter = exists(
+                _explicit_scope_match = exists(
                     select(1)
                     .select_from(deferred_findings_scope_rows)
                     .where(
@@ -2922,11 +3030,29 @@ async def _spawn_research_task_inner(
                         == current_dir_id
                     )
                 )
+                _legacy_blank_scope_match = exists(
+                    select(1)
+                    .select_from(deferred_findings_scope_rows)
+                    .where(
+                        func.coalesce(
+                            func.jsonb_extract_path_text(
+                                deferred_findings_scope_rows.c.value,
+                                "direction_id",
+                            ),
+                            "",
+                        )
+                        == ""
+                    )
+                )
+                _producer_scope = func.coalesce(
+                    func.jsonb_extract_path_text(Task.context, "direction_id"),
+                    "",
+                )
             else:
                 deferred_findings_scope_rows = func.json_each(
                     Task.context, "$.deferred_findings"
                 ).table_valued("key", "value")
-                deferred_findings_scope_filter = exists(
+                _explicit_scope_match = exists(
                     select(1)
                     .select_from(deferred_findings_scope_rows)
                     .where(
@@ -2940,6 +3066,35 @@ async def _spawn_research_task_inner(
                         == current_dir_id
                     )
                 )
+                _legacy_blank_scope_match = exists(
+                    select(1)
+                    .select_from(deferred_findings_scope_rows)
+                    .where(
+                        func.coalesce(
+                            func.json_extract(
+                                deferred_findings_scope_rows.c.value,
+                                "$.direction_id",
+                            ),
+                            "",
+                        )
+                        == ""
+                    )
+                )
+                _producer_scope = func.coalesce(
+                    func.json_extract(Task.context, "$.direction_id"), ""
+                )
+            # Legacy research parents stored the owning direction on the
+            # producer context while leaving each deferred finding unscoped.
+            # Admit those rows so the server-owned fallback in
+            # unacknowledged_deferred_findings() can stamp the direction, but
+            # never use that fallback to override an explicit other direction.
+            deferred_findings_scope_filter = or_(
+                _explicit_scope_match,
+                and_(
+                    _producer_scope == current_dir_id,
+                    _legacy_blank_scope_match,
+                ),
+            )
         else:
             if resolve_dialect_name(session) == "postgresql":
                 deferred_findings_scope_rows = func.jsonb_array_elements(
@@ -2995,8 +3150,6 @@ async def _spawn_research_task_inner(
             .scalars()
             .all()
         )
-        from app.finding_deduplication import finding_hash as _finding_hash
-
         _deferred_ttl_days = int(_runtime_config.get("deferred_finding_ttl_days", 7))
         _ttl_cutoff = _utcnow() - timedelta(days=_deferred_ttl_days)
         dir_deferred: list[dict] = []
@@ -3007,9 +3160,7 @@ async def _spawn_research_task_inner(
         # retired-disposition record so a TTL drop is never only a logged count.
         _expired_by_producer: dict[uuid.UUID, list[dict]] = {}
         for prev_row in prev_research_rows:
-            for f in (prev_row.context or {}).get("deferred_findings", []):
-                if not isinstance(f, dict):
-                    continue
+            for f in unacknowledged_deferred_findings(prev_row):
                 f_dir_id = f.get("direction_id")
                 if current_dir_id:
                     if f_dir_id != current_dir_id:
@@ -3028,16 +3179,10 @@ async def _spawn_research_task_inner(
                             continue
                     except (ValueError, TypeError):
                         pass
-                # Prefer finding_hash for dedup; fall back to computed hash
-                fhash = f.get("finding_hash") or _finding_hash(
-                    f.get("title", ""), f.get("description", "")
-                )
+                # Stored ``finding_hash`` is routing lineage and is not a trusted
+                # carry identity.  Older deferred rows may omit it entirely.
+                fhash = canonical_deferred_finding_hash(f)
                 if fhash not in seen_hashes:
-                    # Stamp the producing task onto injected findings so the
-                    # downstream completion recovery block can reference the
-                    # original producer in its retired-disposition records.
-                    if not f.get("source_task_id"):
-                        f["source_task_id"] = str(prev_row.id)
                     dir_deferred.append(f)
                     seen_hashes.add(fhash)
         # Record a durable retired disposition on each affected producing task.
@@ -3048,12 +3193,58 @@ async def _spawn_research_task_inner(
                 continue
             try:
                 _prod_ctx = dict(prev_row.context or {})
+                # Retirement identity is server-derived. ``finding_hash`` is
+                # legacy routing lineage and may be missing or agent-authored,
+                # so never let it alias an unrelated disposition.
+                _expired_for_retirement = [
+                    {
+                        **finding,
+                        "finding_hash": canonical_deferred_finding_hash(finding),
+                    }
+                    for finding in _expired
+                ]
                 _prod_ctx[RETIRED_DISPOSITION_KEY] = (
                     build_retired_disposition_records(
-                        _expired,
+                        _expired_for_retirement,
                         existing_records=_prod_ctx.get(RETIRED_DISPOSITION_KEY),
                     )
                 )
+                # Once retirement is durable, remove the matching transport
+                # entries from this immediate producer. Otherwise a producer
+                # containing only expired work keeps matching the query above
+                # forever and can occupy one of its 20 bounded slots on every
+                # cycle, starving older producers that still hold live carry.
+                _producer_direction_id = str(
+                    _prod_ctx.get("direction_id") or ""
+                ).strip()
+
+                def _retirement_transport_identity(
+                    finding: dict,
+                    producer_direction_id: str = _producer_direction_id,
+                ) -> tuple[str, str, str]:
+                    return (
+                        canonical_deferred_finding_hash(finding),
+                        str(
+                            finding.get("direction_id") or producer_direction_id
+                        ).strip(),
+                        str(finding.get("originally_researched_at") or "").strip(),
+                    )
+
+                _expired_identities = {
+                    _retirement_transport_identity(finding)
+                    for finding in _expired
+                }
+                _raw_producer_deferred = _prod_ctx.get("deferred_findings", [])
+                if isinstance(_raw_producer_deferred, list):
+                    _prod_ctx["deferred_findings"] = [
+                        finding
+                        for finding in _raw_producer_deferred
+                        if not (
+                            isinstance(finding, dict)
+                            and _retirement_transport_identity(finding)
+                            in _expired_identities
+                        )
+                    ]
                 prev_row.context = _prod_ctx
                 flag_modified(prev_row, "context")
                 session.add(prev_row)
@@ -3222,17 +3413,23 @@ async def _spawn_research_task_inner(
                 )
         else:
             _discovery_cycle_id = None
-        # Stamp how many findings this cycle can actually admit. The flat
-        # per-cycle ceiling (_MAX_FINDINGS_PER_CYCLE) is rarely approached; the
-        # binding constraint on research yield is the prompt's conservative
-        # "2 real findings beats 10 incremental ones" instruction, which carries
-        # no signal about available capacity. Stamping the real headroom (ceiling
-        # minus recovered deferred findings, which consume this cycle's slots)
-        # lets the research agent scale output to actual capacity. Additive and
-        # optional: validated via BasePayload extra='allow', ignored by older
-        # agents, and absent when the cap is already consumed.
+        # Stamp the maximum implementation set this cycle can admit. This is a
+        # capacity ceiling, not a finding-count target: the research parent still
+        # owns the smallest coherent execution graph justified by the evidence,
+        # but must not truncate that graph to a historical 1-3 expectation when
+        # more slots are genuinely available. Deferred task-spawning findings
+        # consume the same ceiling; carried notes/direction/design metadata do
+        # not, because processing them creates no task and cannot consume an
+        # admission slot. Additive and optional: validated via BasePayload
+        # extra='allow' and ignored by older agents.
+        _capacity_consuming_deferred = sum(
+            1
+            for finding in dir_deferred
+            if str(finding.get("type") or "").strip().lower()
+            not in NON_SPAWNING_FINDING_TYPES
+        )
         research_payload["work_headroom"] = effective_research_finding_headroom(
-            len(dir_deferred)
+            _capacity_consuming_deferred
         )
         new_task = Task(
             project_id=project.id,
@@ -3245,6 +3442,7 @@ async def _spawn_research_task_inner(
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             origination=TASK_ORIGINATION_RESEARCH,
+            priority=direction_task_priority(chosen_direction),
             # Atomic per-direction claim (ux_task_active_idempotency_key):
             # see research_direction_claim_key.
             idempotency_key=research_direction_claim_key(

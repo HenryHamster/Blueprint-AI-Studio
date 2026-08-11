@@ -43,6 +43,16 @@ def resolve_capability_proof_gate_mode_default(default: str = "observe") -> str:
     return raw if raw in _GATE_MODES else default
 
 # --- Runtime Config (adjustable via admin API) ---
+_FRONTIER_RESEARCH_PROVIDERS = (
+    "zai",
+    "anthropic",
+    "deepseek",
+    "openai",
+    "gemini",
+)
+_FRONTIER_RESEARCH_EFFORT = "max"
+
+
 runtime_config: Dict = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "8")),
     # Fleet-wide hard spending boundary for NEW managed execution only.  This
@@ -709,7 +719,18 @@ runtime_config: Dict = {
     # Sparse per-task-type routing overrides. Either field optional; the
     # other inherits from the task's category. Use for surgical cases like
     # "route debug tasks to openai at high effort regardless of category".
-    "task_type_routing": {},
+    "task_type_routing": {
+        # A research parent is the campaign's evidence collector, synthesizer,
+        # and work-graph author.  Running it at the same medium initiative tier
+        # as ordinary plan/build work made its output materially weaker than a
+        # Strategic review even though both make similarly consequential
+        # portfolio decisions.  Keep implementation children cost-balanced;
+        # spend frontier effort once at the parent where it has the most leverage.
+        "research": {
+            "providers": list(_FRONTIER_RESEARCH_PROVIDERS),
+            "effort": _FRONTIER_RESEARCH_EFFORT,
+        },
+    },
     # Optional per-task-type concrete model priority overrides. When present,
     # selection uses these ordered {provider, model} pairs before falling back
     # to provider preference + quality tier resolution.
@@ -1829,6 +1850,21 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
         for category in ("_default", "strategic", "initiative", "build", "review", "ops"):
             _ensure_route_defaults(category_routing, category)
 
+    task_type_routing = config.setdefault("task_type_routing", {})
+    if isinstance(task_type_routing, dict):
+        # Existing per-research routes are operator-owned. Missing means this
+        # deployment predates the frontier-parent policy, so seed it once just
+        # like the missing smoketest model preference above. Use the immutable
+        # release policy rather than the process-local runtime_config: on a
+        # multi-instance deployment that dict may already reflect a different
+        # sync/PATCH history, and a migration must converge from persisted state
+        # identically on every instance.
+        if "research" not in task_type_routing:
+            task_type_routing["research"] = {
+                "providers": list(_FRONTIER_RESEARCH_PROVIDERS),
+                "effort": _FRONTIER_RESEARCH_EFFORT,
+            }
+
     if config.get("provider_selection_mode") not in (
         "balanced",
         "preferred",
@@ -2370,6 +2406,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "cochange_decomposition_enabled",
                         bool(config_json["cochange_decomposition_enabled"]),
+                    )
+                if "research_quality_grader_enabled" in config_json:
+                    _set(
+                        "research_quality_grader_enabled",
+                        bool(config_json["research_quality_grader_enabled"]),
                     )
                 if "adversarial_spawn_gate_enabled" in config_json:
                     _set(

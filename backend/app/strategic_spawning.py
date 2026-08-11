@@ -149,6 +149,11 @@ from app.strategic_authority_locks import (
     commit_legacy_authorized,
     lock_and_validate_legacy_authority,
 )
+from app.research_cycle_cadence import (
+    STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY,
+    normalize_strategic_cadence_accepted_count,
+    stamp_strategic_cadence_fire,
+)
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_evaluators import (
     CHALLENGE_AGREES,
@@ -4218,6 +4223,7 @@ async def _spawn_design_doc_update(
     *,
     apply_spawn_budget_guard: bool = False,
     expected_legacy_generation: int | None = None,
+    cadence_accepted_count: object | None = None,
 ) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
@@ -4387,6 +4393,10 @@ async def _spawn_design_doc_update(
         "design_doc_update",
     )
     task_context: dict = {"strategic_cycle_id": cycle_id, **local_runner_intent}
+    if cadence_accepted_count is not None:
+        task_context[STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY] = (
+            normalize_strategic_cadence_accepted_count(cadence_accepted_count)
+        )
     if not apply_spawn_budget_guard:
         # Manual / operator-triggered cycles should not inherit the autonomous
         # budget backstop when Phase 1 completes.
@@ -4436,6 +4446,12 @@ async def _spawn_design_doc_update(
         baseline_problem_model=sanitize_problem_model_raw(project.problem_model or {}),
         baseline_running_update=project.running_update,
     )
+    if cadence_accepted_count is not None:
+        await stamp_strategic_cadence_fire(
+            session,
+            project.id,
+            accepted_count=cadence_accepted_count,
+        )
     await commit_legacy_authorized(
         session, project.id, expected_legacy_generation
     )
@@ -5485,6 +5501,7 @@ async def _finalize_strategic_review_spawn(
     effort_tier: str | None = None,
     effort_reason: str | None = None,
     expected_legacy_generation: int | None = None,
+    cadence_accepted_count: object | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail for the cadence spawn path.
 
@@ -5591,6 +5608,12 @@ async def _finalize_strategic_review_spawn(
     # context so an explicit caller value wins on collision.
     if extra_context:
         task_context.update(extra_context)
+    if cadence_accepted_count is not None:
+        # This server-owned birth receipt is audit/recovery evidence for the
+        # exact accepted-count boundary represented by the durable task.
+        task_context[STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY] = (
+            normalize_strategic_cadence_accepted_count(cadence_accepted_count)
+        )
 
     # Runner-pin AT BIRTH (``runner_pin_id`` is None for every cadence caller,
     # leaving their QUEUED + fresh ``agent-vm`` id and normal VM-dispatch entry
@@ -5666,6 +5689,12 @@ async def _finalize_strategic_review_spawn(
     if _cycle_row is not None and effort_tier is not None:
         strategic_cycle.record_effort_tier(_cycle_row, effort_tier, effort_reason)
         session.add(_cycle_row)
+    if cadence_accepted_count is not None:
+        await stamp_strategic_cadence_fire(
+            session,
+            project_id,
+            accepted_count=cadence_accepted_count,
+        )
     await commit_legacy_authorized(
         session, project_id, expected_legacy_generation
     )
@@ -5702,6 +5731,7 @@ async def _spawn_strategic_review(
     launched_by_user_id: str | None = None,
     apply_spawn_budget_guard: bool = False,
     expected_legacy_generation: int | None = None,
+    cadence_accepted_count: object | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -6112,6 +6142,7 @@ async def _spawn_strategic_review(
             effort_tier=_res_effort_tier,
             effort_reason=_res_effort_reason,
             expected_legacy_generation=expected_legacy_generation,
+            cadence_accepted_count=cadence_accepted_count,
         )
 
     # Build direction stats with rich data (pure over ``project.directions``).
@@ -8416,6 +8447,7 @@ async def _spawn_strategic_review(
         effort_tier=_effort_tier,
         effort_reason=_effort_reason,
         expected_legacy_generation=expected_legacy_generation,
+        cadence_accepted_count=cadence_accepted_count,
     )
 
 

@@ -26,11 +26,14 @@ from app.models import (
     DiscoveryCycle,
     Project,
     StrategicSpawnRequest,
+    TASK_ORIGINATION_RESEARCH,
     TASK_ORIGINATION_STRATEGIST,
     Task,
     TaskStatus,
     _utcnow,
 )
+from app.research_execution_authority import is_server_owned_research_context_key
+from app.sidecar_authority import is_server_owned_sidecar_context_key
 from app.strategic_watches import register_task_watch
 from app.task_locking import project_lock
 
@@ -115,6 +118,7 @@ def _task_from_specification(
     project_id: uuid.UUID,
     specification: dict[str, Any],
     discovery_cycle_id: uuid.UUID | None = None,
+    discovery_decision_successor: bool = False,
     active_task_idempotency_key: str | None = None,
     work_specification_hash: str | None = None,
 ) -> Task:
@@ -126,6 +130,18 @@ def _task_from_specification(
         raise ValueError("spawn request task specification requires payloads")
     context = task_spec.get("context")
     context = {} if not isinstance(context, dict) else dict(context)
+    trusted_research_context_keys = (
+        {"prior_deferred_findings"} if discovery_decision_successor else set()
+    )
+    context = {
+        key: value
+        for key, value in context.items()
+        if (
+            not is_server_owned_research_context_key(key)
+            or key in trusted_research_context_keys
+        )
+        and not is_server_owned_sidecar_context_key(key)
+    }
     if active_task_idempotency_key:
         context["_strategic_work_key"] = active_task_idempotency_key
     if work_specification_hash:
@@ -146,6 +162,16 @@ def _task_from_specification(
     for dep in depends_on_ids:
         if dep not in deduped_depends_on:
             deduped_depends_on.append(dep)
+    first_payload = payloads[0] if isinstance(payloads[0], dict) else {}
+    if first_payload.get("type") == "research":
+        # Direct Strategic work is a persisted research root, not a child whose
+        # recursion lineage can be supplied in the agent-authored specification.
+        context["research_depth"] = 0
+    is_discovery_research = (
+        discovery_decision_successor
+        and discovery_cycle_id is not None
+        and first_payload.get("type") == "research"
+    )
     task = Task(
         project_id=project_id,
         discovery_cycle_id=discovery_cycle_id,
@@ -156,8 +182,12 @@ def _task_from_specification(
         status=TaskStatus.QUEUED,
         priority=int(raw_priority if raw_priority is not None else 50),
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        created_by="STRATEGIC_AGENT",
-        origination=TASK_ORIGINATION_STRATEGIST,
+        created_by="ORCHESTRATOR" if is_discovery_research else "STRATEGIC_AGENT",
+        origination=(
+            TASK_ORIGINATION_RESEARCH
+            if is_discovery_research
+            else TASK_ORIGINATION_STRATEGIST
+        ),
         idempotency_key=active_task_idempotency_key,
         criterion_ids=list(task_spec.get("criterion_ids") or []),
         depends_on=deduped_depends_on,
@@ -180,21 +210,49 @@ async def _dispatch_request(
     request: StrategicSpawnRequest,
 ) -> tuple[Task, str | None]:
     if request.task_id is not None:
-        existing = await session.get(Task, request.task_id)
-        if existing is not None:
-            return existing, await _link_request_debt(
-                session,
-                request=request,
-                task=existing,
+        existing = (
+            await session.execute(
+                select(Task).where(
+                    Task.id == request.task_id,
+                    Task.project_id == request.project_id,
+                )
             )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise ValueError(
+                "strategic spawn request task is missing or belongs to another project"
+            )
+        return existing, await _link_request_debt(
+            session,
+            request=request,
+            task=existing,
+        )
     if request.state not in {"accepted", "deferred"}:
         raise ValueError(
             f"strategic spawn request is no longer dispatchable ({request.state})"
         )
+    cycle = None
+    if request.discovery_cycle_id is not None:
+        cycle = (
+            await session.execute(
+                select(DiscoveryCycle).where(
+                    DiscoveryCycle.id == request.discovery_cycle_id,
+                    DiscoveryCycle.project_id == request.project_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if cycle is None:
+            raise ValueError(
+                "strategic spawn request discovery cycle is missing or belongs "
+                "to another project"
+            )
     task = _task_from_specification(
         project_id=request.project_id,
         specification=dict(request.specification or {}),
         discovery_cycle_id=request.discovery_cycle_id,
+        discovery_decision_successor=(
+            (request.policy_snapshot or {}).get("source") == "discovery_decision"
+        ),
         active_task_idempotency_key=str(
             (request.policy_snapshot or {}).get("active_task_idempotency_key") or ""
         )
@@ -210,7 +268,6 @@ async def _dispatch_request(
         request.discovery_cycle_id is not None
         and request.task_type in {"research", "web_research"}
     ):
-        cycle = await session.get(DiscoveryCycle, request.discovery_cycle_id)
         if cycle is not None and cycle.source_research_task_id is None:
             cycle.source_research_task_id = task.id
             session.add(cycle)
@@ -225,7 +282,14 @@ async def _dispatch_request(
     await _register_request_watch(session, request=request, task=task)
 
     if request.parent_task_id is not None:
-        parent = await session.get(Task, request.parent_task_id)
+        parent = (
+            await session.execute(
+                select(Task).where(
+                    Task.id == request.parent_task_id,
+                    Task.project_id == request.project_id,
+                )
+            )
+        ).scalar_one_or_none()
         if parent is not None:
             context = dict(parent.context or {})
             context["_strategic_tasks_spawned"] = (
@@ -262,10 +326,13 @@ async def _register_request_watch(
     )
 
 
-async def _active_task_for_work_key(session, work_key: str) -> Task | None:
+async def _active_task_for_work_key(
+    session, *, project_id: uuid.UUID, work_key: str
+) -> Task | None:
     return (
         await session.execute(
             select(Task).where(
+                Task.project_id == project_id,
                 Task.idempotency_key == work_key,
                 Task.status.in_(ACTIVE_STRATEGIC_WORK_STATUSES),
             )
@@ -449,6 +516,19 @@ async def submit_strategic_spawn(
 ) -> SpawnSubmission:
     """Persist one intent and immediately dispatch unless the abuse guard trips."""
 
+    parent_task = (
+        await session.execute(
+            select(Task).where(
+                Task.id == parent_task_id,
+                Task.project_id == project_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if parent_task is None:
+        raise ValueError(
+            "parent task is missing or belongs to another project"
+        )
+
     specification_hash = stable_specification_hash(specification)
     work_specification_hash = stable_work_specification_hash(specification)
     normalized_key = (
@@ -463,6 +543,7 @@ async def submit_strategic_spawn(
     existing = (
         await session.execute(
             select(StrategicSpawnRequest).where(
+                StrategicSpawnRequest.project_id == project_id,
                 StrategicSpawnRequest.parent_task_id == parent_task_id,
                 StrategicSpawnRequest.idempotency_key == normalized_key,
             )
@@ -478,11 +559,20 @@ async def submit_strategic_spawn(
                 f"spawn request is already terminal ({existing.state}); "
                 "use a new idempotency key for new work"
             )
-        existing_task = (
-            await session.get(Task, existing.task_id)
-            if existing.task_id is not None
-            else None
-        )
+        existing_task = None
+        if existing.task_id is not None:
+            existing_task = (
+                await session.execute(
+                    select(Task).where(
+                        Task.id == existing.task_id,
+                        Task.project_id == project_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing_task is None:
+                raise ValueError(
+                    "strategic spawn replay task is missing or belongs to another project"
+                )
         linked_debt_id = (
             await _link_request_debt(
                 session,
@@ -508,7 +598,9 @@ async def submit_strategic_spawn(
     # is still queued/running/parked, while the partial Task index releases the
     # key after terminal completion so a later retry remains possible.
     active_task = await _active_task_for_work_key(
-        session, active_task_idempotency_key
+        session,
+        project_id=project_id,
+        work_key=active_task_idempotency_key,
     )
     if active_task is not None:
         active_work_hash = str(
@@ -578,6 +670,7 @@ async def submit_strategic_spawn(
         request.discovery_cycle_id = await resolve_discovery_cycle_lineage(
             session,
             parent_task_id=parent_task_id,
+            project_id=project_id,
         )
     budget_guard = await _budget_guard_for_request(
         session,
