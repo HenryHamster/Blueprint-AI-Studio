@@ -5,6 +5,7 @@
 
 Split from test_release_qualifier.py."""
 from _release_qualifier_testhelpers import *  # noqa: F403
+from typing import ClassVar
 
 
 @pytest.fixture(autouse=True)
@@ -493,7 +494,7 @@ async def test_stabilize_stall_fires_for_low_attempt_hard_blocker_strand(db_sess
     must fire as the backstop once the version is old enough."""
     from datetime import timedelta
 
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.phase_changed_at = rq._utcnow() - timedelta(
         days=rq._STABILIZE_STALL_AGE_DAYS + 5
     )
@@ -5986,6 +5987,13 @@ async def test_requalification_no_open_version(db_session):
 class TestRecoverConfidenceFromCiUnresolved:
     """Unit tests for release_promotion._recover_confidence_from_ci_unresolved."""
 
+    _PASSING_PRIOR_OPERATOR_GATE: ClassVar[dict[str, object]] = {
+        "status": "passed",
+        "passed": True,
+        "count": 0,
+        "reason": "prior_promoted_version_operator_authored_count_zero",
+    }
+
     def _fn(self, base_record, policy=None):
         from app.release_promotion import _recover_confidence_from_ci_unresolved
 
@@ -6010,6 +6018,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
         }
         out = self._fn(record)
         # Recovered confidence should be >0 (all sub_scores perfect)
@@ -6093,6 +6102,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0},
             "smoketest_enabled": False,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
         }
         out = self._fn(record)
         assert out.get("confidence_recovered_from_ci_unresolved") is True
@@ -6107,6 +6117,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
             # The finalize persists the sha-keyed per-category verdicts on the
             # base_record; the recompute re-runs the SAME gate over them.
             "category_verdicts": [
@@ -6127,6 +6138,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
             "migration_safety": "block",
         }
         out = self._fn(record)
@@ -6140,6 +6152,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
             "criterion_coverage": {
                 "total": 0,
                 "covered": 0,
@@ -6160,6 +6173,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
             "merge_grade_status": "fail",
             "merge_grade": {"blocked": True},
         }
@@ -6210,6 +6224,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": sub_scores,
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
         }
 
         # Recovery applies the debt blend.

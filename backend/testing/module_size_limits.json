@@ -144,7 +144,7 @@
     "routers/admin_health.py": 1750,
     "metrics_integrity_sweep.py": 6500,
     "release_readiness.py": 2450,
-    "acceptance_criteria.py": 5150,
+    "acceptance_criteria.py": 5950,
     "runner_health_alerts.py": 2450,
     "routers/agent_strategic_fetch.py": 3150,
     "runner_health_monitors.py": 1450,

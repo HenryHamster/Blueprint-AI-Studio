@@ -114,6 +114,66 @@ async def test_list_criteria_with_open_version(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_update_existing_evidence_contract_is_canonical_audited_and_scoped(
+    client: AsyncClient, db_session
+):
+    """The live-shaped row binds strictly and leaves unrelated criteria untouched."""
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-production1",
+        text="Release authorship is clean",
+        status="active",
+        created_by="strategist",
+    )
+    unrelated = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-unrelated1",
+        text="Unrelated production criterion",
+        status="active",
+        created_by="operator",
+    )
+    db_session.add_all([target, unrelated])
+    await db_session.commit()
+
+    invalid = await client.patch(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}",
+        json={
+            "evidence_contract": {
+                "type": "operator_authored_commits",
+                "predicate": {"max_count": True},
+            }
+        },
+    )
+    assert invalid.status_code == 422
+
+    contract = {
+        "type": "operator_authored_commits",
+        "predicate": {"max_count": 0},
+    }
+    updated = await client.patch(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}/evidence-contract",
+        json={"evidence_contract": contract},
+    )
+    assert updated.status_code == 200, updated.text
+    body = updated.json()
+    assert body["evidence_contract"] == contract
+    assert body["evidence_contract_updated_by"] == TEST_USER_ID
+    assert body["evidence_contract_updated_at"]
+
+    readback = await client.get(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria"
+    )
+    assert readback.status_code == 200
+    by_key = {item["criterion_key"]: item for item in readback.json()["criteria"]}
+    assert by_key[target.criterion_key]["evidence_contract"] == contract
+    assert by_key[unrelated.criterion_key]["evidence_contract"] is None
+
+
+@pytest.mark.asyncio
 async def test_list_criteria_requires_viewer_role(client: AsyncClient, db_session):
     """Project non-member receives 404 (project appears not found)."""
     other_project = Project(name="Other", user_id="other-user")
@@ -982,7 +1042,7 @@ async def test_reconcile_backfill_all_directions_with_merged_task(
     assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
     data = resp.json()
     assert data["status"] == "ok"
-    # 2 evidence rows per direction (task_merge + reachability) × 2 directions = 4
+    # 2 evidence rows per direction (task_merge + reachability) x 2 directions = 4
     assert data["total_evidence_recorded"] == 4
     direction_keys_in_results = {r["direction_key"] for r in data["results"]}
     assert dir_a.direction_key in direction_keys_in_results

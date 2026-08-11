@@ -1404,7 +1404,7 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_schema_head_chains_through_0753_acceptance_evidence_provenance():
+def test_schema_head_chains_through_0755_acceptance_contract_audit():
     """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
@@ -1428,7 +1428,8 @@ def test_schema_head_chains_through_0753_acceptance_evidence_provenance():
     - 0751 removes the unused acceptance-healing sweep-run ledger
     - 0752 persists candidate-bound pre-promotion rehearsal evidence
     - 0753 adds explicit acceptance-criterion evidence contracts
-    - 0754 persists truthful category-verdict provenance — current schema head
+    - 0754 persists truthful category-verdict provenance
+    - 0755 persists acceptance-contract audit metadata — current schema head
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1534,6 +1535,9 @@ def test_schema_head_chains_through_0753_acceptance_evidence_provenance():
     category_evidence_provenance = (
         versions_dir / "0754_category_verdict_evidence_provenance.py"
     ).read_text()
+    acceptance_contract_audit = (
+        versions_dir / "0755_acceptance_criterion_contract_audit.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1612,10 +1616,13 @@ def test_schema_head_chains_through_0753_acceptance_evidence_provenance():
         "0753",
     )
     assert '"evidence_provenance"' in category_evidence_provenance
+    assert parse_revision_identifiers(acceptance_contract_audit) == ("0755", "0754")
+    assert "evidence_contract_updated_at" in acceptance_contract_audit
+    assert "evidence_contract_updated_by" in acceptance_contract_audit
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0754", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0754', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0755", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0755', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

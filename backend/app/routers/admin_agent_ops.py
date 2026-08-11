@@ -333,7 +333,7 @@ async def _backfill_direction_merge_evidence_after_mapping(
         )
         if recorded:
             await session.commit()
-    except Exception:  # noqa: BLE001 - best-effort post-mapping repair
+    except Exception:
         await session.rollback()
         logger.warning(
             "[STRATEGIC API] criterion_keys backfill failed for direction %s",
@@ -1757,7 +1757,7 @@ async def strategic_operation(
                         project.id,
                         retired_direction_id,
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.warning(
                         "[STRATEGIC] API path: failed to fetch retirement memo for recently-retired "
                         "direction %s on project %s",
@@ -5914,6 +5914,8 @@ async def strategic_operation(
             count_active_criteria_for_version as _count_active_criteria,
             get_criteria_by_keys as _get_criteria_by_keys,
             get_criterion_by_text as _get_criterion_by_text,
+            normalize_evidence_contract as _normalize_evidence_contract,
+            update_criterion_evidence_contract as _update_evidence_contract,
             generate_criterion_key as _gen_criterion_key,
             is_operator_authored_criterion as _is_operator_authored_criterion,
             MAX_CRITERIA_PER_VERSION as _MAX_CRITERIA,
@@ -5949,12 +5951,18 @@ async def strategic_operation(
                     status_code=400,
                     detail="set_acceptance_criteria: each criterion must have a non-empty 'text' string",
                 )
-            contract = item.get("evidence_contract")
-            if contract is not None and not isinstance(contract, dict):
-                raise HTTPException(
-                    status_code=400,
-                    detail="set_acceptance_criteria: 'evidence_contract' must be an object when provided",
-                )
+            if "evidence_contract" in item:
+                contract = item.get("evidence_contract")
+                if contract is not None and not isinstance(contract, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="set_acceptance_criteria: 'evidence_contract' must be an object or null when provided",
+                    )
+                if contract is not None and _normalize_evidence_contract(contract) is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="set_acceptance_criteria: unsupported or malformed evidence_contract",
+                    )
         retract_input = data.get("retract", [])
         if not isinstance(retract_input, list):
             raise HTTPException(
@@ -6193,6 +6201,15 @@ async def strategic_operation(
             if existing is not None:
                 criterion_key = existing.criterion_key
                 is_new = False
+                if "evidence_contract" in item:
+                    await _update_evidence_contract(
+                        session,
+                        project_id=project.id,
+                        release_version_id=open_version.id,
+                        criterion_key=existing.criterion_key,
+                        evidence_contract=item.get("evidence_contract"),
+                        updated_by=f"strategist:{task.id}",
+                    )
             else:
                 if existing_active_count + new_added_count >= _MAX_CRITERIA:
                     skipped_over_cap += 1
@@ -6203,7 +6220,11 @@ async def strategic_operation(
                     release_version_id=open_version.id,
                     criterion_key=criterion_key,
                     text=text,
-                    evidence_contract=item.get("evidence_contract"),
+                    evidence_contract=(
+                        _normalize_evidence_contract(item.get("evidence_contract"))
+                        if item.get("evidence_contract") is not None
+                        else None
+                    ),
                     created_by="strategist",
                 )
                 session.add(new_row)
@@ -6283,7 +6304,7 @@ async def strategic_operation(
             for _dk in _mapped_directions:
                 try:
                     await _backfill(session, project.id, _dk)
-                except Exception:  # noqa: BLE001, PERF203
+                except Exception:  # noqa: PERF203
                     logger.warning(
                         "[STRATEGIC API] set_acceptance_criteria backfill failed "
                         "for direction %s (non-fatal)",

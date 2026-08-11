@@ -549,6 +549,8 @@ def test_authorship_receipt_drives_normal_category_grader_without_seeded_verdict
             "kind": "machine",
             "source": "release_authorship",
             "source_kind": "github_compare",
+            "receipt_source": "github_compare",
+            "receipt_state": "resolved",
             "range": {"base_sha": base, "head_sha": head},
         },
     }]

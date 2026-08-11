@@ -59,6 +59,10 @@ class CreateCriterionRequest(BaseModel):
     evidence_contract: dict | None = None
 
 
+class UpdateEvidenceContractRequest(BaseModel):
+    evidence_contract: dict | None = None
+
+
 @router.post("/projects/{project_id}/acceptance-criteria")
 async def create_acceptance_criterion(
     project_id: uuid.UUID,
@@ -90,14 +94,17 @@ async def create_acceptance_criterion(
             detail=f"Version already has {ac.MAX_CRITERIA_PER_VERSION} criteria (cap reached)",
         )
 
-    criterion = await ac.create_criterion(
-        session,
-        project_id=project_id,
-        release_version_id=open_version.id,
-        text=text,
-        evidence_contract=body.evidence_contract,
-        created_by="operator",
-    )
+    try:
+        criterion = await ac.create_criterion(
+            session,
+            project_id=project_id,
+            release_version_id=open_version.id,
+            text=text,
+            evidence_contract=body.evidence_contract,
+            created_by="operator",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     logger.info(
         "[AC] Operator created criterion %s for project %s version %s",
         criterion.criterion_key,
@@ -108,6 +115,57 @@ async def create_acceptance_criterion(
         "criterion_key": criterion.criterion_key,
         "text": criterion.text,
         "evidence_contract": criterion.evidence_contract,
+        "release_version_id": str(open_version.id),
+    }
+
+
+@router.patch(
+    "/projects/{project_id}/acceptance-criteria/{criterion_key}"
+)
+@router.patch(
+    "/projects/{project_id}/acceptance-criteria/{criterion_key}/evidence-contract"
+)
+async def update_acceptance_criterion_evidence_contract(
+    project_id: uuid.UUID,
+    criterion_key: str,
+    body: UpdateEvidenceContractRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Set or clear an existing criterion's canonical machine contract."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+    try:
+        criterion = await ac.update_criterion_evidence_contract(
+            session,
+            project_id=project_id,
+            release_version_id=open_version.id,
+            criterion_key=criterion_key,
+            evidence_contract=body.evidence_contract,
+            updated_by=str(current_user["user_id"]),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if criterion is None:
+        raise HTTPException(status_code=404, detail="Criterion not found")
+    await session.commit()
+    return {
+        "status": "ok",
+        "criterion_key": criterion.criterion_key,
+        "text": criterion.text,
+        "evidence_contract": criterion.evidence_contract,
+        "evidence_contract_updated_at": (
+            criterion.evidence_contract_updated_at.isoformat()
+            if criterion.evidence_contract_updated_at
+            else None
+        ),
+        "evidence_contract_updated_by": criterion.evidence_contract_updated_by,
         "release_version_id": str(open_version.id),
     }
 

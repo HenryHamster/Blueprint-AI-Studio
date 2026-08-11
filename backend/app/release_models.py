@@ -433,6 +433,15 @@ class VersionAcceptanceCriterion(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
 
+    evidence_contract_updated_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    evidence_contract_updated_by: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+
     # Lifecycle status: 'active' | 'retracted' | 'superseded'.
     status: str = Field(
         default="active",

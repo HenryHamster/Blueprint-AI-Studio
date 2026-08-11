@@ -48,6 +48,13 @@ _acceptance_window_recompute_state: dict[
 CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
 
 
+def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:
+    """Return the one closed machine-contract shape supported by qualification."""
+    from app.release_commit_authorship import normalize_authorship_evidence_contract
+
+    return normalize_authorship_evidence_contract(raw)
+
+
 def criterion_release_version_id_from_context(
     context: dict[str, Any] | None,
 ) -> uuid.UUID | None:
@@ -601,14 +608,15 @@ def _attestation_reference_timestamp(e: CriterionEvidence) -> datetime | None:
             )
         except (TypeError, ValueError):
             attested_at = None
-        if attested_at is not None:
+        if attested_at is not None and (
             # Reject a timestamp dated meaningfully in the future; it would
             # otherwise extend (or perpetuate) the window.  A small tolerance
             # absorbs benign client/server clock skew.
-            if (attested_at - _utcnow()) <= timedelta(
+            (attested_at - _utcnow()) <= timedelta(
                 seconds=ATTESTATION_FUTURE_SKEW_SECONDS
-            ):
-                return attested_at
+            )
+        ):
+            return attested_at
     if e.recorded_at is None:
         return None
     return _coerce_naive_utc(e.recorded_at)
@@ -869,12 +877,19 @@ async def create_criterion(
     Commits the session immediately — use :func:`stage_criterion` when calling
     from inside a larger transaction that must commit once at the end.
     """
+    normalized_contract = (
+        normalize_evidence_contract(evidence_contract)
+        if evidence_contract is not None
+        else None
+    )
+    if evidence_contract is not None and normalized_contract is None:
+        raise ValueError("unsupported or malformed evidence_contract")
     criterion = VersionAcceptanceCriterion(
         project_id=project_id,
         release_version_id=release_version_id,
         criterion_key=generate_criterion_key(),
         text=text,
-        evidence_contract=evidence_contract,
+        evidence_contract=normalized_contract,
         created_by=created_by,
     )
     session.add(criterion)
@@ -899,15 +914,59 @@ async def stage_criterion(
     a mid-transaction ``session.commit()`` would break the surrounding
     atomicity guarantee and cause one commit per criterion.
     """
+    normalized_contract = (
+        normalize_evidence_contract(evidence_contract)
+        if evidence_contract is not None
+        else None
+    )
+    if evidence_contract is not None and normalized_contract is None:
+        raise ValueError("unsupported or malformed evidence_contract")
     criterion = VersionAcceptanceCriterion(
         project_id=project_id,
         release_version_id=release_version_id,
         criterion_key=generate_criterion_key(),
         text=text,
-        evidence_contract=evidence_contract,
+        evidence_contract=normalized_contract,
         created_by=created_by,
     )
     session.add(criterion)
+    return criterion
+
+
+async def update_criterion_evidence_contract(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    criterion_key: str,
+    evidence_contract: dict[str, Any] | None,
+    updated_by: str,
+) -> VersionAcceptanceCriterion | None:
+    """Atomically replace an existing criterion's canonical contract."""
+    normalized_contract = (
+        normalize_evidence_contract(evidence_contract)
+        if evidence_contract is not None
+        else None
+    )
+    if evidence_contract is not None and normalized_contract is None:
+        raise ValueError("unsupported or malformed evidence_contract")
+    result = await session.execute(
+        select(VersionAcceptanceCriterion)
+        .where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == criterion_key,
+        )
+        .with_for_update()
+    )
+    criterion = result.scalar_one_or_none()
+    if criterion is None:
+        return None
+    criterion.evidence_contract = normalized_contract
+    criterion.evidence_contract_updated_at = _utcnow()
+    criterion.evidence_contract_updated_by = updated_by[:128]
+    session.add(criterion)
+    await session.flush()
     return criterion
 
 
@@ -1451,8 +1510,8 @@ async def direction_owns_uncovered_criterion(
     criteria, or all owned active criteria are covered.
     """
     try:
-        from app.directions_repo import get_direction_row  # noqa: PLC0415
-        from app.release_version import current_open_version  # noqa: PLC0415
+        from app.directions_repo import get_direction_row
+        from app.release_version import current_open_version
 
         direction_row = await get_direction_row(session, project_id, direction_id)
         keys = list(getattr(direction_row, "criterion_keys", None) or [])
@@ -2649,7 +2708,7 @@ async def backfill_rollup_child_changed_files(
             # Bulk-prime the SQLAlchemy identity map with the direct parent of
             # every qualifying child in this batch.  The walk inside
             # _github_verified_ancestor_changed calls session.get(Task, id),
-            # which hits the identity map on a cache hit, avoiding N×depth
+            # which hits the identity map on a cache hit, avoiding N x depth
             # individual point-queries.  We load only the immediate parents
             # here; deeper ancestors are loaded on demand (rare — most chains
             # are ≤1 hop deep) and are cached after the first walk.
@@ -3354,7 +3413,7 @@ async def record_named_test_execution_evidence(
                 detail=detail,
             )
             recorded += 1
-        except Exception:  # noqa: BLE001 — best-effort per-row
+        except Exception:
             logger.exception(
                 "record_named_test_execution_evidence: failed to record evidence "
                 "for criterion %s (version %s)",
@@ -4302,7 +4361,7 @@ async def get_version_coverage_summary(
                     counts[co] -= 1
                     counts["partial"] = counts.get("partial", 0) + 1
 
-    from app.release_models import ReleaseVersion  # noqa: PLC0415
+    from app.release_models import ReleaseVersion
 
     _rv = await session.get(ReleaseVersion, release_version_id)
 
@@ -4342,6 +4401,9 @@ async def get_version_coverage_summary(
             {
                 "criterion_key": criterion.criterion_key,
                 "text": criterion.text,
+                "evidence_contract": normalize_evidence_contract(
+                    criterion.evidence_contract
+                ),
                 "coverage": coverage,
                 "covered_by": covered_by,
                 "status": criterion.status,
@@ -4354,6 +4416,12 @@ async def get_version_coverage_summary(
                     if coverage == "attested"
                     else None
                 ),
+                "evidence_contract_updated_at": (
+                    criterion.evidence_contract_updated_at.isoformat()
+                    if criterion.evidence_contract_updated_at
+                    else None
+                ),
+                "evidence_contract_updated_by": criterion.evidence_contract_updated_by,
             }
         )
 
@@ -4378,8 +4446,8 @@ async def get_version_coverage_summary(
     }
     if _rv is not None and _rv.status == "open":
         try:
-            from app.models import Project  # noqa: PLC0415 — avoid import cycle
-            from app.release_version import current_open_version  # noqa: PLC0415
+            from app.models import Project
+            from app.release_version import current_open_version
 
             current_version = await current_open_version(session, _rv.project_id)
             if current_version is not None and current_version.id == _rv.id:
@@ -4401,7 +4469,7 @@ async def get_version_coverage_summary(
                 )
                 phantom_bookkeeping["referenced_keys"] = sorted(referenced_keys)
                 phantom_bookkeeping["registered_count"] = len(registered_keys)
-        except Exception:  # noqa: BLE001 — best-effort drift signal, never blocks
+        except Exception:
             logger.exception(
                 "phantom-bookkeeping drift guard failed for version %s",
                 release_version_id,
@@ -4469,7 +4537,7 @@ async def get_failed_corroboration_keys(
     ``corroboration_of`` (JSON null, number, object) is still ignored rather than
     coerced into a key.
     """
-    from app.models import Task, TaskStatus  # noqa: PLC0415
+    from app.models import Task, TaskStatus
 
     # The JSON element (typed) and its text form. The text form is only used for
     # the SQL existence predicate (``->> 'corroboration_of' IS NOT NULL``, which a
@@ -4552,7 +4620,7 @@ async def spawn_corroboration_task(
     attestation or backfill itself is never blocked by a spawn failure.
     """
     try:
-        from app.models import Task, TaskStatus  # noqa: PLC0415
+        from app.models import Task, TaskStatus
 
         # Dedup: skip spawning when a non-terminal corroboration task already
         # exists for this criterion.  The attest endpoint calls this on BOTH
@@ -4767,7 +4835,7 @@ async def enroll_criterion_named_test_trial(
                     criterion_key,
                 )
                 return None
-        except Exception:  # noqa: BLE001 — dedup failure is non-fatal; enroll anyway
+        except Exception:
             logger.warning(
                 "[CRITERION_TRIAL] dedup check failed for criterion %s — "
                 "proceeding with enroll",
@@ -4808,7 +4876,7 @@ async def enroll_criterion_named_test_trial(
             head_sha,
         )
         return task
-    except Exception:  # noqa: BLE001 — enrollment must degrade, never raise
+    except Exception:
         logger.warning(
             "[CRITERION_TRIAL] failed to enroll criterion_named_test_trial for criterion=%r",
             criterion_key,
@@ -4816,7 +4884,7 @@ async def enroll_criterion_named_test_trial(
         )
         try:
             await session.rollback()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug(
                 "[CRITERION_TRIAL] rollback after enroll failure also failed",
                 exc_info=True,

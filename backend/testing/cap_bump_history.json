@@ -1931,14 +1931,14 @@
           "new_cap": 11900
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-11T07:11:28.767235+00:00",
+          "commit_sha": "80ddea758d25628a3603a8e3a26e0ae806aa48ed",
+          "commit_date": "2026-08-11T07:38:32+00:00",
           "old_cap": 10500,
           "new_cap": 10750
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-11T07:43:00+00:00",
+          "commit_sha": "b3e112dc39e3bde411a3e9612683b15bca470ab5",
+          "commit_date": "2026-08-11T08:30:31+00:00",
           "old_cap": 10750,
           "new_cap": 10800
         }
@@ -2891,6 +2891,12 @@
           "commit_date": "2026-07-22T23:14:37Z",
           "old_cap": 4400,
           "new_cap": 5150
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-11T09:01:20.205846+00:00",
+          "old_cap": 5150,
+          "new_cap": 5950
         }
       ],
       "runner_health_alerts.py": [

@@ -2236,7 +2236,7 @@ async def test_run_qualification_stale_verdict_still_blocks_live_promotion(
         release_version_id=version.id,
         candidate_sha="abcd" * 10,
         terminal_status="dry_run",
-        created_at=datetime(2026, 1, 1),  # OLDER than the pending attempt
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),  # OLDER than the pending attempt
     )
     db_session.add(verdict)
 
@@ -2302,7 +2302,7 @@ async def test_abandon_current_version_stale_verdict_still_blocks_live_promotion
         release_version_id=version.id,
         candidate_sha="beef" * 10,
         terminal_status="not_promoted",
-        created_at=datetime(2026, 1, 1),  # OLDER than the pending attempt
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),  # OLDER than the pending attempt
     )
     db_session.add(verdict)
 
@@ -3650,7 +3650,7 @@ def test_scoped_test_erosion_restoration_preserves_other_deletions():
         ],
         "test_count_delta": -5,
     }
-    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(  # noqa: RUF059
         report, prior_detail, prior_blocked=True,
     )
     assert "testing/still_gone.py" in (detail or {}).get("deleted_test_files", [])
@@ -4597,7 +4597,7 @@ async def test_legacy_pending_rubric_reconstructed_from_merge_grade_payload(
 async def test_legacy_pending_without_snapshot_or_task_is_provenance_unknown(
     db_session,
 ):
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     snapshot, provenance, error = await rq._resolve_launched_rubric(
         db_session, version, {"status": "pending"}
     )
@@ -4776,32 +4776,32 @@ def _authorship_contract_receipt(state: str, *, count: int = 0) -> dict:
             "resolved_nonzero",
             _authorship_contract_receipt("resolved", count=1),
             "not_met",
-            "criterion_coverage_incomplete",
+            "prior_operator_authorship_nonzero",
         ),
-        ("missing", None, "not_met", "criterion_coverage_incomplete"),
+        ("missing", None, "not_met", "prior_operator_authorship_evidence_missing"),
         (
             "invalid",
             {"schema_version": "2", "state": "resolved"},
             "not_met",
-            "criterion_coverage_incomplete",
+            "prior_operator_authorship_evidence_missing",
         ),
         (
             "unresolved",
             _authorship_contract_receipt("unresolved"),
             "not_met",
-            "criterion_coverage_incomplete",
+            "prior_operator_authorship_evidence_missing",
         ),
         (
             "terminal",
             _authorship_contract_receipt("terminal"),
             "not_met",
-            "criterion_coverage_incomplete",
+            "prior_operator_authorship_evidence_missing",
         ),
         (
             "spoofed",
             {**_authorship_contract_receipt("resolved"), "extra": "tampered"},
             "not_met",
-            "criterion_coverage_incomplete",
+            "prior_operator_authorship_evidence_missing",
         ),
     ],
 )
@@ -4866,11 +4866,6 @@ async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
         },
         version_goal="Ship the release-authorship contract",
     )
-    mocker.patch.object(
-        rq,
-        "_load_prior_operator_authorship_gate",
-        new=AsyncMock(return_value={"status": "passed", "count": 0}),
-    )
     promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
 
     result = await rq._finalize_qualification(
@@ -4883,12 +4878,32 @@ async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
     assert rows[0].category_key == "generated-authorship-key"
     assert rows[0].status == expected_status
     assert rows[0].grader_run_id is None
-    assert rows[0].evidence_provenance == {
+    expected_provenance = {
         "kind": "machine",
         "source": "release_authorship",
-        "source_kind": "github_compare",
+        "source_kind": (
+            "github_compare"
+            if label == "resolved_zero" or label == "resolved_nonzero"
+            else (
+                "stored_receipt"
+                if label in {"unresolved", "terminal"}
+                else ("release_record_validation" if label != "missing" else "receipt_unavailable")
+            )
+        ),
+        "receipt_state": (
+            "resolved"
+            if label in {"resolved_zero", "resolved_nonzero"}
+            else (
+                label
+                if label in {"unresolved", "terminal"}
+                else ("missing" if label == "missing" else "missing_or_invalid")
+            )
+        ),
         "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
     }
+    if label in {"resolved_zero", "resolved_nonzero", "unresolved", "terminal"}:
+        expected_provenance["receipt_source"] = "github_compare"
+    assert rows[0].evidence_provenance == expected_provenance
     if expected_blocker:
         assert result.get("blocker") == expected_blocker
         promote_spy.assert_not_called()
@@ -5187,7 +5202,7 @@ async def test_dual_write_tags_blocked_dimension_execution_site(db_session):
     until this version itself promotes — while dimensions that did not block carry
     no execution-site tag.
     """
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     candidate_sha = "deadbeef" * 5  # 40-char candidate SHA
 
     base_record = {
@@ -5468,7 +5483,7 @@ async def test_infra_failure_record_stamps_engine_sha(db_session, monkeypatch):
 
     monkeypatch.setenv("DEPLOY_SHA", "aabbccddeeff001")
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     attempt_policy = {
         "threshold": 0.81,
         "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
@@ -5525,7 +5540,7 @@ async def test_infra_failure_engine_sha_none_when_deploy_sha_absent(db_session, 
 
     monkeypatch.delenv("DEPLOY_SHA", raising=False)
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": _LEDGER_SHA_A,
@@ -5573,7 +5588,7 @@ async def test_permanent_gate_incapacity_message_includes_engine_sha(db_session,
 
     monkeypatch.setattr(rq_module, "_notify_operator", _capture_notify)
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     # Compute the expected signature so pre-seeded history entries match.
     _infra_error = "migration_apply_check_unavailable"
     _sig = _infra_failure_signature(_infra_error, [])
@@ -5622,7 +5637,7 @@ async def test_infra_failure_streak_is_per_dimension(db_session):
     burn another gate's retry budget."""
     from app import release_qualifier_audit as rqa
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": _LEDGER_SHA_A,
@@ -6207,7 +6222,7 @@ async def test_infra_failure_does_not_downgrade_resolved_dimension(
     from app.models import QualificationDimensionResult
     from sqlalchemy import select as sa_select
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     candidate_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
     # Seed a pre-resolved dimension row.
@@ -6265,7 +6280,7 @@ async def test_ledger_integrity_infra_failure_does_not_overwrite_passed_audit(
     from app import release_qualifier_audit as rqa
     from app.models import QualificationDimensionResult
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     candidate_sha = "abc123def456abc123def456abc123def456abc1"
     version.qualification_attempts = 2
     db_session.add(version)
@@ -6575,7 +6590,7 @@ async def test_reused_blocked_test_erosion_fact_stays_blocked_not_scored_1_0(
 
     shared_state.runtime_config["promotion_enabled"] = True
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
@@ -6859,10 +6874,10 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     ``explain_qualification_trigger`` classifier onto every branch of
     ``agent_fetch_qualification``), end-to-end over the real HTTP route.
     """
-    from httpx import AsyncClient  # noqa: PLC0415
-    from app.auth import create_agent_token  # noqa: PLC0415
-    from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS  # noqa: PLC0415
-    from app.shared_state import runtime_config as _test_runtime_config  # noqa: PLC0415
+    from httpx import AsyncClient
+    from app.auth import create_agent_token
+    from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS
+    from app.shared_state import runtime_config as _test_runtime_config
 
     assert isinstance(client, AsyncClient)
 

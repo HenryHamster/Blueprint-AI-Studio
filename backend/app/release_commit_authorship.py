@@ -12,12 +12,14 @@ import json
 import logging
 import re
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.database import resolve_dialect_name
 from app.models import Project, ReleaseVersion
 
 
@@ -65,6 +67,9 @@ _PERMANENT_AUTHORSHIP_REASONS = frozenset(
         "provenance_untrusted",
     }
 )
+
+_reconciliation_cursor: tuple[int, datetime | None, Any] | None = None
+_reconciliation_cursor_lock = asyncio.Lock()
 
 AUTHORSHIP_EVIDENCE_CONTRACT_TYPE = "operator_authored_commits"
 
@@ -357,6 +362,21 @@ def authorship_category_evidence(
         return []
     validated = validate_authorship_receipt(receipt, base_sha, head_sha)
     result: list[dict[str, Any]] = []
+    if validated is not None:
+        receipt_state = str(validated.get("state"))
+        provenance_source_kind = (
+            "github_compare" if receipt_state == "resolved" else "stored_receipt"
+        )
+        provenance_extra = {
+            "receipt_source": validated.get("source"),
+            "receipt_state": receipt_state,
+        }
+    elif isinstance(receipt, dict):
+        provenance_source_kind = "release_record_validation"
+        provenance_extra = {"receipt_state": "missing_or_invalid"}
+    else:
+        provenance_source_kind = "receipt_unavailable"
+        provenance_extra = {"receipt_state": "missing"}
     for category in matching:
         contract = normalize_authorship_evidence_contract(category.get("evidence_contract"))
         max_count = contract["predicate"]["max_count"] if contract else -1
@@ -392,7 +412,8 @@ def authorship_category_evidence(
                 "evidence_provenance": {
                     "kind": "machine",
                     "source": "release_authorship",
-                    "source_kind": "github_compare",
+                    "source_kind": provenance_source_kind,
+                    **provenance_extra,
                     "range": {"base_sha": base_sha, "head_sha": head_sha},
                 },
             }
@@ -762,41 +783,50 @@ async def measure_serving_authorship_evidence(
         from app.database import AsyncSessionLocal
 
         session_factory = AsyncSessionLocal
-    async with session_factory() as snapshot_session:
-        await _set_reconciliation_timeouts(snapshot_session, deadline)
-        version = (
-            (
-                await snapshot_session.execute(
-                    select(ReleaseVersion)
-                    .where(ReleaseVersion.id == version_id)
-                    .execution_options(populate_existing=True)
+    try:
+        async with _deadline_session(session_factory, deadline) as snapshot_session:
+            await _set_reconciliation_timeouts(snapshot_session, deadline)
+            version = (
+                (
+                    await asyncio.wait_for(
+                        snapshot_session.execute(
+                            select(ReleaseVersion)
+                            .where(ReleaseVersion.id == version_id)
+                            .execution_options(populate_existing=True)
+                        ),
+                        timeout=_remaining_reconciliation_seconds(deadline),
+                    )
                 )
+                .scalars()
+                .first()
             )
-            .scalars()
-            .first()
-        )
-        if version is None:
-            return False
-        base_sha, served_sha = version.base_sha, version.served_sha
-        report = (version.last_qualification or {}).get("operator_authored_commits")
-        identity = expected_receipt_identity or _receipt_identity(report)
-        if (
-            version.status != "promoted"
-            or version.serving_status != "serving_confirmed"
-            or not isinstance(base_sha, str)
-            or not isinstance(served_sha, str)
-            or identity is None
-            or (
-                validate_authorship_receipt(report, base_sha, served_sha) or {}
-            ).get("state")
-            in {"resolved", "terminal"}
-        ):
-            return False
-        project = await snapshot_session.get(Project, version.project_id)
+            if version is None:
+                return False
+            base_sha, served_sha = version.base_sha, version.served_sha
+            report = (version.last_qualification or {}).get("operator_authored_commits")
+            identity = expected_receipt_identity or _receipt_identity(report)
+            if (
+                version.status != "promoted"
+                or version.serving_status != "serving_confirmed"
+                or not isinstance(base_sha, str)
+                or not isinstance(served_sha, str)
+                or identity is None
+                or (
+                    validate_authorship_receipt(report, base_sha, served_sha) or {}
+                ).get("state")
+                in {"resolved", "terminal"}
+            ):
+                return False
+            project = await asyncio.wait_for(
+                snapshot_session.get(Project, version.project_id),
+                timeout=_remaining_reconciliation_seconds(deadline),
+            )
+    except asyncio.TimeoutError:
+        return False
     if project is None:
         measurement = _unresolved(base_sha, served_sha, "project_unavailable")
     else:
-        effective_timeout = _AUTHORSHIP_MEASUREMENT_TIMEOUT_SECONDS
+        effective_timeout: float = _AUTHORSHIP_MEASUREMENT_TIMEOUT_SECONDS
         if timeout_seconds is not None:
             effective_timeout = min(
                 effective_timeout, max(0.001, float(timeout_seconds))
@@ -834,46 +864,53 @@ async def measure_serving_authorship_evidence(
         served_sha,
         attempt=pending_attempt,
     )
-    async with session_factory() as final_session:
-        await _set_reconciliation_timeouts(final_session, deadline)
-        remaining = _remaining_reconciliation_seconds(deadline)
-        if remaining <= 0:
-            return False
-        current = (
-            (
-                await asyncio.wait_for(final_session.execute(
-                    select(ReleaseVersion)
-                    .where(ReleaseVersion.id == version_id)
-                    .execution_options(populate_existing=True)
-                    .with_for_update()
-                ), timeout=remaining)
+    try:
+        async with _deadline_session(session_factory, deadline) as final_session:
+            await _set_reconciliation_timeouts(final_session, deadline)
+            remaining = _remaining_reconciliation_seconds(deadline)
+            if remaining <= 0:
+                return False
+            current = (
+                (
+                    await asyncio.wait_for(
+                        final_session.execute(
+                            select(ReleaseVersion)
+                            .where(ReleaseVersion.id == version_id)
+                            .execution_options(populate_existing=True)
+                            .with_for_update()
+                        ),
+                        timeout=remaining,
+                    )
+                )
+                .scalars()
+                .first()
             )
-            .scalars()
-            .first()
-        )
-        if current is None:
-            return False
-        current_report = (current.last_qualification or {}).get(
-            "operator_authored_commits"
-        )
-        if (
-            current.status != "promoted"
-            or current.serving_status != "serving_confirmed"
-            or current.base_sha != base_sha
-            or current.served_sha != served_sha
-            or _receipt_identity(current_report) != identity
-        ):
-            await asyncio.wait_for(final_session.rollback(), timeout=remaining)
-            return False
-        current_qualification = dict(current.last_qualification or {})
-        current_qualification["operator_authored_commits"] = receipt
-        current.last_qualification = current_qualification
-        flag_modified(current, "last_qualification")
-        final_session.add(current)
-        await asyncio.wait_for(
-            final_session.commit(), timeout=_remaining_reconciliation_seconds(deadline)
-        )
-    return True
+            if current is None:
+                return False
+            current_report = (current.last_qualification or {}).get(
+                "operator_authored_commits"
+            )
+            if (
+                current.status != "promoted"
+                or current.serving_status != "serving_confirmed"
+                or current.base_sha != base_sha
+                or current.served_sha != served_sha
+                or _receipt_identity(current_report) != identity
+            ):
+                await asyncio.wait_for(final_session.rollback(), timeout=remaining)
+                return False
+            current_qualification = dict(current.last_qualification or {})
+            current_qualification["operator_authored_commits"] = receipt
+            current.last_qualification = current_qualification
+            flag_modified(current, "last_qualification")
+            final_session.add(current)
+            await asyncio.wait_for(
+                final_session.commit(),
+                timeout=_remaining_reconciliation_seconds(deadline),
+            )
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 
 def _remaining_reconciliation_seconds(deadline: float | None) -> float:
@@ -886,13 +923,41 @@ async def _set_reconciliation_timeouts(session: Any, deadline: float | None) -> 
     """Apply transaction-local Postgres timeouts without affecting SQLite tests."""
     if _remaining_reconciliation_seconds(deadline) <= 0:
         raise asyncio.TimeoutError
-    bind = getattr(session, "bind", None)
-    dialect = getattr(getattr(bind, "dialect", None), "name", None)
+    dialect = resolve_dialect_name(session)
     if dialect != "postgresql":
         return
     milliseconds = max(1, int(_remaining_reconciliation_seconds(deadline) * 1000))
-    await session.execute(text(f"SET LOCAL statement_timeout = {milliseconds}"))
-    await session.execute(text(f"SET LOCAL lock_timeout = {milliseconds}"))
+    await asyncio.wait_for(
+        session.execute(text(f"SET LOCAL statement_timeout = {milliseconds}")),
+        timeout=_remaining_reconciliation_seconds(deadline),
+    )
+    await asyncio.wait_for(
+        session.execute(text(f"SET LOCAL lock_timeout = {milliseconds}")),
+        timeout=_remaining_reconciliation_seconds(deadline),
+    )
+
+
+@asynccontextmanager
+async def _deadline_session(session_factory: Any, deadline: float | None):
+    """Enter and leave a DB session without escaping the sweep deadline."""
+    context = session_factory()
+    entered = False
+    try:
+        session = await asyncio.wait_for(
+            context.__aenter__(), timeout=_remaining_reconciliation_seconds(deadline)
+        )
+        entered = True
+        yield session
+    finally:
+        if entered:
+            remaining = _remaining_reconciliation_seconds(deadline)
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(
+                        context.__aexit__(None, None, None), timeout=remaining
+                    )
+                except Exception:
+                    logger.debug("authorship reconciliation session cleanup failed", exc_info=True)
 
 
 def _reconciliation_candidate_is_eligible(
@@ -937,24 +1002,37 @@ async def reconcile_serving_authorship_evidence(
     bounded_limit = max(1, min(int(limit), MAX_RECONCILIATION_VERSIONS))
     deadline = time.monotonic() + _RECONCILIATION_MAX_SECONDS
     version_ids: list[Any] = []
-    cursor_served_at: datetime | None = None
-    cursor_id: Any | None = None
-    cursor_started = False
-    while len(version_ids) < bounded_limit and _remaining_reconciliation_seconds(deadline) > 0:
-        async with session_factory() as scan_session:
-            await _set_reconciliation_timeouts(scan_session, deadline)
+    selected_ids: set[Any] = set()
+    wrapped = False
+
+    # Only the short scan/cursor phase is serialized in-process. Row-lock claims
+    # below remain the cross-process fence, so two workers never measure one
+    # receipt twice even when they are in different service processes.
+    async with _reconciliation_cursor_lock:
+        global _reconciliation_cursor
+        while (
+            len(version_ids) < bounded_limit
+            and _remaining_reconciliation_seconds(deadline) > 0
+        ):
             conditions = [
                 ReleaseVersion.status == "promoted",
                 ReleaseVersion.serving_status == "serving_confirmed",
                 ReleaseVersion.base_sha.is_not(None),
                 ReleaseVersion.served_sha.is_not(None),
             ]
-            if cursor_started:
-                if cursor_served_at is None:
+            cursor = _reconciliation_cursor
+            if cursor is not None:
+                partition, cursor_served_at, cursor_id = cursor
+                if partition == 0:
+                    # NULL served_at is a real first partition. Once its ids
+                    # are exhausted, explicitly enter the non-NULL partition.
                     conditions.append(
-                        and_(
-                            ReleaseVersion.served_at.is_(None),
-                            ReleaseVersion.id > cursor_id,
+                        or_(
+                            and_(
+                                ReleaseVersion.served_at.is_(None),
+                                ReleaseVersion.id > cursor_id,
+                            ),
+                            ReleaseVersion.served_at.is_not(None),
                         )
                     )
                 else:
@@ -977,41 +1055,61 @@ async def reconcile_serving_authorship_evidence(
                 .limit(_RECONCILIATION_SCAN_PAGE_SIZE)
                 .with_for_update(skip_locked=True)
             )
-            remaining = _remaining_reconciliation_seconds(deadline)
+            candidates: list[Any]
             try:
-                candidates = list(
-                    (
-                        await asyncio.wait_for(
-                            scan_session.execute(query), timeout=remaining
+                async with _deadline_session(session_factory, deadline) as scan_session:
+                    await _set_reconciliation_timeouts(scan_session, deadline)
+                    candidates = list(
+                        (
+                            await asyncio.wait_for(
+                                scan_session.execute(query),
+                                timeout=_remaining_reconciliation_seconds(deadline),
+                            )
                         )
+                        .scalars()
+                        .all()
                     )
-                    .scalars()
-                    .all()
-                )
             except asyncio.TimeoutError:
                 break
-        if not candidates:
-            break
-        now = datetime.now(timezone.utc)
-        for candidate in candidates:
-            cursor_served_at = candidate.served_at
-            cursor_id = candidate.id
-            cursor_started = True
-            report = (candidate.last_qualification or {}).get(
-                "operator_authored_commits"
-            )
-            if _reconciliation_candidate_is_eligible(
-                report, candidate.base_sha, candidate.served_sha, now
-            ):
-                version_ids.append(candidate.id)
-                if len(version_ids) >= bounded_limit:
-                    break
+            if not candidates:
+                if cursor is not None and not wrapped:
+                    _reconciliation_cursor = None
+                    wrapped = True
+                    continue
+                break
+            now = datetime.now(timezone.utc)
+            for candidate in candidates:
+                served_at = candidate.served_at
+                _reconciliation_cursor = (
+                    (0, None, candidate.id)
+                    if served_at is None
+                    else (1, served_at, candidate.id)
+                )
+                report = (candidate.last_qualification or {}).get(
+                    "operator_authored_commits"
+                )
+                if (
+                    candidate.id not in selected_ids
+                    and _reconciliation_candidate_is_eligible(
+                        report, candidate.base_sha, candidate.served_sha, now
+                    )
+                ):
+                    selected_ids.add(candidate.id)
+                    version_ids.append(candidate.id)
+                    if len(version_ids) >= bounded_limit:
+                        break
+
     attempted = 0
     for version_id in version_ids:
-        if attempted >= _RECONCILIATION_MAX_CALLS or _remaining_reconciliation_seconds(deadline) <= 0:
+        if (
+            attempted >= _RECONCILIATION_MAX_CALLS
+            or _remaining_reconciliation_seconds(deadline) <= 0
+        ):
             break
-        async with session_factory() as worker_session:
-            try:
+        plan: dict[str, Any] | None = None
+        version: Any = None
+        try:
+            async with _deadline_session(session_factory, deadline) as worker_session:
                 await _set_reconciliation_timeouts(worker_session, deadline)
                 version = (
                     (
@@ -1028,65 +1126,56 @@ async def reconcile_serving_authorship_evidence(
                     .scalars()
                     .first()
                 )
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                continue
-            if version is None:
-                continue
-            report = (version.last_qualification or {}).get("operator_authored_commits")
-            validated = validate_authorship_receipt(
-                report, version.base_sha, version.served_sha
-            )
-            if validated is not None and validated.get("state") in {
-                "resolved",
-                "terminal",
-            }:
-                continue
-            retry = report.get("retry") if isinstance(report, dict) else None
-            next_retry_at = retry.get("next_retry_at") if isinstance(retry, dict) else None
-            if isinstance(next_retry_at, str):
-                try:
-                    if datetime.fromisoformat(next_retry_at.replace("Z", "+00:00")) > datetime.now(
-                        timezone.utc
-                    ):
-                        continue
-                except ValueError:
-                    pass
-            try:
+                if version is None:
+                    continue
+                report = (version.last_qualification or {}).get(
+                    "operator_authored_commits"
+                )
+                validated = validate_authorship_receipt(
+                    report, version.base_sha, version.served_sha
+                )
+                if validated is not None and validated.get("state") in {
+                    "resolved",
+                    "terminal",
+                }:
+                    continue
+                retry = report.get("retry") if isinstance(report, dict) else None
+                next_retry_at = retry.get("next_retry_at") if isinstance(retry, dict) else None
+                if isinstance(next_retry_at, str):
+                    try:
+                        if datetime.fromisoformat(
+                            next_retry_at.replace("Z", "+00:00")
+                        ) > datetime.now(timezone.utc):
+                            continue
+                    except ValueError:
+                        pass
                 plan = await asyncio.wait_for(
                     persist_serving_authorship_evidence(worker_session, version),
                     timeout=_remaining_reconciliation_seconds(deadline),
                 )
                 if plan is None:
                     continue
-                # The pending marker is the durable claim.  A concurrent
-                # sweeper blocks on this row lock and observes its retry time.
+                # Commit the durable claim, then leave the DB session before
+                # GitHub/Secret Manager I/O.
                 await asyncio.wait_for(
                     worker_session.commit(),
                     timeout=_remaining_reconciliation_seconds(deadline),
                 )
-                attempted += 1
-                await asyncio.wait_for(
-                    measure_serving_authorship_evidence(
-                        version.id,
-                        session_factory=session_factory,
-                        expected_receipt_identity=plan["receipt_identity"],
-                        timeout_seconds=max(0.001, deadline - time.monotonic()),
-                        deadline=deadline,
-                    ),
-                    timeout=_remaining_reconciliation_seconds(deadline),
-                )
-            except Exception:  # noqa: BLE001 - one stale release cannot stop repair
-                try:
-                    await asyncio.wait_for(
-                        worker_session.rollback(),
-                        timeout=_remaining_reconciliation_seconds(deadline),
-                    )
-                except Exception:  # noqa: BLE001 - deadline cleanup is best-effort
-                    pass
-                logger.exception(
-                    "authorship evidence reconciliation failed for release %s",
+            attempted += 1
+            await asyncio.wait_for(
+                measure_serving_authorship_evidence(
                     version_id,
-                )
+                    session_factory=session_factory,
+                    expected_receipt_identity=plan["receipt_identity"],
+                    timeout_seconds=max(0.001, deadline - time.monotonic()),
+                    deadline=deadline,
+                ),
+                timeout=_remaining_reconciliation_seconds(deadline),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "authorship evidence reconciliation failed for release %s", version_id
+            )
     return attempted
