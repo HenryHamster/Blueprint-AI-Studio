@@ -11,6 +11,7 @@ from app.models import Project
 from app.release_readiness import (
     _annotate_regime,
     _compute_requalification_decision,
+    auto_mark_stale_audit_findings,
     compute_promotion_ci_green_gate,
     PROMOTION_READINESS_METRIC_MANIFEST,
     _READINESS_LIVE_REGIME_NOTE,
@@ -232,6 +233,29 @@ class TestComputeRequalificationDecision:
         )
         assert result["requalification_ready"] is False
         assert "unresolved" in result["reason"]
+
+    @pytest.mark.asyncio
+    async def test_requalification_ready_when_carried_finding_file_blob_changed(
+        self, db_session
+    ):
+        """A changed audited blob makes carried stale evidence non-blocking."""
+        carried = [{"key": "old-finding", "severity": "high", "file": "backend/app/example.py", "blob_sha": "old-blob"}]
+        project, version = await _make_project_and_version(db_session)
+        version.last_qualification = {"audit_findings": carried}
+        db_session.add(version)
+        await db_session.commit()
+        assert await auto_mark_stale_audit_findings(
+            db_session, project.id, version.id, {"backend/app/example.py": "new-blob"}
+        ) == 1
+        result = _compute_requalification_decision(carried, truncated=False, ledger_states={}, open_version_id="vid", candidate_surface_paths={"backend/app/example.py": "new-blob"})
+        assert result["requalification_ready"] is True
+        assert result["gating_resolved"] == result["gating_total"] == 1
+        assert result["findings"][0]["state"] == "stale"
+        assert result["projected_audit_score"] == pytest.approx(1.0)
+        from sqlmodel import select
+        from app.models import AuditFindingResolution
+        row = (await db_session.execute(select(AuditFindingResolution))).scalars().one()
+        assert row.state == "stale"
 
     def test_no_gating_findings_ready(self):
         """Low-severity findings only → gating_total=0 → ready regardless of truncation."""

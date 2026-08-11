@@ -213,6 +213,351 @@ async def test_sweep_alerts_after_two_qualification_cycles(db_session, tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_clean_strand_triggers_bounded_reland_attempt(db_session, tmp_path: Path):
+    """A clean terminal approval is restored once to the canonical CI queue."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    project = Project(
+        name="Re-land detector project", user_id="test-user", integration_branch="main"
+    )
+    db_session.add(project)
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="clean stranded approval",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+        context={
+            "review_loop": {
+                "review_approved": True,
+                "ci_passed": True,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 17161,
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                },
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    first = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert first["relands_started"] == 1
+    assert task.status == TaskStatus.EVALUATING
+    review_loop = task.context["review_loop"]
+    assert review_loop["ci_waiting"] is True
+    assert review_loop["ci_passed"] is False
+    receipt = task.context["approved_pr_reland"]
+    assert receipt["state"] == "in_flight"
+    assert receipt["attempt_count"] == 1
+    assert receipt["target"] == {
+        "project_id": str(project.id),
+        "pr_number": 17161,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+
+    second = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert second["relands_started"] == 0
+    assert task.status == TaskStatus.EVALUATING
+    assert task.context["approved_pr_reland"]["attempt_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reland_defers_when_review_target_changes_after_evidence(
+    db_session, tmp_path: Path, monkeypatch
+):
+    """Clean evidence for one immutable target cannot revive its replacement."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    project = Project(name="Re-land target race", user_id="test-user", integration_branch="main")
+    db_session.add(project)
+    await db_session.flush()
+    target = {
+        "project_id": str(project.id),
+        "pr_number": 17164,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    task = Task(
+        project_id=project.id,
+        title="target changed after evidence",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+        context={"review_loop": {"review_approved": True, "review_target": target}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    original_observation_for = stranding._observation_for
+
+    def change_target_after_observation(candidate, evidence, *, cycle_id, now):
+        result = original_observation_for(candidate, evidence, cycle_id=cycle_id, now=now)
+        changed_context = dict(candidate.task.context)
+        changed_loop = dict(changed_context["review_loop"])
+        changed_loop["review_target"] = {**target, "head_sha": "replacement-head"}
+        changed_context["review_loop"] = changed_loop
+        candidate.task.context = changed_context
+        db_session.add(candidate.task)
+        return result
+
+    monkeypatch.setattr(stranding, "_observation_for", change_target_after_observation)
+
+    result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert result["relands_started"] == 0
+    assert task.status == TaskStatus.COMPLETED
+    assert task.context["review_loop"]["review_target"]["head_sha"] == "replacement-head"
+    assert "approved_pr_reland" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_approval_gated_replaced_target_is_durably_superseded_not_relanded(
+    db_session, tmp_path: Path
+):
+    """A handoff never follows a changed immutable review target."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    project = Project(name="Superseded re-land", user_id="test-user", integration_branch="main")
+    db_session.add(project)
+    await db_session.flush()
+    original_target = {
+        "project_id": str(project.id),
+        "pr_number": 17162,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    task = Task(
+        project_id=project.id,
+        title="replaced approved target",
+        status=TaskStatus.EVALUATING,
+        created_by="TEST",
+        requires_approval=True,
+        context={
+            "review_loop": {"review_approved": True, "review_target": original_target},
+            "approved_pr_reland": {
+                "identity": "original-target",
+                "target": original_target,
+                "state": "in_flight",
+                "attempt_count": 1,
+            },
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    changed_context = dict(task.context)
+    changed_loop = dict(changed_context["review_loop"])
+    changed_loop["review_target"] = {**original_target, "head_sha": "replacement-head"}
+    changed_context["review_loop"] = changed_loop
+    task.context = changed_context
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert result["superseded"] == 1
+    assert result["relands_started"] == 0
+    assert task.status == TaskStatus.EVALUATING
+    assert task.context["approved_pr_reland"]["state"] == "superseded"
+    assert "replaced" in task.context["approved_pr_reland"]["reason"]
+
+    repeated = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert repeated["superseded"] == 0
+    assert task.context["approved_pr_reland"]["state"] == "superseded"
+
+
+@pytest.mark.asyncio
+async def test_malformed_replacement_never_classifies_a_reland_receipt_superseded(
+    db_session, tmp_path: Path
+):
+    """A missing immutable replacement remains actionable rather than resolved."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    project = Project(name="Malformed replacement", user_id="test-user", integration_branch="main")
+    db_session.add(project)
+    await db_session.flush()
+    target = {
+        "project_id": str(project.id),
+        "pr_number": 17165,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    task = Task(
+        project_id=project.id,
+        title="malformed replacement",
+        status=TaskStatus.EVALUATING,
+        created_by="TEST",
+        context={
+            "review_loop": {"review_approved": True, "review_target": {"pr_number": 17165}},
+            "approved_pr_reland": {
+                "identity": "original-target",
+                "target": target,
+                "state": "in_flight",
+                "attempt_count": 1,
+            },
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert result["superseded"] == 0
+    assert task.context["approved_pr_reland"]["state"] == "in_flight"
+
+
+@pytest.mark.asyncio
+async def test_reland_clears_stale_fix_latches_but_defers_live_child_work(
+    db_session, tmp_path: Path
+):
+    """The monitor receives a reachable handoff, never one it must skip."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    project = Project(name="Re-land retry latches", user_id="test-user", integration_branch="main")
+    db_session.add(project)
+    await db_session.flush()
+    target = {
+        "project_id": str(project.id),
+        "pr_number": 17166,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    stale_latches = {
+        "conflict_fix_spawned": str(uuid.uuid4()),
+        "ci_fix_spawned": str(uuid.uuid4()),
+        "merge_rule_blocked": True,
+    }
+    task = Task(
+        project_id=project.id,
+        title="stale retry latches",
+        status=TaskStatus.FAILED,
+        created_by="TEST",
+        context={"review_loop": {"review_approved": True, "review_target": target, **stale_latches}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    first = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert first["relands_started"] == 1
+    review_loop = task.context["review_loop"]
+    assert not set(stale_latches).intersection(review_loop)
+
+    active_target = {**target, "pr_number": 17167}
+    active_parent = Task(
+        project_id=project.id,
+        title="active conflict fix",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+        context={"review_loop": {"review_approved": True, "review_target": active_target}},
+    )
+    db_session.add(active_parent)
+    await db_session.flush()
+    active_child = Task(
+        project_id=project.id,
+        parent_task_id=active_parent.id,
+        title="live conflict fix",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="TEST",
+    )
+    active_parent.context = {
+        "review_loop": {
+            "review_approved": True,
+            "review_target": active_target,
+            "conflict_fix_spawned": str(active_child.id),
+        }
+    }
+    db_session.add_all([active_parent, active_child])
+    await db_session.commit()
+
+    second = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert second["relands_started"] == 0
+    assert active_parent.status == TaskStatus.COMPLETED
+    assert "approved_pr_reland" not in active_parent.context
+    assert active_parent.context["review_loop"]["conflict_fix_spawned"] == str(active_child.id)
+
+
+@pytest.mark.asyncio
+async def test_reland_defers_terminal_repository_rule_approval_gate(
+    db_session, tmp_path: Path
+):
+    """A repository-rule approval gate remains operator-owned, not re-driven."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    project = Project(name="Re-land rule approval", user_id="test-user", integration_branch="main")
+    db_session.add(project)
+    await db_session.flush()
+    target = {
+        "project_id": str(project.id),
+        "pr_number": 17168,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    task = Task(
+        project_id=project.id,
+        title="repository-rule approval gate",
+        status=TaskStatus.FAILED,
+        created_by="TEST",
+        requires_approval=True,
+        context={
+            "review_loop": {
+                "review_approved": True,
+                "review_target": target,
+                "merge_rule_blocked": True,
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert result["relands_started"] == 0
+    assert task.status == TaskStatus.FAILED
+    assert task.requires_approval is True
+    assert task.context["review_loop"]["merge_rule_blocked"] is True
+    assert "approved_pr_reland" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_unavailable_evidence_never_handoffs_a_terminal_approval(db_session, tmp_path: Path):
+    """Missing ancestry evidence cannot revive a task or imply a resolution."""
+    project = Project(name="Unknown re-land", user_id="test-user", integration_branch="main")
+    db_session.add(project)
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="unknown approval",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+        context={
+            "review_loop": {
+                "review_approved": True,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 17163,
+                    "base_sha": "base-sha",
+                    "head_sha": "head-sha",
+                },
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await sweep_approved_pr_stranding(
+        db_session, repo_root=str(tmp_path / "no-checkout")
+    )
+
+    assert result["unknown"] == 1
+    assert result["relands_started"] == 0
+    assert result["superseded"] == 0
+    assert task.status == TaskStatus.COMPLETED
+    assert "approved_pr_reland" not in task.context
+
+
+@pytest.mark.asyncio
 async def test_stranded_verdict_without_local_checkout(db_session, monkeypatch):
     """The deployed image uses GitHub ancestry without a repo or git binary."""
     monkeypatch.delenv("BLUEPRINT_REPO_ROOT", raising=False)
@@ -309,7 +654,14 @@ async def test_sweep_normalizes_aware_cadence_timestamp(db_session):
         db_session, now=datetime(2026, 8, 10, tzinfo=timezone.utc)
     )
 
-    assert result == {"scanned": 0, "stranded": 0, "unknown": 0, "alerts_created": 0}
+    assert result == {
+        "scanned": 0,
+        "stranded": 0,
+        "unknown": 0,
+        "alerts_created": 0,
+        "relands_started": 0,
+        "superseded": 0,
+    }
 
 
 @pytest.mark.asyncio

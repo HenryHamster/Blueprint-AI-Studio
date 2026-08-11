@@ -466,7 +466,7 @@ def _enum_value(value: Any) -> str:
 
 
 def _compact_text(value: Any, *, max_chars: int = 180) -> str:
-    return compact_text(value, max_chars=max_chars)
+    return str(compact_text(value, max_chars=max_chars))
 
 
 def _attention_target(target: dict[str, Any]) -> dict[str, Any]:
@@ -585,7 +585,7 @@ def _message_attention_item(message: ProjectMessage, *, unread: bool) -> dict[st
 
 def _message_needs_operator_attention(message: ProjectMessage) -> bool:
     """Whether this message needs operator attention — delegates to derive_needs_action."""
-    return derive_needs_action(message)
+    return bool(derive_needs_action(message))
 
 
 def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str, Any]:
@@ -3080,6 +3080,15 @@ async def build_operator_attention(
             "stale_completion_debts": stale_debt_count,
             "stranded_approved_prs": stranded_snapshot.get("count"),
             "stranded_approved_prs_status": stranded_snapshot.get("status"),
+            "stranded_approved_prs_reland_inflight": stranded_snapshot.get(
+                "reland_inflight_count"
+            ),
+            "stranded_approved_prs_unlanded_total": stranded_snapshot.get(
+                "unlanded_approved_pr_count"
+            ),
+            "stranded_approved_prs_superseded": stranded_snapshot.get(
+                "superseded_count"
+            ),
             "stranded_approved_prs_preview": list(
                 stranded_snapshot.get("pr_numbers") or []
             )[:_STRANDED_APPROVED_PR_PREVIEW_LIMIT],

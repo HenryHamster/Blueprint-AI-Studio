@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -29,7 +30,7 @@ from app.landed_signal import (
     LANDED_SIGNAL_KEY,
     STRANDED_LANDING_REASON_KEY,
 )
-from app.models import Alert, AlertSeverity, Project, ReleaseVersion, Task
+from app.models import Alert, AlertSeverity, Project, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _is_cadence_due, _strip_tz_assume_utc, _utcnow
 
 logger = logging.getLogger(__name__)
@@ -40,8 +41,32 @@ _MAX_CYCLE_IDS = 8
 _STRANDING_SCAN_INTERVAL_SECONDS = 15 * 60
 _last_stranding_scan: datetime | None = None
 _OBSERVATION_KEY = "approved_pr_stranding"
+_RELAND_RECEIPT_KEY = "approved_pr_reland"
 _EVENT_TYPE = "release.approved_pr_stranded"
 _ALERT_TITLE = "Approved pull request has not reached the integration branch"
+_MAX_RELAND_ATTEMPTS = 1
+_RELAND_RETRY_LATCH_KEYS = (
+    "conflict_fix_spawned",
+    "ci_fix_spawned",
+    "merge_rule_blocked",
+)
+_RELAND_ACTIVE_CHILD_STATUSES = frozenset(
+    (
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+        TaskStatus.BLOCKED,
+        TaskStatus.PARKED,
+    )
+)
+
+# Cancellation is an explicit abandonment signal.  The detector may continue to
+# record ancestry for it, but it must never turn a cancelled task back into a
+# live merge candidate.
+_RELAND_ELIGIBLE_TERMINAL_STATUSES = frozenset(
+    (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED)
+)
 
 EvidenceState = Literal["landed", "stranded", "unknown"]
 Mergeability = Literal["clean", "conflicted", "not_applicable", "unknown"]
@@ -540,6 +565,242 @@ def _observation_for(
     return updated, changed
 
 
+def _immutable_review_target(
+    candidate: _ApprovedPrCandidate,
+) -> dict[str, str | int] | None:
+    """Return the exact approved target, or ``None`` when it is not fenceable.
+
+    A PR number alone is mutable: force-pushes and retargets can leave it
+    pointing at work the original reviewer never approved.  Re-land therefore
+    requires the original target's project, PR, base, and head identities.
+    """
+    review_loop = (candidate.task.context or {}).get("review_loop")
+    target = review_loop.get("review_target") if isinstance(review_loop, dict) else None
+    if not isinstance(target, dict):
+        return None
+    pr_number = target.get("pr_number")
+    base_sha = target.get("base_sha")
+    head_sha = target.get("head_sha")
+    project_id = target.get("project_id")
+    if (
+        isinstance(pr_number, bool)
+        or not isinstance(pr_number, int)
+        or pr_number <= 0
+        or not isinstance(base_sha, str)
+        or not base_sha.strip()
+        or not isinstance(head_sha, str)
+        or not head_sha.strip()
+        or project_id != str(candidate.project.id)
+        or pr_number != candidate.pr_number
+        or head_sha.strip() != candidate.head_sha
+    ):
+        return None
+    return {
+        "project_id": str(candidate.project.id),
+        "pr_number": pr_number,
+        "base_sha": base_sha.strip(),
+        "head_sha": head_sha.strip(),
+    }
+
+
+def _review_target_identity(target: dict[str, str | int]) -> str:
+    """Stable identity fence for the one allowed detector re-land attempt."""
+    return ":".join(
+        str(target[key]) for key in ("project_id", "pr_number", "base_sha", "head_sha")
+    )
+
+
+def _is_complete_reland_target(value: Any, *, project_id: str) -> bool:
+    """Validate a persisted re-land receipt target before superseding it."""
+    if not isinstance(value, dict):
+        return False
+    pr_number = value.get("pr_number")
+    return (
+        value.get("project_id") == project_id
+        and not isinstance(pr_number, bool)
+        and isinstance(pr_number, int)
+        and pr_number > 0
+        and all(
+            isinstance(value.get(key), str) and value[key].strip()
+            for key in ("base_sha", "head_sha")
+        )
+    )
+
+
+def _reland_receipt(task: Task) -> dict[str, Any] | None:
+    value = (task.context or {}).get(_RELAND_RECEIPT_KEY)
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _coerce_task_id(value: Any) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value)) if value else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+async def _reland_retry_work_is_active(session, task: Task, review_loop: dict[str, Any]) -> bool:
+    """Return whether a retry latch still names live child work.
+
+    The CI monitor deliberately skips its queue while any of these latches is
+    present.  A terminal approved task can clear them only after checking both
+    the canonical direct-child lineage and the child IDs persisted in the
+    conflict/CI-fix latches.  This avoids reviving a parent while a fix still
+    owns the PR, while allowing an old terminal attempt to be re-driven.
+    """
+    latched_child_ids: list[uuid.UUID] = []
+    for key in ("conflict_fix_spawned", "ci_fix_spawned"):
+        child_id = _coerce_task_id(review_loop.get(key))
+        if child_id is not None:
+            latched_child_ids.append(child_id)
+    active_work = Task.parent_task_id == task.id
+    if latched_child_ids:
+        active_work = or_(active_work, Task.id.in_(latched_child_ids))
+    return (
+        await session.execute(
+            select(Task.id)
+            .where(
+                active_work,
+                Task.status.in_(_RELAND_ACTIVE_CHILD_STATUSES),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none() is not None
+
+
+async def _handoff_clean_strand_for_reland(
+    session,
+    candidate: _ApprovedPrCandidate,
+    evidence: ApprovedPrEvidence,
+    *,
+    observed_target: dict[str, str | int] | None,
+    now: datetime,
+) -> Literal["started", "superseded"] | None:
+    """Atomically hand one immutable clean strand back to the CI monitor.
+
+    This deliberately does not call GitHub merge APIs.  It only restores the
+    state selected by ``orchestrator_ci_monitor``; that monitor re-fetches live
+    PR and CI evidence and retains all normal approval/merge/fix authority.
+    The row lock and receipt are a single durable transaction, so overlapping
+    sweeps cannot enqueue duplicate re-land attempts and a crash retries only
+    before the handoff has committed.
+    """
+    locked = (
+        await session.execute(
+            select(Task)
+            .where(Task.id == candidate.task.id)
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().first()
+    if locked is None:
+        return None
+    fresh = _candidate_from_task(locked, candidate.project)
+    if fresh is None:
+        return None
+    target = _immutable_review_target(fresh)
+    # Evidence was gathered before the row lock.  Never apply that clean
+    # ancestry verdict to a force-pushed or retargeted PR that replaced the
+    # exact reviewed base/head in the intervening window; leave it for the
+    # next sweep to observe and assess from scratch.
+    if target != observed_target:
+        return None
+    receipt = _reland_receipt(locked)
+    if receipt is not None:
+        if receipt.get("state") == "superseded":
+            return None
+        receipt_target = receipt.get("target")
+        if (
+            target is not None
+            and isinstance(receipt_target, dict)
+            and _is_complete_reland_target(
+                receipt_target, project_id=str(candidate.project.id)
+            )
+            and receipt_target != target
+        ):
+            # The persisted exact review target has been replaced.  That is a
+            # concrete supersession, unlike unknown GitHub evidence or a merge
+            # conflict, neither of which is allowed to resolve a strand.
+            context = dict(locked.context or {})
+            context[_RELAND_RECEIPT_KEY] = {
+                **receipt,
+                "state": "superseded",
+                "reason": "immutable review target was replaced after re-land handoff",
+                "superseded_at": now.isoformat(),
+                "replacement_target": target,
+            }
+            locked.context = context
+            flag_modified(locked, "context")
+            session.add(locked)
+            return "superseded"
+        if receipt.get("state") in {"in_flight", "exhausted"}:
+            return None
+        if int(receipt.get("attempt_count") or 0) >= _MAX_RELAND_ATTEMPTS:
+            return None
+
+    # A repository-rule failure sets both this operator-owned gate and the
+    # attempt-scoped ``merge_rule_blocked`` latch.  The monitor deliberately
+    # skips approval-gated rows, so re-arming CI while this remains true would
+    # consume the single receipt without producing another live observation.
+    # Receipt supersession above remains allowed: it only records that a prior
+    # immutable target was replaced and never hands the approval-gated task off.
+    if locked.requires_approval:
+        return None
+
+    # Fail closed: only a terminal task with a complete immutable target and a
+    # definitive clean ancestry verdict may be revived.  In particular, an
+    # unavailable API response or a conflict leaves the task untouched.
+    if (
+        target is None
+        or locked.status not in _RELAND_ELIGIBLE_TERMINAL_STATUSES
+        or evidence.state != "stranded"
+        or evidence.mergeability != "clean"
+    ):
+        return None
+
+    target_identity = _review_target_identity(target)
+    review_loop = dict((locked.context or {}).get("review_loop") or {})
+    if await _reland_retry_work_is_active(session, locked, review_loop):
+        return None
+    # These latches are attempt-scoped and make the canonical CI monitor skip
+    # the row unconditionally.  The active-child check above fences a live
+    # conflict/CI-fix chain; once it is clear, a terminal prior attempt may
+    # safely receive its single fresh CI observation.
+    for key in _RELAND_RETRY_LATCH_KEYS:
+        review_loop.pop(key, None)
+    review_loop["pr_number"] = target["pr_number"]
+    review_loop["ci_waiting"] = True
+    review_loop["ci_wait_started"] = now.isoformat()
+    # The original completed CI result cannot authorize a fresh merge attempt.
+    # Clearing its identity forces the canonical monitor to obtain a live result.
+    review_loop["ci_passed"] = False
+    for key in (
+        "ci_checked_head_sha",
+        "ci_checked_base_sha",
+        "ci_last_polled",
+        "head_sha",
+    ):
+        review_loop.pop(key, None)
+    context = dict(locked.context or {})
+    context["review_loop"] = review_loop
+    context[_RELAND_RECEIPT_KEY] = {
+        "identity": target_identity,
+        "target": target,
+        "state": "in_flight",
+        "attempt_count": _MAX_RELAND_ATTEMPTS,
+        "handed_off_at": now.isoformat(),
+        "reason": "clean ancestry confirms approved target is not on integration branch",
+    }
+    locked.context = context
+    locked.status = TaskStatus.EVALUATING
+    locked.latest_status_message = (
+        f"Approved PR #{target['pr_number']} is clean but not landed; "
+        "re-checking live CI before canonical merge handling"
+    )
+    flag_modified(locked, "context")
+    session.add(locked)
+    return "started"
+
+
 async def sweep_approved_pr_stranding(
     session, *, repo_root: str | None = None, now: datetime | None = None
 ) -> dict[str, int]:
@@ -556,7 +817,14 @@ async def sweep_approved_pr_stranding(
         if not _is_cadence_due(
             last_scan, _STRANDING_SCAN_INTERVAL_SECONDS, scan_now
         ):
-            return {"scanned": 0, "stranded": 0, "unknown": 0, "alerts_created": 0}
+            return {
+                "scanned": 0,
+                "stranded": 0,
+                "unknown": 0,
+                "alerts_created": 0,
+                "relands_started": 0,
+                "superseded": 0,
+            }
         _last_stranding_scan = scan_now
 
     rows = (
@@ -596,7 +864,14 @@ async def sweep_approved_pr_stranding(
         )
     ).all()
     if not rows:
-        return {"scanned": 0, "stranded": 0, "unknown": 0, "alerts_created": 0}
+        return {
+            "scanned": 0,
+            "stranded": 0,
+            "unknown": 0,
+            "alerts_created": 0,
+            "relands_started": 0,
+            "superseded": 0,
+        }
 
     projects = {project.id: project for _, project in rows}
     versions = (
@@ -631,9 +906,18 @@ async def sweep_approved_pr_stranding(
         candidates.setdefault(candidate_key, candidate)
 
     now = _strip_tz_assume_utc(now or _utcnow()) or _utcnow()
-    observations: list[tuple[_ApprovedPrCandidate, dict[str, Any]]] = []
+    observations: list[
+        tuple[_ApprovedPrCandidate, dict[str, Any], dict[str, str | int] | None]
+    ] = []
     changed_tasks = False
-    counts = {"scanned": len(candidates), "stranded": 0, "unknown": 0, "alerts_created": 0}
+    counts = {
+        "scanned": len(candidates),
+        "stranded": 0,
+        "unknown": 0,
+        "alerts_created": 0,
+        "relands_started": 0,
+        "superseded": 0,
+    }
     for candidate in candidates.values():
         branch = get_project_integration_branch(candidate.project)
         if not candidate.target_valid:
@@ -661,6 +945,7 @@ async def sweep_approved_pr_stranding(
             counts["stranded"] += 1
         elif evidence.state == "unknown":
             counts["unknown"] += 1
+        observed_target = _immutable_review_target(candidate)
         observation, changed = _observation_for(
             candidate,
             evidence,
@@ -670,20 +955,46 @@ async def sweep_approved_pr_stranding(
         if changed:
             session.add(candidate.task)
             changed_tasks = True
-        observations.append((candidate, observation))
+        observations.append((candidate, observation, observed_target))
 
-    # Publish the evidence before any alert row is created.
+    # Publish the evidence before either a handoff or an alert.  A crash after
+    # this commit leaves a durable strand observation; a later sweep may then
+    # make the single identity-fenced handoff exactly once.
     if changed_tasks:
+        await session.commit()
+
+    handoff_changed = False
+    for candidate, observation, observed_target in observations:
+        # A replaced immutable target is a durable supersession even when the
+        # fresh GitHub/local evidence is unavailable.  Starting a re-land still
+        # requires the definitive clean evidence guarded inside the helper.
+        result = await _handoff_clean_strand_for_reland(
+            session,
+            candidate,
+            ApprovedPrEvidence(
+                state=observation["state"],
+                mergeability=observation["mergeability"],
+            ),
+            observed_target=observed_target,
+            now=now,
+        )
+        if result == "started":
+            counts["relands_started"] += 1
+            handoff_changed = True
+        elif result == "superseded":
+            counts["superseded"] += 1
+            handoff_changed = True
+    if handoff_changed:
         await session.commit()
 
     all_alert_keys = {
         f"approved_pr_stranding:{candidate.project.id}:{candidate.pr_number}:{candidate.commit_sha}"
-        for candidate, observation in observations
+        for candidate, observation, _observed_target in observations
         if candidate.pr_number is not None and candidate.commit_sha
     }
     alert_keys = {
         f"approved_pr_stranding:{candidate.project.id}:{candidate.pr_number}:{candidate.commit_sha}"
-        for candidate, observation in observations
+        for candidate, observation, _observed_target in observations
         if observation.get("state") == "stranded"
         and observation.get("qualification_cycles_seen", 0) >= 2
     }
@@ -698,7 +1009,7 @@ async def sweep_approved_pr_stranding(
         ).scalars().all()
         existing = {alert.dedupe_key: alert for alert in existing_rows}
 
-    for candidate, observation in observations:
+    for candidate, observation, _observed_target in observations:
         alert_key = (
             f"approved_pr_stranding:{candidate.project.id}:{candidate.pr_number}:"
             f"{candidate.commit_sha}"
@@ -741,7 +1052,10 @@ async def sweep_approved_pr_stranding(
             alert.occurrence_count = (alert.occurrence_count or 0) + 1
             alert.last_seen_at = now
             alert.message = message[:2000]
-    if alert_keys or any(observation.get("state") == "landed" for _, observation in observations):
+    if alert_keys or any(
+        observation.get("state") == "landed"
+        for _candidate, observation, _observed_target in observations
+    ):
         await session.commit()
     return counts
 

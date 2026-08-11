@@ -89,26 +89,46 @@ def _unavailable_stranded_approved_pr_snapshot(
 ) -> dict[str, Any]:
     return {
         "status": "unavailable", "count": None, "pr_numbers": [],
-        "details": [], "observed_at": observed_at, "reason": reason[:240],
+        "details": [],
+        "unlanded_approved_pr_count": None,
+        "reland_inflight_count": None,
+        "superseded_count": None,
+        "observed_at": observed_at,
+        "reason": reason[:240],
     }
 
 
-def _stranded_approved_pr_columns(session: AsyncSession) -> tuple[Any, Any]:
-    """Return the (approved-flag, review-target) SQL expressions for the scan.
+def _stranded_approved_pr_columns(
+    session: AsyncSession,
+) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
+    """Return the narrow JSON fields needed to mirror CI-monitor eligibility.
 
-    Only the narrow ``review_loop.review_target`` sub-object is selected — a
-    Task's ``context`` JSONB is permitted up to 100KB, so hydrating whole rows
-    (or even the whole ``context`` column) is far too heavy for the badge-poll
-    and qualification-launch call sites.
+    A Task's ``context`` JSONB is permitted up to 100KB, so the badge-poll and
+    qualification-launch call sites select only the monitor's narrow JSON
+    fields rather than hydrating whole rows or the whole ``context`` column.
     """
     if resolve_dialect_name(session) == "sqlite":
         return (
             func.json_extract(Task.context, "$.review_loop.review_approved"),
             func.json_extract(Task.context, "$.review_loop.review_target"),
+            func.json_extract(Task.context, "$.approved_pr_reland"),
+            func.json_extract(Task.context, "$.review_loop.ci_waiting"),
+            func.json_extract(Task.context, "$.review_loop.conflict_fix_spawned"),
+            func.json_extract(Task.context, "$.review_loop.ci_fix_spawned"),
+            func.json_extract(Task.context, "$.review_loop.merge_rule_blocked"),
+            func.json_extract(Task.context, "$.review_loop.pr_number"),
+            func.json_extract(Task.context, "$.rollup_pr_number"),
         )
     return (
         Task.context["review_loop"]["review_approved"].as_boolean(),
         Task.context["review_loop"]["review_target"],
+        Task.context["approved_pr_reland"],
+        Task.context["review_loop"]["ci_waiting"].as_boolean(),
+        Task.context["review_loop"]["conflict_fix_spawned"],
+        Task.context["review_loop"]["ci_fix_spawned"],
+        Task.context["review_loop"]["merge_rule_blocked"].as_boolean(),
+        Task.context["review_loop"]["pr_number"].as_integer(),
+        Task.context["rollup_pr_number"].as_integer(),
     )
 
 
@@ -120,6 +140,32 @@ def _coerce_review_target(raw: Any) -> dict[str, Any] | None:
         except (TypeError, ValueError):
             return None
     return raw if isinstance(raw, dict) else None
+
+
+def _ci_monitor_can_poll_reland(
+    *,
+    task_status: TaskStatus,
+    ci_waiting: Any,
+    requires_approval: bool,
+    conflict_fix_spawned: Any,
+    ci_fix_spawned: Any,
+    merge_rule_blocked: Any,
+    pr_number: Any,
+    rollup_pr_number: Any,
+) -> bool:
+    """Match the canonical monitor's early skip gates for a re-land receipt."""
+    return (
+        task_status == TaskStatus.EVALUATING
+        and bool(ci_waiting)
+        and not conflict_fix_spawned
+        and not ci_fix_spawned
+        and not merge_rule_blocked
+        and (
+            not requires_approval
+            or not _runtime_config.get("require_approval_gates", True)
+        )
+        and bool(pr_number or rollup_pr_number)
+    )
 
 
 async def snapshot_stranded_approved_prs(
@@ -143,7 +189,17 @@ async def snapshot_stranded_approved_prs(
     """
     observed = observed_at or _utcnow().isoformat()
     try:
-        approved, review_target = _stranded_approved_pr_columns(session)
+        (
+            approved,
+            review_target,
+            reland_receipt,
+            ci_waiting,
+            conflict_fix_spawned,
+            ci_fix_spawned,
+            merge_rule_blocked,
+            pr_number,
+            rollup_pr_number,
+        ) = _stranded_approved_pr_columns(session)
         # ``landed_signal_predicate`` evaluates to NULL (not FALSE) on a row
         # missing the JSON keys entirely, and ``NOT NULL`` is NULL — which would
         # silently drop exactly the unlanded rows this snapshot exists to find.
@@ -151,7 +207,19 @@ async def snapshot_stranded_approved_prs(
             False
         )
         stmt = (
-            select(Task.id, review_target)
+            select(
+                Task.id,
+                Task.status,
+                Task.requires_approval,
+                review_target,
+                reland_receipt,
+                ci_waiting,
+                conflict_fix_spawned,
+                ci_fix_spawned,
+                merge_rule_blocked,
+                pr_number,
+                rollup_pr_number,
+            )
             .where(
                 Task.project_id == project_id,
                 Task.archived.is_(False),
@@ -182,9 +250,28 @@ async def snapshot_stranded_approved_prs(
     # oldest-first, so legacy rows are exactly the ones most likely to lack it.
     # One unparseable row must not void the whole project readout.
     by_pr_number: dict[int, dict[str, Any]] = {}
+    superseded_count = 0
+    reland_inflight_count = 0
     unparseable = 0
-    for task_id, raw_target in rows:
+    for (
+        task_id,
+        task_status,
+        requires_approval,
+        raw_target,
+        raw_receipt,
+        raw_ci_waiting,
+        raw_conflict_fix_spawned,
+        raw_ci_fix_spawned,
+        raw_merge_rule_blocked,
+        raw_pr_number,
+        raw_rollup_pr_number,
+    ) in rows:
         target = _coerce_review_target(raw_target)
+        receipt = _coerce_review_target(raw_receipt)
+        receipt_state = receipt.get("state") if receipt else None
+        if receipt_state == "superseded":
+            superseded_count += 1
+            continue
         pr_number = target.get("pr_number") if target else None
         if (
             isinstance(pr_number, bool)
@@ -193,22 +280,55 @@ async def snapshot_stranded_approved_prs(
         ):
             unparseable += 1
             continue
+        assert target is not None
+        is_live_reland = receipt_state == "in_flight" and _ci_monitor_can_poll_reland(
+            task_status=task_status,
+            ci_waiting=raw_ci_waiting,
+            requires_approval=bool(requires_approval),
+            conflict_fix_spawned=raw_conflict_fix_spawned,
+            ci_fix_spawned=raw_ci_fix_spawned,
+            merge_rule_blocked=raw_merge_rule_blocked,
+            pr_number=raw_pr_number,
+            rollup_pr_number=raw_rollup_pr_number,
+        )
+        # A receipt records that the one allowed handoff happened; it does not
+        # mean recovery is still live after the canonical monitor terminalizes
+        # the task.  Surface that stale in-flight marker as exhausted so the
+        # actionable count cannot hide a closed-but-unmerged re-drive forever.
+        effective_reland_state = (
+            "exhausted"
+            if receipt_state == "in_flight" and not is_live_reland
+            else receipt_state
+        )
+        detail = {
+            "pr_number": pr_number,
+            "task_id": str(task_id),
+            "head_sha": target.get("head_sha"),
+            "base_sha": target.get("base_sha"),
+            "reland_state": effective_reland_state,
+        }
+        if is_live_reland:
+            reland_inflight_count += 1
         by_pr_number.setdefault(
             pr_number,
-            {
-                "pr_number": pr_number,
-                "task_id": str(task_id),
-                "head_sha": target.get("head_sha"),
-                "base_sha": target.get("base_sha"),
-            },
+            detail,
         )
 
     details = [by_pr_number[number] for number in sorted(by_pr_number)]
+    unresolved_details = [
+        detail for detail in details if detail.get("reland_state") != "in_flight"
+    ]
     return {
         "status": "available",
-        "count": len(details),
-        "pr_numbers": [item["pr_number"] for item in details],
-        "details": details[:_STRANDED_APPROVED_PR_PREVIEW_LIMIT],
+        # ``count`` is the operator-actionable residual.  Recovery in flight
+        # remains visible separately and is still included in the unlanded
+        # total, but must not masquerade as a PR waiting for human requeue.
+        "count": len(unresolved_details),
+        "pr_numbers": [item["pr_number"] for item in unresolved_details],
+        "details": unresolved_details[:_STRANDED_APPROVED_PR_PREVIEW_LIMIT],
+        "unlanded_approved_pr_count": len(details),
+        "reland_inflight_count": reland_inflight_count,
+        "superseded_count": superseded_count,
         "unparseable_approvals": unparseable,
         "observed_at": observed,
     }
@@ -1383,7 +1503,7 @@ async def record_direction_merge_grade(
                 project_id=project_id,
             )
             ledger_writes = True
-        except Exception:  # noqa: BLE001 — ledger write failure must not break grading
+        except Exception:  # ledger write failure must not break grading
             logger.warning(
                 "[RELEASE_QUALIFIER] failed to persist direction-scoped "
                 "merge-grade verdicts for direction %s — grading continues with "
@@ -1818,7 +1938,7 @@ async def _handle_infra_failure(
             hotfix_preview = await _release_qualifier_module().check_hotfix_scope_preview(
                 session, version.project_id, candidate_sha=qual.get("candidate_sha")
             )
-        except Exception:  # noqa: BLE001 — remediation guidance is best-effort
+        except Exception:  # remediation guidance is best-effort
             logger.warning(
                 "[RELEASE_QUALIFIER] hotfix scope preview failed for v%d",
                 version.version_number,

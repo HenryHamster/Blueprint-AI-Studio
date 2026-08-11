@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -153,6 +154,36 @@ async def test_strategist_internal_and_null_alerts_excluded_from_operator_attent
     assert message_counts["active_alerts"] == 1, (
         "badge count must exclude NULL and strategist-internal alerts (fail-closed)"
     )
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_separates_reland_from_actionable_strands(
+    db_session, mocker
+):
+    """The attention rail exposes a live recovery without inflating residuals."""
+    project = await _seed_alert_project(db_session)
+    mocker.patch(
+        "app.operator_attention.snapshot_stranded_approved_prs",
+        AsyncMock(
+            return_value={
+                "status": "available",
+                "count": 2,
+                "pr_numbers": [100, 101],
+                "unlanded_approved_pr_count": 3,
+                "reland_inflight_count": 1,
+                "superseded_count": 4,
+            }
+        ),
+    )
+
+    attention = await build_operator_attention(db_session, project, TEST_USER_ID)
+
+    counts = attention["counts"]
+    assert counts["stranded_approved_prs"] == 2
+    assert counts["stranded_approved_prs_unlanded_total"] == 3
+    assert counts["stranded_approved_prs_reland_inflight"] == 1
+    assert counts["stranded_approved_prs_superseded"] == 4
+    assert counts["stranded_approved_prs_preview"] == [100, 101]
 
 
 def _pm(*, message_type: MessageType, status: str = "open", context: dict | None = None) -> ProjectMessage:

@@ -6274,7 +6274,14 @@ async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
     unrelated refactor/rollup merge would drive ``gating_resolved`` to
     ``gating_total`` and promote the version with the findings unaddressed.
     Crediting requires an explicit declaration: task-context keys, or the
-    ``record_finding_resolution`` strategic op / operator trigger."""
+    ``record_finding_resolution`` strategic op / operator trigger.
+
+    This also pins the narrower rule that TOUCHING a finding's file is not
+    evidence the finding was addressed: the merged PR's verified changed-file
+    list here contains the exact path every carried finding sits on, and the
+    ledger must still be empty.  A changed blob may prove STALENESS (see
+    ``auto_mark_stale_audit_findings``, which requires a recorded ``blob_sha``
+    and a SHA mismatch against the audited surface), never a fix."""
     from sqlmodel import select as _select
 
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
@@ -6302,16 +6309,19 @@ async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
                     "key": "aaaabbbbccccdddd",
                     "severity": "critical",
                     "summary": "genuine unresolved critical finding",
+                    "file": "backend/app/touched.py",
                 },
                 {
                     "key": "eeeeffff00001111",
                     "severity": "high",
                     "summary": "genuine unresolved high finding",
+                    "file": "backend/app/touched.py",
                 },
                 {
                     "key": "2222333344445555",
                     "severity": "medium",
                     "summary": "genuine unresolved medium finding",
+                    "file": "backend/app/touched.py",
                 },
             ]
         },
@@ -6324,7 +6334,13 @@ async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
         project_id=project.id,
         title="Ordinary fix task (no finding keys)",
         payloads=[{"type": "fix", "prompt": "fix something"}],
-        context={},  # No resolving_finding_keys
+        # No resolving_finding_keys.  The PR *did* touch the exact file every
+        # carried finding sits on, and that touch is GitHub-verified — still
+        # not evidence of a fix.
+        context={
+            "_pr_changed_files": ["backend/app/touched.py"],
+            "_pr_changed_files_github_verified": True,
+        },
         vm_instance_id=f"agent-vm-orig-nokeys-{uuid.uuid4().hex[:8]}",
         status=TaskStatus.EVALUATING,
     )

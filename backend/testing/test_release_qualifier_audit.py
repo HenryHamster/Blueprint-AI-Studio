@@ -716,6 +716,92 @@ async def test_stranded_snapshot_filters_landed_rows_before_the_scan_cap(db_sess
 
 
 @pytest.mark.asyncio
+async def test_stranded_snapshot_distinguishes_reland_and_superseded_records(db_session):
+    """The qualification readout stays truthful while bounded recovery runs."""
+    project, _version = await _make_project_and_version(db_session)
+    relanding = _approved_task(project.id, "relanding", 800)
+    relanding.status = TaskStatus.EVALUATING
+    relanding.context["approved_pr_reland"] = {
+        "state": "in_flight",
+        "identity": "review-target-800",
+        "attempt_count": 1,
+    }
+    relanding.context["review_loop"]["ci_waiting"] = True
+    relanding.context["review_loop"]["pr_number"] = 800
+    relanding.context = dict(relanding.context)
+    superseded = _approved_task(project.id, "superseded", 801)
+    superseded.context["approved_pr_reland"] = {
+        "state": "superseded",
+        "identity": "review-target-801",
+        "attempt_count": 1,
+        "reason": "immutable review target was replaced",
+    }
+    exhausted = _approved_task(project.id, "closed unmerged re-drive", 802)
+    exhausted.status = TaskStatus.FAILED
+    exhausted.context["approved_pr_reland"] = {
+        "state": "in_flight",
+        "identity": "review-target-802",
+        "attempt_count": 1,
+    }
+    exhausted.context = dict(exhausted.context)
+    db_session.add_all([relanding, superseded, exhausted])
+    await db_session.commit()
+
+    snapshot = await rq.snapshot_stranded_approved_prs(db_session, project.id)
+
+    assert snapshot["status"] == "available"
+    assert snapshot["count"] == 1
+    assert snapshot["pr_numbers"] == [802]
+    assert snapshot["unlanded_approved_pr_count"] == 2
+    assert snapshot["reland_inflight_count"] == 1
+    assert snapshot["superseded_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gate", "value"),
+    [
+        ("requires_approval", True),
+        ("conflict_fix_spawned", "still-running-conflict-fix"),
+        ("ci_fix_spawned", "still-running-ci-fix"),
+        ("merge_rule_blocked", True),
+        ("missing_pr_number", None),
+    ],
+)
+async def test_stranded_snapshot_surfaces_monitor_skipped_relands_as_actionable(
+    db_session, gate, value, monkeypatch
+):
+    """An in-flight receipt is live only while the canonical monitor can poll it."""
+    monkeypatch.setitem(rq._runtime_config, "require_approval_gates", True)
+    project, _version = await _make_project_and_version(db_session)
+    relanding = _approved_task(project.id, f"monitor-skipped {gate}", 803)
+    relanding.status = TaskStatus.EVALUATING
+    relanding.context["approved_pr_reland"] = {
+        "state": "in_flight",
+        "identity": "review-target-803",
+        "attempt_count": 1,
+    }
+    relanding.context["review_loop"]["ci_waiting"] = True
+    relanding.context["review_loop"]["pr_number"] = 803
+    if gate == "requires_approval":
+        relanding.requires_approval = value
+    elif gate != "missing_pr_number":
+        relanding.context["review_loop"][gate] = value
+    else:
+        relanding.context["review_loop"].pop("pr_number", None)
+    relanding.context = dict(relanding.context)
+    db_session.add(relanding)
+    await db_session.commit()
+
+    snapshot = await rq.snapshot_stranded_approved_prs(db_session, project.id)
+
+    assert snapshot["count"] == 1
+    assert snapshot["pr_numbers"] == [803]
+    assert snapshot["details"][0]["reland_state"] == "exhausted"
+    assert snapshot["reland_inflight_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_stranded_snapshot_degrades_per_row_not_project_wide(db_session):
     """One approval without a usable review_target must not void the readout."""
     project, _version = await _make_project_and_version(db_session)

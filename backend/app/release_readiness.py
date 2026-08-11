@@ -45,6 +45,7 @@ from app.models import (
 )
 from app.release_scoring import (
     compute_challenged_vs_unchallenged_telemetry,
+    _finding_matches_candidate_surface,
     project_audit_score,
     project_promotion_confidence,
 )
@@ -1074,6 +1075,7 @@ def _compute_requalification_decision(
     open_version_id: str,
     *,
     policy: dict[str, Any] | None = None,
+    candidate_surface_paths: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Pure re-qualification readiness decision (no I/O; testable without a DB).
 
@@ -1093,14 +1095,21 @@ def _compute_requalification_decision(
     threshold never claims readiness, even on a truncated list.
     """
     valid_findings = [f for f in carried if isinstance(f, dict)]
+    stale_keys = {
+        str(finding.get("key") or _KEYLESS_FINDING_SENTINEL)
+        for finding in valid_findings
+        if candidate_surface_paths is not None
+        and not _finding_matches_candidate_surface(finding, candidate_surface_paths)
+    }
     resolved_keys = {
         str(key)
         for key, state in ledger_states.items()
         if state in _RESOLVED_LEDGER_STATES
-    }
+    } | stale_keys
     projected_audit = project_audit_score(
         valid_findings,
         resolved_finding_keys=resolved_keys,
+        candidate_surface_paths=candidate_surface_paths,
     )
     projection = project_promotion_confidence(
         projected_audit,
@@ -1112,9 +1121,11 @@ def _compute_requalification_decision(
         severity = str(f.get("severity") or "").lower()
         if severity not in _REQUALIFICATION_GATING_SEVERITIES:
             continue
-        key = f.get("key") or _KEYLESS_FINDING_SENTINEL
+        key = str(f.get("key") or _KEYLESS_FINDING_SENTINEL)
         state_val = ledger_states.get(key)
         state = state_val if state_val in _RESOLVED_LEDGER_STATES else "unresolved"
+        if state == "unresolved" and key in stale_keys:
+            state = "stale"
         gating.append(
             {
                 "key": key,
@@ -1202,9 +1213,60 @@ def _compute_requalification_decision(
     }
 
 
+async def auto_mark_stale_audit_findings(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    candidate_surface_paths: dict[str, str] | None,
+) -> int:
+    """Persist stale rows for carried findings disproven by a complete tree."""
+    if not isinstance(candidate_surface_paths, dict) or not candidate_surface_paths:
+        return 0
+
+    version = await session.get(ReleaseVersion, release_version_id)
+    if version is None or version.project_id != project_id:
+        return 0
+    carried, truncated, _ = await _latest_carried_audit_findings(session, version)
+    if truncated:
+        return 0
+
+    rows = (
+        await session.execute(
+            select(AuditFindingResolution).where(
+                AuditFindingResolution.release_version_id == release_version_id
+            )
+        )
+    ).scalars().all()
+    resolved = {
+        row.finding_key for row in rows if row.state in _RESOLVED_LEDGER_STATES
+    }
+    stale = {
+        str(finding.get("key") or _KEYLESS_FINDING_SENTINEL): finding
+        for finding in carried
+        if isinstance(finding, dict)
+        and str(finding.get("key") or _KEYLESS_FINDING_SENTINEL) not in resolved
+        and not _finding_matches_candidate_surface(finding, candidate_surface_paths)
+    }
+    for key, finding in stale.items():
+        path = str(finding.get("file") or finding.get("path") or "").strip()
+        current_blob = candidate_surface_paths.get(path) if path else None
+        await apply_finding_resolution(
+            session, project_id, release_version_id, key, "stale",
+            severity=str(finding.get("severity") or "").lower() or None,
+            note="Carried finding blob changed on the integration branch.",
+            resolving_ref="integration-surface",
+            verified_against_sha=current_blob,
+        )
+    if stale:
+        await session.commit()
+    return len(stale)
+
+
 async def compute_requalification_readiness(
     session: AsyncSession,
     project_id: uuid.UUID,
+    *,
+    candidate_surface_paths: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Decide whether the project's open version is ready to re-qualify.
 
@@ -1326,6 +1388,7 @@ async def compute_requalification_readiness(
         ledger_states,
         str(version.id),
         policy=policy,
+        candidate_surface_paths=candidate_surface_paths,
     )
     result["qualification_provenance"] = provenance
     return result

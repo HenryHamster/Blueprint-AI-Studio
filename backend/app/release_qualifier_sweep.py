@@ -1179,6 +1179,36 @@ async def _recheck_ci_compliance_blocked_version(
         return True
 
 
+async def _current_integration_audited_surface(
+    session: AsyncSession, project: Project
+) -> dict[str, str] | None:
+    """Read the audited-surface map for the live integration HEAD."""
+    resolved = await _resolve_github_with_session(session, project)
+    if resolved is None:
+        return None
+    token, owner, repo = resolved
+    from app import github, release_qualifier
+    from app.release_qualifier_audit_surface import audited_surface_path_map
+    try:
+        integration_branch, _ = release_qualifier._lts_branch_names(project)
+        head_sha = await github.get_branch_sha(
+            token, owner, repo, integration_branch
+        )
+        if not head_sha:
+            return None
+        entries = await github.list_repo_tree_paths_at_ref(
+            token, owner, repo, head_sha, project_id=str(project.id)
+        )
+    except Exception:  # noqa: BLE001 — readiness remains fail-open on GitHub errors
+        logger.warning(
+            "[RELEASE_QUALIFIER] integration audited-surface lookup failed for %s",
+            project.id,
+            exc_info=True,
+        )
+        return None
+    return None if entries is None else audited_surface_path_map(entries)
+
+
 async def _fire_auto_triggered_qualification(
     version_id: Any,
     *,
@@ -1319,13 +1349,28 @@ async def _fire_auto_triggered_qualification(
             return False
         try:
             from app import category_verdict_ledger as _cvl
-            from app.release_readiness import compute_requalification_readiness
+            from app.release_readiness import (
+                auto_mark_stale_audit_findings,
+                compute_requalification_readiness,
+            )
 
             _is_candidate_fully_met = await _cvl.is_candidate_fully_met(
                 fire_session, version.id, qual.get("candidate_sha")
             )
+            current_surface = await _current_integration_audited_surface(
+                fire_session, project
+            )
+            if current_surface:
+                await auto_mark_stale_audit_findings(
+                    fire_session,
+                    version.project_id,
+                    version.id,
+                    current_surface,
+                )
             _readiness = await compute_requalification_readiness(
-                fire_session, version.project_id
+                fire_session,
+                version.project_id,
+                candidate_surface_paths=current_surface,
             )
         except Exception:  # noqa: BLE001 — best-effort sweep; defer to next cycle
             logger.exception(
