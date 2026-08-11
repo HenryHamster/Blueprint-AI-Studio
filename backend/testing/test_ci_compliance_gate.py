@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -2739,4 +2740,119 @@ def test_git_refs_has_no_ci_compliance_branch_literal_fallback():
         "(the deployed evaluator's allowlist lags the tree):\n"
         + "\n".join(violations)
         + "\nResolve the branch through a named constant or per-project config."
+    )
+
+
+def _resolve_test_backend_harness() -> Path | None:
+    """Resolve the standalone harness in local and CI mount layouts."""
+    candidates = (
+        Path("/repo/scripts/test-backend.sh"),
+        Path(__file__).resolve().parents[2] / "scripts" / "test-backend.sh",
+    )
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _parse_script_test_roster(harness: Path) -> tuple[set[str], dict[str, str]]:
+    """Read the machine-checked script roster and its explicit exemptions."""
+    source = harness.read_text(encoding="utf-8")
+    roster_match = re.search(
+        r"^CI_SCRIPT_TEST_ROSTER=\((?P<body>.*?)(?:\n\)|\))",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    exemption_match = re.search(
+        r"^CI_SCRIPT_TEST_EXEMPTIONS=\((?P<body>.*?)(?:\n\)|\))",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert roster_match is not None, (
+        "scripts/test-backend.sh must define CI_SCRIPT_TEST_ROSTER"
+    )
+    assert exemption_match is not None, (
+        "scripts/test-backend.sh must define CI_SCRIPT_TEST_EXEMPTIONS"
+    )
+
+    def _quoted_values(body: str) -> list[str]:
+        values = re.findall(
+            r"^\s*[\"']?([A-Za-z0-9_.-]+(?:\|[A-Za-z0-9_.-]+)?)"
+            r"[\"']?\s*$",
+            body,
+            re.MULTILINE,
+        )
+        return values
+
+    roster = set(_quoted_values(roster_match.group("body")))
+    exemptions: dict[str, str] = {}
+    for entry in _quoted_values(exemption_match.group("body")):
+        path, separator, reason = entry.partition("|")
+        assert separator and reason.strip(), (
+            f"CI script exemption {entry!r} must include an individual reason"
+        )
+        assert path not in exemptions, f"duplicate CI script exemption: {path}"
+        exemptions[path] = reason.strip()
+    return roster, exemptions
+
+
+def _script_test_roster_residue(
+    scripts_root: Path, roster: set[str], exemptions: dict[str, str]
+) -> list[str]:
+    on_disk = {
+        path.name
+        for path in scripts_root.glob("test_*.py")
+        if path.is_file()
+    }
+    known = roster | set(exemptions)
+    return sorted(on_disk - known)
+
+
+def test_script_roster_tripwire_identifies_a_new_unclassified_file(tmp_path: Path):
+    """The drift calculation must name a newly added dark test file."""
+    scripts_root = tmp_path / "scripts"
+    scripts_root.mkdir()
+    (scripts_root / "test_existing.py").write_text("", encoding="utf-8")
+    (scripts_root / "test_new_guard.py").write_text("", encoding="utf-8")
+
+    residue = _script_test_roster_residue(
+        scripts_root,
+        {"test_existing.py"},
+        {},
+    )
+
+    assert residue == ["test_new_guard.py"]
+
+
+def test_every_script_test_is_in_executing_roster_or_justified_exemption():
+    """Prevent a new scripts/test_*.py file from silently going dark."""
+    harness = _resolve_test_backend_harness()
+    if harness is None:
+        pytest.fail(
+            "scripts/test-backend.sh is unavailable; the roster tripwire cannot "
+            "prove CI coverage"
+        )
+
+    roster, exemptions = _parse_script_test_roster(harness)
+    scripts_root = harness.parent
+    on_disk = {
+        path.name
+        for path in scripts_root.glob("test_*.py")
+        if path.is_file()
+    }
+    residue = _script_test_roster_residue(scripts_root, roster, exemptions)
+    assert not residue, (
+        "scripts/test_*.py files are absent from the executing CI roster and "
+        "the explicit exemption list: "
+        + ", ".join(residue)
+        + ". Add each file to CI_SCRIPT_TEST_ROSTER or give it an individual "
+        "CI_SCRIPT_TEST_EXEMPTIONS entry with a concrete reason."
+    )
+    assert roster <= on_disk, (
+        "CI script roster names missing files: " + ", ".join(sorted(roster - on_disk))
+    )
+    assert set(exemptions) <= on_disk, (
+        "CI script exemptions name missing files: "
+        + ", ".join(sorted(set(exemptions) - on_disk))
+    )
+    assert not (roster & set(exemptions)), (
+        "CI script files cannot be both executed and exempted: "
+        + ", ".join(sorted(roster & set(exemptions)))
     )

@@ -4299,6 +4299,12 @@
           "commit_date": "2026-08-06T21:01:19Z",
           "old_cap": 2350,
           "new_cap": 2750
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-11T00:45:18.479837+00:00",
+          "old_cap": 2750,
+          "new_cap": 3300
         }
       ],
       "test_strategic_session_messages.py": [
@@ -4343,8 +4349,8 @@
       ],
       "test_size_offender_governance.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-10T20:54:34.642395+00:00",
+          "commit_sha": "0de0797342187e6fb036cb0537ec16270c311d63",
+          "commit_date": "2026-08-10T21:01:55+00:00",
           "old_cap": 1800,
           "new_cap": 2100
         }

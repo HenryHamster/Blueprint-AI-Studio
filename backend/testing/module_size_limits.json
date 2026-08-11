@@ -406,7 +406,7 @@
     "test_strategic_session_messages.py": 2250,
     "test_warm_pool_dispatch.py": 2100,
     "test_admin_routers__notifications.py": 1800,
-    "test_ci_compliance_gate.py": 2750,
+    "test_ci_compliance_gate.py": 3300,
     "test_ci_compliance.py": 1900,
     "test_dependency_contracts.py": 2000,
     "test_fleet_utilization.py": 1800,

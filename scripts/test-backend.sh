@@ -386,6 +386,8 @@ elif [ "$USE_POSTGRES" = "1" ]; then
   ENV_ARGS="--network $PG_NETWORK \
     -e DATABASE_URL=$PG_DSN \
     -e USE_TEST_POSTGRES=true \
+    -e GCE_METADATA_IP=127.0.0.1 \
+    -e GCE_METADATA_HOST=127.0.0.1:9 \
     -e GCP_PROJECT_ID=test-project \
     -e LOCAL_MODE=true \
     -e GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
@@ -393,6 +395,8 @@ elif [ "$USE_POSTGRES" = "1" ]; then
     -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 else
   ENV_ARGS="-e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
+    -e GCE_METADATA_IP=127.0.0.1 \
+    -e GCE_METADATA_HOST=127.0.0.1:9 \
     -e GCP_PROJECT_ID=test-project \
     -e LOCAL_MODE=true \
     -e GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
@@ -449,6 +453,8 @@ fi
 
 ENV_VARS="DATABASE_URL=${PG_DSN:-postgresql+asyncpg://x:x@localhost/x} \
   USE_TEST_POSTGRES=$([ "$USE_POSTGRES" = "1" ] && echo true || echo false) \
+  GCE_METADATA_IP=127.0.0.1 \
+  GCE_METADATA_HOST=127.0.0.1:9 \
   GCP_PROJECT_ID=test-project \
   LOCAL_MODE=true \
   GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
@@ -482,12 +488,69 @@ _run() {
   fi
 }
 
+# This is the executing roster for scripts/test_*.py. Keep every file either
+# here or in CI_SCRIPT_TEST_EXEMPTIONS below: backend/testing's CI-compliance
+# tripwire enumerates scripts/ on disk and rejects any unclassified test. The
+# harness is the path used by scripts/static_release_guard.py; the workflow's
+# existing runner-script job covers a subset independently.
+CI_SCRIPT_TEST_ROSTER=(
+  test_audit_tasks_prs.py
+  test_blueprint_cli.py
+  test_blueprint_livekit_cli.py
+  test_blueprint_mcp.py
+  test_blueprint_node.py
+  test_blueprint_runner.py
+  test_bootstrap_local_app_release.py
+  test_frontend_release_manifest.py
+  test_gcs_create_only_upload.py
+  test_github_actions_runner.py
+  test_github_actions_vm.py
+  test_guard_gate_left_shift.py
+  test_live_source_rehearsal_export.py
+  test_local_api_service.py
+  test_local_app_release.py
+  test_local_control_plane_services.py
+  test_local_postgres_backup_service.py
+  test_local_postgres_cutover.py
+  test_local_postgres_cutover_integration.py
+  test_local_postgres_rehearsal.py
+  test_local_postgres_service.py
+  test_local_runner.py
+  test_local_runner_livekit_guard.py
+  test_migrate_container_storage.py
+  test_runner_isolation.py
+  test_tailscale_funnel_service.py
+  test_viewport_manifest.py
+  test_walkthrough_stack.py
+)
+
+# No current script suite is exempted. If a future suite is genuinely not
+# executable in CI, add one filename|reason entry and keep it individually
+# justified; the compliance gate rejects silent omissions and stale entries.
+CI_SCRIPT_TEST_EXEMPTIONS=()
+
+STANDALONE_SCRIPT_TEST_ARGS=()
 STANDALONE_RELEASE_TEST_ARGS=()
 if [ "$USE_DOCKER" = "1" ]; then
-  STANDALONE_RELEASE_TEST_ARGS+=(/repo/scripts/test_bootstrap_local_app_release.py)
-elif [ -f ../scripts/test_bootstrap_local_app_release.py ]; then
+  SCRIPT_TEST_ROOT=/repo/scripts
+else
   # Docker-less local runs are rooted at the checkout, not the /repo bind mount.
-  STANDALONE_RELEASE_TEST_ARGS+=(../scripts/test_bootstrap_local_app_release.py)
+  SCRIPT_TEST_ROOT=../scripts
+fi
+# The local static-release comparator does not own the scripts corpus:
+# deployment-host tests have unrelated baseline failures on developer VMs.
+# The real CI lane sets CI=true and runs the complete roster below; direct runs
+# of any roster member remain supported.
+for script_test in "${CI_SCRIPT_TEST_ROSTER[@]}"; do
+  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
+    [ "$script_test" = "test_bootstrap_local_app_release.py" ] && continue
+    STANDALONE_SCRIPT_TEST_ARGS+=("$SCRIPT_TEST_ROOT/$script_test")
+  fi
+done
+if [ "$USE_DOCKER" = "1" ]; then
+  STANDALONE_RELEASE_TEST_ARGS+=("$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py")
+elif [ -f "$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py" ]; then
+  STANDALONE_RELEASE_TEST_ARGS+=("$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py")
 fi
 
 if [ "$USE_DOCKER" = "1" ]; then
@@ -561,13 +624,10 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_vitest_durations_freshness.py
   )
   # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
-  [ -f /repo/scripts/test_blueprint_cli.py ] && STANDALONE_ARGS+=(/repo/scripts/test_blueprint_cli.py)
-  [ -f /repo/scripts/test_blueprint_mcp.py ] && STANDALONE_ARGS+=(/repo/scripts/test_blueprint_mcp.py)
-  # The runner-isolation suite covers the GPU probe's arch gate, probe/real
-  # container-name isolation, and the pre-probe image pull. It lives under
-  # scripts/ (which ships standalone to runner hosts), so the `pytest testing/`
-  # shards never collect it — without this line the whole gate is untested in CI.
-  [ -f /repo/scripts/test_runner_isolation.py ] && STANDALONE_ARGS+=(/repo/scripts/test_runner_isolation.py)
+  # The scripts roster is explicitly maintained above and checked by
+  # backend/testing/test_ci_compliance_gate.py. It runs from the /repo mount in
+  # CI and from ../scripts on Docker-less checkouts.
+  STANDALONE_ARGS+=("${STANDALONE_SCRIPT_TEST_ARGS[@]}")
   # This exit-proof release suite covers durable handoff, serving confirmation,
   # and receipt retry behavior that pytest's backend shards do not collect.
   STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
@@ -575,7 +635,8 @@ if [ "${1:-}" = "--standalone" ]; then
   if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
     STANDALONE_JUNIT_ARGS+=("--junitxml=${BLUEPRINT_STATIC_GUARD_JUNIT}")
   fi
-  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest "${STANDALONE_JUNIT_ARGS[@]}"
+  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest \
+    --timeout=30 --timeout-method=signal "${STANDALONE_JUNIT_ARGS[@]}"
   exit 0
 fi
 
