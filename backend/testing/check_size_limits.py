@@ -177,6 +177,12 @@ _DEFAULT_REPO_ROOT = os.path.normpath(
 )
 _DEFAULT_JSON_PATH = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
 
+
+def _is_git_checkout(repo_root: str) -> bool:
+    """Recognize both normal checkouts and linked worktrees."""
+    git_marker = os.path.join(repo_root, ".git")
+    return os.path.isdir(git_marker) or os.path.isfile(git_marker)
+
 # Section order is significant: matches the JSON's section order so output and
 # --sections=all iteration are deterministic.
 SECTIONS = ("backend", "agent", "frontend", "testing")
@@ -557,10 +563,16 @@ def _collect_baseline_governance_findings(
         phantom_ledger_records,
     )
 
-    if not os.path.isdir(os.path.join(base_root, ".git")):
-        return stale, None, None, f"{base_root} is not a git checkout"
+    # static_release_guard deliberately extracts the base tree with git
+    # archive, so it has no .git entry. The candidate checkout is from the same
+    # repository and supplies the mainline ancestry for the exact extracted
+    # base files. A linked worktree is handled directly because its .git is a
+    # file rather than a directory.
+    git_root = base_root if _is_git_checkout(base_root) else repo_root
+    if not _is_git_checkout(git_root):
+        return stale, None, None, f"{base_root} has no usable git checkout"
     try:
-        ref = _mainline_git_ref(base_root)
+        ref = _mainline_git_ref(git_root)
     except Exception as exc:
         return stale, None, None, f"could not resolve the base mainline ref: {exc}"
     if ref == "HEAD":
@@ -571,11 +583,9 @@ def _collect_baseline_governance_findings(
         os.path.dirname(relative_json),
         "cap_bump_history.json",
     )
-    phantoms = phantom_ledger_records(
-        repo_root=base_root, ledger_path=base_ledger
-    )
+    phantoms = phantom_ledger_records(repo_root=git_root, ledger_path=base_ledger)
     missing = missing_ledger_bump_records(
-        repo_root=base_root,
+        repo_root=git_root,
         caps_json_path=base_json,
         ledger_path=base_ledger,
     )
@@ -610,7 +620,7 @@ def _mainline_limits_via_git(repo_root: str) -> "tuple[dict | None, str | None]"
     """
     from app.size_limit_policy import _mainline_git_ref
 
-    if not os.path.isdir(os.path.join(repo_root, ".git")):
+    if not _is_git_checkout(repo_root):
         return None, f"{repo_root} is not a git checkout"
     try:
         ref = _mainline_git_ref(repo_root)

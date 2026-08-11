@@ -2821,6 +2821,47 @@ async def _spawn_pipeline_task(
         not in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS)
     ]
 
+    # The existing admin reset-iteration-cap endpoint is also the explicit
+    # resume path for an abandon candidate. Its iteration_reset_at timestamp
+    # starts a fresh episode without deleting the immutable historical census.
+    reset_at_values: list[datetime] = []
+    for reset_source in (orig_task, source_task):
+        reset_loop = (reset_source.context or {}).get("review_loop") or {}
+        reset_at = reset_loop.get("iteration_reset_at")
+        if not isinstance(reset_at, str):
+            continue
+        try:
+            parsed_reset_at = datetime.fromisoformat(reset_at)
+        except ValueError:
+            continue
+        if parsed_reset_at.tzinfo is None:
+            parsed_reset_at = parsed_reset_at.replace(tzinfo=_utcnow().tzinfo)
+        reset_at_values.append(parsed_reset_at)
+    if reset_at_values:
+        reset_at = max(reset_at_values)
+        historical_pipeline_tasks = [
+            task
+            for task in historical_pipeline_tasks
+            if task.created_at is not None
+            and (
+                task.created_at.replace(tzinfo=reset_at.tzinfo)
+                if task.created_at.tzinfo is None
+                else task.created_at
+            )
+            > reset_at
+        ]
+        consumed_cross_episode_tasks = [
+            task
+            for task in consumed_cross_episode_tasks
+            if task.created_at is not None
+            and (
+                task.created_at.replace(tzinfo=reset_at.tzinfo)
+                if task.created_at.tzinfo is None
+                else task.created_at
+            )
+            > reset_at
+        ]
+
     # This census intentionally differs from the ordinary cap query: it is
     # keyed only by project+PR and includes cancelled tasks from every episode,
     # so supersede/retarget cannot reset the accumulated burden.  It must run

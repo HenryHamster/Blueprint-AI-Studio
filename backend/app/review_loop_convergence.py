@@ -32,11 +32,10 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
-# The outer-loop convergence distribution currently has a p95 of 7 cycles for
-# PRs that converge.  Ten is a deliberately loose, fixed abandon-candidate
-# threshold: it leaves ordinary long-tail convergence room while catching the
-# observed #17224 shape (nine review/fix tasks spread over ten cycles).
-CROSS_EPISODE_ABANDON_THRESHOLD = 10
+# Keep the PR-level census aligned with the canonical rollup review budget.
+# A smaller value preempts the rollup's 16-cycle cap and leaves no recovery
+# path for work that is still within the budget.
+CROSS_EPISODE_ABANDON_THRESHOLD = 16
 REVIEW_LOOP_ABANDON_CANDIDATE_KEY = "review_loop_abandon_candidate"
 
 

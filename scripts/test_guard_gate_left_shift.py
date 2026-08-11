@@ -450,6 +450,7 @@ def test_docker_junit_attribution_distinguishes_existing_and_new_failures(
 
     output = result.stdout + result.stderr
     assert (result.returncode != 0) is should_fail, output
+    assert "[baseline] governance findings unavailable" not in output
     if should_fail:
         assert "newly_introduced" in output
         assert '"task_id": "task-introducer-123"' in output

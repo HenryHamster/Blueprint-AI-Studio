@@ -4401,6 +4401,11 @@ async def reset_iteration_cap(
         "email", current_user["user_id"]
     )
     new_ctx["review_loop"] = new_review_loop
+    # An abandon-candidate hold is a recoverable episode stop. Resetting the
+    # existing iteration budget explicitly starts a fresh census window; keep
+    # the immutable pre-reset rows for audit, but remove the active stop marker
+    # so the next orchestrator cycle can resume the PR.
+    new_ctx.pop("review_loop_abandon_candidate", None)
     task.context = new_ctx
     flag_modified(task, "context")
 

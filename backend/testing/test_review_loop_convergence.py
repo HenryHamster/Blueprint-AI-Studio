@@ -112,7 +112,7 @@ def test_cross_episode_abandon_candidate_counts_cancelled_superseded_history():
         for index in range(9)
     ]
 
-    candidate = build_cross_episode_abandon_candidate(attempts)
+    candidate = build_cross_episode_abandon_candidate(attempts, threshold=10)
 
     assert candidate == {
         "status": "abandon_candidate",
@@ -144,6 +144,31 @@ def test_cross_episode_abandon_candidate_does_not_flag_converging_pr():
     assert build_cross_episode_abandon_candidate(attempts) is None
 
 
+def test_cross_episode_threshold_matches_rollup_review_cap():
+    """The PR-level census must not stop a rollup before its 16-cycle budget."""
+    from app.review_loop_convergence import (
+        CROSS_EPISODE_ABANDON_THRESHOLD,
+        build_cross_episode_abandon_candidate,
+    )
+    from app.review_pipeline import MAX_REVIEW_FIX_ITERATIONS
+
+    assert CROSS_EPISODE_ABANDON_THRESHOLD == MAX_REVIEW_FIX_ITERATIONS == 16
+
+    project_id = uuid.uuid4()
+    episode = uuid.uuid4()
+    attempts = [
+        _history_attempt(
+            project_id,
+            task_type="review" if index % 2 == 0 else "fix",
+            status=TaskStatus.COMPLETED,
+            iteration=index + 1,
+            original_task_id=episode,
+        )
+        for index in range(15)
+    ]
+    assert build_cross_episode_abandon_candidate(attempts) is None
+
+
 @pytest.mark.asyncio
 async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_session, mocker):
     """The production spawn gate refuses a new fix after the PR threshold."""
@@ -169,10 +194,10 @@ async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_sessi
             project.id,
             task_type="review" if index < 4 else "fix",
             status=TaskStatus.CANCELLED if index in (1, 5, 8) else TaskStatus.COMPLETED,
-            iteration=index + 1 if index < 8 else 10,
+            iteration=index + 1,
             original_task_id=original_task.id,
         )
-        for index in range(9)
+        for index in range(16)
     ]
     db_session.add_all(history)
     source_task = make_task(
@@ -208,6 +233,7 @@ async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_sessi
         base_branch="main",
         original_task_id=str(original_task.id),
         fix_reason="code_review",
+        fix_prompt="resume the review-fix episode",
     )
 
     assert result is None
@@ -215,9 +241,9 @@ async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_sessi
     await db_session.refresh(original_task)
     await db_session.refresh(source_task)
     marker = (original_task.context or {}).get("review_loop_abandon_candidate")
-    assert marker["attempts"] == 9
+    assert marker["attempts"] == 16
     assert marker["cancelled_attempts"] == 3
-    assert marker["cycles"] == 10
+    assert marker["cycles"] == 16
     assert original_task.requires_approval is True
     assert (source_task.context or {}).get("_last_pipeline_spawn_reason") == (
         SPAWN_REASON_ABANDON_CANDIDATE
@@ -230,8 +256,31 @@ async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_sessi
             )
         )
     ).scalar_one()
-    assert "9 attempt(s)" in alert.message
-    assert "3 cancelled" in alert.message
+    assert "16 attempt(s)" in alert.message
+
+    # The existing reset-iteration-cap contract is the explicit resume path.
+    # Its timestamp starts a fresh cap/census window without deleting history.
+    from app.time_utils import _utcnow
+
+    original_task.context = {
+        **(original_task.context or {}),
+        "review_loop": {"iteration_reset_at": _utcnow().isoformat()},
+    }
+    db_session.add(original_task)
+    await db_session.commit()
+    resumed, resumed_created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=17224,
+        branch="blueprint/task-abandon",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_reason="code_review",
+        fix_prompt="resume the review-fix episode",
+    )
+    assert resumed is not None
+    assert resumed_created is True
 
 
 def _mock_preservable_pr(mocker, *, changed_files: int, mergeable_state: str):

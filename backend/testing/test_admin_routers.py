@@ -3156,7 +3156,13 @@ class TestResetIterationCap:
             project_id=project.id,
             status=TaskStatus.IN_PROGRESS,
             payloads=[{"type": "review", "pr_number": 777, "branch": "feat/x"}],
-            context={"review_loop": {"iteration": 5, "pr_number": 777}},
+            context={
+                "review_loop": {"iteration": 5, "pr_number": 777},
+                "review_loop_abandon_candidate": {
+                    "status": "abandon_candidate",
+                    "cycles": 16,
+                },
+            },
         )
         db_session.add(parking)
 
@@ -3191,6 +3197,7 @@ class TestResetIterationCap:
         # Per-chain iteration counter reset to 0 on the parking task.
         await db_session.refresh(parking)
         assert parking.context["review_loop"]["iteration"] == 0
+        assert "review_loop_abandon_candidate" not in parking.context
 
     @pytest.mark.asyncio
     async def test_no_pr_number_in_context_returns_400(

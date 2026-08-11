@@ -331,8 +331,15 @@ _CAP_BUMP_HISTORY_LEDGER_PATH = os.path.join(_TESTING_DIR, "cap_bump_history.jso
 _CAP_BUMP_HISTORY_LEDGER_SCHEMA = 1
 
 
-def _git_reads_history_here() -> bool:
-    """True only when git is on PATH AND ``_REPO_ROOT`` is a git checkout.
+def _is_git_checkout(repo_root: str) -> bool:
+    """Return whether ``repo_root`` has ordinary or linked-worktree Git data."""
+    git_marker = os.path.join(repo_root, ".git")
+    # A linked worktree uses a .git *file* pointing at the common Git dir.
+    return os.path.isdir(git_marker) or os.path.isfile(git_marker)
+
+
+def _git_reads_history_here(repo_root: str | None = None) -> bool:
+    """True only when git is on PATH AND the selected root is a git checkout.
 
     These are the two structural preconditions the deployed backend layout
     fails: the production ``app`` stage has no git binary, and under WORKDIR
@@ -340,9 +347,8 @@ def _git_reads_history_here() -> bool:
     it). When either is false the git evidence source is unreachable and
     :func:`parse_bump_history` reads the committed ledger mirror instead.
     """
-    return shutil.which("git") is not None and os.path.isdir(
-        os.path.join(_REPO_ROOT, ".git")
-    )
+    root = repo_root or _REPO_ROOT
+    return shutil.which("git") is not None and _is_git_checkout(root)
 
 
 # Ref scope for cap-bump history: the mainline integration branch's ancestry,
@@ -960,7 +966,7 @@ def missing_ledger_bump_records(
     root = repo_root or _REPO_ROOT
     caps_path = caps_json_path or _MODULE_SIZE_LIMITS_PATH
     out_path = ledger_path or _CAP_BUMP_HISTORY_LEDGER_PATH
-    if shutil.which("git") is None or not os.path.isdir(os.path.join(root, ".git")):
+    if not _git_reads_history_here(root):
         return []
     try:
         result = subprocess.run(
@@ -1523,7 +1529,7 @@ def phantom_ledger_records(
     ``ledger_path``; ``repo_root`` defaults to ``_REPO_ROOT``.
     """
     root = repo_root or _REPO_ROOT
-    if not _git_reads_history_here():
+    if not _git_reads_history_here(root):
         # No git checkout — nothing to verify the ledger against.  The ledger
         # is the only history source in the deployed layout by design.
         return []

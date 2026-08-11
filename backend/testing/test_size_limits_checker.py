@@ -756,6 +756,43 @@ def test_base_root_preexisting_breach_warn_passes(tmp_path, capsys):
     assert "--force-chronic" in out
 
 
+def test_base_root_governance_baseline_establishes_from_linked_worktree(
+    tmp_path, capsys
+):
+    """The production worktree form must not silently disable governance."""
+    repo, jp = _build_repo(tmp_path, backend={"ok.py": (20, 100)})
+    limits = json.loads(_read(jp))
+    limits["backend"]["deleted.py"] = 100
+    with open(jp, "w") as limits_file:
+        json.dump(limits, limits_file, indent=2)
+        limits_file.write("\n")
+    subprocess.run(["git", "init", "-q", "-b", "automain"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    subprocess.run(["git", "switch", "-q", "-c", "task"], cwd=repo, check=True)
+    base_root = os.path.join(str(tmp_path), "linked-base")
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "--detach", base_root, "automain"],
+        cwd=repo,
+        check=True,
+    )
+
+    try:
+        assert _run(jp, repo, "--base-root", base_root, "--sections", "backend") == 0
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", base_root],
+            cwd=repo,
+            check=True,
+        )
+
+    out = capsys.readouterr().out
+    assert "[baseline] governance findings unavailable" not in out
+    assert "[pre-existing] backend/deleted.py" in out
+
+
 def test_base_root_new_breach_still_blocks(tmp_path, capsys):
     repo, jp = _build_repo(tmp_path, backend={"big.py": (900, 800)})
     base_repo, _ = _build_base_repo(tmp_path, backend={"big.py": (700, 800)})
