@@ -283,13 +283,46 @@ def aggregate_required_artifact_status(
     return ("unconfirmed", None)
 
 
+def summarize_agent_image_freshness(
+    evidence: ReleaseArtifactEvidence | None,
+) -> dict[str, Any]:
+    """Project the optional worker-image artifact into its own freshness dimension.
+
+    ``agent_image`` is intentionally excluded from the serving aggregate.  That
+    keeps backend serving independent from the worker fleet, while this separate
+    projection keeps an unconfirmed, timed-out, or failed fleet observation
+    visible to release consumers.  ``current`` means the fleet independently
+    confirmed the image; ``stale`` means a row exists but is not confirmed;
+    ``unknown`` means no usable fleet observation exists for this version.
+    """
+
+    if evidence is None or evidence.serving_status is None:
+        freshness = "unknown"
+    elif evidence.serving_status == "serving_confirmed":
+        freshness = "current"
+    else:
+        freshness = "stale"
+    return {
+        "artifact_kind": AGENT_IMAGE_ARTIFACT_KIND,
+        "freshness": freshness,
+        "serving_status": evidence.serving_status if evidence else None,
+        "served_identifier": evidence.served_identifier if evidence else None,
+        "served_at": (
+            evidence.served_at.isoformat()
+            if evidence is not None and evidence.served_at is not None
+            else None
+        ),
+        "reason_code": evidence.reason_code if evidence else None,
+    }
+
+
 def summarize_release_artifacts(
     version: ReleaseVersion,
     artifacts: Iterable[ReleaseDeployArtifact] | None,
     *,
     project: Project | None = None,
     identity: DeployIdentity = None,
-) -> tuple[dict[str, str | None], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Summarize aggregate serving truth plus per-provider evidence.
 
     The aggregate status follows the required-artifact registry semantics:
@@ -297,6 +330,9 @@ def summarize_release_artifacts(
     * ``deploy_failed`` iff any required artifact failed,
     * ``serving_confirmed`` iff every required artifact confirmed serving,
     * otherwise ``unconfirmed`` while any required artifact is pending.
+
+    The optional ``fleet_freshness`` member is computed independently from the
+    agent-image artifact and never participates in the aggregate decision.
 
     For backward compatibility, a missing backend artifact row falls back to the
     legacy ``ReleaseVersion`` scalar projection. The scalar is projected AS-IS:
@@ -410,10 +446,21 @@ def summarize_release_artifacts(
         aggregate_status = version.serving_status
         aggregate_reason = version.deploy_failure_reason
 
+    agent_image_evidence = next(
+        (
+            evidence
+            for evidence in evidence_rows
+            if evidence.artifact_kind == AGENT_IMAGE_ARTIFACT_KIND
+        ),
+        None,
+    )
     return (
         {
             "serving_status": aggregate_status,
             "reason_code": aggregate_reason,
+            "fleet_freshness": summarize_agent_image_freshness(
+                agent_image_evidence
+            ),
         },
         [
             {

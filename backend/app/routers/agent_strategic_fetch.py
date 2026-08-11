@@ -678,6 +678,7 @@ def _compose_serving_block(
         "failure_reason": aggregate.get("reason_code")
         if aggregate_status == "deploy_failed"
         else None,
+        "fleet_freshness": aggregate.get("fleet_freshness"),
         "artifacts": artifacts,
     }
 

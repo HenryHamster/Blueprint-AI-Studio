@@ -270,7 +270,18 @@ def test_lagging_agent_fleet_is_reported_without_gating_backend_serving():
 
     aggregate, evidence = summarize_release_artifacts(version, artifacts)
 
-    assert aggregate == {"serving_status": "serving_confirmed", "reason_code": None}
+    assert aggregate == {
+        "serving_status": "serving_confirmed",
+        "reason_code": None,
+        "fleet_freshness": {
+            "artifact_kind": AGENT_IMAGE_ARTIFACT_KIND,
+            "freshness": "stale",
+            "serving_status": "confirmation_timed_out",
+            "served_identifier": None,
+            "served_at": None,
+            "reason_code": "agent_image_fleet_not_yet_serving",
+        },
+    }
     by_kind = {entry["artifact_kind"]: entry for entry in evidence}
     assert by_kind[AGENT_IMAGE_ARTIFACT_KIND] == {
         "artifact_kind": AGENT_IMAGE_ARTIFACT_KIND,
@@ -426,7 +437,18 @@ async def test_optional_agent_image_freshness_continues_after_required_artifacts
             _Artifact(AGENT_IMAGE_ARTIFACT_KIND, "unconfirmed"),
         ],
     )
-    assert aggregate == {"serving_status": "serving_confirmed", "reason_code": None}
+    assert aggregate == {
+        "serving_status": "serving_confirmed",
+        "reason_code": None,
+        "fleet_freshness": {
+            "artifact_kind": AGENT_IMAGE_ARTIFACT_KIND,
+            "freshness": "stale",
+            "serving_status": "unconfirmed",
+            "served_identifier": None,
+            "served_at": None,
+            "reason_code": None,
+        },
+    }
     assert await _serving_confirmation_candidate_ids(db_session) == [version.id]
 
 

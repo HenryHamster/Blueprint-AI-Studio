@@ -110,6 +110,7 @@ def build_project_outcome_projection(
         getattr(item, "artifact_kind", None): item for item in artifacts
     }
     deployment_source = "release_artifact_registry"
+    deployment_summary: dict[str, Any] | None = None
     if promoted_version is None or not getattr(promoted_version, "promoted_sha", None):
         deployment_value = "not_applicable"
         artifact_evidence: list[dict[str, Any]] = []
@@ -240,6 +241,11 @@ def build_project_outcome_projection(
             "source": deployment_source,
             "source_timestamp": _iso(artifact_timestamp),
             "participating_required_artifact_count": len(participating_required),
+            "fleet_freshness": (
+                deployment_summary.get("fleet_freshness")
+                if deployment_summary is not None
+                else None
+            ),
         },
         "evidence": {
             "value": evidence_value,
