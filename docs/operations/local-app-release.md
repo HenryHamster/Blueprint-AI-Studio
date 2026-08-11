@@ -72,47 +72,22 @@ is reported and persisted as `phase=failed` with the attempt count and
 `root_release.failure_reason`; it is not converted into a serving-confirmation
 timeout.
 
-## Pre-stop rehearsal (mandatory gate)
+## Qualification and integrated pre-stop checks
 
-After the one-time bootstrap has installed the deploy-agent and release
-executor, rehearse the exact candidate before every release. Run this before
-stopping any unit. Rehearsal pulls the exact digest from Artifact Registry
-through the same ephemeral worker credential boundary as a real release, then
-removes the temporary Docker credential configuration.
+Do not run either release entrypoint with `--rehearse`. Prequalification
+candidate execution on Hamsterwheel is disabled: those compatibility flags
+are fail-closed sentinels and exit with `host rehearsal disabled` before image
+pull, migration inspection, or service mutation. They are not an operator
+release step.
 
-For the bootstrap entrypoint in the reviewed bootstrap directory:
+Before promotion, any criterion that requires candidate build/smoke evidence
+is satisfied only by the candidate-bound, secrets-free trusted-main GitHub
+workflow. That workflow does not claim to prove Hamsterwheel's live systemd,
+secret-file, database, or activation state.
 
-```bash
-sudo env -i \
-  SUDO_USER=henry_hamster \
-  PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-  /var/lib/blueprint/bootstrap/local-app-release/bootstrap_local_app_release.py \
-  --image IMAGE_AT_SHA256 \
-  --revision FULL_GIT_SHA \
-  --rehearse
-```
-
-For the already installed release bundle (the same checks, through the
-release entrypoint):
-
-```bash
-sudo systemd-run \
-  --unit=blueprint-local-app-release-rehearsal \
-  --collect \
-  --wait \
-  /usr/bin/env -i \
-    SUDO_USER=henry_hamster \
-    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-    /usr/local/lib/blueprint-node/REVIEWED_BUNDLE/local_app_release.py \
-    --image IMAGE_AT_SHA256 \
-    --expected-revision FULL_GIT_SHA \
-    --rehearse
-```
-
-`IMAGE_AT_SHA256` must be the full approved Artifact Registry digest
-(`...@sha256:` followed by 64 lowercase hex characters), and
-`FULL_GIT_SHA` must be the 40-character lowercase Git revision. A successful
-run prints `LOCAL_APP_RELEASE_REHEARSAL` with `units_stopped: false` and proves:
+The real release command below performs the live pre-stop checks itself,
+inside the root-owned activation transaction and immediately before the first
+service mutation. It verifies:
 
 - the live systemd-reported privilege boundary: the non-root deploy agent has
   `User=henry_hamster` and `NoNewPrivileges=yes`, while the root release
@@ -121,15 +96,10 @@ run prints `LOCAL_APP_RELEASE_REHEARSAL` with `units_stopped: false` and proves:
 - worker-secret and other static migration inputs; and
 - that the candidate schema is forward-reachable from the live database head.
 
-It does not apply the migration or verify the post-migration schema, stop or
-start units, or perform candidate API, worker, leadership, or public health
-checks. A green rehearsal is therefore a precondition gate, not a release
-success guarantee. It pulls only the candidate image and does not deploy it.
-
-If rehearsal exits non-zero or prints `ERROR`, do not run the release command
-and do not stop units. Fix the reported input or select a valid candidate,
-then rerun the rehearsal. A failed rehearsal is an abort, not an instruction
-to proceed.
+A precondition failure is recorded in the root release receipt while the
+managed units remain running. Fix the reported input or select a corrected
+candidate, then submit a new ordinary activation. Never bypass the integrated
+check and never run candidate code on the production host before promotion.
 
 ## Release
 
@@ -191,12 +161,12 @@ downtime window begins, a failure leaves the app units stopped and requires a
 fix-forward release; it never rolls prior code back across a possibly advanced
 schema. Other failed activations roll back only their touched services using
 the same identity and readiness checks. Root-only receipts are written below
-`/var/lib/blueprint/local-app-releases/`. If the real run fails after a green
-rehearsal, abort and use that receipt to identify the failed phase; do not
-blindly retry. Before migration downtime begins, the tool restores its touched
-files and services. After downtime begins, leave the units stopped as directed
-by the failure evidence, do not restore the prior image across an advanced
-schema, and fix forward with a corrected candidate.
+`/var/lib/blueprint/local-app-releases/`. If the run fails after its integrated
+pre-stop checks pass, abort and use that receipt to identify the failed phase;
+do not blindly retry. Before migration downtime begins, the tool restores its
+touched files and services. After downtime begins, leave the units stopped as
+directed by the failure evidence, do not restore the prior image across an
+advanced schema, and fix forward with a corrected candidate.
 
 Cloud Run remains a manually activated recovery target. Firebase Hosting
 remains a separately deployed rollback UI, and its origin must remain present

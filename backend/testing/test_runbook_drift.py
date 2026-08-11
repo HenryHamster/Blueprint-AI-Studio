@@ -50,6 +50,15 @@ def test_runbook_matches_release_script_contract() -> None:
     assert "live systemd privilege boundary" in result["preconditions"]
 
 
+def test_runbook_does_not_instruct_operator_to_use_disabled_host_rehearsal() -> None:
+    text = contract._RUNBOOK_PATH.read_text(encoding="utf-8")
+
+    assert "Pre-stop rehearsal (mandatory gate)" not in text
+    assert "Do not run either release entrypoint with `--rehearse`" in text
+    assert "Never bypass the integrated" in text
+    assert "check and never run candidate code" in text
+
+
 def test_missing_script_entrypoint_is_reported(tmp_path: Path) -> None:
     drifted = _expected_contract()
     del drifted["entrypoints"]["bootstrap"]  # type: ignore[index]
