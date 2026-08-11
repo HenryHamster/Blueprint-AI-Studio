@@ -2252,10 +2252,20 @@ async def _ensure_prepromotion_rehearsal_dispatch(
             "detail": "workflow dispatch returned false",
         }
 
-    return True, {
+    marker = {
         "status": "dispatched",
         "candidate_sha": candidate_sha,
     }
+    # The workflow has now been dispatched. Persist its idempotency marker before
+    # any subsequent qualification work can fail and replace last_qualification.
+    # The caller also carries this marker into the two terminal post-dispatch
+    # error records below.
+    version.last_qualification = {
+        **(version.last_qualification or {}),
+        "prepromotion_rehearsal_dispatch": marker,
+    }
+    flag_modified(version, "last_qualification")
+    return True, marker
 
 async def run_qualification(
     session: AsyncSession,
@@ -3468,6 +3478,7 @@ async def run_qualification(
                 "status": "not_promoted",
                 "blocker": "migration_identity_collision",
                 "candidate_sha": candidate_sha,
+                "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
                 "qualification_attempt_id": str(attempt_id),
                 "retry_episode": retry_episode,
                 "retry_episode_cap": retry_episode_cap,
@@ -3610,6 +3621,7 @@ async def run_qualification(
             "engine_sha": get_serving_sha(),
             "detail": str(exc)[:300],
             "candidate_sha": candidate_sha,
+            "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
             "ci_green": ci_green,
             "ci_state": ci_state,
             "started_at": started_at,

@@ -19,14 +19,14 @@ from app.release_prepromotion_rehearsal import (
 
 _CANDIDATE = "a" * 40
 _CATEGORY = {
-    "category_key": "c-bootstrap",
+    "category_key": "c-cafe3815",
     "text": (
         "The release bootstrap is rehearsed against the candidate before promotion "
         "and proves the privilege boundary and migration preconditions."
     ),
 }
 _VERDICT = {
-    "category_key": "c-bootstrap",
+    "category_key": "c-cafe3815",
     "status": "partial",
     "tier": "judged",
     "gap": "no host rehearsal receipt",
@@ -60,6 +60,34 @@ def test_valid_candidate_receipt_grades_rehearsal_category_met():
     assert result[0]["citations"] == [
         {"kind": "test", "ref": "release_prepromotion_rehearsal"}
     ]
+
+
+def test_reworded_rehearsal_criterion_still_binds_by_stable_key():
+    reworded = {
+        **_CATEGORY,
+        "text": "The candidate release has passed its host safety contract.",
+    }
+
+    result = apply_rehearsal_evidence(
+        [_VERDICT], [reworded], _receipt(), _CANDIDATE
+    )
+
+    assert result is not None
+    assert result[0]["category_key"] == "c-cafe3815"
+    assert result[0]["status"] == "met"
+
+
+def test_receipt_omitting_a_pre_stop_precondition_fails_closed():
+    receipt = _receipt()
+    receipt["checked"] = receipt["checked"][1:]
+
+    assert persisted_rehearsal_for_candidate(receipt, _CANDIDATE) is None
+    result = apply_rehearsal_evidence(
+        [_VERDICT], [_CATEGORY], receipt, _CANDIDATE
+    )
+
+    assert result is not None
+    assert result[0]["status"] == "not_met"
 
 
 def test_missing_receipt_fails_closed_as_not_met():
@@ -211,13 +239,20 @@ async def test_qualification_rehearsal_dispatch_failure_is_a_gate_error(
 
 
 @pytest.mark.asyncio
-async def test_same_candidate_rehearsal_marker_suppresses_duplicate_dispatch(mocker):
+@pytest.mark.parametrize(
+    "terminal_status",
+    ["migration_identity_collision", "spawn_failed"],
+)
+async def test_post_dispatch_error_marker_suppresses_retry(
+    mocker, terminal_status
+):
     candidate = "f00dbabe" * 5
     version = SimpleNamespace(
         id=uuid.uuid4(),
         version_number=3,
         prepromotion_rehearsal_receipt=None,
         last_qualification={
+            "status": terminal_status,
             "prepromotion_rehearsal_dispatch": {
                 "status": "dispatched",
                 "candidate_sha": candidate,

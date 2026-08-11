@@ -15,6 +15,15 @@ from typing import Any
 from app import github
 
 PREPROMOTION_REHEARSAL_KIND = "blueprint.local_app_release_rehearsal.v1"
+PREPROMOTION_REHEARSAL_CRITERION_KEY = "c-cafe3815"
+# Keep this tuple aligned with scripts.release_preconditions.PRE_STOP_PRECONDITIONS.
+# The host emits these labels in RehearsalReport.checked; receipt validation must
+# verify the content of that report, not merely its JSON shape.
+PREPROMOTION_REHEARSAL_PRECONDITIONS = (
+    "live systemd privilege boundary",
+    "worker secret and static migration inputs",
+    "candidate migration reachability from live schema",
+)
 PREPROMOTION_REHEARSAL_WORKFLOW = "deploy.yml"
 PREPROMOTION_REHEARSAL_INPUTS: dict[str, str] = {
     # Building the backend image is needed so the host can pull the candidate.
@@ -91,6 +100,8 @@ def validate_prepromotion_rehearsal_receipt(
         or any(len(item) > 200 for item in [*checked, *deferred])
     ):
         return None
+    if not set(PREPROMOTION_REHEARSAL_PRECONDITIONS).issubset(checked):
+        return None
     candidate = receipt.get("candidate")
     if not isinstance(candidate, str) or not candidate.strip():
         return None
@@ -114,11 +125,8 @@ def persisted_rehearsal_for_candidate(
 
 def is_rehearsal_acceptance_category(category: Mapping[str, Any]) -> bool:
     """Identify the rubric category whose contract is the release rehearsal."""
-    text = str(category.get("text") or "").lower()
-    return (
-        "rehears" in text
-        and ("bootstrap" in text or "release" in text)
-        and ("pre-promot" in text or "prepromot" in text or "candidate" in text)
+    return str(category.get("category_key") or "").strip() == (
+        PREPROMOTION_REHEARSAL_CRITERION_KEY
     )
 
 
