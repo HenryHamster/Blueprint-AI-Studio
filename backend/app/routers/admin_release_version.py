@@ -1881,9 +1881,13 @@ async def approve_activation(
     operator_id = current_user.get("email") or current_user["user_id"]
     now = _utcnow()
 
-    if version.activation_requested_at is not None:
+    if (
+        version.activation_requested_at is not None
+        and aggregate_status != "confirmation_timed_out"
+    ):
         # Idempotent re-approval while still unconfirmed — return the existing
-        # durable approval without re-stamping it.
+        # durable approval without re-stamping it. A timed-out approval is a
+        # new execution attempt and must receive a fresh timestamp token.
         return {
             "version_number": version.version_number,
             "project_id": str(project_id),

@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 import re
 import stat
 import subprocess
@@ -44,6 +45,7 @@ _RETIRED_EDGE_DROP_IN = Path(
     "retired-10-noninteractive-funnel.conf"
 )
 _DEPLOY_AGENT_UNIT = Path("/etc/systemd/system/blueprint-deploy-agent.service")
+_GH_CONFIG_DIR = Path("/var/lib/blueprint-deploy-agent/gh")
 _RELEASE_SERVICE = Path("/etc/systemd/system/blueprint-release.service")
 _RELEASE_SOCKET_UNIT = Path("/etc/systemd/system/blueprint-release.socket")
 _RELEASE_SHIM = Path("/usr/local/sbin/blueprint-release")
@@ -110,6 +112,16 @@ def _bundle_digest(payloads: dict[str, bytes]) -> str:
         digest.update(payloads[name])
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _source_path(source: Path, name: str) -> Path:
+    """Resolve allowlisted bundle inputs, including the shared retry module."""
+    staged = source / name
+    if staged.is_file():
+        return staged
+    if name == "release_activation.py":
+        return source.parent / "backend" / "app" / name
+    return staged
 
 
 def _snapshot_optional(path: Path) -> tuple[bytes, int] | None:
@@ -262,6 +274,7 @@ def _deploy_agent_unit(bundle: Path, install_user: str) -> bytes:
         "RuntimeDirectoryMode=0750\n"
         "StateDirectory=blueprint-deploy-agent\n"
         "StateDirectoryMode=0700\n"
+        f"Environment=GH_CONFIG_DIR={_GH_CONFIG_DIR}\n"
         "Environment=PYTHONUNBUFFERED=1\n"
         f"ExecStartPre=/usr/bin/python3.12 {executable} deploy-agent --preflight\n"
         f"ExecStart=/usr/bin/python3.12 {executable} deploy-agent "
@@ -275,6 +288,134 @@ def _deploy_agent_unit(bundle: Path, install_user: str) -> bytes:
         "[Install]\n"
         "WantedBy=multi-user.target\n"
     ).encode()
+
+
+def _source_gh_config_dir(install_user: str) -> Path:
+    try:
+        return Path(pwd.getpwnam(install_user).pw_dir) / ".config" / "gh"
+    except KeyError as exc:
+        raise ValueError(f"service account does not exist: {install_user}") from exc
+
+
+def _provision_github_cli_config(install_user: str) -> None:
+    """Copy the service account's gh host token into protected state storage."""
+    try:
+        account = pwd.getpwnam(install_user)
+    except KeyError as exc:
+        raise ValueError(f"service account does not exist: {install_user}") from exc
+    source_dir = _source_gh_config_dir(install_user)
+    source = source_dir / "hosts.yml"
+    try:
+        directory_info = source_dir.lstat()
+        info = source.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"missing GitHub CLI credential {source}; authenticate gh as {install_user}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(directory_info.st_mode)
+        or stat.S_ISLNK(directory_info.st_mode)
+        or directory_info.st_uid != account.pw_uid
+        or stat.S_IMODE(directory_info.st_mode) & 0o077
+        or not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != account.pw_uid
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise RuntimeError(
+            f"GitHub CLI credential {source} must be private and owned by {install_user}"
+        )
+
+    _GH_CONFIG_DIR.mkdir(parents=True, mode=0o755, exist_ok=True)
+    target_info = _GH_CONFIG_DIR.lstat()
+    if not stat.S_ISDIR(target_info.st_mode) or stat.S_ISLNK(target_info.st_mode):
+        raise RuntimeError(f"unsafe GitHub CLI state directory: {_GH_CONFIG_DIR}")
+    os.chown(_GH_CONFIG_DIR, account.pw_uid, account.pw_gid)
+    os.chmod(_GH_CONFIG_DIR, 0o700)
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".hosts.", dir=_GH_CONFIG_DIR)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(source.read_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chown(temporary, account.pw_uid, account.pw_gid)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, _GH_CONFIG_DIR / "hosts.yml")
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _verify_github_cli_auth(install_user: str) -> None:
+    """Require the service account's owner-only gh credential before enable.
+
+    The deploy agent downloads private Actions artifacts, so an API key alone
+    is insufficient. Keep GitHub auth in the service account's own narrow
+    config directory and run both the auth probe and the exact workflow-list
+    operation as that account during bootstrap; a fresh host fails closed
+    before the unit is enabled.
+    """
+    try:
+        service_uid = pwd.getpwnam(install_user).pw_uid
+    except KeyError as exc:
+        raise ValueError(f"service account does not exist: {install_user}") from exc
+    config_dir = _GH_CONFIG_DIR
+    hosts_file = config_dir / "hosts.yml"
+    try:
+        directory_info = config_dir.lstat()
+        info = hosts_file.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"missing GitHub CLI credential {hosts_file}; authenticate gh as {install_user}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(directory_info.st_mode)
+        or stat.S_ISLNK(directory_info.st_mode)
+        or directory_info.st_uid != service_uid
+        or stat.S_IMODE(directory_info.st_mode) & 0o077
+        or
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != service_uid
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise RuntimeError(
+            f"GitHub CLI credential {hosts_file} must be a private regular file "
+            f"owned by {install_user}"
+        )
+
+    def run_gh(*arguments: str) -> None:
+        result = subprocess.run(
+            [
+                "/usr/sbin/runuser",
+                "--user", install_user,
+                "--",
+                "/usr/bin/env",
+                f"GH_CONFIG_DIR={config_dir}",
+                "gh",
+                *arguments,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "GitHub CLI authentication/preflight failed; run gh auth login "
+                f"as {install_user} and grant read access to private Actions artifacts"
+            )
+
+    run_gh("auth", "status", "--hostname", "github.com")
+    run_gh(
+        "run", "list", "--repo", "HenryHamster/BlueprintAIStudio",
+        "--workflow", "Deploy Blueprint", "--branch", "main", "--limit", "1",
+        "--json", "databaseId,headSha,status,conclusion",
+    )
 
 
 def _release_service_unit() -> bytes:
@@ -362,6 +503,7 @@ def _install_deploy_agent(
             str(_RELEASE_SOCKET_UNIT),
         ])
         _verify_release_execution_boundary(install_user)
+        _verify_github_cli_auth(install_user)
         _run(["/usr/bin/systemctl", "enable", "--now", _DEPLOY_AGENT_UNIT.name])
         _run(["/usr/bin/systemctl", "enable", "--now", _RELEASE_SOCKET_UNIT.name])
         # enable --now does not reload an already-running process after its
@@ -614,7 +756,11 @@ def bootstrap(revision: str) -> Path:
 
     source = Path(__file__).resolve(strict=True).parent
     _trusted_directory(source)
-    payloads = {name: _trusted_file(source / name) for name in _SOURCE_NAMES}
+    payloads = {
+        name: _trusted_file(_source_path(source, name))
+        for name in _SOURCE_NAMES
+    }
+    _provision_github_cli_config(install_user)
     release_shim = _trusted_file(source / "blueprint_release.py")
     edge_template = _trusted_file(source / _EDGE_TEMPLATE_NAME)
     edge_runtime_before = _edge_runtime(install_user)

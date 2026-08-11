@@ -6463,7 +6463,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Local serialization lock path (managed by the systemd runtime directory).")
     p_deploy_agent.add_argument(
         "--state-path", default=_DEPLOY_AGENT_STATE_PATH,
-        help="Local receipt-retry state path (managed by the systemd runtime directory).")
+        help="Local receipt-retry state path (managed by the systemd state directory).")
     p_deploy_agent.add_argument(
         "--poll-state-path", default=_DEPLOY_AGENT_POLL_PATH,
         help="Local successful-poll marker path (managed by the systemd runtime directory).")
@@ -7326,10 +7326,18 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
     state_path = getattr(args, "state_path", None)
     pending_receipt = _read_deploy_agent_state(state_path)
     if pending_receipt is not None:
-        matches_approval = (
+        same_activation = (
             pending_receipt.get("version_number") == approved.get("version_number")
             and pending_receipt.get("promoted_sha") == promoted_sha
             and pending_receipt.get("revision") == promoted_sha
+        )
+        marker_token = pending_receipt.get("activation_requested_at")
+        matches_approval = same_activation and (
+            marker_token == approved.get("activation_requested_at")
+            or (
+                "activation_requested_at" not in pending_receipt
+                and approved.get("serving_status") == "unconfirmed"
+            )
         )
         if matches_approval and pending_receipt.get("phase") == "failed":
             print(
@@ -7415,6 +7423,7 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
         "version_number": current.get("version_number"),
         "promoted_sha": promoted_sha,
         "revision": release["revision"],
+        "activation_requested_at": current.get("activation_requested_at"),
         "phase": "started",
         "activation_attempts": 0,
     }

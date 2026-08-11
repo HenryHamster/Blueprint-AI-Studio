@@ -363,6 +363,12 @@
           "commit_date": "2026-07-12T07:19:38Z",
           "old_cap": 3900,
           "new_cap": 4600
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-10T23:35:56.575326+00:00",
+          "old_cap": 4600,
+          "new_cap": 5350
         }
       ],
       "compute.py": [
@@ -723,6 +729,12 @@
           "commit_date": "2026-07-12T14:21:34Z",
           "old_cap": 1950,
           "new_cap": 2250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-10T23:55:12.467351+00:00",
+          "old_cap": 2250,
+          "new_cap": 2600
         }
       ],
       "routers/admin_pipeline_observability.py": [

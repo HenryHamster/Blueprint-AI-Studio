@@ -7027,7 +7027,9 @@ def test_deploy_agent_retries_failed_activation_phase_then_confirms(
 def _write_accepted_activation_state(state_path):
     state_path.write_text(json.dumps({
         "version_number": 7, "promoted_sha": _DEPLOY_PROMOTED_SHA,
-        "revision": _DEPLOY_PROMOTED_SHA, "phase": "accepted",
+        "revision": _DEPLOY_PROMOTED_SHA,
+        "activation_requested_at": "2026-06-15T00:00:00Z",
+        "phase": "accepted",
     }), encoding="utf-8")
 
 

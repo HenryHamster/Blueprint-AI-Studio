@@ -79,6 +79,35 @@ async def test_approve_activation_allowed_after_confirmation_timed_out(
 
 
 @pytest.mark.asyncio
+async def test_reapproval_after_timeout_gets_a_fresh_attempt_token(
+    client: AsyncClient, db_session
+):
+    """A timed-out approval can be retried and cannot reuse its old marker."""
+    project = await _make_project(db_session)
+    version = await _make_version(
+        db_session,
+        project.id,
+        serving_status="unconfirmed",
+    )
+
+    first = await client.post(
+        f"/api/admin/projects/{project.id}/approve-activation"
+    )
+    assert first.status_code == 200, first.text
+    first_at = first.json()["activation_requested_at"]
+
+    version.serving_status = "confirmation_timed_out"
+    db_session.add(version)
+    await db_session.commit()
+
+    second = await client.post(
+        f"/api/admin/projects/{project.id}/approve-activation"
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["activation_requested_at"] != first_at
+
+
+@pytest.mark.asyncio
 async def test_approve_activation_rejects_never_promoted_version(
     client: AsyncClient, db_session
 ):

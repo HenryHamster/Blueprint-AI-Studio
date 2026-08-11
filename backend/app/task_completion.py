@@ -5314,6 +5314,10 @@ async def _handle_design_doc_completion(
         # Project -> Task pair in canonical order so every recovery write below
         # uses current, live ORM instances on a clean transaction.
         await session.rollback()
+        # Rehydrate the original task before the pair-lock refetch. This is an
+        # explicit async-safe boundary for the rollback-expired ORM instance;
+        # the captured identifiers still fence the recovery lock acquisition.
+        await session.refresh(task)
         async with lock_project_then_task(
             session,
             task_project_id,

@@ -2582,6 +2582,8 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "effective_purpose": None, "direction_counts": None,
     "max_active_directions": None,
     "open_message_count": None,
+    "current_effective_policy": None,
+    "active_or_last_attempt_policy": None,
     # Server-owned Fast activation contract — task payload configuration with
     # no independent fetch path. These critical scalars are carried verbatim.
     "typed_fast_enabled": None, "typed_fast_models": None,

@@ -667,11 +667,15 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
           return serving ? <PinnedServingVersionCallout version={serving} /> : null;
         })()}
         {(() => {
-          // The most recent promoted version still awaiting serving activation.
+          // The most recent promoted version still awaiting serving activation,
+          // including a timeout that the backend deliberately allows to re-arm.
           // `recent` is ordered most-recent-first, so the first matching entry
           // is the latest promotion the operator's approval would activate.
           const awaiting = recent.find(
-            v => v.status === 'promoted' && (v.serving?.status ?? v.serving_status) === 'unconfirmed',
+            v => v.status === 'promoted'
+              && ['unconfirmed', 'confirmation_timed_out'].includes(
+                v.serving?.status ?? v.serving_status ?? '',
+              ),
           );
           return awaiting ? (
             <PromotedAwaitingActivationCallout
