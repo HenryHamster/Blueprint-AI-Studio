@@ -6,6 +6,7 @@
 - Never read a repository `.blueprint-config.json`, copy an API key into a prompt, or assemble raw `curl`/heredoc calls when the MCP or operator CLI covers the request.
 - The MCP surface is intentionally read-only. For a human-authorized mutation, use `./blueprint` on Unix or `.\blueprint.ps1` on Windows with an explicitly selected operator `BLUEPRINT_CONFIG` and `--project`/`--project-id`; never reuse `BLUEPRINT_AGENT_CONFIG` for a mutation. Preserve confirmation and idempotency options.
 - See `docs/CODING_AGENT_ACCESS.md` for scoped credential setup and failure semantics.
+- A trusted developer-hosted operator may instead be provisioned with the non-owner `project-operator` profile. Its CLI allowlist is limited to exact project task, direction, message, and Strategic actions; unsupported platform/bulk/host commands must fail closed. See `docs/HERMES_OPERATOR_ACCESS.md`. Blueprint task workers must not receive this reusable credential.
 
 ## File Restrictions
 - Do NOT modify files in `.github/workflows/` — CI workflows are managed separately and the GitHub App token cannot push workflow changes

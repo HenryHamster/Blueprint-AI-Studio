@@ -28,6 +28,8 @@ The initial `coding-agent:read` scope provides:
   payload-redacted task detail.
 - `list_messages`: bounded operator-visible messages. Non-operator audiences
   and large raw context blobs stay excluded by the backend projection.
+- `list_directions`: bounded, paginated project directions with explicit
+  truncation metadata.
 
 Every tool is annotated read-only and returns both structured MCP content and a
 JSON text copy. A failed required read is an error, not a successful snapshot
@@ -150,7 +152,7 @@ the [official Claude Code MCP documentation](https://code.claude.com/docs/en/mcp
 For another stdio MCP host, use the same command, argument, working-directory,
 and environment fields in that host's configuration format.
 
-After restarting or opening a new host session, confirm that the five Blueprint
+After restarting or opening a new host session, confirm that the six Blueprint
 tools are visible. Ask for a project snapshot first; do not begin a diagnosis by
 manually joining several raw REST calls.
 
@@ -222,12 +224,15 @@ after every intended MCP host has moved to scoped credentials.
 - REST bounded task list: `GET /api/agent-access/v1/tasks`
 - REST bounded task detail: `GET /api/agent-access/v1/tasks/{task_id}`
 - REST bounded message list: `GET /api/agent-access/v1/messages`
+- REST bounded direction list: `GET /api/agent-access/v1/directions`
 - MCP protocol revision: current `2026-07-28`, with negotiation for
   `2025-11-25`, `2025-06-18`, and `2024-11-05` legacy hosts.
 - Snapshot schema: `blueprint.project-snapshot.v1`
 - Bounded task-detail schema: `blueprint.agent-task.v1`
 - Access schema: `blueprint.agent-access.v1`
 
-The first release is deliberately read-only. A future operating surface should
-use a separate scope and narrowly typed, idempotent actions with previews; it
-should not expand `coding-agent:read` or expose a generic arbitrary-API tool.
+The MCP and `coding-agent:read` profile remain deliberately read-only. A
+separate `project-operator` scope now provides narrowly typed CLI actions for a
+trusted external operator such as Hermes; it does not expand this scope or add
+MCP mutations. See [HERMES_OPERATOR_ACCESS.md](HERMES_OPERATOR_ACCESS.md) for
+the exact commands, exclusions, rotation, and deployment boundary.

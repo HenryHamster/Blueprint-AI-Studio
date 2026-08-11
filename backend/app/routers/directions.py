@@ -666,15 +666,44 @@ async def remove_direction(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    return await _remove_direction_impl(
+        project_id,
+        direction_id,
+        session=session,
+        current_user=current_user,
+    )
+
+
+async def _remove_direction_impl(
+    project_id: uuid.UUID,
+    direction_id: str,
+    *,
+    session: AsyncSession,
+    current_user: dict,
+    required_current_status: str | None = None,
+    cancel_queued_tasks: bool = True,
+):
+    """Canonical direction removal with optional internal safety constraints."""
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
 
     def _mutate_remove(directions: list) -> list:
         removed = [d for d in directions if d.get("id") == direction_id]
-        remaining = [d for d in directions if d.get("id") != direction_id]
-        if len(remaining) == len(directions):
+        if not removed:
             raise HTTPException(status_code=404, detail="Direction not found")
+        if (
+            required_current_status is not None
+            and removed[0].get("status") != required_current_status
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Direction must be {required_current_status} for this action "
+                    f"(current status: {removed[0].get('status') or 'unknown'})"
+                ),
+            )
+        remaining = [d for d in directions if d.get("id") != direction_id]
 
         # If this was a proposed or staged direction, keep a tombstone to prevent
         # re-proposal / re-staging.
@@ -709,12 +738,15 @@ async def remove_direction(
         )
 
     # Cancel QUEUED tasks spawned for this direction (same transaction, lock held).
+    # The scoped project-operator cancel path requires a staged direction and
+    # deliberately disables this cascade: staged work is inert, and a command
+    # named for one direction must not become a hidden mass-task cancellation.
     # Paginated to avoid unbounded in-memory fetch for directions with many tasks.
     _CANCEL_BATCH_SIZE = 5000
     cancelled_tasks: List[Task] = []
     vm_ids_to_delete: List[str] = []
     _last_seen_id: int | None = None
-    while True:
+    while cancel_queued_tasks:
         stmt = (
             select(Task).where(
                 Task.project_id == project_id,
@@ -805,6 +837,25 @@ async def update_direction(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    return await _update_direction_impl(
+        project_id,
+        direction_id,
+        payload,
+        session=session,
+        current_user=current_user,
+    )
+
+
+async def _update_direction_impl(
+    project_id: uuid.UUID,
+    direction_id: str,
+    payload: Dict[str, Any],
+    *,
+    session: AsyncSession,
+    current_user: dict,
+    required_current_status: str | None = None,
+):
+    """Canonical direction update with an optional same-lock status fence."""
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
@@ -1041,6 +1092,17 @@ async def update_direction(
 
         for d in directions:
             if d.get("id") == direction_id:
+                if (
+                    required_current_status is not None
+                    and d.get("status") != required_current_status
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Direction must be {required_current_status} for this "
+                            f"action (current status: {d.get('status') or 'unknown'})"
+                        ),
+                    )
                 # Snapshot contract fields before mutation to detect real changes.
                 _pre_text = d.get("text")
                 _pre_paths = list(d.get("paths") or [])

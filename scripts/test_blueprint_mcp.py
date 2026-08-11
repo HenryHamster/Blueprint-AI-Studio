@@ -94,6 +94,7 @@ def test_tool_registry_is_discoverable_and_read_only():
         "get_project_snapshot",
         "list_tasks",
         "get_task",
+        "list_directions",
         "list_messages",
     }
     assert not any(
@@ -535,6 +536,71 @@ def test_list_projects_uses_the_scoped_http_seam(monkeypatch):
     assert calls == [("GET", "/api/agent-access/v1/me", None)]
 
 
+def test_project_operator_profile_is_authorized_without_coding_agent_scope(monkeypatch):
+    _configure_scoped_agent(monkeypatch)
+    profile = _profile()
+    profile["credential"] = {
+        **profile["credential"],
+        "name": "test-project-operator",
+        "scopes": ["project-operator"],
+    }
+    profile["projects"][0]["role"] = "member"
+    profile["capabilities"] = [
+        "project.snapshot",
+        "tasks.list",
+        "tasks.read",
+        "directions.list",
+    ]
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if path == "/api/agent-access/v1/me":
+            return profile
+        raise AssertionError(path)
+
+    monkeypatch.setattr(blueprint_mcp, "api", fake_api)
+    response = blueprint_mcp.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 220,
+            "method": "tools/call",
+            "params": {"name": "list_projects", "arguments": {}},
+        }
+    )
+
+    payload, is_error = _tool_payload(response)
+    assert is_error is False
+    assert payload["access"]["scopes"] == ["project-operator"]
+    assert payload["projects"][0]["role"] == "member"
+    assert calls == [("GET", "/api/agent-access/v1/me", None)]
+
+
+def test_observer_profile_remains_outside_the_mcp_read_boundary(monkeypatch):
+    _configure_scoped_agent(monkeypatch)
+    profile = _profile()
+    profile["credential"] = {
+        **profile["credential"],
+        "name": "test-observer",
+        "scopes": ["observer:read"],
+    }
+    monkeypatch.setattr(blueprint_mcp, "api", lambda *_args, **_kwargs: profile)
+
+    response = blueprint_mcp.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 221,
+            "method": "tools/call",
+            "params": {"name": "list_projects", "arguments": {}},
+        }
+    )
+
+    payload, is_error = _tool_payload(response)
+    assert is_error is True
+    assert "coding-agent:read or project-operator" in payload["error"]
+    assert "observer:read" in payload["error"]
+
+
 def test_list_projects_pages_and_bounds_profile_fields(monkeypatch):
     _configure_scoped_agent(monkeypatch)
     profile = _profile()
@@ -795,6 +861,74 @@ def test_task_and_message_tools_use_bounded_membership_scoped_routes(monkeypatch
         "status": ["needs_action"],
         "limit": ["10"],
         "offset": ["30"],
+    }
+    assert all(method == "GET" for method, _path, _body in calls)
+
+
+def test_list_directions_uses_bounded_paginated_route_for_project_operator(
+    monkeypatch,
+):
+    _configure_scoped_agent(monkeypatch)
+    profile = _profile()
+    profile["credential"] = {
+        **profile["credential"],
+        "name": "test-project-operator",
+        "scopes": ["project-operator"],
+    }
+    profile["projects"][0]["role"] = "member"
+    calls = []
+    bounded_response = {
+        "schema_version": "blueprint.agent-directions.v1",
+        "complete": False,
+        "truncation": {
+            "source_page": True,
+            "items": False,
+            "item_fields": False,
+            "response_bytes": False,
+        },
+        "project": {"id": PROJECT_ID, "name": "Blueprint", "role": "member"},
+        "directions": [{"id": "d-1234abcd", "status": "active"}],
+        "total": 80,
+        "limit": 25,
+        "offset": 50,
+        "returned": 1,
+        "has_more": True,
+        "next_offset": 51,
+    }
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if path == "/api/agent-access/v1/me":
+            return profile
+        if path.startswith("/api/agent-access/v1/directions?"):
+            return bounded_response
+        raise AssertionError(path)
+
+    monkeypatch.setattr(blueprint_mcp, "api", fake_api)
+    response = blueprint_mcp.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 81,
+            "method": "tools/call",
+            "params": {
+                "name": "list_directions",
+                "arguments": {
+                    "project_id": PROJECT_ID,
+                    "limit": 25,
+                    "offset": 50,
+                },
+            },
+        }
+    )
+
+    payload, is_error = _tool_payload(response)
+    assert is_error is False
+    assert payload == bounded_response
+    direction_query = parse_qs(urlsplit(calls[-1][1]).query)
+    assert direction_query == {
+        "project_id": [PROJECT_ID],
+        "limit": ["25"],
+        "offset": ["50"],
     }
     assert all(method == "GET" for method, _path, _body in calls)
 

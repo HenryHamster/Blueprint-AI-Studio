@@ -205,12 +205,21 @@ def api(method: str, path: str, body: dict | None = None, timeout: int = 30) -> 
                 "verify the key is correct.",
                 file=sys.stderr,
             )
-        elif e.code == 403 and cfg.get("read_only"):
-            print(
-                "HTTP 403 Forbidden — the current config is read-only. Select "
-                "a separate operator BLUEPRINT_CONFIG for authorized mutations.",
-                file=sys.stderr,
-            )
+        elif e.code == 403:
+            if str(cfg.get("api_key") or "").startswith("bpsc_"):
+                print(
+                    "HTTP 403 Forbidden — this scoped ServiceCredential does not "
+                    f"permit {method.upper()} {path}. Select an explicitly authorized "
+                    "project-operator credential for supported project actions; "
+                    "platform-admin commands remain unavailable.",
+                    file=sys.stderr,
+                )
+            elif cfg.get("read_only"):
+                print(
+                    "HTTP 403 Forbidden — the current config is read-only. Select "
+                    "a separate operator BLUEPRINT_CONFIG for authorized mutations.",
+                    file=sys.stderr,
+                )
         print(f"API error {e.code}: {body}", file=sys.stderr)
         raise APIError(f"HTTP {e.code}: {body}")
     except urllib.error.URLError as e:

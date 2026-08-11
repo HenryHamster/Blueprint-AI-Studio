@@ -1546,24 +1546,31 @@ def test_tasks_list_scoped_credential_uses_bounded_projection(
         "load_config",
         lambda: {"api_key": "bpsc_scoped-token", "read_only": True},
     )
+    monkeypatch.setattr(blueprint, "_SCOPED_PROFILE_CACHE", None)
     monkeypatch.setattr(blueprint, "get_project_id", lambda _value=None: "project-1")
+
+    def api_fake(method, path, body=None):
+        calls.append((method, path, body))
+        if path == "/api/agent-access/v1/me":
+            return {"credential": {"scopes": ["coding-agent:read"]}}
+        return response
+
     monkeypatch.setattr(
         blueprint,
         "api",
-        lambda method, path, body=None: calls.append((method, path, body))
-        or response,
+        api_fake,
     )
 
     rc = blueprint.main(["--json", "tasks", "list", "--active", "--limit", "10"])
 
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == response
-    assert calls[0][0] == "GET"
-    assert calls[0][1].startswith(
+    assert calls[1][0] == "GET"
+    assert calls[1][1].startswith(
         "/api/agent-access/v1/tasks?project_id=project-1&limit=10"
     )
     assert all(
-        f"status={status}" in calls[0][1]
+        f"status={status}" in calls[1][1]
         for status in ("QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING")
     )
 
@@ -1666,11 +1673,18 @@ def test_tasks_show_scoped_credential_uses_bounded_projection(
         "load_config",
         lambda: {"api_key": "bpsc_scoped-token", "read_only": True},
     )
+    monkeypatch.setattr(blueprint, "_SCOPED_PROFILE_CACHE", None)
+
+    def api_fake(method, path, body=None):
+        calls.append((method, path, body))
+        if path == "/api/agent-access/v1/me":
+            return {"credential": {"scopes": ["coding-agent:read"]}}
+        return projection
+
     monkeypatch.setattr(
         blueprint,
         "api",
-        lambda method, path, body=None: calls.append((method, path, body))
-        or projection,
+        api_fake,
     )
 
     rc = blueprint.main(["--json", "tasks", "show", "task-123"])
@@ -1678,6 +1692,7 @@ def test_tasks_show_scoped_credential_uses_bounded_projection(
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == projection
     assert calls == [
+        ("GET", "/api/agent-access/v1/me", None),
         ("GET", "/api/agent-access/v1/tasks/task-123", None),
     ]
 
@@ -3592,12 +3607,19 @@ def test_messages_list_scoped_credential_uses_operator_projection(
         "load_config",
         lambda: {"api_key": "bpsc_scoped-token", "read_only": True},
     )
+    monkeypatch.setattr(blueprint, "_SCOPED_PROFILE_CACHE", None)
     monkeypatch.setattr(blueprint, "get_project_id", lambda _value=None: "project-1")
+
+    def api_fake(method, path, body=None):
+        calls.append((method, path, body))
+        if path == "/api/agent-access/v1/me":
+            return {"credential": {"scopes": ["coding-agent:read"]}}
+        return response
+
     monkeypatch.setattr(
         blueprint,
         "api",
-        lambda method, path, body=None: calls.append((method, path, body))
-        or response,
+        api_fake,
     )
 
     rc = blueprint.main(
@@ -3610,6 +3632,7 @@ def test_messages_list_scoped_credential_uses_operator_projection(
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == response
     assert calls == [
+        ("GET", "/api/agent-access/v1/me", None),
         (
             "GET",
             "/api/agent-access/v1/messages?project_id=project-1&status=open&limit=25&offset=75",
