@@ -13,7 +13,7 @@ from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.agent_access_redaction import is_secret_field
+from app.agent_access_redaction import is_secret_field, redact_agent_text
 from app.auth import get_current_user
 from app.admin import (
     _get_user_project,
@@ -262,7 +262,7 @@ def _bounded_agent_value(
         return value
 
     raw_text = value.value if hasattr(value, "value") else str(value)
-    sanitized = redact_command_log_text(str(raw_text))
+    sanitized = redact_command_log_text(redact_agent_text(str(raw_text)))
     if sanitized != str(raw_text):
         state["redactions"] = int(state["redactions"]) + 1
     max_bytes = min(
