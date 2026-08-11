@@ -2001,6 +2001,7 @@ async def request_prepromotion_rehearsal(
         owner,
         repo,
         version_number,
+        candidate_sha,
         project_id=str(project_id),
     )
     if not dispatched:

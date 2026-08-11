@@ -105,9 +105,12 @@ async def test_rehearsal_dispatch_pins_release_branch_and_disables_side_effects(
     with patch(
         "app.release_prepromotion_rehearsal.github.dispatch_workflow_run",
         new=dispatch,
+    ), patch(
+        "app.release_prepromotion_rehearsal.github.create_branch",
+        new=AsyncMock(return_value={"object": {"sha": _CANDIDATE}}),
     ):
         assert await dispatch_prepromotion_rehearsal(
-            "token", "owner", "repo", 17, project_id="project"
+            "token", "owner", "repo", 17, _CANDIDATE, project_id="project"
         )
 
     dispatch.assert_awaited_once()

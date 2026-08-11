@@ -2196,7 +2196,6 @@ async def _ensure_prepromotion_rehearsal_dispatch(
     """
     from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
         dispatch_prepromotion_rehearsal,
-        ensure_prepromotion_rehearsal_ref,
         persisted_rehearsal_for_candidate,
     )
 
@@ -2218,22 +2217,12 @@ async def _ensure_prepromotion_rehearsal_dispatch(
         return True, dict(prior_dispatch)
 
     try:
-        # The rehearsal ref is the exact candidate snapshot, and must exist
-        # before deploy.yml is dispatched.  promote() may later reuse this
-        # same ref; its existing SHA-check and recut path keeps promotion
-        # idempotent when qualification has already prepared it.
-        await ensure_prepromotion_rehearsal_ref(
-            token,
-            owner,
-            repo,
-            version.version_number,
-            candidate_sha,
-        )
         dispatched = await dispatch_prepromotion_rehearsal(
             token,
             owner,
             repo,
             version.version_number,
+            candidate_sha,
             project_id=str(project.id),
         )
     except Exception as exc:  # noqa: BLE001 — surface workflow failures as a gate
@@ -8275,6 +8264,18 @@ async def _finalize_qualification(
         for c in launched_rubric
         if c.get("criterion_key")
     ]
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        apply_rehearsal_evidence,
+        persisted_rehearsal_for_candidate,
+        validate_prepromotion_gradeability,
+    )
+
+    # Every active category can hard-block promotion.  Validate its evidence
+    # producer phase before composing any category verdicts, so a newly added
+    # criterion cannot introduce a producer/gate cycle that only wedges a
+    # release attempt.
+    validate_prepromotion_gradeability(active_categories)
+
     # The latest promoted release is the only immutable source for this
     # cross-version qualifier evidence.  Bind it by rubric text through the
     # generic adapter; invalid, unresolved, terminal, and missing receipts all
@@ -8310,10 +8311,6 @@ async def _finalize_qualification(
             *serving_authorship_range(latest_promoted),
             active_categories,
         )
-    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
-        apply_rehearsal_evidence,
-        persisted_rehearsal_for_candidate,
-    )
     prepromotion_rehearsal = persisted_rehearsal_for_candidate(
         getattr(version, "prepromotion_rehearsal_receipt", None), candidate_sha
     )

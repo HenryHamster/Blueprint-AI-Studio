@@ -17,16 +17,19 @@ from __future__ import annotations
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from app import release_qualifier as rq
 from app.release_prepromotion_rehearsal import (
+    PREPROMOTION_GRADEABILITY_CONTRACTS,
     PREPROMOTION_REHEARSAL_CRITERION_KEY,
     PREPROMOTION_REHEARSAL_PRECONDITIONS,
     apply_rehearsal_evidence,
+    dispatch_prepromotion_rehearsal,
+    validate_prepromotion_gradeability,
 )
-from app import release_qualifier as rq
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -263,4 +266,97 @@ def test_rehearsal_criterion_key_format_is_valid():
         f"PREPROMOTION_REHEARSAL_CRITERION_KEY {PREPROMOTION_REHEARSAL_CRITERION_KEY!r} "
         "does not match the expected c-<8hexchars> format. "
         "The rubric validator will reject it and the gate will never be active."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Guard 3 — every workflow dispatch proves its candidate ref first
+#
+# The ref is deliberately owned by dispatch_prepromotion_rehearsal, not by
+# individual callers.  This is the general shape guard for pre-promotion
+# evidence: a criterion's producer must establish its candidate-bound input
+# before the producer runs.  A caller that bypasses that contract, or a future
+# edit that dispatches after an unresolved ref, must fail before a workflow run
+# can be created.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rehearsal_dispatch_resolves_candidate_ref_before_workflow(mocker):
+    """The workflow cannot run until release-vN resolves to the candidate SHA."""
+    events: list[str] = []
+
+    async def create_branch(_token, _owner, _repo, branch_name, sha):
+        events.append(f"ref:{branch_name}:{sha}")
+        return {"object": {"sha": sha}}
+
+    async def dispatch_workflow(*_args, **_kwargs):
+        events.append("dispatch")
+        assert events[-2].startswith("ref:release-v17:"), events
+        assert events[-2].endswith("a" * 40), events
+        return True
+
+    mocker.patch(
+        "app.release_prepromotion_rehearsal.github.create_branch",
+        new=AsyncMock(side_effect=create_branch),
+    )
+    dispatch = mocker.patch(
+        "app.release_prepromotion_rehearsal.github.dispatch_workflow_run",
+        new=AsyncMock(side_effect=dispatch_workflow),
+    )
+
+    assert await dispatch_prepromotion_rehearsal(
+        "token", "owner", "repo", 17, "a" * 40
+    ) is True
+    assert events == [f"ref:release-v17:{'a' * 40}", "dispatch"]
+    dispatch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_candidate_ref_blocks_workflow_dispatch(mocker):
+    """The pre-17278 unresolved-ref shape fails closed before dispatch."""
+    stale = "b" * 40
+    mocker.patch(
+        "app.release_prepromotion_rehearsal.github.create_branch",
+        new=AsyncMock(
+            side_effect=[
+                {"object": {"sha": stale}},
+                {"object": {"sha": stale}},
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.release_prepromotion_rehearsal.github.delete_branch",
+        new=AsyncMock(return_value=True),
+    )
+    dispatch = mocker.patch(
+        "app.release_prepromotion_rehearsal.github.dispatch_workflow_run",
+        new=AsyncMock(return_value=True),
+    )
+
+    with pytest.raises(RuntimeError, match="does not resolve to candidate"):
+        await dispatch_prepromotion_rehearsal(
+            "token", "owner", "repo", 17, "a" * 40
+        )
+    dispatch.assert_not_awaited()
+
+
+def test_gradeability_contract_rejects_circular_evidence_producer():
+    """A producer blocked by the promotion gate is rejected before release."""
+    with pytest.raises(ValueError, match="at or after its promotion gate"):
+        validate_prepromotion_gradeability(
+            [{"category_key": "c-circular1"}],
+            contracts={
+                "c-circular1": {
+                    "producer": "post_promotion_rehearsal",
+                    "producer_phase": "promotion_gate",
+                    "gate_phase": "promotion_gate",
+                }
+            },
+        )
+
+
+def test_registered_gradeability_contracts_are_pre_promotion_gradeable():
+    """Every special machine-backed criterion remains wired to a safe phase."""
+    validate_prepromotion_gradeability(
+        [{"category_key": key} for key in PREPROMOTION_GRADEABILITY_CONTRACTS]
     )

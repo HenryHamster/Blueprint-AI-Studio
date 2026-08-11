@@ -37,6 +37,81 @@ PREPROMOTION_REHEARSAL_INPUTS: dict[str, str] = {
 }
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 
+# Evidence producers are ordered before the promotion gate.  This registry is
+# intentionally small and declarative: a new promotion criterion must name a
+# producer phase that is earlier than the gate, or the qualifier refuses to
+# grade the attempt instead of discovering the cycle during a release.
+_PREPROMOTION_GRADEABILITY_PHASES = {
+    "qualification_setup": 10,
+    "qualification_evidence": 20,
+    "promotion_gate": 30,
+}
+PREPROMOTION_GRADEABILITY_CONTRACTS: dict[str, dict[str, Any]] = {
+    PREPROMOTION_REHEARSAL_CRITERION_KEY: {
+        "producer": "prepromotion_rehearsal_receipt",
+        "producer_phase": "qualification_setup",
+        "gate_phase": "promotion_gate",
+        "prerequisites": ("candidate_ref_resolves_before_dispatch",),
+    }
+}
+
+
+def validate_prepromotion_gradeability(
+    active_categories: list[Mapping[str, Any]],
+    *,
+    contracts: Mapping[str, Mapping[str, Any]] | None = None,
+) -> None:
+    """Reject promotion criteria whose evidence producer is not pre-gradeable.
+
+    Every active category can force ``not_met`` during qualification.  Ordinary
+    categories are produced by the blind merge-grade in the qualification
+    evidence phase; special machine-backed categories must be listed in
+    ``PREPROMOTION_GRADEABILITY_CONTRACTS``.  A producer at or after the gate,
+    or one with an unknown phase, is a circular/deadlocked contract and fails
+    closed before promotion work begins.
+    """
+    declared = contracts or PREPROMOTION_GRADEABILITY_CONTRACTS
+    for category in active_categories:
+        key = str(
+            category.get("category_key") or category.get("criterion_key") or ""
+        ).strip()
+        if not key:
+            raise ValueError("active promotion criterion has no stable key")
+        contract = declared.get(key) or {
+            "producer": "blind_merge_grade",
+            "producer_phase": "qualification_evidence",
+            "gate_phase": "promotion_gate",
+        }
+        producer = str(contract.get("producer") or "").strip()
+        producer_phase = str(contract.get("producer_phase") or "").strip()
+        gate_phase = str(contract.get("gate_phase") or "").strip()
+        if not producer:
+            raise ValueError(f"criterion {key} has no evidence producer")
+        if (
+            producer_phase not in _PREPROMOTION_GRADEABILITY_PHASES
+            or gate_phase not in _PREPROMOTION_GRADEABILITY_PHASES
+        ):
+            raise ValueError(
+                f"criterion {key} has an unknown gradeability phase "
+                f"({producer_phase!r} -> {gate_phase!r})"
+            )
+        if (
+            _PREPROMOTION_GRADEABILITY_PHASES[producer_phase]
+            >= _PREPROMOTION_GRADEABILITY_PHASES[gate_phase]
+        ):
+            raise ValueError(
+                f"criterion {key} evidence producer {producer!r} runs at or "
+                f"after its promotion gate"
+            )
+        if key == PREPROMOTION_REHEARSAL_CRITERION_KEY and (
+            "candidate_ref_resolves_before_dispatch"
+            not in contract.get("prerequisites", ())
+        ):
+            raise ValueError(
+                f"criterion {key} is missing the candidate ref resolution "
+                "precondition"
+            )
+
 
 def prepromotion_rehearsal_ref(version_number: int) -> str:
     """Return the candidate-pinned release branch ref used by the build."""
@@ -93,10 +168,26 @@ async def dispatch_prepromotion_rehearsal(
     owner: str,
     repo: str,
     version_number: int,
+    candidate_sha: str,
     *,
     project_id: str | None = None,
 ) -> bool:
-    """Build the candidate image without granting deploy workflow side effects."""
+    """Build the candidate image without granting deploy workflow side effects.
+
+    The ref is part of this dispatch contract, rather than a caller-owned
+    precondition.  Every caller must supply the candidate SHA; this function
+    proves the exact ``release-vN`` ref resolves to it immediately before the
+    workflow dispatch.  Keeping the proof here prevents a new caller (or a
+    manual retry path) from recreating the old gate deadlock by dispatching an
+    unresolved ref.
+    """
+    await ensure_prepromotion_rehearsal_ref(
+        token,
+        owner,
+        repo,
+        version_number,
+        candidate_sha,
+    )
     dispatched = await github.dispatch_workflow_run(
         token,
         owner,
