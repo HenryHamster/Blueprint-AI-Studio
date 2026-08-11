@@ -1493,19 +1493,16 @@ function buildConfigCheckIntro(buildConfig: BuildConfig): string {
     .filter((x): x is { path: string; cmd: string } => !!x.cmd)
     .map(x => `\`${x.path.replace(/\/$/, '')}/\` (\`${x.cmd}\`)`);
   const testList = testParts.length ? testParts.join(', ') : 'any configured test commands';
-  // Mirrors buildPytestGateInner in prompts/check-helper.ts: a pytest-style
-  // test command gets the honest gate (sanctioned-harness preference +
-  // GATE-ENVIRONMENT fallback), so tell the agent what that note means.
+  // A pytest-style command remains a normal configured test command. Projects
+  // that explicitly declare the retained project-verification contract get
+  // its base-attributed verification block from the generated check helper.
   const effectiveTestCmds = dirs.map(d => effectiveTestCmd(d)).filter((c): c is string => !!c);
   const hasPytestGate = effectiveTestCmds.some(c => isPytestCmd(c));
   const pytestGateNote = hasPytestGate
-    ? `  A pytest-style test command runs honestly: \`./check test\` prefers the
-  project's Docker test harness (\`scripts/test-<dir>.sh\`) when Docker can
-  run it; if this VM can faithfully run neither the harness nor a
-  Postgres-backed pytest, the gate logs a GATE-ENVIRONMENT note instead of
-  failing on pre-existing environment-only failures. When you see that
-  note, record your own faithful test evidence in the PR body — do NOT
-  treat the environment artifact as a blocker for validated work.
+    ? `  A pytest-style test command runs as the configured command under
+  \`./check test\`. A project that declares the \`blueprint-v1\` verification
+  contract gets the retained base-attributed verification block instead of a
+  duplicate generic pytest gate.
 `
     : '';
   return `- \`./check\` — runs this project's configured lint/build commands for the
