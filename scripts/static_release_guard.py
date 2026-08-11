@@ -103,6 +103,11 @@ def _junit_failures(path: Path, *, label: str) -> dict[str, str]:
     return failures
 
 
+def _normalize_failure_detail(detail: str, *, tree_root: Path) -> str:
+    """Remove the tree-specific absolute root from a JUnit failure detail."""
+    return detail.replace(str(tree_root), "<tree-root>")
+
+
 def _run_static_corpus(repo: Path, junit: Path) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
@@ -233,28 +238,53 @@ def main(argv: list[str] | None = None) -> int:
 
         base_junit = Path(temp_dir) / "base.xml"
         current_junit = Path(temp_dir) / "current.xml"
-        base_result = _run_static_corpus(base_root, base_junit)
+        base_result: subprocess.CompletedProcess[str] | None = None
         current_result = _run_static_corpus(repo, current_junit)
         try:
-            base_failures = _junit_failures(base_junit, label="base")
             current_failures = _junit_failures(current_junit, label="current")
         except RuntimeError as exc:
             print(f"[static guard] ERROR: cannot attribute standalone corpus: {exc}", file=sys.stderr)
-            print(base_result.stdout, end="")
-            print(base_result.stderr, end="", file=sys.stderr)
             print(current_result.stdout, end="")
             print(current_result.stderr, end="", file=sys.stderr)
             failures.append("standalone static corpus attribution")
         else:
-            new_failures = {
-                key: detail
-                for key, detail in current_failures.items()
-                if key not in base_failures or base_failures[key] != detail
-            }
-            if current_result.returncode != 0 and not new_failures and not current_failures:
+            if not current_failures:
                 # A harness/import failure has no testcase identity. It is still a
                 # real failure, and must not be converted into a green result.
-                new_failures = {"<harness>": current_result.stderr or current_result.stdout}
+                if current_result.returncode != 0:
+                    new_failures = {
+                        "<harness>": current_result.stderr or current_result.stdout
+                    }
+                else:
+                    new_failures = {}
+            else:
+                # Current-tree failures need a baseline comparison; a clean tree
+                # takes the no-failure path above and avoids this second run.
+                base_result = _run_static_corpus(base_root, base_junit)
+                try:
+                    base_failures = _junit_failures(base_junit, label="base")
+                except RuntimeError as exc:
+                    print(
+                        f"[static guard] ERROR: cannot attribute standalone corpus: {exc}",
+                        file=sys.stderr,
+                    )
+                    print(base_result.stdout, end="")
+                    print(base_result.stderr, end="", file=sys.stderr)
+                    print(current_result.stdout, end="")
+                    print(current_result.stderr, end="", file=sys.stderr)
+                    failures.append("standalone static corpus attribution")
+                    new_failures = {}
+                else:
+                    new_failures = {
+                        key: detail
+                        for key, detail in current_failures.items()
+                        if key not in base_failures
+                        or _normalize_failure_detail(
+                            base_failures[key], tree_root=base_root
+                        )
+                        != _normalize_failure_detail(detail, tree_root=repo)
+                    }
+
             if new_failures:
                 try:
                     attributed = _attributed_findings(
@@ -269,7 +299,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(current_result.stdout, end="")
                 print(current_result.stderr, end="", file=sys.stderr)
                 failures.append("standalone static corpus")
-            elif current_result.returncode != 0 and base_result.returncode == 0:
+            elif (
+                current_result.returncode != 0
+                and base_result is not None
+                and base_result.returncode == 0
+            ):
                 print("[static guard] standalone static corpus FAILED")
                 print(current_result.stdout, end="")
                 print(current_result.stderr, end="", file=sys.stderr)

@@ -180,20 +180,29 @@ case "${1:-}" in
       [ "$arg" = "pytest" ] && is_pytest=1
     done
     if [ "$is_pytest" -eq 0 ]; then exit 0; fi
+    if [ -n "${STATIC_GUARD_CALL_LOG:-}" ]; then
+      printf '%s\n' "$repo_root" >>"$STATIC_GUARD_CALL_LOG"
+    fi
     # Before the fix, the command receives a host /tmp path but that path is
     # not mounted. Model Docker's disposable container filesystem by refusing
     # to create a host report unless the harness supplies the output mount.
     [ -n "$junit" ] && [ -n "$output_root" ] || exit 0
     state="$(cat "$repo_root/attribution_state")"
     report="$output_root/$(basename "$junit")"
-    if [ "$state" = "preexisting" ]; then
+    if [ "$state" = "clean" ]; then
       cat >"$report" <<'XML'
-<testsuite tests="1" failures="1"><testcase classname="guard" name="preexisting"><failure message="preexisting">preexisting</failure></testcase></testsuite>
+<testsuite tests="1" failures="0"><testcase classname="guard" name="clean" /></testsuite>
+XML
+      exit 0
+    fi
+    if [ "$state" = "preexisting" ]; then
+      cat >"$report" <<XML
+<testsuite tests="1" failures="1"><testcase classname="guard" name="preexisting"><failure message="preexisting">preexisting at $repo_root/backend/testing/test_existing.py</failure></testcase></testsuite>
 XML
       exit 1
     fi
-    cat >"$report" <<'XML'
-<testsuite tests="2" failures="2"><testcase classname="guard" name="preexisting"><failure message="preexisting">preexisting</failure></testcase><testcase classname="guard" name="newly_introduced"><failure message="newly introduced">newly introduced</failure></testcase></testsuite>
+    cat >"$report" <<XML
+<testsuite tests="2" failures="2"><testcase classname="guard" name="preexisting"><failure message="preexisting">preexisting at $repo_root/backend/testing/test_existing.py</failure></testcase><testcase classname="guard" name="newly_introduced"><failure message="newly introduced">newly introduced</failure></testcase></testsuite>
 XML
     exit 1
     ;;
@@ -250,6 +259,70 @@ def test_docker_junit_attribution_distinguishes_existing_and_new_failures(
         assert '"task_id": "task-introducer-123"' in output
     else:
         assert "no new failures vs base" in output
+
+
+def test_identical_failure_with_tree_specific_path_is_preexisting(tmp_path: Path) -> None:
+    """A traceback path difference alone must not make an old failure new."""
+    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "preexisting")
+    result = subprocess.run(
+        [
+            "python3",
+            "scripts/static_release_guard.py",
+            "--base",
+            "automain",
+            "--repo-root",
+            str(repo),
+        ],
+        cwd=repo,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TASK_ID": "task-existing-failure-123",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "no new failures vs base" in output
+
+
+@pytest.mark.parametrize(
+    ("current_state", "expected_corpus_runs"),
+    [("clean", 1), ("preexisting", 2)],
+)
+def test_baseline_corpus_is_lazy_after_current_tree_result(
+    tmp_path: Path, current_state: str, expected_corpus_runs: int
+) -> None:
+    """The baseline runs only when current-tree failures need subtraction."""
+    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, current_state)
+    call_log = tmp_path / "corpus-calls.log"
+    result = subprocess.run(
+        [
+            "python3",
+            "scripts/static_release_guard.py",
+            "--base",
+            "automain",
+            "--repo-root",
+            str(repo),
+        ],
+        cwd=repo,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "STATIC_GUARD_CALL_LOG": str(call_log),
+            "TASK_ID": "task-lazy-baseline-123",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert len(call_log.read_text().splitlines()) == expected_corpus_runs
 
 
 def test_new_static_finding_without_task_identity_fails_closed(tmp_path: Path) -> None:
