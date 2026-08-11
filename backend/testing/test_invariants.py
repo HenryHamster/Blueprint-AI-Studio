@@ -143,6 +143,51 @@ def _script_test_roster_residue(
     }
     return sorted(on_disk - roster - set(exemptions))
 
+
+def _script_test_has_discoverable_tests(source: str, *, filename: str) -> bool:
+    """Return whether pytest or unittest can discover a test in ``source``."""
+    try:
+        tree = ast.parse(source, filename=filename)
+    except (SyntaxError, UnicodeError):
+        return False
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test_"):
+                return True
+            continue
+        if not isinstance(node, ast.ClassDef):
+            continue
+
+        is_pytest_class = node.name.startswith("Test")
+        is_unittest_class = any(
+            (isinstance(base, ast.Name) and base.id == "TestCase")
+            or (isinstance(base, ast.Attribute) and base.attr == "TestCase")
+            for base in node.bases
+        )
+        if (is_pytest_class or is_unittest_class) and any(
+            isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and method.name.startswith("test_")
+            for method in node.body
+        ):
+            return True
+    return False
+
+
+def _script_test_execution_residue(
+    scripts_root: Path, filenames: set[str]
+) -> list[str]:
+    """Return classified script tests that cannot execute any test."""
+    residue: list[str] = []
+    for filename in sorted(filenames):
+        path = scripts_root / filename
+        if not path.is_file() or not _script_test_has_discoverable_tests(
+            path.read_text(encoding="utf-8"), filename=str(path)
+        ):
+            residue.append(filename)
+    return residue
+
+
 def _assert_backmerge_modules_do_not_import_rollup_management(
     source: str, *, filename: str
 ) -> None:
@@ -13587,7 +13632,9 @@ def test_script_roster_tripwire_detects_an_unclassified_file(tmp_path: Path):
     """A newly created scripts test must fail closed until classified."""
     scripts_root = tmp_path / "scripts"
     scripts_root.mkdir()
-    (scripts_root / "test_existing.py").write_text("", encoding="utf-8")
+    (scripts_root / "test_existing.py").write_text(
+        "def test_existing():\n    pass\n", encoding="utf-8"
+    )
     (scripts_root / "test_dark.py").write_text("", encoding="utf-8")
 
     assert _script_test_roster_residue(
@@ -13598,6 +13645,53 @@ def test_script_roster_tripwire_detects_an_unclassified_file(tmp_path: Path):
         {"test_existing.py"},
         {"test_dark.py": "requires a separately provisioned host"},
     )
+    assert _script_test_execution_residue(
+        scripts_root, {"test_existing.py", "test_dark.py"}
+    ) == ["test_dark.py"]
+
+
+def test_script_roster_tripwire_accepts_pytest_async_and_unittest_tests(
+    tmp_path: Path,
+):
+    """The execution check recognizes each supported Python test shape."""
+    scripts_root = tmp_path / "scripts"
+    scripts_root.mkdir()
+    (scripts_root / "test_pytest.py").write_text(
+        "def test_sync():\n    pass\n", encoding="utf-8"
+    )
+    (scripts_root / "test_async.py").write_text(
+        "async def test_async():\n    pass\n", encoding="utf-8"
+    )
+    (scripts_root / "test_unittest.py").write_text(
+        "import unittest\n\n"
+        "class LegacyCase(unittest.TestCase):\n"
+        "    def test_case(self):\n"
+        "        pass\n",
+        encoding="utf-8",
+    )
+
+    assert _script_test_execution_residue(
+        scripts_root,
+        {"test_pytest.py", "test_async.py", "test_unittest.py"},
+    ) == []
+
+
+def test_script_roster_tripwire_rejects_non_test_and_malformed_modules(
+    tmp_path: Path,
+):
+    """Syntax errors and ordinary helpers cannot satisfy the execution gate."""
+    scripts_root = tmp_path / "scripts"
+    scripts_root.mkdir()
+    (scripts_root / "test_helper.py").write_text(
+        "def helper():\n    pass\n", encoding="utf-8"
+    )
+    (scripts_root / "test_broken.py").write_text(
+        "def test_broken(:\n    pass\n", encoding="utf-8"
+    )
+
+    assert _script_test_execution_residue(
+        scripts_root, {"test_helper.py", "test_broken.py"}
+    ) == ["test_broken.py", "test_helper.py"]
 
 
 def test_every_script_test_is_rostered_or_has_a_written_exemption():
@@ -13681,6 +13775,12 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     assert not missing, (
         "Docker-less standalone execution omitted non-exempt roster entries: "
         + ", ".join(missing)
+    )
+    execution_residue = _script_test_execution_residue(scripts_root, on_disk)
+    assert not execution_residue, (
+        "classified scripts/test_*.py files contain no discoverable pytest or "
+        "unittest tests: "
+        + ", ".join(execution_residue)
     )
 
 

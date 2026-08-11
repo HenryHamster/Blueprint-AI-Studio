@@ -502,7 +502,8 @@ CI_TEST_MODULE_ROOTS=(
 
 # This is the executing roster for scripts/test_*.py. Keep every file either
 # here or in CI_SCRIPT_TEST_EXEMPTIONS below: backend/testing's CI-compliance
-# tripwire enumerates scripts/ on disk and rejects any unclassified test. The
+# tripwire enumerates scripts/ on disk, rejects unclassified tests, and rejects
+# classified files that contain no pytest- or unittest-discoverable test. The
 # harness is the path used by scripts/static_release_guard.py; the workflow's
 # existing runner-script job covers a subset independently.
 CI_SCRIPT_TEST_ROSTER=(
