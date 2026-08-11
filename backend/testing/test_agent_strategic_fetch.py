@@ -1557,6 +1557,82 @@ async def _make_project_with_version(db_session, *, vm="agent-vm-qual"):
 
 
 @pytest.mark.asyncio
+async def test_operator_authorship_receipt_uses_promoted_serving_range(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """A read validates the immutable promoted-to-served receipt range only."""
+    from unittest.mock import AsyncMock
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.release_commit_authorship import (
+        AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        AUTHORSHIP_RECEIPT_SOURCE,
+    )
+
+    project, task, _ = await _make_project_with_version(
+        db_session, vm="agent-vm-authorship-range"
+    )
+    promoted = ReleaseVersion(
+        project_id=project.id,
+        version_number=9,
+        status="promoted",
+        base_sha="a" * 40,
+        promoted_sha="b" * 40,
+        served_sha="c" * 40,
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        serving_status="serving_confirmed",
+        last_qualification={
+            "status": "promoted",
+            "operator_authored_commits": {
+                "source": AUTHORSHIP_RECEIPT_SOURCE,
+                "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+                "state": "resolved",
+                "count": 0,
+                "offenders": [],
+                "range": {"base_sha": "b" * 40, "head_sha": "c" * 40},
+                "measured_at": "2026-01-01T00:00:00+00:00",
+                "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+            },
+        },
+    )
+    db_session.add(promoted)
+    await db_session.commit()
+
+    monkeypatch.setattr("app.deployed_sha.get_serving_sha", lambda: "d" * 40)
+    count = AsyncMock(side_effect=AssertionError("read path recomputed authorship"))
+    monkeypatch.setattr("app.release_commit_authorship.count_non_bot_authored_commits", count)
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": create_agent_token(str(task.id), task.vm_instance_id)},
+    )
+
+    assert response.status_code == 200, response.text
+    report = response.json()["operator_authored_commits"]
+    assert report["state"] == "resolved"
+    assert report["count"] == 0
+    assert report["range"] == {"base_sha": "b" * 40, "head_sha": "c" * 40}
+    count.assert_not_awaited()
+
+    tampered_qualification = dict(promoted.last_qualification)
+    tampered_report = dict(tampered_qualification["operator_authored_commits"])
+    tampered_report["range"] = {"base_sha": "b" * 40, "head_sha": "d" * 40}
+    tampered_qualification["operator_authored_commits"] = tampered_report
+    promoted.last_qualification = tampered_qualification
+    flag_modified(promoted, "last_qualification")
+    db_session.add(promoted)
+    await db_session.commit()
+
+    tampered = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": create_agent_token(str(task.id), task.vm_instance_id)},
+    )
+    tampered_report = tampered.json()["operator_authored_commits"]
+    assert tampered_report["state"] == "unresolved"
+    assert tampered_report["reason"] == "stored_authorship_receipt_invalid"
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_qualification_returns_latest_verdict_findings(
     client: AsyncClient, db_session
 ):

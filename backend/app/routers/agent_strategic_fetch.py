@@ -56,6 +56,7 @@ from app.project_message_projection import (
 from app.qualification_state_resolver import apply_verdict_substitution
 from app.release_scoring import blocker_execution_site as _blocker_execution_site
 from app.release_commit_authorship import (
+    serving_authorship_range,
     unresolved_authorship_receipt,
     validate_authorship_receipt,
 )
@@ -1713,25 +1714,22 @@ async def agent_fetch_qualification(
         if isinstance(latest_promoted_qualification, dict)
         else None
     )
-    actual_base_sha = (
-        latest_promoted_version.base_sha if latest_promoted_version is not None else None
-    )
-    actual_head_sha = (
-        latest_promoted_version.served_sha if latest_promoted_version is not None else None
+    authorship_base_sha, authorship_head_sha = serving_authorship_range(
+        latest_promoted_version
     )
     validated_authorship = (
         validate_authorship_receipt(
             persisted_authorship,
-            actual_base_sha,
-            actual_head_sha,
+            authorship_base_sha,
+            authorship_head_sha,
         )
         if latest_promoted_version is not None
         and latest_promoted_version.serving_status == "serving_confirmed"
         else None
     )
     operator_authored_commits = validated_authorship or unresolved_authorship_receipt(
-        actual_base_sha,
-        actual_head_sha,
+        authorship_base_sha,
+        authorship_head_sha,
         "stored_authorship_receipt_invalid"
         if persisted_authorship is not None
         else "promotion_authorship_not_persisted",
