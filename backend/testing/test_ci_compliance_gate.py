@@ -2213,6 +2213,48 @@ def test_release_reconciliation_decomposition_resolves_size_breach():
         )
 
 
+def test_release_qualifier_sweep_decomposition_resolves_size_breach():
+    """The hotfix audit recovery cluster keeps the sweep under its old cap."""
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "release_qualifier_sweep.py"
+    assert backend_caps.get(target_rel) == 2150, (
+        f"{target_rel} cap must remain 2150 after decomposition; "
+        f"got {backend_caps.get(target_rel)}. Chronic offenders are decomposed, "
+        "never cap-bumped."
+    )
+
+    backend_app_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    target_path = os.path.join(backend_app_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    assert actual_count <= cap, (
+        f"{target_rel} has {actual_count} lines over its committed cap {cap}. "
+        "Extract the hotfix audit cluster instead of raising the cap."
+    )
+    assert not csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )["breach"]
+
+    sibling_path = os.path.join(backend_app_root, "release_qualifier_hotfix_audit.py")
+    assert os.path.isfile(sibling_path), (
+        "the hotfix audit recovery cluster must live in its sibling module"
+    )
+
+    from app import release_qualifier_hotfix_audit as hotfix_audit
+    from app import release_qualifier_sweep as sweep
+
+    assert sweep._reconcile_hotfix_audit_trail is hotfix_audit._reconcile_hotfix_audit_trail
+    assert sweep._hotfix_audit_recovery_candidate_ids is hotfix_audit._hotfix_audit_recovery_candidate_ids
+    assert hotfix_audit._hotfix_audit_was_attempted({"status": "promoted"}) is True
+    assert hotfix_audit._hotfix_audit_was_attempted({"status": "pending"}) is False
+
+
 def test_cap_bump_resolves_strategic_resident_session_breach():
     """After bumping caps via check_size_limits --fix,
     strategic_resident_session.py must be within its new cap on the real file
