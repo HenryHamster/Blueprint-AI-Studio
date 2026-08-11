@@ -432,7 +432,7 @@ async def get_all_tasks(
     query = (
         select(Task)
         .options(load_only(*_TASK_LIST_COLS, raiseload=True))
-        .order_by(Task.created_at.desc())
+        .order_by(Task.created_at.desc(), Task.id.desc())
         .offset(offset)
         .limit(limit)
     )

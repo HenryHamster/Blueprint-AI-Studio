@@ -138,11 +138,50 @@ def test_list_projects_scoped_credential_uses_access_profile(monkeypatch):
         blueprint_api,
         "api",
         lambda method, path, body=None: calls.append((method, path, body))
-        or {"projects": projects},
+        or {"projects": projects, "has_more": False},
     )
 
     assert blueprint_api.list_projects() == projects
-    assert calls == [("GET", "/api/agent-access/v1/me", None)]
+    assert calls == [
+        ("GET", "/api/agent-access/v1/me?limit=50&offset=0", None)
+    ]
+
+
+def test_list_projects_scoped_credential_follows_bounded_pages(monkeypatch):
+    calls = []
+    first_page = [
+        {"id": f"project-{index}", "name": f"Project {index}"}
+        for index in range(50)
+    ]
+    final_project = {"id": "project-50", "name": "Target on page two"}
+
+    def fake_api(method, path, body=None):
+        calls.append((method, path, body))
+        if "offset=0" in path:
+            return {
+                "projects": first_page,
+                "has_more": True,
+                "next_offset": 50,
+            }
+        return {"projects": [final_project], "has_more": False}
+
+    monkeypatch.setattr(
+        blueprint_api,
+        "load_config",
+        lambda: {"api_key": "bpsc_scoped-token"},
+    )
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+
+    assert blueprint_api.list_projects() == [*first_page, final_project]
+    assert blueprint_api.resolve_project_id_by_name("Target on page two") == (
+        "project-50"
+    )
+    assert calls == [
+        ("GET", "/api/agent-access/v1/me?limit=50&offset=0", None),
+        ("GET", "/api/agent-access/v1/me?limit=50&offset=50", None),
+        ("GET", "/api/agent-access/v1/me?limit=50&offset=0", None),
+        ("GET", "/api/agent-access/v1/me?limit=50&offset=50", None),
+    ]
 
 
 def test_strategic_chat_sends_required_idempotency_key(monkeypatch):

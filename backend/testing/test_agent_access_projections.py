@@ -2,7 +2,10 @@
 
 import json
 
-from app.routers.agent_access import _project_agent_snapshot
+from app.routers.agent_access import (
+    _project_agent_snapshot,
+    _project_agent_task_detail,
+)
 
 
 def test_coding_agent_snapshot_caps_escaped_controls_lists_and_secrets():
@@ -67,3 +70,38 @@ def test_coding_agent_snapshot_caps_escaped_controls_lists_and_secrets():
     assert secret not in serialized
     for sensitive_key in ("client_secret", "nested_bearer", "jwt"):
         assert sensitive_key not in serialized
+
+
+def test_coding_agent_projection_redacts_camel_case_secret_fields():
+    secrets = {
+        "accessToken": "access-token-secret",
+        "accessTokens": "access-tokens-secret",
+        "refreshTokens": "refresh-tokens-secret",
+        "clientSecret": "client-secret-value",
+        "clientSecrets": "client-secrets-value",
+        "privateKey": "private-key-value",
+        "privateKeys": "private-keys-value",
+        "accessKeyId": "access-key-id-value",
+        "authorizationHeader": "authorization-header-value",
+        "authHeader": "auth-header-value",
+        "APIKey": "api-key-value",
+        "apiKeys": "api-keys-value",
+    }
+    accounting = {"inputTokens": 10, "outputTokens": 20, "tokenCount": 30}
+    projected = _project_agent_task_detail(
+        {
+            "id": "00000000-0000-0000-0000-000000000501",
+            "project_id": "00000000-0000-0000-0000-000000000502",
+            "status": "FAILED",
+            "task_type": "fix",
+            "plan_output": {"nested": {**secrets, **accounting}},
+        }
+    )
+    serialized = json.dumps(projected, ensure_ascii=False)
+
+    assert projected["redaction"]["applied"] is True
+    for key, secret in secrets.items():
+        assert key not in serialized
+        assert secret not in serialized
+    for key, value in accounting.items():
+        assert projected["plan_output"]["nested"][key] == value

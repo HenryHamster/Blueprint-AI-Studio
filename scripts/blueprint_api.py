@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 CONFIG_FILE = ".blueprint-config.json"
+SCOPED_PROJECT_PAGE_LIMIT = 50
+SCOPED_PROJECT_CATALOG_MAX = 10_000
 
 _config_cache: dict | None = None
 
@@ -345,12 +347,43 @@ def list_projects() -> list[dict]:
     """Return all projects (each dict carries at least ``id`` and ``name``)."""
     config = load_config()
     if str(config.get("api_key") or "").startswith("bpsc_"):
-        profile = api("GET", "/api/agent-access/v1/me")
-        if not isinstance(profile, dict) or not isinstance(
-            profile.get("projects"), list
-        ):
-            raise APIError("Agent access profile did not return a project list")
-        return profile["projects"]
+        projects: list[dict] = []
+        offset = 0
+        while True:
+            profile = api(
+                "GET",
+                "/api/agent-access/v1/me"
+                f"?limit={SCOPED_PROJECT_PAGE_LIMIT}&offset={offset}",
+            )
+            if not isinstance(profile, dict) or not isinstance(
+                profile.get("projects"), list
+            ):
+                raise APIError("Agent access profile did not return a project list")
+            page = profile["projects"]
+            projects.extend(page)
+            if not profile.get("has_more"):
+                return projects
+            if not page:
+                raise APIError(
+                    "Agent access profile reported has_more=true but returned "
+                    "no projects"
+                )
+            if len(projects) >= SCOPED_PROJECT_CATALOG_MAX:
+                raise APIError(
+                    "Scoped project catalog exceeds the bounded CLI lookup limit; "
+                    "set BLUEPRINT_PROJECT_ID or project_id explicitly"
+                )
+            next_offset = profile.get("next_offset", offset + len(page))
+            if (
+                isinstance(next_offset, bool)
+                or not isinstance(next_offset, int)
+                or next_offset <= offset
+                or next_offset > SCOPED_PROJECT_CATALOG_MAX
+            ):
+                raise APIError(
+                    "Agent access profile returned an invalid next project offset"
+                )
+            offset = next_offset
 
     projects: list[dict] = []
     offset = 0

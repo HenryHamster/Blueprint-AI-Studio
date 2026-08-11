@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -14,6 +13,7 @@ from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.agent_access_redaction import is_secret_field
 from app.auth import get_current_user
 from app.admin import (
     _get_user_project,
@@ -103,63 +103,6 @@ _AGENT_TASK_SECTION_BUDGETS = {
         for section, budget in _AGENT_SNAPSHOT_SECTION_BUDGETS.items()
     },
 }
-
-_SECRET_FIELD_NAMES = frozenset(
-    {
-        "access_key",
-        "api_key",
-        "apikey",
-        "auth",
-        "authorization",
-        "bearer",
-        "client_secret",
-        "container_registry_auth",
-        "cookie",
-        "credentials",
-        "env",
-        "environment",
-        "headers",
-        "key",
-        "jwt",
-        "password",
-        "private_key",
-        "refresh_token",
-        "secret",
-        "signed_url",
-        "token",
-        "upload_url",
-        "download_url",
-    }
-)
-_SECRET_FIELD_PARTS = frozenset(
-    {
-        "authorization",
-        "bearer",
-        "cookie",
-        "credential",
-        "jwt",
-        "password",
-        "secret",
-    }
-)
-
-
-def _is_secret_field(key: Any) -> bool:
-    """Return whether a nested task-detail field is credential-bearing."""
-    normalized = re.sub(r"[^a-z0-9]+", "_", str(key).casefold()).strip("_")
-    if normalized in _SECRET_FIELD_NAMES:
-        return True
-    parts = {part for part in normalized.split("_") if part}
-    if parts & _SECRET_FIELD_PARTS:
-        return True
-    # Do not treat accounting fields such as input_tokens/token_count as
-    # secrets; only conventional credential-bearing *_token/*_key names.
-    if normalized.endswith("_token"):
-        return not normalized.endswith(("_tokens", "_token_count"))
-    if normalized.endswith("_key"):
-        return normalized not in {"dedupe_key", "idempotency_key", "logical_key"}
-    return normalized.endswith("_auth")
-
 
 def _new_projection_state(byte_budget: int) -> dict[str, int | bool]:
     return {
@@ -251,7 +194,7 @@ def _bounded_agent_value(
         if len(entries) > _AGENT_TASK_NESTED_COLLECTION_LIMIT:
             state["truncated"] = True
         for raw_key, nested in entries[:_AGENT_TASK_NESTED_COLLECTION_LIMIT]:
-            if _is_secret_field(raw_key):
+            if is_secret_field(raw_key):
                 state["redactions"] = int(state["redactions"]) + 1
                 continue
             key_clip = (
