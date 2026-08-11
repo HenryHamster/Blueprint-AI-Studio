@@ -496,46 +496,14 @@ CI_TEST_MODULE_ROOTS=(
   backend/testing
 )
 
-# This is the executing roster for scripts/test_*.py. Keep every file either
-# here or in CI_SCRIPT_TEST_EXEMPTIONS below: backend/testing's CI-compliance
-# tripwire enumerates scripts/ on disk, rejects unclassified tests, and rejects
-# classified files that contain no pytest- or unittest-discoverable test. The
-# harness is the path used by scripts/static_release_guard.py; the workflow's
-# existing runner-script job covers a subset independently.
-CI_SCRIPT_TEST_ROSTER=(
-  test_audit_tasks_prs.py
-  test_blueprint_cli.py
-  test_blueprint_livekit_cli.py
-  test_blueprint_mcp.py
-  test_blueprint_node.py
-  test_blueprint_runner.py
-  test_bootstrap_local_app_release.py
-  test_frontend_release_manifest.py
-  test_gcs_create_only_upload.py
-  test_github_actions_runner.py
-  test_github_actions_vm.py
-  test_guard_gate_left_shift.py
-  test_hermes_operator_cli.py
-  test_live_source_rehearsal_export.py
-  test_local_api_service.py
-  test_local_app_release.py
-  test_local_control_plane_services.py
-  test_local_postgres_backup_service.py
-  test_local_postgres_cutover.py
-  test_local_postgres_cutover_integration.py
-  test_local_postgres_rehearsal.py
-  test_local_postgres_service.py
-  test_local_runner.py
-  test_local_runner_livekit_guard.py
-  test_migrate_container_storage.py
-  test_runner_isolation.py
-  test_tailscale_funnel_service.py
-  test_viewport_manifest.py
-  test_walkthrough_stack.py
-)
+# Discover the scripts test corpus at runtime. This is intentionally a glob,
+# not a second per-file roster: a newly added scripts/test_*.py is picked up by
+# the standalone lane and by backend/testing/test_scripts_test_lane.py without
+# an unrelated list edit.
+CI_SCRIPT_TEST_DISCOVERY_GLOB="test_*.py"
 
 # Entries in this list need a capability that the Docker-less standalone lane
-# does not provide. They remain in the CI roster and are collected when the
+# does not provide. They remain in the CI collection and are collected when the
 # Docker capability is present; the reason makes a local omission reviewable.
 CI_SCRIPT_TEST_EXEMPTIONS=(
   "test_blueprint_cli.py|requires Blueprint operator API configuration and control-plane network"
@@ -552,12 +520,14 @@ else
   # Docker-less local runs are rooted at the checkout, not the /repo bind mount.
   SCRIPT_TEST_ROOT=../scripts
 fi
-# Expand the script corpus by capability. Every roster entry is collected in
+# Expand the discovered script corpus by capability. Every discovered entry is collected in
 # the standalone lane unless its written exemption names a capability absent
 # from this invocation. CI is deliberately not part of this decision: a
 # Docker-less CI-marked run has the same capabilities as any other Docker-less
-# run, and the roster tripwire below makes omissions fail closed.
-for script_test in "${CI_SCRIPT_TEST_ROSTER[@]}"; do
+# run, and the discovery tripwire below makes omissions fail closed.
+for script_path in "$SCRIPT_TEST_ROOT"/$CI_SCRIPT_TEST_DISCOVERY_GLOB; do
+  [ -f "$script_path" ] || continue
+  script_test="${script_path##*/}"
   script_test_exempt=0
   for exemption in "${CI_SCRIPT_TEST_EXEMPTIONS[@]}"; do
     [ "${exemption%%|*}" = "$script_test" ] || continue

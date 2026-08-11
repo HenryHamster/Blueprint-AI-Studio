@@ -99,17 +99,25 @@ def _test_module_has_intentional_zero_test_marker(path: Path) -> bool:
 def _parse_script_test_roster(
     harness: Path,
 ) -> tuple[set[str], dict[str, str]]:
-    """Parse the shell-owned executing roster and documented exemptions."""
+    """Parse the shell discovery policy and its documented exemptions."""
     source = harness.read_text(encoding="utf-8")
 
-    def _array_body(name: str) -> str:
-        match = re.search(
-            rf"^{name}=\((?P<body>.*?)(?:\n\)|\))",
-            source,
-            re.MULTILINE | re.DOTALL,
-        )
-        assert match is not None, f"{harness} must define {name}"
-        return match.group("body")
+    glob_match = re.search(
+        r'^CI_SCRIPT_TEST_DISCOVERY_GLOB="(?P<glob>[^"\n]+)"$',
+        source,
+        re.MULTILINE,
+    )
+    assert glob_match is not None, (
+        f"{harness} must define CI_SCRIPT_TEST_DISCOVERY_GLOB"
+    )
+    discovery_glob = glob_match.group("glob")
+
+    match = re.search(
+        r"^CI_SCRIPT_TEST_EXEMPTIONS=\((?P<body>.*?)(?:\n\)|\))",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"{harness} must define CI_SCRIPT_TEST_EXEMPTIONS"
 
     def _entries(body: str) -> list[str]:
         entries: list[str] = []
@@ -122,16 +130,15 @@ def _parse_script_test_roster(
             entries.append(values[0])
         return entries
 
-    roster = set(_entries(_array_body("CI_SCRIPT_TEST_ROSTER")))
     exemptions: dict[str, str] = {}
-    for entry in _entries(_array_body("CI_SCRIPT_TEST_EXEMPTIONS")):
+    for entry in _entries(match.group("body")):
         path, separator, reason = entry.partition("|")
         assert separator and reason.strip(), (
             f"CI script exemption {entry!r} must include an individual reason"
         )
         assert path not in exemptions, f"duplicate CI script exemption: {path}"
         exemptions[path] = reason.strip()
-    return roster, exemptions
+    return {discovery_glob}, exemptions
 
 
 def _script_test_roster_residue(
@@ -13695,10 +13702,10 @@ def test_script_roster_tripwire_rejects_non_test_and_malformed_modules(
     ) == ["test_broken.py", "test_helper.py"]
 
 
-def test_every_script_test_is_rostered_or_has_a_written_exemption():
-    """The shell roster cannot silently drift from scripts/test_*.py on disk."""
+def test_every_script_test_is_discovered_or_has_a_written_exemption():
+    """Runtime discovery cannot silently drift from scripts/test_*.py on disk."""
     harness = _script_test_harness()
-    roster, exemptions = _parse_script_test_roster(harness)
+    discovery_globs, exemptions = _parse_script_test_roster(harness)
     scripts_root = harness.parent
     on_disk = {
         path.name
@@ -13706,28 +13713,20 @@ def test_every_script_test_is_rostered_or_has_a_written_exemption():
         if path.is_file()
     }
 
-    residue = _script_test_roster_residue(scripts_root, roster, exemptions)
-    assert not residue, (
-        "scripts/test_*.py files are absent from the executing roster and the "
-        "explicit exemption list: "
-        + ", ".join(residue)
-    )
-    assert roster <= on_disk, (
-        "CI script roster names missing files: " + ", ".join(sorted(roster - on_disk))
+    assert discovery_globs == {"test_*.py"}, (
+        "CI script discovery must cover the complete scripts/test_*.py corpus: "
+        + ", ".join(sorted(discovery_globs))
     )
     assert set(exemptions) <= on_disk, (
         "CI script exemptions name missing files: "
         + ", ".join(sorted(set(exemptions) - on_disk))
     )
-    # A capability exemption is intentionally also a roster entry: it is
-    # collected when that capability is present and skipped only otherwise.
-    assert set(exemptions) <= roster
 
 
 def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path):
-    """Docker-less standalone execution must not silently drop roster entries."""
+    """Docker-less standalone execution must not silently drop discovered entries."""
     harness = _script_test_harness()
-    roster, exemptions = _parse_script_test_roster(harness)
+    _discovery_globs, exemptions = _parse_script_test_roster(harness)
     scripts_root = harness.parent
     on_disk = {
         path.name
@@ -13754,6 +13753,10 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     root_claude = harness.parent.parent / "CLAUDE.md"
     if root_claude.is_file():
         shutil.copy2(root_claude, run_root / "CLAUDE.md")
+    # The real checkout contains the discovered files.  Empty stand-ins are
+    # enough here because fake_python records argv rather than collecting them.
+    for filename in sorted(on_disk):
+        (run_scripts / filename).write_text("", encoding="utf-8")
     run_harness = run_scripts / harness.name
 
     for path in sorted(
@@ -13804,12 +13807,12 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     ]
     assert pytest_commands, "standalone harness did not invoke pytest"
     invoked = "\n".join(pytest_commands)
-    expected = roster - set(exemptions)
+    expected = on_disk - set(exemptions)
     missing = sorted(
         name for name in expected if f"../scripts/{name}" not in invoked
     )
     assert not missing, (
-        "Docker-less standalone execution omitted non-exempt roster entries: "
+        "Docker-less standalone execution omitted non-exempt discovered entries: "
         + ", ".join(missing)
     )
     execution_residue = _script_test_execution_residue(scripts_root, on_disk)
@@ -13874,9 +13877,9 @@ def test_dark_test_detector_requires_a_marker_for_intentional_zero_tests(
 
 
 def test_script_roster_selection_uses_capability_not_ci_marker():
-    """The standalone roster must use Docker capability, never CI labeling."""
+    """Discovery must use filesystem capability, never CI labeling."""
     source = _script_test_harness().read_text(encoding="utf-8")
-    assert 'for script_test in "${CI_SCRIPT_TEST_ROSTER[@]}"; do' in source
+    assert 'for script_path in "$SCRIPT_TEST_ROOT"/$CI_SCRIPT_TEST_DISCOVERY_GLOB; do' in source
     assert (
         'if [ "$script_test_exempt" = "1" ] && [ "$USE_DOCKER" != "1" ]; then'
     ) in source
