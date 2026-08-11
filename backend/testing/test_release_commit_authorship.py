@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
@@ -25,7 +24,6 @@ from app.release_commit_authorship import (
     reconcile_serving_authorship_evidence,
     validate_authorship_receipt,
 )
-from app.release_commit_authorship import _deadline_session, _settle_abandoned_cleanup
 from app.release_scoring import evaluate_merge_grade
 
 
@@ -1218,562 +1216,83 @@ async def test_reconciliation_scan_cleanup_failure_terminalizes_sweep(db_session
 
 
 @pytest.mark.asyncio
-async def test_deadline_session_always_exits_and_propagates_cleanup_failure():
-    """Uncertain cleanup is observable and cannot be followed by external work."""
-    class FailingContext:
-        def __init__(self):
-            self.exit_calls = 0
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            self.exit_calls += 1
-            raise RuntimeError("connection cleanup failed")
-
-    context = FailingContext()
-
-    def factory():
-        return context
-
-    with pytest.raises(RuntimeError, match="connection cleanup failed"):
-        async with _deadline_session(factory, time.monotonic() + 1):
-            raise asyncio.TimeoutError("operation budget exhausted")
-    assert context.exit_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_deadline_session_preserves_cancellation_when_cleanup_fails():
-    """Cleanup uncertainty must not turn caller cancellation into a normal error."""
-    class FailingContext:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            raise RuntimeError("connection cleanup failed")
-
-    async def cancel_body():
-        async with _deadline_session(FailingContext, time.monotonic() + 1):
-            raise asyncio.CancelledError
-
-    with pytest.raises(asyncio.CancelledError, match="") as caught:
-        await cancel_body()
-    assert any("cleanup failed while cancelled" in note for note in caught.value.__notes__)
-
-
-@pytest.mark.asyncio
-async def test_deadline_session_direct_close_skips_hidden_context_exit_task():
-    """AsyncSession-shaped resources use their actual close primitive."""
-    import app.release_commit_authorship as authorship
-
-    hidden_tasks = []
-    close_calls = 0
-    exit_calls = 0
-
-    async def hidden_cleanup():
-        await asyncio.sleep(3600)
-
-    class Session:
-        async def close(self):
-            nonlocal close_calls
-            close_calls += 1
-
-        async def invalidate(self):
-            return None
-
-    session = Session()
-
-    class Context:
-        async def __aenter__(self):
-            return session
-
-        async def __aexit__(self, *_exc_info):
-            nonlocal exit_calls
-            exit_calls += 1
-            hidden_tasks.append(asyncio.create_task(hidden_cleanup()))
-
-    async with _deadline_session(Context, time.monotonic() + 1):
-        pass
-
-    assert close_calls == 1
-    assert exit_calls == 0
-    assert hidden_tasks == []
-    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
-
-
-@pytest.mark.asyncio
-async def test_deadline_session_blocked_direct_close_is_owned_without_invalidate(mocker):
-    """A cancellation-resistant close keeps the slot and forbids concurrent invalidate."""
-    import app.release_commit_authorship as authorship
-
-    mocker.patch.object(authorship, "_RECONCILIATION_CLEANUP_GRACE_SECONDS", 0.01)
-    mocker.patch.object(
-        authorship, "_RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS", 0.01
-    )
-    release_close = asyncio.Event()
-    close_started = asyncio.Event()
-    invalidate_calls = 0
-
-    class Session:
-        async def close(self):
-            close_started.set()
-            try:
-                await release_close.wait()
-            except asyncio.CancelledError:
-                await release_close.wait()
-
-        async def invalidate(self):
-            nonlocal invalidate_calls
-            invalidate_calls += 1
-
-    class Context:
-        async def __aenter__(self):
-            return Session()
-
-        async def __aexit__(self, *_exc_info):
-            raise AssertionError("direct close must replace __aexit__")
-
-    with pytest.raises(authorship._ReconciliationCleanupError):
-        async with _deadline_session(Context, time.monotonic() + 1):
-            pass
-
-    await close_started.wait()
-    assert invalidate_calls == 0
-    assert len(authorship._RECONCILIATION_OWNED_CLEANUP_TASKS) == 1
-    assert len(authorship._RECONCILIATION_ACTIVE_RESERVATIONS) == 1
-
-    release_close.set()
-    for _ in range(10):
-        await asyncio.sleep(0)
-        if not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS:
-            break
-    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
-    assert not authorship._RECONCILIATION_ACTIVE_RESERVATIONS
-
-
-@pytest.mark.asyncio
-async def test_deadline_session_cooperative_child_cancellation_is_cleanup_error():
-    """Explicit child cancellation is observed as cleanup failure, not caller cancellation."""
-    import app.release_commit_authorship as authorship
-
-    calls = []
-
-    class Session:
-        async def close(self):
-            calls.append("close")
-            raise asyncio.CancelledError("child close")
-
-        async def invalidate(self):
-            calls.append("invalidate")
-            raise asyncio.CancelledError("child invalidate")
-
-    class Context:
-        async def __aenter__(self):
-            return Session()
-
-        async def __aexit__(self, *_exc_info):
-            raise AssertionError("direct close must replace __aexit__")
-
-    with pytest.raises(authorship._ReconciliationCleanupError, match="cancelled"):
-        async with _deadline_session(Context, time.monotonic() + 1):
-            pass
-
-    assert calls == ["close", "invalidate"]
-    assert not asyncio.current_task().cancelled()
-
-
-@pytest.mark.asyncio
-async def test_deadline_session_preserves_exact_cancellation_during_fallback_invalidate():
-    """A later cancellation cannot replace the original caller exception."""
-    import app.release_commit_authorship as authorship
-
-    first_cancel = asyncio.CancelledError("original caller")
-    invalidate_started = asyncio.Event()
-    release_invalidate = asyncio.Event()
-
-    class Session:
-        async def close(self):
-            raise RuntimeError("close failed")
-
-        async def invalidate(self):
-            invalidate_started.set()
-            await release_invalidate.wait()
-
-    class Context:
-        async def __aenter__(self):
-            return Session()
-
-        async def __aexit__(self, *_exc_info):
-            raise AssertionError("direct close must replace __aexit__")
-
-    async def use_session():
-        async with _deadline_session(Context, time.monotonic() + 1):
-            raise first_cancel
-
-    task = asyncio.create_task(use_session())
-    await invalidate_started.wait()
-    task.cancel("late cancellation")
-    with pytest.raises(asyncio.CancelledError) as caught:
-        await task
-    assert caught.value is first_cancel
-
-    release_invalidate.set()
-    for _ in range(10):
-        await asyncio.sleep(0)
-        if not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS:
-            break
-    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
-
-
-@pytest.mark.asyncio
-async def test_deadline_session_capacity_is_atomic_before_entry(mocker):
-    """Concurrent callers never enter beyond reserved slots and recover after release."""
-    import app.release_commit_authorship as authorship
-
-    mocker.patch.object(authorship, "_RECONCILIATION_MAX_OWNED_TERMINALIZATION_TASKS", 2)
-    releases = [asyncio.Event() for _ in range(3)]
-    entered_event = asyncio.Event()
-    factory_calls = 0
-    entered = 0
-    active = 0
-    maximum_active = 0
-
-    class Session:
-        async def close(self):
-            return None
-
-        async def invalidate(self):
-            return None
-
-    class Context:
-        async def __aenter__(self):
-            return Session()
-
-        async def __aexit__(self, *_exc_info):
-            raise AssertionError("direct close must replace __aexit__")
-
-    def factory():
-        nonlocal factory_calls
-        factory_calls += 1
-        return Context()
-
-    async def worker(index):
-        nonlocal active, entered, maximum_active
-        async with _deadline_session(factory, time.monotonic() + 2):
-            entered += 1
-            active += 1
-            maximum_active = max(maximum_active, active)
-            entered_event.set()
-            await releases[index].wait()
-            active -= 1
-
-    tasks = [asyncio.create_task(worker(index)) for index in range(3)]
-    while entered < 2:
-        await entered_event.wait()
-        entered_event.clear()
-    await asyncio.sleep(0)
-    assert factory_calls == 2
-    assert not tasks[2].done()
-    assert maximum_active == 2
-
-    releases[0].set()
-    while entered < 3:
-        await entered_event.wait()
-        entered_event.clear()
-    assert factory_calls == 3
-    for release in releases:
-        release.set()
-    await asyncio.gather(*tasks)
-    assert maximum_active == 2
-    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
-    assert not authorship._RECONCILIATION_ACTIVE_RESERVATIONS
-
-
-@pytest.mark.asyncio
-async def test_deadline_session_external_cancel_invalidates_before_owned_cleanup_reap():
-    """External cancellation cannot leave a blocked driver cleanup unowned."""
-    import app.release_commit_authorship as authorship
-
-    cleanup_started = asyncio.Event()
-    body_started = asyncio.Event()
-    first_cleanup_cancel = asyncio.Event()
-    release_cleanup = asyncio.Event()
-    invalidated = asyncio.Event()
-    factory_calls = 0
-
-    class Session:
-        async def invalidate(self):
-            invalidated.set()
-
-    session = Session()
-    baseline_task_count = len(asyncio.all_tasks())
-
-    class BlockingExit:
-        async def __aenter__(self):
-            return session
-
-        async def __aexit__(self, *_exc_info):
-            cleanup_started.set()
-            try:
-                await release_cleanup.wait()
-            except asyncio.CancelledError:
-                # Resist the forced cancellation long enough to cross the old
-                # 50ms branch; the caller must not regain control yet.
-                first_cleanup_cancel.set()
-                await release_cleanup.wait()
-            return False
-
-    def factory():
-        nonlocal factory_calls
-        factory_calls += 1
-        return BlockingExit()
-
-    async def use_session():
-        async with _deadline_session(factory, time.monotonic() + 1):
-            body_started.set()
-            await asyncio.sleep(3600)
-
-    task = asyncio.create_task(use_session())
-    await body_started.wait()
-    task.cancel("caller cancellation")
-    with pytest.raises(asyncio.CancelledError, match="caller cancellation"):
-        await task
-
-    assert factory_calls == 1
-    assert invalidated.is_set(), "the checked-out connection must be invalidated"
-    assert first_cleanup_cancel.is_set()
-    assert authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
-
-    release_cleanup.set()
-    for _ in range(5):
-        await asyncio.sleep(0)
-        if not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS:
-            break
-    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
-    assert len(asyncio.all_tasks()) == baseline_task_count
-
-
-@pytest.mark.asyncio
-async def test_deadline_session_grace_expiry_invalidates_before_forced_cleanup_reap(
-    mocker,
+async def test_reconciliation_returns_pool_checkout_when_cancelled_mid_sweep(
+    tmp_path, mocker
 ):
-    """Ordinary grace expiry follows the same invalidate-then-own protocol."""
-    import app.release_commit_authorship as authorship
+    """Cancellation during a real session returns its checkout to the pool."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlmodel import SQLModel
 
-    mocker.patch.object(authorship, "_RECONCILIATION_CLEANUP_GRACE_SECONDS", 0.01)
-    mocker.patch.object(
-        authorship, "_RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS", 0.01
+    from app.models import ReleaseAuthorshipReconciliationState
+
+    test_engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'authorship-cancellation.db'}",
+        pool_size=1,
+        max_overflow=0,
     )
-    cleanup_started = asyncio.Event()
-    first_cleanup_cancel = asyncio.Event()
-    release_cleanup = asyncio.Event()
-    invalidated = asyncio.Event()
-    baseline_task_count = len(asyncio.all_tasks())
-
-    class Session:
-        async def invalidate(self):
-            invalidated.set()
-
-    class BlockingExit:
-        async def __aenter__(self):
-            return Session()
-
-        async def __aexit__(self, *_exc_info):
-            cleanup_started.set()
-            try:
-                await release_cleanup.wait()
-            except asyncio.CancelledError:
-                first_cleanup_cancel.set()
-                await release_cleanup.wait()
-            return False
-
-    with pytest.raises(authorship._ReconciliationCleanupError):
-        async with _deadline_session(BlockingExit, time.monotonic() + 1):
-            pass
-
-    assert invalidated.is_set()
-    assert first_cleanup_cancel.is_set()
-    assert authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
-    release_cleanup.set()
-    for _ in range(5):
-        await asyncio.sleep(0)
-        if not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS:
-            break
-    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
-    assert len(asyncio.all_tasks()) == baseline_task_count
-
-
-@pytest.mark.asyncio
-async def test_deadline_session_bounds_and_owns_blocked_invalidate(mocker):
-    """A cancellation-resistant invalidate is bounded and remains explicitly owned."""
-    import app.release_commit_authorship as authorship
-
-    mocker.patch.object(authorship, "_RECONCILIATION_CLEANUP_GRACE_SECONDS", 0.01)
-    mocker.patch.object(
-        authorship, "_RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS", 0.01
-    )
-    release = asyncio.Event()
-    invalidate_started = asyncio.Event()
-    invalidate_cancelled = asyncio.Event()
-    cleanup_cancelled = asyncio.Event()
-    baseline_task_count = len(asyncio.all_tasks())
-
-    class Session:
-        async def invalidate(self):
-            invalidate_started.set()
-            try:
-                await release.wait()
-            except asyncio.CancelledError:
-                invalidate_cancelled.set()
-                await release.wait()
-
-    class BlockingExit:
-        async def __aenter__(self):
-            return Session()
-
-        async def __aexit__(self, *_exc_info):
-            try:
-                await release.wait()
-            except asyncio.CancelledError:
-                cleanup_cancelled.set()
-                await release.wait()
-
-    with pytest.raises(authorship._ReconciliationCleanupError):
-        async with _deadline_session(BlockingExit, time.monotonic() + 1):
-            pass
-
-    assert invalidate_started.is_set()
-    assert invalidate_cancelled.is_set()
-    assert cleanup_cancelled.is_set()
-    assert len(authorship._RECONCILIATION_OWNED_CLEANUP_TASKS) == 2
-
-    release.set()
-    for _ in range(10):
-        await asyncio.sleep(0)
-        if not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS:
-            break
-    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
-    assert len(asyncio.all_tasks()) == baseline_task_count
-
-
-@pytest.mark.asyncio
-async def test_deadline_session_preserves_original_cancel_during_final_settle(mocker):
-    """A second cancellation during the final grace cannot replace the first."""
-    import app.release_commit_authorship as authorship
-
-    mocker.patch.object(authorship, "_RECONCILIATION_CLEANUP_GRACE_SECONDS", 0.01)
-    mocker.patch.object(
-        authorship, "_RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS", 0.05
-    )
-    cleanup_cancelled = asyncio.Event()
-    release_cleanup = asyncio.Event()
-
-    class Session:
-        async def invalidate(self):
-            return None
-
-    class BlockingExit:
-        async def __aenter__(self):
-            return Session()
-
-        async def __aexit__(self, *_exc_info):
-            try:
-                await release_cleanup.wait()
-            except asyncio.CancelledError:
-                cleanup_cancelled.set()
-                await release_cleanup.wait()
-
-    async def use_session():
-        async with _deadline_session(BlockingExit, time.monotonic() + 1):
-            raise first_cancel
-
-    first_cancel = asyncio.CancelledError("original cancellation")
-    task = asyncio.create_task(use_session())
-    await cleanup_cancelled.wait()
-    task.cancel("late cancellation during final settle")
-
-    with pytest.raises(asyncio.CancelledError) as caught:
-        await task
-    assert caught.value is first_cancel
-
-    release_cleanup.set()
-    for _ in range(10):
-        await asyncio.sleep(0)
-        if not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS:
-            break
-    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
-
-
-@pytest.mark.asyncio
-async def test_settle_done_cleanup_success_is_observed_without_invalidation():
-    """A successful done-race is success and does not need terminalization."""
-    invalidated = False
-
-    class Session:
-        async def invalidate(self):
-            nonlocal invalidated
-            invalidated = True
-
-    async def cleanup_body():
-        return None
-
-    cleanup = asyncio.create_task(cleanup_body())
-    await asyncio.sleep(0)
-    assert await _settle_abandoned_cleanup(Session(), cleanup) is None
-    assert invalidated is False
-
-
-@pytest.mark.asyncio
-async def test_settle_done_cleanup_exception_is_observed_and_invalidates():
-    """A done cleanup exception is retrieved and still fences the session."""
-    invalidated = False
-
-    class Session:
-        async def invalidate(self):
-            nonlocal invalidated
-            invalidated = True
-
-    async def cleanup_body():
-        raise RuntimeError("done cleanup failed")
-
-    cleanup = asyncio.create_task(cleanup_body())
-    await asyncio.sleep(0)
-    error = await _settle_abandoned_cleanup(Session(), cleanup)
-    assert isinstance(error, RuntimeError)
-    assert str(error) == "done cleanup failed"
-    assert invalidated is True
-
-
-@pytest.mark.asyncio
-async def test_reconciliation_fails_closed_while_terminalization_is_owned(
-    mocker,
-):
-    """A bounded owned-task registry prevents another DB or measurement attempt."""
-    import app.release_commit_authorship as authorship
-
-    mocker.patch.object(authorship, "_RECONCILIATION_MAX_OWNED_TERMINALIZATION_TASKS", 1)
-    release = asyncio.Event()
-    owned = asyncio.create_task(release.wait())
-    assert authorship._adopt_cleanup_task(owned)
-    contexts_created = 0
-
-    def factory():
-        nonlocal contexts_created
-        contexts_created += 1
-        raise AssertionError("reconciliation must fail closed before creating a session")
-
-    measure = mocker.patch(
-        "app.release_commit_authorship.measure_serving_authorship_evidence",
-        new=AsyncMock(return_value=True),
+    session_factory = async_sessionmaker(
+        test_engine, class_=AsyncSession, expire_on_commit=False
     )
     try:
-        assert await reconcile_serving_authorship_evidence(factory, limit=1) == 0
-    finally:
-        owned.cancel()
+        async with test_engine.begin() as connection:
+            await connection.run_sync(SQLModel.metadata.create_all)
+        async with session_factory() as session:
+            project = Project(name="Cancellation pool", user_id="cancellation-pool")
+            version = ReleaseVersion(
+                project_id=project.id,
+                version_number=1,
+                status="promoted",
+                base_sha="a" * 40,
+                promoted_sha="a" * 40,
+                served_sha="b" * 40,
+                serving_status="serving_confirmed",
+                served_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                last_qualification={},
+            )
+            session.add_all([project, version, ReleaseAuthorshipReconciliationState(id=1)])
+            await session.commit()
+
+        checkout_started = asyncio.Event()
+
+        async def block_while_checked_out(session, *_args, **_kwargs):
+            await session.execute(text("SELECT 1"))
+            checkout_started.set()
+            await asyncio.Event().wait()
+
+        measure = mocker.patch(
+            "app.release_commit_authorship.measure_serving_authorship_evidence",
+            new=AsyncMock(return_value=True),
+        )
+        persist = mocker.patch(
+            "app.release_commit_authorship.persist_serving_authorship_evidence",
+            new=AsyncMock(side_effect=block_while_checked_out),
+        )
+        baseline_checkedout = test_engine.sync_engine.pool.checkedout()
+        baseline_tasks = len(asyncio.all_tasks())
+        reconciliation = asyncio.create_task(
+            reconcile_serving_authorship_evidence(session_factory, limit=1)
+        )
+        await checkout_started.wait()
+        assert test_engine.sync_engine.pool.checkedout() > baseline_checkedout
+
+        reconciliation.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await owned
-    assert contexts_created == 0
-    measure.assert_not_awaited()
+            await reconciliation
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if test_engine.sync_engine.pool.checkedout() == baseline_checkedout:
+                break
+        assert test_engine.sync_engine.pool.checkedout() == baseline_checkedout
+        assert len(asyncio.all_tasks()) == baseline_tasks
+
+        persist.side_effect = None
+        persist.return_value = {"receipt_identity": "retry"}
+        assert await reconcile_serving_authorship_evidence(session_factory, limit=1) == 1
+        measure.assert_awaited_once()
+    finally:
+        await test_engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1992,7 +1511,6 @@ async def test_migration_0755_to_0756_backfills_legacy_contract_audit_on_postgre
 async def test_reconciliation_stops_after_session_cleanup_failure(db_session, mocker):
     """A cleanup failure is terminal for the sweep, not a reason to try another row."""
     from app.database import AsyncSessionLocal
-    from app.release_commit_authorship import _ReconciliationCleanupError
 
     project = Project(name="Authorship cleanup terminal", user_id="authorship-cleanup")
     rows = [
@@ -2026,7 +1544,7 @@ async def test_reconciliation_stops_after_session_cleanup_failure(db_session, mo
         async def __aexit__(self, *exc_info):
             result = await self.context.__aexit__(*exc_info)
             if self.fail_cleanup:
-                raise _ReconciliationCleanupError("connection cleanup failed")
+                raise RuntimeError("connection cleanup failed")
             return result
 
     def session_factory():
