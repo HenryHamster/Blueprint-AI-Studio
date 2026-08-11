@@ -16,13 +16,14 @@ All pure / mocked — no DB.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from app import release_artifacts as artifact_registry
+from app.models import Project, ReleaseDeployArtifact, ReleaseVersion
 from app.release_artifacts import (
     AGENT_IMAGE_ARTIFACT_KIND,
     AGENT_IMAGE_FLEET_SOURCE_UNOBSERVABLE_REASON,
@@ -35,6 +36,7 @@ from app.release_artifacts import (
     summarize_release_artifacts,
     summarize_required_artifact_gap,
 )
+from app.release_qualifier_sweep import _serving_confirmation_candidate_ids
 
 _SHA = "a" * 40
 
@@ -358,6 +360,74 @@ def test_summarize_legacy_caller_projects_backend_scalar():
     by_kind = {e["artifact_kind"]: e for e in evidence}
     assert by_kind[BACKEND_REVISION_ARTIFACT_KIND]["serving_status"] == "unconfirmed"
     assert aggregate["serving_status"] == "unconfirmed"
+
+
+@pytest.mark.asyncio
+async def test_optional_agent_image_freshness_continues_after_required_artifacts_confirm(
+    db_session,
+):
+    """The sweep keeps selecting a confirmed release for its pending optional row.
+
+    Required backend/merge evidence is already terminal, so the aggregate must
+    remain serving-confirmed.  The persisted unconfirmed agent-image row is
+    nevertheless a live candidate for the next provider observation.
+    """
+    project = Project(
+        name="Artifact-Sweep-Test",
+        user_id="artifact-sweep-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    promoted_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        promoted_at=promoted_at,
+        promoted_sha=_SHA,
+        serving_status="serving_confirmed",
+        served_sha=_SHA,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                serving_status="serving_confirmed",
+                served_identifier=_SHA,
+            ),
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind=PROMOTION_MERGE_ARTIFACT_KIND,
+                serving_status="serving_confirmed",
+                served_identifier=_SHA,
+            ),
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind=AGENT_IMAGE_ARTIFACT_KIND,
+                serving_status="unconfirmed",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    aggregate, _evidence = summarize_release_artifacts(
+        version,
+        [
+            _Artifact(BACKEND_REVISION_ARTIFACT_KIND, "serving_confirmed"),
+            _Artifact(PROMOTION_MERGE_ARTIFACT_KIND, "serving_confirmed"),
+            _Artifact(AGENT_IMAGE_ARTIFACT_KIND, "unconfirmed"),
+        ],
+    )
+    assert aggregate == {"serving_status": "serving_confirmed", "reason_code": None}
+    assert await _serving_confirmation_candidate_ids(db_session) == [version.id]
 
 
 def test_summarize_deploy_identity_projects_backend_scalar(monkeypatch):

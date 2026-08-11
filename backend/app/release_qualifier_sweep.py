@@ -32,7 +32,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
-from app.release_artifacts import required_release_artifact_kinds
+from app.release_artifacts import iter_release_artifact_providers
 from app.release_promotion import _notify_operator, _resolve_github_with_session
 from app.release_reconciliation import (
     _confirm_serving_or_fail,
@@ -103,6 +103,53 @@ _MAX_SWEEP_CRASH_STREAK = 3
 # it a genuinely dead deploy stays loudly failed forever.  24h is generous enough
 # to cover the v5 ~5h-late case with wide margin.
 _DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS = 24 * 3600
+
+
+async def _serving_confirmation_candidate_ids(session) -> list:
+    """Return promoted versions whose serving evidence still needs a check.
+
+    The legacy version scalar remains a fast path for newly promoted releases,
+    but it is not the complete candidate state: optional provider rows remain
+    observable after the required aggregate confirms.  Include every persisted
+    row for a registered provider with a NULL/unconfirmed status so an optional
+    dimension such as ``agent_image`` cannot freeze after backend serving is
+    confirmed.  There is intentionally no fixed row cap: every candidate is
+    visited each sweep, in deterministic promoted-at/id order, and each
+    provider check already has its own confirmation deadline bound.
+    """
+    registered_artifact_kinds = tuple(
+        provider.artifact_kind for provider in iter_release_artifact_providers()
+    )
+    unresolved_filter = release_version.ReleaseVersion.serving_status == "unconfirmed"
+    if registered_artifact_kinds:
+        pending_artifact_exists = exists(
+            select(ReleaseDeployArtifact.id).where(
+                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
+                ReleaseDeployArtifact.artifact_kind.in_(registered_artifact_kinds),
+                or_(
+                    ReleaseDeployArtifact.serving_status.is_(None),
+                    ReleaseDeployArtifact.serving_status == "unconfirmed",
+                ),
+            )
+        )
+        unresolved_filter = or_(unresolved_filter, pending_artifact_exists)
+    return list(
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion.id)
+                .where(
+                    release_version.ReleaseVersion.status == "promoted",
+                    unresolved_filter,
+                )
+                .order_by(
+                    release_version.ReleaseVersion.promoted_at.asc().nullsfirst(),
+                    release_version.ReleaseVersion.id.asc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
 
 
 def _parse_started_at(qual: dict[str, Any]) -> datetime | None:
@@ -1835,42 +1882,7 @@ async def sweep_stuck_qualifications(
     # dedicated session, and either confirm it serving or land a distinct loud
     # deploy-failed state.  Unlike the loops above this scans PROMOTED versions
     # (the rest target ``open`` ones), so it runs its own narrow query.
-    required_artifact_kinds = required_release_artifact_kinds()
-    unresolved_filter = release_version.ReleaseVersion.serving_status == "unconfirmed"
-    if required_artifact_kinds:
-        pending_artifact_exists = exists(
-            select(ReleaseDeployArtifact.id).where(
-                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
-                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
-                or_(
-                    ReleaseDeployArtifact.serving_status.is_(None),
-                    ReleaseDeployArtifact.serving_status == "unconfirmed",
-                ),
-            )
-        )
-        # NOTE: We do NOT compare artifact row count against len(required_artifact_kinds).
-        # Per-project observable arming intentionally creates only the observable provider
-        # subset (e.g. only promotion_merge for non-deploy GitHub projects). Comparing
-        # against the global required count would always match external projects as
-        # "missing rows" and re-enter _confirm_serving_or_fail forever after resolution.
-        # The serving_status=="unconfirmed" scalar catches newly-promoted versions before
-        # any rows exist; pending_artifact_exists catches versions with unresolved rows.
-        unresolved_filter = or_(
-            unresolved_filter,
-            pending_artifact_exists,
-        )
-    unconfirmed_ids = list(
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion.id).where(
-                    release_version.ReleaseVersion.status == "promoted",
-                    unresolved_filter,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    unconfirmed_ids = await _serving_confirmation_candidate_ids(session)
     for version_id in unconfirmed_ids:
         try:
             resolved = await _confirm_serving_or_fail(
