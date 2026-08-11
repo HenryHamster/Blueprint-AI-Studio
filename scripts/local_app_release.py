@@ -438,6 +438,37 @@ def _cleanup_stale_registry_auth(expected_uid: int) -> None:
         _remove_registry_auth_directory(directory, expected_uid)
 
 
+def _pull_candidate_for_rehearsal(image_ref: str, install_user: str) -> None:
+    """Pull the exact candidate using the same ephemeral auth as activation."""
+    node_root = Path("/etc/blueprint/nodes") / install_user
+    worker_path = node_root / "roles" / "worker" / "role.env"
+    for directory in (
+        Path("/etc/blueprint"),
+        Path("/etc/blueprint/nodes"),
+        node_root,
+        node_root / "roles",
+        node_root / "roles" / "worker",
+    ):
+        _trusted_root_directory(directory)
+    worker_role = _secure_role_file(worker_path)
+    install_uid = _uid_for_user(install_user)
+    credential = _secure_registry_credential(
+        _role_value(worker_role, "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE"),
+        install_uid,
+    )
+    with _registry_auth(credential) as registry_config:
+        _run(
+            [
+                "/usr/bin/docker",
+                "--config",
+                str(registry_config),
+                "pull",
+                image_ref,
+            ],
+            timeout=600,
+        )
+
+
 @contextlib.contextmanager
 def _registry_auth(credential_text: str) -> Iterator[Path]:
     expected_uid = os.geteuid()
@@ -1292,7 +1323,7 @@ def _run_pre_stop_rehearsal(
 
 
 def rehearse(image_ref: str, revision: str) -> RehearsalReport:
-    """Validate a locally available candidate without pulling, stopping, or writing."""
+    """Pull and validate a candidate without deploying, stopping, or writing."""
     if not _is_root():
         raise PermissionError("local app rehearsal must run as root")
     if not _IMAGE_REF_RE.fullmatch(image_ref):
@@ -1302,6 +1333,7 @@ def rehearse(image_ref: str, revision: str) -> RehearsalReport:
     install_user = os.environ.get("SUDO_USER", "")
     if not _SYSTEM_USER_RE.fullmatch(install_user) or install_user == "root":
         raise ValueError("SUDO_USER must identify the non-root service account")
+    _pull_candidate_for_rehearsal(image_ref, install_user)
     bundle_sha256 = _verify_frontend(image_ref, revision)
     image_id = _inspect_candidate(image_ref, revision, bundle_sha256)
     target_schema_revision = _image_schema_revision(image_id)

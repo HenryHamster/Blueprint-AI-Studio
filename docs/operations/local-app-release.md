@@ -76,8 +76,9 @@ timeout.
 
 After the one-time bootstrap has installed the deploy-agent and release
 executor, rehearse the exact candidate before every release. Run this before
-stopping any unit. The candidate must already be available to Docker; rehearsal
-does not pull from Artifact Registry.
+stopping any unit. Rehearsal pulls the exact digest from Artifact Registry
+through the same ephemeral worker credential boundary as a real release, then
+removes the temporary Docker credential configuration.
 
 For the bootstrap entrypoint in the reviewed bootstrap directory:
 
@@ -123,7 +124,7 @@ run prints `LOCAL_APP_RELEASE_REHEARSAL` with `units_stopped: false` and proves:
 It does not apply the migration or verify the post-migration schema, stop or
 start units, or perform candidate API, worker, leadership, or public health
 checks. A green rehearsal is therefore a precondition gate, not a release
-success guarantee. It also does not pull the candidate image.
+success guarantee. It pulls only the candidate image and does not deploy it.
 
 If rehearsal exits non-zero or prints `ERROR`, do not run the release command
 and do not stop units. Fix the reported input or select a valid candidate,

@@ -7,6 +7,7 @@ existing imports keep working.
 import asyncio
 import re
 import time
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
@@ -637,11 +638,13 @@ async def dispatch_workflow_run(
     workflow_file: str,
     ref: str,
     project_id: str | None = None,
+    inputs: Mapping[str, str] | None = None,
 ) -> bool:
     """Trigger a ``workflow_dispatch`` run of ``workflow_file`` on ``ref``.
 
     POSTs to ``/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches``
-    with body ``{"ref": ref}``.  Returns True on GitHub's documented 204 success,
+    with body ``{"ref": ref, "inputs": inputs}`` when inputs are supplied,
+    otherwise the legacy ``{"ref": ref}`` body. Returns True on GitHub's documented 204 success,
     False (with a warning log) on any other status or on any transport error.
     Never raises — graceful degradation, mirroring the sibling read-only helpers
     (:func:`get_workflow_run_for_sha`, :func:`rerun_failed_jobs`).  The workflow
@@ -658,7 +661,11 @@ async def dispatch_workflow_run(
             f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/"
             f"{workflow_file}/dispatches",
             headers,
-            json={"ref": ref},
+            json=(
+                {"ref": ref, "inputs": dict(inputs)}
+                if inputs is not None
+                else {"ref": ref}
+            ),
             project_id=project_id,
             timeout=10.0,
         )

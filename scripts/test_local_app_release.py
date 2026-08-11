@@ -1090,10 +1090,11 @@ class LocalAppReleaseTests(unittest.TestCase):
         self.assertIn("migration apply", report.deferred[0])
         self.assertEqual(report.as_dict()["units_stopped"], False)
 
-    def test_rehearse_discovers_candidate_without_registry_pull(self):
+    def test_rehearse_pulls_candidate_with_registry_auth_before_checks(self):
         with (
             patch.object(release, "_is_root", return_value=True),
             patch.dict(os.environ, {"SUDO_USER": "henry_hamster"}, clear=True),
+            patch.object(release, "_pull_candidate_for_rehearsal") as pull,
             patch.object(release, "_verify_frontend", return_value="e" * 64),
             patch.object(release, "_inspect_candidate", return_value=NEW_IMAGE),
             patch.object(release, "_image_schema_revision", return_value="0742"),
@@ -1112,6 +1113,7 @@ class LocalAppReleaseTests(unittest.TestCase):
             report = release.rehearse(IMAGE_REF, REVISION)
 
         self.assertEqual(report.candidate, IMAGE_REF)
+        pull.assert_called_once_with(IMAGE_REF, "henry_hamster")
         rehearsal.assert_called_once_with(
             NEW_IMAGE, IMAGE_REF, REVISION, "henry_hamster", "0742", "0742"
         )

@@ -75,6 +75,26 @@ class TestExtractPytestSelectors:
         assert _extract_pytest_selectors(None) == []
 
 
+@pytest.mark.asyncio
+async def test_dispatch_workflow_run_sends_explicit_inputs_when_requested():
+    response = _make_response(204)
+    request = AsyncMock(return_value=response)
+    with patch.object(github_checks, "_github_request", new=request):
+        assert await github_checks.dispatch_workflow_run(
+            "token",
+            "owner",
+            "repo",
+            "deploy.yml",
+            "release-v17",
+            inputs={"deploy_frontend": "false", "deploy_agent": "false"},
+        )
+
+    assert request.await_args.kwargs["json"] == {
+        "ref": "release-v17",
+        "inputs": {"deploy_frontend": "false", "deploy_agent": "false"},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Job-logs fetch: non-200 responses must emit a WARNING (Fix 2 regression)
 # ---------------------------------------------------------------------------

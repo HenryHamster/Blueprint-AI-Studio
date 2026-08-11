@@ -1945,6 +1945,79 @@ class _ActivationReceiptBody(BaseModel):
     rehearsal: Dict[str, Any] | None = None
 
 
+@router.post("/projects/{project_id}/release-versions/{version_number}/prepromotion-rehearsal")
+async def request_prepromotion_rehearsal(
+    project_id: uuid.UUID,
+    version_number: int,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Dispatch an image-only rehearsal for the exact open release candidate.
+
+    The workflow ref is the already-created ``release-vN`` branch.  Explicit
+    workflow inputs keep Firebase, Cloud Run agent, migrations, and backend
+    deployment disabled; the backend image build remains enabled so the host
+    can pull the candidate digest for its read-only pre-stop checks.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="admin"
+    )
+    version = (
+        await session.execute(
+            select(ReleaseVersion).where(
+                ReleaseVersion.project_id == project_id,
+                ReleaseVersion.version_number == version_number,
+            )
+        )
+    ).scalars().first()
+    if version is None:
+        raise HTTPException(status_code=404, detail="Release version not found.")
+    if version.status != "open":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Release version {version_number} is not an open candidate.",
+        )
+    candidate_sha = str((version.last_qualification or {}).get("candidate_sha") or "")
+    if not _SHA40_RE.fullmatch(candidate_sha):
+        raise HTTPException(
+            status_code=409,
+            detail="The open release version has no full candidate SHA to rehearse.",
+        )
+
+    from app.release_prepromotion_rehearsal import (
+        PREPROMOTION_REHEARSAL_INPUTS,
+        PREPROMOTION_REHEARSAL_WORKFLOW,
+        dispatch_prepromotion_rehearsal,
+        prepromotion_rehearsal_ref,
+    )
+    from app.release_promotion import _resolve_github_with_session
+
+    resolved = await _resolve_github_with_session(session, project)
+    if resolved is None:
+        raise HTTPException(status_code=503, detail="GitHub credentials unavailable.")
+    token, owner, repo = resolved
+    dispatched = await dispatch_prepromotion_rehearsal(
+        token,
+        owner,
+        repo,
+        version_number,
+        project_id=str(project_id),
+    )
+    if not dispatched:
+        raise HTTPException(
+            status_code=503,
+            detail="Candidate rehearsal workflow could not be dispatched.",
+        )
+    return {
+        "version_number": version_number,
+        "candidate_sha": candidate_sha,
+        "workflow": PREPROMOTION_REHEARSAL_WORKFLOW,
+        "ref": prepromotion_rehearsal_ref(version_number),
+        "inputs": dict(PREPROMOTION_REHEARSAL_INPUTS),
+        "status": "dispatched",
+    }
+
+
 @router.post("/projects/{project_id}/activation-receipt")
 async def record_activation_receipt(
     project_id: uuid.UUID,

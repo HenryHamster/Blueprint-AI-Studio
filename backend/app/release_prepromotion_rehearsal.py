@@ -12,8 +12,50 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from app import github
+
 PREPROMOTION_REHEARSAL_KIND = "blueprint.local_app_release_rehearsal.v1"
+PREPROMOTION_REHEARSAL_WORKFLOW = "deploy.yml"
+PREPROMOTION_REHEARSAL_INPUTS: dict[str, str] = {
+    # Building the backend image is needed so the host can pull the candidate.
+    # deploy-backend is independently gated by recovery_data_reconciled in the
+    # workflow; these explicit false values fence every other side effect.
+    "deploy_backend": "true",
+    "deploy_frontend": "false",
+    "deploy_agent": "false",
+    "run_migrations": "false",
+    "recovery_data_reconciled": "false",
+}
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def prepromotion_rehearsal_ref(version_number: int) -> str:
+    """Return the candidate-pinned release branch ref used by the build."""
+    if isinstance(version_number, bool) or not isinstance(version_number, int):
+        raise ValueError("release version number must be an integer")
+    if version_number < 1:
+        raise ValueError("release version number must be positive")
+    return f"release-v{version_number}"
+
+
+async def dispatch_prepromotion_rehearsal(
+    token: str,
+    owner: str,
+    repo: str,
+    version_number: int,
+    *,
+    project_id: str | None = None,
+) -> bool:
+    """Build the candidate image without granting deploy workflow side effects."""
+    return await github.dispatch_workflow_run(
+        token,
+        owner,
+        repo,
+        PREPROMOTION_REHEARSAL_WORKFLOW,
+        prepromotion_rehearsal_ref(version_number),
+        project_id=project_id,
+        inputs=PREPROMOTION_REHEARSAL_INPUTS,
+    )
 
 
 def validate_prepromotion_rehearsal_receipt(
@@ -89,15 +131,13 @@ def apply_rehearsal_evidence(
     """Upgrade the matching acceptance category from the persisted receipt.
 
     The host receipt is machine evidence for this one contract.  Other
-    categories retain the grader's result unchanged, and a missing/mismatched
-    receipt leaves the category untouched (therefore not-met/partial remains a
-    blocker).
+    categories retain the grader's result unchanged.  A missing or mismatched
+    receipt explicitly forces the rehearsal category to ``not_met`` so the
+    qualifier fails closed.
     """
     if category_verdicts is None:
         return None
     valid = persisted_rehearsal_for_candidate(receipt, candidate_sha)
-    if valid is None:
-        return category_verdicts
     rehearsal_keys = {
         str(category.get("category_key") or "")
         for category in active_categories
@@ -105,6 +145,19 @@ def apply_rehearsal_evidence(
     }
     if not rehearsal_keys:
         return category_verdicts
+    if valid is None:
+        return [
+            {
+                **verdict,
+                "status": "not_met",
+                "tier": "machine",
+                "gap": "candidate-bound pre-promotion rehearsal receipt is absent",
+                "citations": [],
+            }
+            if str((verdict or {}).get("category_key") or "") in rehearsal_keys
+            else verdict
+            for verdict in category_verdicts
+        ]
     citation = {"kind": "test", "ref": "release_prepromotion_rehearsal"}
     return [
         {
