@@ -4820,7 +4820,7 @@ async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
         project_id=project.id,
         version_number=0,
         status="promoted",
-        base_sha="a" * 40,
+        promoted_sha="a" * 40,
         served_sha="b" * 40,
         serving_status="serving_confirmed",
         last_qualification={"operator_authored_commits": receipt} if receipt else {},

@@ -2175,6 +2175,88 @@ async def _check_lts_sync_gate(
         "requested_probes": sorted(requested_probes),
     }
 
+
+async def _ensure_prepromotion_rehearsal_dispatch(
+    version: release_version.ReleaseVersion,
+    project: Project,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    candidate_sha: str,
+) -> tuple[bool, dict[str, Any]]:
+    """Ensure the candidate has one automatic pre-promotion rehearsal dispatch.
+
+    This runs under the ``ReleaseVersion`` row lock.  The immutable host receipt
+    is the strongest idempotency signal; before it arrives, the persisted
+    same-candidate dispatch marker prevents qualification retries from creating
+    duplicate workflow runs.  A dispatch failure is returned to the caller so
+    qualification records a visible gate error instead of proceeding without
+    the required rehearsal.
+    """
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        dispatch_prepromotion_rehearsal,
+        persisted_rehearsal_for_candidate,
+    )
+
+    if persisted_rehearsal_for_candidate(
+        getattr(version, "prepromotion_rehearsal_receipt", None), candidate_sha
+    ) is not None:
+        return True, {
+            "status": "receipt_present",
+            "candidate_sha": candidate_sha,
+        }
+
+    prior = version.last_qualification or {}
+    prior_dispatch = prior.get("prepromotion_rehearsal_dispatch")
+    if (
+        isinstance(prior_dispatch, dict)
+        and prior_dispatch.get("candidate_sha") == candidate_sha
+        and prior_dispatch.get("status") == "dispatched"
+    ):
+        return True, dict(prior_dispatch)
+
+    try:
+        dispatched = await dispatch_prepromotion_rehearsal(
+            token,
+            owner,
+            repo,
+            version.version_number,
+            project_id=str(project.id),
+        )
+    except Exception as exc:  # noqa: BLE001 — surface workflow failures as a gate
+        logger.warning(
+            "[RELEASE_QUALIFIER] pre-promotion rehearsal dispatch failed for "
+            "v%d candidate %s: %s",
+            version.version_number,
+            candidate_sha[:8],
+            exc,
+            exc_info=True,
+        )
+        return False, {
+            "status": "dispatch_failed",
+            "candidate_sha": candidate_sha,
+            "detail": f"{type(exc).__name__}: {exc}"[:300],
+        }
+
+    if not dispatched:
+        logger.warning(
+            "[RELEASE_QUALIFIER] pre-promotion rehearsal dispatch returned false "
+            "for v%d candidate %s",
+            version.version_number,
+            candidate_sha[:8],
+        )
+        return False, {
+            "status": "dispatch_failed",
+            "candidate_sha": candidate_sha,
+            "detail": "workflow dispatch returned false",
+        }
+
+    return True, {
+        "status": "dispatched",
+        "candidate_sha": candidate_sha,
+    }
+
 async def run_qualification(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -2229,7 +2311,9 @@ async def run_qualification(
     the in-flight check, the child spawns, and the ``last_qualification``
     write — that ReleaseVersion lock (not the strategic path's Project lock) is
     what serializes the race.  The GitHub I/O that resolves ``candidate_sha``
-    runs BEFORE the lock to keep the locked window short.
+    runs BEFORE the lock to keep the locked window short; the bounded rehearsal
+    dispatch is the intentional exception because it must be serialized by the
+    version lock.
 
     Steps (none of which block on the spawned children):
       1. Resolve the project's owner/repo/GitHub token.
@@ -2238,7 +2322,8 @@ async def run_qualification(
          side).  ``ci_green`` is recorded but not acted on here — the composite
          in ``_finalize_qualification`` applies it as a hard blocker.
       4. Lock the ``ReleaseVersion`` row, then re-check the in-flight /
-         cached-verdict guards under the lock.
+         cached-verdict guards under the lock and ensure the candidate rehearsal
+         is dispatched exactly once.
       5. Spawn one holistic final review, plus only the product probes
          explicitly selected by the qualification requester. Their
          payloads carry the exact ``candidate_sha`` so every gate evaluates the
@@ -2788,6 +2873,41 @@ async def run_qualification(
             version.version_number,
         )
         return _promo
+
+    rehearsal_dispatch_ok, rehearsal_dispatch = (
+        await _ensure_prepromotion_rehearsal_dispatch(
+            version,
+            project,
+            token=token,
+            owner=owner,
+            repo=repo,
+            candidate_sha=candidate_sha,
+        )
+    )
+    if not rehearsal_dispatch_ok:
+        detail = str(rehearsal_dispatch.get("detail") or "dispatch failed")
+        version.last_qualification = {
+            **(version.last_qualification or {}),
+            "status": "error",
+            "error": "prepromotion_rehearsal_dispatch_failed",
+            "blocker": "prepromotion_rehearsal_dispatch_failed",
+            "candidate_sha": candidate_sha,
+            "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
+            "detail": detail,
+            "started_at": _utcnow().isoformat(),
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
+            "requested_probes": sorted(effective_requested_probes),
+        }
+        flag_modified(version, "last_qualification")
+        session.add(version)
+        return {
+            "status": "prepromotion_rehearsal_dispatch_failed",
+            "blocker": "prepromotion_rehearsal_dispatch_failed",
+            "candidate_sha": candidate_sha,
+            "detail": detail,
+        }
 
     # Snapshot the merge-state signal under the version lock that owns the
     # qualification launch; promotion scoring stays unchanged.
@@ -3551,6 +3671,7 @@ async def run_qualification(
         "retry_episode": retry_episode,
         "retry_episode_cap": retry_episode_cap,
         "candidate_sha": candidate_sha,
+        "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
         "candidate_diff_hash": candidate_diff_hash,
         "stranded_approved_prs": stranded_approved_prs,
         "audited_surface_paths": candidate_audited_surface or None,
