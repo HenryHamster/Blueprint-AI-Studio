@@ -46,17 +46,20 @@ def _base_ref(repo: Path, base: str) -> str:
 
 
 def _extract_base(repo: Path, ref: str, destination: Path) -> None:
-    archive = subprocess.Popen(
-        ["git", "-c", f"safe.directory={repo}", "archive", ref],
-        cwd=repo,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert archive.stdout is not None
-    with tarfile.open(fileobj=archive.stdout, mode="r|") as bundle:
-        bundle.extractall(destination, filter="data")
-    if archive.wait() != 0:
-        stderr = archive.stderr.read().decode("utf-8", errors="replace") if archive.stderr else ""
+    with tempfile.TemporaryFile() as stderr_file:
+        archive = subprocess.Popen(
+            ["git", "-c", f"safe.directory={repo}", "archive", ref],
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+        )
+        assert archive.stdout is not None
+        with tarfile.open(fileobj=archive.stdout, mode="r|") as bundle:
+            bundle.extractall(destination, filter="data")
+        return_code = archive.wait()
+        stderr_file.seek(0)
+        stderr = stderr_file.read().decode("utf-8", errors="replace")
+    if return_code != 0:
         raise RuntimeError(f"git archive {ref} failed: {stderr.strip()}")
 
 

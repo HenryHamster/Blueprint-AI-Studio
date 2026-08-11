@@ -2,21 +2,95 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import subprocess
+import sys
+import tarfile
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "backend"))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+import backend_verification_guard
+import static_release_guard
 
 
 def test_static_guard_base_unpack_uses_data_filter() -> None:
     """The internal git-archive unpack still uses an explicit safe filter."""
     source = (REPO_ROOT / "scripts" / "static_release_guard.py").read_text()
     assert 'bundle.extractall(destination, filter="data")' in source
+
+
+def test_static_scope_matches_path_boundaries() -> None:
+    assert static_release_guard._is_static_scope("backend/testing/test_guard.py")
+    assert static_release_guard._is_static_scope("check")
+    assert not static_release_guard._is_static_scope("checklist/results.txt")
+    assert not static_release_guard._is_static_scope("scripts/test-backend.sh.bak")
+
+
+class _OrderedStderr:
+    def __init__(self, process: _ArchiveProcess) -> None:
+        self._process = process
+
+    def read(self) -> bytes:
+        assert self._process.waited, "stderr must be read only after the archive exits"
+        return b""
+
+
+class _ArchiveProcess:
+    def __init__(self, archive_bytes: bytes) -> None:
+        self.stdout = io.BytesIO(archive_bytes)
+        self.waited = False
+        self.stderr = _OrderedStderr(self)
+
+    def wait(self) -> int:
+        self.waited = True
+        return 0
+
+
+def _archive_bytes() -> bytes:
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w") as archive:
+        content = b"archive payload\n"
+        member = tarfile.TarInfo("payload.txt")
+        member.size = len(content)
+        archive.addfile(member, io.BytesIO(content))
+    return payload.getvalue()
+
+
+@pytest.mark.parametrize(
+    "extractor",
+    [static_release_guard._extract_base, backend_verification_guard._extract_base],
+)
+def test_archive_extractors_drain_stderr_without_a_pipe_or_read_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    extractor,
+) -> None:
+    process = _ArchiveProcess(_archive_bytes())
+    popen_calls = []
+
+    def fake_popen(*args, **kwargs):
+        popen_calls.append(kwargs)
+        assert kwargs["stderr"] is not subprocess.PIPE
+        return process
+
+    monkeypatch.setattr(static_release_guard.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(backend_verification_guard.subprocess, "Popen", fake_popen)
+
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    extractor(tmp_path / "repo", "automain", destination)
+
+    assert process.waited
+    assert (destination / "payload.txt").read_bytes() == b"archive payload\n"
+    assert len(popen_calls) == 1
 
 
 def test_check_runs_static_guard_only_for_test_gate() -> None:

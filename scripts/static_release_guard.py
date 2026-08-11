@@ -57,23 +57,30 @@ def _changed_files(repo: Path, base: str) -> list[str]:
 
 
 def _is_static_scope(path: str) -> bool:
-    return path.startswith(STATIC_PATH_PREFIXES)
+    normalized = path.replace("\\", "/").strip("/")
+    return any(
+        normalized == prefix.rstrip("/")
+        or normalized.startswith(f"{prefix.rstrip('/')}/")
+        for prefix in STATIC_PATH_PREFIXES
+    )
 
 
 def _extract_base(repo: Path, ref: str, destination: Path) -> None:
-    archive = subprocess.Popen(
-        ["git", "-c", f"safe.directory={repo}", "archive", ref],
-        cwd=repo,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert archive.stdout is not None
-    try:
-        with tarfile.open(fileobj=archive.stdout, mode="r|") as bundle:
-            bundle.extractall(destination, filter="data")
-    finally:
-        stderr = archive.stderr.read().decode("utf-8", errors="replace") if archive.stderr else ""
-        return_code = archive.wait()
+    with tempfile.TemporaryFile() as stderr_file:
+        archive = subprocess.Popen(
+            ["git", "-c", f"safe.directory={repo}", "archive", ref],
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+        )
+        assert archive.stdout is not None
+        try:
+            with tarfile.open(fileobj=archive.stdout, mode="r|") as bundle:
+                bundle.extractall(destination, filter="data")
+        finally:
+            return_code = archive.wait()
+            stderr_file.seek(0)
+            stderr = stderr_file.read().decode("utf-8", errors="replace")
     if return_code != 0:
         raise RuntimeError(f"git archive {ref} failed ({return_code}): {stderr.strip()}")
 
