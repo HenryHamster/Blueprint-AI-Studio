@@ -7,10 +7,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.auth import create_agent_token
 from app.models import Project, ReleaseVersion, Task
-from app.release_commit_authorship import count_non_bot_authored_commits
+from app.release_commit_authorship import (
+    AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+    AUTHORSHIP_RECEIPT_SOURCE,
+    count_non_bot_authored_commits,
+    persist_serving_authorship_evidence,
+)
 
 
 class _GitHubResponse:
@@ -45,7 +51,7 @@ def _compare(base: str, head: str, commits: list[dict], *, total: int | None = N
         "ahead_by": total,
         "total_commits": total,
         "merge_base_commit": {"sha": base},
-        "head_commit": {"sha": head},
+        "base_commit": {"sha": base},
         "commits": commits,
         **extra,
     }
@@ -190,6 +196,7 @@ async def test_compare_paginates_101_commits_and_requires_unique_complete_pages(
         )
         for index in range(1, 102)
     ]
+    commits[-1]["sha"] = head
     project = Project(id="release-authorship-pages", github_owner="owner", github_repo="repo")
     requests = []
 
@@ -214,7 +221,7 @@ async def test_compare_paginates_101_commits_and_requires_unique_complete_pages(
     ("mutate", "reason"),
     [
         (lambda body, base, head: body.update({"merge_base_commit": {"sha": "c" * 40}}), "malformed_github_range"),
-        (lambda body, base, head: body.update({"head_commit": {"sha": "c" * 40}}), "malformed_github_range"),
+        (lambda body, base, head: body.update({"base_commit": {"sha": "c" * 40}}), "malformed_github_range"),
         (lambda body, base, head: body.update({"total_commits": 2}), "malformed_github_range"),
         (
             lambda body, base, head: body.update(
@@ -242,6 +249,64 @@ async def test_malformed_compare_evidence_stays_unresolved(monkeypatch, mutate, 
 
     assert report["state"] == "unresolved"
     assert report["reason"] == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "ahead_by", "total", "reason"),
+    [
+        ("identical", 1, 1, "range_identity_mismatch"),
+        ("ahead", 0, 0, "range_identity_mismatch"),
+    ],
+)
+async def test_compare_rejects_contradictory_identity_states(
+    monkeypatch, status, ahead_by, total, reason
+):
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    body = _compare(base, head, [_github_commit(head, "Henry Example")])
+    body.update({"status": status, "ahead_by": ahead_by, "total_commits": total})
+    if total == 0:
+        body["commits"] = []
+    project = Project(id="release-authorship-contradiction", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    monkeypatch.setattr(
+        github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, body))
+    )
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "unresolved"
+    assert report["reason"] == reason
+
+
+@pytest.mark.asyncio
+async def test_compare_rejects_base_in_commit_set(monkeypatch):
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    body = _compare(
+        base,
+        head,
+        [_github_commit(base, "Base"), _github_commit(head, "Henry Example")],
+    )
+    project = Project(id="release-authorship-base-included", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    monkeypatch.setattr(
+        github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, body))
+    )
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "unresolved"
+    assert report["reason"] == "range_identity_mismatch"
 
 
 @pytest.mark.asyncio
@@ -306,14 +371,21 @@ async def test_read_path_serves_persisted_report_without_recomputation(
         project_id=project.id,
         version_number=1,
         status="promoted",
+        base_sha="a" * 40,
+        served_sha="b" * 40,
         opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        serving_status="serving_confirmed",
         last_qualification={
             "status": "promoted",
             "operator_authored_commits": {
+                "source": AUTHORSHIP_RECEIPT_SOURCE,
+                "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
                 "state": "resolved",
                 "count": 0,
                 "offenders": [],
                 "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+                "measured_at": "2026-01-01T00:00:00+00:00",
+                "retry": {"attempt": 1, "retryable": False},
             },
         },
     )
@@ -345,6 +417,117 @@ async def test_read_path_serves_persisted_report_without_recomputation(
     }
     count.assert_not_awaited()
 
+    # A read must fail closed if the stored JSON is tampered with, even though
+    # the range still names the correct promoted release.
+    tampered_qualification = dict(promoted.last_qualification)
+    tampered_report = dict(tampered_qualification["operator_authored_commits"])
+    tampered_report["range"] = {"base_sha": "a" * 40, "head_sha": "c" * 40}
+    tampered_qualification["operator_authored_commits"] = tampered_report
+    promoted.last_qualification = tampered_qualification
+    flag_modified(promoted, "last_qualification")
+    db_session.add(promoted)
+    await db_session.commit()
+    await db_session.refresh(promoted)
+    assert promoted.last_qualification["operator_authored_commits"]["range"]["head_sha"] == "c" * 40
+    tampered = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": create_agent_token(str(task.id), task.vm_instance_id)},
+    )
+    assert tampered.json()["operator_authored_commits"]["state"] == "unresolved"
+    assert tampered.json()["operator_authored_commits"]["reason"] == (
+        "stored_authorship_receipt_invalid"
+    )
+
+
+@pytest.mark.asyncio
+async def test_retryable_legacy_receipt_reconciles_and_resolves(db_session, mocker):
+    project = Project(name="Authorship retry", user_id="authorship-retry")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        base_sha="a" * 40,
+        served_sha="b" * 40,
+        serving_status="serving_confirmed",
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_qualification={
+            "operator_authored_commits": {
+                "state": "unresolved",
+                "count": None,
+                "offenders": [],
+                "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+                "reason": "github_authorship_timeout",
+            }
+        },
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+    resolved = {
+        "state": "resolved",
+        "count": 1,
+        "offenders": [{"sha": "b" * 12, "author": "Henry Example"}],
+        "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+    }
+    measure = mocker.patch(
+        "app.release_commit_authorship.count_non_bot_authored_commits",
+        new=AsyncMock(side_effect=[
+            {"state": "unresolved", "count": None, "offenders": [], "range": resolved["range"], "reason": "temporary"},
+            resolved,
+        ]),
+    )
+
+    await persist_serving_authorship_evidence(db_session, version)
+    await db_session.refresh(version)
+    assert version.last_qualification["operator_authored_commits"]["state"] == "unresolved"
+    assert version.last_qualification["operator_authored_commits"]["retry"]["attempt"] == 1
+
+    await persist_serving_authorship_evidence(db_session, version)
+    await db_session.refresh(version)
+    receipt = version.last_qualification["operator_authored_commits"]
+    assert receipt["state"] == "resolved"
+    assert receipt["count"] == 1
+    assert receipt["retry"] == {"attempt": 2, "retryable": False}
+    assert measure.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_resolved_current_receipt_is_immutable_and_short_circuits(db_session, mocker):
+    project = Project(name="Authorship immutable", user_id="authorship-immutable")
+    receipt = {
+        "source": AUTHORSHIP_RECEIPT_SOURCE,
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        "state": "resolved",
+        "count": 0,
+        "offenders": [],
+        "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+        "measured_at": "2026-01-01T00:00:00+00:00",
+        "retry": {"attempt": 2, "retryable": False},
+    }
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        base_sha="a" * 40,
+        served_sha="b" * 40,
+        serving_status="serving_confirmed",
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_qualification={"operator_authored_commits": receipt},
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+    measure = mocker.patch(
+        "app.release_commit_authorship.count_non_bot_authored_commits",
+        new=AsyncMock(side_effect=AssertionError("resolved receipt must be immutable")),
+    )
+
+    await persist_serving_authorship_evidence(db_session, version)
+
+    await db_session.refresh(version)
+    assert version.last_qualification["operator_authored_commits"] == receipt
+    measure.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_unresolved_confirmation_receipt_preserves_serving_truth(db_session, mocker):
@@ -375,13 +558,13 @@ async def test_unresolved_confirmation_receipt_preserves_serving_truth(db_sessio
 
     assert version.serving_status == "serving_confirmed"
     assert version.served_sha == "b" * 40
-    assert version.last_qualification["operator_authored_commits"] == {
-        "state": "unresolved",
-        "count": None,
-        "offenders": [],
-        "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
-        "reason": "github_authorship_unavailable",
-    }
+    receipt = version.last_qualification["operator_authored_commits"]
+    assert receipt["source"] == AUTHORSHIP_RECEIPT_SOURCE
+    assert receipt["schema_version"] == AUTHORSHIP_RECEIPT_SCHEMA_VERSION
+    assert receipt["state"] == "unresolved"
+    assert receipt["reason"] == "github_authorship_unavailable"
+    assert receipt["range"] == {"base_sha": "a" * 40, "head_sha": "b" * 40}
+    assert receipt["retry"] == {"attempt": 1, "retryable": True}
 
 
 @pytest.mark.asyncio

@@ -17,7 +17,7 @@ import hashlib
 import random
 import re as _re
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from collections import OrderedDict
 
 import httpx
@@ -48,7 +48,7 @@ _github_client: httpx.AsyncClient | None = None
 # than a live request would. Collapses the ~50-VM fan-out that hammers a shared
 # ref (e.g. every rollup parent reading automain's tip in the same sweep), a
 # dominant install-token-budget drain.
-_inflight_reads: dict[tuple[str, str, str], "asyncio.Future[httpx.Response]"] = {}
+_inflight_reads: dict[tuple[str, str, str, str], "asyncio.Future[httpx.Response]"] = {}
 
 # File-content cache: memoizes get_file_text_at_ref results by
 # (owner, repo, ref, path) for a short TTL, but only when ``ref`` is a full
@@ -444,6 +444,29 @@ def _github_auth_fingerprint(headers: dict | None) -> str:
     return hashlib.sha256(authorization.encode("utf-8")).hexdigest()
 
 
+def _canonical_query_params(params) -> str:
+    """Return a stable, credential-free representation of request params.
+
+    ``httpx`` accepts mappings, ``QueryParams``, and repeated key/value pairs.
+    Sorting the encoded pairs makes equivalent mappings coalesce while keeping
+    page, head, and other semantically distinct reads separate.
+    """
+    if params is None:
+        return ""
+    if hasattr(params, "multi_items"):
+        items = list(params.multi_items())
+    elif hasattr(params, "items"):
+        items = list(params.items())
+    else:
+        try:
+            items = list(params)
+        except TypeError:
+            return repr(params)
+    normalized = [(str(key), str(value)) for key, value in items]
+    normalized.sort()
+    return urlencode(normalized, doseq=True)
+
+
 async def _github_request(
     method: str,
     url: str,
@@ -476,7 +499,12 @@ async def _github_request(
         )
     # The same URL can return different repository sets and permissions for two
     # user/App credentials. Coalesce only within one credential identity.
-    key = ("GET", url, _github_auth_fingerprint(headers))
+    key = (
+        "GET",
+        url,
+        _github_auth_fingerprint(headers),
+        _canonical_query_params(kwargs.get("params")),
+    )
     existing = _inflight_reads.get(key)
     if existing is not None:
         import app.shared_state as _ss

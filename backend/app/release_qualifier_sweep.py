@@ -2026,6 +2026,22 @@ async def sweep_stuck_qualifications(
                 version_id,
             )
 
+    # Serving confirmation predates the authorship receipt on some releases.
+    # Retry only a bounded promoted/serving-confirmed subset; the receipt writer
+    # itself is idempotent and CAS-protected, so this also upgrades legacy and
+    # retryable receipts without changing serving or promotion truth.
+    try:
+        from app.release_commit_authorship import reconcile_serving_authorship_evidence
+
+        await reconcile_serving_authorship_evidence(
+            session_factory=session_factory,
+            limit=25,
+        )
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] sweep: serving authorship reconciliation failed"
+        )
+
     # Standing full-suite drift sentinel: canonical and ON by default, dispatch
     # ci.yml on the integration branch for each open version (the only opt-out
     # is an explicit build_config False), alert+harvest when a run concludes

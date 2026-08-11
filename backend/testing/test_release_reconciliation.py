@@ -1208,6 +1208,7 @@ async def _make_promoted_unconfirmed_version(
     await db_session.refresh(project)
 
     version = await rv.open_version(db_session, project.id, version_number=1)
+    version.base_sha = "b" * 40
     version.status = "promoted"
     version.promoted_at = promoted_at
     version.promoted_sha = promoted_sha
@@ -1381,7 +1382,12 @@ async def test_confirm_serving_confirmed_scenario(db_session, mocker):
     assert version.served_sha == _SHA_A
     assert version.served_at is not None
     assert version.deploy_failure_reason is None
-    assert version.last_qualification["operator_authored_commits"] == report
+    stored_report = version.last_qualification["operator_authored_commits"]
+    assert stored_report["state"] == report["state"]
+    assert stored_report["count"] == report["count"]
+    assert stored_report["range"] == report["range"]
+    assert stored_report["source"] == "github_compare"
+    assert stored_report["schema_version"] == 1
     measure.assert_awaited_once_with(
         version.base_sha, _SHA_A, session=db_session, project=_project
     )
@@ -2429,6 +2435,7 @@ async def _make_promoted_deploy_failed_version(
     await db_session.refresh(project)
 
     version = await rv.open_version(db_session, project.id, version_number=1)
+    version.base_sha = "b" * 40
     version.status = "promoted"
     version.promoted_at = promoted_at
     version.promoted_sha = promoted_sha
@@ -2513,7 +2520,12 @@ async def test_recover_deploy_failed_when_sha_serves_within_window(db_session, m
     assert version.served_sha == _SHA_A
     assert version.served_at is not None
     assert version.deploy_failure_reason is None
-    assert version.last_qualification["operator_authored_commits"] == report
+    stored_report = version.last_qualification["operator_authored_commits"]
+    assert stored_report["state"] == report["state"]
+    assert stored_report["count"] == report["count"]
+    assert stored_report["range"] == report["range"]
+    assert stored_report["source"] == "github_compare"
+    assert stored_report["schema_version"] == 1
     measure.assert_awaited_once_with(
         version.base_sha, _SHA_A, session=db_session, project=project
     )

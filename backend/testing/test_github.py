@@ -5126,6 +5126,37 @@ async def test_singleflight_same_url_distinct_credentials_not_coalesced(mocker):
 
 
 @pytest.mark.asyncio
+async def test_singleflight_same_url_distinct_query_pages_and_heads_not_coalesced(mocker):
+    """Compare pages and query-selected heads are distinct logical reads."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls.append(tuple(sorted(kw.get("params", {}).items())))
+        await asyncio.sleep(0.01)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    await asyncio.gather(
+        github._github_request(
+            "GET", "https://api.github.com/repos/o/r/compare/a...b", {},
+            params={"page": 1, "per_page": 100},
+        ),
+        github._github_request(
+            "GET", "https://api.github.com/repos/o/r/compare/a...b", {},
+            params={"page": 2, "per_page": 100},
+        ),
+        github._github_request(
+            "GET", "https://api.github.com/repos/o/r/commits", {},
+            params={"sha": "b" * 40, "page": 1},
+        ),
+    )
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
 async def test_singleflight_non_get_not_coalesced(mocker):
     """Mutating methods (and body-carrying GETs) are never coalesced."""
     import app.github as github

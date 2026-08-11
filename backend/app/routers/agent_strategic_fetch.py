@@ -55,6 +55,10 @@ from app.project_message_projection import (
 )
 from app.qualification_state_resolver import apply_verdict_substitution
 from app.release_scoring import blocker_execution_site as _blocker_execution_site
+from app.release_commit_authorship import (
+    unresolved_authorship_receipt,
+    validate_authorship_receipt,
+)
 from app.routers.agent import verify_agent_token
 from app.schemas import serialize_compute_job_response_safe
 from app.shared_state import limiter
@@ -1684,10 +1688,10 @@ async def agent_fetch_qualification(
     # or this backend process.  Reading only the latest closed promoted record
     # prevents a vN+1 open from changing vN's immutable authorship range and
     # keeps this polled endpoint free of GitHub/network work.
-    latest_promoted_qualification = (
+    latest_promoted_version = (
         (
             await session.execute(
-                select(ReleaseVersion.last_qualification)
+                select(ReleaseVersion)
                 .where(
                     ReleaseVersion.project_id == project_id,
                     ReleaseVersion.status == "promoted",
@@ -1699,21 +1703,38 @@ async def agent_fetch_qualification(
         .scalars()
         .first()
     )
+    latest_promoted_qualification = (
+        latest_promoted_version.last_qualification
+        if latest_promoted_version is not None
+        else None
+    )
     persisted_authorship = (
         latest_promoted_qualification.get("operator_authored_commits")
         if isinstance(latest_promoted_qualification, dict)
         else None
     )
-    operator_authored_commits = (
-        persisted_authorship
-        if isinstance(persisted_authorship, dict)
-        else {
-            "state": "unresolved",
-            "count": None,
-            "offenders": [],
-            "range": {"base_sha": None, "head_sha": None},
-            "reason": "promotion_authorship_not_persisted",
-        }
+    actual_base_sha = (
+        latest_promoted_version.base_sha if latest_promoted_version is not None else None
+    )
+    actual_head_sha = (
+        latest_promoted_version.served_sha if latest_promoted_version is not None else None
+    )
+    validated_authorship = (
+        validate_authorship_receipt(
+            persisted_authorship,
+            actual_base_sha,
+            actual_head_sha,
+        )
+        if latest_promoted_version is not None
+        and latest_promoted_version.serving_status == "serving_confirmed"
+        else None
+    )
+    operator_authored_commits = validated_authorship or unresolved_authorship_receipt(
+        actual_base_sha,
+        actual_head_sha,
+        "stored_authorship_receipt_invalid"
+        if persisted_authorship is not None
+        else "promotion_authorship_not_persisted",
     )
     active_or_last_attempt_policy = qualification_attempt_policy_projection(
         open_row.last_qualification

@@ -723,8 +723,9 @@ async def _recover_serving_confirmed(
     latched sha_mismatch as supersession); left ``None`` the confirmation clears
     the artifact reason code, exactly as before.
 
-    Runs entirely on the caller's already-locked session; does NOT commit (the
-    caller commits under the SAME per-version row lock).
+    Runs on the caller's session.  Authorship evidence deliberately commits its
+    pending marker before GitHub I/O and performs its final write under a short
+    CAS lock; the remaining recovery projection is committed by the caller.
     """
     backend_artifact, _created = await get_or_create_release_deploy_artifact(
         session,
