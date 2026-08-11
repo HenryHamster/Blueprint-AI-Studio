@@ -109,6 +109,8 @@ from app.routers.admin_service_credentials import (
     router as admin_service_credentials_router,
 )
 from app.routers.agent_access import router as agent_access_router
+from app.routers.agent_access_directions import router as agent_access_directions_router
+from app.routers.operator_access import router as operator_access_router
 from app.shared_state import limiter
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -1066,6 +1068,8 @@ app.include_router(admin_acceptance_criteria_router)
 app.include_router(admin_operator_attention_router)
 app.include_router(admin_service_credentials_router)
 app.include_router(agent_access_router)
+app.include_router(agent_access_directions_router)
+app.include_router(operator_access_router)
 app.include_router(admin_evergreen_router)
 app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)

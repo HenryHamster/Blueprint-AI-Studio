@@ -65,8 +65,26 @@ def hash_service_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-# A UUID-shaped path segment shared by the project-scoped allowlist regexes.
+# Path segments shared by the project-scoped allowlist regexes.
 _UUID_PATH_SEGMENT = r"[0-9a-fA-F-]{36}"
+_DIRECTION_PATH_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}"
+
+_BOUNDED_AGENT_READ_RULES: list[tuple[str, re.Pattern]] = [
+    ("GET", re.compile(r"^/api/agent-access/v1/me$")),
+    (
+        "GET",
+        re.compile(
+            rf"^/api/agent-access/v1/projects/{_UUID_PATH_SEGMENT}/snapshot$"
+        ),
+    ),
+    ("GET", re.compile(r"^/api/agent-access/v1/tasks$")),
+    (
+        "GET",
+        re.compile(rf"^/api/agent-access/v1/tasks/{_UUID_PATH_SEGMENT}$"),
+    ),
+    ("GET", re.compile(r"^/api/agent-access/v1/messages$")),
+    ("GET", re.compile(r"^/api/agent-access/v1/directions$")),
+]
 
 # Scope registry: each scope name maps to a list of (HTTP method, compiled
 # path-regex) pairs allowlisting exactly which endpoints a credential holding
@@ -98,19 +116,82 @@ SCOPE_DEFINITIONS: dict[str, list[tuple[str, re.Pattern]]] = {
     # credential principal's ProjectMember boundary, and no mutating method is
     # present in the scope.
     "coding-agent:read": [
-        ("GET", re.compile(r"^/api/agent-access/v1/me$")),
+        *_BOUNDED_AGENT_READ_RULES,
+    ],
+    # Project-scoped operator access for Hermes and similar external operator
+    # agents. This is deliberately self-contained (it includes the bounded read
+    # surface) and reaches only strict /api/operator-access/v1 contracts. It
+    # never grants a generic /api/admin mutation, require_admin, or platform
+    # operations such as deploy/migrate/settings/fleet/runner control.
+    "project-operator": [
+        *_BOUNDED_AGENT_READ_RULES,
+        ("GET", re.compile(r"^/api/operator-access/v1/task-capabilities$")),
         (
             "GET",
             re.compile(
-                rf"^/api/agent-access/v1/projects/{_UUID_PATH_SEGMENT}/snapshot$"
+                rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/strategic-conversation$"
             ),
         ),
-        ("GET", re.compile(r"^/api/agent-access/v1/tasks$")),
         (
             "GET",
-            re.compile(rf"^/api/agent-access/v1/tasks/{_UUID_PATH_SEGMENT}$"),
+            re.compile(
+                rf"^/api/operator-access/v1/tasks/{_UUID_PATH_SEGMENT}/cancel-impact$"
+            ),
         ),
-        ("GET", re.compile(r"^/api/agent-access/v1/messages$")),
+        (
+            "POST",
+            re.compile(
+                rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/tasks$"
+            ),
+        ),
+        (
+            "POST",
+            re.compile(
+                rf"^/api/operator-access/v1/tasks/{_UUID_PATH_SEGMENT}/(?:requeue|cancel|request-changes)$"
+            ),
+        ),
+        (
+            "POST",
+            re.compile(
+                rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/directions$"
+            ),
+        ),
+        (
+            "PATCH",
+            re.compile(
+                rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/directions/{_DIRECTION_PATH_SEGMENT}$"
+            ),
+        ),
+        (
+            "POST",
+            re.compile(
+                rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/directions/{_DIRECTION_PATH_SEGMENT}/(?:activate|retarget|cancel)$"
+            ),
+        ),
+        (
+            "POST",
+            re.compile(
+                rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/messages$"
+            ),
+        ),
+        (
+            "POST",
+            re.compile(
+                rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/messages/{_UUID_PATH_SEGMENT}/answer$"
+            ),
+        ),
+        (
+            "POST",
+            re.compile(
+                rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/strategic-cycle$"
+            ),
+        ),
+        (
+            "POST",
+            re.compile(
+                rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/strategic/(?:start|messages)$"
+            ),
+        ),
     ],
 }
 

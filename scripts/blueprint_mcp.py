@@ -4,9 +4,9 @@
 The server deliberately does not import ``blueprint.py``: remote diagnosis must
 not depend on Linux deploy-agent modules or the operator CLI's large argparse
 tree. It reuses ``blueprint_api`` for the single HTTP/auth implementation, but
-requires an explicitly configured ``coding-agent:read`` ServiceCredential. An
-ambient admin config, gcloud bootstrap, agent task JWT, or observer token is
-rejected before any project data is read.
+requires an explicitly configured ``coding-agent:read`` or ``project-operator``
+ServiceCredential. An ambient admin config, gcloud bootstrap, agent task JWT, or
+observer token is rejected before any project data is read.
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ LEGACY_PROTOCOL_VERSIONS = (
 )
 SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION, *reversed(LEGACY_PROTOCOL_VERSIONS))
 CODING_AGENT_SCOPE = "coding-agent:read"
+PROJECT_OPERATOR_SCOPE = "project-operator"
+MCP_READ_SCOPES = (CODING_AGENT_SCOPE, PROJECT_OPERATOR_SCOPE)
 PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion"
 CLIENT_INFO_META_KEY = "io.modelcontextprotocol/clientInfo"
 CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
@@ -41,11 +43,12 @@ PROJECT_PAGE_LIMIT = 50
 PROJECT_FIELD_MAX_SERIALIZED_BYTES = 512
 PROJECT_SELECTOR_MAX_CHARS = 200
 PROJECT_ERROR_PREVIEW_LIMIT = 5
+DIRECTION_PAGE_LIMIT = 100
 
 SERVER_INSTRUCTIONS = (
     "Blueprint is a read-only operational context source. Start with "
     "get_project_snapshot, use exact task IDs for get_task, and use "
-    "list_tasks/list_messages only for bounded drill-down. No tool in "
+    "list_tasks/list_directions/list_messages only for bounded drill-down. No tool in "
     "this server authorizes mutations."
 )
 
@@ -102,7 +105,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "name": "list_projects",
             "description": (
                 "List one bounded, offset-pageable set of projects this scoped "
-                "coding-agent credential can read. Use this when project identity "
+                "credential can read. Use this when project identity "
                 "is ambiguous."
             ),
             "inputSchema": {
@@ -187,6 +190,33 @@ def tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "list_directions",
+            "description": (
+                "List one bounded, offset-pageable set of Blueprint directions "
+                "for an authorized project. The backend excludes rich project "
+                "state and returns explicit truncation metadata."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **selector,
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": DIRECTION_PAGE_LIMIT,
+                        "default": 50,
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1_000_000,
+                        "default": 0,
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "list_messages",
             "description": (
                 "List one bounded, offset-pageable set of operator-visible Blueprint "
@@ -242,12 +272,12 @@ def _explicit_agent_config_present() -> bool:
 def _access_profile(
     *, limit: int | None = None, offset: int | None = None
 ) -> dict[str, Any]:
-    """Load and prove a scoped coding-agent identity without leaking its token."""
+    """Load and prove a supported scoped identity without leaking its token."""
     if not _explicit_agent_config_present():
         raise ToolError(
             "Blueprint MCP requires an explicit BLUEPRINT_CONFIG or "
             "BLUEPRINT_API_URL + BLUEPRINT_API_KEY. Ambient repo/home config and "
-            "gcloud admin bootstrap are intentionally disabled for coding agents."
+            "gcloud admin bootstrap are intentionally disabled for MCP clients."
         )
     config = _as_object(load_config(), "Blueprint config")
     token = str(config.get("api_key") or "")
@@ -274,9 +304,10 @@ def _access_profile(
         not isinstance(project, dict) for project in projects
     ):
         raise ToolError("profile projects must be an array of objects")
-    if CODING_AGENT_SCOPE not in scopes:
+    if not set(scopes).intersection(MCP_READ_SCOPES):
         raise ToolError(
-            "Blueprint MCP requires the coding-agent:read scope; this credential "
+            "Blueprint MCP requires the coding-agent:read or project-operator "
+            "scope; this credential "
             f"has: {', '.join(scopes) if scopes else '(none)'}"
         )
     return profile
@@ -369,7 +400,7 @@ def _select_project(
     total = int(profile.get("total") or len(projects))
     has_more = bool(profile.get("has_more", total > len(projects)))
     if not projects:
-        raise ToolError("this coding-agent credential has no project memberships")
+        raise ToolError("this scoped credential has no project memberships")
 
     if has_id:
         return {"id": project_id}
@@ -624,6 +655,37 @@ def _get_task(arguments: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _list_directions(arguments: dict[str, Any]) -> dict[str, Any]:
+    project = _select_project(arguments)
+    limit = _bounded_int(
+        arguments.get("limit"),
+        label="limit",
+        default=50,
+        maximum=DIRECTION_PAGE_LIMIT,
+    )
+    offset = _bounded_int(
+        arguments.get("offset"),
+        label="offset",
+        default=0,
+        maximum=1_000_000,
+        minimum=0,
+    )
+    return _as_object(
+        api(
+            "GET",
+            _with_query(
+                "/api/agent-access/v1/directions",
+                [
+                    ("project_id", project["id"]),
+                    ("limit", limit),
+                    ("offset", offset),
+                ],
+            ),
+        ),
+        "bounded agent direction list",
+    )
+
+
 def _list_messages(arguments: dict[str, Any]) -> dict[str, Any]:
     project = _select_project(arguments)
     limit = _bounded_int(arguments.get("limit"), label="limit", default=50, maximum=200)
@@ -679,6 +741,8 @@ def call_tool(name: str, arguments: Any) -> tuple[dict[str, Any], bool]:
         return _list_tasks(args), False
     if name == "get_task":
         return _get_task(args), False
+    if name == "list_directions":
+        return _list_directions(args), False
     if name == "list_messages":
         return _list_messages(args), False
     raise ProtocolError(-32602, f"Unknown tool: {name}")

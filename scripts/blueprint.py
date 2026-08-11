@@ -179,7 +179,7 @@ def _render_projects(data: dict) -> None:
 # ── coding-agent access ──────────────────────────────────────────────────────
 
 def cmd_agent_access(args: argparse.Namespace) -> None:
-    """Manage or verify the scoped, read-only coding-agent access boundary."""
+    """Manage or verify scoped coding-agent and project-operator access."""
     subcommand = getattr(args, "agent_access_cmd", None) or "whoami"
     if subcommand == "whoami":
         result = api("GET", "/api/agent-access/v1/me")
@@ -201,8 +201,12 @@ def cmd_agent_access(args: argparse.Namespace) -> None:
         project_id = get_project_id(getattr(args, "project_id", None))
         name = args.name
         expires_in_days = args.expires_in_days
+        profile = getattr(args, "profile", "coding-agent-read")
+        project_operator = profile == "project-operator"
+        scopes = ["project-operator"] if project_operator else ["coding-agent:read"]
+        membership_role = "member" if project_operator else "viewer"
         prompt = (
-            f"Grant read-only coding-agent access named {name!r} to project "
+            f"Grant {profile} access named {name!r} to project "
             f"{project_id} for {expires_in_days} day(s)?"
         )
         if not _confirm(prompt, getattr(args, "yes", False)):
@@ -214,10 +218,10 @@ def cmd_agent_access(args: argparse.Namespace) -> None:
             {
                 "name": name,
                 "description": getattr(args, "description", None),
-                "scopes": ["coding-agent:read"],
+                "scopes": scopes,
                 "expires_in_days": expires_in_days,
                 "project_memberships": [
-                    {"project_id": project_id, "role": "viewer"}
+                    {"project_id": project_id, "role": membership_role}
                 ],
             },
         )
@@ -227,7 +231,7 @@ def cmd_agent_access(args: argparse.Namespace) -> None:
         _require_write_config("agent-access revoke")
         credential_id = args.credential_id
         if not _confirm(
-            f"Revoke coding-agent credential {credential_id}?",
+            f"Revoke scoped service credential {credential_id}?",
             getattr(args, "yes", False),
         ):
             print("Aborted.")
@@ -242,7 +246,7 @@ def cmd_agent_access(args: argparse.Namespace) -> None:
 
 def _render_agent_access_profile(data: dict) -> None:
     credential = data.get("credential") or {}
-    print("=== CODING-AGENT ACCESS ===")
+    print("=== SCOPED SERVICE ACCESS ===")
     print(f"  Credential: {credential.get('name', '?')}")
     print(f"  Expires:    {credential.get('expires_at') or 'never'}")
     print(f"  Scopes:     {', '.join(credential.get('scopes') or []) or '(none)'}")
@@ -299,15 +303,21 @@ def _render_agent_credentials(data: dict) -> None:
 
 
 def _render_agent_credential_grant(data: dict) -> None:
-    print("=== CODING-AGENT CREDENTIAL CREATED ===")
+    print("=== SCOPED SERVICE CREDENTIAL CREATED ===")
     print(f"  Name:    {data.get('name', '?')}")
     print(f"  ID:      {data.get('id', '?')}")
     print(f"  Expires: {data.get('expires_at') or 'never'}")
     print(f"  Token:   {data.get('token', '?')}")
     print("  The token is shown once. Store it outside the repository.")
-    print("  Put it in a read-only config outside the repository, then point the")
-    print("  MCP child at that file with BLUEPRINT_AGENT_CONFIG. See")
-    print("  docs/CODING_AGENT_ACCESS.md; the model never needs the token text.")
+    if "project-operator" in set(data.get("scopes") or []):
+        print("  Put it in a dedicated operator config outside the repository and")
+        print("  select it explicitly with BLUEPRINT_CONFIG for operator CLI calls.")
+        print("  See docs/HERMES_OPERATOR_ACCESS.md; do not put the token in prompts,")
+        print("  task-worker environments, or the repository.")
+    else:
+        print("  Put it in a read-only config outside the repository, then point the")
+        print("  MCP child at that file with BLUEPRINT_AGENT_CONFIG. See")
+        print("  docs/CODING_AGENT_ACCESS.md; the model never needs the token text.")
 
 
 # ── status ───────────────────────────────────────────────────────────────────
@@ -315,6 +325,10 @@ def _render_agent_credential_grant(data: dict) -> None:
 def cmd_status(args: argparse.Namespace) -> None:
     """Fetch canonical system state from GET /api/admin/state and version-lifecycle."""
     pid = get_project_id(getattr(args, "project_id", None))
+    if _using_scoped_service_credential():
+        snapshot = api("GET", f"/api/agent-access/v1/projects/{pid}/snapshot")
+        _emit(args, snapshot, _render_agent_snapshot)
+        return
     state, state_err = _safe_read(f"/api/admin/state?project_id={pid}")
     state = state or {}
     lifecycle, lifecycle_err = _safe_read(f"/api/admin/projects/{pid}/version-lifecycle")
@@ -418,6 +432,11 @@ def cmd_diagnostics(args: argparse.Namespace) -> None:
     see at a glance which failure mode dominates. Uses ``_safe_read`` so a
     diagnostics-endpoint failure degrades to an error dict rather than crashing.
     """
+    if _using_scoped_service_credential():
+        pid = get_project_id(getattr(args, "project_id", None))
+        snapshot = api("GET", f"/api/agent-access/v1/projects/{pid}/snapshot")
+        _emit(args, snapshot, _render_agent_snapshot)
+        return
     diag, err = _safe_read("/api/admin/diagnostics")
     diag = diag or {}
     stuck_tasks = diag.get("stuck_tasks") or []
@@ -502,6 +521,8 @@ def cmd_tasks(args: argparse.Namespace) -> None:
         _tasks_cancel(args)
     elif sub == "requeue":
         _tasks_requeue(args)
+    elif sub == "request-changes":
+        _tasks_request_changes(args)
     elif sub == "scope":
         _tasks_scope(args)
     elif sub == "tree":
@@ -672,10 +693,46 @@ def _tasks_cancel(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    if not _confirm(f"Cancel task {args.task_id}?", getattr(args, "yes", False)):
+    scoped = _using_scoped_service_credential()
+    impact: dict = {}
+    cascade_count = 0
+    if scoped:
+        impact = api(
+            "GET", f"/api/operator-access/v1/tasks/{args.task_id}/cancel-impact"
+        )
+        cascade_count = int(impact.get("active_child_cascade_count") or 0) + int(
+            impact.get("waiting_dependent_count") or 0
+        )
+        if cascade_count and not getattr(args, "confirm_cascade", False):
+            print(
+                f"ERROR: cancelling {args.task_id} would also cancel/block "
+                f"{cascade_count} child/dependent task(s). Re-run with "
+                "--confirm-cascade after reviewing the impact.",
+                file=sys.stderr,
+            )
+            raise APIError("cancel cascade confirmation required")
+    prompt = f"Cancel task {args.task_id}?"
+    if cascade_count:
+        prompt = f"Cancel task {args.task_id} and {cascade_count} affected task(s)?"
+    if not _confirm(prompt, getattr(args, "yes", False)):
         print("Aborted.")
         return
-    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", {"status": "CANCELLED"})
+    if scoped:
+        body = {
+            "confirm_cascade": bool(cascade_count),
+            **(
+                {"reason": args.reason}
+                if getattr(args, "reason", None)
+                else {}
+            ),
+        }
+        result = api(
+            "POST", f"/api/operator-access/v1/tasks/{args.task_id}/cancel", body
+        )
+    else:
+        result = api(
+            "PATCH", f"/api/admin/tasks/{args.task_id}", {"status": "CANCELLED"}
+        )
     _emit(args, result, lambda d: print(f"  {args.task_id}: {d.get('status', 'ok')}"))
 
 
@@ -689,24 +746,153 @@ def _tasks_requeue(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    scoped = _using_scoped_service_credential()
+    guidance = getattr(args, "requeue_prompt_suffix", None)
+    if scoped and (not isinstance(guidance, str) or not guidance.strip()):
+        print(
+            "ERROR: scoped project-operator requeue requires non-empty --guidance.",
+            file=sys.stderr,
+        )
+        raise APIError("requeue guidance is required")
     if not _confirm(f"Requeue task {args.task_id}?", getattr(args, "yes", False)):
         print("Aborted.")
         return
     body = {"status": "QUEUED"}
-    guidance = getattr(args, "requeue_prompt_suffix", None)
     if guidance is not None:
         guidance = guidance.strip()
         if not guidance:
             print("ERROR: --prompt-suffix/--guidance cannot be empty", file=sys.stderr)
             sys.exit(2)
         body["requeue_prompt_suffix"] = guidance
-    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
+    if scoped:
+        result = api(
+            "POST",
+            f"/api/operator-access/v1/tasks/{args.task_id}/requeue",
+            {"guidance": guidance},
+        )
+    else:
+        result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
     _emit(args, result, lambda d: print(f"  {args.task_id}: {d.get('status', 'ok')}"))
+
+
+def _tasks_request_changes(args: argparse.Namespace) -> None:
+    _require_write_config("tasks request-changes")
+    if not _confirm(
+        f"Request {args.action} follow-up for task {args.task_id}?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+    route = (
+        f"/api/operator-access/v1/tasks/{args.task_id}/request-changes"
+        if _using_scoped_service_credential()
+        else f"/api/admin/tasks/{args.task_id}/request-changes"
+    )
+    result = api(
+        "POST", route, {"feedback": args.feedback, "action": args.action}
+    )
+    _emit(
+        args,
+        result,
+        lambda row: print(
+            f"  spawned {row.get('action', args.action)} task: "
+            f"{row.get('spawned_task_id', '?')}"
+        ),
+    )
 
 
 def _using_scoped_service_credential() -> bool:
     """Return whether the selected config carries a scoped service token."""
     return str(load_config().get("api_key") or "").startswith("bpsc_")
+
+
+_SCOPED_PROFILE_CACHE: tuple[str, dict] | None = None
+_SCOPED_READ_COMMANDS = frozenset(
+    {
+        ("projects", None),
+        ("agent-access", "whoami"),
+        ("agent-access", "snapshot"),
+        ("status", None),
+        ("diagnostics", None),
+        ("tasks", "list"),
+        ("tasks", "show"),
+        ("directions", "list"),
+        ("directions", "show"),
+        ("messages", "list"),
+    }
+)
+_PROJECT_OPERATOR_WRITE_COMMANDS = frozenset(
+    {
+        ("tasks", "create"),
+        ("tasks", "cancel"),
+        ("tasks", "requeue"),
+        ("tasks", "request-changes"),
+        ("directions", "add"),
+        ("directions", "update"),
+        ("directions", "retarget"),
+        ("directions", "activate"),
+        ("directions", "cancel"),
+        ("messages", "send"),
+        ("messages", "answer"),
+        ("strategic", "start"),
+        ("strategic", "chat"),
+        ("strategic", "send"),
+        ("strategic-cycle", None),
+    }
+)
+
+
+def _scoped_command_key(args: argparse.Namespace) -> tuple[str, str | None]:
+    command = str(getattr(args, "command", ""))
+    subcommand_attr = {
+        "agent-access": "agent_access_cmd",
+        "tasks": "tasks_cmd",
+        "directions": "directions_cmd",
+        "messages": "messages_cmd",
+        "strategic": "strategic_cmd",
+    }.get(command)
+    subcommand = getattr(args, subcommand_attr, None) if subcommand_attr else None
+    if subcommand is None and command in {"tasks", "directions", "messages"}:
+        subcommand = "list"
+    if subcommand is None and command == "agent-access":
+        subcommand = "whoami"
+    return command, subcommand
+
+
+def _scoped_service_profile() -> dict:
+    global _SCOPED_PROFILE_CACHE
+    token = str(load_config().get("api_key") or "")
+    if _SCOPED_PROFILE_CACHE is None or _SCOPED_PROFILE_CACHE[0] != token:
+        profile = api("GET", "/api/agent-access/v1/me")
+        if not isinstance(profile, dict):
+            raise APIError("invalid scoped ServiceCredential profile")
+        _SCOPED_PROFILE_CACHE = (token, profile)
+    return _SCOPED_PROFILE_CACHE[1]
+
+
+def _enforce_scoped_cli_command(args: argparse.Namespace) -> None:
+    """Deny unsupported ServiceCredential commands before any local side effect."""
+    if not _using_scoped_service_credential():
+        return
+    key = _scoped_command_key(args)
+    profile = _scoped_service_profile()
+    scopes = set((profile.get("credential") or {}).get("scopes") or [])
+    allowed = key in _SCOPED_READ_COMMANDS and bool(
+        scopes.intersection({"coding-agent:read", "project-operator"})
+    )
+    allowed = allowed or (
+        key in _PROJECT_OPERATOR_WRITE_COMMANDS and "project-operator" in scopes
+    )
+    if not allowed:
+        label = " ".join(part for part in key if part)
+        print(
+            f"ERROR: scoped ServiceCredential command not permitted: {label}. "
+            "The project-operator profile exposes only exact project task, "
+            "direction, message, and Strategic actions; platform admin, bulk, "
+            "deploy, migrate, provider/fleet/runner, and host commands are denied.",
+            file=sys.stderr,
+        )
+        raise APIError("scoped ServiceCredential command not permitted")
 
 
 def _tasks_show(args: argparse.Namespace) -> None:
@@ -1215,13 +1401,37 @@ def _tasks_research(args: argparse.Namespace) -> None:
 
 def _tasks_create(args: argparse.Namespace) -> None:
     _require_write_config("tasks create")
+    scoped = _using_scoped_service_credential()
+    if scoped:
+        forbidden = {
+            "--repo": getattr(args, "repo", None),
+            "--base-branch": getattr(args, "base_branch", None),
+            "--model": getattr(args, "model", None),
+            "--effort": getattr(args, "effort", None),
+            "--hotfix": getattr(args, "hotfix", False),
+            "--require-deps-landed-on": getattr(args, "require_deps_landed_on", None),
+            "--release-base-branch": getattr(args, "release_base_branch", None),
+            "--acceptance-evidence-file": getattr(
+                args, "acceptance_evidence_file", None
+            ),
+        }
+        requested = [flag for flag, value in forbidden.items() if value]
+        if requested:
+            print(
+                "ERROR: project-operator task creation does not authorize "
+                + ", ".join(requested)
+                + ". Project/repository/base/provider authority is derived "
+                "server-side, and scoped commands cannot read local evidence files.",
+                file=sys.stderr,
+            )
+            raise APIError("task creation authority flag is not permitted")
     cfg = load_config()
     title = args.title
     prompt = args.prompt
     task_type = getattr(args, "task_type", "create")
     target_project_id = get_project_id(getattr(args, "project_id", None))
     github_repo = getattr(args, "repo", None) or cfg.get("default_repo", "")
-    if not getattr(args, "repo", None):
+    if not scoped and not getattr(args, "repo", None):
         selected_project = next(
             (
                 project
@@ -1236,10 +1446,15 @@ def _tasks_create(args: argparse.Namespace) -> None:
             if owner and repo:
                 github_repo = f"{owner}/{repo}"
     base_branch = getattr(args, "base_branch", None)
-    if not github_repo:
+    if not scoped and not github_repo:
         print("ERROR: --repo is required (or set default_repo in config).", file=sys.stderr)
         sys.exit(1)
-    capability_response = api("GET", "/api/admin/task-capabilities")
+    capability_route = (
+        "/api/operator-access/v1/task-capabilities"
+        if scoped
+        else "/api/admin/task-capabilities"
+    )
+    capability_response = api("GET", capability_route)
     capability_contract = (
         capability_response.get("task_capabilities")
         if isinstance(capability_response, dict)
@@ -1316,27 +1531,28 @@ def _tasks_create(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         raise APIError("PR task metadata is required")
-    body: dict = {
-        "github_repo": github_repo,
-        "project_id": target_project_id,
-        "title": title,
-        "prompt": prompt,
-        "task_type": task_type,
-    }
-    if base_branch is not None:
+    body: dict = {"title": title, "prompt": prompt, "task_type": task_type}
+    if not scoped:
+        body["github_repo"] = github_repo
+        body["project_id"] = target_project_id
+    if not scoped and base_branch is not None:
         body["base_branch"] = base_branch
-    if getattr(args, "model", None):
+    if not scoped and getattr(args, "model", None):
         body["model"] = args.model
-    if getattr(args, "effort", None):
+    if not scoped and getattr(args, "effort", None):
         body["effort"] = args.effort
-    if getattr(args, "hotfix", False):
+    if not scoped and getattr(args, "hotfix", False):
         body["hotfix"] = True
     optional_fields = {
         "pr_number": getattr(args, "pr_number", None),
         "branch": getattr(args, "branch", None),
         "idempotency_key": getattr(args, "idempotency_key", None),
-        "require_deps_landed_on": getattr(args, "require_deps_landed_on", None),
-        "release_base_branch": getattr(args, "release_base_branch", None),
+        "require_deps_landed_on": (
+            None if scoped else getattr(args, "require_deps_landed_on", None)
+        ),
+        "release_base_branch": (
+            None if scoped else getattr(args, "release_base_branch", None)
+        ),
         "work_class": getattr(args, "work_class", None),
         "stop_or_pivot_condition": getattr(args, "stop_or_pivot_condition", None),
     }
@@ -1346,7 +1562,12 @@ def _tasks_create(args: argparse.Namespace) -> None:
     if not _confirm(f"Create task: {title[:60]}?", getattr(args, "yes", False)):
         print("Aborted.")
         return
-    result = api("POST", "/api/admin/tasks", body)
+    create_route = (
+        f"/api/operator-access/v1/projects/{target_project_id}/tasks"
+        if scoped
+        else "/api/admin/tasks"
+    )
+    result = api("POST", create_route, body)
     _emit(args, result, lambda r: print(
         f"  task {'reused' if r.get('is_duplicate') else 'created'}: "
         f"{r.get('id', '?')}  [{r.get('task_type', '?')}]  {r.get('title', '')}"
@@ -1907,7 +2128,16 @@ def cmd_directions(args: argparse.Namespace) -> None:
 
 def _directions_list(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
-    resp = api("GET", f"/api/admin/projects/{pid}/directions")
+    if _using_scoped_service_credential():
+        limit = getattr(args, "limit", 50)
+        offset = getattr(args, "offset", 0)
+        route = (
+            f"/api/agent-access/v1/directions?project_id={pid}"
+            f"&limit={limit}&offset={offset}"
+        )
+    else:
+        route = f"/api/admin/projects/{pid}/directions"
+    resp = api("GET", route)
     directions = resp.get("directions", []) if isinstance(resp, dict) else resp
 
     if getattr(args, "staged", False):
@@ -1956,11 +2186,47 @@ def _render_directions_list(data: dict) -> None:
               f"  ({len(history)} cycles, {len(notes)} notes)")
 
 
-def _resolve_direction(args: argparse.Namespace, direction_id: str, *, require_staged: bool = False) -> dict:
+def _resolve_direction(
+    args: argparse.Namespace,
+    direction_id: str,
+    *,
+    require_staged: bool = False,
+) -> dict:
     pid = get_project_id(getattr(args, "project_id", None))
-    resp = api("GET", f"/api/admin/projects/{pid}/directions")
-    directions = resp.get("directions", []) if isinstance(resp, dict) else resp
-    matches = [d for d in directions if (d.get("id") or "").startswith(direction_id)]
+    matches: list[dict] = []
+    if _using_scoped_service_credential():
+        offset = 0
+        while offset < 10_000:
+            resp = api(
+                "GET",
+                f"/api/agent-access/v1/directions?project_id={pid}"
+                f"&limit=100&offset={offset}",
+            )
+            directions = resp.get("directions", []) if isinstance(resp, dict) else []
+            exact = [d for d in directions if (d.get("id") or "") == direction_id]
+            if exact:
+                matches = exact
+                break
+            matches.extend(
+                d for d in directions if (d.get("id") or "").startswith(direction_id)
+            )
+            next_offset = resp.get("next_offset") if isinstance(resp, dict) else None
+            if not resp.get("has_more") or not isinstance(next_offset, int):
+                break
+            if next_offset <= offset:
+                raise APIError("direction pagination made no progress")
+            offset = next_offset
+        else:
+            raise APIError(
+                "direction catalog exceeds the 10,000-row CLI resolution bound; "
+                "use the exact direction id"
+            )
+    else:
+        resp = api("GET", f"/api/admin/projects/{pid}/directions")
+        directions = resp.get("directions", []) if isinstance(resp, dict) else resp
+        matches = [
+            d for d in directions if (d.get("id") or "").startswith(direction_id)
+        ]
     if not matches:
         print(f"Direction not found: {direction_id}", file=sys.stderr)
         sys.exit(1)
@@ -2058,6 +2324,7 @@ def _directions_add(args: argparse.Namespace) -> None:
     priority = getattr(args, "priority", "medium") or "medium"
     paths = getattr(args, "paths", None) or []
     completion_criteria = getattr(args, "completion_criteria", None)
+    idempotency_key = getattr(args, "idempotency_key", None)
     body: dict = {"text": text, "priority": priority}
     if paths:
         body["paths"] = paths
@@ -2065,12 +2332,19 @@ def _directions_add(args: argparse.Namespace) -> None:
         body["completion_criteria"] = completion_criteria
     if staged:
         body["staged"] = True
+    if idempotency_key:
+        body["idempotency_key"] = idempotency_key
     if not _confirm(f"Add {'staged ' if staged else ''}direction: {text[:60]}?",
                     getattr(args, "yes", False)):
         print("Aborted.")
         return
     pid = get_project_id(getattr(args, "project_id", None))
-    result = api("POST", f"/api/admin/projects/{pid}/directions", body)
+    route = (
+        f"/api/operator-access/v1/projects/{pid}/directions"
+        if _using_scoped_service_credential()
+        else f"/api/admin/projects/{pid}/directions"
+    )
+    result = api("POST", route, body)
     d = result.get("direction", {})
     _emit(args, result, lambda r: print(
         f"Added {d.get('id', '?')} [{priority}]{' (staged)' if staged else ''}: {text[:80]}"
@@ -2088,6 +2362,24 @@ def _directions_update(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
+    scoped = _using_scoped_service_credential()
+    if scoped and (
+        getattr(args, "status", None)
+        or getattr(args, "staged_for_version", None) is not None
+        or getattr(args, "reset_context", False)
+        or getattr(args, "reset_history", False)
+        or getattr(args, "reset_agent_notes", False)
+        or getattr(args, "reset_all", False)
+    ):
+        print(
+            "ERROR: project-operator directions update permits only text, priority, "
+            "paths, and completion criteria. Use activate/retarget/cancel for "
+            "staged lifecycle actions; "
+            "research/history resets remain admin-only.",
+            file=sys.stderr,
+        )
+        raise APIError("direction update field is not permitted")
+
     pid = get_project_id(getattr(args, "project_id", None))
     d = _resolve_direction(args, args.direction_id,
                            require_staged=getattr(args, "staged_for_version", None) is not None)
@@ -2100,6 +2392,10 @@ def _directions_update(args: argparse.Namespace) -> None:
         patch["text"] = args.text
     if getattr(args, "priority", None):
         patch["priority"] = args.priority
+    if getattr(args, "paths", None) is not None:
+        patch["paths"] = args.paths
+    if getattr(args, "completion_criteria", None) is not None:
+        patch["completion_criteria"] = args.completion_criteria
     if getattr(args, "status", None):
         patch["status"] = args.status
     if staged_for_version is not None:
@@ -2116,8 +2412,8 @@ def _directions_update(args: argparse.Namespace) -> None:
         patch["notes"] = [n for n in notes if not n.get("added_by_task")]
 
     if not patch:
-        print("Nothing to update. Use --text, --priority, --status, --staged-for-version,"
-              " or a reset flag.",
+        print("Nothing to update. Use --text, --priority, --paths, "
+              "--completion-criteria, --status, --staged-for-version, or a reset flag.",
               file=sys.stderr)
         sys.exit(1)
 
@@ -2130,7 +2426,12 @@ def _directions_update(args: argparse.Namespace) -> None:
         print("Aborted.")
         return
 
-    result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", patch)
+    route = (
+        f"/api/operator-access/v1/projects/{pid}/directions/{did}"
+        if scoped
+        else f"/api/admin/projects/{pid}/directions/{did}"
+    )
+    result = api("PATCH", route, patch)
     _emit(args, result, lambda r: print(
         f"Retargeted {did} to v{staged_for_version}"
         if is_retarget else f"Updated {did}: {', '.join(patch.keys())}"
@@ -2146,9 +2447,16 @@ def _directions_retarget(args: argparse.Namespace) -> None:
     if not _confirm(f"Retarget staged direction {did} to v{version}?", getattr(args, "yes", False)):
         print("Aborted.")
         return
-    result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", {
-        "staged_for_version": version,
-    })
+    if _using_scoped_service_credential():
+        result = api(
+            "POST",
+            f"/api/operator-access/v1/projects/{pid}/directions/{did}/retarget",
+            {"version": version},
+        )
+    else:
+        result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", {
+            "staged_for_version": version,
+        })
     _emit(args, result, lambda r: print(f"Retargeted {did} to v{version}"))
 
 
@@ -2160,9 +2468,16 @@ def _directions_activate(args: argparse.Namespace) -> None:
     if not _confirm(f"Activate staged direction {did} now?", getattr(args, "yes", False)):
         print("Aborted.")
         return
-    result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", {
-        "status": "active",
-    })
+    if _using_scoped_service_credential():
+        result = api(
+            "POST",
+            f"/api/operator-access/v1/projects/{pid}/directions/{did}/activate",
+            {},
+        )
+    else:
+        result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", {
+            "status": "active",
+        })
     _emit(args, result, lambda r: print(f"Activated staged direction {did}"))
 
 
@@ -2174,7 +2489,14 @@ def _directions_cancel(args: argparse.Namespace) -> None:
     if not _confirm(f"Cancel staged direction {did}?", getattr(args, "yes", False)):
         print("Aborted.")
         return
-    result = api("DELETE", f"/api/admin/projects/{pid}/directions/{did}")
+    if _using_scoped_service_credential():
+        result = api(
+            "POST",
+            f"/api/operator-access/v1/projects/{pid}/directions/{did}/cancel",
+            {},
+        )
+    else:
+        result = api("DELETE", f"/api/admin/projects/{pid}/directions/{did}")
     _emit(args, result, lambda r: print(
         f"Cancelled staged direction {did}: {r.get('message', 'removed')}"
     ))
@@ -2471,19 +2793,35 @@ def _messages_send(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
     pid = get_project_id(getattr(args, "project_id", None))
-    result = api("POST", f"/api/admin/projects/{pid}/messages", {
+    body = {
         "content": args.content,
         "message_type": getattr(args, "type", "FEEDBACK"),
-    })
+    }
+    if getattr(args, "idempotency_key", None):
+        body["idempotency_key"] = args.idempotency_key
+    route = (
+        f"/api/operator-access/v1/projects/{pid}/messages"
+        if _using_scoped_service_credential()
+        else f"/api/admin/projects/{pid}/messages"
+    )
+    result = api("POST", route, body)
     _emit(args, result, lambda d: print(f"  Message sent: {d.get('id', '?')}"))
 
 
 def _messages_answer(args: argparse.Namespace) -> None:
     _require_write_config("answer")
+    pid = get_project_id(getattr(args, "project_id", None))
     message_id = args.message_id
-    result = api("PATCH", f"/api/admin/messages/{message_id}", {
-        "resolution": args.content,
-    })
+    if _using_scoped_service_credential():
+        result = api(
+            "POST",
+            f"/api/operator-access/v1/projects/{pid}/messages/{message_id}/answer",
+            {"resolution": args.content},
+        )
+    else:
+        result = api("PATCH", f"/api/admin/messages/{message_id}", {
+            "resolution": args.content,
+        })
     _emit(args, result, lambda d: print(f"  Answer sent: {d.get('id', '?')}"))
 
 
@@ -3734,7 +4072,14 @@ def cmd_strategic_cycle(args: argparse.Namespace) -> None:
     if not _confirm(f"Trigger strategic-cycle (phase={phase})?", getattr(args, "yes", False)):
         print("Aborted.")
         return
-    result = api("POST", f"/api/admin/projects/{pid}/strategic-cycle?phase={phase}")
+    if _using_scoped_service_credential():
+        result = api(
+            "POST",
+            f"/api/operator-access/v1/projects/{pid}/strategic-cycle",
+            {"phase": phase},
+        )
+    else:
+        result = api("POST", f"/api/admin/projects/{pid}/strategic-cycle?phase={phase}")
     out = {"phase": phase, **result}
     _emit(args, out, _render_strategic_cycle)
 
@@ -3751,7 +4096,7 @@ def _render_strategic_cycle(d: dict) -> None:
 # ── strategic (resident session: start / stop / chat) ─────────────────────────
 
 def cmd_strategic(args: argparse.Namespace) -> None:
-    """Dispatch resident Strategic session subcommands: start / stop / chat."""
+    """Dispatch resident Strategic session subcommands: start / stop / chat / send."""
     sub = getattr(args, "strategic_cmd", None)
     if sub == "start":
         _strategic_start(args)
@@ -3759,8 +4104,10 @@ def cmd_strategic(args: argparse.Namespace) -> None:
         _strategic_stop(args)
     elif sub == "chat":
         _strategic_chat(args)
+    elif sub == "send":
+        _strategic_send(args)
     else:
-        print("Usage: blueprint strategic {start|stop|chat}", file=sys.stderr)
+        print("Usage: blueprint strategic {start|stop|chat|send}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -3770,11 +4117,24 @@ def _strategic_start(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
     body: dict = {}
     runner = getattr(args, "runner_id", None)
+    if _using_scoped_service_credential() and runner:
+        print(
+            "ERROR: project-operator Strategic start uses server-selected placement; "
+            "--runner-id is not authorized.",
+            file=sys.stderr,
+        )
+        raise APIError("Strategic runner selection is not permitted")
     if runner:
         body["runner_id"] = runner
-    result = api("POST",
-                 f"/api/admin/projects/{pid}/strategic-session/start",
-                 body or None)
+    if _using_scoped_service_credential():
+        result = api(
+            "POST", f"/api/operator-access/v1/projects/{pid}/strategic/start", {}
+        )
+        result = result.get("data") or result
+    else:
+        result = api("POST",
+                     f"/api/admin/projects/{pid}/strategic-session/start",
+                     body or None)
     _emit(args, result, _render_strategic_session_start)
 
 
@@ -3855,6 +4215,13 @@ def _strategic_chat(args: argparse.Namespace) -> None:
     seen: set = set()
 
     def _conversation_items() -> list:
+        if _using_scoped_service_credential():
+            resp = api(
+                "GET",
+                f"/api/operator-access/v1/projects/{pid}/strategic-conversation"
+                "?limit=50",
+            )
+            return ((resp.get("data") or {}).get("items") or [])
         resp = api("GET", f"/api/admin/projects/{pid}/strategic-session")
         conv = resp.get("conversation") or {}
         return conv.get("items") or []
@@ -3893,13 +4260,16 @@ def _strategic_chat(args: argparse.Namespace) -> None:
             if content in ("/quit", "/exit", "/q"):
                 break
             if content:
-                sent = api("POST",
-                           f"/api/admin/projects/{pid}/strategic-session/messages",
-                           {
-                               "content": content,
-                               "message_type": msg_type,
-                               "idempotency_key": f"strategic-chat:{uuid.uuid4()}",
-                           })
+                route = (
+                    f"/api/operator-access/v1/projects/{pid}/strategic/messages"
+                    if _using_scoped_service_credential()
+                    else f"/api/admin/projects/{pid}/strategic-session/messages"
+                )
+                sent = api("POST", route, {
+                    "content": content,
+                    "message_type": msg_type,
+                    "idempotency_key": f"strategic-chat:{uuid.uuid4()}",
+                })
                 sent_id = sent.get("id") if isinstance(sent, dict) else None
                 if sent_id:
                     seen.add(sent_id)
@@ -3924,6 +4294,31 @@ def _strategic_chat(args: argparse.Namespace) -> None:
                       file=sys.stderr)
     except KeyboardInterrupt:
         print("\nExiting chat.", file=sys.stderr)
+
+
+def _strategic_send(args: argparse.Namespace) -> None:
+    """Send one non-interactive Strategic continuation message."""
+    _require_write_config("strategic send")
+    pid = get_project_id(getattr(args, "project_id", None))
+    body = {
+        "content": args.content,
+        "message_type": getattr(args, "type", "NOTE"),
+        "idempotency_key": (
+            getattr(args, "idempotency_key", None)
+            or f"strategic-send:{uuid.uuid4()}"
+        ),
+    }
+    route = (
+        f"/api/operator-access/v1/projects/{pid}/strategic/messages"
+        if _using_scoped_service_credential()
+        else f"/api/admin/projects/{pid}/strategic-session/messages"
+    )
+    result = api("POST", route, body)
+    _emit(
+        args,
+        result,
+        lambda row: print(f"  Strategic message sent: {row.get('id', '?')}"),
+    )
 
 
 # ── trim-playbook-archive ─────────────────────────────────────────────────────
@@ -5363,7 +5758,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent_access = sub.add_parser(
         "agent-access",
         parents=[common],
-        help="Grant, inspect, and verify scoped read-only coding-agent access.",
+        help="Grant, inspect, and verify scoped service access.",
     )
     agent_access_sub = p_agent_access.add_subparsers(dest="agent_access_cmd")
     agent_access_sub.add_parser(
@@ -5373,11 +5768,20 @@ def build_parser() -> argparse.ArgumentParser:
         "snapshot", parents=[common], help="Show the canonical project orientation snapshot."
     )
     p_agent_access_grant = agent_access_sub.add_parser(
-        "grant", parents=[common], help="Mint one read-only coding-agent credential."
+        "grant", parents=[common], help="Mint one scoped service credential."
     )
     p_agent_access_grant.add_argument("name", help="Unique lowercase credential name.")
     p_agent_access_grant.add_argument(
         "--description", default=None, help="Optional credential purpose/owner note."
+    )
+    p_agent_access_grant.add_argument(
+        "--profile",
+        choices=["coding-agent-read", "project-operator"],
+        default="coding-agent-read",
+        help=(
+            "Access profile: read-only coding context (viewer) or the narrow "
+            "project-operator CLI surface (member)."
+        ),
     )
     p_agent_access_grant.add_argument(
         "--expires-in-days",
@@ -5481,6 +5885,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_tasks_cancel = tasks_sub.add_parser("cancel", parents=[common],
                                           help="Cancel a task by id (confirms before mutating).")
     p_tasks_cancel.add_argument("task_id", help="Task id (full uuid).")
+    p_tasks_cancel.add_argument(
+        "--reason", default=None, help="Optional bounded cancellation reason."
+    )
+    p_tasks_cancel.add_argument(
+        "--confirm-cascade",
+        action="store_true",
+        help="Acknowledge cancellation of reported child/dependent tasks.",
+    )
     p_tasks_cancel.add_argument("--yes", action="store_true",
                                 help="Skip the confirmation prompt (for scripting).")
     p_tasks_requeue = tasks_sub.add_parser("requeue", parents=[common],
@@ -5497,6 +5909,21 @@ def build_parser() -> argparse.ArgumentParser:
             "Replaces guidance from an earlier manual retry without changing "
             "the original task prompt."
         ),
+    )
+    p_tasks_request_changes = tasks_sub.add_parser(
+        "request-changes",
+        parents=[common],
+        help="Request a bounded fix or review follow-up for an approval-gated task.",
+    )
+    p_tasks_request_changes.add_argument("task_id", help="Task id (full uuid).")
+    p_tasks_request_changes.add_argument(
+        "feedback", help="Concrete feedback delivered to the follow-up task."
+    )
+    p_tasks_request_changes.add_argument(
+        "--action", choices=["fix", "review"], default="fix"
+    )
+    p_tasks_request_changes.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt."
     )
     p_tasks_scope = tasks_sub.add_parser("scope", parents=[common],
                                          help="Show prompt, research question, and payload scope for a task.")
@@ -5710,6 +6137,12 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Include paused/completed/expired directions.")
     p_dirs_list.add_argument("--staged", action="store_true",
                              help="Show only staged directions.")
+    p_dirs_list.add_argument(
+        "--limit", type=int, choices=range(1, 101), default=50,
+        metavar="1..100", help="Scoped direction page size (default 50).")
+    p_dirs_list.add_argument(
+        "--offset", type=_message_offset, default=0,
+        metavar="0..1000000", help="Scoped direction rows to skip.")
 
     p_dirs_show = dirs_sub.add_parser("show", parents=[common],
                                       help="Show one direction in detail.")
@@ -5726,6 +6159,9 @@ def build_parser() -> argparse.ArgumentParser:
                             metavar="TEXT", help="Completion criteria text.")
     p_dirs_add.add_argument("--staged", action="store_true",
                             help="Create the direction staged against the open version.")
+    p_dirs_add.add_argument(
+        "--idempotency-key", default=None,
+        help="Optional stable retry key for exactly-once direction creation.")
     p_dirs_add.add_argument("--yes", action="store_true",
                             help="Skip the confirmation prompt.")
 
@@ -5735,6 +6171,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_dirs_update.add_argument("--text", help="New direction text.")
     p_dirs_update.add_argument("--priority", choices=["high", "medium", "low"],
                                help="New priority.")
+    p_dirs_update.add_argument(
+        "--paths", nargs="*", metavar="PATH",
+        help="Replace associated paths; pass the flag with no paths to clear them.")
+    p_dirs_update.add_argument(
+        "--completion-criteria", dest="completion_criteria", metavar="TEXT",
+        help="Replace completion criteria text.")
     p_dirs_update.add_argument("--status",
                                choices=["active", "paused", "completed",
                                         "staged", "proposed", "expired"],
@@ -5821,7 +6263,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_msgs_send.add_argument("content", help="Message content.")
     p_msgs_send.add_argument(
         "--type", default="FEEDBACK",
+        choices=["FEEDBACK", "NOTE", "BUG_REPORT", "QUESTION", "BLOCKER"],
         help="Message type: FEEDBACK|NOTE|BUG_REPORT|QUESTION|BLOCKER (default FEEDBACK).",
+    )
+    p_msgs_send.add_argument(
+        "--idempotency-key", default=None,
+        help="Optional stable retry key for exactly-once message creation.",
     )
     p_msgs_answer = msgs_sub.add_parser("answer", parents=[common],
                                         help="Answer a QUESTION message with a threaded reply.")
@@ -6069,12 +6516,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show design document pages; optionally pass a page KEY to show one page.",
     )
 
-    # strategic (resident session: start / stop / chat)
+    # strategic (resident session: start / stop / chat / send)
     p_strategic = sub.add_parser(
         "strategic", parents=[common],
-        help="Resident Strategic session: start, stop, or chat from the terminal.",
+        help="Resident Strategic session: start, stop, chat, or send one message.",
         description="Start (or adopt) a resident strategist session on the operator's "
-                    "runner, stop it, or chat with it interactively.")
+                    "runner, stop it, chat interactively, or send one message.")
     strategic_sub = p_strategic.add_subparsers(dest="strategic_cmd")
     p_strat_start = strategic_sub.add_parser(
         "start", parents=[common],
@@ -6098,7 +6545,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max seconds to wait for a reply per turn (default 120).")
     p_strat_chat.add_argument(
         "--type", dest="type", default="NOTE",
+        choices=["NOTE", "QUESTION", "FEEDBACK"],
         help="Message type to send (default NOTE).")
+    p_strat_send = strategic_sub.add_parser(
+        "send", parents=[common],
+        help="Send one non-interactive Strategic continuation message.")
+    p_strat_send.add_argument("content", help="Message content.")
+    p_strat_send.add_argument(
+        "--type", dest="type", default="NOTE",
+        choices=["NOTE", "QUESTION", "FEEDBACK"],
+        help="Message type to send (default NOTE).")
+    p_strat_send.add_argument(
+        "--idempotency-key", default=None,
+        help="Optional stable retry key for exactly-once message creation.")
 
     # strategic-cycle
     p_sc = sub.add_parser("strategic-cycle", parents=[common],
@@ -7610,6 +8069,11 @@ def main(argv: list | None = None) -> int:
         return 1
     handler = _DISPATCH[args.command]
     try:
+        # ServiceCredentials are machine principals, not ambient admin keys.
+        # Fence the complete CLI before project resolution or handler dispatch so
+        # a denied command cannot reach subprocess, Docker, gcloud, git, SSH, or
+        # even an unintended API route.
+        _enforce_scoped_cli_command(args)
         # Resolve --project <name> to an id once, up front, so every
         # get_project_id(args.project_id) call site targets it. An explicit
         # --project-id wins if both are supplied.
