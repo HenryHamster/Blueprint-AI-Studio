@@ -29,6 +29,7 @@ from app.landed_signal import (
     LANDED_ON_INTEGRATION_KEY,
     LANDED_SIGNAL_KEY,
     STRANDED_LANDING_REASON_KEY,
+    has_landed_signal_via_rollup,
 )
 from app.models import Alert, AlertSeverity, Project, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _is_cadence_due, _strip_tz_assume_utc, _utcnow
@@ -920,7 +921,17 @@ async def sweep_approved_pr_stranding(
     }
     for candidate in candidates.values():
         branch = get_project_integration_branch(candidate.project)
-        if not candidate.target_valid:
+        if await has_landed_signal_via_rollup(candidate.task, session):
+            # A squash-merged rollup carries the child's content without
+            # carrying the child's own commit ancestry. The canonical landed
+            # signal on the rollup lineage is the existing proof of that
+            # delivery; do not reclassify the child from its own PR tip.
+            evidence = ApprovedPrEvidence(
+                "landed",
+                "not_applicable",
+                reason="content carried by a landed rollup ancestor",
+            )
+        elif not candidate.target_valid:
             evidence = ApprovedPrEvidence(
                 "unknown", "unknown", reason=candidate.target_reason
             )

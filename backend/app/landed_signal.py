@@ -52,6 +52,14 @@ LANDED_MERGE_SHA_KEY = "merge_commit_sha"
 # durable and visible to operators / analytics.
 STRANDED_LANDING_REASON_KEY = "rollup_landing_stranded"
 
+# These merge-equivalent markers mean a child was deliberately dropped from a
+# rollup rather than carried by it. Keep the values beside the canonical
+# landing signal so readers cannot accidentally credit discarded work when
+# reconstructing a rollup-carried landing.
+FORCE_DROP_UNBLOCK_REASONS = frozenset(
+    {"rollup_no_pr_artifact", "malformed_pr_url", "review_respawn_cap"}
+)
+
 # Where the no-CI merge gate stamps WHY a PR merged without real test
 # verification. Lives under ``task.context["review_loop"]``; absent on a
 # verified/normal merge. The reason KEYS are minted in ``ci_resolution`` and
@@ -98,6 +106,51 @@ def has_landed_signal(task: Task) -> bool:
     return (
         ctx.get(LANDED_SIGNAL_KEY) is True and NON_MERGE_UNBLOCK_REASON_KEY not in ctx
     )
+
+
+async def has_landed_signal_via_rollup(task: Task, session: AsyncSession) -> bool:
+    """Return whether *task* landed directly or through a landed rollup.
+
+    A rollup child can be absent from the integration branch's ancestry after a
+    squash merge: the rollup's single merge commit carries the child's content,
+    while the child's own PR commit does not. The normal rollup propagation
+    path stamps :func:`has_landed_signal` on those children, but this reader
+    also closes the crash/legacy gap by walking the existing parent lineage.
+
+    The fallback is deliberately conservative. The child must have a genuine
+    merge-equivalent signal, every lineage edge must remain in the same
+    project, and every inspected ancestor must be merge-equivalent until a
+    canonical landed ancestor is found. Missing parents and force-dropped
+    children remain unlanded rather than being inferred as clean.
+    """
+    if has_landed_signal(task):
+        return True
+    if not has_merge_unblock_signal(task):
+        return False
+
+    current = task
+    visited: set[Any] = set()
+    while current.parent_task_id is not None:
+        parent_id = current.parent_task_id
+        if parent_id in visited:
+            return False
+        visited.add(parent_id)
+        parent = await session.get(Task, parent_id)
+        if parent is None or parent.project_id != task.project_id:
+            return False
+
+        current_context = current.context or {}
+        if current_context.get(NON_MERGE_UNBLOCK_REASON_KEY) in FORCE_DROP_UNBLOCK_REASONS:
+            return False
+        parent_context = parent.context or {}
+        if parent_context.get(NON_MERGE_UNBLOCK_REASON_KEY) in FORCE_DROP_UNBLOCK_REASONS:
+            return False
+        if has_landed_signal(parent):
+            return True
+        if not has_merge_unblock_signal(parent):
+            return False
+        current = parent
+    return False
 
 
 def landed_on_branch(task: Task, branch: str, project: Any = None) -> bool:

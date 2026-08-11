@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 import app.approved_pr_stranding as stranding
 from app.approved_pr_stranding import inspect_approved_pr, sweep_approved_pr_stranding
+from app.landed_signal import has_landed_signal_via_rollup, mark_landed_on_integration
 from app.models import Alert, Project, ReleaseVersion, Task, TaskStatus
 
 
@@ -158,6 +159,110 @@ def test_inspect_unknown_never_becomes_clean(tmp_path: Path):
     )
     assert evidence.state == "unknown"
     assert evidence.mergeability == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_sweep_recognizes_child_subsumed_by_landed_rollup(
+    db_session, tmp_path: Path, monkeypatch
+):
+    """A landed rollup carries a child's content even when its PR tip is absent."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    project = Project(
+        name="Rollup-subsumed child", user_id="test-user", integration_branch="main"
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    parent = Task(
+        project_id=project.id,
+        title="landed rollup",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+        context={"_is_rollup_review": True},
+    )
+    mark_landed_on_integration(parent)
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="subsumed child",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            "review_loop": {
+                "review_approved": True,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 18001,
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                },
+            },
+        },
+    )
+    db_session.add_all([parent, child])
+    await db_session.commit()
+
+    def fail_if_pr_ancestry_is_used(*args, **kwargs):
+        raise AssertionError("rollup-subsumed child should use the landed signal")
+
+    monkeypatch.setattr(stranding, "inspect_approved_pr", fail_if_pr_ancestry_is_used)
+
+    assert await has_landed_signal_via_rollup(child, db_session) is True
+    result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert result["stranded"] == 0
+    assert child.context["approved_pr_stranding"]["state"] == "landed"
+
+
+@pytest.mark.asyncio
+async def test_closed_child_without_rollup_subsumption_remains_stranded(
+    db_session, tmp_path: Path
+):
+    """A closed child with no merge-equivalent signal is still actionable."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    project = Project(
+        name="Closed unsubsumed child", user_id="test-user", integration_branch="main"
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    parent = Task(
+        project_id=project.id,
+        title="landed rollup",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+        context={"_is_rollup_review": True},
+    )
+    mark_landed_on_integration(parent)
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="closed child",
+        status=TaskStatus.CANCELLED,
+        created_by="TEST",
+        context={
+            "review_loop": {
+                "review_approved": True,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 18002,
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                },
+            }
+        },
+    )
+    db_session.add_all([parent, child])
+    await db_session.commit()
+
+    assert await has_landed_signal_via_rollup(child, db_session) is False
+    result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert result["stranded"] == 1
+    assert child.context["approved_pr_stranding"]["state"] == "stranded"
 
 
 @pytest.mark.asyncio

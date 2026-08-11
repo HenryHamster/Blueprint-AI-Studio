@@ -82,6 +82,7 @@ from app.branch_resolution import (
     merged_pr_counts_as_integration_landing,
 )
 from app.landed_signal import (
+    FORCE_DROP_UNBLOCK_REASONS,
     LANDED_MERGE_SHA_KEY,
     corroborate_and_apply_merged_landed_signal,
     mark_unblocked_non_merge,
@@ -421,9 +422,7 @@ def _task_owns_staging_branch(task: Task, staging_branch: str | None) -> bool:
     return tail == str(task.id).replace("-", "")[:8]
 
 
-_FORCE_DROP_REASONS = frozenset(
-    {"rollup_no_pr_artifact", "malformed_pr_url", "review_respawn_cap"}
-)
+_FORCE_DROP_REASONS = FORCE_DROP_UNBLOCK_REASONS
 
 
 async def _stamp_child_commit_range(
