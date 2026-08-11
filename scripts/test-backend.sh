@@ -115,7 +115,7 @@ fi
 # without an explicit --testmon* arg, so a leftover .testmondata on disk
 # has no effect on the run and is preserved for the next opt-in.
 
-# --- Cleanup: combined trap for CLAUDE.md copy + Postgres sidecar ---
+# --- Cleanup: combined trap for Postgres sidecar and temporary outputs ---
 PG_CONTAINER=""
 PG_NETWORK=""
 PG_DATA=""
@@ -124,7 +124,6 @@ PG_BIN=""
 VERIFICATION_OUTPUT_DIR=""
 VERIFICATION_OUTPUT_DIR_OWNED=0
 cleanup() {
-  rm -f CLAUDE.md
   [ -n "$PG_CONTAINER" ] && docker rm -f "$PG_CONTAINER" &>/dev/null || true
   [ -n "$PG_NETWORK" ] && docker network rm "$PG_NETWORK" &>/dev/null || true
   if [ -n "$PG_BIN" ] && [ -n "$PG_DATA" ] && [ -d "$PG_DATA" ]; then
@@ -136,13 +135,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Copy root CLAUDE.md into the Docker build context so test_claude_md_* in
-# test_invariants.py finds it at /app/CLAUDE.md inside the image — mirrors
-# CI (.github/workflows/ci.yml already does this same cp before its own
-# docker build). backend/CLAUDE.md is in .gitignore as a safety net.
-if [ -f ../CLAUDE.md ]; then
-  cp ../CLAUDE.md CLAUDE.md
-fi
+# Do not stage CLAUDE.md into backend/.  The harness can run from a read-only
+# checkout (including the /repo bind mount used by CI).  In Docker, the repo
+# root is mounted at /repo; outside Docker, test_invariants.py resolves the
+# checkout root directly.  Neither path requires mutating the backend tree.
 
 # --- Select the execution boundary. The authoring-verification path uses a
 # private PostgreSQL process plus a baked read-only venv inside bwrap, never the

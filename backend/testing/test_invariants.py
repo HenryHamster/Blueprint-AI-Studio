@@ -13735,11 +13735,10 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         if path.is_file()
     }
 
-    # CI mounts both /app and /repo read-only.  The real harness stages the
-    # root CLAUDE.md into backend/ before its Docker build, so invoking the
-    # bind-mounted script from /repo/backend would fail before the roster is
-    # exercised.  Copy only the harness boundary into a writable checkout;
-    # the fake executables below keep this invariant focused on its argv.
+    # CI mounts both /app and /repo read-only.  Run the harness from a
+    # read-only checkout so its setup cannot fail before the roster is
+    # exercised.  Copy only the harness boundary; fake executables keep this
+    # invariant focused on the harness argv.
     run_root = tmp_path / "checkout"
     run_scripts = run_root / "scripts"
     run_backend = run_root / "backend"
@@ -13756,6 +13755,11 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     if root_claude.is_file():
         shutil.copy2(root_claude, run_root / "CLAUDE.md")
     run_harness = run_scripts / harness.name
+
+    for path in sorted(
+        run_root.rglob("*"), key=lambda item: len(item.parts), reverse=True
+    ):
+        path.chmod(0o555 if path.is_dir() else 0o444)
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -13790,6 +13794,9 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         check=False,
     )
     assert result.returncode == 0, result.stderr + result.stdout
+    assert not (run_backend / "CLAUDE.md").exists(), (
+        "read-only harness execution must not stage CLAUDE.md into backend/"
+    )
 
     pytest_commands = [
         line for line in log_path.read_text(encoding="utf-8").splitlines()
