@@ -274,4 +274,18 @@ async def maybe_sweep_terminal_rollup_prs(session: AsyncSession) -> dict[str, in
     ):
         return {}
     _last_sweep_monotonic = now
-    return await sweep_terminal_rollup_prs(session)
+    results = await sweep_terminal_rollup_prs(session)
+    # The orchestrator cadence is also a bounded recovery opportunity for a
+    # failed task whose agent preserved work without opening a PR.  Keep this
+    # separate from rollup candidate selection so a checkpoint can never be
+    # mistaken for PR approval or a rollup parent.
+    if session is not None:
+        from app.approved_pr_stranding import _sweep_checkpoint_owners
+
+        checkpoint_results = await _sweep_checkpoint_owners(
+            session, repo_root=None, now=_utcnow()
+        )
+        for key, value in checkpoint_results.items():
+            if value:
+                results[key] = value
+    return results

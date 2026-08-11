@@ -85,6 +85,32 @@ def _squash_merge_fixture(tmp_path: Path) -> tuple[Path, str, str, str]:
     return repo, base_sha, head_sha, merge_commit_sha
 
 
+def _checkpoint_fixture(
+    tmp_path: Path, task_id: uuid.UUID, *, valid: bool = True
+) -> tuple[Path, str, str]:
+    repo, base_sha, _head_sha, _integration_sha = _git_fixture(tmp_path)
+    branch = f"blueprint/task-{str(task_id).replace('-', '')[:8]}"
+    _run("git", "checkout", "-b", branch, cwd=repo)
+    (repo / "checkpoint.txt").write_text("preserved work\n", encoding="utf-8")
+    _run("git", "add", ".", cwd=repo)
+    subject = (
+        f"blueprint-checkpoint: preserve unshipped task {task_id}"
+        if valid
+        else "ordinary commit on a task branch"
+    )
+    body = (
+        "Blueprint-Checkpoint-Version: 1\n"
+        f"Blueprint-Task-Id: {task_id}\n"
+        f"Blueprint-Base-Commit: {base_sha}"
+        if valid
+        else "not a checkpoint"
+    )
+    _run("git", "commit", "-m", subject, "-m", body, cwd=repo)
+    checkpoint_sha = _run("git", "rev-parse", "HEAD", cwd=repo)
+    _run("git", "checkout", "main", cwd=repo)
+    return repo, branch, checkpoint_sha
+
+
 def test_inspect_flags_clean_strand_and_ignores_ancestor(tmp_path: Path):
     repo, base_sha, head_sha, integration_sha = _git_fixture(tmp_path)
 
@@ -159,6 +185,375 @@ def test_inspect_unknown_never_becomes_clean(tmp_path: Path):
     )
     assert evidence.state == "unknown"
     assert evidence.mergeability == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_sweep_assigns_exact_checkpoint_branch_to_failed_owner(
+    db_session, tmp_path: Path
+):
+    task_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+    repo, branch, checkpoint_sha = _checkpoint_fixture(tmp_path, task_id)
+    project = Project(
+        name="Checkpoint owner project",
+        user_id="test-user",
+        integration_branch="main",
+    )
+    task = Task(
+        id=task_id,
+        project_id=project.id,
+        title="unshipped work",
+        status=TaskStatus.FAILED,
+        created_by="TEST",
+        payloads=[{"type": "create", "prompt": "preserve"}],
+        context={"branch": branch},
+    )
+    db_session.add_all([project, task])
+    await db_session.commit()
+
+    result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    await db_session.refresh(task)
+    owner = task.context["unshipped_checkpoint"]
+    assert result["checkpoint_scanned"] == 1
+    assert result["checkpoint_stranded"] == 1
+    assert result["checkpoint_handoffs"] == 1
+    assert result.get("checkpoint_alerts_created", 0) == 0
+    assert task.status == TaskStatus.QUEUED
+    assert owner["task_id"] == str(task_id)
+    assert owner["branch"] == branch
+    assert owner["checkpoint_sha"] == checkpoint_sha
+    assert owner["state"] == "stranded"
+
+
+@pytest.mark.asyncio
+async def test_sweep_ignores_unproven_checkpoint_lookalike(
+    db_session, tmp_path: Path
+):
+    task_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    repo, branch, _checkpoint_sha = _checkpoint_fixture(tmp_path, task_id, valid=False)
+    project = Project(
+        name="Malformed checkpoint project",
+        user_id="test-user",
+        integration_branch="main",
+    )
+    task = Task(
+        id=task_id,
+        project_id=project.id,
+        title="unrelated branch",
+        status=TaskStatus.FAILED,
+        created_by="TEST",
+        payloads=[{"type": "create", "prompt": "ignore"}],
+        context={"branch": branch},
+    )
+    db_session.add_all([project, task])
+    await db_session.commit()
+
+    result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    await db_session.refresh(task)
+    assert result.get("checkpoint_scanned", 0) == 0
+    assert result.get("checkpoint_handoffs", 0) == 0
+    assert task.status == TaskStatus.FAILED
+    assert "unshipped_checkpoint" not in task.context
+    # A branch we read that carries no checkpoint contract is a durable verdict,
+    # so the row must leave the oldest-first candidate window.
+    assert (
+        task.context["unshipped_checkpoint_examined"]["reason"]
+        == "not_a_checkpoint_branch"
+    )
+
+
+def _checkpoint_project_and_task(
+    task_id: uuid.UUID, *, branch: str, name: str
+) -> tuple[Project, Task]:
+    project = Project(
+        name=name,
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="main",
+    )
+    task = Task(
+        id=task_id,
+        project_id=project.id,
+        title="unshipped work",
+        status=TaskStatus.FAILED,
+        created_by="TEST",
+        payloads=[{"type": "create", "prompt": "preserve"}],
+        context={"branch": branch, "failure_class": "AGENT_TIMEOUT"},
+    )
+    return project, task
+
+
+def _patch_github_checkpoint(
+    monkeypatch, *, branch: str, task_id: uuid.UUID, ancestor: bool | None
+) -> None:
+    """Wire the deployed (repo_root=None) checkpoint path onto fake GitHub."""
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "acme", "widget")),
+    )
+    monkeypatch.setattr(
+        "app.github.list_branches",
+        AsyncMock(
+            return_value=[
+                {"name": branch, "sha": "checkpoint-sha"},
+                {"name": "blueprint/task-unrelated", "sha": "other-sha"},
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "app.github.list_recent_commit_messages",
+        AsyncMock(
+            return_value=[
+                f"blueprint-checkpoint: preserve unshipped task {task_id}\n"
+                "Blueprint-Checkpoint-Version: 1\n"
+                f"Blueprint-Task-Id: {task_id}\n"
+                "Blueprint-Base-Commit: abc1234"
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "app.github.get_branch_sha", AsyncMock(return_value="integration-head")
+    )
+    monkeypatch.setattr(
+        "app.github.is_ancestor_of", AsyncMock(return_value=ancestor)
+    )
+
+
+@pytest.mark.asyncio
+async def test_github_checkpoint_strand_hands_off_owner_without_checkout(
+    db_session, monkeypatch
+):
+    """The deployed sweep runs with repo_root=None and no git binary."""
+
+    def no_git_available(*args, **kwargs):
+        raise AssertionError("deployed checkpoint sweep must not invoke local git")
+
+    monkeypatch.setattr(stranding.subprocess, "run", no_git_available)
+    task_id = uuid.UUID("33333333-3333-4333-8333-333333333333")
+    branch = "blueprint/task-33333333"
+    project, task = _checkpoint_project_and_task(
+        task_id, branch=branch, name="Deployed checkpoint project"
+    )
+    task.vm_instance_id = "agent-vm-dead"
+    task.last_heartbeat = datetime(2026, 8, 9, tzinfo=timezone.utc)
+    db_session.add_all([project, task])
+    await db_session.commit()
+    _patch_github_checkpoint(
+        monkeypatch, branch=branch, task_id=task_id, ancestor=False
+    )
+
+    counts = await stranding._sweep_checkpoint_owners(
+        db_session, repo_root=None, now=datetime(2026, 8, 10)
+    )
+
+    await db_session.refresh(task)
+    assert counts["checkpoint_scanned"] == 1
+    assert counts["checkpoint_stranded"] == 1
+    assert counts["checkpoint_handoffs"] == 1
+    assert counts["checkpoint_alerts_created"] == 0
+    assert task.status == TaskStatus.QUEUED
+    assert task.context["unshipped_checkpoint"]["checkpoint_sha"] == "checkpoint-sha"
+    assert task.context["unshipped_checkpoint"]["state"] == "stranded"
+    # The requeue must be a genuine fresh attempt, not a bare status flip.
+    assert task.vm_instance_id is None
+    assert task.last_heartbeat is None
+    assert task.started_at is None
+    assert "failure_class" not in task.context
+    assert "_fresh_attempt_started_at" in task.context
+
+
+@pytest.mark.asyncio
+async def test_github_checkpoint_unknown_never_hands_off_or_alerts(
+    db_session, monkeypatch
+):
+    """An unavailable ancestry answer is unknown — never a strand, never clean."""
+    task_id = uuid.UUID("44444444-4444-4444-8444-444444444444")
+    branch = "blueprint/task-44444444"
+    project, task = _checkpoint_project_and_task(
+        task_id, branch=branch, name="Unknown checkpoint project"
+    )
+    db_session.add_all([project, task])
+    await db_session.commit()
+    _patch_github_checkpoint(
+        monkeypatch, branch=branch, task_id=task_id, ancestor=None
+    )
+
+    counts = await stranding._sweep_checkpoint_owners(
+        db_session, repo_root=None, now=datetime(2026, 8, 10)
+    )
+
+    await db_session.refresh(task)
+    assert counts["checkpoint_scanned"] == 1
+    assert counts["checkpoint_unknown"] == 1
+    assert counts["checkpoint_stranded"] == 0
+    assert counts["checkpoint_handoffs"] == 0
+    assert counts["checkpoint_alerts_created"] == 0
+    assert task.status == TaskStatus.FAILED
+    assert task.context["unshipped_checkpoint"]["state"] == "unknown"
+    # Unknown evidence must NOT close the row out of the candidate window.
+    assert "unshipped_checkpoint_examined" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_handoff_skips_active_idempotency_key_collision(
+    db_session, monkeypatch
+):
+    """A live clone already holds the key — requeueing would abort the commit."""
+    task_id = uuid.UUID("55555555-5555-4555-8555-555555555555")
+    branch = "blueprint/task-55555555"
+    project, task = _checkpoint_project_and_task(
+        task_id, branch=branch, name="Colliding checkpoint project"
+    )
+    task.idempotency_key = "shared-key"
+    replacement = Task(
+        project_id=project.id,
+        title="live replacement",
+        status=TaskStatus.QUEUED,
+        created_by="TEST",
+        payloads=[{"type": "create", "prompt": "preserve"}],
+        idempotency_key="shared-key",
+    )
+    db_session.add_all([project, task, replacement])
+    await db_session.commit()
+    _patch_github_checkpoint(
+        monkeypatch, branch=branch, task_id=task_id, ancestor=False
+    )
+
+    counts = await stranding._sweep_checkpoint_owners(
+        db_session, repo_root=None, now=datetime(2026, 8, 10)
+    )
+
+    await db_session.refresh(task)
+    assert counts["checkpoint_stranded"] == 1
+    assert counts["checkpoint_handoffs"] == 0
+    assert counts["checkpoint_alerts_created"] == 1
+    assert task.status == TaskStatus.FAILED
+    assert task.context["unshipped_checkpoint_examined"]["reason"] == (
+        "operator_attention"
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_sweep_skips_parents_and_abandoned_work(
+    db_session, monkeypatch
+):
+    """Parents re-evaluate through their own path; closed PRs are abandoned."""
+    parent_id = uuid.UUID("66666666-6666-4666-8666-666666666666")
+    abandoned_id = uuid.UUID("77777777-7777-4777-8777-777777777777")
+    project, parent = _checkpoint_project_and_task(
+        parent_id, branch="blueprint/task-66666666", name="Parent checkpoint project"
+    )
+    parent.payloads = [{"type": "research", "prompt": "plan"}]
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent_id,
+        title="child",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+        payloads=[{"type": "create", "prompt": "work"}],
+    )
+    abandoned = Task(
+        id=abandoned_id,
+        project_id=project.id,
+        title="abandoned",
+        status=TaskStatus.FAILED,
+        created_by="TEST",
+        payloads=[{"type": "create", "prompt": "work"}],
+        context={"branch": "blueprint/task-77777777", "pr_closed_unmerged": True},
+    )
+    db_session.add_all([project, parent, child, abandoned])
+    await db_session.commit()
+    list_branches = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "acme", "widget")),
+    )
+    monkeypatch.setattr("app.github.list_branches", list_branches)
+
+    counts = await stranding._sweep_checkpoint_owners(
+        db_session, repo_root=None, now=datetime(2026, 8, 10)
+    )
+
+    await db_session.refresh(parent)
+    await db_session.refresh(abandoned)
+    assert counts["checkpoint_scanned"] == 0
+    assert counts["checkpoint_handoffs"] == 0
+    # The abandoned row is excluded by the candidate predicate itself, so the
+    # sweep never even resolves a project for it.
+    assert list_branches.await_count == 0
+    assert "unshipped_checkpoint_examined" not in abandoned.context
+    assert parent.context["unshipped_checkpoint_examined"]["reason"] == (
+        "parent_with_children"
+    )
+
+
+@pytest.mark.asyncio
+async def test_examined_rows_leave_the_candidate_window(db_session, monkeypatch):
+    """A scanned row without a checkpoint must not pin the bounded scan."""
+    task_id = uuid.UUID("88888888-8888-4888-8888-888888888888")
+    branch = "blueprint/task-88888888"
+    project, task = _checkpoint_project_and_task(
+        task_id, branch=branch, name="Starvation checkpoint project"
+    )
+    db_session.add_all([project, task])
+    await db_session.commit()
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "acme", "widget")),
+    )
+    monkeypatch.setattr(
+        "app.github.list_branches",
+        AsyncMock(return_value=[{"name": "blueprint/task-other", "sha": "sha"}]),
+    )
+
+    first = await stranding._sweep_checkpoint_owners(
+        db_session, repo_root=None, now=datetime(2026, 8, 10)
+    )
+    await db_session.refresh(task)
+    assert first["checkpoint_scanned"] == 0
+    assert task.context["unshipped_checkpoint_examined"]["reason"] == (
+        "no_checkpoint_branch"
+    )
+
+    second_listing = AsyncMock(
+        return_value=[{"name": branch, "sha": "checkpoint-sha"}]
+    )
+    monkeypatch.setattr("app.github.list_branches", second_listing)
+    second = await stranding._sweep_checkpoint_owners(
+        db_session, repo_root=None, now=datetime(2026, 8, 10)
+    )
+    assert second["checkpoint_scanned"] == 0
+    assert second_listing.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_incomplete_branch_listing_never_marks_a_row_examined(
+    db_session, monkeypatch
+):
+    """An empty listing is an API failure, not proof that no branch exists."""
+    task_id = uuid.UUID("99999999-9999-4999-8999-999999999999")
+    project, task = _checkpoint_project_and_task(
+        task_id,
+        branch="blueprint/task-99999999",
+        name="Unavailable listing project",
+    )
+    db_session.add_all([project, task])
+    await db_session.commit()
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "acme", "widget")),
+    )
+    monkeypatch.setattr("app.github.list_branches", AsyncMock(return_value=[]))
+
+    counts = await stranding._sweep_checkpoint_owners(
+        db_session, repo_root=None, now=datetime(2026, 8, 10)
+    )
+
+    await db_session.refresh(task)
+    assert counts["checkpoint_scanned"] == 0
+    assert "unshipped_checkpoint_examined" not in task.context
 
 
 @pytest.mark.asyncio
@@ -268,7 +663,7 @@ async def test_closed_child_without_rollup_subsumption_remains_stranded(
 
 
 @pytest.mark.asyncio
-async def test_sweep_alerts_after_two_qualification_cycles(db_session, tmp_path: Path):
+async def test_sweep_alerts_after_one_qualification_cycle(db_session, tmp_path: Path):
     repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
     project = Project(name="Detector project", user_id="test-user", integration_branch="main")
     db_session.add(project)
@@ -302,14 +697,14 @@ async def test_sweep_alerts_after_two_qualification_cycles(db_session, tmp_path:
 
     first = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
     assert first["stranded"] == 1
-    assert first["alerts_created"] == 0
+    assert first["alerts_created"] == 1
     assert (task.context["approved_pr_stranding"]["qualification_cycles_seen"]) == 1
 
     version.active_qualification_attempt_id = uuid.uuid4()
     db_session.add(version)
     await db_session.commit()
     second = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
-    assert second["alerts_created"] == 1
+    assert second["alerts_created"] == 0
     alert = (
         await db_session.execute(
             select(Alert).where(Alert.event_type == "release.approved_pr_stranded")
@@ -729,7 +1124,7 @@ async def test_stranded_verdict_without_local_checkout(db_session, monkeypatch):
         db_session, now=datetime(2026, 8, 9, tzinfo=timezone.utc)
     )
     assert first["stranded"] == 1
-    assert first["alerts_created"] == 0
+    assert first["alerts_created"] == 1
     assert task.context["approved_pr_stranding"]["state"] == "stranded"
 
     version.active_qualification_attempt_id = uuid.uuid4()
@@ -739,7 +1134,7 @@ async def test_stranded_verdict_without_local_checkout(db_session, monkeypatch):
         db_session, now=datetime(2026, 8, 9, 0, 15, tzinfo=timezone.utc)
     )
     assert second["stranded"] == 1
-    assert second["alerts_created"] == 1
+    assert second["alerts_created"] == 0
     alert = (
         await db_session.execute(
             select(Alert).where(
@@ -817,7 +1212,7 @@ async def test_sweep_detects_strand_on_non_integration_branch(
 
     first = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
     assert first["stranded"] == 1
-    assert first["alerts_created"] == 0
+    assert first["alerts_created"] == 1
     assert task.context["approved_pr_stranding"]["checked_commit_sha"] == merge_commit_sha
     assert task.context["approved_pr_stranding"]["reachability_signal"] == "neither"
 
@@ -825,7 +1220,7 @@ async def test_sweep_detects_strand_on_non_integration_branch(
     db_session.add(version)
     await db_session.commit()
     second = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
-    assert second["alerts_created"] == 1
+    assert second["alerts_created"] == 0
     alert = (
         await db_session.execute(
             select(Alert).where(
@@ -880,14 +1275,14 @@ async def test_sweep_alerts_post_promotion_without_open_version(
 
     first = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
     assert first["stranded"] == 1
-    assert first["alerts_created"] == 0
+    assert first["alerts_created"] == 1
     assert task.context["approved_pr_stranding"]["qualification_cycles_seen"] == 1
 
     version.last_qualification = {"qualification_attempt_id": str(uuid.uuid4())}
     db_session.add(version)
     await db_session.commit()
     second = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
-    assert second["alerts_created"] == 1
+    assert second["alerts_created"] == 0
     alert = (
         await db_session.execute(
             select(Alert).where(

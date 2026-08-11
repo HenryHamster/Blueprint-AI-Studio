@@ -47,6 +47,7 @@ from typing import Any, Callable, Literal
 from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     acceptance_blocks_success,
+    finding_clearance_blocks_success,
 )
 from app.ci_resolution import (
     acceptance_test_block,
@@ -161,6 +162,8 @@ def _evaluate_write(task: Task) -> TaskOutcome:
         if vs == "unverified_degraded":
             return TaskOutcome("neutral", KIND_CODE_MERGE)
         if reproduce_verdict_status(task) in ("already_resolved", "indeterminate"):
+            return TaskOutcome("neutral", KIND_CODE_MERGE)
+        if finding_clearance_blocks_success(_task_local_attr(task, "context")):
             return TaskOutcome("neutral", KIND_CODE_MERGE)
         # Code-task acceptance gate. A code task that DECLARED acceptance
         # evidence carries a durable verdict (recorded at merge under

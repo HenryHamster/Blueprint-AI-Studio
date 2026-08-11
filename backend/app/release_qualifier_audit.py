@@ -14,7 +14,7 @@ import logging
 import uuid
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -83,6 +83,7 @@ _INFRA_WEBHOOK_TASKS: set[asyncio.Task[Any]] = set()
 
 _STRANDED_APPROVED_PR_SCAN_LIMIT = 101
 _STRANDED_APPROVED_PR_PREVIEW_LIMIT = 20
+_STRANDING_OBSERVATION_KEY = "approved_pr_stranding"
 
 # Approvals on a cancelled task are deliberate abandonment, not stranding.
 _STRANDED_APPROVED_PR_EXCLUDED_STATUSES = (TaskStatus.CANCELLED,)
@@ -104,7 +105,7 @@ def _unavailable_stranded_approved_pr_snapshot(
 
 def _stranded_approved_pr_columns(
     session: AsyncSession,
-) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
+) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     """Return the narrow JSON fields needed to mirror CI-monitor eligibility.
 
     A Task's ``context`` JSONB is permitted up to 100KB, so the badge-poll and
@@ -122,6 +123,10 @@ def _stranded_approved_pr_columns(
             func.json_extract(Task.context, "$.review_loop.merge_rule_blocked"),
             func.json_extract(Task.context, "$.review_loop.pr_number"),
             func.json_extract(Task.context, "$.rollup_pr_number"),
+            func.json_extract(Task.context, f"$.{_STRANDING_OBSERVATION_KEY}.state"),
+            func.json_extract(
+                Task.context, f"$.{_STRANDING_OBSERVATION_KEY}.rollup_subsumed"
+            ),
         )
     return (
         Task.context["review_loop"]["review_approved"].as_boolean(),
@@ -133,6 +138,8 @@ def _stranded_approved_pr_columns(
         Task.context["review_loop"]["merge_rule_blocked"].as_boolean(),
         Task.context["review_loop"]["pr_number"].as_integer(),
         Task.context["rollup_pr_number"].as_integer(),
+        Task.context[_STRANDING_OBSERVATION_KEY]["state"].as_string(),
+        Task.context[_STRANDING_OBSERVATION_KEY]["rollup_subsumed"].as_boolean(),
     )
 
 
@@ -203,13 +210,27 @@ async def snapshot_stranded_approved_prs(
             merge_rule_blocked,
             pr_number,
             rollup_pr_number,
+            stranding_observation_state,
+            stranding_observation_rollup_subsumed,
         ) = _stranded_approved_pr_columns(session)
         # ``landed_signal_predicate`` evaluates to NULL (not FALSE) on a row
         # missing the JSON keys entirely, and ``NOT NULL`` is NULL — which would
         # silently drop exactly the unlanded rows this snapshot exists to find.
-        not_landed = func.coalesce(landed_signal_predicate(session), False).is_(
-            False
-        )
+        direct_not_landed = func.coalesce(
+            landed_signal_predicate(session), False
+        ).is_(False)
+        # The reaper persists rollup ancestry evidence because a squash-merged
+        # child does not carry a direct integration-branch landing marker.  Use
+        # that durable observation before applying the bounded scan cap; the
+        # direct marker remains the fallback for rows with no reconciliation.
+        reconciled_landed = func.coalesce(
+            or_(
+                stranding_observation_state == "landed",
+                stranding_observation_rollup_subsumed.is_(True),
+            ),
+            False,
+        ).is_(False)
+        not_landed = and_(direct_not_landed, reconciled_landed)
         stmt = (
             select(
                 Task.id,

@@ -19,11 +19,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.branch_resolution import get_project_integration_branch
+from app.branch_resolution import (
+    derive_task_branch,
+    get_project_integration_branch,
+    get_project_task_branch_namespace,
+    resolve_task_branch,
+)
+from app.database import resolve_dialect_name
 from app.landed_signal import (
     LANDED_MERGE_SHA_KEY,
     LANDED_ON_INTEGRATION_KEY,
@@ -46,6 +52,33 @@ _RELAND_RECEIPT_KEY = "approved_pr_reland"
 _EVENT_TYPE = "release.approved_pr_stranded"
 _ALERT_TITLE = "Approved pull request has not reached the integration branch"
 _MAX_RELAND_ATTEMPTS = 1
+_MIN_STRANDING_CYCLES_FOR_ALERT = 1
+_CHECKPOINT_OWNER_KEY = "unshipped_checkpoint"
+_CHECKPOINT_HANDOFF_COUNT_KEY = "_unshipped_checkpoint_handoffs"
+_CHECKPOINT_SUBJECT_PREFIX = "blueprint-checkpoint: preserve unshipped task "
+_CHECKPOINT_VERSION = "1"
+_CHECKPOINT_BATCH_SIZE = 100
+_CHECKPOINT_HANDOFF_CAP = 1
+# Durable "this row has been decided" marker.  The scan is a bounded, oldest-first
+# window over FAILED tasks, and a task with no checkpoint branch is never written
+# to — without this marker a wall of permanently-failed rows would pin the window
+# and no newer checkpoint would ever be scanned.  Mirrors the attention marker the
+# sibling terminal-rollup sweep excludes in its candidate predicate.
+_CHECKPOINT_EXAMINED_KEY = "unshipped_checkpoint_examined"
+# Statuses inside the ``ux_task_active_idempotency_key`` partial unique index
+# (migration 0199).  A FAILED -> QUEUED flip enters that index, so a live
+# duplicate holding the same key would abort the commit on the orchestrator's
+# shared session.  Must mirror the index predicate EXACTLY.
+_ACTIVE_IDEMPOTENCY_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+    TaskStatus.BLOCKED,
+    TaskStatus.PARKED,
+)
+_CHECKPOINT_ALERT_TITLE = "Unshipped task checkpoint needs attention"
+_CHECKPOINT_EVENT_TYPE = "release.unshipped_checkpoint_stranded"
 _RELAND_RETRY_LATCH_KEYS = (
     "conflict_fix_spawned",
     "ci_fix_spawned",
@@ -74,6 +107,52 @@ Mergeability = Literal["clean", "conflicted", "not_applicable", "unknown"]
 ReachabilitySignal = Literal["merge_sha", "head_sha", "neither"]
 
 ROLLUP_SUBSUMED_REASON = "content carried by a landed rollup ancestor"
+
+
+@dataclass(frozen=True)
+class _CheckpointEvidence:
+    branch: str
+    checkpoint_sha: str
+    base_commit: str
+    state: EvidenceState
+    integration_branch: str
+    integration_head_sha: str | None = None
+    mergeability: Mergeability = "unknown"
+    reason: str | None = None
+
+
+def _parse_checkpoint_message(message: str, task_id: uuid.UUID) -> dict[str, str] | None:
+    """Parse the agent's exact checkpoint contract, rejecting lookalikes."""
+    lines = message.replace("\r\n", "\n").split("\n")
+    if not lines or lines[0] != f"{_CHECKPOINT_SUBJECT_PREFIX}{task_id}":
+        return None
+    trailers: dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key and key[0].isalpha() and all(char.isalpha() or char == "-" for char in key):
+            trailers[key] = value.strip()
+    base_commit = trailers.get("Blueprint-Base-Commit")
+    if (
+        trailers.get("Blueprint-Checkpoint-Version") != _CHECKPOINT_VERSION
+        or trailers.get("Blueprint-Task-Id") != str(task_id)
+        or not base_commit
+        or not all(char in "0123456789abcdefABCDEF" for char in base_commit)
+        or not 7 <= len(base_commit) <= 64
+    ):
+        return None
+    return {"task_id": str(task_id), "base_commit": base_commit}
+
+
+def _checkpoint_branch_aliases(task: Task, project: Project) -> set[str]:
+    namespace = get_project_task_branch_namespace(project)
+    payload = task.first_payload
+    aliases = {
+        resolve_task_branch(task, namespace),
+        derive_task_branch(task.id, payload.get("type"), namespace),
+    }
+    return {branch for branch in aliases if isinstance(branch, str) and branch}
 
 
 @dataclass(frozen=True)
@@ -119,6 +198,558 @@ def _git(args: list[str], *, repo_root: str) -> subprocess.CompletedProcess[str]
     except (OSError, subprocess.SubprocessError):
         logger.warning("[APPROVED_PR] git evidence unavailable in %s", repo_root)
         return None
+
+
+def _local_checkpoint_branch_names(repo_root: str, prefix: str) -> list[str] | None:
+    """Return the complete local branch list, or ``None`` when git is unavailable.
+
+    ``None`` is not "no branches": absence is only provable from a listing that
+    actually succeeded, and only a provable absence may mark a task examined.
+    """
+    result = _git(
+        ["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        repo_root=repo_root,
+    )
+    if result is None or result.returncode != 0:
+        return None
+    return [
+        name.strip()
+        for name in result.stdout.splitlines()
+        if name.strip().startswith(prefix)
+    ]
+
+
+def _local_checkpoint_evidence(
+    *, task: Task, branch: str, integration_branch: str, repo_root: str
+) -> tuple[_CheckpointEvidence | None, bool]:
+    """Return ``(evidence, proven_not_a_checkpoint)`` for one local branch.
+
+    The second element is ``True`` only when the branch tip was read and its
+    message provably fails the checkpoint contract.  An unreadable branch is
+    unknown, never a lookalike.
+    """
+    sha_result = _git(
+        ["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"],
+        repo_root=repo_root,
+    )
+    message_result = _git(
+        ["show", "-s", "--format=%B", f"refs/heads/{branch}"],
+        repo_root=repo_root,
+    )
+    if (
+        sha_result is None
+        or message_result is None
+        or sha_result.returncode != 0
+        or message_result.returncode != 0
+    ):
+        return None, False
+    checkpoint_sha = sha_result.stdout.strip()
+    parsed = _parse_checkpoint_message(message_result.stdout, task.id)
+    if not checkpoint_sha or parsed is None:
+        return None, bool(checkpoint_sha)
+    evidence = inspect_approved_pr(
+        base_sha=parsed["base_commit"],
+        head_sha=checkpoint_sha,
+        integration_branch=integration_branch,
+        repo_root=repo_root,
+    )
+    return (
+        _CheckpointEvidence(
+            branch=branch,
+            checkpoint_sha=checkpoint_sha,
+            base_commit=parsed["base_commit"],
+            state=evidence.state,
+            integration_branch=integration_branch,
+            integration_head_sha=evidence.integration_head_sha,
+            mergeability=evidence.mergeability,
+            reason=evidence.reason,
+        ),
+        False,
+    )
+
+
+async def _github_checkpoint_evidence(
+    *, session, task: Task, project: Project, branch: str, branch_sha: str
+) -> tuple[_CheckpointEvidence | None, bool]:
+    """Return ``(evidence, proven_not_a_checkpoint)`` for one remote branch.
+
+    Same contract as :func:`_local_checkpoint_evidence`: only a commit message we
+    actually read can prove a branch is a lookalike.  Every unavailable path
+    yields ``unknown`` evidence or ``None``, never a clean verdict.
+    """
+    from app import github
+    from app.release_promotion import _resolve_github_with_session
+
+    try:
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return None, False
+        token, owner, repo = resolved
+        messages = await github.list_recent_commit_messages(
+            token,
+            owner,
+            repo,
+            branch,
+            limit=1,
+            project_id=str(project.id),
+        )
+        if not messages:
+            return None, False
+        parsed = _parse_checkpoint_message(messages[0], task.id)
+        if parsed is None:
+            return None, True
+        integration_branch = get_project_integration_branch(project)
+        integration_head_sha = await github.get_branch_sha(
+            token,
+            owner,
+            repo,
+            integration_branch,
+            project_id=str(project.id),
+            live=True,
+        )
+        reachable = await github.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            branch_sha,
+            integration_branch,
+            project_id=str(project.id),
+        )
+        if reachable is None:
+            state: EvidenceState = "unknown"
+            reason = "GitHub ancestry check unavailable"
+        else:
+            state = "landed" if reachable else "stranded"
+            reason = None
+        return (
+            _CheckpointEvidence(
+                branch,
+                branch_sha,
+                parsed["base_commit"],
+                state,
+                integration_branch,
+                integration_head_sha,
+                "not_applicable" if state == "landed" else "unknown",
+                reason,
+            ),
+            False,
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence must remain tri-state
+        logger.warning(
+            "[APPROVED_PR] checkpoint evidence unavailable for task %s branch %s: %s",
+            task.id,
+            branch,
+            exc,
+        )
+        return (
+            _CheckpointEvidence(
+                branch,
+                branch_sha,
+                "",
+                "unknown",
+                get_project_integration_branch(project),
+                reason="GitHub checkpoint evidence unavailable",
+            ),
+            False,
+        )
+
+
+def _checkpoint_observation_for(
+    task: Task, project: Project, evidence: _CheckpointEvidence, now: datetime
+) -> tuple[dict[str, Any], bool]:
+    old = (task.context or {}).get(_CHECKPOINT_OWNER_KEY) or {}
+    identity = f"{evidence.branch}:{evidence.checkpoint_sha}"
+    if old.get("identity") != identity:
+        old = {}
+    from app.task_completion import checkpoint_owner_metadata
+
+    updated = {
+        **checkpoint_owner_metadata(task, evidence.branch),
+        "identity": identity,
+        "checkpoint_sha": evidence.checkpoint_sha,
+        "base_commit": evidence.base_commit,
+        "state": evidence.state,
+        "mergeability": evidence.mergeability,
+        "integration_branch": evidence.integration_branch,
+        "integration_head_sha": evidence.integration_head_sha,
+        "reason": evidence.reason,
+        "first_observed_at": old.get("first_observed_at") or now.isoformat(),
+        "last_observed_at": now.isoformat(),
+        "handoff_count": old.get("handoff_count", 0),
+    }
+    changed = updated != old
+    if changed:
+        context = dict(task.context or {})
+        context[_CHECKPOINT_OWNER_KEY] = updated
+        task.context = context
+        flag_modified(task, "context")
+    return updated, changed
+
+
+async def _active_idempotency_keys(session, tasks: list[Task]) -> set[str]:
+    """Pre-query the keys a FAILED -> QUEUED flip could collide with.
+
+    Mirrors ``reaper_infra_recovery``: the requeue enters the partial unique
+    index ``ux_task_active_idempotency_key``, and a UniqueViolation on the
+    orchestrator's shared session poisons every downstream sweep in the batch.
+    """
+    candidate_keys = {task.idempotency_key for task in tasks if task.idempotency_key}
+    if not candidate_keys:
+        return set()
+    return set(
+        (
+            await session.execute(
+                select(Task.idempotency_key).where(
+                    Task.idempotency_key.in_(candidate_keys),
+                    Task.status.in_(list(_ACTIVE_IDEMPOTENCY_STATUSES)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _handoff_checkpoint_owner(
+    session,
+    task: Task,
+    observation: dict[str, Any],
+    now: datetime,
+    *,
+    blocked_idempotency_keys: set[str],
+) -> bool:
+    """Queue the exact failed owner once so its agent restores the branch."""
+    locked = (
+        await session.execute(
+            select(Task)
+            .where(Task.id == task.id)
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().first()
+    if locked is None or locked.status != TaskStatus.FAILED:
+        return False
+    current = (locked.context or {}).get(_CHECKPOINT_OWNER_KEY) or {}
+    if current.get("identity") != observation.get("identity"):
+        return False
+    try:
+        handoffs = int((locked.context or {}).get(_CHECKPOINT_HANDOFF_COUNT_KEY, 0))
+    except (TypeError, ValueError):
+        handoffs = 0
+    if handoffs >= _CHECKPOINT_HANDOFF_CAP:
+        return False
+    # A failed task keeps its idempotency_key, so an abandoned failure whose
+    # replacement clone is live is exactly the colliding case.  The live
+    # duplicate already represents the work — leave the checkpoint to the alert.
+    if locked.idempotency_key and locked.idempotency_key in blocked_idempotency_keys:
+        logger.info(
+            "[APPROVED_PR] skipping checkpoint handoff for task %s: "
+            "idempotency_key already held by an active task",
+            locked.id,
+        )
+        return False
+
+    from app.task_blocked import reset_task_for_fresh_attempt
+
+    # Every other FAILED -> QUEUED site resets the attempt before re-dispatch:
+    # bank the finished attempt, advance the lifetime counter, and drop the dead
+    # VM binding, liveness markers, retry_after and failure verdict.  Without it
+    # the reaper's staleness checks read the previous attempt's markers.
+    reset_task_for_fresh_attempt(locked)
+    context = dict(locked.context or {})
+    owner = dict(current)
+    owner.update({"handoff_count": handoffs + 1, "handoff_at": now.isoformat()})
+    context[_CHECKPOINT_OWNER_KEY] = owner
+    context[_CHECKPOINT_HANDOFF_COUNT_KEY] = handoffs + 1
+    locked.context = context
+    locked.status = TaskStatus.QUEUED
+    locked.latest_status_message = (
+        f"Recovered unshipped checkpoint on {owner.get('branch')}; "
+        "requeued the owning task to restore it before the next attempt."
+    )
+    flag_modified(locked, "context")
+    session.add(locked)
+    return True
+
+
+def _checkpoint_candidate_filter(session) -> tuple[Any, ...]:
+    """Narrow the FAILED window so decided and abandoned rows leave it.
+
+    Deliberately abandoned work (``pr_closed_unmerged`` / ``pr_closed_empty`` /
+    ``pr_rejected``) is never resurrected — the sibling reaper sweep skips the
+    same markers — and an already-examined row must not pin the oldest-first
+    window forever.
+    """
+    if resolve_dialect_name(session) == "sqlite":
+        return (
+            func.json_extract(Task.context, f"$.{_CHECKPOINT_EXAMINED_KEY}").is_(None),
+            func.coalesce(func.json_extract(Task.context, "$.pr_closed_unmerged"), 0)
+            != 1,
+            func.coalesce(func.json_extract(Task.context, "$.pr_closed_empty"), 0) != 1,
+            func.coalesce(func.json_extract(Task.context, "$.pr_rejected"), 0) != 1,
+        )
+    return (
+        Task.context[_CHECKPOINT_EXAMINED_KEY].as_string().is_(None),
+        Task.context["pr_closed_unmerged"].as_boolean().is_not(True),
+        Task.context["pr_closed_empty"].as_boolean().is_not(True),
+        Task.context["pr_rejected"].as_boolean().is_not(True),
+    )
+
+
+def _mark_checkpoint_examined(task: Task, reason: str, now: datetime) -> None:
+    """Record a definitive verdict so the row leaves the candidate window."""
+    context = dict(task.context or {})
+    context[_CHECKPOINT_EXAMINED_KEY] = {
+        "reason": reason,
+        "examined_at": now.isoformat(),
+    }
+    task.context = context
+    flag_modified(task, "context")
+
+
+async def _parent_task_ids_with_children(session, task_ids: list[Any]) -> set[Any]:
+    """Return the subset of ``task_ids`` that own children.
+
+    A parent must re-evaluate through its own requeue path, never resurrect as a
+    leaf dispatch — the same exclusion ``reaper_infra_recovery`` applies.
+    """
+    if not task_ids:
+        return set()
+    rows = (
+        (
+            await session.execute(
+                select(Task.parent_task_id)
+                .where(Task.parent_task_id.in_(task_ids))
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {parent_id for parent_id in rows if parent_id is not None}
+
+
+async def _sweep_checkpoint_owners(
+    session, *, repo_root: str | None, now: datetime
+) -> dict[str, int]:
+    """Find provenance-marked task branches and return their owner to dispatch."""
+    rows = (
+        await session.execute(
+            select(Task, Project)
+            .join(Project, Project.id == Task.project_id)
+            .where(
+                Task.status == TaskStatus.FAILED,
+                Task.archived.is_(False),
+                *_checkpoint_candidate_filter(session),
+            )
+            .order_by(Task.updated_at.asc())
+            .limit(_CHECKPOINT_BATCH_SIZE)
+        )
+    ).all()
+    counts = {
+        "checkpoint_scanned": 0,
+        "checkpoint_stranded": 0,
+        "checkpoint_unknown": 0,
+        "checkpoint_handoffs": 0,
+        "checkpoint_alerts_created": 0,
+    }
+    if not rows:
+        return counts
+
+    parents_with_children = await _parent_task_ids_with_children(
+        session, [task.id for task, _project in rows]
+    )
+    by_project: dict[Any, list[tuple[Task, Project]]] = {}
+    changed = False
+    for task, project in rows:
+        if task.id in parents_with_children:
+            # A parent re-evaluates through its own requeue path; resurrecting it
+            # as a leaf dispatch is exactly what the sibling reaper sweep forbids.
+            _mark_checkpoint_examined(task, "parent_with_children", now)
+            changed = True
+            continue
+        by_project.setdefault(project.id, []).append((task, project))
+    observations: list[tuple[Task, Project, dict[str, Any]]] = []
+    for task_rows in by_project.values():
+        project = task_rows[0][1]
+        aliases = {
+            alias: task
+            for task, _project in task_rows
+            for alias in _checkpoint_branch_aliases(task, project)
+        }
+        branch_entries: list[dict[str, str]] = []
+        # Only a listing that provably enumerated the whole namespace turns
+        # "no branch for this task" into a durable verdict.  A failed, empty or
+        # truncated listing stays unknown and the row is rescanned next cycle.
+        listing_complete = False
+        if repo_root is not None:
+            local_names = _local_checkpoint_branch_names(
+                repo_root, project.task_branch_prefix
+            )
+            listing_complete = local_names is not None
+            branch_entries = [
+                {"name": branch} for branch in (local_names or []) if branch in aliases
+            ]
+        else:
+            from app import github
+            from app.release_promotion import _resolve_github_with_session
+
+            try:
+                resolved = await _resolve_github_with_session(session, project)
+                if resolved is None:
+                    continue
+                token, owner, repo = resolved
+                listed = await github.list_branches(
+                    token,
+                    owner,
+                    repo,
+                    prefixes=[project.task_branch_prefix],
+                    max_branches=_CHECKPOINT_BATCH_SIZE,
+                )
+                # ``list_branches`` returns [] on API failure and silently stops
+                # at ``max_branches``; neither case proves a branch is absent.
+                listing_complete = (
+                    bool(listed) and len(listed) < _CHECKPOINT_BATCH_SIZE
+                )
+                branch_entries = [
+                    entry
+                    for entry in listed
+                    if entry.get("name") in aliases and entry.get("sha")
+                ]
+            except Exception as exc:  # noqa: BLE001 - unknown is not clean
+                logger.warning(
+                    "[APPROVED_PR] checkpoint branch listing unavailable for project %s: %s",
+                    project.id,
+                    exc,
+                )
+                continue
+        if listing_complete:
+            owned = {aliases[entry["name"]].id for entry in branch_entries}
+            for task, _project in task_rows:
+                if task.id not in owned:
+                    _mark_checkpoint_examined(task, "no_checkpoint_branch", now)
+                    changed = True
+        for entry in branch_entries:
+            branch = entry["name"]
+            task = aliases[branch]
+            evidence, proven_lookalike = (
+                _local_checkpoint_evidence(
+                    task=task,
+                    branch=branch,
+                    integration_branch=get_project_integration_branch(project),
+                    repo_root=repo_root,
+                )
+                if repo_root is not None
+                else await _github_checkpoint_evidence(
+                    session=session,
+                    task=task,
+                    project=project,
+                    branch=branch,
+                    branch_sha=entry["sha"],
+                )
+            )
+            if evidence is None:
+                if proven_lookalike:
+                    # The branch exists but carries no checkpoint contract — a
+                    # durable verdict, so the row must leave the scan window.
+                    _mark_checkpoint_examined(task, "not_a_checkpoint_branch", now)
+                    changed = True
+                continue
+            counts["checkpoint_scanned"] += 1
+            if evidence.state == "stranded":
+                counts["checkpoint_stranded"] += 1
+            elif evidence.state == "unknown":
+                counts["checkpoint_unknown"] += 1
+            elif evidence.state == "landed":
+                # The checkpoint reached the integration branch; nothing is left
+                # to recover for this task.
+                _mark_checkpoint_examined(task, "checkpoint_landed", now)
+                changed = True
+            observation, observation_changed = _checkpoint_observation_for(
+                task, project, evidence, now
+            )
+            changed = changed or observation_changed
+            observations.append((task, project, observation))
+    if changed:
+        await session.commit()
+
+    stranded_owners = [
+        (task, observation)
+        for task, _project, observation in observations
+        if observation.get("state") == "stranded"
+    ]
+    blocked_keys = await _active_idempotency_keys(
+        session, [task for task, _observation in stranded_owners]
+    )
+    handed_off: set[str] = set()
+    for task, observation in stranded_owners:
+        if await _handoff_checkpoint_owner(
+            session, task, observation, now, blocked_idempotency_keys=blocked_keys
+        ):
+            counts["checkpoint_handoffs"] += 1
+            handed_off.add(observation["identity"])
+            # Two FAILED duplicates can share a key while neither is active at
+            # pre-query time; claim it here so the second requeue is skipped.
+            if task.idempotency_key:
+                blocked_keys.add(task.idempotency_key)
+    if counts["checkpoint_handoffs"]:
+        await session.commit()
+
+    alert_keys = {
+        f"unshipped_checkpoint:{project.id}:{task.id}:{observation['identity']}"
+        for task, project, observation in observations
+        if observation.get("state") == "stranded"
+        and observation["identity"] not in handed_off
+    }
+    existing = {}
+    if alert_keys:
+        existing_rows = (
+            await session.execute(
+                select(Alert).where(
+                    Alert.dedupe_key.in_(alert_keys), Alert.dismissed_at.is_(None)
+                )
+            )
+        ).scalars().all()
+        existing = {alert.dedupe_key: alert for alert in existing_rows}
+    for task, project, observation in observations:
+        key = f"unshipped_checkpoint:{project.id}:{task.id}:{observation['identity']}"
+        if key not in alert_keys:
+            continue
+        alert = existing.get(key)
+        message = (
+            f"Task {task.id} owns checkpoint branch {observation['branch']}, but its "
+            f"tip {observation['checkpoint_sha']} is not on {observation['integration_branch']} "
+            "and the automatic owner handoff cap is exhausted."
+        )
+        # Automatic recovery is finished for this row; the alert now carries it.
+        # Leaving it in the oldest-first window would starve newer checkpoints.
+        _mark_checkpoint_examined(task, "operator_attention", now)
+        if alert is None:
+            session.add(
+                Alert(
+                    project_id=project.id,
+                    severity=AlertSeverity.WARNING,
+                    title=_CHECKPOINT_ALERT_TITLE,
+                    message=message[:2000],
+                    event_type=_CHECKPOINT_EVENT_TYPE,
+                    source="approved_pr_stranding_detector",
+                    dedupe_key=key,
+                    last_seen_at=now,
+                    task_id=task.id,
+                )
+            )
+            counts["checkpoint_alerts_created"] += 1
+        else:
+            alert.occurrence_count = (alert.occurrence_count or 0) + 1
+            alert.last_seen_at = now
+            alert.message = message[:2000]
+    if alert_keys:
+        await session.commit()
+    return counts
+
+
+def _nonzero_checkpoint_counts(counts: dict[str, int]) -> dict[str, int]:
+    """Keep the long-standing PR-sweep result shape quiet when no checkpoint exists."""
+    return {key: value for key, value in counts.items() if value}
 
 
 def _resolve_integration_head(branch: str, *, repo_root: str) -> str | None:
@@ -830,8 +1461,18 @@ async def sweep_approved_pr_stranding(
                 "alerts_created": 0,
                 "relands_started": 0,
                 "superseded": 0,
+                "checkpoint_scanned": 0,
+                "checkpoint_stranded": 0,
+                "checkpoint_unknown": 0,
+                "checkpoint_handoffs": 0,
+                "checkpoint_alerts_created": 0,
             }
         _last_stranding_scan = scan_now
+
+    now = _strip_tz_assume_utc(now or _utcnow()) or _utcnow()
+    checkpoint_counts = await _sweep_checkpoint_owners(
+        session, repo_root=repo_root, now=now
+    )
 
     rows = (
         await session.execute(
@@ -871,6 +1512,7 @@ async def sweep_approved_pr_stranding(
     ).all()
     if not rows:
         return {
+            **_nonzero_checkpoint_counts(checkpoint_counts),
             "scanned": 0,
             "stranded": 0,
             "unknown": 0,
@@ -912,12 +1554,12 @@ async def sweep_approved_pr_stranding(
         )
         candidates.setdefault(candidate_key, candidate)
 
-    now = _strip_tz_assume_utc(now or _utcnow()) or _utcnow()
     observations: list[
         tuple[_ApprovedPrCandidate, dict[str, Any], dict[str, str | int] | None]
     ] = []
     changed_tasks = False
     counts = {
+        **_nonzero_checkpoint_counts(checkpoint_counts),
         "scanned": len(candidates),
         "stranded": 0,
         "unknown": 0,
@@ -1017,7 +1659,7 @@ async def sweep_approved_pr_stranding(
         f"approved_pr_stranding:{candidate.project.id}:{candidate.pr_number}:{candidate.commit_sha}"
         for candidate, observation, _observed_target in observations
         if observation.get("state") == "stranded"
-        and observation.get("qualification_cycles_seen", 0) >= 2
+        and observation.get("qualification_cycles_seen", 0) >= _MIN_STRANDING_CYCLES_FOR_ALERT
     }
     existing = {}
     if all_alert_keys:
@@ -1042,7 +1684,7 @@ async def sweep_approved_pr_stranding(
             continue
         if (
             observation.get("state") != "stranded"
-            or observation.get("qualification_cycles_seen", 0) < 2
+            or observation.get("qualification_cycles_seen", 0) < _MIN_STRANDING_CYCLES_FOR_ALERT
         ):
             continue
         message = (

@@ -6104,14 +6104,8 @@ def test_arm_ci_wait_asserts_pr_number_present():
 
 
 @pytest.mark.asyncio
-async def test_merge_auto_resolves_finding_keys_on_orig_task(db_session, mocker):
-    """When the original (fix) task carries resolving_finding_keys and a PR
-    merges, apply_finding_resolution must write resolved ledger rows for the
-    open ReleaseVersion.  Exercises the primary path inside _orig_session.
-
-    Credit is tied to the DECLARED keys: only findings the merged work said it
-    addressed are credited.  Merges that declare nothing credit nothing (see
-    ``test_merge_auto_resolve_no_keys_writes_no_rows``)."""
+async def test_merge_does_not_auto_resolve_finding_keys_on_orig_task(db_session, mocker):
+    """A merge declaration is not current-HEAD evidence for carried findings."""
     from sqlmodel import select as _select
 
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
@@ -6169,8 +6163,8 @@ async def test_merge_auto_resolves_finding_keys_on_orig_task(db_session, mocker)
     assert result is True
     assert task.status == TaskStatus.COMPLETED
 
-    # The auto-resolve writes run in the _orig_session (dedicated session).
-    # Read the committed rows back through the test session.
+    # No merge-time helper may write resolution rows. An explicit audit or
+    # operator resolution remains the only path that can advance this ledger.
     rows = (
         (
             await db_session.execute(
@@ -6182,17 +6176,7 @@ async def test_merge_auto_resolves_finding_keys_on_orig_task(db_session, mocker)
         .scalars()
         .all()
     )
-    resolved_keys = {r.finding_key for r in rows}
-    assert finding_key_a in resolved_keys, (
-        "finding_key_a must be marked resolved after merge"
-    )
-    assert finding_key_b in resolved_keys, (
-        "finding_key_b must be marked resolved after merge"
-    )
-    for row in rows:
-        assert row.state == "resolved"
-        assert row.project_id == project.id
-        assert row.release_version_id == version.id
+    assert rows == []
 
 
 @pytest.mark.asyncio

@@ -835,6 +835,75 @@ async def get_file_content_at_ref(
         return None, None
 
 
+async def get_file_blob_sha_at_ref(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    project_id: str | None = None,
+) -> tuple[bool | None, str | None]:
+    """Fetch the git blob SHA of *path* at ``owner/repo@ref``.
+
+    The blob SHA is the same identity the qualifier's audited-surface map
+    records per path, so comparing it against a finding's recorded ``blob_sha``
+    answers "did the cited surface actually change at this commit?" without a
+    checkout.
+
+    Returns ``(exists, blob_sha)`` with a tri-state ``exists``:
+
+      * ``True``  — the path is a file on ``ref``; ``blob_sha`` is its git blob
+        SHA (``None`` only if GitHub omitted it).
+      * ``False`` — ``ref`` unambiguously has no such file (HTTP 404);
+        ``blob_sha`` is ``None``.
+      * ``None``  — indeterminate (non-200/non-404 status, a non-file payload,
+        or any error). Callers MUST NOT read ``None`` as absence or as change.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_path = quote(path, safe="/")
+    encoded_ref = quote(ref, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_ref}"
+    )
+    try:
+        response = await _github_request(
+            "GET", url, headers, max_retries=2, project_id=project_id
+        )
+        if response.status_code == 404:
+            return False, None
+        if response.status_code != 200:
+            logger.warning(
+                "[GITHUB] blob-sha fetch for %s on %s/%s@%s: HTTP %s",
+                path,
+                owner,
+                repo,
+                ref,
+                response.status_code,
+            )
+            return None, None
+        payload = response.json()
+        if not (isinstance(payload, dict) and payload.get("type") == "file"):
+            return None, None
+        blob_sha = payload.get("sha")
+        return True, blob_sha if isinstance(blob_sha, str) and blob_sha else None
+    except Exception as e:  # noqa: BLE001 — never let a fetch error read as change
+        logger.warning(
+            "[GITHUB] Failed blob-sha fetch for %s on %s/%s@%s: %s",
+            path,
+            owner,
+            repo,
+            ref,
+            e,
+        )
+        return None, None
+
+
 async def _list_versions_dir_entries(
     token: str,
     owner: str,

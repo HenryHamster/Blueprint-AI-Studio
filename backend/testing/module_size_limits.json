@@ -170,7 +170,8 @@
     "release_models.py": 1750,
     "size_limit_policy.py": 2050,
     "schemas.py": 1750,
-    "release_commit_authorship.py": 1800
+    "release_commit_authorship.py": 1800,
+    "approved_pr_stranding.py": 1800
   },
   "agent": {
     "index.ts": 4600,

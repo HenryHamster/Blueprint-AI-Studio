@@ -2452,7 +2452,7 @@
   "testing/test_ci_completion.py::test_integration_landing_triggers_build_config_refresh": 0.5190513019997525,
   "testing/test_ci_completion.py::test_merge_auto_resolve_no_keys_writes_no_rows": 0.5380892680004763,
   "testing/test_ci_completion.py::test_merge_auto_resolve_skips_when_no_open_version": 0.47137724500043987,
-  "testing/test_ci_completion.py::test_merge_auto_resolves_finding_keys_on_orig_task": 0.5745526880009493,
+  "testing/test_ci_completion.py::test_merge_does_not_auto_resolve_finding_keys_on_orig_task": 0.5745526880009493,
   "testing/test_ci_completion.py::test_merge_conflict_skips_retries_and_spawns_fix": 0.2861155979990144,
   "testing/test_ci_completion.py::test_merge_conflict_spawn_uses_project_integration_branch": 0.2927456589995927,
   "testing/test_ci_completion.py::test_merge_conflict_uses_pr_head_ref_on_drift": 0.3005552499998885,

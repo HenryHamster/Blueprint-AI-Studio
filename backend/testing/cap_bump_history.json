@@ -4417,8 +4417,8 @@
       ],
       "test_release_commit_authorship.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-11T13:31:07.621115+00:00",
+          "commit_sha": "d305abbdf8198458c858d7aed9807100b9c52293",
+          "commit_date": "2026-08-11T13:41:25+00:00",
           "old_cap": 2100,
           "new_cap": 2650
         }

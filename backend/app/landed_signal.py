@@ -605,6 +605,37 @@ async def _stamp_changed_files_before_landing(
     )
 
 
+async def _verify_finding_clearance_before_landing(
+    task: Task,
+    session: AsyncSession,
+    *,
+    merge_commit_sha: str | None,
+    github_credentials: tuple[str, str, str] | None = None,
+) -> None:
+    """Stamp current-tree proof for a merged finding-clearing claim.
+
+    Runs on the same choke point as changed-file provenance and acceptance
+    corroboration so every async merged-landing lane produces the marker
+    ``finding_clearance_blocks_success`` reads. Best-effort: a failure leaves the
+    claim unproven (no credit) and never aborts the landing.
+    """
+    from app.acceptance_gate import verify_finding_clearance_at_landing
+
+    try:
+        await verify_finding_clearance_at_landing(
+            task,
+            session,
+            merge_commit_sha=_pinned_corroboration_sha(merge_commit_sha),
+            github_credentials=github_credentials,
+        )
+    except Exception:  # noqa: BLE001 — proof recording must never undo a merge
+        logger.warning(
+            "[LANDED] finding-clearance verification failed for task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+
+
 async def corroborate_and_mark_landed_on_integration(
     task: Task,
     session: AsyncSession,
@@ -653,6 +684,12 @@ async def corroborate_and_mark_landed_on_integration(
         project=project,
         branch=branch,
         commit_sha=_pinned_corroboration_sha(merge_commit_sha),
+    )
+    await _verify_finding_clearance_before_landing(
+        task,
+        session,
+        merge_commit_sha=merge_commit_sha,
+        github_credentials=github_credentials,
     )
     mark_landed_on_integration(task, project, merge_commit_sha=merge_commit_sha)
 
@@ -718,6 +755,12 @@ async def corroborate_and_apply_merged_landed_signal(
         project=project,
         branch=base_branch,
         commit_sha=_pinned_corroboration_sha(merge_commit_sha),
+    )
+    await _verify_finding_clearance_before_landing(
+        task,
+        session,
+        merge_commit_sha=merge_commit_sha,
+        github_credentials=github_credentials,
     )
     return apply_merged_landed_signal(
         task,

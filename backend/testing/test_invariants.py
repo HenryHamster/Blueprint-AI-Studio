@@ -10969,6 +10969,9 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         # Approved-PR stranding compares the reviewed commit against the live
         # integration tip; a cached tip could misclassify a just-landed PR.
         "approved_pr_stranding.py:_inspect_approved_pr_with_github",
+        # Checkpoint recovery compares the checkpoint commit against the live
+        # integration tip before deciding whether to requeue or alert its owner.
+        "approved_pr_stranding.py:_github_checkpoint_evidence",
 
         "release_reconciliation.py:_reconcile_if_promotion_failed_landed",
         "release_reconciliation.py:_reconcile_if_not_promoted_but_pr_merged",

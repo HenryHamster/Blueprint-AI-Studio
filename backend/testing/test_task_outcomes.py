@@ -188,6 +188,35 @@ def test_write_merged_no_acceptance_key_is_success_legacy():
     assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
 
 
+def test_write_merged_finding_clearance_without_current_head_proof_is_neutral():
+    """Naming findings on a fix is not proof that the merged code cleared them."""
+    task = _make_task(
+        "fix",
+        context={**_merged_context(), "resolving_finding_keys": ["finding-a"]},
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is False
+
+
+def test_write_merged_finding_clearance_requires_complete_landed_sha_proof():
+    """Only an explicit all-keys marker tied to the landed commit can pass."""
+    merge_sha = "a" * 40
+    task = _make_task(
+        "fix",
+        context={
+            **_merged_context(),
+            "merge_commit_sha": merge_sha,
+            "resolving_finding_keys": ["finding-a", "finding-b"],
+            "finding_clearance_verification": {
+                "state": "verified",
+                "finding_keys": ["finding-a", "finding-b"],
+                "verified_against_sha": merge_sha,
+            },
+        },
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Research family
 # ─────────────────────────────────────────────────────────────────────────────

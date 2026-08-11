@@ -115,6 +115,20 @@ from app.json_extract import (  # noqa: F401  (re-exported; callers import from 
 logger = logging.getLogger(__name__)
 
 
+def checkpoint_owner_metadata(task: Task, branch_name: str) -> dict[str, str]:
+    """Return the stable owner identity for an agent checkpoint branch.
+
+    Checkpoint commits carry the task id, but the branch name is also part of
+    the ownership fence: a valid commit on an unrelated branch must never be
+    adopted by a task merely because its trailer names that task.
+    """
+    return {
+        "project_id": str(task.project_id),
+        "task_id": str(task.id),
+        "branch": branch_name,
+    }
+
+
 _COMPUTE_WAKE_POST_COMMIT_META_KEY = "_compute_wake_post_commit_meta"
 _COMPUTE_WAKE_NEXT_RETRY_KEY = "_compute_wake_next_retry_after"
 _COMPUTE_WAKE_MAX_ATTEMPTS = 12
