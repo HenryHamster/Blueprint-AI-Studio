@@ -6885,6 +6885,10 @@ async def _handle_research_completion(
                 await session.commit()
             except Exception:  # noqa: BLE001, PERF203
                 await session.rollback()
+                # ``rollback`` expires every ORM instance in this session.
+                # Reload the parent before either the log line below or the
+                # post-spawn projection reads synchronous Task attributes.
+                await session.refresh(task)
                 logger.warning(
                     "[RESEARCH] deferred-memo evergreen enrollment failed "
                     "(task %s, finding %s)",
@@ -6908,6 +6912,9 @@ async def _handle_research_completion(
             await session.commit()
         except Exception as _eg_exc:  # noqa: BLE001
             await session.rollback()
+            # Keep the parent usable by ``apply_post_spawn_state`` after the
+            # error-path rollback expires its ORM state.
+            await session.refresh(task)
             logger.warning(
                 "[EVERGREEN] failed to apply research outcome for item %s: %s",
                 _evergreen_item_id,
