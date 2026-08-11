@@ -73,6 +73,8 @@ EvidenceState = Literal["landed", "stranded", "unknown"]
 Mergeability = Literal["clean", "conflicted", "not_applicable", "unknown"]
 ReachabilitySignal = Literal["merge_sha", "head_sha", "neither"]
 
+ROLLUP_SUBSUMED_REASON = "content carried by a landed rollup ancestor"
+
 
 @dataclass(frozen=True)
 class ApprovedPrEvidence:
@@ -86,6 +88,7 @@ class ApprovedPrEvidence:
     reachability_signal: ReachabilitySignal = "neither"
     checked_commit_sha: str | None = None
     merge_commit_sha: str | None = None
+    rollup_subsumed: bool = False
 
 
 @dataclass(frozen=True)
@@ -550,6 +553,7 @@ def _observation_for(
         "integration_head_sha": evidence.integration_head_sha,
         "merge_base_sha": evidence.merge_base_sha,
         "reason": evidence.reason or candidate.target_reason,
+        "rollup_subsumed": evidence.rollup_subsumed,
         "first_observed_at": old.get("first_observed_at") or now.isoformat(),
         "last_observed_at": now.isoformat(),
         "qualification_cycle_ids": cycle_ids,
@@ -822,6 +826,7 @@ async def sweep_approved_pr_stranding(
                 "scanned": 0,
                 "stranded": 0,
                 "unknown": 0,
+                "rollup_subsumed": 0,
                 "alerts_created": 0,
                 "relands_started": 0,
                 "superseded": 0,
@@ -869,6 +874,7 @@ async def sweep_approved_pr_stranding(
             "scanned": 0,
             "stranded": 0,
             "unknown": 0,
+            "rollup_subsumed": 0,
             "alerts_created": 0,
             "relands_started": 0,
             "superseded": 0,
@@ -915,6 +921,7 @@ async def sweep_approved_pr_stranding(
         "scanned": len(candidates),
         "stranded": 0,
         "unknown": 0,
+        "rollup_subsumed": 0,
         "alerts_created": 0,
         "relands_started": 0,
         "superseded": 0,
@@ -929,7 +936,8 @@ async def sweep_approved_pr_stranding(
             evidence = ApprovedPrEvidence(
                 "landed",
                 "not_applicable",
-                reason="content carried by a landed rollup ancestor",
+                reason=ROLLUP_SUBSUMED_REASON,
+                rollup_subsumed=True,
             )
         elif not candidate.target_valid:
             evidence = ApprovedPrEvidence(
@@ -956,6 +964,8 @@ async def sweep_approved_pr_stranding(
             counts["stranded"] += 1
         elif evidence.state == "unknown":
             counts["unknown"] += 1
+        if evidence.rollup_subsumed:
+            counts["rollup_subsumed"] += 1
         observed_target = _immutable_review_target(candidate)
         observation, changed = _observation_for(
             candidate,
@@ -1072,6 +1082,7 @@ async def sweep_approved_pr_stranding(
 
 
 __all__ = [
+    "ROLLUP_SUBSUMED_REASON",
     "ApprovedPrEvidence",
     "inspect_approved_pr",
     "sweep_approved_pr_stranding",

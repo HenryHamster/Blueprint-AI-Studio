@@ -214,7 +214,9 @@ async def test_sweep_recognizes_child_subsumed_by_landed_rollup(
     result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
 
     assert result["stranded"] == 0
+    assert result["rollup_subsumed"] == 1
     assert child.context["approved_pr_stranding"]["state"] == "landed"
+    assert child.context["approved_pr_stranding"]["rollup_subsumed"] is True
 
 
 @pytest.mark.asyncio
@@ -763,6 +765,7 @@ async def test_sweep_normalizes_aware_cadence_timestamp(db_session):
         "scanned": 0,
         "stranded": 0,
         "unknown": 0,
+        "rollup_subsumed": 0,
         "alerts_created": 0,
         "relands_started": 0,
         "superseded": 0,

@@ -203,9 +203,6 @@ async def _reconcile_one(task_id, session: AsyncSession) -> str | None:
             flag_modified(locked, "context")
             _clear_attention_marker(locked)
             locked.status = TaskStatus.QUEUED
-            locked.latest_status_message = (
-                f"Terminal rollup PR {outcome}; automatic requeue scheduled."
-            )
             session.add(locked)
             from app.task_lifecycle import _requeue_parent_task
 
@@ -215,8 +212,15 @@ async def _reconcile_one(task_id, session: AsyncSession) -> str | None:
                 session.add(locked)
                 await session.commit()
                 return outcome
+            tracked_pr = (locked.context or {}).get("rollup_pr_number")
+            locked.latest_status_message = (
+                f"Terminal rollup PR #{tracked_pr} {outcome}; "
+                "automatic requeue scheduled."
+            )
+            session.add(locked)
             if outcome == "merged_pr_rearmed":
                 await _trigger_merged_parent_classifier(locked, session)
+            await session.commit()
             return outcome
         session.add(locked)
         await session.commit()
