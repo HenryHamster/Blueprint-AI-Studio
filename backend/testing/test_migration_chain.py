@@ -3,9 +3,9 @@ auto-merge guard that consumes them."""
 
 import ast
 import os
-from pathlib import Path
 import re
 import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
 from app.migration_chain import (
@@ -1404,7 +1404,7 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_schema_head_chains_through_0756_authorship_reconciliation_state():
+def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
@@ -1430,7 +1430,8 @@ def test_schema_head_chains_through_0756_authorship_reconciliation_state():
     - 0753 adds explicit acceptance-criterion evidence contracts
     - 0754 persists truthful category-verdict provenance
     - 0755 persists acceptance-contract audit metadata
-    - 0756 persists the fleet-wide authorship reconciliation cursor — current schema head
+    - 0756 persists the fleet-wide authorship reconciliation cursor
+    - 0757 persists the candidate-bound trusted-CI dispatch outbox — current schema head
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1542,6 +1543,9 @@ def test_schema_head_chains_through_0756_authorship_reconciliation_state():
     authorship_reconciliation_state = (
         versions_dir / "0756_release_authorship_reconciliation_state.py"
     ).read_text()
+    prepromotion_dispatch_outbox = (
+        versions_dir / "0757_release_prepromotion_dispatch_outbox.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1627,10 +1631,15 @@ def test_schema_head_chains_through_0756_authorship_reconciliation_state():
     assert "releaseauthorshipreconciliationstate" in authorship_reconciliation_state
     assert "legacy:created_at" in authorship_reconciliation_state
     assert "op.drop_table" in authorship_reconciliation_state
+    assert parse_revision_identifiers(prepromotion_dispatch_outbox) == (
+        "0757",
+        "0756",
+    )
+    assert "releaseprepromotiondispatch" in prepromotion_dispatch_outbox
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0756", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0756', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0757", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0757', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

@@ -9,6 +9,7 @@ import re
 import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 from fastapi import HTTPException, status
 
@@ -650,6 +651,34 @@ async def dispatch_workflow_run(
     (:func:`get_workflow_run_for_sha`, :func:`rerun_failed_jobs`).  The workflow
     file must expose a ``workflow_dispatch:`` trigger for this to succeed.
     """
+    outcome = await dispatch_workflow_run_outcome(
+        token,
+        owner,
+        repo,
+        workflow_file,
+        ref,
+        project_id=project_id,
+        inputs=inputs,
+    )
+    return outcome == "accepted"
+
+
+async def dispatch_workflow_run_outcome(
+    token: str,
+    owner: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    project_id: str | None = None,
+    inputs: Mapping[str, str] | None = None,
+) -> str:
+    """Return accepted, rejected, or ambiguous for a workflow dispatch POST.
+
+    GitHub's endpoint returns no run id or idempotency token. Transport errors,
+    throttling, and server errors are therefore ambiguous: the server may have
+    enqueued the run before the response was lost. Callers must reconcile a
+    workflow-visible correlation id before retrying an ambiguous outcome.
+    """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -668,6 +697,7 @@ async def dispatch_workflow_run(
             ),
             project_id=project_id,
             timeout=10.0,
+            max_retries=1,
         )
     except Exception:  # noqa: BLE001
         logger.exception(
@@ -677,9 +707,9 @@ async def dispatch_workflow_run(
             workflow_file,
             ref,
         )
-        return False
+        return "ambiguous"
     if response.status_code == 204:
-        return True
+        return "accepted"
     logger.warning(
         "[GITHUB] dispatch_workflow_run: %s/%s workflow=%s ref=%s returned %s: %s",
         owner,
@@ -689,7 +719,90 @@ async def dispatch_workflow_run(
         response.status_code,
         response.text[:200],
     )
-    return False
+    if 400 <= response.status_code < 500 and response.status_code not in {
+        408,
+        409,
+        425,
+        429,
+    }:
+        return "rejected"
+    return "ambiguous"
+
+
+async def get_workflow_run_for_dispatch_request(
+    token: str,
+    owner: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    request_id: str,
+    candidate_sha: str,
+    *,
+    project_id: str | None = None,
+    max_pages: int = 5,
+) -> dict:
+    """Reconcile a dispatch by the request id embedded in its trusted run title."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    expected_title = f"Prepromotion rehearsal {request_id} {candidate_sha}"
+    bounded_pages = max(1, min(int(max_pages), 10))
+    for page in range(1, bounded_pages + 1):
+        query = urlencode(
+            {
+                "branch": ref,
+                "event": "workflow_dispatch",
+                "per_page": 100,
+                "page": page,
+            }
+        )
+        try:
+            response = await _github_request(
+                "GET",
+                f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/"
+                f"{workflow_file}/runs?{query}",
+                headers,
+                project_id=project_id,
+                timeout=10.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"state": "unavailable", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+        if response.status_code != 200:
+            return {
+                "state": "unavailable",
+                "detail": f"github returned {response.status_code}",
+            }
+        try:
+            runs = response.json().get("workflow_runs", [])
+        except (ValueError, TypeError, AttributeError):
+            return {"state": "unavailable", "detail": "malformed workflow-runs response"}
+        if not isinstance(runs, list):
+            return {"state": "unavailable", "detail": "malformed workflow-runs response"}
+        for run in runs:
+            if not isinstance(run, dict) or run.get("display_title") != expected_title:
+                continue
+            run_id = run.get("id")
+            if isinstance(run_id, bool) or not isinstance(run_id, int):
+                return {"state": "unavailable", "detail": "matched run has invalid id"}
+            return {
+                "state": "found",
+                "run_id": run_id,
+                "status": run.get("status"),
+                "conclusion": run.get("conclusion"),
+                "html_url": run.get("html_url", ""),
+                "head_sha": run.get("head_sha"),
+                "head_branch": run.get("head_branch"),
+                "event": run.get("event"),
+                "path": run.get("path"),
+                "run_attempt": run.get("run_attempt"),
+                "created_at": run.get("created_at"),
+                "updated_at": run.get("updated_at"),
+            }
+        if len(runs) < 100:
+            return {"state": "not_found"}
+    return {"state": "not_found"}
 
 
 async def get_workflow_run_for_sha(

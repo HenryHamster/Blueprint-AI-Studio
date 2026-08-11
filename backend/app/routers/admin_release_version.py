@@ -1940,11 +1940,6 @@ class _ActivationReceiptBody(BaseModel):
     revision: str | None = _Field(default=None, max_length=40)
     # SSH host that performed the activation (provenance, informational).
     host: str | None = _Field(default=None, max_length=200)
-    # Existing host receipt channel also accepts the pre-promotion rehearsal
-    # report.  It is valid for an open candidate as well as a promoted version.
-    rehearsal: Dict[str, Any] | None = None
-
-
 @router.post("/projects/{project_id}/release-versions/{version_number}/prepromotion-rehearsal")
 async def request_prepromotion_rehearsal(
     project_id: uuid.UUID,
@@ -1952,22 +1947,23 @@ async def request_prepromotion_rehearsal(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ) -> Dict[str, Any]:
-    """Dispatch an image-only rehearsal for the exact open release candidate.
+    """Queue trusted-main CI build/smoke for the exact open candidate.
 
-    The workflow ref is the already-created ``release-vN`` branch.  Explicit
-    workflow inputs keep Firebase, Cloud Run agent, migrations, and backend
-    deployment disabled; the backend image build remains enabled so the host
-    can pull the candidate digest for its read-only pre-stop checks.
+    This writes the same durable outbox intent as automatic qualification. The
+    reaper dispatches the trusted-main workflow after the transaction commits;
+    the request never performs GitHub I/O while holding the release row lock.
     """
-    project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, min_role="admin"
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="owner"
     )
     version = (
         await session.execute(
-            select(ReleaseVersion).where(
+            select(ReleaseVersion)
+            .where(
                 ReleaseVersion.project_id == project_id,
                 ReleaseVersion.version_number == version_number,
             )
+            .with_for_update()
         )
     ).scalars().first()
     if version is None:
@@ -1985,37 +1981,18 @@ async def request_prepromotion_rehearsal(
         )
 
     from app.release_prepromotion_rehearsal import (
-        PREPROMOTION_REHEARSAL_INPUTS,
-        PREPROMOTION_REHEARSAL_WORKFLOW,
-        dispatch_prepromotion_rehearsal,
-        prepromotion_rehearsal_ref,
+        prepare_rehearsal_dispatch_intent,
     )
-    from app.release_promotion import _resolve_github_with_session
 
-    resolved = await _resolve_github_with_session(session, project)
-    if resolved is None:
-        raise HTTPException(status_code=503, detail="GitHub credentials unavailable.")
-    token, owner, repo = resolved
-    dispatched = await dispatch_prepromotion_rehearsal(
-        token,
-        owner,
-        repo,
-        version_number,
-        candidate_sha,
-        project_id=str(project_id),
+    ready, dispatch = await prepare_rehearsal_dispatch_intent(
+        session, version, candidate_sha, rearm_terminal=True
     )
-    if not dispatched:
-        raise HTTPException(
-            status_code=503,
-            detail="Candidate rehearsal workflow could not be dispatched.",
-        )
+    await session.commit()
     return {
         "version_number": version_number,
         "candidate_sha": candidate_sha,
-        "workflow": PREPROMOTION_REHEARSAL_WORKFLOW,
-        "ref": prepromotion_rehearsal_ref(version_number),
-        "inputs": dict(PREPROMOTION_REHEARSAL_INPUTS),
-        "status": "dispatched",
+        "dispatch": dispatch,
+        "status": "ready" if ready else "rehearsal_dispatch_pending",
     }
 
 
@@ -2067,49 +2044,6 @@ async def record_activation_receipt(
     )
     if version is None:
         raise HTTPException(status_code=404, detail="Release version not found.")
-    if payload.rehearsal is not None:
-        from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
-            validate_prepromotion_rehearsal_receipt,
-        )
-        from app.time_utils import _utcnow  # noqa: PLC0415
-
-        expected_sha = (
-            version.promoted_sha
-            or (version.last_qualification or {}).get("candidate_sha")
-            or ""
-        ).strip()
-        rehearsal = validate_prepromotion_rehearsal_receipt(
-            payload.rehearsal, expected_sha
-        )
-        if rehearsal is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "rehearsal receipt is missing, malformed, or does not match "
-                    "the release candidate SHA"
-                ),
-            )
-        if version.status not in {"open", "promoted"}:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Release version {version.version_number} is not an active "
-                    f"candidate (status={version.status})."
-                ),
-            )
-        version.prepromotion_rehearsal_receipt = {
-            **rehearsal,
-            "host": payload.host,
-            "recorded_at": _utcnow().isoformat(),
-        }
-        session.add(version)
-        await session.commit()
-        await session.refresh(version)
-        return {
-            "version_number": version.version_number,
-            "candidate_sha": expected_sha,
-            "receipt": version.prepromotion_rehearsal_receipt,
-        }
     if version.status != "promoted":
         raise HTTPException(
             status_code=409,

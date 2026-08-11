@@ -864,10 +864,11 @@ def bootstrap(revision: str) -> Path:
 
 
 def rehearse(image_ref: str, revision: str):
-    """Run the candidate rehearsal without installing or stopping anything."""
-    import local_app_release
-
-    return local_app_release.rehearse(image_ref, revision)
+    """Refuse prequalification candidate execution on the production host."""
+    del image_ref, revision
+    raise RuntimeError(
+        "host rehearsal disabled; use trusted CI build/smoke evidence"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

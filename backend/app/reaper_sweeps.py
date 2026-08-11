@@ -1580,6 +1580,15 @@ async def sweep_stuck_qualifications(session, *, session_factory) -> int:
     Returns the number of qualifications finalized.
     """
     from app import release_qualifier
+    from app.release_prepromotion_rehearsal import (
+        dispatch_pending_rehearsal_intents,
+    )
+
+    dispatched = await dispatch_pending_rehearsal_intents(
+        session_factory=session_factory
+    )
+    if dispatched:
+        logger.info("[REAPER] Processed %d prepromotion rehearsal intent(s)", dispatched)
 
     finalized = await release_qualifier.sweep_stuck_qualifications(
         session, session_factory=session_factory

@@ -1323,28 +1323,10 @@ def _run_pre_stop_rehearsal(
 
 
 def rehearse(image_ref: str, revision: str) -> RehearsalReport:
-    """Pull and validate a candidate without deploying, stopping, or writing."""
-    if not _is_root():
-        raise PermissionError("local app rehearsal must run as root")
-    if not _IMAGE_REF_RE.fullmatch(image_ref):
-        raise ValueError("image-ref must be the approved Artifact Registry digest")
-    if not _REVISION_RE.fullmatch(revision):
-        raise ValueError("expected-revision must be a full lowercase git SHA")
-    install_user = os.environ.get("SUDO_USER", "")
-    if not _SYSTEM_USER_RE.fullmatch(install_user) or install_user == "root":
-        raise ValueError("SUDO_USER must identify the non-root service account")
-    _pull_candidate_for_rehearsal(image_ref, install_user)
-    bundle_sha256 = _verify_frontend(image_ref, revision)
-    image_id = _inspect_candidate(image_ref, revision, bundle_sha256)
-    target_schema_revision = _image_schema_revision(image_id)
-    database_schema_before = _database_schema_revision()
-    return _run_pre_stop_rehearsal(
-        image_id,
-        image_ref,
-        revision,
-        install_user,
-        target_schema_revision,
-        database_schema_before,
+    """Refuse standalone candidate execution on the production host."""
+    del image_ref, revision
+    raise RuntimeError(
+        "host rehearsal disabled; use trusted CI build/smoke evidence"
     )
 
 

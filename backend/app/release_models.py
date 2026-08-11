@@ -21,6 +21,7 @@ from datetime import datetime
 
 from pydantic import BaseModel
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -322,8 +323,8 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(255), nullable=True),
     )
 
-    # Immutable host-produced pre-promotion bootstrap rehearsal evidence.  The
-    # receipt is candidate-bound and read by qualification; unlike
+    # Immutable backend-authored trusted-CI candidate build/smoke evidence. The
+    # receipt is request/run/candidate-bound and read by qualification; unlike
     # last_qualification it survives later qualification projections.
     prepromotion_rehearsal_receipt: Dict[str, Any] | None = Field(
         default=None,
@@ -376,6 +377,79 @@ class ReleaseVersion(SQLModel, table=True):
             "project_id",
             "version_number",
             name="uq_releaseversion_project_version",
+        ),
+    )
+
+
+class ReleasePrepromotionDispatch(SQLModel, table=True):
+    """Durable outbox claim for one candidate-bound rehearsal dispatch."""
+
+    __tablename__ = "releaseprepromotiondispatch"
+    __table_args__ = (
+        UniqueConstraint(
+            "release_version_id",
+            "candidate_sha",
+            name="uq_releaseprepromotiondispatch_version_candidate",
+        ),
+        Index(
+            "ix_releaseprepromotiondispatch_status_retry",
+            "status",
+            "next_retry_at",
+            "claimed_at",
+        ),
+    )
+
+    # The primary key is also the public workflow correlation/request id.
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    project_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False)
+    )
+    candidate_sha: str = Field(sa_column=Column(String(40), nullable=False))
+    workflow_ref: str = Field(
+        default="main",
+        sa_column=Column(String(255), nullable=False, server_default="main"),
+    )
+    # claimed | attempting | dispatched | uncertain | observed | rejected
+    # Rejected is terminal until an authenticated operator explicitly rearms it.
+    status: str = Field(
+        default="claimed",
+        sa_column=Column(String(32), nullable=False, server_default="claimed"),
+    )
+    dispatch_attempts: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    workflow_run_id: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    claimed_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    attempted_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    next_retry_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    observed_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    last_error: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
         ),
     )
 

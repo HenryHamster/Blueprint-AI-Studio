@@ -1374,6 +1374,8 @@ from app.github_checks import (  # noqa: F401
     AGENT_BAKE_WORKFLOW_FILE,
     CI_WORKFLOW_FILE,
     dispatch_workflow_run,
+    dispatch_workflow_run_outcome,
+    get_workflow_run_for_dispatch_request,
     invalidate_check_runs_cache,
     get_check_runs_cached,
     _CHECK_RUNS_CACHE_TTL_S,

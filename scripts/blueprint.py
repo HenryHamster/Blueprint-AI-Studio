@@ -8103,6 +8103,11 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     re-verifies digest, revision label, and health with automatic rollback —
     so this client is a convenience, not a trust boundary.
     """
+    if getattr(args, "rehearse", False):
+        raise SystemExit(
+            "Host rehearsal is disabled; trusted CI build/smoke evidence is "
+            "observed by Blueprint automatically."
+        )
     release = _fetch_deploy_manifest(args.sha)
     run = release["run"]
     digest = release["digest"]
@@ -8113,11 +8118,6 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     print(f"  Revision:  {revision}")
     print(f"  Image:     ...@{digest[:19]}...")
     print(f"  Built:     {run.get('createdAt', '?')} (run {run['databaseId']})")
-    if getattr(args, "rehearse", False):
-        version = _read_open_rehearsal_version(args, revision)
-        report = _request_release_rehearsal(digest, revision, host=args.host)
-        _post_prepromotion_rehearsal_receipt(args, version, report)
-        return
     promoted = _resolve_deploy_binding(args, revision)
     if args.dry_run:
         print("  (dry run — nothing deployed)")

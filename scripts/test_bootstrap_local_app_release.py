@@ -553,15 +553,13 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         ):
             bootstrap._verify_release_execution_boundary("henry_hamster")
 
-    def test_rehearse_delegates_to_candidate_release_tool(self):
-        sentinel = object()
+    def test_bootstrap_rehearsal_refuses_before_candidate_tool(self):
         with unittest.mock.patch(
-            "local_app_release.rehearse", return_value=sentinel
+            "local_app_release.rehearse"
         ) as rehearse:
-            self.assertIs(
-                bootstrap.rehearse("image@digest", "a" * 40), sentinel
-            )
-        rehearse.assert_called_once_with("image@digest", "a" * 40)
+            with self.assertRaisesRegex(RuntimeError, "host rehearsal disabled"):
+                bootstrap.rehearse("image@digest", "a" * 40)
+        rehearse.assert_not_called()
 
     def test_root_release_shim_rehearsal_reuses_release_tool_with_flag(self):
         digest = "sha256:" + "0" * 64
@@ -572,6 +570,24 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
 
         self.assertEqual(command[-1], "--rehearse")
         self.assertEqual(command[-2], "a" * 40)
+
+    def test_root_release_shim_refuses_host_rehearsal_before_exec(self):
+        digest = "sha256:" + "0" * 64
+        with (
+            unittest.mock.patch.object(release.os, "geteuid", return_value=0),
+            unittest.mock.patch.object(
+                release.sys,
+                "argv",
+                ["blueprint-release", "--rehearse", digest, "a" * 40],
+            ),
+            unittest.mock.patch.object(
+                release.os,
+                "execv",
+                side_effect=AssertionError("disabled rehearsal must never exec"),
+            ),
+        ):
+            with self.assertRaisesRegex(SystemExit, "2"):
+                release.main()
 
     def test_root_release_shim_parses_machine_readable_rehearsal(self):
         report = {

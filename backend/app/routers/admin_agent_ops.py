@@ -5918,6 +5918,7 @@ async def strategic_operation(
             update_criterion_evidence_contract as _update_evidence_contract,
             generate_criterion_key as _gen_criterion_key,
             is_operator_authored_criterion as _is_operator_authored_criterion,
+            is_owner_controlled_machine_contract as _is_owner_controlled_machine_contract,
             MAX_CRITERIA_PER_VERSION as _MAX_CRITERIA,
             OperatorAuthoredRetractionError as _OperatorAuthoredRetractionError,
             retract_criterion as _retract_criterion,
@@ -5958,11 +5959,21 @@ async def strategic_operation(
                         status_code=400,
                         detail="set_acceptance_criteria: 'evidence_contract' must be an object or null when provided",
                     )
-                if contract is not None and _normalize_evidence_contract(contract) is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="set_acceptance_criteria: unsupported or malformed evidence_contract",
-                    )
+                if contract is not None:
+                    normalized_contract = _normalize_evidence_contract(contract)
+                    if normalized_contract is None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="set_acceptance_criteria: unsupported or malformed evidence_contract",
+                        )
+                    if normalized_contract.get("type") == "prepromotion_ci_build_smoke":
+                        raise HTTPException(
+                            status_code=403,
+                            detail=(
+                                "set_acceptance_criteria: external CI evidence "
+                                "contracts require an authenticated project owner"
+                            ),
+                        )
         retract_input = data.get("retract", [])
         if not isinstance(retract_input, list):
             raise HTTPException(
@@ -6039,14 +6050,15 @@ async def strategic_operation(
             pre_status_by_key[criterion_key] = (
                 existing.status if existing is not None else None
             )
-            if existing is not None and _is_operator_authored_criterion(
-                existing.created_by
+            if existing is not None and (
+                _is_operator_authored_criterion(existing.created_by)
+                or _is_owner_controlled_machine_contract(existing)
             ):
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        f"set_acceptance_criteria: criterion '{criterion_key}' was "
-                        f"authored by an operator and cannot be retracted by the "
+                        f"set_acceptance_criteria: criterion '{criterion_key}' is "
+                        f"operator-controlled and cannot be retracted by the "
                         f"autonomous loop; operator action is required to retract it"
                     ),
                 )
@@ -6204,8 +6216,10 @@ async def strategic_operation(
             if existing is not None:
                 criterion_key = existing.criterion_key
                 is_new = False
-                if "evidence_contract" in item and not _is_operator_authored_criterion(
-                    existing.created_by
+                if (
+                    "evidence_contract" in item
+                    and not _is_operator_authored_criterion(existing.created_by)
+                    and not _is_owner_controlled_machine_contract(existing)
                 ):
                     # Operator-authored contracts are an ownership boundary:
                     # strategic retries may reuse the criterion but may never

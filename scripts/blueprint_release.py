@@ -30,7 +30,6 @@ to the host operator account.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -169,12 +168,9 @@ def _serve_one_request() -> None:
             payload = connection.recv(_MAX_REQUEST_BYTES)
             request = _request_args(payload)
             if request and request[0] == "rehearse":
-                digest, revision = _validated_args(request[1:])
-                report = _run_rehearsal(digest, revision)
-                encoded = base64.b64encode(
-                    json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
-                ).decode("ascii")
-                connection.sendall(f"REHEARSAL {encoded}\n".encode("ascii"))
+                # Candidate execution is never permitted on the production
+                # host before qualification. Trusted CI owns build/smoke.
+                connection.sendall(b"ERROR host rehearsal disabled\n")
                 return
             digest, revision = _validated_args(request)
             return_code = _run_release(digest, revision)
@@ -199,6 +195,8 @@ def main() -> None:
     if os.geteuid() != 0:
         _fail("must run as root (via the release socket service)")
     rehearsal = len(sys.argv) == 4 and sys.argv[1] == "--rehearse"
+    if rehearsal:
+        _fail("host rehearsal disabled; use trusted CI build/smoke evidence")
     args = sys.argv[2:] if rehearsal else sys.argv[1:]
     digest, revision = _validated_args(args)
     command = _release_command(digest, revision, rehearsal=rehearsal)

@@ -501,6 +501,22 @@ def evaluate_merge_grade(
     category_verdicts, residual_uncaptured_gap}``. ``status`` is one of ``pass`` |
     ``fail`` | ``not_applicable`` | ``unparseable`` | ``category_grade_unsupported``.
     """
+    active_category_keys = {
+        str(item.get("category_key") or item.get("criterion_key") or "").strip()
+        for item in (active_categories or [])
+        if isinstance(item, dict)
+    }
+    active_category_keys.discard("")
+    authoritative_category_keys = {
+        str(item.get("category_key") or item.get("criterion_key") or "").strip()
+        for item in (authoritative_category_evidence or [])
+        if isinstance(item, dict)
+    }
+    authoritative_category_keys.discard("")
+    authoritative_covers_all = bool(active_category_keys) and (
+        active_category_keys <= authoritative_category_keys
+    )
+
     goal_text = (goal or "").strip()
     if not goal_text or is_contentless_goal(goal_text):
         # A contentless/unset goal normally means there is nothing to grade
@@ -519,7 +535,10 @@ def evaluate_merge_grade(
         if active_categories:
             if (
                 not isinstance(artifact, dict)
-                or ("category_verdicts" not in artifact and not authoritative_category_evidence)
+                or (
+                    "category_verdicts" not in artifact
+                    and not authoritative_covers_all
+                )
             ):
                 # The grader cannot produce per-category output (a non-dict
                 # artifact, or a dict with no ``category_verdicts`` key at all —
@@ -609,7 +628,7 @@ def evaluate_merge_grade(
     category_verdicts: list[dict[str, Any]] | None = None
     residual_uncaptured_gap: str | None = None
     if active_categories:
-        if "category_verdicts" not in artifact and not authoritative_category_evidence:
+        if "category_verdicts" not in artifact and not authoritative_covers_all:
             # The grader returned a usable HOLISTIC verdict but omitted the
             # per-category section ENTIRELY — not one key, not an empty list.  A
             # grader that ACTUALLY assessed the rubric always emits the key (the

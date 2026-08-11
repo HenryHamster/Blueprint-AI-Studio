@@ -95,6 +95,65 @@ async def test_dispatch_workflow_run_sends_explicit_inputs_when_requested():
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [(204, "accepted"), (422, "rejected"), (429, "ambiguous"), (503, "ambiguous")],
+)
+async def test_dispatch_workflow_run_outcome_distinguishes_ambiguous_success(
+    status_code, expected
+):
+    request = AsyncMock(return_value=_make_response(status_code))
+    with patch.object(github_checks, "_github_request", new=request):
+        result = await github_checks.dispatch_workflow_run_outcome(
+            "token", "owner", "repo", "prepromotion-rehearsal.yml", "main"
+        )
+    assert result == expected
+    assert request.await_count == 1
+    assert request.await_args.kwargs["max_retries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_request_lookup_pages_and_matches_exact_title():
+    request_id = "11111111-1111-1111-1111-111111111111"
+    candidate_sha = "a" * 40
+    first_page = [{"id": index, "display_title": "other"} for index in range(100)]
+    second_page = [
+        {
+            "id": 4242,
+            "display_title": f"Prepromotion rehearsal {request_id} {candidate_sha}",
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": "b" * 40,
+            "head_branch": "main",
+            "event": "workflow_dispatch",
+            "path": ".github/workflows/prepromotion-rehearsal.yml",
+            "run_attempt": 1,
+            "created_at": "2026-08-11T12:00:00Z",
+            "updated_at": "2026-08-11T12:01:00Z",
+        }
+    ]
+    request = AsyncMock(
+        side_effect=[
+            _make_response(200, {"workflow_runs": first_page}),
+            _make_response(200, {"workflow_runs": second_page}),
+        ]
+    )
+    with patch.object(github_checks, "_github_request", new=request):
+        result = await github_checks.get_workflow_run_for_dispatch_request(
+            "token",
+            "owner",
+            "repo",
+            "prepromotion-rehearsal.yml",
+            "main",
+            request_id,
+            candidate_sha,
+        )
+    assert result["state"] == "found"
+    assert result["run_id"] == 4242
+    assert request.await_count == 2
+
+
 # ---------------------------------------------------------------------------
 # Job-logs fetch: non-200 responses must emit a WARNING (Fix 2 regression)
 # ---------------------------------------------------------------------------

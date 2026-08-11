@@ -65,6 +65,7 @@ from app.acceptance_criteria import (
     WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS,
     get_criteria_for_version,
     get_version_coverage_summary,
+    normalize_evidence_contract,
 )
 from app.acceptance_provenance import PR_CHANGED_FILES_STAMP_SKIPPED_KEY
 
@@ -97,7 +98,6 @@ from app.release_policy_projection import (
 from app.release_models import CriterionEvidence
 from app.release_commit_authorship import (
     authorship_category_evidence,
-    normalize_authorship_evidence_contract,
     serving_authorship_range,
 )
 from app.notification_dispatch import (
@@ -608,7 +608,7 @@ def _canonicalize_rubric(raw: Any) -> list[dict[str, Any]]:
             continue
         text = " ".join(str(item.get("text") or "").split())
         entry: dict[str, Any] = {"criterion_key": key, "text": text}
-        contract = normalize_authorship_evidence_contract(item.get("evidence_contract"))
+        contract = normalize_evidence_contract(item.get("evidence_contract"))
         if contract is not None:
             entry["evidence_contract"] = contract
         canonical.append(entry)
@@ -2176,98 +2176,6 @@ async def _check_lts_sync_gate(
     }
 
 
-async def _ensure_prepromotion_rehearsal_dispatch(
-    version: release_version.ReleaseVersion,
-    project: Project,
-    *,
-    token: str,
-    owner: str,
-    repo: str,
-    candidate_sha: str,
-) -> tuple[bool, dict[str, Any]]:
-    """Ensure the candidate has one automatic pre-promotion rehearsal dispatch.
-
-    This runs under the ``ReleaseVersion`` row lock.  The immutable host receipt
-    is the strongest idempotency signal; before it arrives, the persisted
-    same-candidate dispatch marker prevents qualification retries from creating
-    duplicate workflow runs.  A dispatch failure is returned to the caller so
-    qualification records a visible gate error instead of proceeding without
-    the required rehearsal.
-    """
-    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
-        dispatch_prepromotion_rehearsal,
-        persisted_rehearsal_for_candidate,
-    )
-
-    if persisted_rehearsal_for_candidate(
-        getattr(version, "prepromotion_rehearsal_receipt", None), candidate_sha
-    ) is not None:
-        return True, {
-            "status": "receipt_present",
-            "candidate_sha": candidate_sha,
-        }
-
-    prior = version.last_qualification or {}
-    prior_dispatch = prior.get("prepromotion_rehearsal_dispatch")
-    if (
-        isinstance(prior_dispatch, dict)
-        and prior_dispatch.get("candidate_sha") == candidate_sha
-        and prior_dispatch.get("status") == "dispatched"
-    ):
-        return True, dict(prior_dispatch)
-
-    try:
-        dispatched = await dispatch_prepromotion_rehearsal(
-            token,
-            owner,
-            repo,
-            version.version_number,
-            candidate_sha,
-            project_id=str(project.id),
-        )
-    except Exception as exc:  # noqa: BLE001 — surface workflow failures as a gate
-        logger.warning(
-            "[RELEASE_QUALIFIER] pre-promotion rehearsal dispatch failed for "
-            "v%d candidate %s: %s",
-            version.version_number,
-            candidate_sha[:8],
-            exc,
-            exc_info=True,
-        )
-        return False, {
-            "status": "dispatch_failed",
-            "candidate_sha": candidate_sha,
-            "detail": f"{type(exc).__name__}: {exc}"[:300],
-        }
-
-    if not dispatched:
-        logger.warning(
-            "[RELEASE_QUALIFIER] pre-promotion rehearsal dispatch returned false "
-            "for v%d candidate %s",
-            version.version_number,
-            candidate_sha[:8],
-        )
-        return False, {
-            "status": "dispatch_failed",
-            "candidate_sha": candidate_sha,
-            "detail": "workflow dispatch returned false",
-        }
-
-    marker = {
-        "status": "dispatched",
-        "candidate_sha": candidate_sha,
-    }
-    # The workflow has now been dispatched. Persist its idempotency marker before
-    # any subsequent qualification work can fail and replace last_qualification.
-    # The caller also carries this marker into the two terminal post-dispatch
-    # error records below.
-    version.last_qualification = {
-        **(version.last_qualification or {}),
-        "prepromotion_rehearsal_dispatch": marker,
-    }
-    flag_modified(version, "last_qualification")
-    return True, marker
-
 async def run_qualification(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -2688,6 +2596,37 @@ async def run_qualification(
     candidate_audited_surface = audited_surface_path_map(candidate_tree_entries)
     candidate_diff_hash = compute_audited_surface_hash(candidate_tree_entries)
 
+    # All candidate GitHub content evidence is gathered before the authoritative
+    # ReleaseVersion lock. The locked section below consumes only these immutable
+    # candidate-bound values and rechecks phase/in-flight/dispatch intent before
+    # spawning or writing.
+    try:
+        _pre_mi_verdict, _pre_mi_detail = await check_qualification_migration_identity(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            promotion_target,
+            project_id=str(project_id),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _pre_mi_verdict = "defer"
+        _pre_mi_detail = f"migration-identity pre-spawn check error: {exc}"
+
+    env_preflight_evidence: dict[str, Any] | None = None
+    try:
+        env_preflight_evidence = await _build_env_preflight_evidence_for_candidate(
+            project, token, owner, repo, candidate_sha
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to build env-preflight evidence for "
+            "v%d candidate %s — evidence unavailable",
+            version.version_number,
+            candidate_sha[:8],
+            exc_info=True,
+        )
+
     # 3b. Qualify-on-synced gate (LTS split only).  Don't score a candidate that
     #     is behind the promotion target — it would fail the promotion merge and
     #     bounce the version back to stabilize, burning a full re-audit.  Bounded,
@@ -2885,26 +2824,34 @@ async def run_qualification(
         )
         return _promo
 
-    rehearsal_dispatch_ok, rehearsal_dispatch = (
-        await _ensure_prepromotion_rehearsal_dispatch(
-            version,
-            project,
-            token=token,
-            owner=owner,
-            repo=repo,
-            candidate_sha=candidate_sha,
-        )
+    active_criteria = [
+        row
+        for row in await get_criteria_for_version(session, version.id)
+        if row.status == "active"
+    ]
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        normalize_rehearsal_evidence_contract,
+        prepare_rehearsal_dispatch_intent,
     )
-    if not rehearsal_dispatch_ok:
-        detail = str(rehearsal_dispatch.get("detail") or "dispatch failed")
+
+    rehearsal_required = any(
+        normalize_rehearsal_evidence_contract(row.evidence_contract) is not None
+        for row in active_criteria
+    )
+    rehearsal_dispatch_ok = True
+    rehearsal_dispatch: dict[str, Any] | None = None
+    if rehearsal_required:
+        rehearsal_dispatch_ok, rehearsal_dispatch = (
+            await prepare_rehearsal_dispatch_intent(session, version, candidate_sha)
+        )
+    if rehearsal_required and not rehearsal_dispatch_ok:
         version.last_qualification = {
             **(version.last_qualification or {}),
-            "status": "error",
-            "error": "prepromotion_rehearsal_dispatch_failed",
-            "blocker": "prepromotion_rehearsal_dispatch_failed",
+            "status": "rehearsal_dispatch_pending",
+            "blocker": "prepromotion_rehearsal_dispatch_pending",
             "candidate_sha": candidate_sha,
             "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
-            "detail": detail,
+            "detail": "durable rehearsal outbox intent awaits dispatch/reconciliation",
             "started_at": _utcnow().isoformat(),
             "qualification_attempt_id": str(attempt_id),
             "retry_episode": retry_episode,
@@ -2914,10 +2861,10 @@ async def run_qualification(
         flag_modified(version, "last_qualification")
         session.add(version)
         return {
-            "status": "prepromotion_rehearsal_dispatch_failed",
-            "blocker": "prepromotion_rehearsal_dispatch_failed",
+            "status": "rehearsal_dispatch_pending",
+            "blocker": "prepromotion_rehearsal_dispatch_pending",
             "candidate_sha": candidate_sha,
-            "detail": detail,
+            "dispatch": rehearsal_dispatch,
         }
 
     # Snapshot the merge-state signal under the version lock that owns the
@@ -3437,20 +3384,6 @@ async def run_qualification(
     # a prior finalize (the dimension was verified clean or blocked then; either
     # way the live fetch is redundant).  Under the FOR UPDATE lock — safe to write.
     if "migration_identity" not in resolved_dims:
-        try:
-            _pre_mi_verdict, _pre_mi_detail = (
-                await check_qualification_migration_identity(
-                    token,
-                    owner,
-                    repo,
-                    candidate_sha,
-                    promotion_target,
-                    project_id=str(project_id),
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            _pre_mi_verdict = "defer"
-            _pre_mi_detail = f"migration-identity pre-spawn check error: {exc}"
         if _pre_mi_verdict == "block":
             logger.info(
                 "[RELEASE_QUALIFIER] run_qualification: v%d candidate %s blocked "
@@ -3649,28 +3582,6 @@ async def run_qualification(
 
     audit_challenge_spawn_pending = _audit_needed
 
-
-    # Unconditionally produce candidate-side env-preflight evidence (Slice 2,
-    # design 245212a4).  Decoupled from the smoketest child task: this is a
-    # cheap pure-content introspection of the candidate tree done via the
-    # GitHub contents API (no VM required), so it must not depend on
-    # ``smoketest_enabled``.  A failure to fetch the source is caught and
-    # treated as "evidence unavailable" — the env-preflight judge (Slice 3)
-    # handles the None by either pass-through (judge disabled) or
-    # ``boot_prereq_evidence_missing`` (judge enabled, fail-closed).
-    env_preflight_evidence: dict[str, Any] | None = None
-    try:
-        env_preflight_evidence = await _build_env_preflight_evidence_for_candidate(
-            session, project, token, owner, repo, candidate_sha
-        )
-    except Exception:  # noqa: BLE001 — GitHub API I/O can fail in many ways (network, HTTP, parse); evidence absence is handled gracefully by the Slice-3 judge.
-        logger.warning(
-            "[RELEASE_QUALIFIER] failed to build env-preflight evidence for "
-            "v%d candidate %s — evidence unavailable",
-            version.version_number,
-            candidate_sha[:8],
-            exc_info=True,
-        )
 
     # 6. Stamp the pending qualification record.  smoketest_task_id is None
     #    when the smoketest subsystem is disabled — maybe_finalize_qualification
@@ -6135,7 +6046,6 @@ async def _dual_write_dimension_results(
         )
 
 async def _build_env_preflight_evidence_for_candidate(
-    session: AsyncSession,
     project: Project,
     token: str,
     owner: str,
@@ -8265,8 +8175,6 @@ async def _finalize_qualification(
         if c.get("criterion_key")
     ]
     from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
-        apply_rehearsal_evidence,
-        persisted_rehearsal_for_candidate,
         validate_prepromotion_gradeability,
     )
 
@@ -8311,9 +8219,25 @@ async def _finalize_qualification(
             *serving_authorship_range(latest_promoted),
             active_categories,
         )
-    prepromotion_rehearsal = persisted_rehearsal_for_candidate(
-        getattr(version, "prepromotion_rehearsal_receipt", None), candidate_sha
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        apply_rehearsal_evidence,
+        persisted_rehearsal_for_version,
+        rehearsal_category_evidence,
     )
+    prepromotion_rehearsal = await persisted_rehearsal_for_version(
+        session,
+        version,
+        candidate_sha,
+    )
+    rehearsal_evidence = rehearsal_category_evidence(
+        prepromotion_rehearsal,
+        candidate_sha,
+        active_categories,
+    )
+    authoritative_category_evidence = [
+        *authorship_evidence,
+        *rehearsal_evidence,
+    ]
     _merge_grade_goal_usable = bool(_frozen_version_goal) and not is_contentless_goal(
         _frozen_version_goal
     )
@@ -8388,7 +8312,7 @@ async def _finalize_qualification(
             merge_grade_artifact,
             active_categories or None,
             _verified_merge_evidence,
-            authorship_evidence,
+            authoritative_category_evidence,
         )
         if qual.get("prior_superseded") and merge_grade_cert["status"] == "fail":
             merge_grade_cert = {
@@ -8656,6 +8580,24 @@ async def _finalize_qualification(
                     prepromotion_rehearsal,
                     candidate_sha,
                 )
+                for _v in _gate_category_verdicts or []:
+                    _machine_provenance = _v.get("evidence_provenance")
+                    if not isinstance(_machine_provenance, dict):
+                        continue
+                    await _category_ledger.upsert_category_verdict(
+                        session,
+                        version_id=version.id,
+                        candidate_sha=candidate_sha,
+                        category_key=_v.get("category_key"),
+                        status=_v.get("status"),
+                        tier=_v.get("tier", "machine"),
+                        gap=_v.get("gap"),
+                        citations=_v.get("citations") or [],
+                        grader_run_id=None,
+                        evidence_provenance=_machine_provenance,
+                        qualification_attempt_id=attempt_id,
+                        project_id=version.project_id,
+                    )
                 _gate_residual = await _category_ledger.get_residual(
                     session, version.id, candidate_sha,
                     qualification_attempt_id=attempt_id,

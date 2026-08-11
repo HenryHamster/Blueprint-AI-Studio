@@ -1234,7 +1234,16 @@ async def reconcile_serving_authorship_evidence(
                     worker_session.commit(),
                     timeout=_remaining_reconciliation_seconds(deadline),
                 )
-            attempted += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "authorship evidence reconciliation stopped after session cleanup failure"
+            )
+            break
+
+        attempted += 1
+        try:
             await asyncio.wait_for(
                 measure_serving_authorship_evidence(
                     version_id,
@@ -1245,11 +1254,6 @@ async def reconcile_serving_authorship_evidence(
                 ),
                 timeout=_remaining_reconciliation_seconds(deadline),
             )
-        except Exception:
-            logger.exception(
-                "authorship evidence reconciliation stopped after session cleanup failure"
-            )
-            break
         except asyncio.CancelledError:
             raise
         except Exception:

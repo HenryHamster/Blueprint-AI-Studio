@@ -437,6 +437,49 @@ class TestEvaluateMergeGradeCategories:
         assert out["covers_goal"] is True
         assert out["coverage"] == 0.9
 
+    def test_machine_evidence_can_replace_omitted_grader_only_when_complete(self):
+        art = {"covers_goal": True, "coverage_score": 1.0}
+        evidence = [
+            {
+                "category_key": key,
+                "status": "met",
+                "tier": "machine",
+                "citations": [{"kind": "test", "ref": f"trusted:{key}"}],
+                "authoritative": True,
+            }
+            for key in ("c-1", "c-2")
+        ]
+        out = rs.evaluate_merge_grade(
+            "ship the widget",
+            art,
+            self._CATS,
+            authoritative_category_evidence=evidence,
+        )
+        assert out["status"] == "pass"
+        assert {item["category_key"] for item in out["category_verdicts"]} == {
+            "c-1",
+            "c-2",
+        }
+
+    def test_partial_machine_evidence_does_not_fabricate_ungraded_human_verdict(self):
+        art = {"covers_goal": True, "coverage_score": 1.0}
+        out = rs.evaluate_merge_grade(
+            "ship the widget",
+            art,
+            self._CATS,
+            authoritative_category_evidence=[
+                {
+                    "category_key": "c-1",
+                    "status": "met",
+                    "tier": "machine",
+                    "citations": [{"kind": "test", "ref": "trusted:c-1"}],
+                    "authoritative": True,
+                }
+            ],
+        )
+        assert out["status"] == "category_grade_unsupported"
+        assert out["category_verdicts"] is None
+
     def test_empty_goal_with_active_rubric_grades_categories(self):
         """A version with NO goal string but an ACTIVE rubric is still graded
         per-category: the acceptance contract is the gradeable object.

@@ -1222,12 +1222,14 @@ async def test_reconciliation_returns_pool_checkout_when_cancelled_mid_sweep(
     """Cancellation during a real session returns its checkout to the pool."""
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import AsyncAdaptedQueuePool
     from sqlmodel import SQLModel
 
     from app.models import ReleaseAuthorshipReconciliationState
 
     test_engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'authorship-cancellation.db'}",
+        poolclass=AsyncAdaptedQueuePool,
         pool_size=1,
         max_overflow=0,
     )
@@ -1293,6 +1295,54 @@ async def test_reconciliation_returns_pool_checkout_when_cancelled_mid_sweep(
         measure.assert_awaited_once()
     finally:
         await test_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_measurement_failure_continues_selected_batch(
+    db_session, mocker
+):
+    """One remote measurement failure cannot strand later selected versions."""
+    import uuid
+
+    from app.database import AsyncSessionLocal
+    from app.models import ReleaseAuthorshipReconciliationState
+
+    project = Project(name="Authorship batch", user_id="authorship-batch")
+    rows = [
+        ReleaseVersion(
+            id=uuid.UUID(int=900 + index),
+            project_id=project.id,
+            version_number=index + 1,
+            status="promoted",
+            base_sha=f"{index + 1:040x}",
+            promoted_sha=f"{index + 1:040x}",
+            served_sha=f"{index + 10:040x}",
+            serving_status="serving_confirmed",
+            served_at=None,
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification={},
+        )
+        for index in range(2)
+    ]
+    db_session.add_all(
+        [
+            project,
+            *rows,
+            ReleaseAuthorshipReconciliationState(id=1, cursor_partition=0),
+        ]
+    )
+    await db_session.commit()
+
+    measure = mocker.patch(
+        "app.release_commit_authorship.measure_serving_authorship_evidence",
+        new=AsyncMock(side_effect=[RuntimeError("temporary GitHub failure"), True]),
+    )
+
+    assert await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=2) == 2
+    assert [call.args[0] for call in measure.await_args_list] == [
+        rows[0].id,
+        rows[1].id,
+    ]
 
 
 @pytest.mark.asyncio

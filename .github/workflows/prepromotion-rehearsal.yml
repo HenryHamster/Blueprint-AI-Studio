@@ -1,0 +1,132 @@
+name: Prepromotion Rehearsal
+run-name: Prepromotion rehearsal ${{ inputs.request_id }} ${{ inputs.candidate_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact 40-hex candidate commit to build
+        required: true
+        type: string
+      request_id:
+        description: Durable Blueprint dispatch correlation UUID
+        required: true
+        type: string
+
+# Replays of one durable request serialize without sharing the production deploy
+# workflow's concurrency group.
+concurrency:
+  group: prepromotion-rehearsal-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+jobs:
+  build-unprivileged:
+    name: Build candidate without cloud credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      REQUEST_ID: ${{ inputs.request_id }}
+    steps:
+      - name: Validate immutable request
+        shell: bash
+        run: |
+          [[ "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${REQUEST_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify checkout and build contexts
+        run: |
+          test "$(git -C trusted rev-parse HEAD)" = "${GITHUB_SHA}"
+          test "$(git -C candidate rev-parse HEAD)" = "${CANDIDATE_SHA}"
+          test -d candidate/admin-ui
+          test ! -L candidate/admin-ui
+          test -d candidate/backend
+          test ! -L candidate/backend
+          test -f candidate/backend/Dockerfile
+          test ! -L candidate/backend/Dockerfile
+
+      # Candidate npm lifecycle hooks execute only inside an ephemeral Docker
+      # build. They never run in the trusted workflow shell or inherit Actions
+      # command-file paths.
+      - name: Build candidate frontend in an isolated image
+        run: |
+          docker build \
+            --build-arg "CANDIDATE_SHA=${CANDIDATE_SHA}" \
+            -f - -t "blueprint-frontend-rehearsal:${CANDIDATE_SHA}" candidate <<'DOCKERFILE'
+          FROM node:20-bookworm-slim
+          WORKDIR /src/admin-ui
+          COPY admin-ui/package*.json ./
+          RUN npm ci
+          COPY admin-ui/ ./
+          ARG CANDIDATE_SHA
+          ENV VITE_API_URL="" \
+              VITE_FIREBASE_API_KEY="rehearsal-public-placeholder" \
+              VITE_FIREBASE_AUTH_DOMAIN="rehearsal.invalid" \
+              VITE_FIREBASE_PROJECT_ID="rehearsal" \
+              VITE_EXPECTED_BACKEND_SHA="${CANDIDATE_SHA}"
+          RUN npm run build
+          DOCKERFILE
+
+      - name: Extract and verify frontend with trusted code
+        run: |
+          CONTAINER_ID="$(docker create "blueprint-frontend-rehearsal:${CANDIDATE_SHA}")"
+          trap 'docker rm -f "${CONTAINER_ID}" >/dev/null 2>&1 || true' EXIT
+          rm -rf candidate/backend/static
+          mkdir -p candidate/backend/static
+          docker cp "${CONTAINER_ID}:/src/admin-ui/dist/." candidate/backend/static/
+          if find candidate/backend/static -type l -print -quit | grep -q .; then
+            echo "frontend artifact contains a symbolic link" >&2
+            exit 1
+          fi
+          BUNDLE_SHA256="$(python trusted/scripts/frontend_release_manifest.py \
+            --verify candidate/backend/static "${CANDIDATE_SHA}")"
+          [[ "${BUNDLE_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s' "${BUNDLE_SHA256}" > frontend-bundle.sha256
+
+      - name: Build candidate image locally
+        working-directory: ./candidate/backend
+        run: |
+          docker build \
+            --label "org.opencontainers.image.revision=${CANDIDATE_SHA}" \
+            --label "com.blueprint.frontend.bundle-sha256=$(cat ../../frontend-bundle.sha256)" \
+            -t "blueprint-rehearsal:${CANDIDATE_SHA}" .
+
+      - name: Verify immutable image identity
+        run: |
+          IMAGE="blueprint-rehearsal:${CANDIDATE_SHA}"
+          IMAGE_BYTES="$(docker image inspect --format '{{.Size}}' "${IMAGE}")"
+          test "${IMAGE_BYTES}" -gt 0
+          test "${IMAGE_BYTES}" -le 4294967296
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${IMAGE}")" \
+            = "${CANDIDATE_SHA}"
+
+      # Candidate execution stays on an ephemeral, secrets-free GitHub runner.
+      # Nothing from this image is uploaded, published, or run on Hamsterwheel.
+      - name: Bounded isolated image smoke
+        run: |
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 256 \
+            --memory 2g \
+            --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=134217728 \
+            --entrypoint /usr/local/bin/python \
+            "blueprint-rehearsal:${CANDIDATE_SHA}" \
+            -c "import app.main; print('candidate-import-ok')"

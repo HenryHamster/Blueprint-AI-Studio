@@ -49,10 +49,25 @@ CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
 
 
 def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:
-    """Return the one closed machine-contract shape supported by qualification."""
+    """Return a supported closed machine-contract shape for qualification."""
     from app.release_commit_authorship import normalize_authorship_evidence_contract
+    from app.release_prepromotion_rehearsal import (
+        normalize_rehearsal_evidence_contract,
+    )
 
-    return normalize_authorship_evidence_contract(raw)
+    return normalize_authorship_evidence_contract(
+        raw
+    ) or normalize_rehearsal_evidence_contract(raw)
+
+
+def is_owner_controlled_machine_contract(
+    criterion: VersionAcceptanceCriterion,
+) -> bool:
+    """Return whether an autonomous loop must preserve this machine policy."""
+    if normalize_evidence_contract(criterion.evidence_contract) is None:
+        return False
+    actor = str(criterion.evidence_contract_updated_by or "")
+    return not actor.startswith("strategist:")
 
 
 def criterion_release_version_id_from_context(
@@ -996,6 +1011,25 @@ async def get_criterion_by_key(
         )
     )
     return result.scalars().first()
+
+
+async def get_criterion_by_key_for_update(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    criterion_key: str,
+) -> VersionAcceptanceCriterion | None:
+    """Lock and return the exact row used for lifecycle authorization."""
+    result = await session.execute(
+        select(VersionAcceptanceCriterion)
+        .where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == criterion_key,
+        )
+        .with_for_update()
+    )
+    return result.scalar_one_or_none()
 
 
 async def count_criteria_for_version(
@@ -4031,11 +4065,13 @@ async def delete_criterion(
     Returns True if the row was found and deleted, False if not found.
     """
     result = await session.execute(
-        select(VersionAcceptanceCriterion).where(
+        select(VersionAcceptanceCriterion)
+        .where(
             VersionAcceptanceCriterion.project_id == project_id,
             VersionAcceptanceCriterion.release_version_id == release_version_id,
             VersionAcceptanceCriterion.criterion_key == criterion_key,
         )
+        .with_for_update()
     )
     row = result.scalar_one_or_none()
     if row is None:
@@ -4079,8 +4115,14 @@ async def retract_criterion(
     row = result.scalar_one_or_none()
     if row is None:
         return None
-    if enforce_loop_authored and is_operator_authored_criterion(row.created_by):
-        raise OperatorAuthoredRetractionError(criterion_key, row.created_by)
+    if enforce_loop_authored and (
+        is_operator_authored_criterion(row.created_by)
+        or is_owner_controlled_machine_contract(row)
+    ):
+        raise OperatorAuthoredRetractionError(
+            criterion_key,
+            row.evidence_contract_updated_by or row.created_by,
+        )
     if row.status == "active":
         row.status = "superseded" if superseded_by_key else "retracted"
         row.retraction_reason = reason
@@ -4122,11 +4164,13 @@ async def reinstate_criterion(
     before calling this function.
     """
     result = await session.execute(
-        select(VersionAcceptanceCriterion).where(
+        select(VersionAcceptanceCriterion)
+        .where(
             VersionAcceptanceCriterion.project_id == project_id,
             VersionAcceptanceCriterion.release_version_id == release_version_id,
             VersionAcceptanceCriterion.criterion_key == criterion_key,
         )
+        .with_for_update()
     )
     row = result.scalar_one_or_none()
     if row is None:
