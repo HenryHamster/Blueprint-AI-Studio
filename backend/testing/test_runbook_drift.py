@@ -38,20 +38,24 @@ def test_runbook_matches_release_script_contract() -> None:
     result = contract.validate_runbook_contract()
 
     assert result["entrypoints"]["bootstrap"]["flags"] == [
+        "--image",
+        "--rehearse",
         "--revision",
     ]
     assert result["entrypoints"]["release"]["flags"] == [
         "--expected-revision",
         "--image",
+        "--rehearse",
     ]
     assert "live systemd privilege boundary" in result["preconditions"]
 
 
-def test_runbook_describes_integrated_pre_stop_checks() -> None:
+def test_runbook_does_not_instruct_operator_to_use_disabled_host_rehearsal() -> None:
     text = contract._RUNBOOK_PATH.read_text(encoding="utf-8")
 
-    assert "--rehearse" not in text
-    assert "standalone pre-stop command" not in text
+    assert "Pre-stop rehearsal (mandatory gate)" not in text
+    assert "does not run a standalone pre-stop command" in text
+    assert "do not\ninvoke either release entrypoint with `--rehearse`" in text
     assert "Never bypass the integrated" in text
     assert "check and never run candidate code" in text
 

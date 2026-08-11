@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 # Labels are the stable, operator-facing names of every read-only check that
 # must pass before local_app_release may stop an application unit.  The
@@ -65,3 +67,24 @@ def verify_privilege_boundary(
         raise RuntimeError("deploy agent effective hardening is incomplete")
     if release != {"User": "root", "NoNewPrivileges": "no"}:
         raise RuntimeError("release executor is still subject to no-new-privileges")
+
+
+@dataclass(frozen=True)
+class RehearsalReport:
+    """Machine-readable result of checks that precede bounded downtime."""
+
+    candidate: str
+    revision: str
+    checked: tuple[str, ...]
+    deferred: tuple[str, ...]
+    units_stopped: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "blueprint.local_app_release_rehearsal.v1",
+            "candidate": self.candidate,
+            "revision": self.revision,
+            "checked": list(self.checked),
+            "deferred": list(self.deferred),
+            "units_stopped": self.units_stopped,
+        }

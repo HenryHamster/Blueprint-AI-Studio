@@ -5966,6 +5966,14 @@ async def strategic_operation(
                             status_code=400,
                             detail="set_acceptance_criteria: unsupported or malformed evidence_contract",
                         )
+                    if normalized_contract.get("type") == "prepromotion_ci_build_smoke":
+                        raise HTTPException(
+                            status_code=403,
+                            detail=(
+                                "set_acceptance_criteria: external CI evidence "
+                                "contracts require an authenticated project owner"
+                            ),
+                        )
         retract_input = data.get("retract", [])
         if not isinstance(retract_input, list):
             raise HTTPException(

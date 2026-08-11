@@ -2824,6 +2824,49 @@ async def run_qualification(
         )
         return _promo
 
+    active_criteria = [
+        row
+        for row in await get_criteria_for_version(session, version.id)
+        if row.status == "active"
+    ]
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        normalize_rehearsal_evidence_contract,
+        prepare_rehearsal_dispatch_intent,
+    )
+
+    rehearsal_required = any(
+        normalize_rehearsal_evidence_contract(row.evidence_contract) is not None
+        for row in active_criteria
+    )
+    rehearsal_dispatch_ok = True
+    rehearsal_dispatch: dict[str, Any] | None = None
+    if rehearsal_required:
+        rehearsal_dispatch_ok, rehearsal_dispatch = (
+            await prepare_rehearsal_dispatch_intent(session, version, candidate_sha)
+        )
+    if rehearsal_required and not rehearsal_dispatch_ok:
+        version.last_qualification = {
+            **(version.last_qualification or {}),
+            "status": "rehearsal_dispatch_pending",
+            "blocker": "prepromotion_rehearsal_dispatch_pending",
+            "candidate_sha": candidate_sha,
+            "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
+            "detail": "durable rehearsal outbox intent awaits dispatch/reconciliation",
+            "started_at": _utcnow().isoformat(),
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
+            "requested_probes": sorted(effective_requested_probes),
+        }
+        flag_modified(version, "last_qualification")
+        session.add(version)
+        return {
+            "status": "rehearsal_dispatch_pending",
+            "blocker": "prepromotion_rehearsal_dispatch_pending",
+            "candidate_sha": candidate_sha,
+            "dispatch": rehearsal_dispatch,
+        }
+
     # Snapshot the merge-state signal under the version lock that owns the
     # qualification launch; promotion scoring stays unchanged.
     stranded_approved_prs = await snapshot_stranded_approved_prs(
@@ -3369,6 +3412,7 @@ async def run_qualification(
                 "status": "not_promoted",
                 "blocker": "migration_identity_collision",
                 "candidate_sha": candidate_sha,
+                "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
                 "qualification_attempt_id": str(attempt_id),
                 "retry_episode": retry_episode,
                 "retry_episode_cap": retry_episode_cap,
@@ -3511,6 +3555,7 @@ async def run_qualification(
             "engine_sha": get_serving_sha(),
             "detail": str(exc)[:300],
             "candidate_sha": candidate_sha,
+            "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
             "ci_green": ci_green,
             "ci_state": ci_state,
             "started_at": started_at,
@@ -3550,6 +3595,7 @@ async def run_qualification(
         "retry_episode": retry_episode,
         "retry_episode_cap": retry_episode_cap,
         "candidate_sha": candidate_sha,
+        "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
         "candidate_diff_hash": candidate_diff_hash,
         "stranded_approved_prs": stranded_approved_prs,
         "audited_surface_paths": candidate_audited_surface or None,
@@ -8128,6 +8174,16 @@ async def _finalize_qualification(
         for c in launched_rubric
         if c.get("criterion_key")
     ]
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        validate_prepromotion_gradeability,
+    )
+
+    # Every active category can hard-block promotion.  Validate its evidence
+    # producer phase before composing any category verdicts, so a newly added
+    # criterion cannot introduce a producer/gate cycle that only wedges a
+    # release attempt.
+    validate_prepromotion_gradeability(active_categories)
+
     # The latest promoted release is the only immutable source for this
     # cross-version qualifier evidence.  Bind it by rubric text through the
     # generic adapter; invalid, unresolved, terminal, and missing receipts all
@@ -8163,7 +8219,25 @@ async def _finalize_qualification(
             *serving_authorship_range(latest_promoted),
             active_categories,
         )
-    authoritative_category_evidence = authorship_evidence
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        apply_rehearsal_evidence,
+        persisted_rehearsal_for_version,
+        rehearsal_category_evidence,
+    )
+    prepromotion_rehearsal = await persisted_rehearsal_for_version(
+        session,
+        version,
+        candidate_sha,
+    )
+    rehearsal_evidence = rehearsal_category_evidence(
+        prepromotion_rehearsal,
+        candidate_sha,
+        active_categories,
+    )
+    authoritative_category_evidence = [
+        *authorship_evidence,
+        *rehearsal_evidence,
+    ]
     _merge_grade_goal_usable = bool(_frozen_version_goal) and not is_contentless_goal(
         _frozen_version_goal
     )
@@ -8400,6 +8474,12 @@ async def _finalize_qualification(
             _expected_grader_run_id = str(_expected_grader_run_id)
         _fresh_category_verdicts = merge_grade_cert.get("category_verdicts")
         if _fresh_category_verdicts is not None:
+            _fresh_category_verdicts = apply_rehearsal_evidence(
+                _fresh_category_verdicts,
+                active_categories,
+                prepromotion_rehearsal,
+                candidate_sha,
+            )
             # Fresh grade this finalize: write each category verdict + the residual.
             try:
                 for _v in _fresh_category_verdicts:
@@ -8493,6 +8573,12 @@ async def _finalize_qualification(
                     _fail_closed_category_verdicts(_active_keys)
                     if _merge_grade_ran
                     else None
+                )
+                _gate_category_verdicts = apply_rehearsal_evidence(
+                    _gate_category_verdicts,
+                    active_categories,
+                    prepromotion_rehearsal,
+                    candidate_sha,
                 )
                 for _v in _gate_category_verdicts or []:
                     _machine_provenance = _v.get("evidence_provenance")
@@ -9084,6 +9170,7 @@ async def _finalize_qualification(
         # gating in ENFORCE).  Recorded in the per-dimension fact ledger.
         "capability_proof_blocked": capability_proof_blocked,
         "capability_proof_detail": capability_proof_detail,
+        "prepromotion_rehearsal": prepromotion_rehearsal,
     }
 
     # Enforce-mode confidence preview — only in observe/off mode, only when no

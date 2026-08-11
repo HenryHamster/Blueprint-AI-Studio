@@ -137,6 +137,11 @@ def _serve_one_request() -> None:
         with connection:
             payload = connection.recv(_MAX_REQUEST_BYTES)
             request = _request_args(payload)
+            if request and request[0] == "rehearse":
+                # Candidate execution is never permitted on the production
+                # host before qualification. Trusted CI owns build/smoke.
+                connection.sendall(b"ERROR host rehearsal disabled\n")
+                return
             digest, revision = _validated_args(request)
             return_code = _run_release(digest, revision)
             try:
@@ -159,7 +164,11 @@ def main() -> None:
         return
     if os.geteuid() != 0:
         _fail("must run as root (via the release socket service)")
-    digest, revision = _validated_args(sys.argv[1:])
+    rehearsal = len(sys.argv) == 4 and sys.argv[1] == "--rehearse"
+    if rehearsal:
+        _fail("host rehearsal disabled; use trusted CI build/smoke evidence")
+    args = sys.argv[2:] if rehearsal else sys.argv[1:]
+    digest, revision = _validated_args(args)
     command = _release_command(digest, revision)
     os.execv(command[0], command)
 

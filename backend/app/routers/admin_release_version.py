@@ -1940,6 +1940,62 @@ class _ActivationReceiptBody(BaseModel):
     revision: str | None = _Field(default=None, max_length=40)
     # SSH host that performed the activation (provenance, informational).
     host: str | None = _Field(default=None, max_length=200)
+@router.post("/projects/{project_id}/release-versions/{version_number}/prepromotion-rehearsal")
+async def request_prepromotion_rehearsal(
+    project_id: uuid.UUID,
+    version_number: int,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Queue trusted-main CI build/smoke for the exact open candidate.
+
+    This writes the same durable outbox intent as automatic qualification. The
+    reaper dispatches the trusted-main workflow after the transaction commits;
+    the request never performs GitHub I/O while holding the release row lock.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="owner"
+    )
+    version = (
+        await session.execute(
+            select(ReleaseVersion)
+            .where(
+                ReleaseVersion.project_id == project_id,
+                ReleaseVersion.version_number == version_number,
+            )
+            .with_for_update()
+        )
+    ).scalars().first()
+    if version is None:
+        raise HTTPException(status_code=404, detail="Release version not found.")
+    if version.status != "open":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Release version {version_number} is not an open candidate.",
+        )
+    candidate_sha = str((version.last_qualification or {}).get("candidate_sha") or "")
+    if not _SHA40_RE.fullmatch(candidate_sha):
+        raise HTTPException(
+            status_code=409,
+            detail="The open release version has no full candidate SHA to rehearse.",
+        )
+
+    from app.release_prepromotion_rehearsal import (
+        prepare_rehearsal_dispatch_intent,
+    )
+
+    ready, dispatch = await prepare_rehearsal_dispatch_intent(
+        session, version, candidate_sha, rearm_terminal=True
+    )
+    await session.commit()
+    return {
+        "version_number": version_number,
+        "candidate_sha": candidate_sha,
+        "dispatch": dispatch,
+        "status": "ready" if ready else "rehearsal_dispatch_pending",
+    }
+
+
 @router.post("/projects/{project_id}/activation-receipt")
 async def record_activation_receipt(
     project_id: uuid.UUID,

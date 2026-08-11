@@ -5,11 +5,11 @@
 {
   "entrypoints": {
     "bootstrap": {
-      "flags": ["--revision"],
+      "flags": ["--image", "--rehearse", "--revision"],
       "script": "scripts/bootstrap_local_app_release.py"
     },
     "release": {
-      "flags": ["--expected-revision", "--image"],
+      "flags": ["--expected-revision", "--image", "--rehearse"],
       "script": "scripts/local_app_release.py"
     }
   },
@@ -73,6 +73,17 @@ is reported and persisted as `phase=failed` with the attempt count and
 timeout.
 
 ## Qualification and integrated pre-stop checks
+
+The operator does not run a standalone pre-stop command. In particular, do not
+invoke either release entrypoint with `--rehearse`. Prequalification candidate
+execution on Hamsterwheel is disabled: those compatibility flags are fail-closed
+sentinels and exit with `host rehearsal disabled` before image pull, migration
+inspection, or service mutation. They are not an operator release step.
+
+Before promotion, any criterion that requires candidate build/smoke evidence
+is satisfied only by the candidate-bound, secrets-free trusted-main GitHub
+workflow. That workflow does not claim to prove Hamsterwheel's live systemd,
+secret-file, database, or activation state.
 
 The ordinary release command below performs the live pre-stop checks itself,
 inside the root-owned activation transaction and immediately before the first

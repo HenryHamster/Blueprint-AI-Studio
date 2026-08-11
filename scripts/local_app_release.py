@@ -31,7 +31,11 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import frontend_release_manifest as frontend_manifest
-from release_preconditions import verify_privilege_boundary
+from release_preconditions import (
+    PRE_STOP_PRECONDITIONS,
+    RehearsalReport,
+    verify_privilege_boundary,
+)
 
 _IMAGE_PREFIX = (
     "us-central1-docker.pkg.dev/blueprint-orchestrator/blueprint-repo/"
@@ -433,6 +437,36 @@ def _cleanup_stale_registry_auth(expected_uid: int) -> None:
             raise RuntimeError("unexpected registry credential directory name")
         _remove_registry_auth_directory(directory, expected_uid)
 
+
+def _pull_candidate_for_rehearsal(image_ref: str, install_user: str) -> None:
+    """Pull the exact candidate using the same ephemeral auth as activation."""
+    node_root = Path("/etc/blueprint/nodes") / install_user
+    worker_path = node_root / "roles" / "worker" / "role.env"
+    for directory in (
+        Path("/etc/blueprint"),
+        Path("/etc/blueprint/nodes"),
+        node_root,
+        node_root / "roles",
+        node_root / "roles" / "worker",
+    ):
+        _trusted_root_directory(directory)
+    worker_role = _secure_role_file(worker_path)
+    install_uid = _uid_for_user(install_user)
+    credential = _secure_registry_credential(
+        _role_value(worker_role, "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE"),
+        install_uid,
+    )
+    with _registry_auth(credential) as registry_config:
+        _run(
+            [
+                "/usr/bin/docker",
+                "--config",
+                str(registry_config),
+                "pull",
+                image_ref,
+            ],
+            timeout=600,
+        )
 
 
 @contextlib.contextmanager
@@ -1256,14 +1290,14 @@ def _preflight_local_migration_inputs(image_ref: str) -> None:
     )
 
 
-def _verify_pre_stop_conditions(
+def _run_pre_stop_rehearsal(
     image_id: str,
     image_ref: str,
     revision: str,
     install_user: str,
     target_schema_revision: str,
     database_schema_before: str,
-) -> None:
+) -> RehearsalReport:
     """Prove all deterministic release preconditions before stopping units."""
     verify_privilege_boundary(
         install_user,
@@ -1277,6 +1311,25 @@ def _verify_pre_stop_conditions(
     )
     if target_refusal is not None:
         raise RuntimeError(target_refusal)
+    return RehearsalReport(
+        candidate=image_ref,
+        revision=revision,
+        checked=PRE_STOP_PRECONDITIONS,
+        deferred=(
+            "migration apply and post-migration schema verification (mutates live DB)",
+            "unit stop/start and application health verification (requires downtime)",
+        ),
+    )
+
+
+def rehearse(image_ref: str, revision: str) -> RehearsalReport:
+    """Refuse standalone candidate execution on the production host."""
+    del image_ref, revision
+    raise RuntimeError(
+        "host rehearsal disabled; use trusted CI build/smoke evidence"
+    )
+
+
 def _schema_mismatch_refusal(
     image_id: str,
     image_label: str,
@@ -1506,7 +1559,7 @@ def release(image_ref: str, revision: str) -> Path:
         }
 
     try:
-        _verify_pre_stop_conditions(
+        _run_pre_stop_rehearsal(
             image_id,
             image_ref,
             revision,
@@ -1728,6 +1781,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-revision", required=True)
+    parser.add_argument(
+        "--rehearse",
+        action="store_true",
+        help="validate candidate preconditions without stopping or changing units",
+    )
     return parser
 
 
@@ -1735,6 +1793,13 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.rehearse:
+            report = rehearse(args.image, args.expected_revision)
+            print(
+                "LOCAL_APP_RELEASE_REHEARSAL "
+                + json.dumps(report.as_dict(), sort_keys=True)
+            )
+            return 0
         evidence = _locked_release(args.image, args.expected_revision)
     except (OSError, ValueError, RuntimeError, PermissionError) as exc:
         print(f"ERROR: {exc}", file=os.sys.stderr)

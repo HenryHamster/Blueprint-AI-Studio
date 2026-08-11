@@ -185,11 +185,23 @@ async def test_list_criteria_requires_viewer_role(client: AsyncClient, db_sessio
 
 
 @pytest.mark.asyncio
-async def test_member_can_write_text_but_cannot_clear_machine_policy(
+async def test_member_can_write_text_but_cannot_activate_or_clear_machine_policy(
     client: AsyncClient, db_session
 ):
     project = await _make_project_member(db_session, role="member")
     version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-owner-policy",
+        text="Trusted CI must verify the candidate",
+        status="active",
+        created_by="operator",
+        evidence_contract={
+            "type": "prepromotion_ci_build_smoke",
+            "predicate": {"required": True},
+        },
+    )
     authorship_target = VersionAcceptanceCriterion(
         project_id=project.id,
         release_version_id=version.id,
@@ -203,7 +215,7 @@ async def test_member_can_write_text_but_cannot_clear_machine_policy(
         },
         evidence_contract_updated_by=TEST_USER_ID,
     )
-    db_session.add(authorship_target)
+    db_session.add_all([target, authorship_target])
     await db_session.commit()
 
     ordinary = await client.post(
@@ -211,6 +223,39 @@ async def test_member_can_write_text_but_cannot_clear_machine_policy(
         json={"text": "Member-authored prose criterion"},
     )
     assert ordinary.status_code == 200
+
+    machine = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria",
+        json={
+            "text": "Member must not spend Actions authority",
+            "evidence_contract": {
+                "type": "prepromotion_ci_build_smoke",
+                "predicate": {"required": True},
+            },
+        },
+    )
+    assert machine.status_code == 403
+
+    clear = await client.patch(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/"
+        f"{target.criterion_key}/evidence-contract",
+        json={"evidence_contract": None},
+    )
+    assert clear.status_code == 403
+
+    delete = await client.delete(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}"
+    )
+    assert delete.status_code == 403
+
+    target.status = "retracted"
+    db_session.add(target)
+    await db_session.commit()
+    reinstate = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/"
+        f"{target.criterion_key}/reinstate"
+    )
+    assert reinstate.status_code == 403
 
     delete_authorship = await client.delete(
         f"{_BASE}/projects/{project.id}/acceptance-criteria/"
@@ -229,6 +274,41 @@ async def test_member_can_write_text_but_cannot_clear_machine_policy(
 
 
 @pytest.mark.asyncio
+async def test_owner_can_reinstate_then_delete_external_ci_policy(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-owner-external-policy",
+        text="Trusted CI verifies the candidate",
+        status="retracted",
+        created_by="strategist",
+        evidence_contract={
+            "type": "prepromotion_ci_build_smoke",
+            "predicate": {"required": True},
+        },
+        evidence_contract_updated_by=TEST_USER_ID,
+    )
+    db_session.add(target)
+    await db_session.commit()
+
+    reinstate = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/"
+        f"{target.criterion_key}/reinstate"
+    )
+    assert reinstate.status_code == 200
+    await db_session.refresh(target)
+    assert target.status == "active"
+
+    delete = await client.delete(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}"
+    )
+    assert delete.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # POST /api/admin/projects/{project_id}/acceptance-criteria (create)
 # DELETE /api/admin/projects/{project_id}/acceptance-criteria/{key} (delete)

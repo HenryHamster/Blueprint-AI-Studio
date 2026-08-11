@@ -19829,6 +19829,27 @@ async def test_strategic_authors_and_maps_acceptance_criteria(
     assert "d-ac-test1" in first_item["direction_keys"]
     assert second_item["direction_keys"] == []
 
+    external_policy = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "text": "Spend external CI authority",
+                        "evidence_contract": {
+                            "type": "prepromotion_ci_build_smoke",
+                            "predicate": {"required": True},
+                        },
+                    }
+                ]
+            },
+        },
+    )
+    assert external_policy.status_code == 403
+
     criterion_key_1 = first_item["criterion_key"]
     criterion_key_2 = second_item["criterion_key"]
 
@@ -21186,6 +21207,19 @@ async def test_strategic_contract_ownership_and_active_direction_mapping(
         evidence_contract_updated_at=_utcnow(),
         created_by="strategist",
     )
+    owner_bound_row = VersionAcceptanceCriterion(
+        project_id=task.project_id,
+        release_version_id=version.id,
+        criterion_key="c-owner-bound-ci",
+        text="Owner-bound external CI contract",
+        evidence_contract={
+            "type": "prepromotion_ci_build_smoke",
+            "predicate": {"required": True},
+        },
+        evidence_contract_updated_by="project-owner",
+        evidence_contract_updated_at=_utcnow(),
+        created_by="strategist",
+    )
     owner_bound_authorship_row = VersionAcceptanceCriterion(
         project_id=task.project_id,
         release_version_id=version.id,
@@ -21216,6 +21250,7 @@ async def test_strategic_contract_ownership_and_active_direction_mapping(
             version,
             operator_row,
             strategist_row,
+            owner_bound_row,
             owner_bound_authorship_row,
             inactive_direction,
             active_direction,
@@ -21248,6 +21283,31 @@ async def test_strategic_contract_ownership_and_active_direction_mapping(
     assert operator_row.evidence_contract == operator_contract
     assert inactive_direction.criterion_keys == []
 
+    attempted_clear = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "text": owner_bound_row.text,
+                        "evidence_contract": None,
+                        "direction_keys": [],
+                    }
+                ]
+            },
+        },
+    )
+    assert attempted_clear.status_code == 200, attempted_clear.text
+    await db_session.refresh(owner_bound_row)
+    assert owner_bound_row.evidence_contract == {
+        "type": "prepromotion_ci_build_smoke",
+        "predicate": {"required": True},
+    }
+    assert owner_bound_row.evidence_contract_updated_by == "project-owner"
+
     attempted_authorship_clear = await client.post(
         "/api/agent/strategic",
         headers=headers,
@@ -21272,6 +21332,27 @@ async def test_strategic_contract_ownership_and_active_direction_mapping(
         "predicate": {"max_count": 0},
     }
     assert owner_bound_authorship_row.evidence_contract_updated_by == "project-owner"
+
+    attempted_retract = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [],
+                "retract": [
+                    {
+                        "criterion_key": owner_bound_row.criterion_key,
+                        "reason": "autonomous policy relaxation",
+                    }
+                ],
+            },
+        },
+    )
+    assert attempted_retract.status_code == 422
+    await db_session.refresh(owner_bound_row)
+    assert owner_bound_row.status == "active"
 
     attempted_authorship_retract = await client.post(
         "/api/agent/strategic",

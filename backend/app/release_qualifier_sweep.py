@@ -192,6 +192,7 @@ async def _cancel_qualifier_children(
                 version.id,
             )
 
+
 async def _force_finalize_timed_out_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -1404,6 +1405,34 @@ async def sweep_stuck_qualifications(
             logger.exception(
                 "[RELEASE_QUALIFIER] sweep: acceptance evidence refresh failed "
                 "for version %s",
+                version_id,
+            )
+
+    # The durable rehearsal dispatcher runs before this sweep. Once it has
+    # persisted a candidate-bound receipt, resume only the qualification that
+    # was explicitly parked waiting for that receipt. This path is independent
+    # of the general auto-trigger knob: it completes an already-authorized
+    # attempt and remains inert for missing, invalid, or stale evidence.
+    from app.release_prepromotion_rehearsal import (
+        redrive_rehearsal_ready_qualification,
+    )
+
+    for version_id in version_ids:
+        try:
+            redriven = await redrive_rehearsal_ready_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: rehearsal-ready re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove rehearsal-ready version %s",
                 version_id,
             )
 
