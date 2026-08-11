@@ -48,7 +48,9 @@ _github_client: httpx.AsyncClient | None = None
 # than a live request would. Collapses the ~50-VM fan-out that hammers a shared
 # ref (e.g. every rollup parent reading automain's tip in the same sweep), a
 # dominant install-token-budget drain.
-_inflight_reads: dict[tuple[str, str, str, str], "asyncio.Future[httpx.Response]"] = {}
+_inflight_reads: dict[
+    tuple[str, str, str, str, str, str], "asyncio.Future[httpx.Response]"
+] = {}
 
 # File-content cache: memoizes get_file_text_at_ref results by
 # (owner, repo, ref, path) for a short TTL, but only when ``ref`` is a full
@@ -440,8 +442,16 @@ def is_github_rate_limited_response(response: httpx.Response) -> bool:
 def _github_auth_fingerprint(headers: dict | None) -> str:
     """Return a non-reversible single-flight identity; never retain the credential."""
 
-    authorization = (headers or {}).get("Authorization", "")
+    authorization = httpx.Headers(headers or {}).get("authorization", "")
     return hashlib.sha256(authorization.encode("utf-8")).hexdigest()
+
+
+def _response_header_fingerprint(headers: dict | None) -> tuple[str, str]:
+    normalized = httpx.Headers(headers or {})
+    return (
+        normalized.get("accept", ""),
+        normalized.get("x-github-api-version", ""),
+    )
 
 
 def _canonical_query_params(params) -> str:
@@ -453,15 +463,14 @@ def _canonical_query_params(params) -> str:
     """
     if params is None:
         return ""
-    if hasattr(params, "multi_items"):
-        items = list(params.multi_items())
-    elif hasattr(params, "items"):
-        items = list(params.items())
-    else:
-        try:
-            items = list(params)
-        except TypeError:
-            return repr(params)
+    try:
+        # QueryParams is the one canonical parser for mappings, repeated pairs,
+        # and already-encoded query values.  In particular, it avoids treating
+        # a list value as one Python string and avoids collisions between
+        # ``[("label", "a"), ("label", "b")]`` and ``{"label": ["a", "b"]}``.
+        items = list(httpx.QueryParams(params).multi_items())
+    except (TypeError, ValueError):
+        return repr(params)
     normalized = [(str(key), str(value)) for key, value in items]
     normalized.sort()
     return urlencode(normalized, doseq=True)
@@ -499,11 +508,14 @@ async def _github_request(
         )
     # The same URL can return different repository sets and permissions for two
     # user/App credentials. Coalesce only within one credential identity.
+    accept, api_version = _response_header_fingerprint(headers)
     key = (
         "GET",
         url,
         _github_auth_fingerprint(headers),
         _canonical_query_params(kwargs.get("params")),
+        accept,
+        api_version,
     )
     existing = _inflight_reads.get(key)
     if existing is not None:
@@ -512,15 +524,19 @@ async def _github_request(
         _ss.github_cache_hits["read_singleflight"] = (
             _ss.github_cache_hits.get("read_singleflight", 0) + 1
         )
-        return await existing
+        return await asyncio.shield(existing)
     task = asyncio.ensure_future(
         _github_request_uncoalesced(
             method, url, headers, max_retries, project_id, consumer=consumer, **kwargs
         )
     )
     _inflight_reads[key] = task
-    task.add_done_callback(lambda t: _inflight_reads.pop(key, None))
-    return await task
+    def _forget_completed(done_task: asyncio.Future) -> None:
+        if _inflight_reads.get(key) is done_task:
+            _inflight_reads.pop(key, None)
+
+    task.add_done_callback(_forget_completed)
+    return await asyncio.shield(task)
 
 
 async def _github_request_uncoalesced(

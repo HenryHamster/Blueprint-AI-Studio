@@ -5157,6 +5157,72 @@ async def test_singleflight_same_url_distinct_query_pages_and_heads_not_coalesce
 
 
 @pytest.mark.asyncio
+async def test_singleflight_query_params_preserve_repeated_values_and_header_variants(mocker):
+    """Repeated query values and response-affecting headers are part of identity."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls.append((headers, kw.get("params")))
+        await asyncio.sleep(0.01)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    await asyncio.gather(
+        github._github_request(
+            "GET",
+            "https://api.github.com/search",
+            {"authorization": "Bearer same", "ACCEPT": "application/json"},
+            params=[("label", "a"), ("label", "b")],
+        ),
+        github._github_request(
+            "GET",
+            "https://api.github.com/search",
+            {"Authorization": "Bearer same", "Accept": "application/json"},
+            params={"label": ["a", "b"]},
+        ),
+        github._github_request(
+            "GET",
+            "https://api.github.com/search",
+            {"Authorization": "Bearer same", "Accept": "application/vnd.github+json"},
+            params=[("label", "a"), ("label", "b")],
+        ),
+    )
+
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_singleflight_cancelled_waiter_does_not_cancel_shared_request(mocker):
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = {"n": 0}
+    started = asyncio.Event()
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls["n"] += 1
+        started.set()
+        await asyncio.sleep(0.03)
+        return MockResponse(200, json_data={"ok": True})
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    owner = asyncio.create_task(github._github_request("GET", "https://api.github.com/x", {}))
+    await started.wait()
+    waiter = asyncio.create_task(github._github_request("GET", "https://api.github.com/x", {}))
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    result = await owner
+
+    assert result.json() == {"ok": True}
+    assert calls["n"] == 1
+    assert github._inflight_reads == {}
+
+
+@pytest.mark.asyncio
 async def test_singleflight_non_get_not_coalesced(mocker):
     """Mutating methods (and body-carrying GETs) are never coalesced."""
     import app.github as github

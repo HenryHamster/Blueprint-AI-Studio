@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
@@ -15,7 +16,10 @@ from app.release_commit_authorship import (
     AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
     AUTHORSHIP_RECEIPT_SOURCE,
     count_non_bot_authored_commits,
+    measure_serving_authorship_evidence,
     persist_serving_authorship_evidence,
+    reconcile_serving_authorship_evidence,
+    validate_authorship_receipt,
 )
 
 
@@ -36,11 +40,33 @@ def _github_commit(
     identity_type: str | None = None,
     verified: bool | None = None,
 ) -> dict:
-    commit = {"sha": sha, "commit": {"author": {"name": author}}}
+    raw_author = {"name": author}
+    raw_committer = {"name": author}
+    if login == "blueprintagentorchestrator[bot]":
+        raw_author["email"] = (
+            "272093198+blueprintagentorchestrator[bot]@users.noreply.github.com"
+        )
+        raw_committer["email"] = raw_author["email"]
+    else:
+        raw_author["email"] = "human@example.com"
+        raw_committer["email"] = "human@example.com"
+    commit = {
+        "sha": sha,
+        "commit": {"author": raw_author, "committer": raw_committer},
+    }
     if login is not None or identity_type is not None:
         commit["author"] = {"login": login, "type": identity_type}
     if verified is not None:
-        commit["commit"]["verification"] = {"verified": verified}
+        commit["commit"]["verification"] = {
+            "verified": verified,
+            "reason": "valid" if verified else "unsigned",
+        }
+    if login == "blueprintagentorchestrator[bot]":
+        commit["author"]["id"] = 272093198
+        commit["commit"]["committer"] = {
+            "name": "GitHub",
+            "email": "noreply@github.com",
+        }
     return commit
 
 
@@ -358,6 +384,71 @@ async def test_fully_verified_blueprint_bot_commit_is_not_an_offender(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_bot_looking_author_with_human_committer_is_an_offender(monkeypatch):
+    """A human-signed commit cannot spoof the Blueprint App identity."""
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    spoof = _github_commit(
+        head,
+        "blueprintagentorchestrator[bot]",
+        login="blueprintagentorchestrator[bot]",
+        identity_type="Bot",
+        verified=True,
+    )
+    spoof["commit"]["committer"] = {
+        "name": "Henry Hamster",
+        "email": "henry@example.com",
+    }
+    project = Project(id="release-authorship-human-committer", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    monkeypatch.setattr(
+        github,
+        "_github_request",
+        AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [spoof]))),
+    )
+
+    report = await count_non_bot_authored_commits(
+        base, head, session=object(), project=project
+    )
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 1
+    assert report["offenders"] == [
+        {"sha": head[:12], "author": "blueprintagentorchestrator[bot]"}
+    ]
+
+
+def test_receipt_rejects_tampered_zero_and_offender_shapes():
+    base, head = "a" * 40, "b" * 40
+    common = {
+        "source": AUTHORSHIP_RECEIPT_SOURCE,
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        "state": "resolved",
+        "count": 1,
+        "offenders": [{"sha": "b" * 12, "author": "Human"}],
+        "range": {"base_sha": base, "head_sha": head},
+        "measured_at": "2026-01-01T00:00:00+00:00",
+        "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+    }
+    assert validate_authorship_receipt(common, base, head) is not None
+    assert validate_authorship_receipt({**common, "count": 0}, base, head) is None
+    assert validate_authorship_receipt(
+        {**common, "offenders": [{"sha": "B" * 12, "author": "Human"}]},
+        base,
+        head,
+    ) is None
+    assert validate_authorship_receipt(
+        {**common, "offenders": [{"sha": "b" * 12, "author": "Human", "extra": 1}]},
+        base,
+        head,
+    ) is None
+
+
+@pytest.mark.asyncio
 async def test_read_path_serves_persisted_report_without_recomputation(
     client: AsyncClient, db_session, monkeypatch
 ):
@@ -377,6 +468,10 @@ async def test_read_path_serves_persisted_report_without_recomputation(
         serving_status="serving_confirmed",
         last_qualification={
             "status": "promoted",
+            # The current v32 rubric delegates c-429 grading to the audit
+            # projection; this endpoint must carry that verdict alongside the
+            # persisted receipt without synthesising CriterionEvidence.
+            "category_verdicts": [{"category_key": "c-4299443b", "status": "met"}],
             "operator_authored_commits": {
                 "source": AUTHORSHIP_RECEIPT_SOURCE,
                 "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
@@ -385,7 +480,7 @@ async def test_read_path_serves_persisted_report_without_recomputation(
                 "offenders": [],
                 "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
                 "measured_at": "2026-01-01T00:00:00+00:00",
-                "retry": {"attempt": 1, "retryable": False},
+                "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
             },
         },
     )
@@ -395,6 +490,11 @@ async def test_read_path_serves_persisted_report_without_recomputation(
         status="open",
         base_sha="b" * 40,
         opened_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+        last_qualification={
+            # The live qualification projection is the explicit c-429 consumer;
+            # the promoted row supplies the immutable authorship evidence.
+            "category_verdicts": [{"category_key": "c-4299443b", "status": "met"}],
+        },
     )
     db_session.add_all([task, promoted, open_version])
     await db_session.commit()
@@ -415,6 +515,9 @@ async def test_read_path_serves_persisted_report_without_recomputation(
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
     }
+    assert response.json()["category_verdicts"] == [
+        {"category_key": "c-4299443b", "status": "met"}
+    ]
     count.assert_not_awaited()
 
     # A read must fail closed if the stored JSON is tampered with, even though
@@ -477,17 +580,29 @@ async def test_retryable_legacy_receipt_reconciles_and_resolves(db_session, mock
         ]),
     )
 
-    await persist_serving_authorship_evidence(db_session, version)
+    first_plan = await persist_serving_authorship_evidence(db_session, version)
+    await db_session.commit()
+    await measure_serving_authorship_evidence(
+        version.id,
+        expected_receipt_identity=first_plan["receipt_identity"],
+    )
     await db_session.refresh(version)
     assert version.last_qualification["operator_authored_commits"]["state"] == "unresolved"
     assert version.last_qualification["operator_authored_commits"]["retry"]["attempt"] == 1
 
-    await persist_serving_authorship_evidence(db_session, version)
+    second_plan = await persist_serving_authorship_evidence(db_session, version)
+    await db_session.commit()
+    await measure_serving_authorship_evidence(
+        version.id,
+        expected_receipt_identity=second_plan["receipt_identity"],
+    )
     await db_session.refresh(version)
     receipt = version.last_qualification["operator_authored_commits"]
     assert receipt["state"] == "resolved"
     assert receipt["count"] == 1
-    assert receipt["retry"] == {"attempt": 2, "retryable": False}
+    assert receipt["retry"]["attempt"] == 2
+    assert receipt["retry"]["retryable"] is False
+    assert receipt["retry"]["next_retry_at"] is None
     assert measure.await_count == 2
 
 
@@ -502,7 +617,7 @@ async def test_resolved_current_receipt_is_immutable_and_short_circuits(db_sessi
         "offenders": [],
         "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
         "measured_at": "2026-01-01T00:00:00+00:00",
-        "retry": {"attempt": 2, "retryable": False},
+        "retry": {"attempt": 2, "retryable": False, "next_retry_at": None},
     }
     version = ReleaseVersion(
         project_id=project.id,
@@ -552,8 +667,12 @@ async def test_unresolved_confirmation_receipt_preserves_serving_truth(db_sessio
         new=AsyncMock(side_effect=RuntimeError("GitHub outage")),
     )
 
-    await persist_serving_authorship_evidence(db_session, version)
+    plan = await persist_serving_authorship_evidence(db_session, version)
     await db_session.commit()
+    await measure_serving_authorship_evidence(
+        version.id,
+        expected_receipt_identity=plan["receipt_identity"],
+    )
     await db_session.refresh(version)
 
     assert version.serving_status == "serving_confirmed"
@@ -564,7 +683,98 @@ async def test_unresolved_confirmation_receipt_preserves_serving_truth(db_sessio
     assert receipt["state"] == "unresolved"
     assert receipt["reason"] == "github_authorship_unavailable"
     assert receipt["range"] == {"base_sha": "a" * 40, "head_sha": "b" * 40}
-    assert receipt["retry"] == {"attempt": 1, "retryable": True}
+    assert receipt["retry"]["attempt"] == 1
+    assert receipt["retry"]["retryable"] is True
+    assert receipt["retry"]["next_retry_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_staging_never_commits_caller_transaction(db_session, mocker):
+    project = Project(name="Authorship transaction", user_id="authorship-transaction")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        base_sha="a" * 40,
+        served_sha="b" * 40,
+        serving_status="serving_confirmed",
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_qualification={"category_verdicts": [{"category_key": "c-4299443b", "status": "met"}]},
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+    commit = mocker.patch.object(db_session, "commit", new=AsyncMock())
+
+    plan = await persist_serving_authorship_evidence(db_session, version)
+
+    assert plan is not None
+    commit.assert_not_awaited()
+    assert version.last_qualification["category_verdicts"] == [
+        {"category_key": "c-4299443b", "status": "met"}
+    ]
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_old_rows_and_concurrent_claim_once(db_session, mocker):
+    from app.database import AsyncSessionLocal
+
+    projects = [Project(name=f"Sweep {i}", user_id=f"sweep-{i}") for i in range(2)]
+    db_session.add_all(projects)
+    await db_session.commit()
+    for project in projects:
+        await db_session.refresh(project)
+    resolved = []
+    for i in range(4):
+        base, head = f"{i + 1:040x}", f"{i + 10:040x}"
+        resolved.append(
+            ReleaseVersion(
+                project_id=projects[i % 2].id,
+                version_number=i + 1,
+                status="promoted",
+                base_sha=base,
+                served_sha=head,
+                serving_status="serving_confirmed",
+                served_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                last_qualification={"operator_authored_commits": {
+                    "source": AUTHORSHIP_RECEIPT_SOURCE,
+                    "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+                    "state": "resolved", "count": 0, "offenders": [],
+                    "range": {"base_sha": base, "head_sha": head},
+                    "measured_at": "2026-01-01T00:00:00+00:00",
+                    "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+                }},
+            )
+        )
+    target = ReleaseVersion(
+        project_id=projects[0].id, version_number=999, status="promoted",
+        base_sha="f" * 40, served_sha="e" * 40,
+        serving_status="serving_confirmed",
+        served_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+    db_session.add_all([*resolved, target])
+    await db_session.commit()
+    await db_session.refresh(target)
+
+    async def _slow_measure(*_args, **_kwargs):
+        await asyncio.sleep(0.05)
+        return True
+
+    measure = mocker.patch(
+        "app.release_commit_authorship.measure_serving_authorship_evidence",
+        new=AsyncMock(side_effect=_slow_measure),
+    )
+    results = await asyncio.gather(
+        reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1),
+        reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1),
+    )
+
+    assert sorted(results) == [0, 1]
+    assert measure.await_count == 1
+    assert measure.await_args.args[0] == target.id
 
 
 @pytest.mark.asyncio

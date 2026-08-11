@@ -1389,7 +1389,7 @@ async def test_confirm_serving_confirmed_scenario(db_session, mocker):
     assert stored_report["source"] == "github_compare"
     assert stored_report["schema_version"] == 1
     measure.assert_awaited_once_with(
-        version.base_sha, _SHA_A, session=db_session, project=_project
+        version.base_sha, _SHA_A, project=_project, github_context=None
     )
 
     state = rv.summarize_qualification_state(
@@ -2527,7 +2527,7 @@ async def test_recover_deploy_failed_when_sha_serves_within_window(db_session, m
     assert stored_report["source"] == "github_compare"
     assert stored_report["schema_version"] == 1
     measure.assert_awaited_once_with(
-        version.base_sha, _SHA_A, session=db_session, project=project
+        version.base_sha, _SHA_A, project=project, github_context=None
     )
 
     # The view-time summary now reports the TRUE serving_confirmed state.

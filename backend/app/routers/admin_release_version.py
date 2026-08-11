@@ -1792,6 +1792,9 @@ async def clear_deploy_failed(
         )
 
     await session.commit()
+    from app.release_commit_authorship import measure_serving_authorship_evidence
+
+    await measure_serving_authorship_evidence(version.id)
     await session.refresh(version)
     return {
         "version_number": version.version_number,

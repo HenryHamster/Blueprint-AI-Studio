@@ -473,7 +473,9 @@ async def _confirm_serving_or_fail(
                     persist_serving_authorship_evidence,
                 )
 
-                await persist_serving_authorship_evidence(session, version)
+                authorship_plan = await persist_serving_authorship_evidence(
+                    session, version
+                )
                 await _record_post_promotion_outcome(
                     session, version, "serving_confirmed", _now
                 )
@@ -505,6 +507,15 @@ async def _confirm_serving_or_fail(
                     idempotency_key=f"release:{version.id}:serving:confirmed",
                 )
                 await session.commit()
+                if authorship_plan is not None:
+                    from app.release_commit_authorship import (
+                        measure_serving_authorship_evidence,
+                    )
+
+                    await measure_serving_authorship_evidence(
+                        version.id,
+                        expected_receipt_identity=authorship_plan["receipt_identity"],
+                    )
                 logger.info(
                     "[RELEASE_QUALIFIER] serving confirmed for promoted v%d "
                     "(served_sha=%s)",
@@ -701,7 +712,7 @@ async def _recover_serving_confirmed(
     now: datetime,
     *,
     confirmed_reason_code: str | None = None,
-) -> None:
+) -> dict[str, Any] | None:
     """Flip a deploy_failed version back to serving_confirmed and clear surfaces.
 
     Shared mutation helper for the deploy-failure recovery path.  Given a version
@@ -746,7 +757,7 @@ async def _recover_serving_confirmed(
         persist_serving_authorship_evidence,
     )
 
-    await persist_serving_authorship_evidence(session, version)
+    authorship_plan = await persist_serving_authorship_evidence(session, version)
     await _record_post_promotion_outcome(session, version, "serving_confirmed", now)
     # Resolve the loud deploy-failed operator alert — it no longer describes a
     # real condition once the promoted SHA is confirmed serving.  Best-effort and
@@ -780,6 +791,11 @@ async def _recover_serving_confirmed(
             "v%d (non-fatal)",
             version.version_number,
         )
+
+    # The caller commits the serving truth and all recovery projections.  Only
+    # after that durable boundary may the external authorship measurement run.
+    # Recovery callers that need the plan can consume this private return value.
+    return authorship_plan
 
 
 async def _record_activation_receipt(
@@ -985,7 +1001,7 @@ async def _reconcile_if_deploy_failed_recovered(
                 if mutated:
                     await session.commit()
                 return False
-            await _recover_serving_confirmed(
+            authorship_plan = await _recover_serving_confirmed(
                 session,
                 version,
                 backend_artifact.served_identifier,
@@ -997,6 +1013,15 @@ async def _reconcile_if_deploy_failed_recovered(
                 confirmed_reason_code=backend_artifact.reason_code,
             )
             await session.commit()
+            if authorship_plan is not None:
+                from app.release_commit_authorship import (
+                    measure_serving_authorship_evidence,
+                )
+
+                await measure_serving_authorship_evidence(
+                    version.id,
+                    expected_receipt_identity=authorship_plan["receipt_identity"],
+                )
             logger.info(
                 "[RELEASE_QUALIFIER] deploy-failed RECOVERED for promoted v%d "
                 "(served_sha=%s) — promoted SHA confirmed serving after a prior "
