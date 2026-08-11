@@ -168,7 +168,8 @@
     "post_commit_errors.py": 58,
     "task_lifecycle_completion_dispatch.py": 500,
     "release_models.py": 1750,
-    "size_limit_policy.py": 2050
+    "size_limit_policy.py": 2050,
+    "schemas.py": 1750
   },
   "agent": {
     "index.ts": 4600,

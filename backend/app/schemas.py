@@ -185,6 +185,25 @@ class TaskParkRequest(BaseModel):
         return v
 
 
+class PublicationGateReceipt(BaseModel):
+    """Bounded receipt from the local publication gate.
+
+    This is intentionally a closed, additive shape: the blocker transition
+    stores only these fields in task context for durable diagnostics.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    status: str = Field(..., min_length=1, max_length=50)
+    command: str = Field(..., min_length=1, max_length=200)
+    timeout_seconds: int = Field(..., ge=1, le=900)
+    hard_timeout_seconds: int = Field(..., ge=1, le=1800)
+    elapsed_seconds: int = Field(..., ge=0, le=86400)
+    deadline_extended: bool
+    exit_code: int = Field(..., ge=0, le=255)
+    authoritative_ci_required: bool
+    recorded_at: str = Field(..., min_length=1, max_length=64)
+
+
 class AgentStatusPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
@@ -273,6 +292,10 @@ class AgentStatusPayload(BaseModel):
     # into context['blocker']['need'] on the BLOCKED-entry path. Absent payloads
     # behave identically to today (free-text waiting_on/reason only).
     blocked_need: BlockedNeed | None = None
+    # Structured local ./check verdict captured when the publication gate
+    # blocks before a PR exists. Persisted under context['blocker']; omitted by
+    # older agents and all non-gate status reports.
+    publication_gate_receipt: PublicationGateReceipt | None = None
     # Optional request to PARK this task on an external wake source (released
     # fleet slot + durable wake registration). Honored when ``status == PARKED``.
     # Absent payloads behave identically to today — backward compatible.
@@ -363,6 +386,18 @@ class HeartbeatRequest(BaseModel):
     task_id: uuid.UUID
     status_message: str | None = None
     metrics: HeartbeatMetrics | None = None
+    # Structured local ./check verdict captured when the publication gate blocks
+    # before a PR exists. A blocked gate is RETRYABLE — the agent fixes the
+    # failures and re-runs ./pr open — so the receipt must be persistable
+    # WITHOUT the terminal/BLOCKED transition the status endpoint performs.
+    # Persisted into task.context["publication_gate_receipt"]; omitted by older
+    # agents and by every ordinary heartbeat.
+    # Loosely typed on purpose (same rationale as fix_loop_events): heartbeat is
+    # the liveness channel, so a malformed receipt from a forward/backward-rolled
+    # agent must be dropped by the handler's bounded sanitizer rather than 422
+    # the whole heartbeat. The closed shape is enforced by
+    # ``app.task_blocked.sanitize_publication_gate_receipt``.
+    publication_gate_receipt: Dict[str, Any] | None = None
     # Ring buffer of recent tool invocations from the agent. Persists to
     # task.context._tool_trace on each heartbeat, so the last-successful
     # heartbeat's value serves as a post-mortem when the reaper later kills

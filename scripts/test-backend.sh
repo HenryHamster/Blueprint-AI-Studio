@@ -450,6 +450,9 @@ if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
     ENV_ARGS="$ENV_ARGS -e BLUEPRINT_STATIC_GUARD_JUNIT=$BLUEPRINT_STATIC_GUARD_JUNIT"
   fi
 fi
+if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ] && [ "$USE_DOCKER" = "1" ]; then
+  ENV_ARGS="$ENV_ARGS -e BLUEPRINT_STATIC_GUARD_SELECTORS=$BLUEPRINT_STATIC_GUARD_SELECTORS"
+fi
 
 ENV_VARS="DATABASE_URL=${PG_DSN:-postgresql+asyncpg://x:x@localhost/x} \
   USE_TEST_POSTGRES=$([ "$USE_POSTGRES" = "1" ] && echo true || echo false) \
@@ -556,6 +559,27 @@ elif [ -f "$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py" ]; then
   STANDALONE_RELEASE_TEST_ARGS+=("$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py")
 fi
 
+STATIC_GUARD_SELECTORS_ARGS=()
+if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ]; then
+  while IFS= read -r selector; do
+    [ -n "$selector" ] || continue
+    case "$selector" in
+      scripts/*)
+        if [ "$USE_DOCKER" = "1" ]; then
+          selector="/repo/$selector"
+        else
+          selector="../$selector"
+        fi
+        ;;
+    esac
+    STATIC_GUARD_SELECTORS_ARGS+=("$selector")
+  done < <(printf '%s\n' "$BLUEPRINT_STATIC_GUARD_SELECTORS" | base64 --decode)
+  [ "${#STATIC_GUARD_SELECTORS_ARGS[@]}" -gt 0 ] || {
+    echo "ERROR: static guard selector list is empty or invalid" >&2
+    exit 2
+  }
+fi
+
 if [ "$USE_DOCKER" = "1" ]; then
   # Fast path: resolve a prebuilt deps image (local baked → GHCR pull) and
   # bind-mount the source (set in _run). Falls back loudly to the local build on
@@ -605,7 +629,10 @@ _run python3 -c "from app.main import app; print(f'OK: {len(app.routes)} routes'
 
 if [ "${1:-}" = "--standalone" ]; then
   echo "=== Standalone tests (no DB) ==="
-  STANDALONE_ARGS=(
+  if [ "${#STATIC_GUARD_SELECTORS_ARGS[@]}" -gt 0 ]; then
+    STANDALONE_ARGS=("${STATIC_GUARD_SELECTORS_ARGS[@]}")
+  else
+    STANDALONE_ARGS=(
     testing/test_security.py
     testing/test_pipeline.py
     testing/test_invariants.py
@@ -625,15 +652,16 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_shard_balance.py
     testing/test_conversational_workday_protection.py
     testing/test_vitest_durations_freshness.py
-  )
-  # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
-  # The scripts roster is explicitly maintained above and checked by
-  # backend/testing/test_ci_compliance_gate.py. It runs from the /repo mount in
-  # CI and from ../scripts on Docker-less checkouts.
-  STANDALONE_ARGS+=("${STANDALONE_SCRIPT_TEST_ARGS[@]}")
-  # This exit-proof release suite covers durable handoff, serving confirmation,
-  # and receipt retry behavior that pytest's backend shards do not collect.
-  STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
+    )
+    # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
+    # The scripts roster is explicitly maintained above and checked by
+    # backend/testing/test_ci_compliance_gate.py. It runs from the /repo mount in
+    # CI and from ../scripts on Docker-less checkouts.
+    STANDALONE_ARGS+=("${STANDALONE_SCRIPT_TEST_ARGS[@]}")
+    # This exit-proof release suite covers durable handoff, serving confirmation,
+    # and receipt retry behavior that pytest's backend shards do not collect.
+    STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
+  fi
   STANDALONE_JUNIT_ARGS=()
   if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
     STANDALONE_JUNIT_ARGS+=("--junitxml=${BLUEPRINT_STATIC_GUARD_JUNIT}")

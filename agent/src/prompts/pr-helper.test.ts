@@ -988,6 +988,90 @@ exec "$@"
     expect(realFs.existsSync(prPath)).toBe(false);
     realFs.rmSync(receiptPath, { force: true });
   });
+
+  // A blocked ./check is RETRYABLE — ./pr open tells the agent to fix the
+  // failures and re-run. So the receipt must be persisted through the
+  // non-terminal heartbeat channel: posting status=FAILED with
+  // failure_category=BLOCKED_PRECONDITION would take the backend's BLOCKED
+  // branch, which releases the account slot and deletes the VM the agent is
+  // still running on.
+  it('records the gate receipt durably when the gate blocks publication', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const receiptPath = '/tmp/pr_gate_receipt_task-gate-durable.json';
+    const blockerPath = '/tmp/pr_gate_blocker_task-gate-durable.json';
+    const curlArgsPath = '/tmp/pr_gate_blocker_args_task-gate-durable.txt';
+    const prPath = '/tmp/pr_url_task-gate-durable';
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(blockerPath, { force: true });
+    realFs.rmSync(curlArgsPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+
+    const script = writeScript({
+      taskId: 'task-gate-durable',
+      workBranch: 'blueprint/task-gate-durable',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 23\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/timeout`, `#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --signal=*|--kill-after=*|--preserve-status) shift ;;
+    *s) shift; break ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+printf '%s\\n' "$@" > ${curlArgsPath}
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cat > ${blockerPath}
+[ -n "$OUT" ] && : > "$OUT"
+printf '200'
+`, { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(1);
+    const payload = JSON.parse(realFs.readFileSync(blockerPath, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(payload).toMatchObject({
+      task_id: 'task-gate-durable',
+      publication_gate_receipt: {
+        status: 'failed',
+        command: './check',
+        timeout_seconds: 600,
+        hard_timeout_seconds: 1800,
+        exit_code: 23,
+        authoritative_ci_required: false,
+      },
+    });
+    // No terminal status transition: these keys would drive the task to
+    // BLOCKED and tear down the still-running VM.
+    expect(payload.status).toBeUndefined();
+    expect(payload.failure_category).toBeUndefined();
+    expect(payload.artifact_type).toBeUndefined();
+    const curlArgs = realFs.readFileSync(curlArgsPath, 'utf8');
+    expect(curlArgs).toContain('/api/agent/heartbeat');
+    expect(curlArgs).not.toContain('/api/agent/status');
+    expect(realFs.existsSync(prPath)).toBe(false);
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(blockerPath, { force: true });
+    realFs.rmSync(curlArgsPath, { force: true });
+  });
   // Regression test: when the timeout tool itself fails (exits 127 — command not
   // found inside timeout, or timeout's own internal error), the gate must BLOCK.
   // Previously this fell through the `125|126|127` unavailable case and published

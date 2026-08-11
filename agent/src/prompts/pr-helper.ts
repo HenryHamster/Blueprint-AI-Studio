@@ -278,6 +278,67 @@ write_gate_receipt() {
     '<!-- /blueprint:local-gate -->')
 }
 
+# A blocked gate normally exits before any PR body exists, so the bounded
+# receipt would be lost if the VM later died. Persist it through the
+# authenticated HEARTBEAT endpoint, which records telemetry without any task
+# state transition.
+#
+# WHY NOT /api/agent/status: a failing ./check is RETRYABLE — the very next
+# lines tell the agent to fix the failures and re-run ./pr open. Posting
+# status=FAILED with failure_category=BLOCKED_PRECONDITION would take the
+# backend's BLOCKED_PRECONDITION branch (routers/agent_status.py), which
+# releases the LLM account slot, retires the LEASED warm-pool member, clears
+# vm_instance_id and deletes the VM the agent is still running on. The
+# heartbeat channel persists the same sanitized receipt into
+# task.context["publication_gate_receipt"] and leaves the task IN_PROGRESS.
+record_gate_receipt() {
+  local gate_status="$1"
+  local api="\${ORCHESTRATOR_URL:-}"
+  local receipt_json payload http
+  if [ -z "$api" ]; then
+    echo "[pr] Warning: cannot persist local-gate receipt — ORCHESTRATOR_URL is unset" >&2
+    return 1
+  fi
+  if ! _load_agent_token; then
+    echo "[pr] Warning: cannot persist local-gate receipt — no agent token" >&2
+    return 1
+  fi
+  receipt_json=$(cat "$GATE_RECEIPT_FILE" 2>/dev/null || true)
+  if [ -z "$receipt_json" ]; then
+    echo "[pr] Warning: cannot persist local-gate receipt — receipt file is empty" >&2
+    return 1
+  fi
+  payload=$(printf '{"task_id":%s,"status_message":%s,"publication_gate_receipt":%s}' \\
+    "$(_json_str "${cfg.taskId}")" \\
+    "$(_json_str "local publication gate blocked with status $gate_status")" \\
+    "$receipt_json")
+  for attempt in 1 2 3; do
+    http=$(printf '%s' "$payload" | curl -sS -o /tmp/pr_gate_receipt_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
+      -X POST "$api/api/agent/heartbeat" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-) || http="000"
+    if [ "$http" = "200" ]; then
+      rm -f /tmp/pr_gate_receipt_resp_${cfg.taskId}
+      echo "[pr] Persisted local-gate receipt on the task (HTTP=$http)"
+      return 0
+    fi
+    case "$http" in
+      # 409 = the task row is locked by a concurrent writer; the heartbeat
+      # contract is explicitly "retry next cycle", so it is retryable here too.
+      000|409|429|5[0-9][0-9])
+        if [ "$attempt" -lt 3 ]; then
+          sleep "$attempt"
+          continue
+        fi
+        ;;
+    esac
+    echo "[pr] Warning: local-gate receipt POST failed with HTTP=$http" >&2
+    cat /tmp/pr_gate_receipt_resp_${cfg.taskId} >&2 2>/dev/null || true
+    break
+  done
+  rm -f /tmp/pr_gate_receipt_resp_${cfg.taskId}
+  return 1
+}
+
 run_pr_gate() {
   GATE_COMMAND="./check"
   [ "$#" -gt 0 ] && GATE_COMMAND="./check $*"
@@ -331,6 +392,7 @@ run_pr_gate() {
 
 if [ "$WITH_TESTS" = "1" ]; then
   if ! run_pr_gate test; then
+    record_gate_receipt "\${GATE_STATUS}" || true
     echo ""
     echo "[pr] ./check test failed — fix lint/build/tests then re-run ./pr open."
     exit 1
@@ -351,6 +413,7 @@ if [ "$WITH_TESTS" = "1" ]; then
   fi
 else
   if ! run_pr_gate; then
+    record_gate_receipt "\${GATE_STATUS}" || true
     echo ""
     echo "[pr] ./check failed — fix lint/build then re-run ./pr open."
     exit 1

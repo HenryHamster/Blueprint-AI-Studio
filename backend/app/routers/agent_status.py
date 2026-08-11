@@ -2280,6 +2280,11 @@ async def update_agent_status(
                             if payload.blocked_need
                             else None
                         ),
+                        publication_gate_receipt=(
+                            payload.publication_gate_receipt.model_dump()
+                            if payload.publication_gate_receipt
+                            else None
+                        ),
                     )
                     task.vm_stopped_at = _utcnow()
                     # Retire any LEASED pool member before clearing vm_instance_id.

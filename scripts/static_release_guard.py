@@ -9,8 +9,10 @@ pytest failures are attributed to this task.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -105,16 +107,22 @@ def _junit_failures(path: Path, *, label: str) -> dict[str, str]:
 
 def _normalize_failure_detail(detail: str, *, tree_root: Path) -> str:
     """Remove the tree-specific absolute root from a JUnit failure detail."""
-    return detail.replace(str(tree_root), "<tree-root>")
+    normalized = detail.replace(str(tree_root), "<tree-root>")
+    return re.sub(r"(object at )0x[0-9a-fA-F]+", r"\1<address>", normalized)
 
 
-def _run_static_corpus(repo: Path, junit: Path) -> subprocess.CompletedProcess[str]:
+def _run_static_corpus(
+    repo: Path, junit: Path, *, selectors: list[str] | None = None
+) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
         "BLUEPRINT_STATIC_GUARD_MODE": "1",
         "BLUEPRINT_STATIC_GUARD_JUNIT": str(junit),
         "TESTMON_NO_FETCH": "1",
     }
+    if selectors is not None:
+        encoded = base64.b64encode(("\n".join(selectors) + "\n").encode()).decode()
+        env["BLUEPRINT_STATIC_GUARD_SELECTORS"] = encoded
     return _run(
         ["bash", "scripts/test-backend.sh", "--standalone", "--no-postgres"],
         cwd=repo,
@@ -138,6 +146,107 @@ def _run_size_guard(repo: Path, base_root: Path) -> subprocess.CompletedProcess[
 def _task_id() -> str:
     """Return the runner-provided task identity used for guard attribution."""
     return os.environ.get("TASK_ID", "").strip()
+
+
+def _pytest_selector(
+    classname: str, name: str, *, tree_root: Path
+) -> tuple[str, Path] | None:
+    """Translate pytest's JUnit classname/name pair into a repository node id.
+
+    pytest derives ``classname`` from the failing node id relative to its
+    rootdir, so a file selected from OUTSIDE rootdir keeps the traversal
+    segments — and ``.``-splitting drops the empty ones but keeps any real
+    directory name they walked through.  The harness runs pytest from the
+    backend directory and selects the ``scripts/`` corpus by path, giving two
+    distinct shapes for the same file:
+
+    * non-Docker: ``../scripts/test_x.py`` -> ``...scripts.test_x``
+    * Docker (rootdir ``/app``, repo bind-mounted at ``/repo``):
+      ``/repo/scripts/test_x.py`` -> ``...repo.scripts.test_x``
+
+    The Docker shape retains the ``repo`` mount segment, which exists in the
+    container but not in the tree being resolved.  So resolution walks the
+    leading segments off as well as the trailing ones: the first prefix that
+    names a real file wins, which handles the ``/repo`` mount (and any future
+    mount point) without hard-coding the container layout.
+
+    A COLLECTION error has no test identity: pytest's ``mangle_test_address``
+    yields a single element, so ``classname`` is empty and the dotted MODULE
+    path lands in ``name`` instead.  That shape is resolved by reading the
+    module path out of ``name`` and returning a file-level selector with no
+    ``::`` node — otherwise an import error present in both trees would be
+    unresolvable here and charged as new.
+    """
+    parts = [part for part in classname.split(".") if part]
+    node = name
+    if not parts:
+        parts = [part for part in name.split(".") if part]
+        node = ""
+    for start in range(len(parts)):
+        for module_length in range(len(parts), start, -1):
+            relative = Path(*parts[start:module_length]).with_suffix(".py")
+            for source_root in (tree_root, tree_root / "backend"):
+                source = source_root / relative
+                if source.is_file():
+                    suffix = [part for part in (*parts[module_length:], node) if part]
+                    return (
+                        f"{relative}{''.join(f'::{part}' for part in suffix)}",
+                        source,
+                    )
+    return None
+
+
+def _base_file_selectors(selectors: dict[str, str], *, base_root: Path) -> list[str]:
+    """Return FILE-level pytest selectors for failed nodes resolvable in base.
+
+    Deliberately file-level rather than node-level.  A failed node that is NEW
+    or RENAMED in the current tree has no counterpart in the base tree, and
+    handing its node id to pytest is a *usage* error (``ERROR: not found:
+    <nodeid>``) that aborts before any test runs: no JUnit report is written, so
+    the guard would block with an unattributable corpus failure naming no test.
+    Selecting the containing file always resolves, and the new node simply never
+    appears in the base report — so it is still correctly charged as new.
+    """
+    files: set[str] = set()
+    for selector in selectors.values():
+        relative = selector.split("::", 1)[0]
+        if any(
+            (source_root / relative).is_file()
+            for source_root in (base_root, base_root / "backend")
+        ):
+            files.add(relative)
+    return sorted(files)
+
+
+def _failed_selectors(
+    path: Path, *, tree_root: Path
+) -> tuple[dict[str, str], list[str]]:
+    """Return selectors for failed JUnit nodes, plus the keys that resolved to none.
+
+    The unresolved keys matter as much as the resolved ones: a failure whose
+    selector cannot be derived is invisible to the SCOPED baseline, so its
+    counterpart would never appear in ``base_failures`` and the failure would be
+    charged as new even when it exists identically in base.  The caller uses a
+    non-empty unresolved list as the signal to run the FULL base corpus, which
+    is what the pre-scoping guard always did.
+    """
+    if not path.is_file() or path.stat().st_size == 0:
+        return {}, []
+    root = ET.parse(path).getroot()
+    selectors: dict[str, str] = {}
+    unresolved: list[str] = []
+    for case in root.iter("testcase"):
+        if case.find("failure") is None and case.find("error") is None:
+            continue
+        classname = case.attrib.get("classname", "")
+        name = case.attrib.get("name", "")
+        key = f"{classname}::{name}"
+        selector = _pytest_selector(classname, name, tree_root=tree_root)
+        if selector is not None:
+            selectors[key] = selector[0]
+        else:
+            unresolved.append(key)
+    return selectors, sorted(set(unresolved))
 
 
 def _attributed_findings(
@@ -235,6 +344,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         shutil.copy2(current_harness, base_harness)
         base_harness.chmod(base_harness.stat().st_mode | 0o111)
+        current_route = repo / "scripts" / "backend-test-route.sh"
+        base_route = base_root / "scripts" / "backend-test-route.sh"
+        if current_route.is_file():
+            shutil.copy2(current_route, base_route)
+            base_route.chmod(base_route.stat().st_mode | 0o111)
 
         base_junit = Path(temp_dir) / "base.xml"
         current_junit = Path(temp_dir) / "current.xml"
@@ -260,30 +374,78 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 # Current-tree failures need a baseline comparison; a clean tree
                 # takes the no-failure path above and avoids this second run.
-                base_result = _run_static_corpus(base_root, base_junit)
-                try:
-                    base_failures = _junit_failures(base_junit, label="base")
-                except RuntimeError as exc:
+                selectors, unresolved = _failed_selectors(current_junit, tree_root=repo)
+                base_selectors: list[str] | None
+                if unresolved:
+                    # At least one current failure has no derivable selector
+                    # (e.g. a collection error, which pytest reports with an
+                    # empty classname). A scoped baseline cannot cover it, so
+                    # it would be charged as new even when base fails the same
+                    # way. Fall back to the FULL base corpus — ``None`` selects
+                    # everything — which is exactly what the pre-scoping guard
+                    # always did.
                     print(
-                        f"[static guard] ERROR: cannot attribute standalone corpus: {exc}",
+                        "[static guard] WARNING: unresolvable failure id(s) "
+                        f"{json.dumps(unresolved)}; running the full base corpus",
                         file=sys.stderr,
                     )
-                    print(base_result.stdout, end="")
-                    print(base_result.stderr, end="", file=sys.stderr)
-                    print(current_result.stdout, end="")
-                    print(current_result.stderr, end="", file=sys.stderr)
-                    failures.append("standalone static corpus attribution")
-                    new_failures = {}
+                    base_selectors = None
                 else:
-                    new_failures = {
-                        key: detail
-                        for key, detail in current_failures.items()
-                        if key not in base_failures
-                        or _normalize_failure_detail(
-                            base_failures[key], tree_root=base_root
-                        )
-                        != _normalize_failure_detail(detail, tree_root=repo)
-                    }
+                    base_selectors = _base_file_selectors(
+                        selectors, base_root=base_root
+                    )
+                base_failures: dict[str, str] | None
+                if base_selectors is not None and not base_selectors:
+                    # Every failed file is absent from the base tree, so there is
+                    # no baseline evidence to gather: all of it is new.
+                    base_failures = {}
+                    new_failures = current_failures
+                else:
+                    base_result = _run_static_corpus(
+                        base_root, base_junit, selectors=base_selectors
+                    )
+                    try:
+                        base_failures = _junit_failures(base_junit, label="base")
+                    except RuntimeError as scoped_exc:
+                        # The scoped baseline produced no usable report (e.g. the
+                        # diff changed the harness's own roster/routing, so the
+                        # base run collapsed). Fall back to the FULL base corpus
+                        # rather than blocking with an attribution failure that
+                        # names no test — unscoped is slower but still correct.
+                        # When the run was ALREADY unscoped there is no broader
+                        # baseline left, so fail attribution below instead.
+                        if base_selectors is not None:
+                            print(
+                                "[static guard] WARNING: scoped baseline unusable "
+                                f"({scoped_exc}); retrying the full base corpus",
+                                file=sys.stderr,
+                            )
+                            base_junit.unlink(missing_ok=True)
+                            base_result = _run_static_corpus(base_root, base_junit)
+                        try:
+                            base_failures = _junit_failures(base_junit, label="base")
+                        except RuntimeError as exc:
+                            print(
+                                f"[static guard] ERROR: cannot attribute standalone corpus: {exc}",
+                                file=sys.stderr,
+                            )
+                            print(base_result.stdout, end="")
+                            print(base_result.stderr, end="", file=sys.stderr)
+                            print(current_result.stdout, end="")
+                            print(current_result.stderr, end="", file=sys.stderr)
+                            failures.append("standalone static corpus attribution")
+                            base_failures = None
+                            new_failures = {}
+                    if base_failures is not None:
+                        new_failures = {
+                            key: detail
+                            for key, detail in current_failures.items()
+                            if key not in base_failures
+                            or _normalize_failure_detail(
+                                base_failures[key], tree_root=base_root
+                            )
+                            != _normalize_failure_detail(detail, tree_root=repo)
+                        }
 
             if new_failures:
                 try:

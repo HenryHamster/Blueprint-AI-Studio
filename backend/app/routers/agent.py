@@ -5282,6 +5282,26 @@ async def agent_heartbeat(
         if validated:
             apply_fix_loop_events(task, validated)
 
+    if req.publication_gate_receipt is not None:
+        # Durably record the local publication-gate verdict WITHOUT any state
+        # transition. ./pr open sends this when the bounded ./check gate blocks
+        # publication: that outcome is retryable (the agent fixes the failures
+        # and re-runs ./pr open), so it must NOT take the status endpoint's
+        # BLOCKED_PRECONDITION path, which releases the account slot, retires the
+        # warm-pool member and deletes the VM the agent is still running on.
+        # Overwrite: the latest gate run is the authoritative verdict.
+        from app.task_blocked import (  # noqa: PLC0415
+            PUBLICATION_GATE_RECEIPT_KEY,
+            sanitize_publication_gate_receipt,
+        )
+
+        _receipt = sanitize_publication_gate_receipt(req.publication_gate_receipt)
+        if _receipt is not None:
+            ctx = dict(task.context or {})
+            if ctx.get(PUBLICATION_GATE_RECEIPT_KEY) != _receipt:
+                ctx[PUBLICATION_GATE_RECEIPT_KEY] = _receipt
+                task.context = ctx
+
     # Persist prompt fingerprint on the dedicated column. Mirror to context only
     # when needed for older readers / backfills, so repeated heartbeats stay
     # idempotent and don't force unnecessary JSONB rewrites.

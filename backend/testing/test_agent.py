@@ -1334,6 +1334,93 @@ async def test_agent_heartbeat_updates_last_heartbeat(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
+    client: AsyncClient, db_session
+):
+    """A blocked local gate is retryable: persist the receipt, change no state.
+
+    ``./pr open`` reports the bounded ./check verdict when the publication gate
+    blocks before a PR exists. That outcome is retryable — the agent fixes the
+    failures and re-runs ./pr open — so it must NOT travel through the status
+    endpoint's BLOCKED_PRECONDITION branch, which releases the account slot,
+    retires the warm-pool member and deletes the VM the agent is still using.
+    """
+    project = Project(name="Gate Receipt Heartbeat", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-gate-receipt",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-gate-receipt")
+    headers = {"x-agent-token": token}
+    receipt = {
+        "status": "failed",
+        "command": "./check test",
+        "timeout_seconds": 600,
+        "hard_timeout_seconds": 1800,
+        "elapsed_seconds": 42,
+        "deadline_extended": False,
+        "exit_code": 23,
+        "authoritative_ci_required": False,
+        "recorded_at": "2026-08-11T00:00:00Z",
+    }
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "status_message": "local publication gate blocked with status failed",
+            "publication_gate_receipt": receipt,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert (task.context or {}).get("publication_gate_receipt") == receipt
+    # Non-terminal: the task keeps running on the same VM.
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.vm_instance_id == "agent-vm-gate-receipt"
+    assert task.vm_stopped_at is None
+    assert (task.context or {}).get("blocker") is None
+    assert (task.context or {}).get("_slot_released") is None
+
+    # A later gate run overwrites the receipt: the latest verdict is the
+    # authoritative one.
+    passed = {**receipt, "status": "passed", "exit_code": 0}
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "publication_gate_receipt": passed},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("publication_gate_receipt") == passed
+
+    # A malformed receipt is dropped, never partially persisted, and never
+    # 422s the heartbeat itself.
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "publication_gate_receipt": {"status": "failed"},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("publication_gate_receipt") == passed
+
+
+@pytest.mark.asyncio
 async def test_agent_heartbeat_upserts_vm_contact(client: AsyncClient, db_session):
     """Heartbeat false-reap fix (option B): a heartbeat upserts an uncontended
     vmcontact row keyed on vm_instance_id, independent of the contended task-row
@@ -10876,6 +10963,17 @@ async def test_blocker_persists_structured_need_into_context(
         "status": "FAILED",
         "failure_category": "BLOCKED_PRECONDITION",
         "logs": "BLOCKER: waiting on the shared auth foundation",
+        "publication_gate_receipt": {
+            "status": "failed",
+            "command": "./check test",
+            "timeout_seconds": 600,
+            "hard_timeout_seconds": 1800,
+            "elapsed_seconds": 42,
+            "deadline_extended": False,
+            "exit_code": 23,
+            "authoritative_ci_required": False,
+            "recorded_at": "2026-08-11T00:00:00Z",
+        },
         # kind=task requires an EXACT ref (UUID / finding hash) under the shared
         # exact-task-ref policy.
         "blocked_need": {"kind": "task", "ref": foundation_ref, "label": "auth"},
@@ -10888,6 +10986,10 @@ async def test_blocker_persists_structured_need_into_context(
     assert task.status == TaskStatus.BLOCKED
     need = ((task.context or {}).get("blocker") or {}).get("need")
     assert need == {"kind": "task", "ref": foundation_ref, "label": "auth"}
+    receipt = ((task.context or {}).get("blocker") or {}).get(
+        "publication_gate_receipt"
+    )
+    assert receipt == payload["publication_gate_receipt"]
 
 
 @pytest.mark.asyncio
