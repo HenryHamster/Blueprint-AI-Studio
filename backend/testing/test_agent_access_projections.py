@@ -86,8 +86,21 @@ def test_coding_agent_projection_redacts_camel_case_secret_fields():
         "authHeader": "auth-header-value",
         "APIKey": "api-key-value",
         "apiKeys": "api-keys-value",
+        "accessTokenValue": "access-token-wrapper-secret",
+        "refreshTokenValue": "refresh-token-wrapper-secret",
+        "oauthTokenValue": "oauth-token-wrapper-secret",
+        "tokenValue": "generic-token-wrapper-secret",
+        "sessionTokenValue": "session-token-wrapper-secret",
+        "accessTokenList": "access-token-list-secret",
+        "refreshTokenList": "refresh-token-list-secret",
     }
-    accounting = {"inputTokens": 10, "outputTokens": 20, "tokenCount": 30}
+    accounting = {
+        "inputTokens": 10,
+        "outputTokens": 20,
+        "tokenCount": 30,
+        "tokenBudget": 40,
+        "maxTokens": 50,
+    }
     projected = _project_agent_task_detail(
         {
             "id": "00000000-0000-0000-0000-000000000501",

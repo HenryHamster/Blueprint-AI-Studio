@@ -58,6 +58,29 @@ _NON_SECRET_TOKEN_FIELDS = frozenset(
         "total_tokens",
     }
 )
+_NON_SECRET_TOKEN_METADATA_PARTS = frozenset(
+    {
+        "available",
+        "budget",
+        "budgets",
+        "capacity",
+        "count",
+        "counts",
+        "limit",
+        "limits",
+        "max",
+        "maximum",
+        "min",
+        "minimum",
+        "remaining",
+        "usage",
+        "used",
+        "window",
+    }
+)
+_CREDENTIAL_TOKEN_QUALIFIERS = frozenset(
+    {"access", "api", "auth", "bearer", "client", "oauth", "refresh", "session"}
+)
 _NON_SECRET_KEY_FIELDS = frozenset(
     {
         "dedupe_key",
@@ -89,8 +112,14 @@ def is_secret_field(key: Any) -> bool:
         return True
     # Do not treat accounting fields such as input_tokens/token_count as
     # secrets; only conventional credential-bearing *_token/*_key names.
-    if normalized.endswith(("_token", "_tokens")):
-        return normalized not in _NON_SECRET_TOKEN_FIELDS
+    if parts & {"token", "tokens"}:
+        if parts & _CREDENTIAL_TOKEN_QUALIFIERS:
+            return True
+        if normalized in _NON_SECRET_TOKEN_FIELDS:
+            return False
+        # Generic wrappers such as tokenValue/tokenList are credential-shaped
+        # even when the secret qualifier is omitted.
+        return not bool(parts & _NON_SECRET_TOKEN_METADATA_PARTS)
     if normalized.endswith(("_key", "_keys")):
         return normalized not in _NON_SECRET_KEY_FIELDS
     if parts & {"key", "keys"} and parts & _CREDENTIAL_KEY_QUALIFIERS:
