@@ -553,6 +553,8 @@ def test_authorship_receipt_drives_normal_category_grader_without_seeded_verdict
             "source_kind": "github_compare",
             "receipt_source": "github_compare",
             "receipt_state": "resolved",
+            "receipt_measured_at": "2026-01-01T00:00:00+00:00",
+            "receipt_attempt": 1,
             "range": {"base_sha": base, "head_sha": head},
         },
     }]
@@ -1105,6 +1107,25 @@ async def test_deadline_session_always_exits_and_propagates_cleanup_failure():
         async with _deadline_session(factory, time.monotonic() + 1):
             raise asyncio.TimeoutError("operation budget exhausted")
     assert context.exit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_deadline_session_preserves_cancellation_when_cleanup_fails():
+    """Cleanup uncertainty must not turn caller cancellation into a normal error."""
+    class FailingContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            raise RuntimeError("connection cleanup failed")
+
+    async def cancel_body():
+        async with _deadline_session(FailingContext, time.monotonic() + 1):
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError, match="") as caught:
+        await cancel_body()
+    assert any("cleanup failed while cancelled" in note for note in caught.value.__notes__)
 
 
 @pytest.mark.asyncio

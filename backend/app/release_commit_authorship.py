@@ -370,9 +370,12 @@ def authorship_category_evidence(
         provenance_source_kind = (
             "github_compare" if receipt_state == "resolved" else "stored_receipt"
         )
+        retry = validated.get("retry")
         provenance_extra = {
             "receipt_source": validated.get("source"),
             "receipt_state": receipt_state,
+            "receipt_measured_at": validated.get("measured_at"),
+            "receipt_attempt": retry.get("attempt") if isinstance(retry, dict) else None,
         }
     elif isinstance(receipt, dict):
         provenance_source_kind = "release_record_validation"
@@ -982,7 +985,21 @@ async def _deadline_session(session_factory: Any, deadline: float | None):
                 except BaseException as exc:  # noqa: BLE001
                     cleanup_error = exc
                 if cleanup_error is not None:
-                    raise cleanup_error from cancellation
+                    # Cancellation is the caller's control signal.  Do not
+                    # replace it with a cleanup failure: doing so makes a
+                    # cancelled sweep look like an ordinary reconciliation
+                    # error and can cause an outer worker to retry incorrectly.
+                    cancellation.add_note(
+                        "authorship reconciliation session cleanup failed while cancelled"
+                    )
+                    logger.warning(
+                        "authorship reconciliation session cleanup failed during cancellation",
+                        exc_info=(
+                            type(cleanup_error),
+                            cleanup_error,
+                            cleanup_error.__traceback__,
+                        ),
+                    )
                 raise
             except BaseException as exc:  # noqa: BLE001
                 cleanup_error = exc
@@ -994,6 +1011,19 @@ async def _deadline_session(session_factory: Any, deadline: float | None):
                             asyncio.shield(cleanup),
                             _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS,
                         )
+                if isinstance(body_error, asyncio.CancelledError):
+                    body_error.add_note(
+                        "authorship reconciliation session cleanup failed while cancelled"
+                    )
+                    logger.warning(
+                        "authorship reconciliation session cleanup failed during cancellation",
+                        exc_info=(
+                            type(cleanup_error),
+                            cleanup_error,
+                            cleanup_error.__traceback__,
+                        ),
+                    )
+                    raise body_error
                 raise cleanup_error
 
 
