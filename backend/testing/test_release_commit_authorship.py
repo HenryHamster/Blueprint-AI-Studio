@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.orm.attributes import flag_modified
+from testing.conftest import USE_POSTGRES
 
 from app.auth import create_agent_token
 from app.models import Project, ReleaseVersion, Task
@@ -978,8 +979,13 @@ async def test_staging_never_commits_caller_transaction(db_session, mocker):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="singleton row-lock contention requires the PostgreSQL harness",
+)
 async def test_reconciliation_old_rows_and_concurrent_claim_once(db_session, mocker):
     from app.database import AsyncSessionLocal
+    from app.models import ReleaseAuthorshipReconciliationState
 
     projects = [Project(name=f"Sweep {i}", user_id=f"sweep-{i}") for i in range(2)]
     db_session.add_all(projects)
@@ -1016,7 +1022,7 @@ async def test_reconciliation_old_rows_and_concurrent_claim_once(db_session, moc
         served_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
         opened_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
     )
-    db_session.add_all([*resolved, target])
+    db_session.add_all([*resolved, target, ReleaseAuthorshipReconciliationState(id=1)])
     await db_session.commit()
     await db_session.refresh(target)
 
@@ -1029,8 +1035,8 @@ async def test_reconciliation_old_rows_and_concurrent_claim_once(db_session, moc
         new=AsyncMock(side_effect=_slow_measure),
     )
     results = await asyncio.gather(
-        reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1),
-        reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1),
+        reconcile_serving_authorship_evidence(lambda: AsyncSessionLocal(), limit=1),
+        reconcile_serving_authorship_evidence(lambda: AsyncSessionLocal(), limit=1),
     )
 
     assert sorted(results) == [0, 1]
@@ -1185,6 +1191,330 @@ async def test_deadline_session_preserves_cancellation_when_cleanup_fails():
 
 
 @pytest.mark.asyncio
+async def test_deadline_session_external_cancel_invalidates_before_owned_cleanup_reap():
+    """External cancellation cannot leave a blocked driver cleanup unowned."""
+    import app.release_commit_authorship as authorship
+
+    cleanup_started = asyncio.Event()
+    body_started = asyncio.Event()
+    first_cleanup_cancel = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    invalidated = asyncio.Event()
+    factory_calls = 0
+
+    class Session:
+        async def invalidate(self):
+            invalidated.set()
+
+    session = Session()
+    baseline_task_count = len(asyncio.all_tasks())
+
+    class BlockingExit:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_exc_info):
+            cleanup_started.set()
+            try:
+                await release_cleanup.wait()
+            except asyncio.CancelledError:
+                # Resist the forced cancellation long enough to cross the old
+                # 50ms branch; the caller must not regain control yet.
+                first_cleanup_cancel.set()
+                await release_cleanup.wait()
+            return False
+
+    def factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return BlockingExit()
+
+    async def use_session():
+        async with _deadline_session(factory, time.monotonic() + 1):
+            body_started.set()
+            await asyncio.sleep(3600)
+
+    task = asyncio.create_task(use_session())
+    await body_started.wait()
+    task.cancel("caller cancellation")
+    with pytest.raises(asyncio.CancelledError, match="caller cancellation"):
+        await task
+
+    assert factory_calls == 1
+    assert invalidated.is_set(), "the checked-out connection must be invalidated"
+    assert first_cleanup_cancel.is_set()
+    assert authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
+
+    release_cleanup.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+        if not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS:
+            break
+    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
+    assert len(asyncio.all_tasks()) == baseline_task_count
+
+
+@pytest.mark.asyncio
+async def test_deadline_session_grace_expiry_invalidates_before_forced_cleanup_reap(
+    mocker,
+):
+    """Ordinary grace expiry follows the same invalidate-then-own protocol."""
+    import app.release_commit_authorship as authorship
+
+    mocker.patch.object(authorship, "_RECONCILIATION_CLEANUP_GRACE_SECONDS", 0.01)
+    mocker.patch.object(
+        authorship, "_RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS", 0.01
+    )
+    cleanup_started = asyncio.Event()
+    first_cleanup_cancel = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    invalidated = asyncio.Event()
+    baseline_task_count = len(asyncio.all_tasks())
+
+    class Session:
+        async def invalidate(self):
+            invalidated.set()
+
+    class BlockingExit:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, *_exc_info):
+            cleanup_started.set()
+            try:
+                await release_cleanup.wait()
+            except asyncio.CancelledError:
+                first_cleanup_cancel.set()
+                await release_cleanup.wait()
+            return False
+
+    with pytest.raises(authorship._ReconciliationCleanupError):
+        async with _deadline_session(BlockingExit, time.monotonic() + 1):
+            pass
+
+    assert invalidated.is_set()
+    assert first_cleanup_cancel.is_set()
+    assert authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
+    release_cleanup.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+        if not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS:
+            break
+    assert not authorship._RECONCILIATION_OWNED_CLEANUP_TASKS
+    assert len(asyncio.all_tasks()) == baseline_task_count
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_cursor_wraps_and_revisits_newly_eligible_rows(
+    db_session, mocker
+):
+    """Pages advance, wrap with a generation, and revisit rows behind the cursor."""
+    import uuid
+
+    from app.models import ReleaseAuthorshipReconciliationState
+    from sqlalchemy import select
+    from app.database import AsyncSessionLocal
+
+    project = Project(name="Cursor wrap", user_id="cursor-wrap")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    resolved_report = {
+        "source": AUTHORSHIP_RECEIPT_SOURCE,
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        "state": "resolved",
+        "count": 0,
+        "offenders": [],
+        "range": {"base_sha": f"{1:040x}", "head_sha": f"{10:040x}"},
+        "measured_at": "2026-01-01T00:00:00+00:00",
+        "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+    }
+    null_rows = [
+        ReleaseVersion(
+            id=uuid.UUID(int=100 + index),
+            project_id=project.id,
+            version_number=index + 1,
+            status="promoted",
+            base_sha=f"{index + 1:040x}",
+            served_sha=f"{index + 10:040x}",
+            serving_status="serving_confirmed",
+            served_at=None,
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification=(
+                {"operator_authored_commits": resolved_report}
+                if index == 0
+                else {}
+            ),
+        )
+        for index in range(3)
+    ]
+    served_rows = [
+        ReleaseVersion(
+            id=uuid.UUID(int=200 + index),
+            project_id=project.id,
+            version_number=index + 10,
+            status="promoted",
+            base_sha=f"{index + 20:040x}",
+            served_sha=f"{index + 30:040x}",
+            serving_status="serving_confirmed",
+            served_at=datetime(2026, 1, index + 1, tzinfo=timezone.utc),
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification={},
+        )
+        for index in range(3)
+    ]
+    db_session.add_all([*null_rows, *served_rows])
+    await db_session.commit()
+    mocker.patch("app.release_commit_authorship._RECONCILIATION_SCAN_PAGE_SIZE", 2)
+    measure = mocker.patch(
+        "app.release_commit_authorship.measure_serving_authorship_evidence",
+        new=AsyncMock(return_value=True),
+    )
+
+    assert await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1) == 1
+    assert measure.await_args.args[0] == null_rows[1].id
+    null_rows[0].last_qualification = {}
+    flag_modified(null_rows[0], "last_qualification")
+    await db_session.commit()
+
+    measure.reset_mock()
+    assert await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1) == 1
+    assert measure.await_args.args[0] == null_rows[2].id
+    measure.reset_mock()
+    assert await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1) == 1
+    assert measure.await_args.args[0] == served_rows[0].id
+    measure.reset_mock()
+    assert await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1) == 1
+    assert measure.await_args.args[0] == served_rows[1].id
+    measure.reset_mock()
+    assert await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1) == 1
+    assert measure.await_args.args[0] == served_rows[2].id
+    measure.reset_mock()
+    assert await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1) == 1
+    assert measure.await_args.args[0] == null_rows[0].id
+
+    state = (
+        await db_session.execute(
+            select(ReleaseAuthorshipReconciliationState).where(
+                ReleaseAuthorshipReconciliationState.id == 1
+            )
+        )
+    ).scalar_one()
+    assert state.generation == 1, "EOF must increment the durable cursor generation"
+    assert state.cursor_partition == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_0755_to_0756_backfills_legacy_contract_audit_on_postgres():
+    """The real Postgres chain preserves truthful legacy audit provenance."""
+    import importlib.util
+    import os
+    from pathlib import Path
+
+    import sqlalchemy as sa
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy.engine import make_url
+    from app.migration_apply_gate import ephemeral_postgres_database
+
+    database_url = os.getenv("DATABASE_URL", "")
+    if os.getenv("USE_TEST_POSTGRES", "").lower() != "true" or not database_url.startswith(
+        "postgresql"
+    ):
+        pytest.skip("requires the real PostgreSQL migration harness")
+
+    versions = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+
+    def load(revision: str, filename: str):
+        spec = importlib.util.spec_from_file_location(revision, versions / filename)
+        assert spec is not None and spec.loader is not None
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        return migration
+
+    migration_0755 = load("migration_0755", "0755_acceptance_criterion_contract_audit.py")
+    migration_0756 = load(
+        "migration_0756", "0756_release_authorship_reconciliation_state.py"
+    )
+
+    def run(migration, connection, operation):
+        original_op = migration.op
+        migration.op = Operations(MigrationContext.configure(connection))
+        try:
+            getattr(migration, operation)()
+        finally:
+            migration.op = original_op
+
+    async with (
+        ephemeral_postgres_database(make_url(database_url)) as (engine, _name),
+        engine.begin() as connection,
+    ):
+        def seed_and_upgrade(sync_connection):
+            sync_connection.exec_driver_sql(
+                "CREATE TABLE versionacceptancecriterion ("
+                "id uuid PRIMARY KEY, evidence_contract jsonb, "
+                "created_at timestamptz NOT NULL, created_by varchar(64))"
+            )
+            run(migration_0755, sync_connection, "upgrade")
+            sync_connection.exec_driver_sql(
+                "INSERT INTO versionacceptancecriterion "
+                "(id, evidence_contract, created_at, created_by) VALUES "
+                "('00000000-0000-0000-0000-000000000001', '{\"predicate\":{}}', "
+                "'2026-01-01T00:00:00+00:00', 'operator:legacy'), "
+                "('00000000-0000-0000-0000-000000000002', '{\"predicate\":{}}', "
+                "'2026-01-02T00:00:00+00:00', NULL)"
+            )
+            run(migration_0756, sync_connection, "upgrade")
+            state = sync_connection.exec_driver_sql(
+                "SELECT id, cursor_partition, generation "
+                "FROM releaseauthorshipreconciliationstate"
+            ).mappings().one()
+            state_columns = {
+                column["name"]: column
+                for column in sa.inspect(sync_connection).get_columns(
+                    "releaseauthorshipreconciliationstate"
+                )
+            }
+            state_pk = sa.inspect(sync_connection).get_pk_constraint(
+                "releaseauthorshipreconciliationstate"
+            )
+            audit = sync_connection.exec_driver_sql(
+                "SELECT evidence_contract_updated_at, evidence_contract_updated_by "
+                "FROM versionacceptancecriterion ORDER BY id"
+            ).mappings().all()
+            assert state == {"id": 1, "cursor_partition": 0, "generation": 0}
+            assert state_pk["constrained_columns"] == ["id"]
+            assert {
+                "cursor_partition",
+                "null_cursor_id",
+                "served_at_cursor",
+                "served_id_cursor",
+                "generation",
+            } <= state_columns.keys()
+            assert audit[0]["evidence_contract_updated_by"] == "operator:legacy"
+            assert audit[1]["evidence_contract_updated_by"] == "legacy:created_at"
+            assert str(audit[0]["evidence_contract_updated_at"])[:10] == "2026-01-01"
+            assert str(audit[1]["evidence_contract_updated_at"])[:10] == "2026-01-02"
+
+            run(migration_0756, sync_connection, "downgrade")
+            assert not sync_connection.dialect.has_table(
+                sync_connection, "releaseauthorshipreconciliationstate"
+            )
+            run(migration_0756, sync_connection, "upgrade")
+            run(migration_0756, sync_connection, "downgrade")
+            run(migration_0755, sync_connection, "downgrade")
+            columns = {
+                row["column_name"]
+                for row in sync_connection.exec_driver_sql(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'versionacceptancecriterion'"
+                ).mappings()
+            }
+            assert "evidence_contract_updated_by" not in columns
+            assert "evidence_contract_updated_at" not in columns
+
+        await connection.run_sync(seed_and_upgrade)
+@pytest.mark.asyncio
 async def test_reconciliation_stops_after_session_cleanup_failure(db_session, mocker):
     """A cleanup failure is terminal for the sweep, not a reason to try another row."""
     from app.database import AsyncSessionLocal
@@ -1321,6 +1651,10 @@ async def test_reconciliation_keyset_scans_mixed_malformed_rows_without_json_cas
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="skip_locked contention requires the PostgreSQL harness",
+)
 async def test_reconciliation_skip_locked_moves_past_contended_candidate(db_session, mocker):
     """A held row is skipped and cannot consume the sweep's only candidate slot."""
     from app.database import AsyncSessionLocal
@@ -1449,5 +1783,5 @@ async def test_promotion_defers_authorship_until_serving_confirmation(db_session
     await db_session.refresh(version)
 
     assert result["status"] == "promoted"
-    assert "operator_authored_commits" not in version.last_qualification
+    assert "operator_authored_commits" not in (version.last_qualification or {})
     measurement.assert_not_awaited()

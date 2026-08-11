@@ -20,6 +20,7 @@ from typing import Any
 
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import resolve_dialect_name
@@ -73,6 +74,7 @@ _PERMANENT_AUTHORSHIP_REASONS = frozenset(
 
 _RECONCILIATION_CLEANUP_GRACE_SECONDS = 0.25
 _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS = 0.05
+_RECONCILIATION_OWNED_CLEANUP_TASKS: set[asyncio.Task[Any]] = set()
 
 
 class _ReconciliationCleanupError(RuntimeError):
@@ -948,6 +950,71 @@ async def _set_reconciliation_timeouts(session: Any, deadline: float | None) -> 
     )
 
 
+def _reap_owned_cleanup_task(task: asyncio.Task[Any]) -> None:
+    """Forget an adopted driver task only after it reaches a terminal state."""
+    _RECONCILIATION_OWNED_CLEANUP_TASKS.discard(task)
+    if not task.cancelled():
+        with contextlib.suppress(BaseException):
+            task.exception()
+
+
+def _adopt_cleanup_task(task: asyncio.Task[Any]) -> None:
+    """Keep an uncooperative cleanup task owned until its done callback reaps it."""
+    _RECONCILIATION_OWNED_CLEANUP_TASKS.add(task)
+    task.add_done_callback(_reap_owned_cleanup_task)
+    assert task in _RECONCILIATION_OWNED_CLEANUP_TASKS
+
+
+async def _invalidate_session(session: Any) -> None:
+    """Terminate the session's checked-out connection before abandoning cleanup."""
+    invalidate = getattr(session, "invalidate", None)
+    if not callable(invalidate):
+        return
+    result = invalidate()
+    if hasattr(result, "__await__"):
+        await result
+
+
+async def _settle_abandoned_cleanup(
+    session: Any, cleanup: asyncio.Task[Any]
+) -> BaseException | None:
+    """Invalidate ownership, then cancel and settle the original exit task."""
+    invalidate_error: BaseException | None = None
+    invalidate_task = asyncio.create_task(_invalidate_session(session))
+    try:
+        await asyncio.shield(invalidate_task)
+    except BaseException as exc:  # noqa: BLE001
+        invalidate_error = exc
+        if not invalidate_task.done():
+            invalidate_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(invalidate_task)
+
+    cleanup_error: BaseException | None = None
+    if not cleanup.done():
+        cleanup.cancel()
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(cleanup), _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS
+        )
+    except asyncio.TimeoutError:
+        # The connection has already been invalidated.  A driver that still
+        # resists cancellation remains explicitly owned and is reaped later.
+        _adopt_cleanup_task(cleanup)
+        cleanup_error = _ReconciliationCleanupError(
+            "session cleanup task did not terminate after connection invalidation"
+        )
+    except BaseException as exc:  # noqa: BLE001
+        cleanup_error = exc
+
+    if invalidate_error is not None:
+        if cleanup_error is None:
+            cleanup_error = invalidate_error
+        else:
+            cleanup_error.add_note(f"session invalidation failed: {invalidate_error}")
+    return cleanup_error
+
+
 @asynccontextmanager
 async def _deadline_session(session_factory: Any, deadline: float | None):
     """Enter and leave a DB session with bounded, cancellation-safe cleanup.
@@ -979,21 +1046,11 @@ async def _deadline_session(session_factory: Any, deadline: float | None):
                     asyncio.shield(cleanup), _RECONCILIATION_CLEANUP_GRACE_SECONDS
                 )
             except asyncio.CancelledError as cancellation:
-                # The caller's cancellation must not interrupt the one cleanup
-                # attempt.  If the cleanup cannot settle, retain cancellation
-                # and expose the uncertain ownership instead of proceeding.
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(cleanup),
-                        _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS,
-                    )
-                except BaseException as exc:  # noqa: BLE001
-                    cleanup_error = exc
+                if cleanup.done():
+                    cleanup_error = cancellation
+                else:
+                    cleanup_error = await _settle_abandoned_cleanup(session, cleanup)
                 if cleanup_error is not None:
-                    # Cancellation is the caller's control signal.  Do not
-                    # replace it with a cleanup failure: doing so makes a
-                    # cancelled sweep look like an ordinary reconciliation
-                    # error and can cause an outer worker to retry incorrectly.
                     cancellation.add_note(
                         "authorship reconciliation session cleanup failed while cancelled"
                     )
@@ -1006,16 +1063,15 @@ async def _deadline_session(session_factory: Any, deadline: float | None):
                         ),
                     )
                 raise
+            except asyncio.TimeoutError:
+                cleanup_error = await _settle_abandoned_cleanup(session, cleanup)
+                if cleanup_error is None:
+                    cleanup_error = _ReconciliationCleanupError(
+                        "session cleanup exceeded its grace period"
+                    )
             except BaseException as exc:  # noqa: BLE001
                 cleanup_error = exc
             if cleanup_error is not None:
-                if not cleanup.done():
-                    cleanup.cancel()
-                    with contextlib.suppress(BaseException):
-                        await asyncio.wait_for(
-                            asyncio.shield(cleanup),
-                            _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS,
-                        )
                 if isinstance(body_error, asyncio.CancelledError):
                     body_error.add_note(
                         "authorship reconciliation session cleanup failed while cancelled"
@@ -1172,20 +1228,7 @@ async def reconcile_serving_authorship_evidence(
                     .scalars()
                     .all()
                 )
-                if candidates:
-                    last = candidates[-1]
-                    if state.cursor_partition == 0:
-                        state.null_cursor_id = last.id
-                    else:
-                        state.served_at_cursor = last.served_at
-                        state.served_id_cursor = last.id
-                    state.updated_at = datetime.now(timezone.utc)
-                    scan_session.add(state)
-                    await asyncio.wait_for(
-                        scan_session.commit(),
-                        timeout=_remaining_reconciliation_seconds(deadline),
-                    )
-                elif state.cursor_partition == 0:
+                if not candidates and state.cursor_partition == 0:
                     state.cursor_partition = 1
                     state.null_cursor_id = None
                     state.updated_at = datetime.now(timezone.utc)
@@ -1195,7 +1238,7 @@ async def reconcile_serving_authorship_evidence(
                         timeout=_remaining_reconciliation_seconds(deadline),
                     )
                     continue
-                else:
+                elif not candidates:
                     state.cursor_partition = 0
                     state.null_cursor_id = None
                     state.served_at_cursor = None
@@ -1211,27 +1254,51 @@ async def reconcile_serving_authorship_evidence(
                         break
                     wrapped = True
                     continue
-                now = datetime.now(timezone.utc)
-                for candidate in candidates:
-                    report = (candidate.last_qualification or {}).get(
-                        "operator_authored_commits"
-                    )
-                    if (
-                        candidate.id not in selected_ids
-                        and _reconciliation_candidate_is_eligible(
-                            report, candidate.base_sha, candidate.served_sha, now
+                if candidates:
+                    # Do not advance beyond an eligible candidate that was
+                    # not selected only because this sweep reached ``limit``.
+                    # Otherwise a small limit skips the remainder of a page
+                    # until a future EOF wrap.
+                    last_inspected = candidates[-1]
+                    now = datetime.now(timezone.utc)
+                    for candidate in candidates:
+                        report = (candidate.last_qualification or {}).get(
+                            "operator_authored_commits"
                         )
-                    ):
-                        selected_ids.add(candidate.id)
-                        version_ids.append(candidate.id)
-                        if len(version_ids) >= bounded_limit:
-                            break
+                        if (
+                            candidate.id not in selected_ids
+                            and _reconciliation_candidate_is_eligible(
+                                report, candidate.base_sha, candidate.served_sha, now
+                            )
+                        ):
+                            selected_ids.add(candidate.id)
+                            version_ids.append(candidate.id)
+                            last_inspected = candidate
+                            if len(version_ids) >= bounded_limit:
+                                break
+                    if state.cursor_partition == 0:
+                        state.null_cursor_id = last_inspected.id
+                    else:
+                        state.served_at_cursor = last_inspected.served_at
+                        state.served_id_cursor = last_inspected.id
+                    state.updated_at = datetime.now(timezone.utc)
+                    scan_session.add(state)
+                    await asyncio.wait_for(
+                        scan_session.commit(),
+                        timeout=_remaining_reconciliation_seconds(deadline),
+                    )
         except _ReconciliationCleanupError:
             # A failed scan-session cleanup leaves ownership uncertain.  Stop
             # before selecting or measuring another page.
             logger.exception(
                 "authorship evidence reconciliation stopped after scan session cleanup failure"
             )
+            break
+        except StaleDataError:
+            # SQLite does not implement row-level ``skip_locked``. A second
+            # worker can therefore race the singleton update in unit tests;
+            # losing that CAS is a normal contention result, not a reason to
+            # retry the page with an in-process cursor.
             break
         except asyncio.TimeoutError:
             break
