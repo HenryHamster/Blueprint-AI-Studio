@@ -44,6 +44,57 @@ def _script_test_harness() -> Path:
     pytest.fail("scripts/test-backend.sh is unavailable; roster cannot be checked")
 
 
+def _parse_test_module_roots(harness: Path) -> tuple[Path, ...]:
+    """Resolve the test-module roots declared by the backend harness."""
+    source = harness.read_text(encoding="utf-8")
+    match = re.search(
+        r"^CI_TEST_MODULE_ROOTS=\((?P<body>.*?)(?:\n\)|\))",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"{harness} must define CI_TEST_MODULE_ROOTS"
+    roots = []
+    for raw_line in match.group("body").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        values = shlex.split(line, comments=True)
+        assert len(values) == 1, f"test module root must be one shell word: {line!r}"
+        roots.append(harness.parent.parent / values[0])
+    assert roots, f"{harness} must declare at least one test module root"
+    assert all(root.is_dir() for root in roots), (
+        f"{harness} declares missing test module root(s): "
+        + ", ".join(str(root) for root in roots if not root.is_dir())
+    )
+    return tuple(roots)
+
+
+def _test_module_has_executing_tests(path: Path) -> bool:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test_"):
+                return True
+        elif isinstance(node, ast.ClassDef) and any(
+            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name.startswith("test_")
+            for member in node.body
+        ):
+            return True
+    return False
+
+
+def _test_module_has_intentional_zero_test_marker(path: Path) -> bool:
+    source = path.read_text(encoding="utf-8")
+    return bool(
+        re.search(
+            r"^#\s*blueprint-test-module:\s*intentional-zero-tests\s+--\s+\S.+$",
+            source,
+            re.MULTILINE,
+        )
+    )
+
+
 def _parse_script_test_roster(
     harness: Path,
 ) -> tuple[set[str], dict[str, str]]:
@@ -13574,6 +13625,59 @@ def test_every_script_test_is_rostered_or_has_a_written_exemption():
         "CI script files cannot be both executed and exempted: "
         + ", ".join(sorted(roster & set(exemptions)))
     )
+
+
+def test_every_test_module_has_executing_tests_or_an_explicit_zero_test_marker():
+    """A collected test module cannot silently become a docstring-only stub."""
+    harness = _script_test_harness()
+    roots = _parse_test_module_roots(harness)
+    declared_roots = {
+        root.relative_to(harness.parent.parent).as_posix() for root in roots
+    }
+    assert {"scripts", "backend/testing"} <= declared_roots, (
+        "CI_TEST_MODULE_ROOTS must cover both scripts/ and backend/testing/: "
+        + ", ".join(sorted(declared_roots))
+    )
+    dark_modules = [
+        path.relative_to(harness.parent.parent).as_posix()
+        for root in roots
+        for path in sorted(root.glob("test_*.py"))
+        if path.is_file()
+        and not _test_module_has_executing_tests(path)
+        and not _test_module_has_intentional_zero_test_marker(path)
+    ]
+    assert not dark_modules, (
+        "test modules with zero executing tests must be removed or carry a "
+        "reviewable '# blueprint-test-module: intentional-zero-tests -- reason' "
+        "marker: "
+        + ", ".join(dark_modules)
+    )
+
+
+def test_dark_test_detector_requires_a_marker_for_intentional_zero_tests(
+    tmp_path: Path,
+):
+    """The detector distinguishes real tests from explicit helper/retirement markers."""
+    dark = tmp_path / "test_dark.py"
+    dark.write_text('"""retired"""\n', encoding="utf-8")
+    nested = tmp_path / "test_nested.py"
+    nested.write_text(
+        "def helper():\n    def test_nested():\n        pass\n",
+        encoding="utf-8",
+    )
+    marked = tmp_path / "test_helper.py"
+    marked.write_text(
+        "# blueprint-test-module: intentional-zero-tests -- imported helpers\n",
+        encoding="utf-8",
+    )
+    real = tmp_path / "test_real.py"
+    real.write_text("def test_real():\n    pass\n", encoding="utf-8")
+
+    assert not _test_module_has_executing_tests(dark)
+    assert not _test_module_has_intentional_zero_test_marker(dark)
+    assert not _test_module_has_executing_tests(nested)
+    assert _test_module_has_intentional_zero_test_marker(marked)
+    assert _test_module_has_executing_tests(real)
 
 
 def test_script_roster_expands_only_with_an_executing_capability():

@@ -492,6 +492,14 @@ _run() {
   fi
 }
 
+# These are all roots containing test_*.py modules that the backend test gates
+# must inspect for silent zero-test stubs. Keep this derived from the repository
+# layout rather than maintaining a second per-file coverage roster.
+CI_TEST_MODULE_ROOTS=(
+  scripts
+  backend/testing
+)
+
 # This is the executing roster for scripts/test_*.py. Keep every file either
 # here or in CI_SCRIPT_TEST_EXEMPTIONS below: backend/testing's CI-compliance
 # tripwire enumerates scripts/ on disk and rejects any unclassified test. The

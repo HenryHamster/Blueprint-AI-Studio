@@ -5,6 +5,7 @@ the flat+children contract for GET /api/agent/projects/{project_id}/tasks
 and /api/agent/projects/{project_id}/tasks/{task_id}.
 """
 
+# blueprint-test-module: intentional-zero-tests -- imported contract assertion helpers; pytest tests live in test_agent_tasks.py and test_agent_strategic_fetch.py
 
 def assert_task_item_contract(item: dict) -> None:
     """Assert that a single task item matches the flat+children contract.
