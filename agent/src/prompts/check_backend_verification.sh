@@ -115,7 +115,7 @@
             _verification_attribution='{"state":"execution_failure","blocking":true,"new_failures":{}}'
           elif [ -s "$_verification_current_junit" ]; then
             _verification_attribution=$(python3 scripts/backend_verification_guard.py \
-              --base "@BASE@" --repo-root "$PWD" --current-junit "$_verification_current_junit" \
+              --base "$BASE" --repo-root "$PWD" --current-junit "$_verification_current_junit" \
               --route="$_verification_postgres_flag" --harness "$_VERIFICATION_HARNESS" \
               "${_verification_selector_args[@]}" 2>/dev/null || true)
           else

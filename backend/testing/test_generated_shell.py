@@ -2090,6 +2090,7 @@ class TestProjectVerificationRuntimeContract:
             .replace("@PYTHON_PATH_RE@", r"^backend/.*\.py$")
             .replace("@TEST_PATH_RE@", r"^backend/(testing|tests)/test_.*\.py$")
             .replace("@SELECTOR_PREFIX_RE@", "backend/")
+            .replace("@BASE@", "$BASE")
             .rstrip("\n")
         )
         start = tracked.index("    # required backend-authoring verification")

@@ -12,6 +12,7 @@ import io
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import symtable
 import sys
@@ -13727,6 +13728,34 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     """Docker-less standalone execution must not silently drop roster entries."""
     harness = _script_test_harness()
     roster, exemptions = _parse_script_test_roster(harness)
+    scripts_root = harness.parent
+    on_disk = {
+        path.name
+        for path in scripts_root.glob("test_*.py")
+        if path.is_file()
+    }
+
+    # CI mounts both /app and /repo read-only.  The real harness stages the
+    # root CLAUDE.md into backend/ before its Docker build, so invoking the
+    # bind-mounted script from /repo/backend would fail before the roster is
+    # exercised.  Copy only the harness boundary into a writable checkout;
+    # the fake executables below keep this invariant focused on its argv.
+    run_root = tmp_path / "checkout"
+    run_scripts = run_root / "scripts"
+    run_backend = run_root / "backend"
+    run_scripts.mkdir(parents=True)
+    run_backend.mkdir()
+    shutil.copy2(harness, run_scripts / harness.name)
+    shutil.copy2(
+        harness.parent / "backend-test-route.sh", run_scripts / "backend-test-route.sh"
+    )
+    bootstrap_test = harness.parent / "test_bootstrap_local_app_release.py"
+    if bootstrap_test.is_file():
+        shutil.copy2(bootstrap_test, run_scripts / bootstrap_test.name)
+    root_claude = harness.parent.parent / "CLAUDE.md"
+    if root_claude.is_file():
+        shutil.copy2(root_claude, run_root / "CLAUDE.md")
+    run_harness = run_scripts / harness.name
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -13752,8 +13781,8 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         }
     )
     result = subprocess.run(
-        ["bash", str(harness), "--standalone", "--no-postgres"],
-        cwd=harness.parent.parent / "backend",
+        ["bash", str(run_harness), "--standalone", "--no-postgres"],
+        cwd=run_backend,
         env=env,
         capture_output=True,
         text=True,

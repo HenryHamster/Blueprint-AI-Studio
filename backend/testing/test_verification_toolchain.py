@@ -4,7 +4,18 @@ import subprocess
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[2]
+def _resolve_repo_root() -> Path:
+    """Find the checkout across CI mounts and ordinary checkout paths."""
+    candidates = [Path("/repo")]
+    for anchor in (Path(__file__).resolve(), Path.cwd()):
+        candidates.extend((anchor, *anchor.parents))
+    for candidate in candidates:
+        if (candidate / "scripts" / "verification-toolchain.json").is_file():
+            return candidate
+    raise RuntimeError("repository root not found from CI mount or checkout path")
+
+
+ROOT = _resolve_repo_root()
 MANIFEST = ROOT / "scripts" / "verification-toolchain.json"
 PROVISIONER = ROOT / "scripts" / "provision-verification-toolchain.sh"
 PACKER = ROOT / "infra" / "packer" / "agent.pkr.hcl"
