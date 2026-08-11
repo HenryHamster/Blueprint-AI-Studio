@@ -643,13 +643,23 @@ async def _dispatch_pending_rehearsal_intents(
         status = {
             "accepted": "dispatched",
             "rejected": "rejected",
+            "rejected_permanent_404": "rejected",
             "ambiguous": "uncertain",
         }[outcome]
+        detail = None
+        if outcome == "rejected_permanent_404":
+            detail = (
+                "permanent 404: dispatch target absent "
+                f"{owner}/{repo}/actions/workflows/"
+                f"{PREPROMOTION_REHEARSAL_WORKFLOW}@{snapshot['workflow_ref']}"
+            )
+        elif outcome != "accepted":
+            detail = f"dispatch {outcome}"
         await _cas_dispatch_result(
             snapshot["id"],
             attempt,
             status=status,
-            detail=None if outcome == "accepted" else f"dispatch {outcome}",
+            detail=detail,
             session_factory=session_factory,
         )
         processed += 1

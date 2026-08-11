@@ -10,7 +10,6 @@ import hashlib
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 import urllib.error
@@ -7228,18 +7227,3 @@ def test_deploy_agent_noops_without_live_approval(monkeypatch):
     )
 
     assert blueprint._deploy_agent_once(argparse.Namespace(project_id=None)) is False
-
-
-def test_deploy_rehearse_is_disabled_before_manifest_or_host_io(monkeypatch):
-    monkeypatch.setattr(
-        blueprint,
-        "_fetch_deploy_manifest",
-        lambda *_args, **_kwargs: pytest.fail("disabled rehearsal must perform no I/O"),
-    )
-    with pytest.raises(SystemExit, match="Host rehearsal is disabled"):
-        blueprint.cmd_deploy(
-            argparse.Namespace(
-                rehearse=True,
-                sha="a" * 40,
-            )
-        )

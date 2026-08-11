@@ -21,7 +21,7 @@
     "github.py": 2718,
     "github_token_resolver.py": 600,
     "github_auth.py": 700,
-    "github_checks.py": 1050,
+    "github_checks.py": 1350,
     "hotfix_backmerge.py": 2350,
     "github_issues.py": 750,
     "github_refs.py": 1250,

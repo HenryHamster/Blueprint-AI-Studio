@@ -98,7 +98,13 @@ async def test_dispatch_workflow_run_sends_explicit_inputs_when_requested():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status_code", "expected"),
-    [(204, "accepted"), (422, "rejected"), (429, "ambiguous"), (503, "ambiguous")],
+    [
+        (204, "accepted"),
+        (404, "rejected_permanent_404"),
+        (422, "rejected"),
+        (429, "ambiguous"),
+        (503, "ambiguous"),
+    ],
 )
 async def test_dispatch_workflow_run_outcome_distinguishes_ambiguous_success(
     status_code, expected

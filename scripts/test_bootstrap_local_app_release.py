@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import base64
 import io
 import json
 import os
@@ -561,16 +560,6 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 bootstrap.rehearse("image@digest", "a" * 40)
         rehearse.assert_not_called()
 
-    def test_root_release_shim_rehearsal_reuses_release_tool_with_flag(self):
-        digest = "sha256:" + "0" * 64
-        with unittest.mock.patch.object(
-            release, "_newest_release_tool", return_value=Path("/bundle/local_app_release.py")
-        ):
-            command = release._release_command(digest, "a" * 40, rehearsal=True)
-
-        self.assertEqual(command[-1], "--rehearse")
-        self.assertEqual(command[-2], "a" * 40)
-
     def test_root_release_shim_refuses_host_rehearsal_before_exec(self):
         digest = "sha256:" + "0" * 64
         with (
@@ -588,89 +577,6 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(SystemExit, "2"):
                 release.main()
-
-    def test_root_release_shim_parses_machine_readable_rehearsal(self):
-        report = {
-            "kind": "blueprint.local_app_release_rehearsal.v1",
-            "revision": "a" * 40,
-            "units_stopped": False,
-        }
-        completed = release.subprocess.CompletedProcess(
-            [], 0, "LOCAL_APP_RELEASE_REHEARSAL " + json.dumps(report) + "\n", ""
-        )
-        with (
-            unittest.mock.patch.object(
-                release, "_newest_release_tool", return_value=Path("/bundle/local_app_release.py")
-            ),
-            unittest.mock.patch.object(
-                release.subprocess, "run", return_value=completed
-            ) as run,
-        ):
-            self.assertEqual(
-                release._run_rehearsal("sha256:" + "0" * 64, "a" * 40),
-                report,
-            )
-        run.assert_called_once()
-        self.assertIn("--rehearse", run.call_args.args[0])
-
-    def test_cli_rehearsal_socket_decodes_host_report(self):
-        report = {"kind": "blueprint.local_app_release_rehearsal.v1"}
-        encoded = base64.b64encode(json.dumps(report).encode()).decode()
-
-        class Socket:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def settimeout(self, _timeout):
-                pass
-
-            def connect(self, _path):
-                pass
-
-            def sendall(self, payload):
-                self.payload = payload
-
-            def recv(self, _limit):
-                return f"REHEARSAL {encoded}\n".encode("ascii")
-
-        with unittest.mock.patch.object(blueprint.socket, "socket", return_value=Socket()):
-            result = blueprint._request_release_rehearsal(
-                "sha256:" + "0" * 64, "a" * 40
-            )
-        self.assertEqual(result, report)
-
-    def test_cli_rehearsal_runs_on_selected_remote_host(self):
-        report = {"kind": "blueprint.local_app_release_rehearsal.v1"}
-        completed = subprocess.CompletedProcess(
-            [],
-            0,
-            "REHEARSAL "
-            + base64.b64encode(json.dumps(report).encode()).decode(),
-            "",
-        )
-        with unittest.mock.patch.object(
-            blueprint.subprocess, "run", return_value=completed
-        ) as run:
-            result = blueprint._request_release_rehearsal(
-                "sha256:" + "0" * 64, "a" * 40, host="hamsterwheel"
-            )
-        self.assertEqual(result, report)
-        self.assertEqual(
-            run.call_args.args[0],
-            [
-                "ssh",
-                "-t",
-                "hamsterwheel",
-                "sudo",
-                blueprint._RELEASE_SHIM_PATH,
-                "--rehearse",
-                "sha256:" + "0" * 64,
-                "a" * 40,
-            ],
-        )
 
     def test_approved_activation_rehearses_root_handoff_and_receipt(self):
         deploy_blueprint = blueprint

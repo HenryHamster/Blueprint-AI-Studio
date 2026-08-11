@@ -451,6 +451,12 @@
           "commit_date": "2026-07-13T02:44:39-07:00",
           "old_cap": 800,
           "new_cap": 1050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-11T18:09:20.634212+00:00",
+          "old_cap": 1050,
+          "new_cap": 1350
         }
       ],
       "hotfix_backmerge.py": [

@@ -1,9 +1,10 @@
 """Acceptance evidence for durable candidate-bound rehearsal dispatch."""
 
 import asyncio
+import ast
 from datetime import timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _release_qualifier_testhelpers import (
@@ -48,6 +49,66 @@ _VERDICT = {
     "gap": "no trusted CI receipt",
     "citations": [],
 }
+
+
+def test_disabled_host_rehearsal_shell_is_gone_and_fail_closed_stubs_remain():
+    repo_root = Path(__file__).parents[2]
+    blueprint_source = (repo_root / "scripts" / "blueprint.py").read_text(
+        encoding="utf-8"
+    )
+    for retired_name in (
+        "_request_release_rehearsal",
+        "_post_prepromotion_rehearsal_receipt",
+        "_read_open_rehearsal_version",
+    ):
+        assert f"def {retired_name}" not in blueprint_source
+    assert "Host rehearsal is disabled" not in blueprint_source
+
+    for relative_path in (
+        "scripts/local_app_release.py",
+        "scripts/bootstrap_local_app_release.py",
+    ):
+        tree = ast.parse((repo_root / relative_path).read_text(encoding="utf-8"))
+        rehearse = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "rehearse"
+        )
+        assert isinstance(rehearse.body[-1], ast.Raise)
+        assert "host rehearsal disabled" in ast.unparse(rehearse)
+
+    release_source = (repo_root / "scripts" / "blueprint_release.py").read_text(
+        encoding="utf-8"
+    )
+    assert "host rehearsal disabled" in release_source
+    assert "--rehearse" in release_source
+
+
+@pytest.mark.asyncio
+async def test_permanent_dispatch_404_terminalizes_with_named_target(db_session, mocker):
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {"candidate_sha": _CANDIDATE}
+    _, projection = await prepare_rehearsal_dispatch_intent(
+        db_session, version, _CANDIDATE
+    )
+    await db_session.commit()
+    mocker.patch(
+        "app.release_prepromotion_rehearsal._resolve_dispatch_github_context",
+        new=AsyncMock(return_value=("token", "acme", "widget")),
+    )
+    response = MagicMock(status_code=404, text="workflow not found")
+    mocker.patch("app.github._github_request", new=AsyncMock(return_value=response))
+
+    assert await dispatch_pending_rehearsal_intents(limit=1) == 1
+
+    row = await db_session.get(ReleasePrepromotionDispatch, projection["request_id"])
+    assert row is not None
+    assert row.status == "rejected"
+    assert row.last_error == (
+        "permanent 404: dispatch target absent "
+        "acme/widget/actions/workflows/prepromotion-rehearsal.yml@main"
+    )
 
 
 def _receipt(

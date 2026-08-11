@@ -30,7 +30,6 @@ to the host operator account.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import socket
@@ -89,9 +88,7 @@ def _validated_args(args: list[str]) -> tuple[str, str]:
     return digest, revision
 
 
-def _release_command(
-    digest: str, revision: str, *, rehearsal: bool = False
-) -> list[str]:
+def _release_command(digest: str, revision: str) -> list[str]:
 
     sudo_user = os.environ.get("SUDO_USER", "") or _DEFAULT_SUDO_USER
     if not _SUDO_USER_RE.fullmatch(sudo_user):
@@ -116,38 +113,11 @@ def _release_command(
         "--expected-revision",
         revision,
     ]
-    if rehearsal:
-        command.append("--rehearse")
     return command
 
 
 def _run_release(digest: str, revision: str) -> int:
     return subprocess.run(_release_command(digest, revision), check=False).returncode
-
-
-def _run_rehearsal(digest: str, revision: str) -> dict:
-    result = subprocess.run(
-        _release_command(digest, revision, rehearsal=True),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        _fail(f"rehearsal exited {result.returncode}")
-    marker = "LOCAL_APP_RELEASE_REHEARSAL "
-    line = next(
-        (line for line in result.stdout.splitlines() if line.startswith(marker)),
-        None,
-    )
-    if line is None:
-        _fail("rehearsal returned no machine-readable report")
-    try:
-        report = json.loads(line.removeprefix(marker))
-    except json.JSONDecodeError as exc:
-        _fail(f"rehearsal report is malformed: {exc}")
-    if not isinstance(report, dict):
-        _fail("rehearsal report is not an object")
-    return report
 
 
 def _request_args(payload: bytes) -> list[str]:
@@ -199,7 +169,7 @@ def main() -> None:
         _fail("host rehearsal disabled; use trusted CI build/smoke evidence")
     args = sys.argv[2:] if rehearsal else sys.argv[1:]
     digest, revision = _validated_args(args)
-    command = _release_command(digest, revision, rehearsal=rehearsal)
+    command = _release_command(digest, revision)
     os.execv(command[0], command)
 
 

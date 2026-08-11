@@ -672,7 +672,7 @@ async def dispatch_workflow_run_outcome(
     project_id: str | None = None,
     inputs: Mapping[str, str] | None = None,
 ) -> str:
-    """Return accepted, rejected, or ambiguous for a workflow dispatch POST.
+    """Return accepted, rejected, permanent-404, or ambiguous for a workflow dispatch POST.
 
     GitHub's endpoint returns no run id or idempotency token. Transport errors,
     throttling, and server errors are therefore ambiguous: the server may have
@@ -719,6 +719,8 @@ async def dispatch_workflow_run_outcome(
         response.status_code,
         response.text[:200],
     )
+    if response.status_code == 404:
+        return "rejected_permanent_404"
     if 400 <= response.status_code < 500 and response.status_code not in {
         408,
         409,
