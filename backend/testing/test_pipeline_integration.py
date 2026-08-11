@@ -1864,14 +1864,14 @@ async def test_review_fix_cap_sets_status_message(
         logs="Review: more changes needed",
     )
 
-    # The original task's status message must contain the expected keywords
+    # The abandon-candidate path supersedes the old iteration-cap wording.
     await db_session.refresh(original_task)
     msg = original_task.latest_status_message or ""
-    assert "iteration" in msg.lower(), (
-        f"Status message should mention 'iteration', got: {msg!r}"
+    assert "abandon candidate" in msg.lower(), (
+        f"Status message should identify an abandon candidate, got: {msg!r}"
     )
-    assert "manual review" in msg.lower(), (
-        f"Status message should mention 'manual review', got: {msg!r}"
+    assert "cycle(s)" in msg.lower() and "automatic fix spawning stopped" in msg.lower(), (
+        f"Status message should preserve cycle count and stop signal, got: {msg!r}"
     )
 
 

@@ -19,7 +19,7 @@ from app.ci_merge_helpers import (
     _pr_number_match,
     revoke_review_authority_for_active_fix,
 )
-from app.github import get_pull_request
+from app.github import get_open_pull_request_for_head_branch, get_pull_request
 from app.github_token_resolver import get_github_token_for_task
 from app.models import Task, TaskStatus, _utcnow
 from app.review_execution_ownership import (
@@ -82,6 +82,125 @@ def _cancel_pr_task(task: Task, reason: str) -> None:
     task.status = TaskStatus.CANCELLED
     task.completed_at = _utcnow()
     task.latest_status_message = f"Cancelled by PR execution fence: {reason}"[:500]
+
+
+def _is_rollup_fix(task: Task, pr_number: int) -> bool:
+    """Return whether *task* is a child fix for the tracked rollup PR."""
+
+    context = task.context or {}
+    review_loop = context.get("review_loop") or {}
+    if (
+        context.get("_is_rollup_review") is True
+        or context.get("_rollup_retries") is not None
+    ):
+        return True
+    try:
+        rollup_pr = int(context.get("rollup_pr_number") or 0)
+        loop_pr = int(review_loop.get("pr_number") or 0)
+    except (TypeError, ValueError):
+        return False
+    return rollup_pr == pr_number and loop_pr == pr_number
+
+
+async def _retarget_closed_rollup_fix(
+    task: Task,
+    *,
+    pr_number: int,
+    closed_pr: dict,
+    github_token: str,
+    owner: str,
+    repo: str,
+) -> tuple[str, dict[str, str | int] | None]:
+    """Rebind a rollup fix to its authoritative replacement PR, if present.
+
+    A replacement is safe to adopt only when GitHub identifies one open PR for
+    the same head branch and base branch.  A changed head on an otherwise-open
+    PR, or an ambiguous/missing replacement, remains a hard stale-target
+    failure below; this helper never turns arbitrary head drift into admission.
+    """
+
+    if not _is_rollup_fix(task, pr_number):
+        return "not_applicable", None
+    review_loop = dict((task.context or {}).get("review_loop") or {})
+    head_ref = str(
+        review_loop.get("branch")
+        or (closed_pr.get("head") or {}).get("ref")
+        or ""
+    )
+    base_ref = str(
+        review_loop.get("base_branch")
+        or (closed_pr.get("base") or {}).get("ref")
+        or ""
+    )
+    if not head_ref or not base_ref:
+        return "not_found", None
+    try:
+        replacement = await get_open_pull_request_for_head_branch(
+            github_token,
+            owner,
+            repo,
+            head_ref,
+            base_ref,
+            project_id=str(task.project_id),
+        )
+    except Exception as exc:  # noqa: BLE001 - execution must retry, not guess
+        return f"lookup_failed: {exc}", None
+    if not isinstance(replacement, dict):
+        return "not_found", None
+    try:
+        replacement_number = int(replacement.get("number") or 0)
+    except (TypeError, ValueError):
+        replacement_number = 0
+    if replacement_number <= 0 or replacement_number == pr_number:
+        return "not_found", None
+    if str(replacement.get("state") or "").lower() != "open" or replacement.get(
+        "merged"
+    ) is True:
+        return "not_found", None
+    replacement_target = _live_target(task, replacement_number, replacement)
+    if replacement_target is None:
+        return "unresolved", None
+
+    payloads = list(task.payloads or [])
+    if not payloads or not isinstance(payloads[0], dict):
+        return "unresolved", None
+    payloads[0] = {**payloads[0], "pr_number": replacement_number}
+    task.payloads = payloads
+    flag_modified(task, "payloads")
+
+    replacement_loop = dict(review_loop)
+    replacement_loop.update(
+        {
+            "pr_number": replacement_number,
+            "branch": str(
+                (replacement.get("head") or {}).get("ref") or head_ref
+            ),
+            "base_branch": str(
+                (replacement.get("base") or {}).get("ref") or base_ref
+            ),
+            "fix_target": replacement_target,
+            # This is a backend-issued exact target for the same fix task. It
+            # preserves the chain history while preventing the old head from
+            # authorizing writes on the replacement PR.
+            "reviewed_head_sha": replacement_target["head_sha"],
+            "head_drift_retargeted_from": {
+                "pr_number": pr_number,
+                "head_sha": str((closed_pr.get("head") or {}).get("sha") or ""),
+            },
+        }
+    )
+    replacement_context = {**(task.context or {}), "review_loop": replacement_loop}
+    if replacement_context.get("rollup_pr_number") == pr_number:
+        replacement_context["rollup_pr_number"] = replacement_number
+    if replacement.get("html_url"):
+        replacement_context["rollup_pr_url"] = replacement["html_url"]
+    task.context = replacement_context
+    task.latest_status_message = (
+        f"Retargeted rollup fix from closed PR #{pr_number} to open replacement "
+        f"PR #{replacement_number}; review history and iteration state preserved"
+    )[:500]
+    flag_modified(task, "context")
+    return "retargeted", replacement_target
 
 
 def _target_matches_live(
@@ -287,11 +406,92 @@ async def lock_pr_task_for_execution(
             retryable=True,
         )
     state = str(live_pr.get("state") or "").lower()
+    retargeted_live_target: dict[str, str | int] | None = None
     if live_pr.get("merged") is True or state in {"closed", "merged"}:
-        reason = "PR is no longer open"
-        _cancel_pr_task(task, reason)
-        session.add(task)
-        return PrClaimFenceDecision(True, False, task=task, reason=reason)
+        if task_type == "fix" and live_pr.get("merged") is not True and state == "closed":
+            retarget_status, replacement_target = await _retarget_closed_rollup_fix(
+                task,
+                pr_number=pr_number,
+                closed_pr=live_pr,
+                github_token=gh_token,
+                owner=owner,
+                repo=repo,
+            )
+            if retarget_status == "retargeted" and replacement_target is not None:
+                replacement_pr_number = int(replacement_target["pr_number"])
+                await acquire_pr_spawn_lock(
+                    session,
+                    task.project_id,
+                    replacement_pr_number,
+                    repo_identity=f"{owner}/{repo}",
+                )
+                project_scope = await repository_project_ids(
+                    session,
+                    task.project_id,
+                    owner=owner,
+                    repo=repo,
+                )
+                await session.flush()
+                chain_tasks = (
+                    (
+                        await session.execute(
+                            select(Task)
+                            .where(
+                                Task.project_id.in_(project_scope),
+                                _pr_number_match(session, replacement_pr_number),
+                            )
+                            .order_by(Task.id)
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                task = next(
+                    (candidate for candidate in chain_tasks if candidate.id == task.id),
+                    None,
+                )
+                if task is None:
+                    return PrClaimFenceDecision(
+                        True,
+                        False,
+                        reason="retargeted fix task disappeared during claim",
+                        retryable=True,
+                    )
+                pr_number = replacement_pr_number
+                retargeted_live_target = replacement_target
+                state = "open"
+            else:
+                if retarget_status.startswith("lookup_failed") or retarget_status == (
+                    "unresolved"
+                ):
+                    reason = (
+                        "assigned fix head drift: replacement lookup failed"
+                        if retarget_status.startswith("lookup_failed")
+                        else "assigned fix head drift: replacement target unresolved"
+                    )
+                    return PrClaimFenceDecision(
+                        True,
+                        False,
+                        task=task,
+                        reason=reason,
+                        retryable=True,
+                    )
+                reason = "assigned fix head drift: no authoritative open replacement"
+                _cancel_pr_task(task, reason)
+                session.add(task)
+                return PrClaimFenceDecision(
+                    True,
+                    False,
+                    task=task,
+                    reason=reason,
+                )
+        else:
+            reason = "assigned review head drift: PR is no longer open"
+            _cancel_pr_task(task, reason)
+            session.add(task)
+            return PrClaimFenceDecision(True, False, task=task, reason=reason)
     if state != "open":
         return PrClaimFenceDecision(
             True,
@@ -300,7 +500,7 @@ async def lock_pr_task_for_execution(
             reason="live PR state is unresolved",
             retryable=True,
         )
-    live_target = _live_target(task, pr_number, live_pr)
+    live_target = retargeted_live_target or _live_target(task, pr_number, live_pr)
     if live_target is None:
         return PrClaimFenceDecision(
             True,
@@ -319,7 +519,7 @@ async def lock_pr_task_for_execution(
             pr_number=pr_number,
             live_target=live_target,
         ):
-            reason = "assigned review target is stale"
+            reason = "assigned review head drift"
             _cancel_pr_task(task, reason)
             session.add(task)
             return PrClaimFenceDecision(True, False, task=task, reason=reason)
@@ -372,7 +572,7 @@ async def lock_pr_task_for_execution(
                 live_target=live_target,
             )
         ) or (reviewed_head and reviewed_head != live_target["head_sha"]):
-            reason = "assigned fix target is stale"
+            reason = "assigned fix head drift"
             _cancel_pr_task(task, reason)
             session.add(task)
             return PrClaimFenceDecision(True, False, task=task, reason=reason)
