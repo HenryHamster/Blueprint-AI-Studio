@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from sqlalchemy import and_, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -449,25 +450,46 @@ async def _handoff_checkpoint_owner(
         return False
 
     from app.task_blocked import reset_task_for_fresh_attempt
+    task_id = task.id
 
-    # Every other FAILED -> QUEUED site resets the attempt before re-dispatch:
-    # bank the finished attempt, advance the lifetime counter, and drop the dead
-    # VM binding, liveness markers, retry_after and failure verdict.  Without it
-    # the reaper's staleness checks read the previous attempt's markers.
-    reset_task_for_fresh_attempt(locked)
-    context = dict(locked.context or {})
-    owner = dict(current)
-    owner.update({"handoff_count": handoffs + 1, "handoff_at": now.isoformat()})
-    context[_CHECKPOINT_OWNER_KEY] = owner
-    context[_CHECKPOINT_HANDOFF_COUNT_KEY] = handoffs + 1
-    locked.context = context
-    locked.status = TaskStatus.QUEUED
-    locked.latest_status_message = (
-        f"Recovered unshipped checkpoint on {owner.get('branch')}; "
-        "requeued the owning task to restore it before the next attempt."
-    )
-    flag_modified(locked, "context")
-    session.add(locked)
+    try:
+        # The pre-query above is only an optimization. A concurrent dispatcher
+        # can claim the same key after it runs, so make the state transition and
+        # its unique-index check one savepoint-scoped operation. This preserves
+        # the sweep's outer transaction when the concurrent winner is observed.
+        async with session.begin_nested():
+            # Every other FAILED -> QUEUED site resets the attempt before
+            # re-dispatch: bank the finished attempt, advance the lifetime
+            # counter, and drop stale liveness state.
+            reset_task_for_fresh_attempt(locked)
+            context = dict(locked.context or {})
+            owner = dict(current)
+            owner.update(
+                {"handoff_count": handoffs + 1, "handoff_at": now.isoformat()}
+            )
+            context[_CHECKPOINT_OWNER_KEY] = owner
+            context[_CHECKPOINT_HANDOFF_COUNT_KEY] = handoffs + 1
+            locked.context = context
+            locked.status = TaskStatus.QUEUED
+            locked.latest_status_message = (
+                f"Recovered unshipped checkpoint on {owner.get('branch')}; "
+                "requeued the owning task to restore it before the next attempt."
+            )
+            flag_modified(locked, "context")
+            session.add(locked)
+            await session.flush()
+    except IntegrityError as exc:
+        if "idempotency" not in str(exc).lower():
+            raise
+        # The savepoint rollback expires attributes changed by the failed
+        # UPDATE. Rehydrate the row while still in the async bridge so the
+        # caller can record its alert/examined marker without implicit IO.
+        await session.refresh(locked)
+        logger.info(
+            "[APPROVED_PR] checkpoint handoff lost idempotency race for task %s",
+            task_id,
+        )
+        return False
     return True
 
 
@@ -476,27 +498,33 @@ def _checkpoint_candidate_filter(session) -> tuple[Any, ...]:
 
     Deliberately abandoned work (``pr_closed_unmerged`` / ``pr_closed_empty`` /
     ``pr_rejected``) is never resurrected — the sibling reaper sweep skips the
-    same markers — and an already-examined row must not pin the oldest-first
-    window forever.
+    same markers. Examined rows remain eligible so a checkpoint branch created
+    after an earlier clean scan is eventually observed.
     """
     if resolve_dialect_name(session) == "sqlite":
         return (
-            func.json_extract(Task.context, f"$.{_CHECKPOINT_EXAMINED_KEY}").is_(None),
             func.coalesce(func.json_extract(Task.context, "$.pr_closed_unmerged"), 0)
             != 1,
             func.coalesce(func.json_extract(Task.context, "$.pr_closed_empty"), 0) != 1,
             func.coalesce(func.json_extract(Task.context, "$.pr_rejected"), 0) != 1,
         )
     return (
-        Task.context[_CHECKPOINT_EXAMINED_KEY].as_string().is_(None),
         Task.context["pr_closed_unmerged"].as_boolean().is_not(True),
         Task.context["pr_closed_empty"].as_boolean().is_not(True),
         Task.context["pr_rejected"].as_boolean().is_not(True),
     )
 
 
+def _checkpoint_examined_at_expression(session):
+    if resolve_dialect_name(session) == "sqlite":
+        return func.json_extract(
+            Task.context, f"$.{_CHECKPOINT_EXAMINED_KEY}.examined_at"
+        )
+    return Task.context[_CHECKPOINT_EXAMINED_KEY]["examined_at"].as_string()
+
+
 def _mark_checkpoint_examined(task: Task, reason: str, now: datetime) -> None:
-    """Record a definitive verdict so the row leaves the candidate window."""
+    """Record the last scan/decision cursor used to rotate candidate owners."""
     context = dict(task.context or {})
     context[_CHECKPOINT_EXAMINED_KEY] = {
         "reason": reason,
@@ -541,7 +569,15 @@ async def _sweep_checkpoint_owners(
                 Task.archived.is_(False),
                 *_checkpoint_candidate_filter(session),
             )
-            .order_by(Task.updated_at.asc())
+            # Visit never-examined owners first, then rotate the examined
+            # population by its last scan time. This prevents a permanently
+            # clean prefix from starving owners whose checkpoint branch appears
+            # after that prefix was first inspected.
+            .order_by(
+                _checkpoint_examined_at_expression(session).asc().nulls_first(),
+                Task.updated_at.asc(),
+                Task.id.asc(),
+            )
             .limit(_CHECKPOINT_BATCH_SIZE)
         )
     ).all()
@@ -648,17 +684,23 @@ async def _sweep_checkpoint_owners(
                 )
             )
             if evidence is None:
+                # The branch was found, but its contents were not readable.
+                # Record the scan position so one unavailable owner cannot
+                # monopolize the NULLS-FIRST batch; the row remains eligible
+                # and will be retried on a later rotation.
                 if proven_lookalike:
-                    # The branch exists but carries no checkpoint contract — a
-                    # durable verdict, so the row must leave the scan window.
                     _mark_checkpoint_examined(task, "not_a_checkpoint_branch", now)
-                    changed = True
+                else:
+                    _mark_checkpoint_examined(task, "evidence_unavailable", now)
+                changed = True
                 continue
             counts["checkpoint_scanned"] += 1
             if evidence.state == "stranded":
                 counts["checkpoint_stranded"] += 1
             elif evidence.state == "unknown":
                 counts["checkpoint_unknown"] += 1
+                _mark_checkpoint_examined(task, "checkpoint_unknown", now)
+                changed = True
             elif evidence.state == "landed":
                 # The checkpoint reached the integration branch; nothing is left
                 # to recover for this task.

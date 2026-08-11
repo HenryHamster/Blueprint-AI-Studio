@@ -392,8 +392,11 @@ async def test_github_checkpoint_unknown_never_hands_off_or_alerts(
     assert counts["checkpoint_alerts_created"] == 0
     assert task.status == TaskStatus.FAILED
     assert task.context["unshipped_checkpoint"]["state"] == "unknown"
-    # Unknown evidence must NOT close the row out of the candidate window.
-    assert "unshipped_checkpoint_examined" not in task.context
+    # Unknown evidence remains eligible, but its cursor advances so it cannot
+    # starve another owner in the bounded NULLS-FIRST batch.
+    assert task.context["unshipped_checkpoint_examined"]["reason"] == (
+        "checkpoint_unknown"
+    )
 
 
 @pytest.mark.asyncio
@@ -490,8 +493,8 @@ async def test_checkpoint_sweep_skips_parents_and_abandoned_work(
 
 
 @pytest.mark.asyncio
-async def test_examined_rows_leave_the_candidate_window(db_session, monkeypatch):
-    """A scanned row without a checkpoint must not pin the bounded scan."""
+async def test_examined_rows_are_revisited_after_rotation(db_session, monkeypatch):
+    """Examined owners rotate so a checkpoint created later is revisited."""
     task_id = uuid.UUID("88888888-8888-4888-8888-888888888888")
     branch = "blueprint/task-88888888"
     project, task = _checkpoint_project_and_task(
@@ -521,11 +524,72 @@ async def test_examined_rows_leave_the_candidate_window(db_session, monkeypatch)
         return_value=[{"name": branch, "sha": "checkpoint-sha"}]
     )
     monkeypatch.setattr("app.github.list_branches", second_listing)
+    monkeypatch.setattr(
+        stranding,
+        "_github_checkpoint_evidence",
+        AsyncMock(
+            return_value=(
+                stranding._CheckpointEvidence(
+                    branch=branch,
+                    checkpoint_sha="checkpoint-sha",
+                    base_commit="base-sha",
+                    state="unknown",
+                    integration_branch="main",
+                    reason="test evidence",
+                ),
+                False,
+            )
+        ),
+    )
     second = await stranding._sweep_checkpoint_owners(
         db_session, repo_root=None, now=datetime(2026, 8, 10)
     )
-    assert second["checkpoint_scanned"] == 0
-    assert second_listing.await_count == 0
+    assert second["checkpoint_scanned"] == 1
+    assert second_listing.await_count == 1
+    assert task.context["unshipped_checkpoint"]["state"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_handoff_handles_concurrent_idempotency_collision(
+    db_session, monkeypatch
+):
+    """A pre-check race must roll back only the handoff savepoint."""
+    task_id = uuid.UUID("56565656-5656-4565-8565-565656565656")
+    branch = "blueprint/task-56565656"
+    project, task = _checkpoint_project_and_task(
+        task_id, branch=branch, name="Concurrent checkpoint project"
+    )
+    task.idempotency_key = "shared-race-key"
+    replacement = Task(
+        project_id=project.id,
+        title="concurrent live replacement",
+        status=TaskStatus.QUEUED,
+        created_by="TEST",
+        payloads=[{"type": "create", "prompt": "preserve"}],
+        idempotency_key="shared-race-key",
+    )
+    db_session.add_all([project, task, replacement])
+    await db_session.commit()
+    _patch_github_checkpoint(
+        monkeypatch, branch=branch, task_id=task_id, ancestor=False
+    )
+    monkeypatch.setattr(
+        stranding,
+        "_active_idempotency_keys",
+        AsyncMock(return_value=set()),
+    )
+
+    counts = await stranding._sweep_checkpoint_owners(
+        db_session, repo_root=None, now=datetime(2026, 8, 10)
+    )
+
+    await db_session.refresh(task)
+    assert counts["checkpoint_handoffs"] == 0
+    assert counts["checkpoint_alerts_created"] == 1
+    assert task.status == TaskStatus.FAILED
+    assert task.context["unshipped_checkpoint_examined"]["reason"] == (
+        "operator_attention"
+    )
 
 
 @pytest.mark.asyncio

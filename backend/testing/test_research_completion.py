@@ -18592,6 +18592,51 @@ class TestSelfClaimCollisionRecovery:
         assert peer.status == TaskStatus.QUEUED
 
     @_pytest.mark.asyncio
+    async def test_evergreen_adapter_failure_preserves_spawn_session(
+        self, db_session, mocker
+    ):
+        """A failed optional adapter must not roll back the shared spawn session."""
+        import app.research_completion as research_completion
+        from app.models import EvergreenBacklogItem
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        project, direction, parent = await _grader_project_and_task(
+            db_session, "d-aux-savepoint"
+        )
+        item = EvergreenBacklogItem(
+            project_id=project.id,
+            finding_key="auxiliary-savepoint",
+            title="Auxiliary savepoint",
+            status="spawned",
+            spawned_task_id=parent.id,
+        )
+        parent.context = {
+            **(parent.context or {}),
+            "evergreen_backlog_item_id": str(item.id),
+        }
+        db_session.add_all([item, parent])
+        await db_session.commit()
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[
+                _make_finding("Savepoint child", direction_id=direction["id"])
+            ],
+        )
+        mocker.patch(
+            "app.evergreen_backlog.apply_research_outcome",
+            side_effect=RuntimeError("simulated optional adapter failure"),
+        )
+        rollback = mocker.spy(db_session, "rollback")
+
+        await research_completion._handle_research_completion(parent, "", db_session)
+
+        assert rollback.await_count == 0
+        await db_session.refresh(parent)
+        assert parent.status == TaskStatus.EVALUATING
+
+    @_pytest.mark.asyncio
     async def test_self_claim_retry_does_not_resurrect_cancelled_parent(
         self, db_session, mocker
     ):

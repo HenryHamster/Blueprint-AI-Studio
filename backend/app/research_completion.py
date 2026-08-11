@@ -6873,22 +6873,17 @@ async def _handle_research_completion(
 
         for _eq_hash, _eq_title, _eq_detail, _eq_dir_id in _memo_enrollment_queue:
             try:
-                await _enroll_backlog_item(
-                    session,
-                    project_id=task.project_id,
-                    finding_key=_eq_hash,
-                    title=_eq_title,
-                    detail=_eq_detail,
-                    direction_id=_eq_dir_id,
-                    provenance="deferred_memo",
-                )
-                await session.commit()
+                async with session.begin_nested():
+                    await _enroll_backlog_item(
+                        session,
+                        project_id=task.project_id,
+                        finding_key=_eq_hash,
+                        title=_eq_title,
+                        detail=_eq_detail,
+                        direction_id=_eq_dir_id,
+                        provenance="deferred_memo",
+                    )
             except Exception:  # noqa: BLE001, PERF203
-                await session.rollback()
-                # ``rollback`` expires every ORM instance in this session.
-                # Reload the parent before either the log line below or the
-                # post-spawn projection reads synchronous Task attributes.
-                await session.refresh(task)
                 logger.warning(
                     "[RESEARCH] deferred-memo evergreen enrollment failed "
                     "(task %s, finding %s)",
@@ -6902,19 +6897,15 @@ async def _handle_research_completion(
         try:
             from app.evergreen_backlog import apply_research_outcome
 
-            await apply_research_outcome(
-                session,
-                item_id=str(_evergreen_item_id),
-                impl_spawned=_impl_spawned,
-                reproduce_rejected=len(_reproduce_rejected),
-                surviving=_impl_spawned,
-            )
-            await session.commit()
+            async with session.begin_nested():
+                await apply_research_outcome(
+                    session,
+                    item_id=str(_evergreen_item_id),
+                    impl_spawned=_impl_spawned,
+                    reproduce_rejected=len(_reproduce_rejected),
+                    surviving=_impl_spawned,
+                )
         except Exception as _eg_exc:  # noqa: BLE001
-            await session.rollback()
-            # Keep the parent usable by ``apply_post_spawn_state`` after the
-            # error-path rollback expires its ORM state.
-            await session.refresh(task)
             logger.warning(
                 "[EVERGREEN] failed to apply research outcome for item %s: %s",
                 _evergreen_item_id,
