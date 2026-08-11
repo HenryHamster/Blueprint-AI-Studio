@@ -13621,9 +13621,63 @@ def test_every_script_test_is_rostered_or_has_a_written_exemption():
         "CI script exemptions name missing files: "
         + ", ".join(sorted(set(exemptions) - on_disk))
     )
-    assert not roster & set(exemptions), (
-        "CI script files cannot be both executed and exempted: "
-        + ", ".join(sorted(roster & set(exemptions)))
+    # A capability exemption is intentionally also a roster entry: it is
+    # collected when that capability is present and skipped only otherwise.
+    assert set(exemptions) <= roster
+
+
+def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path):
+    """Docker-less standalone execution must not silently drop roster entries."""
+    harness = _script_test_harness()
+    roster, exemptions = _parse_script_test_roster(harness)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log_path = tmp_path / "python-argv.log"
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ROSTER_PROBE_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_docker.chmod(0o755)
+
+    env = os.environ.copy()
+    env.pop("CI", None)
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "ROSTER_PROBE_LOG": str(log_path),
+            "TESTMON_NO_FETCH": "1",
+            "ALLOW_LOW_MEM": "1",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(harness), "--standalone", "--no-postgres"],
+        cwd=harness.parent.parent / "backend",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+    pytest_commands = [
+        line for line in log_path.read_text(encoding="utf-8").splitlines()
+        if "-m pytest" in line
+    ]
+    assert pytest_commands, "standalone harness did not invoke pytest"
+    invoked = "\n".join(pytest_commands)
+    expected = roster - set(exemptions)
+    missing = sorted(
+        name for name in expected if f"../scripts/{name}" not in invoked
+    )
+    assert not missing, (
+        "Docker-less standalone execution omitted non-exempt roster entries: "
+        + ", ".join(missing)
     )
 
 
@@ -13680,10 +13734,12 @@ def test_dark_test_detector_requires_a_marker_for_intentional_zero_tests(
     assert _test_module_has_executing_tests(real)
 
 
-def test_script_roster_expands_only_with_an_executing_capability():
-    """Host-only suites must not be claimed by a Docker-less smoke run."""
+def test_script_roster_selection_uses_capability_not_ci_marker():
+    """The standalone roster must use Docker capability, never CI labeling."""
     source = _script_test_harness().read_text(encoding="utf-8")
+    assert 'for script_test in "${CI_SCRIPT_TEST_ROSTER[@]}"; do' in source
     assert (
-        'if [ "$USE_DOCKER" = "1" ] || [ "${CI:-}" = "true" ]'
-        ' || [ "${CI:-}" = "1" ]; then'
+        'if [ "$script_test_exempt" = "1" ] && [ "$USE_DOCKER" != "1" ]; then'
     ) in source
+    assert '"${CI:-}" = "true"' not in source
+    assert '"${CI:-}" = "1"' not in source

@@ -537,10 +537,15 @@ CI_SCRIPT_TEST_ROSTER=(
   test_walkthrough_stack.py
 )
 
-# No current script suite is exempted. If a future suite is genuinely not
-# executable in CI, add one filename|reason entry and keep it individually
-# justified; the compliance gate rejects silent omissions and stale entries.
-CI_SCRIPT_TEST_EXEMPTIONS=()
+# Entries in this list need a capability that the Docker-less standalone lane
+# does not provide. They remain in the CI roster and are collected when the
+# Docker capability is present; the reason makes a local omission reviewable.
+CI_SCRIPT_TEST_EXEMPTIONS=(
+  "test_blueprint_cli.py|requires Blueprint operator API configuration and control-plane network"
+  "test_blueprint_node.py|requires a root-owned system Python and systemd deployment host"
+  "test_local_postgres_cutover_integration.py|requires a Docker daemon and two real PostgreSQL containers"
+  "test_local_runner.py|requires an enrolled local runner and its host services"
+)
 
 STANDALONE_SCRIPT_TEST_ARGS=()
 STANDALONE_RELEASE_TEST_ARGS=()
@@ -550,17 +555,23 @@ else
   # Docker-less local runs are rooted at the checkout, not the /repo bind mount.
   SCRIPT_TEST_ROOT=../scripts
 fi
-# Expand the script corpus only when the executing capability is present. A
-# Docker-less standalone smoke run still executes the backend invariant corpus
-# and the bootstrap release tests, while the deployment-host suites run in the
-# Docker-backed CI lane (or an explicitly CI-marked local run). This is a
-# capability boundary, not a test skip: every file remains classified by the
-# roster tripwire below and is collected by the executing lane that can run it.
+# Expand the script corpus by capability. Every roster entry is collected in
+# the standalone lane unless its written exemption names a capability absent
+# from this invocation. CI is deliberately not part of this decision: a
+# Docker-less CI-marked run has the same capabilities as any other Docker-less
+# run, and the roster tripwire below makes omissions fail closed.
 for script_test in "${CI_SCRIPT_TEST_ROSTER[@]}"; do
-  if [ "$USE_DOCKER" = "1" ] || [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
-    [ "$script_test" = "test_bootstrap_local_app_release.py" ] && continue
-    STANDALONE_SCRIPT_TEST_ARGS+=("$SCRIPT_TEST_ROOT/$script_test")
+  script_test_exempt=0
+  for exemption in "${CI_SCRIPT_TEST_EXEMPTIONS[@]}"; do
+    [ "${exemption%%|*}" = "$script_test" ] || continue
+    script_test_exempt=1
+    break
+  done
+  if [ "$script_test_exempt" = "1" ] && [ "$USE_DOCKER" != "1" ]; then
+    continue
   fi
+  [ "$script_test" = "test_bootstrap_local_app_release.py" ] && continue
+  STANDALONE_SCRIPT_TEST_ARGS+=("$SCRIPT_TEST_ROOT/$script_test")
 done
 if [ "$USE_DOCKER" = "1" ]; then
   STANDALONE_RELEASE_TEST_ARGS+=("$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py")
