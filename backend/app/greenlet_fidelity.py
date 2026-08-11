@@ -140,10 +140,10 @@ ROLLBACK_FLOW_ALLOWLIST: frozenset[str] = frozenset({
     #     post-try code at L4624 (_runtime_config dict write) is only reached when
     #     the commit succeeded (no rollback occurred on that path).
     "metrics_integrity_sweep.py::check_capability_proof_gate_auto_graduation",
-    # session.rollback() at task_completion.py::_handle_design_doc_completion
-    # is immediately followed by lock_project_then_task(), which refetches
-    # both ORM rows before any recovery reads or writes; the scanner cannot
-    # trace that canonical pair-locking helper.
+    # The Phase-2 recovery path at task_completion.py:L5316 immediately
+    # re-fetches the Project -> Task pair through lock_project_then_task after
+    # rollback before reading either ORM instance; the scanner cannot follow
+    # that helper-mediated refetch.
     "task_completion.py::_handle_design_doc_completion",
 })
 
