@@ -50,6 +50,10 @@ _RELEASE_SERVICE = Path("/etc/systemd/system/blueprint-release.service")
 _RELEASE_SOCKET_UNIT = Path("/etc/systemd/system/blueprint-release.socket")
 _RELEASE_SHIM = Path("/usr/local/sbin/blueprint-release")
 _LEGACY_RELEASE_SUDOERS = Path("/etc/sudoers.d/blueprint-release")
+# Keep the socket client and root executor alive for the same complete,
+# synchronous activation envelope.  See blueprint.py for the budget's
+# component waits and margin.
+_RELEASE_ACTIVATION_TIMEOUT_SECONDS = 1200
 _NODE_ROOT = Path("/etc/blueprint/nodes")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _EDGE_ENTRYPOINT_RE = re.compile(
@@ -429,7 +433,8 @@ def _release_service_unit() -> bytes:
         b"Type=oneshot\n"
         b"User=root\n"
         b"NoNewPrivileges=no\n"
-        b"ExecStart=/usr/local/sbin/blueprint-release --serve\n"
+        + f"TimeoutStartSec={_RELEASE_ACTIVATION_TIMEOUT_SECONDS}s\n".encode()
+        + b"ExecStart=/usr/local/sbin/blueprint-release --serve\n"
     )
 
 

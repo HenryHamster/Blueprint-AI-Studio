@@ -1856,6 +1856,40 @@ async def test_admin_ui_task_dispatch_requires_viewport_capable_runner(db_sessio
     assert task.vm_instance_id == f"runner:{capable.id}"
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "admin-ui/src/components/Widget.tsx",
+        "admin-ui/package.json",
+        "admin-ui/package-lock.json",
+        "admin-ui/vite.config.ts",
+        "admin-ui/vitest.config.ts",
+        "admin-ui/vitest.viewport.config.ts",
+        "admin-ui/eslint.config.js",
+        "admin-ui/eslint-rules/no-browser-bypass.ts",
+    ],
+)
+def test_admin_ui_runtime_paths_require_browser_runner(path):
+    from app.orchestrator_runner_dispatch import _paths_require_browser
+
+    assert _paths_require_browser([path]) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "admin-ui/public/logo.svg",
+        "admin-ui/README.md",
+        "admin-ui/srcx/not-source.ts",
+        "backend/app/compute.py",
+    ],
+)
+def test_unrelated_paths_do_not_require_browser_runner(path):
+    from app.orchestrator_runner_dispatch import _paths_require_browser
+
+    assert _paths_require_browser([path]) is False
+
+
 @pytest.mark.asyncio
 async def test_pull_time_browser_backstop_uses_context_only_requirement(
     client: AsyncClient, db_session
@@ -1951,7 +1985,7 @@ async def test_viewport_block_retries_when_capable_runner_appears(monkeypatch):
         first_payload={"type": "refactor"},
         context={
             "blocker": {"source": "agent"},
-            "related_files": ["admin-ui/src/components/Widget.tsx"],
+            "related_files": ["admin-ui/vitest.viewport.config.ts"],
         },
     )
 

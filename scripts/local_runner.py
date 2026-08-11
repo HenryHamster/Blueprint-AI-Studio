@@ -159,6 +159,58 @@ import walkthrough_stack as wts
 # ── Configuration ────────────────────────────────────────────────────────────
 
 _verification_toolchain: "iso.VerificationToolchain | None" = None
+_verification_toolchain_lock = threading.Lock()
+_VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS = 300.0
+
+
+class _VerificationToolchainState:
+    """Thread-safe report holder shared by recovery and heartbeat threads."""
+
+    def __init__(self, report: dict):
+        self._lock = threading.Lock()
+        self._report = report
+        self._recovery_in_progress = False
+
+    def report(self) -> dict:
+        with self._lock:
+            return dict(self._report)
+
+    def ready(self) -> bool:
+        with self._lock:
+            return self._report.get("ready") is True
+
+    def begin_recovery(self) -> bool:
+        with self._lock:
+            if self._report.get("ready") is True or self._recovery_in_progress:
+                return False
+            self._recovery_in_progress = True
+            return True
+
+    def end_recovery(self) -> None:
+        with self._lock:
+            self._recovery_in_progress = False
+
+    def publish(self, toolchain: "iso.VerificationToolchain", report: dict) -> None:
+        global _verification_toolchain
+        with _verification_toolchain_lock:
+            with self._lock:
+                self._report = report
+                _verification_toolchain = toolchain
+
+
+def _set_verification_toolchain(toolchain: "iso.VerificationToolchain | None") -> None:
+    global _verification_toolchain
+    with _verification_toolchain_lock:
+        _verification_toolchain = toolchain
+
+
+def _current_verification_toolchain() -> "iso.VerificationToolchain | None":
+    with _verification_toolchain_lock:
+        return _verification_toolchain
+
+
+def _verification_recovery_due(last_attempt_at: float, now: float) -> bool:
+    return now - last_attempt_at >= _VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS
 
 
 def _verification_toolchain_root() -> str:
@@ -4001,6 +4053,7 @@ def _heartbeat_loop(
     agent_image: str | None = None,
     live_config: "_LiveRunnerConfig | None" = None,
     project_verification: dict | None = None,
+    verification_state: _VerificationToolchainState | None = None,
     resource_ledger: "_ResourceLedger | None" = None,
     gpu_state: dict | None = None,
 ) -> None:
@@ -4015,6 +4068,7 @@ def _heartbeat_loop(
     # describe shell-out) and send it on every heartbeat so the fleet view can show
     # which build each device runs. Best-effort: None when git/the repo is absent.
     version = _runner_version()
+    checkout_sha = _clean_source_sha(version)
     consecutive_401 = 0
     consecutive_network_failures = 0
     next_auto_update_attempt_at = 0.0
@@ -4250,7 +4304,7 @@ def _heartbeat_loop(
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
                 "version": version,
-                "git_sha": _clean_source_sha(version),
+                "git_sha": checkout_sha,
                 "isolation_backends": isolation_backends,
                 "container_gpu_passthrough": (
                     caps.container_gpu_passthrough if caps is not None else None
@@ -4302,8 +4356,13 @@ def _heartbeat_loop(
             }
             if container_images_present is not None:
                 body["container_images_present"] = container_images_present
-            if project_verification is not None:
-                body["project_verification"] = project_verification
+            current_project_verification = (
+                verification_state.report()
+                if verification_state is not None
+                else project_verification
+            )
+            if current_project_verification is not None:
+                body["project_verification"] = current_project_verification
             # Per-GPU VRAM (probe failure ⇒ fields omitted entirely, matching
             # the schema's absent-tolerant contract for old runners).
             if gpu_memory is not None:
@@ -7735,6 +7794,57 @@ def _earn_project_verification(
         }
 
 
+def _recover_verification_toolchain_once(
+    state: _VerificationToolchainState,
+    caps: "iso.Capabilities",
+    agent_binary: list[str] | None,
+    agent_image: str | None,
+) -> bool:
+    """Attempt one fail-closed recovery, publishing only a complete proof."""
+    if not state.begin_recovery():
+        return state.ready()
+    try:
+        toolchain = _bootstrap_verification_toolchain()
+        if toolchain is None:
+            return False
+        report = _earn_project_verification(caps, agent_binary, agent_image, toolchain)
+        if not isinstance(report, dict) or report.get("ready") is not True:
+            return False
+        state.publish(toolchain, report)
+        print("[runner] verification toolchain recovered; project verification is ready", flush=True)
+        return True
+    except Exception as exc:  # noqa: BLE001 — recovery must never affect availability
+        print(f"[runner] verification toolchain recovery failed: {str(exc)[:700]}", flush=True)
+        return False
+    finally:
+        state.end_recovery()
+
+
+def _verification_toolchain_recovery_loop(
+    state: _VerificationToolchainState,
+    caps: "iso.Capabilities",
+    agent_binary: list[str] | None,
+    agent_image: str | None,
+) -> None:
+    """Retry an unavailable verification proof without blocking heartbeats."""
+    last_attempt_at = time.monotonic()
+    while not _shutdown_event.is_set() and not state.ready():
+        now = time.monotonic()
+        remaining = max(
+            0.0,
+            _VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS
+            - (now - last_attempt_at),
+        )
+        if _verification_recovery_due(last_attempt_at, now):
+            remaining = 0.0
+        if _shutdown_event.wait(remaining):
+            return
+        if state.ready():
+            return
+        last_attempt_at = time.monotonic()
+        _recover_verification_toolchain_once(state, caps, agent_binary, agent_image)
+
+
 def _preflight(
     orchestrator_url: str,
     token: str,
@@ -7787,6 +7897,7 @@ def _preflight(
 
     gpu_caps = _detect_gpu()
     preflight_version = _runner_version()
+    checkout_sha = _clean_source_sha(preflight_version)
 
     # Orchestrator / token ping (the token validation).
     heartbeat_body = {
@@ -7803,7 +7914,7 @@ def _preflight(
         "supported_agent_task_types": supported_agent_task_types,
         "hostname": hostname,
         "version": preflight_version,
-        "git_sha": _clean_source_sha(preflight_version),
+        "git_sha": checkout_sha,
         # Isolation-backend inventory + selected backends so `--check`
         # populates the fleet view the same way the running heartbeat does.
         "isolation_backends": iso.capabilities_inventory(caps),
@@ -8360,7 +8471,7 @@ def _spawn_agent_task(
         source_env=dict(os.environ),
         task_type=task_type,
         agent_image=plan_image,
-        verification_toolchain=verification_toolchain or _verification_toolchain,
+        verification_toolchain=verification_toolchain or _current_verification_toolchain(),
     )
     if plan.declined:
         return _decline(plan.decline_reason or "sandbox plan declined")
@@ -8599,8 +8710,8 @@ def main() -> None:
         # agent_image kept as-is; the fail-closed image-present check below applies.
 
     caps = _get_capabilities()
-    global _verification_toolchain
-    _verification_toolchain = _bootstrap_verification_toolchain()
+    initial_verification_toolchain = _bootstrap_verification_toolchain()
+    _set_verification_toolchain(initial_verification_toolchain)
 
     # FAIL-CLOSED image check (Fix 3): a docker-usable box with BLUEPRINT_AGENT_IMAGE
     # set but the image ABSENT would still advertise agent_available=True and drain
@@ -8645,8 +8756,9 @@ def main() -> None:
     # and compute availability: read-only work and compute stay claimable when
     # Ruff or Docker/Postgres verification is unavailable.
     project_verification = _earn_project_verification(
-        caps, agent_binary, agent_image, _verification_toolchain
+        caps, agent_binary, agent_image, initial_verification_toolchain
     )
+    verification_state = _VerificationToolchainState(project_verification)
 
     # LOUD warning (Fix 2): a docker-only box (docker + agent image usable, but NO
     # bwrap) can run ONLY the read-only agent slice (iso.AGENT_DOCKER_TYPES). The
@@ -8721,6 +8833,14 @@ def main() -> None:
         )
         if _shutdown_event.is_set():
             return
+
+    if not verification_state.ready():
+        threading.Thread(
+            target=_verification_toolchain_recovery_loop,
+            args=(verification_state, caps, agent_binary, agent_image),
+            name="blueprint-verification-recovery",
+            daemon=True,
+        ).start()
 
     # A 401 is NOT fatal (the row may be inactive and the heartbeat re-arms it)
     # — mirrors the prior behavior. Other reachable rejection responses retain
@@ -8827,6 +8947,7 @@ def main() -> None:
             # config block and echoes applied-vs-pending back.
             "live_config": live_config,
             "project_verification": project_verification,
+            "verification_state": verification_state,
             "resource_ledger": resource_ledger,
             "gpu_state": gpu_state,
         },

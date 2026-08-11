@@ -151,6 +151,79 @@ class TestVerificationToolchain(unittest.TestCase):
             self.assertEqual(toolchain.python_path, os.path.join(root, "venv", "bin", "python"))
 
 
+class TestVerificationToolchainRecovery(unittest.TestCase):
+    def setUp(self):
+        self._old_toolchain = local_runner._verification_toolchain
+        local_runner._verification_toolchain = None
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._verification_toolchain = self._old_toolchain
+        local_runner._shutdown_event.clear()
+
+    @staticmethod
+    def _report(*, ready, reason):
+        return {
+            "version": 1,
+            "boundary": {"class": "agent", "backend": "bwrap"},
+            "ready": ready,
+            "reason": reason,
+            "probes": {},
+        }
+
+    def test_recovery_is_due_only_after_bounded_cadence(self):
+        cadence = local_runner._VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS
+        self.assertFalse(local_runner._verification_recovery_due(10.0, 10.0 + cadence - 0.01))
+        self.assertTrue(local_runner._verification_recovery_due(10.0, 10.0 + cadence))
+
+    def test_transient_failure_then_success_publishes_report_and_spawn_toolchain(self):
+        state = local_runner._VerificationToolchainState(
+            self._report(ready=False, reason="bootstrap failed")
+        )
+        toolchain = iso.VerificationToolchain("/runner/venv/bin/python", "/runner/pg/bin")
+        ready_report = self._report(ready=True, reason=None)
+        with patch.object(local_runner, "_bootstrap_verification_toolchain", side_effect=[None, toolchain]), \
+             patch.object(local_runner, "_earn_project_verification", return_value=ready_report):
+            self.assertFalse(local_runner._recover_verification_toolchain_once(
+                state, _bwrap_caps(), ["node", "/agent/dist/index.js"], None
+            ))
+            self.assertTrue(local_runner._recover_verification_toolchain_once(
+                state, _bwrap_caps(), ["node", "/agent/dist/index.js"], None
+            ))
+
+        self.assertEqual(state.report(), ready_report)
+        self.assertIs(local_runner._current_verification_toolchain(), toolchain)
+
+    def test_failed_recovery_preserves_fail_closed_report_and_availability_state(self):
+        report = self._report(ready=False, reason="temporary network failure")
+        state = local_runner._VerificationToolchainState(report)
+        with patch.object(local_runner, "_bootstrap_verification_toolchain", return_value=None):
+            self.assertFalse(local_runner._recover_verification_toolchain_once(
+                state, _bwrap_caps(), ["node", "/agent/dist/index.js"], None
+            ))
+        self.assertEqual(state.report(), report)
+        self.assertIsNone(local_runner._current_verification_toolchain())
+
+    def test_recovered_toolchain_is_used_by_later_spawn(self):
+        state = local_runner._VerificationToolchainState(self._report(ready=True, reason=None))
+        toolchain = iso.VerificationToolchain("/runner/venv/bin/python", "/runner/pg/bin")
+        state.publish(toolchain, state.report())
+        plan = iso.ExecutionPlan(backend=iso.BACKEND_BWRAP, argv=["bwrap"])
+        process = MagicMock(pid=123, stdout=io.BytesIO(b""))
+        with patch.object(local_runner.iso, "decide_agent_backend", return_value=iso.BACKEND_BWRAP), \
+             patch.object(local_runner.iso, "plan_agent_execution", return_value=plan) as planner, \
+             patch.object(local_runner.subprocess, "Popen", return_value=process):
+            self.assertTrue(local_runner._spawn_agent_task(
+                task_id="recovered-task", task_type="fix", agent_token="token",
+                vm_instance_id="runner", orchestrator_url="https://api",
+                workspace="/tmp/ws", caps=_bwrap_caps(),
+                agent_binary=["node", "/agent/dist/index.js"], agent_image=None,
+                active_tasks={}, agent_started_at={}, agent_teardown={},
+                lock=threading.Lock(),
+            ))
+        self.assertIs(planner.call_args.kwargs["verification_toolchain"], toolchain)
+
+
 def _healthy_llm_clis():
     return {
         "claude": {
@@ -4022,6 +4095,32 @@ class TestGpuDetection(unittest.TestCase):
         self.assertEqual(body["agent_backend"], iso.BACKEND_BWRAP)
         self.assertEqual(body["compute_backend"], iso.BACKEND_BWRAP)
 
+    def test_heartbeat_reports_full_checkout_sha(self):
+        posted_bodies = []
+        checkout_sha = "b" * 40
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v22-abc"), \
+                 patch.object(local_runner, "_checkout_source_sha", return_value=checkout_sha):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    {},
+                    threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(posted_bodies[0]["git_sha"], checkout_sha)
+
     def test_isolation_fields_none_when_caps_absent(self):
         """caps=None (an old caller) → the three isolation fields serialize as
         None so the heartbeat is non-breaking and the backend tolerates them."""
@@ -4092,7 +4191,7 @@ class TestGpuDetection(unittest.TestCase):
                     threading.Lock(),
                     {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
                     caps=_bwrap_caps(),
-                    project_verification=verification,
+                    verification_state=local_runner._VerificationToolchainState(verification),
                 )
         finally:
             local_runner._shutdown_event.clear()
@@ -5236,6 +5335,39 @@ class TestFunctionalProbes(unittest.TestCase):
         fake.stdout = "   \n"
         with patch("subprocess.run", return_value=fake):
             self.assertIsNone(local_runner._runner_version())
+
+    def test_checkout_source_sha_returns_full_head_sha(self):
+        sha = "a" * 40
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = sha + "\n"
+        with patch("subprocess.run", return_value=fake) as run:
+            self.assertEqual(
+                local_runner._clean_source_sha("v22-15-gabc1234"), sha
+            )
+        self.assertEqual(run.call_args.args[0], ["git", "rev-parse", "HEAD"])
+
+    def test_checkout_source_sha_rejects_dirty_checkout(self):
+        with patch("subprocess.run") as run:
+            self.assertIsNone(
+                local_runner._clean_source_sha("v22-15-gabc1234-dirty")
+            )
+        run.assert_not_called()
+
+    def test_checkout_source_sha_rejects_unavailable_checkout(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertIsNone(
+                local_runner._clean_source_sha("v22-15-gabc1234")
+            )
+
+    def test_checkout_source_sha_rejects_short_head_sha(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "abc1234\n"
+        with patch("subprocess.run", return_value=fake):
+            self.assertIsNone(
+                local_runner._clean_source_sha("v22-15-gabc1234")
+            )
 
     def test_agent_binary_checkout_sha_returns_full_sha_from_entry_directory(self):
         sha = "9" * 40
@@ -7792,8 +7924,10 @@ class TestConcurrencyPresetMismatch(_LocalRunnerTestCase):
             captured["body"] = body
             return 200, {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}
 
+        checkout_sha = "c" * 40
         with patch.object(local_runner, "_post", side_effect=fake_post), \
-             patch.object(local_runner, "_workspace_writable", return_value=True):
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(local_runner, "_checkout_source_sha", return_value=checkout_sha):
             local_runner._preflight(
                 "https://api.example.com", "tok", None,
                 _bwrap_caps(), _gpu_state(()), 2, 2,
@@ -7802,6 +7936,7 @@ class TestConcurrencyPresetMismatch(_LocalRunnerTestCase):
         self.assertIn("body", captured)
         self.assertFalse(captured["body"]["active_work_report"])
         self.assertEqual(captured["body"]["active_task_ids"], [])
+        self.assertEqual(captured["body"]["git_sha"], checkout_sha)
 
     def test_no_warn_only_mismatch_path(self):
         """main() no longer emits the warn-only "disagrees" advisory when the env

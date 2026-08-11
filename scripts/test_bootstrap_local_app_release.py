@@ -449,6 +449,10 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         socket = bootstrap._release_socket_unit("henry_hamster").decode()
         self.assertIn("User=root", service)
         self.assertIn("ExecStart=/usr/local/sbin/blueprint-release --serve", service)
+        self.assertIn(
+            "TimeoutStartSec=1200s",
+            service,
+        )
         self.assertIn("ListenStream=/run/blueprint-release.sock", socket)
         self.assertIn("SocketGroup=henry_hamster", socket)
         self.assertIn("SocketMode=0660", socket)

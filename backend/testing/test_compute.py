@@ -66,6 +66,7 @@ from app.models import (
     Project,
     ReleaseDeployArtifact,
     ReleaseVersion,
+    RunnerProjectBinding,
     Task,
     TaskHistory,
     TaskStatus,
@@ -501,6 +502,36 @@ async def test_fleet_serving_source_sha_rejects_local_runner_on_different_sha(
 
 
 @pytest.mark.asyncio
+async def test_fleet_serving_source_sha_ignores_legacy_abbreviated_runner_sha(
+    db_session,
+):
+    """A legacy short runner identity is unobservable, not a serving mismatch."""
+    promoted_sha = "a" * 40
+    project = Project(name="Legacy runner identity", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add(
+        LocalRunner(
+            project_id=project.id,
+            token_hash="2" * 64,
+            status="active",
+            last_seen_at=_utcnow(),
+            source_sha=promoted_sha[:7],
+        )
+    )
+    await db_session.commit()
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            db_session,
+            promoted_sha,
+            project_id=project.id,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_fleet_serving_source_sha_accepts_descendant_when_enabled(
     monkeypatch, mocker
 ):
@@ -655,6 +686,79 @@ async def test_fleet_serving_source_sha_ignores_inactive_and_other_project_runne
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_bound_runner_is_visible_to_serving_gate_and_snapshot(gcp_cleanup_db):
+    """A live runner explicitly bound to a project appears in both fleet paths."""
+    promoted_sha = "b" * 40
+    project = Project(name="Bound runner target", user_id="user-1")
+    enrollment_project = Project(name="Bound runner enrollment", user_id="user-2")
+    gcp_cleanup_db.add_all([project, enrollment_project])
+    await gcp_cleanup_db.commit()
+    await gcp_cleanup_db.refresh(project)
+    await gcp_cleanup_db.refresh(enrollment_project)
+
+    runner = LocalRunner(
+        project_id=enrollment_project.id,
+        token_hash="f" * 64,
+        status="active",
+        last_seen_at=_utcnow(),
+        agent_source_sha=promoted_sha,
+    )
+    gcp_cleanup_db.add(runner)
+    await gcp_cleanup_db.commit()
+    await gcp_cleanup_db.refresh(runner)
+    gcp_cleanup_db.add(
+        RunnerProjectBinding(runner_id=runner.id, project_id=project.id)
+    )
+    await gcp_cleanup_db.commit()
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            gcp_cleanup_db,
+            promoted_sha,
+            project_id=str(project.id),
+        )
+        is True
+    )
+
+    snapshot = await compute.agent_fleet_source_sha_snapshot(
+        gcp_cleanup_db, project.id
+    )
+    assert snapshot["total_observed"] == 1
+    assert snapshot["buckets"][0]["source_sha"] == promoted_sha
+    assert snapshot["buckets"][0]["runner_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_fleet_source_sha_snapshot_falls_back_to_runner_source_sha(
+    gcp_cleanup_db,
+):
+    """The snapshot exposes the runner identity when heartbeat SHA is absent."""
+    project = Project(name="Runner source fallback", user_id="user-1")
+    gcp_cleanup_db.add(project)
+    await gcp_cleanup_db.commit()
+    await gcp_cleanup_db.refresh(project)
+
+    source_sha = "d" * 40
+    gcp_cleanup_db.add(
+        LocalRunner(
+            project_id=project.id,
+            token_hash="1" * 64,
+            status="active",
+            last_seen_at=_utcnow(),
+            source_sha=source_sha,
+        )
+    )
+    await gcp_cleanup_db.commit()
+
+    snapshot = await compute.agent_fleet_source_sha_snapshot(
+        gcp_cleanup_db, project.id
+    )
+    assert snapshot["unknown_count"] == 0
+    assert snapshot["buckets"][0]["source_sha"] == source_sha
+    assert snapshot["buckets"][0]["runner_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -5506,9 +5610,10 @@ async def test_live_proof_compute_job_records_serving_evidence_and_idempotency(
     assert evidence["release_version_number"] == 7
     assert evidence["promoted_sha"] == "def456"
     assert evidence["aggregate_serving_status"] == "serving_confirmed"
-    # promotion_merge is also a registered required provider; it appears vacuous
-    # (serving_status=None) when the test project has no GitHub config.
-    assert {"backend_revision", "agent_image"}.issubset(
+    # agent_image is operator-visible but deliberately non-required for the
+    # aggregate serving decision; promotion_merge is vacuous without GitHub
+    # configuration. The backend revision is the required evidence here.
+    assert {"backend_revision"}.issubset(
         {artifact["artifact_kind"] for artifact in evidence["required_artifacts"]}
     )
 
@@ -8338,4 +8443,3 @@ async def test_build_launch_spec_declared_metric_none_when_absent(db_session, mo
 
     spec = compute_jobs._build_launch_spec(job)
     assert spec.declared_metric is None
-

@@ -730,6 +730,17 @@ async def _load_runner_active_task_counts(
 _BROWSER_EVIDENCE_KINDS = frozenset(
     {"browser", "playwright", "screenshot", "viewport", "visual"}
 )
+_BROWSER_RUNTIME_PATHS = frozenset(
+    {
+        "admin-ui/package.json",
+        "admin-ui/package-lock.json",
+        "admin-ui/vite.config.ts",
+        "admin-ui/vitest.config.ts",
+        "admin-ui/vitest.viewport.config.ts",
+        "admin-ui/eslint.config.js",
+    }
+)
+_BROWSER_RUNTIME_PREFIXES = ("admin-ui/src/", "admin-ui/eslint-rules/")
 
 
 def _paths_require_browser(paths: object) -> bool:
@@ -737,7 +748,11 @@ def _paths_require_browser(paths: object) -> bool:
     if not isinstance(paths, (list, tuple, set)):
         return False
     return any(
-        isinstance(path, str) and path.startswith("admin-ui/src/")
+        isinstance(path, str)
+        and (
+            path.startswith(_BROWSER_RUNTIME_PREFIXES)
+            or path in _BROWSER_RUNTIME_PATHS
+        )
         for path in paths
     )
 

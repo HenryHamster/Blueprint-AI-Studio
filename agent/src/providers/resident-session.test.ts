@@ -31,6 +31,7 @@ vi.mock('../index.js', () => ({
   sanitize: vi.fn((s: string) => s),
   recordLlmCallStart: vi.fn(),
   recordLlmTokens: vi.fn(),
+  recordProviderReportedUsage: vi.fn(),
   recordNumTurns: vi.fn(),
 }));
 
@@ -83,7 +84,10 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import { startResidentClaudeSession } from './resident-session.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
-import { normalizeClaudeConfigContent, recordLlmTokens, recordNumTurns } from '../index.js';
+import {
+  normalizeClaudeConfigContent, recordLlmTokens, recordProviderReportedUsage,
+  recordNumTurns,
+} from '../index.js';
 import { encodeUserTurnBlocks } from './resident-stream.js';
 import {
   probeClaudeCapabilities, stripUnsupportedClaudeOptionalArgs,
@@ -671,15 +675,23 @@ describe('startResidentClaudeSession', () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
     vi.mocked(recordLlmTokens).mockClear();
+    vi.mocked(recordProviderReportedUsage).mockClear();
     const session = startResidentClaudeSession({});
     const turn = session.sendTurn('q');
     ctl.pushLine({
       type: 'result', result: 'a',
-      usage: { input_tokens: 50, output_tokens: 20, cache_read_input_tokens: 5 },
+      usage: {
+        input_tokens: 50,
+        output_tokens: 20,
+        cache_creation_input_tokens: 10,
+        cache_read_input_tokens: 5,
+      },
     });
     await turn;
-    // inputTokens folds in the cache classes: 50 + 0 + 5 = 55.
-    expect(recordLlmTokens).toHaveBeenCalledWith(55, 20, 0, 5);
+    // The normalized path folds in cache classes: 50 + 10 + 5 = 65.
+    expect(recordLlmTokens).toHaveBeenCalledWith(65, 20, 10, 5);
+    // The reconciliation path preserves the provider's raw four-field split.
+    expect(recordProviderReportedUsage).toHaveBeenCalledWith(50, 20, 10, 5);
     session.close();
   });
 

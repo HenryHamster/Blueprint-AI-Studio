@@ -5,7 +5,8 @@ import path from 'path';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import {
   WORKSPACE, getAgentToken, log, normalizeClaudeConfigContent,
-  recordLlmCallStart, recordLlmTokens, recordNumTurns, sanitize,
+  recordLlmCallStart, recordLlmTokens, recordProviderReportedUsage,
+  recordNumTurns, sanitize,
 } from '../index.js';
 import { writeAgentTokenFile } from '../token-file.js';
 import { PROCESS_KILL_GRACE_MS } from '../constants.js';
@@ -726,6 +727,20 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         // a swallowed stale one — the tokens were still spent) so a multi-hour
         // session reports real totals instead of 1 call / 0 tokens.
         if (ev.usage) {
+          // The resident stream exposes normalized inclusive input totals, so
+          // reconstruct the raw provider split before recording the independent
+          // reconciliation probe.
+          recordProviderReportedUsage(
+            Math.max(
+              ev.usage.inputTokens
+                - ev.usage.cacheCreationTokens
+                - ev.usage.cacheReadTokens,
+              0,
+            ),
+            ev.usage.outputTokens,
+            ev.usage.cacheCreationTokens,
+            ev.usage.cacheReadTokens,
+          );
           recordLlmTokens(
             ev.usage.inputTokens, ev.usage.outputTokens,
             ev.usage.cacheCreationTokens, ev.usage.cacheReadTokens,
