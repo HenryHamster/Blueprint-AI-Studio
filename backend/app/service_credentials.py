@@ -82,6 +82,7 @@ _UUID_PATH_SEGMENT = r"[0-9a-fA-F-]{36}"
 SCOPE_DEFINITIONS: dict[str, list[tuple[str, re.Pattern]]] = {
     # Read-only observation of authorized projects (Hermes observer).
     "observer:read": [
+        ("GET", re.compile(r"^/api/agent-access/v1/me$")),
         # GET /api/admin/projects (admin_projects.py) — lists the CALLER's own
         # projects via a ProjectMember join filtered on current_user["user_id"];
         # membership-scoped, not admin-only. Verified against the live route.
@@ -89,6 +90,27 @@ SCOPE_DEFINITIONS: dict[str, list[tuple[str, re.Pattern]]] = {
         ("GET", re.compile(r"^/api/admin/operator-attention$")),
         ("GET", re.compile(rf"^/api/admin/projects/{_UUID_PATH_SEGMENT}/diagnostics$")),
         ("GET", re.compile(rf"^/api/admin/projects/{_UUID_PATH_SEGMENT}/resource-summary$")),
+    ],
+    # Read-only project diagnosis for interactive coding agents. This is
+    # deliberately separate from observer:read: task details and operator
+    # messages may contain repository context that a low-context monitoring
+    # bot should not receive. Every route below independently enforces the
+    # credential principal's ProjectMember boundary, and no mutating method is
+    # present in the scope.
+    "coding-agent:read": [
+        ("GET", re.compile(r"^/api/agent-access/v1/me$")),
+        (
+            "GET",
+            re.compile(
+                rf"^/api/agent-access/v1/projects/{_UUID_PATH_SEGMENT}/snapshot$"
+            ),
+        ),
+        ("GET", re.compile(r"^/api/agent-access/v1/tasks$")),
+        (
+            "GET",
+            re.compile(rf"^/api/agent-access/v1/tasks/{_UUID_PATH_SEGMENT}$"),
+        ),
+        ("GET", re.compile(r"^/api/agent-access/v1/messages$")),
     ],
 }
 
@@ -165,6 +187,7 @@ async def authenticate_service_token(
     # best-effort telemetry write so a failed commit cannot break auth itself.
     principal_user_id = cred.principal_user_id
     credential_name = cred.name
+    credential_id = cred.id
     now = _utcnow()
     if cred.last_used_at is None or (now - cred.last_used_at) >= _LAST_USED_UPDATE_INTERVAL:
         try:
@@ -196,4 +219,5 @@ async def authenticate_service_token(
         "email": f"{credential_name}@service.blueprint.local",
         "role": "user",
         "service_credential": credential_name,
+        "service_credential_id": str(credential_id),
     }

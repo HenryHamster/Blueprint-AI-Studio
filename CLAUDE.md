@@ -1,5 +1,12 @@
 # Blueprint AI Studio
 
+## Blueprint Access for Coding Agents
+- These tools are for developer-hosted Codex and Claude sessions. Blueprint task workers are not provisioned with a reusable `bpsc_` credential; they must keep using their task-scoped runtime helpers and token.
+- In a developer host with the Blueprint MCP configured, prefer its tools for operational context. Start with `get_project_snapshot`, then use `list_tasks`, `get_task`, or `list_messages` for bounded drill-down.
+- Never read a repository `.blueprint-config.json`, copy an API key into a prompt, or assemble raw `curl`/heredoc calls when the MCP or operator CLI covers the request.
+- The MCP surface is intentionally read-only. For a human-authorized mutation, use `./blueprint` on Unix or `.\blueprint.ps1` on Windows with an explicitly selected operator `BLUEPRINT_CONFIG` and `--project`/`--project-id`; never reuse `BLUEPRINT_AGENT_CONFIG` for a mutation. Preserve confirmation and idempotency options.
+- See `docs/CODING_AGENT_ACCESS.md` for scoped credential setup and failure semantics.
+
 ## File Restrictions
 - Do NOT modify files in `.github/workflows/` — CI workflows are managed separately and the GitHub App token cannot push workflow changes
 - Do NOT modify **existing** migration files in `backend/alembic/versions/` — applied history is immutable. Adding a new migration file (next revision, chained from the latest `down_revision`) is fine and expected when `models.py` changes; also bump `EXPECTED_SCHEMA_REVISION` in `backend/app/main.py` to match.

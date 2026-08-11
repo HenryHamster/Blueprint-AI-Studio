@@ -15,7 +15,7 @@ with an HTTP 400.
 import pytest
 from httpx import AsyncClient
 
-from app.models import Project, ProjectMember, ProjectStatus
+from app.models import Project, ProjectMember, ProjectStatus, Task, TaskStatus
 
 # Code-producing tasks now require an acceptance_evidence declaration at
 # validation (validate_task_payload). These tests exercise the operator
@@ -397,6 +397,113 @@ async def test_idempotency_key_dedupes_duplicate_submit(
     assert task_id_1 == task_id_2
     # Second response marked as duplicate
     assert resp2.json()["is_duplicate"] is True
+    assert resp2.json()["task_type"] == "create"
+
+
+@pytest.mark.asyncio
+async def test_idempotent_retry_succeeds_after_active_task_cap(
+    client: AsyncClient, db_session
+):
+    """A replay returns its original task even after the project reaches 200 active tasks."""
+    project = await _make_project_with_member(db_session, "acme/widget")
+    key = "retry-at-active-cap"
+    body = {
+        "github_repo": "acme/widget",
+        "project_id": str(project.id),
+        "title": "Already accepted",
+        "prompt": "do something",
+        "task_type": "create",
+        "acceptance_evidence": _CODE_EVIDENCE,
+        "idempotency_key": key,
+    }
+    first = await client.post("/api/admin/tasks", json=body)
+    assert first.status_code == 200, first.text
+
+    db_session.add_all([
+        Task(
+            project_id=project.id,
+            title=f"filler {index}",
+            description="fill the active queue",
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "plan", "prompt": "fill", "base_branch": "main"}],
+            vm_instance_id=f"filler-vm-{index}",
+        )
+        for index in range(199)
+    ])
+    await db_session.commit()
+
+    replay = await client.post("/api/admin/tasks", json=body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    assert replay.json()["is_duplicate"] is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_project_id_targets_exact_duplicate_repo_project(
+    client: AsyncClient, db_session
+):
+    project_a = await _make_project_with_member(db_session, "acme/widget")
+    project_b = await _make_project_with_member(db_session, "acme/widget")
+
+    response = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "project_id": str(project_b.id),
+            "title": "Target B",
+            "prompt": "enqueue on the explicitly selected project",
+            "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["project_id"] == str(project_b.id)
+    assert await _count_tasks(db_session, project_a.id) == 0
+    assert await _count_tasks(db_session, project_b.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_project_id_rejects_repo_mismatch(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_with_member(db_session, "acme/gadget")
+    response = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "project_id": str(project.id),
+            "title": "Mismatched identity",
+            "prompt": "must not enqueue",
+            "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert "not acme/widget" in response.json()["error"]["message"]
+    assert await _count_tasks(db_session, project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_explicit_project_id_enforces_member_role(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_with_member(
+        db_session, "acme/widget", role="viewer"
+    )
+    response = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "project_id": str(project.id),
+            "title": "Viewer cannot enqueue",
+            "prompt": "must not enqueue",
+            "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
+        },
+    )
+    assert response.status_code == 403, response.text
+    assert await _count_tasks(db_session, project.id) == 0
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ Two auth postures are exercised:
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,13 +31,27 @@ from starlette.requests import Request
 
 from app.auth import get_current_user, get_current_user_optional, require_admin
 from app.main import app
-from app.models import Project, ProjectMember, ServiceCredential, _utcnow
+from app.models import (
+    MessageType,
+    Project,
+    ProjectMember,
+    ProjectMessage,
+    ServiceCredential,
+    Task,
+    TaskStatus,
+    _utcnow,
+)
 from app.service_credentials import (
     TOKEN_PREFIX,
     authenticate_service_token,
     hash_service_token,
     mint_service_token,
     request_allowed,
+)
+from app.routers.agent_access import (
+    _project_agent_message_list,
+    _project_agent_task_detail,
+    _project_agent_task_list,
 )
 from testing.factories import make_membership
 
@@ -246,6 +261,677 @@ async def test_service_credential_observer_read_authorized_endpoints(
     assert authorized_item["my_role"] == "viewer"
     assert "env_vars" not in authorized_item["build_config"]
     assert authorized_item["build_config"].get("node_version") == "20"
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_read_scope_is_bounded_introspectable_and_non_mutating(
+    override_get_session, db_session, monkeypatch
+):
+    """The coding-agent scope can drill into its own tasks/messages but cannot
+    cross the ProjectMember boundary or call a mutating task route."""
+    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    authorized = await _make_project(db_session, "Coding agent authorized project")
+    authorized_later = await _make_project(db_session, "ZZ " + ("\x01" * 8_000))
+    foreign = await _make_project(db_session, "Coding agent foreign project")
+    cred, token = await _seed_credential(
+        db_session,
+        name="coding-agent-read",
+        principal_user_id="service:credential:00000000-0000-0000-0000-000000000001",
+        scopes=["coding-agent:read"],
+    )
+    db_session.add(
+        make_membership(authorized.id, user_id=cred.principal_user_id, role="viewer")
+    )
+    db_session.add(
+        make_membership(authorized_later.id, user_id=cred.principal_user_id, role="viewer")
+    )
+    own_task = Task(
+        project_id=authorized.id,
+        title="Own project failure",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.FAILED,
+    )
+    foreign_task = Task(
+        project_id=foreign.id,
+        title="Foreign project failure",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.FAILED,
+        # Deliberately corrupt cross-project linkage: the external projection
+        # must not inherit the admin detail reader's parent-only child query.
+        parent_task_id=own_task.id,
+    )
+    db_session.add_all([own_task, foreign_task])
+    await db_session.commit()
+
+    attention_projection = AsyncMock(
+        return_value={
+            "level": "watch",
+            "summary": "One item",
+            "last_seen_at": None,
+            "counts": {"unread": 1, "blockers": 1},
+            "items": [{"id": "message:test", "unread": True}],
+        }
+    )
+    diagnostics_projection = AsyncMock(
+        return_value={"queued_count": 0, "in_progress_count": 0, "stuck_tasks": []}
+    )
+    resource_projection = AsyncMock(
+        return_value={"runners": {"total": 1, "online": 1, "offline": 0}}
+    )
+    message_projection = AsyncMock(
+        return_value={"unread": 1, "needs_operator": 1, "blocker": 1}
+    )
+    monkeypatch.setattr(
+        "app.routers.agent_access.build_operator_attention", attention_projection
+    )
+    monkeypatch.setattr(
+        "app.routers.agent_access.get_project_diagnostics", diagnostics_projection
+    )
+    monkeypatch.setattr(
+        "app.routers.agent_access.get_project_resource_summary", resource_projection
+    )
+    monkeypatch.setattr(
+        "app.routers.agent_access.get_message_counts", message_projection
+    )
+
+    async with _real_auth_client() as rc:
+        profile = await rc.get(
+            "/api/agent-access/v1/me?limit=1", headers=_auth_header(token)
+        )
+        profile_next = await rc.get(
+            "/api/agent-access/v1/me?limit=1&offset=1", headers=_auth_header(token)
+        )
+        snapshot = await rc.get(
+            f"/api/agent-access/v1/projects/{authorized.id}/snapshot",
+            headers=_auth_header(token),
+        )
+        task_list = await rc.get(
+            f"/api/agent-access/v1/tasks?project_id={authorized.id}&limit=20",
+            headers=_auth_header(token),
+        )
+        raw_task_list = await rc.get(
+            f"/api/admin/tasks?project_id={authorized.id}&limit=20",
+            headers=_auth_header(token),
+        )
+        task_detail = await rc.get(
+            f"/api/agent-access/v1/tasks/{own_task.id}",
+            headers=_auth_header(token),
+        )
+        raw_task_detail = await rc.get(
+            f"/api/admin/tasks/{own_task.id}", headers=_auth_header(token)
+        )
+        messages = await rc.get(
+            f"/api/agent-access/v1/messages?project_id={authorized.id}&status=open",
+            headers=_auth_header(token),
+        )
+        raw_messages = await rc.get(
+            f"/api/admin/messages?project_id={authorized.id}&status=open",
+            headers=_auth_header(token),
+        )
+        message_counts = await rc.get(
+            f"/api/admin/messages/counts?project_id={authorized.id}",
+            headers=_auth_header(token),
+        )
+        foreign_detail = await rc.get(
+            f"/api/agent-access/v1/tasks/{foreign_task.id}",
+            headers=_auth_header(token),
+        )
+        foreign_snapshot = await rc.get(
+            f"/api/agent-access/v1/projects/{foreign.id}/snapshot",
+            headers=_auth_header(token),
+        )
+        foreign_task_list = await rc.get(
+            f"/api/agent-access/v1/tasks?project_id={foreign.id}",
+            headers=_auth_header(token),
+        )
+        foreign_messages = await rc.get(
+            f"/api/agent-access/v1/messages?project_id={foreign.id}",
+            headers=_auth_header(token),
+        )
+        mutation = await rc.patch(
+            f"/api/admin/tasks/{own_task.id}",
+            headers=_auth_header(token),
+            json={"status": "QUEUED"},
+        )
+
+    assert profile.status_code == 200, profile.text
+    access = profile.json()
+    assert access["schema_version"] == "blueprint.agent-access.v1"
+    assert access["credential"]["name"] == "coding-agent-read"
+    assert access["credential"]["scopes"] == ["coding-agent:read"]
+    assert access["total"] == 2
+    assert access["has_more"] is True
+    assert access["next_offset"] == 1
+    assert access["projects"] == [
+        {
+            "id": str(authorized.id),
+            "name": authorized.name,
+            "github_owner": authorized.github_owner,
+            "github_repo": authorized.github_repo,
+            "role": "viewer",
+        }
+    ]
+    assert profile_next.status_code == 200, profile_next.text
+    assert profile_next.json()["projects"][0]["id"] == str(authorized_later.id)
+    assert profile_next.json()["has_more"] is False
+    assert profile_next.json()["complete"] is False
+    assert profile_next.json()["truncation"]["item_fields"] is True
+    assert "tasks.read" in access["capabilities"]
+    assert "messages.list" in access["capabilities"]
+
+    assert snapshot.status_code == 200, snapshot.text
+    snapshot_body = snapshot.json()
+    assert snapshot_body["schema_version"] == "blueprint.project-snapshot.v1"
+    assert snapshot_body["complete"] is True
+    assert snapshot_body["project"]["id"] == str(authorized.id)
+    assert snapshot_body["attention"]["level"] == "watch"
+    assert snapshot_body["resources"]["runners"]["online"] == 1
+    assert snapshot_body["message_counts"] == {
+        "needs_operator": 1,
+        "blocker": 1,
+    }
+    assert snapshot_body["attention"]["counts"] == {"blockers": 1}
+    assert snapshot_body["attention"]["items"] == [{"id": "message:test"}]
+    assert "last_seen_at" not in snapshot_body["attention"]
+    assert snapshot_body["read_state"]["tracked"] is False
+    assert foreign_snapshot.status_code == 404, foreign_snapshot.text
+
+    assert task_list.status_code == 200, task_list.text
+    task_list_body = task_list.json()
+    assert task_list_body["schema_version"] == "blueprint.agent-tasks.v1"
+    assert task_list_body["project"]["id"] == str(authorized.id)
+    assert task_list_body["limit"] == 20
+    assert task_list_body["offset"] == 0
+    task_ids = {item["id"] for item in task_list_body["tasks"]}
+    assert str(own_task.id) in task_ids
+    assert str(foreign_task.id) not in task_ids
+    assert raw_task_list.status_code == 403, raw_task_list.text
+    assert foreign_task_list.status_code == 404, foreign_task_list.text
+    assert task_detail.status_code == 200, task_detail.text
+    assert task_detail.json()["schema_version"] == "blueprint.agent-task.v1"
+    assert task_detail.json()["task"]["id"] == str(own_task.id)
+    assert str(foreign_task.id) not in task_detail.json()["children"]["ids"]
+    assert raw_task_detail.status_code == 403, raw_task_detail.text
+    assert messages.status_code == 200, messages.text
+    assert messages.json()["schema_version"] == "blueprint.agent-messages.v1"
+    assert messages.json()["project"]["id"] == str(authorized.id)
+    assert raw_messages.status_code == 403, raw_messages.text
+    assert foreign_messages.status_code == 404, foreign_messages.text
+    assert message_counts.status_code == 403, message_counts.text
+    assert foreign_detail.status_code == 404, foreign_detail.text
+    assert mutation.status_code == 403, mutation.text
+
+    attention_projection.assert_awaited_once()
+    diagnostics_projection.assert_awaited_once()
+    resource_projection.assert_awaited_once()
+    message_projection.assert_awaited_once()
+
+    assert not request_allowed(
+        ["observer:read"], "GET", f"/api/admin/tasks/{own_task.id}"
+    )
+    assert request_allowed(
+        ["coding-agent:read"],
+        "GET",
+        f"/api/agent-access/v1/tasks/{own_task.id}",
+    )
+    assert not request_allowed(
+        ["coding-agent:read"], "GET", f"/api/admin/tasks/{own_task.id}"
+    )
+    assert request_allowed(
+        ["coding-agent:read"], "GET", "/api/agent-access/v1/tasks"
+    )
+    assert request_allowed(
+        ["coding-agent:read"], "GET", "/api/agent-access/v1/messages"
+    )
+    assert not request_allowed(
+        ["coding-agent:read"], "GET", "/api/admin/tasks"
+    )
+    assert not request_allowed(
+        ["coding-agent:read"], "GET", "/api/admin/messages"
+    )
+    assert not request_allowed(
+        ["coding-agent:read"], "GET", "/api/admin/messages/counts"
+    )
+    assert not request_allowed(
+        ["coding-agent:read"], "PATCH", f"/api/admin/tasks/{own_task.id}"
+    )
+
+
+def test_coding_agent_task_projection_is_bounded_and_secret_redacted():
+    """The external task contract has hard collection/body limits and applies
+    defense-in-depth redaction beyond the admin payload's top-level filtering."""
+    bearer_secret = "opaque-bearer-value-that-must-not-escape"
+    github_secret = "ghp_" + ("a" * 40)
+    nested_secret = "do-not-expose-nested-secret"
+    registry_secret = "do-not-expose-registry-password"
+    raw_detail = {
+        "id": "00000000-0000-0000-0000-000000000101",
+        "project_id": "00000000-0000-0000-0000-000000000102",
+        "title": "Bounded projection",
+        "description": "Authorization: Bearer " + bearer_secret,
+        "status": "FAILED",
+        "task_type": "fix",
+        "attempt_count": 3,
+        "attempt_number": 8,
+        "payloads": [
+            {
+                "type": "fix",
+                "prompt": f"inspect {github_secret}",
+                "nested": {"api_key": nested_secret},
+                "container_registry_auth": {"password": registry_secret},
+            }
+            for _ in range(8)
+        ],
+        "plan_output": {
+            "summary": "x" * 100_000,
+            "client_secret": nested_secret,
+        },
+        "latest_status_message": "Authorization: Bearer " + bearer_secret,
+        "status_log": [
+            {
+                "index": index,
+                "message": "status " + ("s" * 2_000),
+                "password": nested_secret,
+            }
+            for index in range(90)
+        ],
+        "history": [
+            {
+                "timestamp": f"2026-08-10T00:{index:02d}:00Z",
+                "action": "STATUS_CHANGE",
+                "details": {
+                    "message": "history " + ("h" * 2_000),
+                    "authorization": bearer_secret,
+                },
+            }
+            for index in range(90)
+        ],
+        "artifacts": [
+            {
+                "artifact_type": "ERROR_LOG",
+                "pr_url": (
+                    f"https://example.test/pull/{index}?token={bearer_secret}"
+                ),
+                "commit_hash": f"commit-{index}",
+                "repo_url": "https://example.test/repo.git",
+                "storage_uri": "gs://private-bucket/not-in-projection",
+                "created_at": f"2026-08-10T01:{index:02d}:00Z",
+            }
+            for index in range(80)
+        ],
+        "child_task_ids": [f"child-{index}" for index in range(150)],
+        "child_task_ids_truncated": True,
+        "blocker_kind": "code_failure",
+        "blocked_reason": "Authorization: Bearer " + bearer_secret,
+        "error_logs": ("log\n" * 40_000) + github_secret,
+        "evaluation_summary": {
+            "reason": "Authorization: Bearer " + bearer_secret,
+            "private_key": nested_secret,
+        },
+    }
+
+    projected = _project_agent_task_detail(raw_detail)
+    serialized = json.dumps(projected, ensure_ascii=False)
+
+    assert projected["schema_version"] == "blueprint.agent-task.v1"
+    assert projected["task"]["attempt_count"] == 3
+    assert projected["task"]["attempt_number"] == 8
+    assert len(serialized.encode("utf-8")) <= projected["limits"]["response_bytes"]
+    assert len(projected["payloads"]) <= projected["limits"]["payload_entries"]
+    assert len(projected["status"]["log"]) <= projected["limits"][
+        "status_log_entries"
+    ]
+    assert len(projected["history"]) <= projected["limits"]["history_entries"]
+    assert len(projected["artifacts"]) <= projected["limits"]["artifact_entries"]
+    assert projected["children"]["returned"] <= projected["limits"][
+        "child_task_ids"
+    ]
+    assert projected["status"]["log"][0]["index"] == 40
+    assert projected["artifacts"][0]["commit_hash"] == "commit-30"
+    assert projected["complete"] is False
+    assert all(
+        projected["truncation"][key]
+        for key in (
+            "payloads",
+            "plan_output",
+            "status_log",
+            "history",
+            "artifacts",
+            "children",
+            "failure_evidence",
+        )
+    )
+    assert projected["redaction"]["applied"] is True
+    assert projected["redaction"]["fields_or_values"] > 0
+    for secret in (bearer_secret, github_secret, nested_secret, registry_secret):
+        assert secret not in serialized
+    for sensitive_key in (
+        "api_key",
+        "client_secret",
+        "container_registry_auth",
+        "password",
+        "private_key",
+        "storage_uri",
+    ):
+        assert sensitive_key not in serialized
+
+
+def test_coding_agent_task_projection_redacts_bearer_and_jwt_key_variants():
+    raw_detail = {
+        "id": "00000000-0000-0000-0000-000000000103",
+        "project_id": "00000000-0000-0000-0000-000000000104",
+        "status": "FAILED",
+        "task_type": "fix",
+        "plan_output": {
+            "bearer": "opaque-super-secret",
+            "jwt": "eyJopaque",
+            "nested_bearer": "nested-bearer-secret",
+        },
+        "history": [
+            {
+                "details": {
+                    "bearer": "history-secret",
+                    "jwt_claims": "claims-secret",
+                }
+            }
+        ],
+    }
+
+    projected = _project_agent_task_detail(raw_detail)
+    serialized = json.dumps(projected, ensure_ascii=False)
+
+    assert projected["redaction"]["applied"] is True
+    for secret in (
+        "opaque-super-secret",
+        "eyJopaque",
+        "nested-bearer-secret",
+        "history-secret",
+        "claims-secret",
+    ):
+        assert secret not in serialized
+
+
+def test_coding_agent_task_projection_caps_json_escaped_control_text():
+    control_text = "\x01" * 8_000
+    raw_detail = {
+        "id": "00000000-0000-0000-0000-000000000101",
+        "project_id": "00000000-0000-0000-0000-000000000102",
+        "title": "Escaped control-character budget",
+        "description": control_text,
+        "status": "FAILED",
+        "task_type": "create",
+        "pr_url": control_text,
+        "commit_hash": control_text,
+        "repo_url": control_text,
+        "payloads": [],
+        "status_log": [],
+        "latest_status_message": control_text,
+        "history": [],
+        "artifacts": [],
+        "child_task_ids": [],
+        "blocker_kind": control_text,
+        "blocked_reason": control_text,
+        "park_reason": control_text,
+        "movement_explanation": control_text,
+        "error_logs": control_text,
+        "evaluation_summary": control_text,
+    }
+
+    projected = _project_agent_task_detail(raw_detail)
+    serialized_bytes = len(
+        json.dumps(projected, ensure_ascii=False).encode("utf-8")
+    )
+
+    assert serialized_bytes <= projected["limits"]["response_bytes"]
+    assert projected["truncation"]["response_bytes"] is True
+    assert projected["complete"] is False
+    assert projected["task"]["id"] == raw_detail["id"]
+
+
+def test_coding_agent_task_list_caps_escaped_control_text_and_redacts_secrets():
+    control_text = "\x01" * 8_000
+    secret = "task-list-secret-must-not-escape"
+    project = {
+        "id": "00000000-0000-0000-0000-000000000201",
+        "name": "Bounded task list",
+        "github_owner": "owner",
+        "github_repo": "repo",
+    }
+    raw_response = {
+        "tasks": [
+            {
+                "id": f"00000000-0000-0000-0000-{index:012d}",
+                "project_id": project["id"],
+                "title": control_text,
+                "description": control_text,
+                "status": "FAILED",
+                "task_type": "fix",
+                "attempt_count": 1,
+                "attempt_number": index + 4,
+                "latest_status_message": control_text,
+                "payloads": [{"type": "fix", "api_key": secret}],
+            }
+            for index in range(20)
+        ],
+        "total": 20,
+        "scoped_active_count": 0,
+        "scoped_evaluating_count": 0,
+        "scoped_queued_count": 0,
+    }
+
+    projected = _project_agent_task_list(
+        raw_response,
+        project,
+        limit=20,
+        offset=0,
+        statuses=[TaskStatus.FAILED],
+        task_type="fix",
+        search=None,
+        direction_id="direction-test",
+        approval_needed=False,
+    )
+    serialized = json.dumps(projected, ensure_ascii=False)
+
+    assert projected["schema_version"] == "blueprint.agent-tasks.v1"
+    assert len(serialized.encode("utf-8")) <= projected["limits"]["response_bytes"]
+    assert projected["truncation"]["response_bytes"] is True
+    assert projected["complete"] is False
+    assert projected["returned"] < projected["source_returned"]
+    assert projected["next_offset"] == projected["returned"]
+    assert projected["has_more"] is True
+    assert projected["project"]["id"] == project["id"]
+    assert projected["limit"] == 20
+    assert projected["offset"] == 0
+    assert projected["filters"]["status"] == ["FAILED"]
+    assert projected["filters"]["direction_id"] == "direction-test"
+    assert all("attempt_number" in item for item in projected["tasks"])
+    assert all(
+        len(json.dumps(item["title"], ensure_ascii=False).encode("utf-8"))
+        <= projected["limits"]["string_serialized_bytes"]
+        for item in projected["tasks"]
+    )
+    assert secret not in serialized
+    assert "api_key" not in serialized
+
+
+def test_coding_agent_message_list_caps_escaped_control_text_and_redacts_secrets():
+    control_text = "\x02" * 8_000
+    secret = "message-list-secret-must-not-escape"
+    project = {
+        "id": "00000000-0000-0000-0000-000000000301",
+        "name": "Bounded message list",
+        "github_owner": "owner",
+        "github_repo": "repo",
+    }
+    raw_response = {
+        "messages": [
+            {
+                "id": f"10000000-0000-0000-0000-{index:012d}",
+                "project_id": project["id"],
+                "message_type": "BLOCKER",
+                "from_type": "system",
+                "content": control_text,
+                "context": {"note": control_text, "client_secret": secret},
+                "status": "open",
+                "resolution": control_text,
+            }
+            for index in range(20)
+        ],
+        "total": 20,
+    }
+
+    projected = _project_agent_message_list(
+        raw_response,
+        project,
+        limit=20,
+        offset=0,
+        message_status="open",
+        query=None,
+    )
+    serialized = json.dumps(projected, ensure_ascii=False)
+
+    assert projected["schema_version"] == "blueprint.agent-messages.v1"
+    assert len(serialized.encode("utf-8")) <= projected["limits"]["response_bytes"]
+    assert projected["truncation"]["response_bytes"] is True
+    assert projected["complete"] is False
+    assert projected["returned"] < projected["source_returned"]
+    assert projected["project"]["id"] == project["id"]
+    assert projected["limit"] == 20
+    assert projected["offset"] == 0
+    assert projected["filters"] == {"status": "open", "q": None}
+    assert all(
+        len(json.dumps(item["content"], ensure_ascii=False).encode("utf-8"))
+        <= projected["limits"]["string_serialized_bytes"]
+        for item in projected["messages"]
+    )
+    assert secret not in serialized
+    assert "client_secret" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_messages_pages_without_guaranteed_message_reinjection(
+    override_get_session, db_session, monkeypatch
+):
+    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    project = await _make_project(db_session, "Coding agent message pagination")
+    cred, token = await _seed_credential(
+        db_session,
+        name="coding-agent-message-pages",
+        principal_user_id="service:credential:00000000-0000-0000-0000-000000000402",
+        scopes=["coding-agent:read"],
+    )
+    db_session.add(
+        make_membership(project.id, user_id=cred.principal_user_id, role="viewer")
+    )
+    now = _utcnow()
+    for index in range(5):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="user",
+                content=f"paged-message-{index}",
+                status="open",
+                created_at=now - timedelta(seconds=index),
+            )
+        )
+    await db_session.commit()
+
+    async with _real_auth_client() as rc:
+        pages = [
+            await rc.get(
+                f"/api/agent-access/v1/messages?project_id={project.id}"
+                f"&status=open&limit=2&offset={offset}",
+                headers=_auth_header(token),
+            )
+            for offset in (0, 2, 4)
+        ]
+        excessive_offset = await rc.get(
+            f"/api/agent-access/v1/messages?project_id={project.id}"
+            "&status=open&limit=2&offset=1000001",
+            headers=_auth_header(token),
+        )
+
+    assert all(page.status_code == 200 for page in pages), [
+        page.text for page in pages
+    ]
+    bodies = [page.json() for page in pages]
+    assert [body["offset"] for body in bodies] == [0, 2, 4]
+    assert [body["returned"] for body in bodies] == [2, 2, 1]
+    assert [body["next_offset"] for body in bodies] == [2, 4, None]
+    assert [body["has_more"] for body in bodies] == [True, True, False]
+    assert [body["total"] for body in bodies] == [5, 5, 5]
+    assert excessive_offset.status_code == 422, excessive_offset.text
+    assert [
+        message["content"]
+        for body in bodies
+        for message in body["messages"]
+    ] == [f"paged-message-{index}" for index in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_mint_owns_a_fresh_principal_on_every_grant(
+    client: AsyncClient, db_session
+):
+    """A coding-agent token cannot borrow a human identity or retain the
+    memberships of a revoked same-name credential when it is re-minted."""
+    first_project = await _make_project(db_session, "First coding grant")
+    second_project = await _make_project(db_session, "Second coding grant")
+
+    borrowed = await client.post(
+        MGMT_URL,
+        json={
+            "name": "borrowed-coding-agent",
+            "scopes": ["coding-agent:read"],
+            "principal_user_id": "existing-human-member",
+            "project_memberships": [
+                {"project_id": str(first_project.id), "role": "viewer"}
+            ],
+        },
+    )
+    assert borrowed.status_code == 422, borrowed.text
+
+    first = await client.post(
+        MGMT_URL,
+        json={
+            "name": "rotating-coding-agent",
+            "scopes": ["coding-agent:read"],
+            "project_memberships": [
+                {"project_id": str(first_project.id), "role": "viewer"}
+            ],
+        },
+    )
+    assert first.status_code == 201, first.text
+    first_body = first.json()
+    assert first_body["principal_user_id"].startswith("service:credential:")
+
+    revoked = await client.post(f"{MGMT_URL}/{first_body['id']}/revoke")
+    assert revoked.status_code == 200, revoked.text
+    second = await client.post(
+        MGMT_URL,
+        json={
+            "name": "rotating-coding-agent",
+            "scopes": ["coding-agent:read"],
+            "project_memberships": [
+                {"project_id": str(second_project.id), "role": "viewer"}
+            ],
+        },
+    )
+    assert second.status_code == 201, second.text
+    second_body = second.json()
+    assert second_body["principal_user_id"].startswith("service:credential:")
+    assert second_body["principal_user_id"] != first_body["principal_user_id"]
+
+    memberships = (
+        await db_session.execute(
+            select(ProjectMember).where(
+                ProjectMember.user_id == second_body["principal_user_id"]
+            )
+        )
+    ).scalars().all()
+    assert [(str(row.project_id), row.role) for row in memberships] == [
+        (str(second_project.id), "viewer")
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +1223,7 @@ async def test_last_used_telemetry_issues_short_lock_timeout_literal_on_postgres
         assert len(call.args) == 1, "SET LOCAL must carry no bind params"
     session.commit.assert_awaited_once()
     assert principal["user_id"] == cred.principal_user_id
+    assert principal["service_credential_id"] == str(cred.id)
 
 
 @pytest.mark.asyncio
@@ -570,6 +1257,7 @@ async def test_last_used_telemetry_skips_lock_timeout_on_non_postgres(db_session
     ), "SET LOCAL must not be issued on non-Postgres dialects"
     session.commit.assert_awaited_once()
     assert principal["user_id"] == cred.principal_user_id
+    assert principal["service_credential_id"] == str(cred.id)
 
 
 @pytest.mark.asyncio
@@ -578,6 +1266,7 @@ async def test_authentication_survives_failed_last_used_telemetry_commit(
 ):
     """A telemetry rollback must not invalidate an otherwise valid principal."""
     cred, token = await _seed_credential(db_session, name="observer-telemetry-failure")
+    credential_id = str(cred.id)
     request = Request(
         {
             "type": "http",
@@ -602,6 +1291,7 @@ async def test_authentication_survives_failed_last_used_telemetry_commit(
         "email": "observer-telemetry-failure@service.blueprint.local",
         "role": "user",
         "service_credential": "observer-telemetry-failure",
+        "service_credential_id": credential_id,
     }
 
 
