@@ -18,7 +18,7 @@ import pytest
 
 from sqlalchemy import select
 
-from app.models import Project, Task, TaskStatus
+from app.models import Alert, Project, Task, TaskStatus
 from testing.factories import make_project, make_task
 
 
@@ -65,6 +65,173 @@ def _authoritative_approval_loop(
         },
         "issue_ledger": {"open": [], "resolved": []},
     }
+
+
+def _history_attempt(
+    project_id: uuid.UUID,
+    *,
+    task_type: str,
+    status: TaskStatus,
+    iteration: int,
+    original_task_id: uuid.UUID,
+) -> Task:
+    return make_task(
+        project_id=project_id,
+        status=status,
+        payloads=[
+            {
+                "type": task_type,
+                "pr_number": 17224,
+                "original_task_id": str(original_task_id),
+            }
+        ],
+        context={
+            "review_loop": {
+                "iteration": iteration,
+                "original_task_id": str(original_task_id),
+            }
+        },
+    )
+
+
+def test_cross_episode_abandon_candidate_counts_cancelled_superseded_history():
+    """The PR identity carries burden across episodes and cancelled tasks."""
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    first_episode = uuid.uuid4()
+    superseded_episode = uuid.uuid4()
+    attempts = [
+        _history_attempt(
+            project_id,
+            task_type="review" if index < 4 else "fix",
+            status=TaskStatus.CANCELLED if index in (1, 5, 8) else TaskStatus.COMPLETED,
+            iteration=index + 1 if index < 6 else (index - 5 if index < 8 else 4),
+            original_task_id=first_episode if index < 6 else superseded_episode,
+        )
+        for index in range(9)
+    ]
+
+    candidate = build_cross_episode_abandon_candidate(attempts)
+
+    assert candidate == {
+        "status": "abandon_candidate",
+        "threshold": 10,
+        "attempts": 9,
+        "cycles": 10,
+        "burden": 10,
+        "cancelled_attempts": 3,
+        "episodes": 2,
+    }
+
+
+def test_cross_episode_abandon_candidate_does_not_flag_converging_pr():
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    episode = uuid.uuid4()
+    attempts = [
+        _history_attempt(
+            project_id,
+            task_type="review" if index % 2 == 0 else "fix",
+            status=TaskStatus.COMPLETED,
+            iteration=index + 1,
+            original_task_id=episode,
+        )
+        for index in range(4)
+    ]
+
+    assert build_cross_episode_abandon_candidate(attempts) is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_session, mocker):
+    """The production spawn gate refuses a new fix after the PR threshold."""
+    from app.review_pipeline import (
+        SPAWN_REASON_ABANDON_CANDIDATE,
+        _spawn_pipeline_task,
+    )
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "rollup", "base_branch": "main"}],
+        context={"scope": "large"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    history = [
+        _history_attempt(
+            project.id,
+            task_type="review" if index < 4 else "fix",
+            status=TaskStatus.CANCELLED if index in (1, 5, 8) else TaskStatus.COMPLETED,
+            iteration=index + 1 if index < 8 else 10,
+            original_task_id=original_task.id,
+        )
+        for index in range(9)
+    ]
+    db_session.add_all(history)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 17224,
+                "branch": "blueprint/task-abandon",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "large",
+            "review_loop": {
+                "iteration": 10,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=17224,
+        branch="blueprint/task-abandon",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_reason="code_review",
+    )
+
+    assert result is None
+    assert created is False
+    await db_session.refresh(original_task)
+    await db_session.refresh(source_task)
+    marker = (original_task.context or {}).get("review_loop_abandon_candidate")
+    assert marker["attempts"] == 9
+    assert marker["cancelled_attempts"] == 3
+    assert marker["cycles"] == 10
+    assert original_task.requires_approval is True
+    assert (source_task.context or {}).get("_last_pipeline_spawn_reason") == (
+        SPAWN_REASON_ABANDON_CANDIDATE
+    )
+    alert = (
+        await db_session.execute(
+            select(Alert).where(
+                Alert.task_id == original_task.id,
+                Alert.title.contains("abandon candidate"),
+            )
+        )
+    ).scalar_one()
+    assert "9 attempt(s)" in alert.message
+    assert "3 cancelled" in alert.message
 
 
 def _mock_preservable_pr(mocker, *, changed_files: int, mergeable_state: str):

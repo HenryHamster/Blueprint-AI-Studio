@@ -3104,6 +3104,14 @@
           "old_cap": 1750,
           "new_cap": 2050
         }
+      ],
+      "review_loop_convergence.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-11T02:56:16.555345+00:00",
+          "old_cap": 1950,
+          "new_cap": 2350
+        }
       ]
     },
     "agent": {
@@ -4313,8 +4321,8 @@
           "new_cap": 2750
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-11T00:45:18.479837+00:00",
+          "commit_sha": "17d0d29f415a22d8776b6f2d1ba9bd74e06df038",
+          "commit_date": "2026-08-11T02:13:43+00:00",
           "old_cap": 2750,
           "new_cap": 3300
         }
@@ -4365,6 +4373,14 @@
           "commit_date": "2026-08-10T21:01:55+00:00",
           "old_cap": 1800,
           "new_cap": 2100
+        }
+      ],
+      "test_review_loop_convergence.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-11T02:56:16.555345+00:00",
+          "old_cap": 1900,
+          "new_cap": 2250
         }
       ]
     }
