@@ -897,6 +897,81 @@ def _score_env_preflight(
     return 1.0, [], deploy_target_scope
 
 
+def evaluate_prior_operator_authorship_gate(
+    prior_promoted_version: Any | None,
+) -> dict[str, Any]:
+    """Evaluate the persisted receipt from the prior promoted release.
+
+    The current candidate cannot have a post-promotion serving window yet, so
+    its own authorship count is unavailable at qualification time. This gate
+    consumes only the prior promoted ``ReleaseVersion`` record and never calls
+    GitHub. ``None`` is the explicit first-promotion bootstrap case; once a
+    promoted row exists, every missing, unserved, or invalid receipt fails closed.
+    """
+    if prior_promoted_version is None:
+        return {
+            "status": "bootstrap",
+            "passed": True,
+            "count": None,
+            "reason": "no_prior_promoted_version",
+        }
+
+    if isinstance(prior_promoted_version, dict):
+        get_value = prior_promoted_version.get
+    else:
+        def get_value(key: str, default: Any = None) -> Any:
+            return getattr(prior_promoted_version, key, default)
+
+    status = get_value("status")
+    serving_status = get_value("serving_status")
+    qualification = get_value("last_qualification")
+    base_sha = get_value("base_sha")
+    served_sha = get_value("served_sha")
+    receipt = (
+        qualification.get("operator_authored_commits")
+        if isinstance(qualification, dict)
+        else None
+    )
+
+    # Reuse the exact server-receipt contract used by the read API. The import
+    # stays lazy so this pure scoring module has no ORM or I/O dependency.
+    from app.release_commit_authorship import validate_authorship_receipt
+
+    validated = (
+        validate_authorship_receipt(receipt, base_sha, served_sha)
+        if status == "promoted" and serving_status == "serving_confirmed"
+        else None
+    )
+    if validated is None or validated.get("state") != "resolved":
+        return {
+            "status": "unresolved",
+            "passed": False,
+            "count": None,
+            "blocker": "prior_operator_authorship_evidence_missing",
+            "reason": (
+                "prior_promoted_version_authorship_receipt_invalid"
+                if receipt is not None
+                else "prior_promoted_version_authorship_receipt_absent"
+            ),
+        }
+
+    count = validated.get("count")
+    if count == 0:
+        return {
+            "status": "passed",
+            "passed": True,
+            "count": 0,
+            "reason": "prior_promoted_version_operator_authored_count_zero",
+        }
+    return {
+        "status": "blocked",
+        "passed": False,
+        "count": count,
+        "blocker": "prior_operator_authorship_nonzero",
+        "reason": "prior_promoted_version_operator_authored_count_nonzero",
+    }
+
+
 def compute_composite(
     ci_green: bool,
     audit_score: float,
@@ -919,6 +994,7 @@ def compute_composite(
     env_preflight_score: float | None = None,
     env_preflight_missing: list[str] | None = None,
     env_preflight_ack_override: bool = False,
+    prior_operator_authorship_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -951,6 +1027,11 @@ def compute_composite(
         caller precomputes this via
         ``migration_apply_gate.run_migration_apply_gate`` — this function stays
         pure and only consumes the boolean.
+      * ``prior_operator_authorship_gate`` is the persisted receipt result from
+        the prior promoted release. A non-zero count blocks with
+        ``"prior_operator_authorship_nonzero"``; absent or invalid evidence
+        blocks with ``"prior_operator_authorship_evidence_missing"``. The
+        explicit ``"bootstrap"`` result is the only no-prior-version pass.
       * ``merge_grade_misses`` is True — the required blind merge-grade ran and
         found that the candidate misses the frozen version goal
         (``"merge_grade_misses"``).  Checked before the category gate so an
@@ -1095,6 +1176,14 @@ def compute_composite(
         # candidate failing both reports the identity collision first.
         blocker = "migration_apply_drift"
         failing_gates.append(blocker)
+    if prior_operator_authorship_gate is not None:
+        prior_gate_status = prior_operator_authorship_gate.get("status")
+        if prior_gate_status == "blocked":
+            blocker = "prior_operator_authorship_nonzero"
+            failing_gates.append(blocker)
+        elif prior_gate_status not in {"passed", "bootstrap"}:
+            blocker = "prior_operator_authorship_evidence_missing"
+            failing_gates.append(blocker)
     if env_preflight_enabled and env_preflight_score is None:
         # No boot/env-prerequisite evidence was produced by the candidate — the
         # evidence producer never ran, or ran but produced no usable manifest.
@@ -1206,6 +1295,13 @@ def compute_composite(
             # bypass is auditable rather than silent.
             if env_preflight_ack_override:
                 sub_scores["env_preflight_ack_override"] = True
+
+    if prior_operator_authorship_gate is not None:
+        sub_scores["prior_operator_authorship"] = {
+            "status": prior_operator_authorship_gate.get("status"),
+            "count": prior_operator_authorship_gate.get("count"),
+            "reason": prior_operator_authorship_gate.get("reason"),
+        }
 
     # Goal-verification observability (redesign): surface the per-category grade
     # and residual so operators see WHY the gate fired (or would fire), not just
@@ -1365,6 +1461,8 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     # once the version itself promotes, so a fix on automain is inert until then.
     "migration_identity_collision": EXECUTION_SITE_DEPLOYED,
     "migration_apply_drift": EXECUTION_SITE_DEPLOYED,
+    "prior_operator_authorship_nonzero": EXECUTION_SITE_DEPLOYED,
+    "prior_operator_authorship_evidence_missing": EXECUTION_SITE_DEPLOYED,
     # Operator-env site (Slice 4, design 245212a4): the env-preflight judge runs in
     # the DEPLOYED process and compares the candidate's declared boot prerequisites
     # against the deployed process's OWN environ (a presence-proxy of the deploy

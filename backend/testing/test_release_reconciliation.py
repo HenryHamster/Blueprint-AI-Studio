@@ -897,6 +897,11 @@ async def test_reconcile_not_promoted_ci_unresolved_armed_merge_grade_propagates
         "candidate_sha": candidate_sha,
         "confidence": 0.0,
         "merge_grade_misses": True,
+        "prior_operator_authorship_gate": {
+            "status": "bootstrap",
+            "passed": True,
+            "count": None,
+        },
         "pr_url": "https://github.com/acme/widget/pull/9",
         "sub_scores": {"audit": 0.91, "test_erosion": 0.85, "smoketest": 0.0},
     }

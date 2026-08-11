@@ -314,6 +314,18 @@ def _recover_confidence_from_ci_unresolved(
         and not isinstance(debt_pressure_raw, bool)
         else None
     )
+    prior_operator_authorship_gate = base_record.get(
+        "prior_operator_authorship_gate"
+    )
+    if not isinstance(prior_operator_authorship_gate, dict):
+        # Legacy pending records predate this gate. Recovery must not turn the
+        # missing persisted decision into a bootstrap pass.
+        prior_operator_authorship_gate = {
+            "status": "unresolved",
+            "passed": False,
+            "count": None,
+            "reason": "prior_operator_authorship_gate_record_missing",
+        }
 
     recovered = compute_composite(
         ci_green=True,
@@ -341,6 +353,7 @@ def _recover_confidence_from_ci_unresolved(
         env_preflight_ack_override=bool(
             base_record.get("env_preflight_ack_override", False)
         ),
+        prior_operator_authorship_gate=prior_operator_authorship_gate,
     )
 
     recovered_sub_scores = dict(sub_scores)

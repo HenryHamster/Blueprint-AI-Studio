@@ -204,6 +204,7 @@ from app.release_scoring import (
     _score_env_preflight,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
+    evaluate_prior_operator_authorship_gate,
     evaluate_merge_grade,
     is_contentless_goal,
     promotion_threshold_for_policy,  # noqa: F401 — canonical enforcement helper
@@ -4110,6 +4111,14 @@ _BLOCKER_LABELS: dict[str, str] = {
         "the candidate's migration chain does not apply cleanly against "
         "production's recorded schema state (deploy-fatal drift)"
     ),
+    "prior_operator_authorship_nonzero": (
+        "the prior promoted release recorded one or more operator-authored "
+        "commits in its serving window"
+    ),
+    "prior_operator_authorship_evidence_missing": (
+        "the prior promoted release has no valid persisted operator-authorship "
+        "receipt; the gate fails closed until that evidence is resolved"
+    ),
     "criterion_coverage_incomplete": (
         "the blind merge-grade found the merged diff does not yet satisfy the "
         "version goal: at least one active acceptance-criterion CATEGORY is not "
@@ -6184,6 +6193,36 @@ async def _record_rubric_provenance_outcome(
         "rubric_provenance_error": provenance_error,
     }
 
+async def _load_prior_operator_authorship_gate(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> dict[str, Any]:
+    """Read and validate the latest prior promoted release receipt.
+
+    Qualification runs before the current version's serving window exists, so
+    this query intentionally excludes the open candidate and never performs a
+    live authorship measurement. The scoring helper owns receipt validation and
+    the explicit no-prior bootstrap result.
+    """
+    prior = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(
+                    release_version.ReleaseVersion.project_id == version.project_id,
+                    release_version.ReleaseVersion.status == "promoted",
+                    release_version.ReleaseVersion.version_number < version.version_number,
+                )
+                .order_by(release_version.ReleaseVersion.version_number.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    return evaluate_prior_operator_authorship_gate(prior)
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -6293,6 +6332,9 @@ async def _finalize_qualification(
 
     ci_state = ci_resolution.get("state", _CI_RED)
     _policy_project = await session.get(Project, version.project_id)
+    prior_operator_authorship_gate = await _load_prior_operator_authorship_gate(
+        session, version
+    )
     ci_required = True
     if _pre_gates is not None and "ci_required" in _pre_gates:
         ci_required = bool(_pre_gates["ci_required"])
@@ -8557,6 +8599,7 @@ async def _finalize_qualification(
         # Slice 4: OWNER-armed one-shot override of the boot_prereq_missing block
         # (scoped to that blocker only — see _env_ack above).
         env_preflight_ack_override=env_preflight_ack_override,
+        prior_operator_authorship_gate=prior_operator_authorship_gate,
     )
 
     # --- Explicit product probe: decision-bearing walkthrough --------------
@@ -8801,6 +8844,10 @@ async def _finalize_qualification(
         "failing_gates": composite.get("failing_gates") or [],
         "confidence_ceiling": composite.get("confidence_ceiling"),
         "required_sub_scores": composite.get("required_sub_scores") or {},
+        # The current candidate cannot have a post-promotion serving window.
+        # Persist the prior-release gate result so CI-unresolved recovery reuses
+        # the same decision without a fresh database or GitHub interpretation.
+        "prior_operator_authorship_gate": prior_operator_authorship_gate,
         "stranded_approved_prs": qual.get("stranded_approved_prs"),
         "blocker": composite["blocker"],
         # Execution-site of the responsible check (dir: tag promotion blockers

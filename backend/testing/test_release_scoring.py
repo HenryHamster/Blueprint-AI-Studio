@@ -1015,6 +1015,11 @@ class TestCategoryGateNonEngagingPaths:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": {
+                "status": "bootstrap",
+                "passed": True,
+                "count": None,
+            },
             "category_verdicts": None,  # no rubric or exempt at finalize time
         }
         out = _recover_confidence_from_ci_unresolved(record)
@@ -1039,6 +1044,11 @@ class TestCategoryGateNonEngagingPaths:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": {
+                "status": "bootstrap",
+                "passed": True,
+                "count": None,
+            },
             "category_verdicts": [
                 {
                     "category_key": "c-1",
@@ -1074,6 +1084,11 @@ class TestCategoryGateNonEngagingPaths:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": {
+                "status": "bootstrap",
+                "passed": True,
+                "count": None,
+            },
             "category_verdicts": [
                 {
                     "category_key": "c-1",
