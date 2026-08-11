@@ -538,12 +538,14 @@ else
   # Docker-less local runs are rooted at the checkout, not the /repo bind mount.
   SCRIPT_TEST_ROOT=../scripts
 fi
-# The local static-release comparator does not own the scripts corpus:
-# deployment-host tests have unrelated baseline failures on developer VMs.
-# The real CI lane sets CI=true and runs the complete roster below; direct runs
-# of any roster member remain supported.
+# Expand the script corpus only when the executing capability is present. A
+# Docker-less standalone smoke run still executes the backend invariant corpus
+# and the bootstrap release tests, while the deployment-host suites run in the
+# Docker-backed CI lane (or an explicitly CI-marked local run). This is a
+# capability boundary, not a test skip: every file remains classified by the
+# roster tripwire below and is collected by the executing lane that can run it.
 for script_test in "${CI_SCRIPT_TEST_ROSTER[@]}"; do
-  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
+  if [ "$USE_DOCKER" = "1" ] || [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
     [ "$script_test" = "test_bootstrap_local_app_release.py" ] && continue
     STANDALONE_SCRIPT_TEST_ARGS+=("$SCRIPT_TEST_ROOT/$script_test")
   fi

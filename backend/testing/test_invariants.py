@@ -11,6 +11,7 @@ import ast
 import io
 import os
 import re
+import shlex
 import subprocess
 import symtable
 import sys
@@ -29,6 +30,67 @@ if str(BACKEND_ROOT) not in sys.path:
 # backend test conftest.
 os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check-x")
 os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
+
+
+def _script_test_harness() -> Path:
+    """Resolve the roster owner in both the CI mount and local checkout."""
+    candidates = (
+        Path("/repo/scripts/test-backend.sh"),
+        BACKEND_ROOT.parent / "scripts" / "test-backend.sh",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    pytest.fail("scripts/test-backend.sh is unavailable; roster cannot be checked")
+
+
+def _parse_script_test_roster(
+    harness: Path,
+) -> tuple[set[str], dict[str, str]]:
+    """Parse the shell-owned executing roster and documented exemptions."""
+    source = harness.read_text(encoding="utf-8")
+
+    def _array_body(name: str) -> str:
+        match = re.search(
+            rf"^{name}=\((?P<body>.*?)(?:\n\)|\))",
+            source,
+            re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None, f"{harness} must define {name}"
+        return match.group("body")
+
+    def _entries(body: str) -> list[str]:
+        entries: list[str] = []
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            values = shlex.split(line, comments=True)
+            assert len(values) == 1, f"roster entry must be one shell word: {line!r}"
+            entries.append(values[0])
+        return entries
+
+    roster = set(_entries(_array_body("CI_SCRIPT_TEST_ROSTER")))
+    exemptions: dict[str, str] = {}
+    for entry in _entries(_array_body("CI_SCRIPT_TEST_EXEMPTIONS")):
+        path, separator, reason = entry.partition("|")
+        assert separator and reason.strip(), (
+            f"CI script exemption {entry!r} must include an individual reason"
+        )
+        assert path not in exemptions, f"duplicate CI script exemption: {path}"
+        exemptions[path] = reason.strip()
+    return roster, exemptions
+
+
+def _script_test_roster_residue(
+    scripts_root: Path, roster: set[str], exemptions: dict[str, str]
+) -> list[str]:
+    on_disk = {
+        path.name
+        for path in scripts_root.glob("test_*.py")
+        if path.is_file()
+    }
+    return sorted(on_disk - roster - set(exemptions))
 
 def _assert_backmerge_modules_do_not_import_rollup_management(
     source: str, *, filename: str
@@ -13464,3 +13526,59 @@ def test_no_absolute_datetime_literals_in_freshness_graded_fixtures():
         "freshness window on every promotion date:\n\n"
         + "\n".join(all_violations)
     )
+
+
+def test_script_roster_tripwire_detects_an_unclassified_file(tmp_path: Path):
+    """A newly created scripts test must fail closed until classified."""
+    scripts_root = tmp_path / "scripts"
+    scripts_root.mkdir()
+    (scripts_root / "test_existing.py").write_text("", encoding="utf-8")
+    (scripts_root / "test_dark.py").write_text("", encoding="utf-8")
+
+    assert _script_test_roster_residue(
+        scripts_root, {"test_existing.py"}, {}
+    ) == ["test_dark.py"]
+    assert not _script_test_roster_residue(
+        scripts_root,
+        {"test_existing.py"},
+        {"test_dark.py": "requires a separately provisioned host"},
+    )
+
+
+def test_every_script_test_is_rostered_or_has_a_written_exemption():
+    """The shell roster cannot silently drift from scripts/test_*.py on disk."""
+    harness = _script_test_harness()
+    roster, exemptions = _parse_script_test_roster(harness)
+    scripts_root = harness.parent
+    on_disk = {
+        path.name
+        for path in scripts_root.glob("test_*.py")
+        if path.is_file()
+    }
+
+    residue = _script_test_roster_residue(scripts_root, roster, exemptions)
+    assert not residue, (
+        "scripts/test_*.py files are absent from the executing roster and the "
+        "explicit exemption list: "
+        + ", ".join(residue)
+    )
+    assert roster <= on_disk, (
+        "CI script roster names missing files: " + ", ".join(sorted(roster - on_disk))
+    )
+    assert set(exemptions) <= on_disk, (
+        "CI script exemptions name missing files: "
+        + ", ".join(sorted(set(exemptions) - on_disk))
+    )
+    assert not roster & set(exemptions), (
+        "CI script files cannot be both executed and exempted: "
+        + ", ".join(sorted(roster & set(exemptions)))
+    )
+
+
+def test_script_roster_expands_only_with_an_executing_capability():
+    """Host-only suites must not be claimed by a Docker-less smoke run."""
+    source = _script_test_harness().read_text(encoding="utf-8")
+    assert (
+        'if [ "$USE_DOCKER" = "1" ] || [ "${CI:-}" = "true" ]'
+        ' || [ "${CI:-}" = "1" ]; then'
+    ) in source
