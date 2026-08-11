@@ -1638,10 +1638,9 @@ async def agent_fetch_qualification(
     Payload includes: candidate_sha, finalized_at, status, confidence,
     sub_scores, findings, excluded_findings, challenger_refuted_findings, and
     serving_sha (the git SHA of the deployed code producing this response), and
-    operator_authored_commits (the fail-closed count for base_sha..serving_sha).
+    the persisted operator_authored_commits release evidence.
     """
     from app.deployed_sha import get_serving_sha  # noqa: PLC0415
-    from app.release_commit_authorship import count_non_bot_authored_commits  # noqa: PLC0415
     from app.release_qualifier import (  # noqa: PLC0415
         current_effective_policy_projection,
         get_latest_qualification_audit_findings,
@@ -1681,11 +1680,42 @@ async def agent_fetch_qualification(
             },
         }
 
-    operator_authored_commits = await count_non_bot_authored_commits(
-        open_row.base_sha,
-        serving_sha,
-        session=session,
-        project=project,
+    persisted_authorship = (open_row.last_qualification or {}).get(
+        "operator_authored_commits"
+    )
+    if not isinstance(persisted_authorship, dict):
+        latest_promoted_qualification = (
+            (
+                await session.execute(
+                    select(ReleaseVersion.last_qualification)
+                    .where(
+                        ReleaseVersion.project_id == project_id,
+                        ReleaseVersion.status == "promoted",
+                    )
+                    .order_by(ReleaseVersion.version_number.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if isinstance(latest_promoted_qualification, dict):
+            persisted_authorship = latest_promoted_qualification.get(
+                "operator_authored_commits"
+            )
+    operator_authored_commits = (
+        persisted_authorship
+        if isinstance(persisted_authorship, dict)
+        else {
+            "state": "unresolved",
+            "count": None,
+            "offenders": [],
+            "range": {
+                "base_sha": open_row.base_sha,
+                "head_sha": serving_sha,
+            },
+            "reason": "promotion_authorship_not_persisted",
+        }
     )
     active_or_last_attempt_policy = qualification_attempt_policy_projection(
         open_row.last_qualification

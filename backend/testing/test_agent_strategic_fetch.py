@@ -2455,22 +2455,6 @@ async def test_agent_fetch_qualification_stamps_serving_sha_on_verdict_path(
         "app.deployed_sha.get_serving_sha",
         lambda: test_serving_sha,
     )
-    async def _count_authorship(base_sha, head_sha, *, session, project):
-        assert session is not None
-        assert project.id == project_id
-        return {
-            "state": "resolved",
-            "count": 1,
-            "offenders": [{"sha": "c" * 12, "author": "Henry Example"}],
-            "range": {"base_sha": base_sha, "head_sha": head_sha},
-        }
-
-    project_id = project.id
-    monkeypatch.setattr(
-        "app.release_commit_authorship.count_non_bot_authored_commits",
-        _count_authorship,
-    )
-
     token = create_agent_token(str(task.id), task.vm_instance_id)
     res = await client.get(
         f"/api/agent/projects/{project.id}/qualification",
@@ -2481,12 +2465,8 @@ async def test_agent_fetch_qualification_stamps_serving_sha_on_verdict_path(
 
     assert body["source"] == "qualification_verdict"
     assert body["serving_sha"] == test_serving_sha
-    assert body["operator_authored_commits"] == {
-        "state": "resolved",
-        "count": 1,
-        "offenders": [{"sha": "c" * 12, "author": "Henry Example"}],
-        "range": {"base_sha": "b" * 40, "head_sha": test_serving_sha},
-    }
+    assert body["operator_authored_commits"]["state"] == "unresolved"
+    assert body["operator_authored_commits"]["count"] is None
 
 
 @pytest.mark.asyncio
