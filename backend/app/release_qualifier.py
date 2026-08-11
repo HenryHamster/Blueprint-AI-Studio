@@ -2196,6 +2196,7 @@ async def _ensure_prepromotion_rehearsal_dispatch(
     """
     from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
         dispatch_prepromotion_rehearsal,
+        ensure_prepromotion_rehearsal_ref,
         persisted_rehearsal_for_candidate,
     )
 
@@ -2217,6 +2218,17 @@ async def _ensure_prepromotion_rehearsal_dispatch(
         return True, dict(prior_dispatch)
 
     try:
+        # The rehearsal ref is the exact candidate snapshot, and must exist
+        # before deploy.yml is dispatched.  promote() may later reuse this
+        # same ref; its existing SHA-check and recut path keeps promotion
+        # idempotent when qualification has already prepared it.
+        await ensure_prepromotion_rehearsal_ref(
+            token,
+            owner,
+            repo,
+            version.version_number,
+            candidate_sha,
+        )
         dispatched = await dispatch_prepromotion_rehearsal(
             token,
             owner,

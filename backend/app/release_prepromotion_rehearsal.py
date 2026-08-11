@@ -47,6 +47,47 @@ def prepromotion_rehearsal_ref(version_number: int) -> str:
     return f"release-v{version_number}"
 
 
+async def ensure_prepromotion_rehearsal_ref(
+    token: str,
+    owner: str,
+    repo: str,
+    version_number: int,
+    candidate_sha: str,
+) -> str:
+    """Create or recut the rehearsal ref and prove its exact candidate SHA.
+
+    Qualification creates this ref before dispatching the build workflow.  A
+    pre-existing ref is safe only when it already resolves to the candidate;
+    otherwise it is deleted and recreated, mirroring the promotion path's
+    candidate-pinning contract.  Any ambiguous result fails closed before a
+    workflow can build a different tree.
+    """
+    expected_sha = str(candidate_sha or "").strip()
+    if not expected_sha:
+        raise ValueError("candidate SHA must be non-empty")
+
+    release_ref = prepromotion_rehearsal_ref(version_number)
+
+    async def _create_and_observe() -> str | None:
+        created = await github.create_branch(
+            token, owner, repo, release_ref, expected_sha
+        )
+        observed = (created or {}).get("object", {}).get("sha")
+        return observed if isinstance(observed, str) else None
+
+    observed_sha = await _create_and_observe()
+    if observed_sha != expected_sha:
+        await github.delete_branch(token, owner, repo, release_ref)
+        observed_sha = await _create_and_observe()
+
+    if observed_sha != expected_sha:
+        raise RuntimeError(
+            f"rehearsal ref {release_ref} does not resolve to candidate "
+            f"{expected_sha} (observed {observed_sha or 'unknown'})"
+        )
+    return release_ref
+
+
 async def dispatch_prepromotion_rehearsal(
     token: str,
     owner: str,
@@ -56,7 +97,7 @@ async def dispatch_prepromotion_rehearsal(
     project_id: str | None = None,
 ) -> bool:
     """Build the candidate image without granting deploy workflow side effects."""
-    return await github.dispatch_workflow_run(
+    dispatched = await github.dispatch_workflow_run(
         token,
         owner,
         repo,
@@ -65,6 +106,7 @@ async def dispatch_prepromotion_rehearsal(
         project_id=project_id,
         inputs=PREPROMOTION_REHEARSAL_INPUTS,
     )
+    return bool(dispatched)
 
 
 def validate_prepromotion_rehearsal_receipt(

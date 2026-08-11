@@ -3,7 +3,7 @@
 import pytest
 import uuid
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 from _release_qualifier_testhelpers import _make_project_and_version
 from app import release_qualifier as rq
@@ -12,6 +12,7 @@ from app.release_prepromotion_rehearsal import PREPROMOTION_REHEARSAL_INPUTS
 from app.release_prepromotion_rehearsal import (
     apply_rehearsal_evidence,
     dispatch_prepromotion_rehearsal,
+    ensure_prepromotion_rehearsal_ref,
     prepromotion_rehearsal_ref,
     persisted_rehearsal_for_candidate,
 )
@@ -130,6 +131,86 @@ async def test_rehearsal_dispatch_pins_release_branch_and_disables_side_effects(
 
 
 @pytest.mark.asyncio
+async def test_rehearsal_dispatch_sees_candidate_ref_at_exact_candidate_sha(mocker):
+    refs: dict[str, str] = {}
+    version = SimpleNamespace(
+        version_number=17,
+        prepromotion_rehearsal_receipt=None,
+        last_qualification={},
+    )
+    project = SimpleNamespace(id="project")
+
+    async def _create_branch(_token, _owner, _repo, branch_name, sha):
+        refs[branch_name] = sha
+        return {
+            "ref": f"refs/heads/{branch_name}",
+            "object": {"sha": sha},
+        }
+
+    async def _dispatch(_token, _owner, _repo, _workflow, ref, **_kwargs):
+        assert refs.get(ref) == _CANDIDATE
+        return True
+
+    create_branch = mocker.patch(
+        "app.release_prepromotion_rehearsal.github.create_branch",
+        new=AsyncMock(side_effect=_create_branch),
+    )
+    dispatch = mocker.patch(
+        "app.release_prepromotion_rehearsal.github.dispatch_workflow_run",
+        new=AsyncMock(side_effect=_dispatch),
+    )
+    mocker.patch("app.release_qualifier.flag_modified")
+
+    ready, state = await rq._ensure_prepromotion_rehearsal_dispatch(
+        version,
+        project,
+        token="token",
+        owner="owner",
+        repo="repo",
+        candidate_sha=_CANDIDATE,
+    )
+    assert ready is True
+    assert state == {"status": "dispatched", "candidate_sha": _CANDIDATE}
+    assert refs["release-v17"] == _CANDIDATE
+    create_branch.assert_awaited_once_with(
+        "token", "owner", "repo", "release-v17", _CANDIDATE
+    )
+    dispatch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rehearsal_ref_recuts_stale_existing_ref(mocker):
+    stale_sha = "b" * 40
+    create_branch = mocker.patch(
+        "app.release_prepromotion_rehearsal.github.create_branch",
+        new=AsyncMock(
+            side_effect=[
+                {"object": {"sha": stale_sha}, "reused": True},
+                {"object": {"sha": _CANDIDATE}, "reused": False},
+            ]
+        ),
+    )
+    delete_branch = mocker.patch(
+        "app.release_prepromotion_rehearsal.github.delete_branch",
+        new=AsyncMock(return_value=True),
+    )
+
+    assert (
+        await ensure_prepromotion_rehearsal_ref(
+            "token", "owner", "repo", 17, _CANDIDATE
+        )
+        == "release-v17"
+    )
+    assert create_branch.await_args_list == [
+        call("token", "owner", "repo", "release-v17", _CANDIDATE),
+        call("token", "owner", "repo", "release-v17", _CANDIDATE),
+    ]
+    delete_branch.assert_awaited_once_with(
+        "token", "owner", "repo", "release-v17"
+    )
+
+
+@pytest.mark.asyncio
 async def test_qualification_path_dispatches_rehearsal_without_admin(
     db_session, mocker
 ):
@@ -150,6 +231,15 @@ async def test_qualification_path_dispatches_rehearsal_without_admin(
     dispatch = mocker.patch(
         "app.release_prepromotion_rehearsal.github.dispatch_workflow_run",
         new=AsyncMock(side_effect=_dispatch_and_complete),
+    )
+    mocker.patch(
+        "app.release_prepromotion_rehearsal.github.create_branch",
+        new=AsyncMock(
+            return_value={
+                "ref": "refs/heads/release-v1",
+                "object": {"sha": candidate},
+            }
+        ),
     )
     mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="gh-token"))
     mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
@@ -206,6 +296,15 @@ async def test_qualification_rehearsal_dispatch_failure_is_a_gate_error(
     mocker.patch(
         "app.release_prepromotion_rehearsal.github.dispatch_workflow_run",
         new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_prepromotion_rehearsal.github.create_branch",
+        new=AsyncMock(
+            return_value={
+                "ref": "refs/heads/release-v1",
+                "object": {"sha": candidate},
+            }
+        ),
     )
     mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="gh-token"))
     mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
