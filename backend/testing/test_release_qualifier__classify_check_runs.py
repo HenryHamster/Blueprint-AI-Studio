@@ -4903,6 +4903,8 @@ async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
     }
     if label in {"resolved_zero", "resolved_nonzero", "unresolved", "terminal"}:
         expected_provenance["receipt_source"] = "github_compare"
+        expected_provenance["receipt_measured_at"] = "2026-01-01T00:00:00+00:00"
+        expected_provenance["receipt_attempt"] = 1
     assert rows[0].evidence_provenance == expected_provenance
     if expected_blocker:
         assert result.get("blocker") == expected_blocker

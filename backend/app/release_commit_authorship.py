@@ -74,6 +74,11 @@ _PERMANENT_AUTHORSHIP_REASONS = frozenset(
 _RECONCILIATION_CLEANUP_GRACE_SECONDS = 0.25
 _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS = 0.05
 
+
+class _ReconciliationCleanupError(RuntimeError):
+    """A DB-session cleanup failure that must stop the current sweep."""
+
+
 AUTHORSHIP_EVIDENCE_CONTRACT_TYPE = "operator_authored_commits"
 
 
@@ -1024,7 +1029,9 @@ async def _deadline_session(session_factory: Any, deadline: float | None):
                         ),
                     )
                     raise body_error
-                raise cleanup_error
+                if isinstance(cleanup_error, _ReconciliationCleanupError):
+                    raise cleanup_error
+                raise _ReconciliationCleanupError(str(cleanup_error)) from cleanup_error
 
 
 def _reconciliation_candidate_is_eligible(
@@ -1295,6 +1302,14 @@ async def reconcile_serving_authorship_evidence(
                 ),
                 timeout=_remaining_reconciliation_seconds(deadline),
             )
+        except _ReconciliationCleanupError:
+            # The session's ownership is uncertain. Continuing would start
+            # another DB/GitHub attempt while the failed cleanup may still own
+            # a transaction or pooled connection, so end this sweep terminally.
+            logger.exception(
+                "authorship evidence reconciliation stopped after session cleanup failure"
+            )
+            break
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -1129,6 +1129,65 @@ async def test_deadline_session_preserves_cancellation_when_cleanup_fails():
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_stops_after_session_cleanup_failure(db_session, mocker):
+    """A cleanup failure is terminal for the sweep, not a reason to try another row."""
+    from app.database import AsyncSessionLocal
+    from app.release_commit_authorship import _ReconciliationCleanupError
+
+    project = Project(name="Authorship cleanup terminal", user_id="authorship-cleanup")
+    rows = [
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=index + 1,
+            status="promoted",
+            base_sha=f"{index + 1:040x}",
+            served_sha=f"{index + 2:040x}",
+            serving_status="serving_confirmed",
+            served_at=datetime(2026, 1, index + 1, tzinfo=timezone.utc),
+            opened_at=datetime(2026, 1, index + 1, tzinfo=timezone.utc),
+            last_qualification={},
+        )
+        for index in range(2)
+    ]
+    db_session.add_all([project, *rows])
+    await db_session.commit()
+
+    contexts_created = 0
+
+    class FailingExitContext:
+        def __init__(self, context, *, fail_cleanup):
+            self.context = context
+            self.fail_cleanup = fail_cleanup
+
+        async def __aenter__(self):
+            return await self.context.__aenter__()
+
+        async def __aexit__(self, *exc_info):
+            result = await self.context.__aexit__(*exc_info)
+            if self.fail_cleanup:
+                raise _ReconciliationCleanupError("connection cleanup failed")
+            return result
+
+    def session_factory():
+        nonlocal contexts_created
+        contexts_created += 1
+        return FailingExitContext(
+            AsyncSessionLocal(), fail_cleanup=contexts_created == 3
+        )
+
+    measure = mocker.patch(
+        "app.release_commit_authorship.measure_serving_authorship_evidence",
+        new=AsyncMock(return_value=True),
+    )
+
+    attempted = await reconcile_serving_authorship_evidence(session_factory, limit=2)
+
+    assert attempted == 0
+    assert contexts_created == 3  # two scan partitions; no second worker after cleanup failure
+    measure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_keyset_scans_mixed_malformed_rows_without_json_casts(
     db_session, mocker
 ):
