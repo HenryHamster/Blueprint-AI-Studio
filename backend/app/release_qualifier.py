@@ -95,7 +95,10 @@ from app.release_policy_projection import (
     qualification_attempt_policy_record_fields,
 )
 from app.release_models import CriterionEvidence
-from app.release_commit_authorship import authorship_category_evidence
+from app.release_commit_authorship import (
+    authorship_category_evidence,
+    normalize_authorship_evidence_contract,
+)
 from app.notification_dispatch import (
     dispatch_external_notification,  # noqa: F401 — re-exported for tests / compat patch point
     post_version_build_stalled_message,  # noqa: F401 — re-exported for tests
@@ -311,15 +314,15 @@ from app.release_qualifier_audit_surface import (
 )
 
 # Size governance: this module's cap in backend/testing/module_size_limits.json.
-# Bumped 10300 -> 10500 (tight governing raise) when the release-audit and
-# research rollups accreted qualifier logic and the module reached 10323 lines,
-# past the historically governing 10300. The raise keeps only a small explicit
-# margin (~180 lines, <2% of the cap) — NOT the generic +15% bump to 11900,
+# Bumped 10300 -> 10800 (tight governing raise) when the authorship evidence
+# contract and reconciliation hard-deadline logic brought the module to 10549
+# lines, past the historically governing 10500. The raise keeps only a small
+# explicit margin (~250 lines, <3% of the cap) — NOT an unbounded generic bump,
 # which reintroduces the ~2k dead-headroom value the governance test rejects.
 # Keep the JSON entry in sync with this constant — the governance test in
 # test_release_qualifier.py cross-checks them, so an over-loosened cap regresses
 # red instead of silently widening headroom past the point the guardrail fires.
-_MODULE_SIZE_GOVERNANCE_CAP: int = 10750
+_MODULE_SIZE_GOVERNANCE_CAP: int = 10800
 
 # Product probes are opt-in parts of a qualification attempt's decision
 # contract. Keep the set closed: silently dropping an unknown value would let a
@@ -591,10 +594,10 @@ _NEVER_GRADED_GAP = (
 _RUBRIC_PROVENANCE_VERSION = 1
 _MAX_RUBRIC_DIFF_KEYS = 20
 
-def _canonicalize_rubric(raw: Any) -> list[dict[str, str]]:
+def _canonicalize_rubric(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return []
-    canonical: list[dict[str, str]] = []
+    canonical: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in raw:
         if not isinstance(item, dict):
@@ -603,11 +606,15 @@ def _canonicalize_rubric(raw: Any) -> list[dict[str, str]]:
         if not key or key in seen:
             continue
         text = " ".join(str(item.get("text") or "").split())
-        canonical.append({"criterion_key": key, "text": text})
+        entry: dict[str, Any] = {"criterion_key": key, "text": text}
+        contract = normalize_authorship_evidence_contract(item.get("evidence_contract"))
+        if contract is not None:
+            entry["evidence_contract"] = contract
+        canonical.append(entry)
         seen.add(key)
     return canonical
 
-def _rubric_fingerprint(snapshot: list[dict[str, str]]) -> str:
+def _rubric_fingerprint(snapshot: list[dict[str, Any]]) -> str:
     encoded = json.dumps(
         _canonicalize_rubric(snapshot),
         ensure_ascii=False,
@@ -722,11 +729,15 @@ def _rubric_dimension_reusable(
 async def _snapshot_qualification_rubric(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     rows = await get_criteria_for_version(session, version.id)
     active = _canonicalize_rubric(
         [
-            {"criterion_key": row.criterion_key, "text": row.text}
+            {
+                "criterion_key": row.criterion_key,
+                "text": row.text,
+                "evidence_contract": row.evidence_contract,
+            }
             for row in rows
             if row.status == "active"
         ]
@@ -745,7 +756,7 @@ async def _resolve_launched_rubric(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
     qual: dict[str, Any],
-) -> tuple[list[dict[str, str]] | None, dict[str, Any] | None, str | None]:
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None, str | None]:
     if isinstance(qual.get("rubric_snapshot"), list):
         snapshot = _canonicalize_rubric(qual["rubric_snapshot"])
         fingerprint = _rubric_fingerprint(snapshot)
@@ -6414,7 +6425,11 @@ async def _finalize_qualification(
     live_criterion_rows = await get_criteria_for_version(session, version.id)
     live_rubric = _canonicalize_rubric(
         [
-            {"criterion_key": row.criterion_key, "text": row.text}
+            {
+                "criterion_key": row.criterion_key,
+                "text": row.text,
+                "evidence_contract": row.evidence_contract,
+            }
             for row in live_criterion_rows
             if row.status == "active"
         ]
@@ -8102,7 +8117,15 @@ async def _finalize_qualification(
     # Keep today's coverage summary for observability; gate on launched rubric.
     criterion_coverage = await get_version_coverage_summary(session, version.id)
     active_categories: list[dict[str, Any]] = [
-        {"category_key": c.get("criterion_key"), "text": c.get("text")}
+        {
+            "category_key": c.get("criterion_key"),
+            "text": c.get("text"),
+            **(
+                {"evidence_contract": c["evidence_contract"]}
+                if isinstance(c.get("evidence_contract"), dict)
+                else {}
+            ),
+        }
         for c in launched_rubric
         if c.get("criterion_key")
     ]
@@ -8394,6 +8417,7 @@ async def _finalize_qualification(
             # Fresh grade this finalize: write each category verdict + the residual.
             try:
                 for _v in _fresh_category_verdicts:
+                    _machine_provenance = _v.get("evidence_provenance")
                     await _category_ledger.upsert_category_verdict(
                         session,
                         version_id=version.id,
@@ -8403,7 +8427,12 @@ async def _finalize_qualification(
                         tier=_v.get("tier", "judged"),
                         gap=_v.get("gap"),
                         citations=_v.get("citations") or [],
-                        grader_run_id=merge_grade_task_id,
+                        grader_run_id=(
+                            None
+                            if isinstance(_machine_provenance, dict)
+                            else merge_grade_task_id
+                        ),
+                        evidence_provenance=_machine_provenance,
                         qualification_attempt_id=attempt_id,
                         project_id=version.project_id,
                     )

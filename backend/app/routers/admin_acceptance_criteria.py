@@ -56,6 +56,7 @@ async def list_acceptance_criteria(
 
 class CreateCriterionRequest(BaseModel):
     text: str
+    evidence_contract: dict | None = None
 
 
 @router.post("/projects/{project_id}/acceptance-criteria")
@@ -94,6 +95,7 @@ async def create_acceptance_criterion(
         project_id=project_id,
         release_version_id=open_version.id,
         text=text,
+        evidence_contract=body.evidence_contract,
         created_by="operator",
     )
     logger.info(
@@ -105,6 +107,7 @@ async def create_acceptance_criterion(
     return {
         "criterion_key": criterion.criterion_key,
         "text": criterion.text,
+        "evidence_contract": criterion.evidence_contract,
         "release_version_id": str(open_version.id),
     }
 

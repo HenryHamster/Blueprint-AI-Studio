@@ -9426,6 +9426,7 @@ async def test_evaluating_flip_is_atomic_with_child_spawn(db_session, mocker):
     # Despite the wiring failure, the child-spawn commit already flipped the parent
     # to EVALUATING atomically with the children — never COMPLETED-with-children.
     await db_session.rollback()
+    await db_session.refresh(task)
     children = (
         (
             await db_session.execute(
@@ -22820,6 +22821,7 @@ class TestDecayThresholdDBIntegration:
         assert (task.context or {}).get(FINALIZED_RESEARCH_FINDINGS_KEY) is not True
         first_id = first[0].id
         await db_session.rollback()
+        await db_session.refresh(task)
 
         await _handle_research_completion(task, "", db_session)
         await db_session.refresh(task)

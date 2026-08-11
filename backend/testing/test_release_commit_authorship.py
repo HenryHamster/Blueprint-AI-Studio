@@ -18,6 +18,7 @@ from app.release_commit_authorship import (
     count_non_bot_authored_commits,
     authorship_category_evidence,
     measure_serving_authorship_evidence,
+    normalized_authorship_prompt_evidence,
     persist_serving_authorship_evidence,
     reconcile_serving_authorship_evidence,
     validate_authorship_receipt,
@@ -515,6 +516,10 @@ def test_authorship_receipt_drives_normal_category_grader_without_seeded_verdict
     category = [{
         "category_key": "generated-authorship-key",
         "text": "All release commits must satisfy the Blueprint bot authorship contract.",
+        "evidence_contract": {
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
     }]
     resolved = {
         "source": AUTHORSHIP_RECEIPT_SOURCE,
@@ -540,6 +545,12 @@ def test_authorship_receipt_drives_normal_category_grader_without_seeded_verdict
         "tier": "machine",
         "gap": None,
         "citations": [{"kind": "diff", "ref": "release-authorship:count=0"}],
+        "evidence_provenance": {
+            "kind": "machine",
+            "source": "release_authorship",
+            "source_kind": "github_compare",
+            "range": {"base_sha": base, "head_sha": head},
+        },
     }]
 
 
@@ -562,12 +573,94 @@ def test_authorship_receipt_drives_normal_category_grader_without_seeded_verdict
     ],
 )
 def test_missing_legacy_or_unresolved_authorship_evidence_fails_category_closed(receipt):
-    category = [{"category_key": "generated-authorship-key", "text": "Commit authorship is Blueprint-controlled."}]
+    category = [{
+        "category_key": "generated-authorship-key",
+        "text": "Commit authorship is Blueprint-controlled.",
+        "evidence_contract": {
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
+    }]
     evidence = authorship_category_evidence(receipt, "a" * 40, "b" * 40, category)
 
     assert evidence[0]["status"] == "not_met"
     assert evidence[0]["authoritative"] is True
     assert evidence[0]["citations"]
+
+
+def test_authorship_projection_requires_structured_contract_not_rubric_prose():
+    base, head = "a" * 40, "b" * 40
+    receipt = {
+        "source": AUTHORSHIP_RECEIPT_SOURCE,
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        "state": "resolved",
+        "count": 0,
+        "offenders": [],
+        "range": {"base_sha": base, "head_sha": head},
+        "measured_at": "2026-01-01T00:00:00+00:00",
+        "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+    }
+    categories = [
+        {"category_key": "uncontracted", "text": "operator-authored commits"},
+        {
+            "category_key": "inverse",
+            "text": "No operator-authored commits are required.",
+            "evidence_contract": {
+                "type": "some_other_contract",
+                "predicate": {"max_count": 0},
+            },
+        },
+    ]
+
+    assert authorship_category_evidence(receipt, base, head, categories) == []
+
+
+def test_authorship_contract_max_count_projects_nonzero_as_unmet_and_prompt_is_bounded():
+    base, head = "a" * 40, "b" * 40
+    receipt = {
+        "source": AUTHORSHIP_RECEIPT_SOURCE,
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        "state": "resolved",
+        "count": 1,
+        "offenders": [{"sha": "c" * 12, "author": "attacker-controlled name"}],
+        "range": {"base_sha": base, "head_sha": head},
+        "measured_at": "2026-01-01T00:00:00+00:00",
+        "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+    }
+    category = {
+        "category_key": "generated-key",
+        "text": "Any rubric prose is irrelevant to this projection.",
+        "evidence_contract": {
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
+    }
+
+    evidence = authorship_category_evidence(receipt, base, head, [category])
+    prompt = normalized_authorship_prompt_evidence(receipt, base, head, [category])
+
+    assert evidence[0]["status"] == "not_met"
+    assert evidence[0]["citations"] == [{"kind": "diff", "ref": "release-authorship:cccccccccccc"}]
+    assert "attacker-controlled name" not in str(prompt)
+    assert prompt["operator_authored_commits"] == {
+        "state": "resolved",
+        "count": 1,
+        "offender_shas": ["cccccccccccc"],
+    }
+    assert prompt["range"] == {"base_sha": "a" * 12, "head_sha": "b" * 12}
+
+
+def test_malformed_receipt_is_repair_candidate_without_json_casting():
+    from app.release_commit_authorship import _reconciliation_candidate_is_eligible
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for report in (
+        {"schema_version": "2", "state": "resolved"},
+        {"schema_version": 2, "state": "terminal", "retry": {"next_retry_at": []}},
+        {"schema_version": 2, "state": "resolved", "measured_at": "not-a-time"},
+        {"schema_version": 2, "state": "unresolved", "retry": {"next_retry_at": {}}},
+    ):
+        assert _reconciliation_candidate_is_eligible(report, "a" * 40, "b" * 40, now)
 
 
 @pytest.mark.asyncio
@@ -937,6 +1030,168 @@ async def test_reconciliation_old_rows_and_concurrent_claim_once(db_session, moc
     assert sorted(results) == [0, 1]
     assert measure.await_count == 1
     assert measure.await_args.args[0] == target.id
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_keyset_scans_mixed_malformed_rows_without_json_casts(
+    db_session, mocker
+):
+    """Postgres sweep walks past valid rows and repairs malformed JSON claims."""
+    from app.database import AsyncSessionLocal
+
+    project = Project(name="Authorship mixed rows", user_id="authorship-mixed")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    base, head = "a" * 40, "b" * 40
+
+    def valid(state: str, next_retry_at: str | None = None) -> dict:
+        return {
+            "source": AUTHORSHIP_RECEIPT_SOURCE,
+            "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+            "state": state,
+            "count": 0 if state == "resolved" else None,
+            "offenders": [],
+            "range": {"base_sha": base, "head_sha": head},
+            **({"reason": "terminal"} if state != "resolved" else {}),
+            "measured_at": "2026-01-01T00:00:00+00:00",
+            "retry": {
+                "attempt": 1,
+                "retryable": state == "unresolved",
+                "next_retry_at": next_retry_at,
+            },
+        }
+
+    reports = [
+        None,
+        {"schema_version": 1, "state": "resolved"},
+        {"schema_version": "2", "state": "resolved"},
+        {"schema_version": [], "state": "resolved"},
+        {"schema_version": {}, "state": "resolved"},
+        {"schema_version": 2, "state": "resolved", "retry": {"next_retry_at": []}},
+        {"schema_version": 2, "state": "terminal", "retry": {"next_retry_at": "2099"}},
+        valid("resolved"),
+        valid("terminal"),
+        valid("unresolved", "2099-01-01T00:00:00+00:00"),
+    ]
+    rows = [
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=index + 1,
+            status="promoted",
+            base_sha=base,
+            served_sha=head,
+            serving_status="serving_confirmed",
+            served_at=datetime(2026, 1, 1, index, tzinfo=timezone.utc),
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification=(
+                {"operator_authored_commits": report} if report is not None else {}
+            ),
+        )
+        for index, report in enumerate(reports)
+    ]
+    db_session.add_all(rows)
+    await db_session.commit()
+
+    mocker.patch("app.release_commit_authorship._RECONCILIATION_SCAN_PAGE_SIZE", 2)
+    measure = mocker.patch(
+        "app.release_commit_authorship.measure_serving_authorship_evidence",
+        new=AsyncMock(return_value=True),
+    )
+
+    attempted = await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=10)
+
+    assert attempted == 7
+    assert measure.await_count == 7
+    # The last three rows were valid current receipts and stayed untouched;
+    # malformed v2 resolved/terminal claims were included in the repair set.
+    await db_session.refresh(rows[-1])
+    assert rows[-1].last_qualification["operator_authored_commits"]["state"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_skip_locked_moves_past_contended_candidate(db_session, mocker):
+    """A held row is skipped and cannot consume the sweep's only candidate slot."""
+    from app.database import AsyncSessionLocal
+    from sqlalchemy import select
+
+    project = Project(name="Authorship contention", user_id="authorship-contention")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    rows = [
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=index + 1,
+            status="promoted",
+            base_sha=f"{index + 1:040x}",
+            served_sha=f"{index + 2:040x}",
+            serving_status="serving_confirmed",
+            served_at=datetime(2026, 1, 1, index, tzinfo=timezone.utc),
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification={},
+        )
+        for index in range(2)
+    ]
+    db_session.add_all(rows)
+    await db_session.commit()
+
+    blocker = AsyncSessionLocal()
+    await blocker.begin()
+    await blocker.execute(
+        select(ReleaseVersion)
+        .where(ReleaseVersion.id == rows[0].id)
+        .with_for_update()
+    )
+    measure = mocker.patch(
+        "app.release_commit_authorship.measure_serving_authorship_evidence",
+        new=AsyncMock(return_value=True),
+    )
+    try:
+        attempted = await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1)
+    finally:
+        await blocker.rollback()
+        await blocker.close()
+
+    assert attempted == 1
+    assert measure.await_args.args[0] == rows[1].id
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_deadline_cancels_slow_external_measurement(db_session, mocker):
+    """The sweep deadline applies to external I/O, not only candidate SQL."""
+    project = Project(name="Authorship deadline", user_id="authorship-deadline")
+    row = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        base_sha="a" * 40,
+        served_sha="b" * 40,
+        serving_status="serving_confirmed",
+        served_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_qualification={},
+    )
+    db_session.add_all([project, row])
+    await db_session.commit()
+    from app.database import AsyncSessionLocal
+
+    async def slow_measure(*_args, **_kwargs):
+        await asyncio.sleep(0.2)
+
+    mocker.patch(
+        "app.release_commit_authorship._RECONCILIATION_MAX_SECONDS", 0.05
+    )
+    mocker.patch(
+        "app.release_commit_authorship.measure_serving_authorship_evidence",
+        new=AsyncMock(side_effect=slow_measure),
+    )
+    started = asyncio.get_running_loop().time()
+    attempted = await reconcile_serving_authorship_evidence(AsyncSessionLocal, limit=1)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert attempted == 1
+    assert elapsed < 0.15
 
 
 @pytest.mark.asyncio

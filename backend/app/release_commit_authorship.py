@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import Project, ReleaseVersion
@@ -47,6 +47,7 @@ GITHUB_WEB_FLOW_ID = 19864447
 MAX_RECONCILIATION_VERSIONS = 100
 _RECONCILIATION_MAX_CALLS = 25
 _RECONCILIATION_MAX_SECONDS = 20
+_RECONCILIATION_SCAN_PAGE_SIZE = 100
 _RETRY_BASE_SECONDS = 60
 _RETRY_MAX_SECONDS = 3600
 _PERMANENT_AUTHORSHIP_REASONS = frozenset(
@@ -65,17 +66,69 @@ _PERMANENT_AUTHORSHIP_REASONS = frozenset(
     }
 )
 
-# Rubric text is the binding metadata for this evidence lane.  Criterion keys
-# remain generated/project-specific; only criteria that explicitly describe
-# commit authorship are eligible for the receipt below.
-_AUTHORSHIP_CRITERION_MARKERS = (
-    "authorship",
-    "operator-authored",
-    "authored commit",
-    "commit author",
-    "operator commit",
-    "bot commit",
-)
+AUTHORSHIP_EVIDENCE_CONTRACT_TYPE = "operator_authored_commits"
+
+
+def normalize_authorship_evidence_contract(raw: Any) -> dict[str, Any] | None:
+    """Accept only the explicit, structured authorship contract shape."""
+    if not isinstance(raw, dict) or set(raw) != {"type", "predicate"}:
+        return None
+    if raw.get("type") != AUTHORSHIP_EVIDENCE_CONTRACT_TYPE:
+        return None
+    predicate = raw.get("predicate")
+    if (
+        not isinstance(predicate, dict)
+        or set(predicate) != {"max_count"}
+        or isinstance(predicate.get("max_count"), bool)
+        or not isinstance(predicate.get("max_count"), int)
+        or predicate["max_count"] < 0
+    ):
+        return None
+    return {
+        "type": AUTHORSHIP_EVIDENCE_CONTRACT_TYPE,
+        "predicate": {"max_count": predicate["max_count"]},
+    }
+
+
+def normalized_authorship_prompt_evidence(
+    receipt: Any,
+    base_sha: str | None,
+    head_sha: str | None,
+    categories: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return bounded receipt facts safe to place in an agent prompt."""
+    validated = validate_authorship_receipt(receipt, base_sha, head_sha)
+    if validated is None:
+        state = "missing_or_invalid"
+        count = None
+        offender_shas: list[str] = []
+    else:
+        state = str(validated["state"])
+        count = validated.get("count") if isinstance(validated.get("count"), int) else None
+        offender_shas = [
+            item["sha"]
+            for item in validated.get("offenders", [])
+            if isinstance(item, dict) and isinstance(item.get("sha"), str)
+        ]
+    contracts = [
+        contract
+        for category in categories
+        if isinstance(category, dict)
+        for contract in [normalize_authorship_evidence_contract(category.get("evidence_contract"))]
+        if contract is not None
+    ]
+    return {
+        "operator_authored_commits": {
+            "state": state,
+            "count": count,
+            "offender_shas": offender_shas[:MAX_REPORTED_OFFENDERS],
+        },
+        "range": {
+            "base_sha": base_sha[:12] if isinstance(base_sha, str) else None,
+            "head_sha": head_sha[:12] if isinstance(head_sha, str) else None,
+        },
+        "contracts": contracts,
+    }
 
 
 def _unresolved(
@@ -293,63 +346,58 @@ def authorship_category_evidence(
     head_sha: str | None,
     categories: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Project the immutable receipt into matching rubric categories.
-
-    This is the generic qualifier evidence adapter: it binds by criterion text,
-    never by a one-off criterion id.  A matching category always receives a
-    verdict, including invalid/missing/unresolved/terminal evidence, so the
-    normal category ledger fails closed rather than allowing an unrelated LLM
-    ``met`` claim to mask an unavailable receipt.
-    """
+    """Project a validated receipt only into explicitly contracted categories."""
     matching = [
         category
         for category in categories
         if isinstance(category, dict)
-        and any(
-            marker in str(category.get("text") or "").casefold()
-            for marker in _AUTHORSHIP_CRITERION_MARKERS
-        )
+        and normalize_authorship_evidence_contract(category.get("evidence_contract"))
     ]
     if not matching:
         return []
     validated = validate_authorship_receipt(receipt, base_sha, head_sha)
-    citations: list[dict[str, str]] = []
-    if validated is not None and validated.get("state") == "resolved":
-        count = validated["count"]
-        offenders = validated["offenders"]
-        status = "met" if count == 0 else "not_met"
-        gap = None if status == "met" else (
-            f"{count} non-Blueprint-authored commit(s) in the immutable release range."
-        )
-        citations = [
-            {
-                "kind": "diff",
-                "ref": f"release-authorship:{item['sha']}:{item['author']}",
-            }
-            for item in offenders
-        ]
-        if not citations:
-            citations = [{"kind": "diff", "ref": "release-authorship:count=0"}]
-    else:
-        status = "not_met"
-        if isinstance(receipt, dict) and receipt.get("state") == "terminal":
-            gap = "Authorship receipt is terminal and cannot support a clean qualifier verdict."
-        elif isinstance(receipt, dict) and receipt.get("state") == "unresolved":
-            gap = "Authorship receipt is unresolved and cannot support a clean qualifier verdict."
+    result: list[dict[str, Any]] = []
+    for category in matching:
+        contract = normalize_authorship_evidence_contract(category.get("evidence_contract"))
+        max_count = contract["predicate"]["max_count"] if contract else -1
+        if validated is not None and validated.get("state") == "resolved":
+            count = validated["count"]
+            offenders = validated["offenders"]
+            status = "met" if count <= max_count else "not_met"
+            gap = None if status == "met" else (
+                f"{count} non-Blueprint-authored commit(s) exceed the contracted "
+                f"maximum of {max_count}."
+            )
+            citations = [
+                {"kind": "diff", "ref": f"release-authorship:{item['sha']}"}
+                for item in offenders
+            ] or [{"kind": "diff", "ref": "release-authorship:count=0"}]
         else:
-            gap = "Current-schema immutable authorship receipt is missing or invalid."
-        citations = [{"kind": "diff", "ref": "release-authorship:unavailable"}]
-    return [
-        {
-            "category_key": str(category.get("category_key") or category.get("criterion_key")),
-            "status": status,
-            "tier": "machine",
-            "gap": gap,
-            "citations": citations,
-            "authoritative": True,
-        }
-        for category in matching
-    ]
+            status = "not_met"
+            if isinstance(receipt, dict) and receipt.get("state") == "terminal":
+                gap = "Authorship receipt is terminal and cannot support a clean qualifier verdict."
+            elif isinstance(receipt, dict) and receipt.get("state") == "unresolved":
+                gap = "Authorship receipt is unresolved and cannot support a clean qualifier verdict."
+            else:
+                gap = "Current-schema immutable authorship receipt is missing or invalid."
+            citations = [{"kind": "diff", "ref": "release-authorship:unavailable"}]
+        result.append(
+            {
+                "category_key": str(category.get("category_key") or category.get("criterion_key")),
+                "status": status,
+                "tier": "machine",
+                "gap": gap,
+                "citations": citations,
+                "authoritative": True,
+                "evidence_provenance": {
+                    "kind": "machine",
+                    "source": "release_authorship",
+                    "source_kind": "github_compare",
+                    "range": {"base_sha": base_sha, "head_sha": head_sha},
+                },
+            }
+        )
+    return result
 
 
 def _next_attempt(receipt: Any) -> int:
@@ -707,6 +755,7 @@ async def measure_serving_authorship_evidence(
     session_factory=None,
     expected_receipt_identity: str | None = None,
     timeout_seconds: float | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """Measure a committed pending receipt and atomically CAS its final result."""
     if session_factory is None:
@@ -714,6 +763,7 @@ async def measure_serving_authorship_evidence(
 
         session_factory = AsyncSessionLocal
     async with session_factory() as snapshot_session:
+        await _set_reconciliation_timeouts(snapshot_session, deadline)
         version = (
             (
                 await snapshot_session.execute(
@@ -785,14 +835,18 @@ async def measure_serving_authorship_evidence(
         attempt=pending_attempt,
     )
     async with session_factory() as final_session:
+        await _set_reconciliation_timeouts(final_session, deadline)
+        remaining = _remaining_reconciliation_seconds(deadline)
+        if remaining <= 0:
+            return False
         current = (
             (
-                await final_session.execute(
+                await asyncio.wait_for(final_session.execute(
                     select(ReleaseVersion)
                     .where(ReleaseVersion.id == version_id)
                     .execution_options(populate_existing=True)
                     .with_for_update()
-                )
+                ), timeout=remaining)
             )
             .scalars()
             .first()
@@ -809,15 +863,58 @@ async def measure_serving_authorship_evidence(
             or current.served_sha != served_sha
             or _receipt_identity(current_report) != identity
         ):
-            await final_session.rollback()
+            await asyncio.wait_for(final_session.rollback(), timeout=remaining)
             return False
         current_qualification = dict(current.last_qualification or {})
         current_qualification["operator_authored_commits"] = receipt
         current.last_qualification = current_qualification
         flag_modified(current, "last_qualification")
         final_session.add(current)
-        await final_session.commit()
+        await asyncio.wait_for(
+            final_session.commit(), timeout=_remaining_reconciliation_seconds(deadline)
+        )
     return True
+
+
+def _remaining_reconciliation_seconds(deadline: float | None) -> float:
+    if deadline is None:
+        return _RECONCILIATION_MAX_SECONDS
+    return max(0.0, deadline - time.monotonic())
+
+
+async def _set_reconciliation_timeouts(session: Any, deadline: float | None) -> None:
+    """Apply transaction-local Postgres timeouts without affecting SQLite tests."""
+    if _remaining_reconciliation_seconds(deadline) <= 0:
+        raise asyncio.TimeoutError
+    bind = getattr(session, "bind", None)
+    dialect = getattr(getattr(bind, "dialect", None), "name", None)
+    if dialect != "postgresql":
+        return
+    milliseconds = max(1, int(_remaining_reconciliation_seconds(deadline) * 1000))
+    await session.execute(text(f"SET LOCAL statement_timeout = {milliseconds}"))
+    await session.execute(text(f"SET LOCAL lock_timeout = {milliseconds}"))
+
+
+def _reconciliation_candidate_is_eligible(
+    report: Any,
+    base_sha: str | None,
+    served_sha: str | None,
+    now: datetime,
+) -> bool:
+    """Keep malformed JSON in the repair population; Python validation is authoritative."""
+    validated = validate_authorship_receipt(report, base_sha, served_sha)
+    if validated is None:
+        return True
+    if validated.get("state") in {"resolved", "terminal"}:
+        return False
+    retry = validated.get("retry")
+    next_retry_at = retry.get("next_retry_at") if isinstance(retry, dict) else None
+    if not isinstance(next_retry_at, str):
+        return True
+    try:
+        return datetime.fromisoformat(next_retry_at.replace("Z", "+00:00")) <= now
+    except ValueError:
+        return True
 
 
 async def reconcile_serving_authorship_evidence(
@@ -838,82 +935,103 @@ async def reconcile_serving_authorship_evidence(
 
         session_factory = AsyncSessionLocal
     bounded_limit = max(1, min(int(limit), MAX_RECONCILIATION_VERSIONS))
-    now = datetime.now(timezone.utc)
     deadline = time.monotonic() + _RECONCILIATION_MAX_SECONDS
     version_ids: list[Any] = []
-    async with session_factory() as scan_session:
-        # Filter eligibility in SQL instead of walking an offset over every
-        # resolved row.  Legacy/malformed rows remain candidates for bounded
-        # backfill, while current v2 resolved/terminal rows and future backoff
-        # leases are excluded before the limit is applied.
-        receipt = ReleaseVersion.last_qualification["operator_authored_commits"]
-        schema_version = receipt["schema_version"].as_integer()
-        receipt_state = receipt["state"].as_string()
-        next_retry_at = receipt["retry"]["next_retry_at"].as_string()
-        eligible_state = or_(
-            schema_version.is_(None),
-            schema_version != AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
-            receipt_state.is_(None),
-            ~receipt_state.in_(("resolved", "terminal")),
-        )
-        eligible_time = or_(
-            schema_version.is_(None),
-            schema_version != AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
-            receipt_state != "unresolved",
-            next_retry_at.is_(None),
-            next_retry_at <= now.isoformat(),
-        )
-        candidates = list(
-            (
-                await scan_session.execute(
-                    select(ReleaseVersion)
-                    .where(
-                        ReleaseVersion.status == "promoted",
-                        ReleaseVersion.serving_status == "serving_confirmed",
-                        ReleaseVersion.base_sha.is_not(None),
-                        ReleaseVersion.served_sha.is_not(None),
-                        eligible_state,
-                        eligible_time,
+    cursor_served_at: datetime | None = None
+    cursor_id: Any | None = None
+    cursor_started = False
+    while len(version_ids) < bounded_limit and _remaining_reconciliation_seconds(deadline) > 0:
+        async with session_factory() as scan_session:
+            await _set_reconciliation_timeouts(scan_session, deadline)
+            conditions = [
+                ReleaseVersion.status == "promoted",
+                ReleaseVersion.serving_status == "serving_confirmed",
+                ReleaseVersion.base_sha.is_not(None),
+                ReleaseVersion.served_sha.is_not(None),
+            ]
+            if cursor_started:
+                if cursor_served_at is None:
+                    conditions.append(
+                        and_(
+                            ReleaseVersion.served_at.is_(None),
+                            ReleaseVersion.id > cursor_id,
+                        )
                     )
-                    .order_by(
-                        ReleaseVersion.served_at.asc().nulls_first(),
-                        ReleaseVersion.id.asc(),
+                else:
+                    conditions.append(
+                        or_(
+                            ReleaseVersion.served_at > cursor_served_at,
+                            and_(
+                                ReleaseVersion.served_at == cursor_served_at,
+                                ReleaseVersion.id > cursor_id,
+                            ),
+                        )
                     )
-                    .limit(bounded_limit)
+            query = (
+                select(ReleaseVersion)
+                .where(*conditions)
+                .order_by(
+                    ReleaseVersion.served_at.asc().nulls_first(),
+                    ReleaseVersion.id.asc(),
                 )
+                .limit(_RECONCILIATION_SCAN_PAGE_SIZE)
+                .with_for_update(skip_locked=True)
             )
-            .scalars()
-            .all()
-        )
+            remaining = _remaining_reconciliation_seconds(deadline)
+            try:
+                candidates = list(
+                    (
+                        await asyncio.wait_for(
+                            scan_session.execute(query), timeout=remaining
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            except asyncio.TimeoutError:
+                break
+        if not candidates:
+            break
+        now = datetime.now(timezone.utc)
         for candidate in candidates:
+            cursor_served_at = candidate.served_at
+            cursor_id = candidate.id
+            cursor_started = True
             report = (candidate.last_qualification or {}).get(
                 "operator_authored_commits"
             )
-            validated = validate_authorship_receipt(
-                report, candidate.base_sha, candidate.served_sha
-            )
-            if validated is None or validated.get("state") not in {
-                "resolved",
-                "terminal",
-            }:
+            if _reconciliation_candidate_is_eligible(
+                report, candidate.base_sha, candidate.served_sha, now
+            ):
                 version_ids.append(candidate.id)
+                if len(version_ids) >= bounded_limit:
+                    break
     attempted = 0
     for version_id in version_ids:
-        if attempted >= _RECONCILIATION_MAX_CALLS or time.monotonic() >= deadline:
+        if attempted >= _RECONCILIATION_MAX_CALLS or _remaining_reconciliation_seconds(deadline) <= 0:
             break
         async with session_factory() as worker_session:
-            version = (
-                (
-                    await worker_session.execute(
-                        select(ReleaseVersion)
-                        .where(ReleaseVersion.id == version_id)
-                        .execution_options(populate_existing=True)
-                        .with_for_update()
+            try:
+                await _set_reconciliation_timeouts(worker_session, deadline)
+                version = (
+                    (
+                        await asyncio.wait_for(
+                            worker_session.execute(
+                                select(ReleaseVersion)
+                                .where(ReleaseVersion.id == version_id)
+                                .execution_options(populate_existing=True)
+                                .with_for_update(skip_locked=True)
+                            ),
+                            timeout=_remaining_reconciliation_seconds(deadline),
+                        )
                     )
+                    .scalars()
+                    .first()
                 )
-                .scalars()
-                .first()
-            )
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                continue
             if version is None:
                 continue
             report = (version.last_qualification or {}).get("operator_authored_commits")
@@ -936,21 +1054,37 @@ async def reconcile_serving_authorship_evidence(
                 except ValueError:
                     pass
             try:
-                plan = await persist_serving_authorship_evidence(worker_session, version)
+                plan = await asyncio.wait_for(
+                    persist_serving_authorship_evidence(worker_session, version),
+                    timeout=_remaining_reconciliation_seconds(deadline),
+                )
                 if plan is None:
                     continue
                 # The pending marker is the durable claim.  A concurrent
                 # sweeper blocks on this row lock and observes its retry time.
-                await worker_session.commit()
+                await asyncio.wait_for(
+                    worker_session.commit(),
+                    timeout=_remaining_reconciliation_seconds(deadline),
+                )
                 attempted += 1
-                await measure_serving_authorship_evidence(
-                    version.id,
-                    session_factory=session_factory,
-                    expected_receipt_identity=plan["receipt_identity"],
-                    timeout_seconds=max(0.001, deadline - time.monotonic()),
+                await asyncio.wait_for(
+                    measure_serving_authorship_evidence(
+                        version.id,
+                        session_factory=session_factory,
+                        expected_receipt_identity=plan["receipt_identity"],
+                        timeout_seconds=max(0.001, deadline - time.monotonic()),
+                        deadline=deadline,
+                    ),
+                    timeout=_remaining_reconciliation_seconds(deadline),
                 )
             except Exception:  # noqa: BLE001 - one stale release cannot stop repair
-                await worker_session.rollback()
+                try:
+                    await asyncio.wait_for(
+                        worker_session.rollback(),
+                        timeout=_remaining_reconciliation_seconds(deadline),
+                    )
+                except Exception:  # noqa: BLE001 - deadline cleanup is best-effort
+                    pass
                 logger.exception(
                     "authorship evidence reconciliation failed for release %s",
                     version_id,

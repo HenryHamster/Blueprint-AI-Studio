@@ -4740,6 +4740,179 @@ async def test_criterion_coverage_incomplete_blocks_qualification(
     assert _cv["c-covered1"]["status"] == "met"
 
 
+def _authorship_contract_receipt(state: str, *, count: int = 0) -> dict:
+    base, head = "a" * 40, "b" * 40
+    receipt = {
+        "source": "github_compare",
+        "schema_version": 2,
+        "state": state,
+        "count": count if state == "resolved" else None,
+        "offenders": (
+            [{"sha": "c" * 12, "author": "operator"}]
+            if state == "resolved" and count
+            else []
+        ),
+        "range": {"base_sha": base, "head_sha": head},
+        "measured_at": "2026-01-01T00:00:00+00:00",
+        "retry": {
+            "attempt": 1,
+            "retryable": state == "unresolved",
+            "next_retry_at": (
+                "2026-01-02T00:00:00+00:00" if state == "unresolved" else None
+            ),
+        },
+    }
+    if state != "resolved":
+        receipt["reason"] = "github_authorship_timeout"
+    return receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "receipt", "expected_status", "expected_blocker"),
+    [
+        ("resolved_zero", _authorship_contract_receipt("resolved"), "met", None),
+        (
+            "resolved_nonzero",
+            _authorship_contract_receipt("resolved", count=1),
+            "not_met",
+            "criterion_coverage_incomplete",
+        ),
+        ("missing", None, "not_met", "criterion_coverage_incomplete"),
+        (
+            "invalid",
+            {"schema_version": "2", "state": "resolved"},
+            "not_met",
+            "criterion_coverage_incomplete",
+        ),
+        (
+            "unresolved",
+            _authorship_contract_receipt("unresolved"),
+            "not_met",
+            "criterion_coverage_incomplete",
+        ),
+        (
+            "terminal",
+            _authorship_contract_receipt("terminal"),
+            "not_met",
+            "criterion_coverage_incomplete",
+        ),
+        (
+            "spoofed",
+            {**_authorship_contract_receipt("resolved"), "extra": "tampered"},
+            "not_met",
+            "criterion_coverage_incomplete",
+        ),
+    ],
+)
+async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
+    db_session, mocker, label, receipt, expected_status, expected_blocker
+):
+    """The real finalize path projects only an explicit contract into the ledger."""
+    from app import category_verdict_ledger as cvl
+    from app.models import ReleaseVersion
+
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    project, version = await _make_project_and_version(db_session)
+    prior = ReleaseVersion(
+        project_id=project.id,
+        version_number=0,
+        status="promoted",
+        base_sha="a" * 40,
+        served_sha="b" * 40,
+        serving_status="serving_confirmed",
+        last_qualification={"operator_authored_commits": receipt} if receipt else {},
+    )
+    db_session.add(prior)
+    db_session.add(
+        VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key="generated-authorship-key",
+            text="This prose is not the binding machine contract.",
+            evidence_contract={
+                "type": "operator_authored_commits",
+                "predicate": {"max_count": 0},
+            },
+            status="active",
+            created_by="test",
+        )
+    )
+    await db_session.commit()
+
+    # No category_verdicts are preseeded: finalize must derive the verdict from
+    # the promoted receipt, write the category ledger, and apply the gate.
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+            "covers_goal": True,
+            "coverage_score": 1.0,
+            "biggest_gap": None,
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        version_goal="Ship the release-authorship contract",
+    )
+    mocker.patch.object(
+        rq,
+        "_load_prior_operator_authorship_gate",
+        new=AsyncMock(return_value={"status": "passed", "count": 0}),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+
+    rows = await cvl.get_category_verdicts(db_session, version.id, "feed" * 10)
+    assert len(rows) == 1, label
+    assert rows[0].category_key == "generated-authorship-key"
+    assert rows[0].status == expected_status
+    assert rows[0].grader_run_id is None
+    assert rows[0].evidence_provenance == {
+        "kind": "machine",
+        "source": "release_authorship",
+        "source_kind": "github_compare",
+        "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+    }
+    if expected_blocker:
+        assert result.get("blocker") == expected_blocker
+        promote_spy.assert_not_called()
+    else:
+        promote_spy.assert_awaited_once()
+
+    criterion_evidence = (
+        await db_session.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id
+                == (
+                    await db_session.execute(
+                        select(VersionAcceptanceCriterion.id).where(
+                            VersionAcceptanceCriterion.criterion_key
+                            == "generated-authorship-key"
+                        )
+                    )
+                ).scalar_one()
+            )
+        )
+    ).scalars().all()
+    assert criterion_evidence == []
+
+
 @pytest.mark.asyncio
 async def test_finalize_gate_ignores_retracted_criterion_stale_not_met_verdict(
     db_session, mocker

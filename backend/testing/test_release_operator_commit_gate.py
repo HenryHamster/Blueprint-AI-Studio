@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from app import release_scoring as rs
+from app.release_commit_authorship import (
+    AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+    _reconciliation_candidate_is_eligible,
+)
 
 
 _POLICY = {
@@ -16,7 +22,7 @@ _SERVED_SHA = "b" * 40
 def _receipt(count: int) -> dict:
     return {
         "source": "github_compare",
-        "schema_version": 1,
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
         "state": "resolved",
         "count": count,
         "offenders": [
@@ -27,6 +33,13 @@ def _receipt(count: int) -> dict:
         "measured_at": "2026-08-11T00:00:00+00:00",
         "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
     }
+
+
+def _legacy_v1_receipt(count: int) -> dict:
+    """A real legacy blob retained for fail-closed reconciliation coverage."""
+    receipt = _receipt(count)
+    receipt["schema_version"] = 1
+    return receipt
 
 
 def _prior_record(receipt: dict | None, *, serving_status: str = "serving_confirmed"):
@@ -92,6 +105,24 @@ def test_prior_promoted_absent_or_unresolvable_evidence_fails_closed():
     assert absent_result["blocker"] == "prior_operator_authorship_evidence_missing"
     assert invalid_result["promote"] is False
     assert invalid_result["blocker"] == "prior_operator_authorship_evidence_missing"
+
+
+def test_legacy_v1_receipt_is_a_backfill_candidate_but_never_a_pass():
+    legacy = _legacy_v1_receipt(0)
+
+    assert _reconciliation_candidate_is_eligible(
+        legacy,
+        _BASE_SHA,
+        _SERVED_SHA,
+        datetime.now(timezone.utc),
+    ) is True
+    gate = rs.evaluate_prior_operator_authorship_gate(
+        _prior_record(legacy)
+    )
+
+    assert gate["status"] == "unresolved"
+    assert gate["reason"] == "prior_promoted_version_authorship_receipt_invalid"
+    assert _score(gate)["blocker"] == "prior_operator_authorship_evidence_missing"
 
 
 def test_no_prior_promoted_version_is_explicit_bootstrap_pass():

@@ -224,6 +224,7 @@ const {
     'QUALIFICATION_STATE_VOCAB',
     'aggregateDirectionStats',
     'buildAvailableCapabilitiesSection',
+    'buildCarriedResearchWorkSection',
     'buildCapabilityVerificationSection',
     'buildEfficiencySnapshotSection',
     'buildEmptyRepoGuidance',
@@ -232,6 +233,7 @@ const {
     'buildOperatorOverridesSection',
     'buildPortfolioComposition',
     'buildRejectedProposalsSection',
+    'buildResearchToolGuidance',
     'buildResearchScopeGuidance',
     'buildRunningUpdateSupersededSection',
     'buildScopeCalibrationSignal',
@@ -255,6 +257,8 @@ const {
     'readProgressArtifact',
     'resolveMemoHandles',
     'runThinkerWithGate',
+    'RESEARCH_CARRIED_WORK_CHAR_BUDGET',
+    'validateComputeFindingContract',
   ] satisfies ResearchPlanExportKey[],
     STRATEGIC_SECTIONS_EXPORT_NAMES: [
     'buildCapabilityVerificationSection',
@@ -487,6 +491,10 @@ vi.mock('./research-plan.js', () => ({
   readProgressArtifact: () => '',
   buildRejectedProposalsSection: () => '',
   buildResearchScopeGuidance: vi.fn(),
+  RESEARCH_CARRIED_WORK_CHAR_BUDGET: 12_000,
+  buildCarriedResearchWorkSection: vi.fn(),
+  buildResearchToolGuidance: vi.fn(),
+  validateComputeFindingContract: vi.fn(),
   buildOperatorOverridesSection: (o: Array<Record<string, unknown>>) =>
     Array.isArray(o) && o.length ? `OPERATOR_OVERRIDES(${o.length})` : '',
   buildRunningUpdateSupersededSection: (signal: Record<string, unknown> | null | undefined) =>

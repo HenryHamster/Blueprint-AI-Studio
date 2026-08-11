@@ -1935,6 +1935,12 @@
           "commit_date": "2026-08-11T07:11:28.767235+00:00",
           "old_cap": 10500,
           "new_cap": 10750
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-11T07:43:00+00:00",
+          "old_cap": 10750,
+          "new_cap": 10800
         }
       ],
       "release_reconciliation.py": [

@@ -862,6 +862,7 @@ async def create_criterion(
     release_version_id: uuid.UUID,
     text: str,
     created_by: str | None = None,
+    evidence_contract: dict[str, Any] | None = None,
 ) -> VersionAcceptanceCriterion:
     """Create and persist a new acceptance criterion for a release version.
 
@@ -873,6 +874,7 @@ async def create_criterion(
         release_version_id=release_version_id,
         criterion_key=generate_criterion_key(),
         text=text,
+        evidence_contract=evidence_contract,
         created_by=created_by,
     )
     session.add(criterion)
@@ -887,6 +889,7 @@ async def stage_criterion(
     release_version_id: uuid.UUID,
     text: str,
     created_by: str | None = None,
+    evidence_contract: dict[str, Any] | None = None,
 ) -> VersionAcceptanceCriterion:
     """Stage a new acceptance criterion without committing the session.
 
@@ -901,6 +904,7 @@ async def stage_criterion(
         release_version_id=release_version_id,
         criterion_key=generate_criterion_key(),
         text=text,
+        evidence_contract=evidence_contract,
         created_by=created_by,
     )
     session.add(criterion)
@@ -991,7 +995,15 @@ async def get_active_criteria_rubric(
         .order_by(VersionAcceptanceCriterion.created_at)
     )
     return [
-        {"criterion_key": c.criterion_key, "text": c.text}
+        {
+            "criterion_key": c.criterion_key,
+            "text": c.text,
+            **(
+                {"evidence_contract": c.evidence_contract}
+                if isinstance(c.evidence_contract, dict)
+                else {}
+            ),
+        }
         for c in result.scalars().all()
     ]
 

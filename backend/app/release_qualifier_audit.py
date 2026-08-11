@@ -38,6 +38,7 @@ from app.models import (
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.qualification_dimensions import LEDGER_DIMENSION_KEYS
 from app.release_promotion import _lts_branch_names, _record_qualification_verdict
+from app.release_commit_authorship import normalized_authorship_prompt_evidence
 from app.runner_eligibility import (
     RunnerDispatchSnapshot,
     _runner_accepting_new_work,
@@ -655,17 +656,16 @@ async def _spawn_release_audit_task(
     promoted_qualification = (
         latest_promoted.last_qualification if latest_promoted is not None else None
     )
-    payload["release_evidence"] = {
-        "operator_authored_commits": (
+    payload["release_evidence"] = normalized_authorship_prompt_evidence(
+        (
             promoted_qualification.get("operator_authored_commits")
             if isinstance(promoted_qualification, dict)
             else None
         ),
-        "range": {
-            "base_sha": latest_promoted.base_sha if latest_promoted is not None else None,
-            "head_sha": latest_promoted.served_sha if latest_promoted is not None else None,
-        },
-    }
+        latest_promoted.base_sha if latest_promoted is not None else None,
+        latest_promoted.served_sha if latest_promoted is not None else None,
+        list(categories or []),
+    )
     if audit_base_sha:
         # A hint, not an assertion: the agent verifies ancestry/range
         # resolvability and falls back to base_branch...candidate_sha if stale.

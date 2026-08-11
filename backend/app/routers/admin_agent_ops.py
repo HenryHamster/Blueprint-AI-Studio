@@ -5949,6 +5949,12 @@ async def strategic_operation(
                     status_code=400,
                     detail="set_acceptance_criteria: each criterion must have a non-empty 'text' string",
                 )
+            contract = item.get("evidence_contract")
+            if contract is not None and not isinstance(contract, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_acceptance_criteria: 'evidence_contract' must be an object when provided",
+                )
         retract_input = data.get("retract", [])
         if not isinstance(retract_input, list):
             raise HTTPException(
@@ -6197,6 +6203,7 @@ async def strategic_operation(
                     release_version_id=open_version.id,
                     criterion_key=criterion_key,
                     text=text,
+                    evidence_contract=item.get("evidence_contract"),
                     created_by="strategist",
                 )
                 session.add(new_row)

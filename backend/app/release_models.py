@@ -425,6 +425,14 @@ class VersionAcceptanceCriterion(SQLModel, table=True):
     # Human-readable criterion description.
     text: str = Field(sa_column=Column(Text, nullable=False))
 
+    # Optional machine evidence contract.  This is deliberately separate from
+    # ``text``: free-form rubric prose must never select a deterministic
+    # evidence producer by substring matching.
+    evidence_contract: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     # Lifecycle status: 'active' | 'retracted' | 'superseded'.
     status: str = Field(
         default="active",
@@ -1276,6 +1284,13 @@ class CategoryVerdict(SQLModel, table=True):
     # Supporting citations (file paths, PR refs, evidence blobs) backing the
     # verdict.  Free-form JSON (list or dict).
     citations: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Truthful source for deterministic evidence.  Machine projections do not
+    # borrow the LLM grader task id as their provenance.
+    evidence_provenance: Any | None = Field(
         default=None,
         sa_column=Column(JSONB, nullable=True),
     )

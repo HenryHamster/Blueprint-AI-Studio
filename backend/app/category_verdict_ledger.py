@@ -78,6 +78,7 @@ async def upsert_category_verdict(
     gap: str | None,
     citations: Any | None,
     grader_run_id: str | None,
+    evidence_provenance: Any | None = None,
     qualification_attempt_id: uuid.UUID | None = None,
     project_id: uuid.UUID | None = None,
 ) -> CategoryVerdict:
@@ -115,6 +116,7 @@ async def upsert_category_verdict(
         existing.tier = tier
         existing.gap = gap
         existing.citations = citations
+        existing.evidence_provenance = evidence_provenance
         existing.grader_run_id = grader_run_id
         existing.qualification_attempt_id = qualification_attempt_id
         existing.graded_at = _utcnow()
@@ -141,6 +143,7 @@ async def upsert_category_verdict(
         tier=tier,
         gap=gap,
         citations=citations,
+        evidence_provenance=evidence_provenance,
         grader_run_id=grader_run_id,
         qualification_attempt_id=qualification_attempt_id,
         graded_at=_utcnow(),

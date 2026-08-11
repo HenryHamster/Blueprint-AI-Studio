@@ -352,7 +352,10 @@ def _normalize_category_verdicts(
                 if key:
                     emitted[key] = item
     authoritative = {
-        str(item.get("category_key") or item.get("criterion_key")): item
+        str(item.get("category_key") or item.get("criterion_key")): {
+            **item,
+            "_backend_machine_evidence": True,
+        }
         for item in (authoritative_category_evidence or [])
         if isinstance(item, dict)
         and item.get("category_key") is not None
@@ -396,13 +399,16 @@ def _normalize_category_verdicts(
         # Tier: a MET category whose test citation is machine-validated against the
         # candidate's verified merges earns the machine tier; everything else stays
         # judged (fail toward the lower tier).
-        tier = "machine" if raw.get("authoritative") is True else "judged"
+        tier = (
+            "machine"
+            if raw.get("_backend_machine_evidence") is True
+            else "judged"
+        )
         if tier != "machine" and status == "met" and _cited_test_is_machine_verified(
             citations, verified_merge_evidence
         ):
             tier = "machine"
-        verdicts.append(
-            {
+        verdict = {
                 "category_key": key,
                 "status": status,
                 "tier": tier,
@@ -410,7 +416,11 @@ def _normalize_category_verdicts(
                 "gap": gap if status != "met" else (gap or None),
                 "citations": citations,
             }
-        )
+        if raw.get("_backend_machine_evidence") is True and isinstance(
+            raw.get("evidence_provenance"), dict
+        ):
+            verdict["evidence_provenance"] = raw["evidence_provenance"]
+        verdicts.append(verdict)
 
     residual_raw: Any = None
     if isinstance(artifact, dict):
