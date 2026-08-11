@@ -74,20 +74,21 @@ timeout.
 
 ## Qualification and integrated pre-stop checks
 
-Do not run either release entrypoint with `--rehearse`. Prequalification
-candidate execution on Hamsterwheel is disabled: those compatibility flags
-are fail-closed sentinels and exit with `host rehearsal disabled` before image
-pull, migration inspection, or service mutation. They are not an operator
-release step.
+The operator does not run a standalone pre-stop command. In particular, do not
+invoke either release entrypoint with `--rehearse`. Prequalification candidate
+execution on Hamsterwheel is disabled: those compatibility flags are fail-closed
+sentinels and exit with `host rehearsal disabled` before image pull, migration
+inspection, or service mutation. They are not an operator release step.
 
 Before promotion, any criterion that requires candidate build/smoke evidence
 is satisfied only by the candidate-bound, secrets-free trusted-main GitHub
 workflow. That workflow does not claim to prove Hamsterwheel's live systemd,
 secret-file, database, or activation state.
 
-The real release command below performs the live pre-stop checks itself,
+The ordinary release command below performs the live pre-stop checks itself,
 inside the root-owned activation transaction and immediately before the first
-service mutation. It verifies:
+service mutation. This integrated phase is the only operator-facing pre-stop
+check and verifies:
 
 - the live systemd-reported privilege boundary: the non-root deploy agent has
   `User=henry_hamster` and `NoNewPrivileges=yes`, while the root release

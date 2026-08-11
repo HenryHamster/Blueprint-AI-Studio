@@ -21,7 +21,10 @@ stay aligned with ``FIRST_LAUNCH_COMMANDS`` and do not revert to the legacy
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
+
+import pytest
 
 _THIS_DIR = Path(__file__).resolve().parent
 _BACKEND_ROOT = _THIS_DIR.parent
@@ -37,6 +40,14 @@ if not (_REPO_ROOT / "docs").is_dir() and (Path("/repo") / "docs").is_dir():
 _RUNBOOK_PATH = _REPO_ROOT / "docs" / "RUNNER_RUNBOOK.md"
 _RUNNER_INSTALL_PATH = _REPO_ROOT / "docs" / "runner-install.md"
 _BLUEPRINT_RUNNER = _REPO_ROOT / "scripts" / "blueprint_runner.py"
+_LOCAL_RELEASE_RUNBOOK_PATH = (
+    _REPO_ROOT / "docs" / "operations" / "local-app-release.md"
+)
+_SCRIPTS_ROOT = _REPO_ROOT / "scripts"
+if str(_SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_ROOT))
+
+import release_runbook_contract as release_contract  # noqa: E402
 
 # RunnerPreset = Literal["default", "strategic", "strategic_local"]
 # in backend/app/routers/admin_runners.py:122
@@ -196,3 +207,57 @@ def test_runner_install_first_launch_matches_shipped_cli() -> None:
         "Use 'blueprint-runner start' instead — the CLI wrapper is the "
         "canonical first-launch path."
     )
+
+
+def test_local_release_runbook_uses_integrated_pre_stop_checks() -> None:
+    """The release runbook must not offer a shell pre-stop rehearsal step."""
+    text = _LOCAL_RELEASE_RUNBOOK_PATH.read_text(encoding="utf-8")
+
+    release_contract.validate_no_host_rehearsal_commands(
+        _LOCAL_RELEASE_RUNBOOK_PATH
+    )
+    assert "does not run a standalone pre-stop command" in text
+    assert (
+        "ordinary release command below performs the live pre-stop checks itself"
+        in text
+    )
+    assert "before the first\nservice mutation" in text
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["bootstrap_local_app_release.py", "local_app_release.py"],
+)
+def test_host_rehearsal_command_is_rejected(
+    tmp_path: Path, entrypoint: str
+) -> None:
+    """A future fenced command with either hard-aborting entrypoint must fail."""
+    path = tmp_path / "local-app-release.md"
+    path.write_text(
+        f"""## Unsafe regression
+
+```bash
+/usr/local/bin/{entrypoint} --image IMAGE_AT_SHA256 --rehearse
+```
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="hard-aborting host rehearsal"):
+        release_contract.validate_no_host_rehearsal_commands(path)
+
+
+def test_prose_warning_and_contract_metadata_are_not_commands(tmp_path: Path) -> None:
+    """Warnings and JSON parser metadata can mention the compatibility flag safely."""
+    path = tmp_path / "local-app-release.md"
+    path.write_text(
+        """Do not invoke `local_app_release.py --rehearse` on the host.
+
+```json
+{"flags": ["--image", "--rehearse"]}
+```
+""",
+        encoding="utf-8",
+    )
+
+    release_contract.validate_no_host_rehearsal_commands(path)

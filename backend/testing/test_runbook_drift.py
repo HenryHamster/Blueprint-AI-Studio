@@ -54,7 +54,8 @@ def test_runbook_does_not_instruct_operator_to_use_disabled_host_rehearsal() -> 
     text = contract._RUNBOOK_PATH.read_text(encoding="utf-8")
 
     assert "Pre-stop rehearsal (mandatory gate)" not in text
-    assert "Do not run either release entrypoint with `--rehearse`" in text
+    assert "does not run a standalone pre-stop command" in text
+    assert "do not\ninvoke either release entrypoint with `--rehearse`" in text
     assert "Never bypass the integrated" in text
     assert "check and never run candidate code" in text
 
