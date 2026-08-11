@@ -16,7 +16,8 @@ _POLICY = {
     "threshold": 0.75,
 }
 _BASE_SHA = "a" * 40
-_SERVED_SHA = "b" * 40
+_PROMOTED_SHA = "b" * 40
+_SERVED_SHA = "c" * 40
 
 
 def _receipt(count: int) -> dict:
@@ -29,7 +30,7 @@ def _receipt(count: int) -> dict:
             {"sha": chr(ord("c") + index) * 12, "author": f"operator-{index}"}
             for index in range(count)
         ],
-        "range": {"base_sha": _BASE_SHA, "head_sha": _SERVED_SHA},
+        "range": {"base_sha": _PROMOTED_SHA, "head_sha": _SERVED_SHA},
         "measured_at": "2026-08-11T00:00:00+00:00",
         "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
     }
@@ -47,6 +48,7 @@ def _prior_record(receipt: dict | None, *, serving_status: str = "serving_confir
         "status": "promoted",
         "serving_status": serving_status,
         "base_sha": _BASE_SHA,
+        "promoted_sha": _PROMOTED_SHA,
         "served_sha": _SERVED_SHA,
         "last_qualification": (
             {"operator_authored_commits": receipt} if receipt is not None else {}

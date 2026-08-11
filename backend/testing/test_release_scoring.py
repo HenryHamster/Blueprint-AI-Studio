@@ -25,6 +25,7 @@ from typing import ClassVar
 import pytest
 
 from app import release_scoring as rs
+from app.release_commit_authorship import AUTHORSHIP_RECEIPT_SCHEMA_VERSION
 
 # Fixed policy mirroring promotion_policy.yaml; threshold pinned low so the
 # judged-tier penalty (a few %) never crosses the promote boundary by accident.
@@ -55,6 +56,74 @@ def _perfect_kwargs(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def _authorship_receipt(base_sha: str, head_sha: str, count: int) -> dict:
+    return {
+        "source": "github_compare",
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        "state": "resolved",
+        "count": count,
+        "offenders": [
+            {"sha": "d" * 12, "author": "Operator"}
+            for _ in range(count)
+        ],
+        "range": {"base_sha": base_sha, "head_sha": head_sha},
+        "measured_at": "2026-08-11T00:00:00+00:00",
+        "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+    }
+
+
+def test_prior_authorship_gate_uses_only_the_promote_to_serving_window():
+    """Development commits before promotion never enter the release gate."""
+    development_sha = "a" * 40
+    promoted_sha = "b" * 40
+    served_sha = "c" * 40
+    prior_version = {
+        "status": "promoted",
+        "serving_status": "serving_confirmed",
+        "base_sha": development_sha,
+        "promoted_sha": promoted_sha,
+        "served_sha": served_sha,
+        "last_qualification": {
+            "operator_authored_commits": _authorship_receipt(
+                promoted_sha, served_sha, 0
+            )
+        },
+    }
+
+    clean_window = rs.evaluate_prior_operator_authorship_gate(prior_version)
+
+    assert clean_window["status"] == "passed"
+    assert clean_window["count"] == 0
+
+    in_window_operator_commit = {
+        **prior_version,
+        "last_qualification": {
+            "operator_authored_commits": _authorship_receipt(
+                promoted_sha, served_sha, 1
+            )
+        },
+    }
+    blocked_window = rs.evaluate_prior_operator_authorship_gate(
+        in_window_operator_commit
+    )
+
+    assert blocked_window["status"] == "blocked"
+    assert blocked_window["count"] == 1
+
+    whole_version_receipt = {
+        **prior_version,
+        "last_qualification": {
+            "operator_authored_commits": _authorship_receipt(
+                development_sha, served_sha, 1
+            )
+        },
+    }
+    rejected_range = rs.evaluate_prior_operator_authorship_gate(whole_version_receipt)
+
+    assert rejected_range["status"] == "unresolved"
+    assert rejected_range["reason"] == "prior_promoted_version_authorship_receipt_invalid"
 
 
 # ---------------------------------------------------------------------------

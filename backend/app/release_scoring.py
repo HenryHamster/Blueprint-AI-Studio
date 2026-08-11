@@ -967,8 +967,9 @@ def evaluate_prior_operator_authorship_gate(
     status = get_value("status")
     serving_status = get_value("serving_status")
     qualification = get_value("last_qualification")
-    base_sha = get_value("base_sha")
-    served_sha = get_value("served_sha")
+    from app.release_commit_authorship import serving_authorship_range
+
+    promoted_sha, served_sha = serving_authorship_range(prior_promoted_version)
     receipt = (
         qualification.get("operator_authored_commits")
         if isinstance(qualification, dict)
@@ -980,7 +981,7 @@ def evaluate_prior_operator_authorship_gate(
     from app.release_commit_authorship import validate_authorship_receipt
 
     validated = (
-        validate_authorship_receipt(receipt, base_sha, served_sha)
+        validate_authorship_receipt(receipt, promoted_sha, served_sha)
         if status == "promoted" and serving_status == "serving_confirmed"
         else None
     )

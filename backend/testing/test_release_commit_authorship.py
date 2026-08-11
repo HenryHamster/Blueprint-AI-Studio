@@ -685,6 +685,7 @@ async def test_read_path_serves_persisted_report_without_recomputation(
         version_number=1,
         status="promoted",
         base_sha="a" * 40,
+        promoted_sha="a" * 40,
         served_sha="b" * 40,
         opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         serving_status="serving_confirmed",
@@ -762,6 +763,7 @@ async def test_retryable_legacy_receipt_reconciles_and_resolves(db_session, mock
         version_number=1,
         status="promoted",
         base_sha="a" * 40,
+        promoted_sha="a" * 40,
         served_sha="b" * 40,
         serving_status="serving_confirmed",
         opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -842,6 +844,7 @@ async def test_resolved_current_receipt_is_immutable_and_short_circuits(db_sessi
         version_number=1,
         status="promoted",
         base_sha="a" * 40,
+        promoted_sha="a" * 40,
         served_sha="b" * 40,
         serving_status="serving_confirmed",
         opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -893,6 +896,7 @@ async def test_staging_respects_terminal_immutability_and_future_backoff(db_sess
             version_number=number,
             status="promoted",
             base_sha=base,
+            promoted_sha=base,
             served_sha=head,
             serving_status="serving_confirmed",
             opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -918,6 +922,7 @@ async def test_unresolved_confirmation_receipt_preserves_serving_truth(db_sessio
         version_number=1,
         status="promoted",
         base_sha="a" * 40,
+        promoted_sha="a" * 40,
         served_sha="b" * 40,
         serving_status="serving_confirmed",
         opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -960,6 +965,7 @@ async def test_staging_never_commits_caller_transaction(db_session, mocker):
         version_number=1,
         status="promoted",
         base_sha="a" * 40,
+        promoted_sha="a" * 40,
         served_sha="b" * 40,
         serving_status="serving_confirmed",
         opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -975,6 +981,36 @@ async def test_staging_never_commits_caller_transaction(db_session, mocker):
     assert plan is not None
     commit.assert_not_awaited()
     assert "category_verdicts" not in version.last_qualification
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_staging_uses_promoted_sha_as_the_serving_window_base(db_session):
+    project = Project(name="Authorship serving window", user_id="authorship-serving-window")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        base_sha="a" * 40,
+        promoted_sha="b" * 40,
+        served_sha="c" * 40,
+        serving_status="serving_confirmed",
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_qualification={},
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    plan = await persist_serving_authorship_evidence(db_session, version)
+
+    assert plan is not None
+    assert plan["base_sha"] == "b" * 40
+    assert plan["served_sha"] == "c" * 40
+    assert version.last_qualification["operator_authored_commits"]["range"] == {
+        "base_sha": "b" * 40,
+        "head_sha": "c" * 40,
+    }
     await db_session.rollback()
 
 
@@ -1001,6 +1037,7 @@ async def test_reconciliation_old_rows_and_concurrent_claim_once(db_session, moc
                 version_number=i + 1,
                 status="promoted",
                 base_sha=base,
+                promoted_sha=base,
                 served_sha=head,
                 serving_status="serving_confirmed",
                 served_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -1017,7 +1054,7 @@ async def test_reconciliation_old_rows_and_concurrent_claim_once(db_session, moc
         )
     target = ReleaseVersion(
         project_id=projects[0].id, version_number=999, status="promoted",
-        base_sha="f" * 40, served_sha="e" * 40,
+        base_sha="f" * 40, promoted_sha="f" * 40, served_sha="e" * 40,
         serving_status="serving_confirmed",
         served_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
         opened_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
@@ -1063,6 +1100,7 @@ async def test_reconciliation_cursor_is_durable_and_process_global_cursor_is_abs
             version_number=index + 1,
             status="promoted",
             base_sha=f"{index + 1:040x}",
+            promoted_sha=f"{index + 1:040x}",
             served_sha=f"{index + 2:040x}",
             serving_status="serving_confirmed",
             served_at=None if index == 0 else datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -1113,6 +1151,7 @@ async def test_reconciliation_scan_cleanup_failure_terminalizes_sweep(db_session
         version_number=1,
         status="promoted",
         base_sha="a" * 40,
+        promoted_sha="a" * 40,
         served_sha="b" * 40,
         serving_status="serving_confirmed",
         served_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -1334,9 +1373,10 @@ async def test_reconciliation_cursor_wraps_and_revisits_newly_eligible_rows(
             id=uuid.UUID(int=100 + index),
             project_id=project.id,
             version_number=index + 1,
-            status="promoted",
-            base_sha=f"{index + 1:040x}",
-            served_sha=f"{index + 10:040x}",
+                status="promoted",
+                base_sha=f"{index + 1:040x}",
+                promoted_sha=f"{index + 1:040x}",
+                served_sha=f"{index + 10:040x}",
             serving_status="serving_confirmed",
             served_at=None,
             opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -1353,9 +1393,10 @@ async def test_reconciliation_cursor_wraps_and_revisits_newly_eligible_rows(
             id=uuid.UUID(int=200 + index),
             project_id=project.id,
             version_number=index + 10,
-            status="promoted",
-            base_sha=f"{index + 20:040x}",
-            served_sha=f"{index + 30:040x}",
+                status="promoted",
+                base_sha=f"{index + 20:040x}",
+                promoted_sha=f"{index + 20:040x}",
+                served_sha=f"{index + 30:040x}",
             serving_status="serving_confirmed",
             served_at=datetime(2026, 1, index + 1, tzinfo=timezone.utc),
             opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -1525,9 +1566,10 @@ async def test_reconciliation_stops_after_session_cleanup_failure(db_session, mo
         ReleaseVersion(
             project_id=project.id,
             version_number=index + 1,
-            status="promoted",
-            base_sha=f"{index + 1:040x}",
-            served_sha=f"{index + 2:040x}",
+                status="promoted",
+                base_sha=f"{index + 1:040x}",
+                promoted_sha=f"{index + 1:040x}",
+                served_sha=f"{index + 2:040x}",
             serving_status="serving_confirmed",
             served_at=datetime(2026, 1, index + 1, tzinfo=timezone.utc),
             opened_at=datetime(2026, 1, index + 1, tzinfo=timezone.utc),
@@ -1621,6 +1663,7 @@ async def test_reconciliation_keyset_scans_mixed_malformed_rows_without_json_cas
             version_number=index + 1,
             status="promoted",
             base_sha=base,
+            promoted_sha=base,
             served_sha=head,
             serving_status="serving_confirmed",
             served_at=datetime(2026, 1, 1, index, tzinfo=timezone.utc),
@@ -1670,6 +1713,7 @@ async def test_reconciliation_skip_locked_moves_past_contended_candidate(db_sess
             version_number=index + 1,
             status="promoted",
             base_sha=f"{index + 1:040x}",
+            promoted_sha=f"{index + 1:040x}",
             served_sha=f"{index + 2:040x}",
             serving_status="serving_confirmed",
             served_at=datetime(2026, 1, 1, index, tzinfo=timezone.utc),
@@ -1711,6 +1755,7 @@ async def test_reconciliation_deadline_cancels_slow_external_measurement(db_sess
         version_number=1,
         status="promoted",
         base_sha="a" * 40,
+        promoted_sha="a" * 40,
         served_sha="b" * 40,
         serving_status="serving_confirmed",
         served_at=datetime(2026, 1, 1, tzinfo=timezone.utc),

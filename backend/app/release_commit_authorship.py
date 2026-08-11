@@ -77,6 +77,20 @@ _RECONCILIATION_CLEANUP_CANCEL_GRACE_SECONDS = 0.05
 _RECONCILIATION_OWNED_CLEANUP_TASKS: set[asyncio.Task[Any]] = set()
 
 
+def serving_authorship_range(version: Any) -> tuple[str | None, str | None]:
+    """Return the immutable promote-to-serving compare range for a release."""
+    if isinstance(version, dict):
+        promoted_sha = version.get("promoted_sha")
+        served_sha = version.get("served_sha")
+    else:
+        promoted_sha = getattr(version, "promoted_sha", None)
+        served_sha = getattr(version, "served_sha", None)
+    return (
+        promoted_sha if isinstance(promoted_sha, str) else None,
+        served_sha if isinstance(served_sha, str) else None,
+    )
+
+
 class _ReconciliationCleanupError(RuntimeError):
     """A DB-session cleanup failure that must stop the current sweep."""
 
@@ -680,8 +694,7 @@ async def persist_serving_authorship_evidence(
     is an explicit audited retry override; normal confirmation/recovery/admin
     callers leave it false.
     """
-    base_sha = version.base_sha
-    served_sha = version.served_sha
+    base_sha, served_sha = serving_authorship_range(version)
     if (
         version.status != "promoted"
         or version.serving_status != "serving_confirmed"
@@ -815,7 +828,7 @@ async def measure_serving_authorship_evidence(
             )
             if version is None:
                 return False
-            base_sha, served_sha = version.base_sha, version.served_sha
+            base_sha, served_sha = serving_authorship_range(version)
             report = (version.last_qualification or {}).get("operator_authored_commits")
             identity = expected_receipt_identity or _receipt_identity(report)
             if (
@@ -900,14 +913,15 @@ async def measure_serving_authorship_evidence(
             )
             if current is None:
                 return False
+            current_promoted_sha, current_served_sha = serving_authorship_range(current)
             current_report = (current.last_qualification or {}).get(
                 "operator_authored_commits"
             )
             if (
                 current.status != "promoted"
                 or current.serving_status != "serving_confirmed"
-                or current.base_sha != base_sha
-                or current.served_sha != served_sha
+                or current_promoted_sha != base_sha
+                or current_served_sha != served_sha
                 or _receipt_identity(current_report) != identity
             ):
                 await asyncio.wait_for(final_session.rollback(), timeout=remaining)
@@ -1189,7 +1203,7 @@ async def reconcile_serving_authorship_evidence(
                 conditions = [
                     ReleaseVersion.status == "promoted",
                     ReleaseVersion.serving_status == "serving_confirmed",
-                    ReleaseVersion.base_sha.is_not(None),
+                    ReleaseVersion.promoted_sha.is_not(None),
                     ReleaseVersion.served_sha.is_not(None),
                 ]
                 if state.cursor_partition == 0:
@@ -1268,7 +1282,7 @@ async def reconcile_serving_authorship_evidence(
                         if (
                             candidate.id not in selected_ids
                             and _reconciliation_candidate_is_eligible(
-                                report, candidate.base_sha, candidate.served_sha, now
+                                report, *serving_authorship_range(candidate), now
                             )
                         ):
                             selected_ids.add(candidate.id)
@@ -1336,7 +1350,7 @@ async def reconcile_serving_authorship_evidence(
                     "operator_authored_commits"
                 )
                 validated = validate_authorship_receipt(
-                    report, version.base_sha, version.served_sha
+                    report, *serving_authorship_range(version)
                 )
                 if validated is not None and validated.get("state") in {
                     "resolved",

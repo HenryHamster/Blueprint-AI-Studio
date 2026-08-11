@@ -4400,6 +4400,14 @@
           "old_cap": 1900,
           "new_cap": 2250
         }
+      ],
+      "test_release_scoring.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-11T12:35:52.353897+00:00",
+          "old_cap": 2100,
+          "new_cap": 2500
+        }
       ]
     }
   }

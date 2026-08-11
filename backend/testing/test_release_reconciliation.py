@@ -1370,7 +1370,7 @@ async def test_confirm_serving_confirmed_scenario(db_session, mocker):
         "state": "resolved",
         "count": 1,
         "offenders": [{"sha": _SHA_A[:12], "author": "Henry Example"}],
-        "range": {"base_sha": version.base_sha, "head_sha": _SHA_A},
+        "range": {"base_sha": version.promoted_sha, "head_sha": _SHA_A},
     }
     measure = mocker.patch(
         "app.release_commit_authorship.count_non_bot_authored_commits",
@@ -1395,7 +1395,7 @@ async def test_confirm_serving_confirmed_scenario(db_session, mocker):
     assert stored_report["source"] == "github_compare"
     assert stored_report["schema_version"] == AUTHORSHIP_RECEIPT_SCHEMA_VERSION
     measure.assert_awaited_once_with(
-        version.base_sha, _SHA_A, project=_project, github_context=None
+        version.promoted_sha, _SHA_A, project=_project, github_context=None
     )
 
     state = rv.summarize_qualification_state(
@@ -2508,7 +2508,7 @@ async def test_recover_deploy_failed_when_sha_serves_within_window(db_session, m
         "state": "resolved",
         "count": 0,
         "offenders": [],
-        "range": {"base_sha": version.base_sha, "head_sha": _SHA_A},
+        "range": {"base_sha": version.promoted_sha, "head_sha": _SHA_A},
     }
     measure = mocker.patch(
         "app.release_commit_authorship.count_non_bot_authored_commits",
@@ -2533,7 +2533,7 @@ async def test_recover_deploy_failed_when_sha_serves_within_window(db_session, m
     assert stored_report["source"] == "github_compare"
     assert stored_report["schema_version"] == AUTHORSHIP_RECEIPT_SCHEMA_VERSION
     measure.assert_awaited_once_with(
-        version.base_sha, _SHA_A, project=project, github_context=None
+        version.promoted_sha, _SHA_A, project=project, github_context=None
     )
 
     # The view-time summary now reports the TRUE serving_confirmed state.

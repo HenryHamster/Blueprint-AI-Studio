@@ -98,6 +98,7 @@ from app.release_models import CriterionEvidence
 from app.release_commit_authorship import (
     authorship_category_evidence,
     normalize_authorship_evidence_contract,
+    serving_authorship_range,
 )
 from app.notification_dispatch import (
     dispatch_external_notification,  # noqa: F401 — re-exported for tests / compat patch point
@@ -8161,8 +8162,7 @@ async def _finalize_qualification(
                 if isinstance(promoted_qualification, dict)
                 else None
             ),
-            latest_promoted.base_sha if latest_promoted is not None else None,
-            latest_promoted.served_sha if latest_promoted is not None else None,
+            *serving_authorship_range(latest_promoted),
             active_categories,
         )
     from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
