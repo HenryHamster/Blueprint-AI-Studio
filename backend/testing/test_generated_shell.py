@@ -2093,6 +2093,10 @@ class TestProjectVerificationRuntimeContract:
             .replace("@BASE@", "$BASE")
             .rstrip("\n")
         )
+        assert not re.search(r"@[^@\n]+@", rendered_fragment), (
+            "generated backend verification fragment contains an unsubstituted "
+            "placeholder"
+        )
         start = tracked.index("    # required backend-authoring verification")
         end = tracked.index(
             '\n  fi\nfi\n\nif touches "golden_tasks/"',
