@@ -13,6 +13,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_static_guard_base_unpack_uses_data_filter() -> None:
+    """The internal git-archive unpack still uses an explicit safe filter."""
+    source = (REPO_ROOT / "scripts" / "static_release_guard.py").read_text()
+    assert 'bundle.extractall(destination, filter="data")' in source
+
+
 def test_check_runs_static_guard_only_for_test_gate() -> None:
     """The release guard is invoked only by the explicit test/merge gate."""
     source = (REPO_ROOT / "check").read_text()

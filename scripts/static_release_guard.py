@@ -68,7 +68,7 @@ def _extract_base(repo: Path, ref: str, destination: Path) -> None:
     assert archive.stdout is not None
     try:
         with tarfile.open(fileobj=archive.stdout, mode="r|") as bundle:
-            bundle.extractall(destination)
+            bundle.extractall(destination, filter="data")
     finally:
         stderr = archive.stderr.read().decode("utf-8", errors="replace") if archive.stderr else ""
         return_code = archive.wait()

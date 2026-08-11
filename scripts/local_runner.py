@@ -6241,7 +6241,7 @@ def _rehydrate_input_artifact(
                         flush=True,
                     )
                     continue
-                tar.extract(member, path=artifact_dir)
+                tar.extract(member, path=artifact_dir, filter="data")
                 extracted += 1
     except (tarfile.TarError, OSError) as exc:
         raise RuntimeError(

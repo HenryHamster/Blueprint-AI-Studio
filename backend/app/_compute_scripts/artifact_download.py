@@ -48,7 +48,7 @@ def main() -> int:
                     "skipping unsafe artifact-bundle member: %r\n" % member.name
                 )
                 continue
-            tar.extract(member, path=dest_dir)
+            tar.extract(member, path=dest_dir, filter="data")
     return 0
 
 

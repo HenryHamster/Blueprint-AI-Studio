@@ -9736,14 +9736,27 @@ class DownloadInputArtifactTests(_LocalRunnerTestCase):
 
     def test_corrupt_extract_never_publishes_staged_predecessor_files(self):
         """A tar failure after a member write leaves the durable dir empty."""
-        class _PartiallyFailingTar:
-            def getmembers(self):
-                return []
+        class _PartiallyFailingSource:
+            def __init__(self):
+                self._first_read = True
 
-            def extractall(self, destination, members):
-                with open(os.path.join(destination, "checkpoint.pt"), "wb") as fh:
-                    fh.write(b"partial predecessor")
+            def read(self, _size=-1):
+                if self._first_read:
+                    self._first_read = False
+                    return b"partial predecessor"
                 raise tarfile.ReadError("corrupt after first member")
+
+            def close(self):
+                pass
+
+        class _PartiallyFailingTar:
+            def __iter__(self):
+                member = tarfile.TarInfo("checkpoint.pt")
+                member.size = len(b"partial predecessor") + 1
+                return iter((member,))
+
+            def extractfile(self, _member):
+                return _PartiallyFailingSource()
 
             def __enter__(self):
                 return self

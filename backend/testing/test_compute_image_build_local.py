@@ -6231,6 +6231,11 @@ async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
     assert "/tmp/blueprint_resume_stage" in script
     assert "tarfile.open" in script
     assert "m.isreg() or m.isdir()" in script
+    assert 'tf.extract(m,d,filter="data")' in script
+    artifact_downloader = base64.b64decode(
+        compute_backends_module._ARTIFACT_DOWNLOAD_B64
+    ).decode()
+    assert 'tar.extract(member, path=dest_dir, filter="data")' in artifact_downloader
     assert "resume_hydration.ok" in script
     assert "resume_hydration.failed" in script
 

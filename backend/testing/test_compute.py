@@ -2549,7 +2549,8 @@ def test_safe_extract_artifact_bundle_rejects_path_traversal(tmp_path):
         _add("safe.txt", "ok")
         _add("nested/deep.txt", "ok2")
         _add("../escape.txt", "evil")
-        _add("/abs.txt", "evil")
+        absolute_escape = tmp_path / "absolute-escape.txt"
+        _add(str(absolute_escape), "evil")
     bundle = buf.getvalue()
 
     dest = tmp_path / "artifacts"
@@ -2562,7 +2563,7 @@ def test_safe_extract_artifact_bundle_rejects_path_traversal(tmp_path):
     assert (dest / "nested" / "deep.txt").exists()
     # Neither traversal member escaped the destination dir.
     assert not (tmp_path / "escape.txt").exists()
-    assert not os.path.exists("/abs.txt") or True  # never wrote a real /abs.txt
+    assert not absolute_escape.exists()
 
 
 def test_is_safe_tar_member_guards():
