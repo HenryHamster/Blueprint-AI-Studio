@@ -12,13 +12,14 @@ from app import github_checks
 from app.github_checks import _extract_pytest_selectors
 
 
-def _make_response(status_code: int, json_data=None, text="", links=None):
+def _make_response(status_code: int, json_data=None, text="", links=None, headers=None):
     """Minimal httpx-like response mock."""
     m = MagicMock()
     m.status_code = status_code
     m.json.return_value = json_data if json_data is not None else {}
     m.text = text
     m.links = links or {}
+    m.headers = headers or {}
     return m
 
 
@@ -117,6 +118,59 @@ async def test_dispatch_workflow_run_outcome_distinguishes_ambiguous_success(
     assert result == expected
     assert request.await_count == 1
     assert request.await_args.kwargs["max_retries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_workflow_dispatch_rate_limit_403_is_retryable():
+    response = _make_response(
+        403,
+        json_data={"message": "API rate limit exceeded for 203.0.113.7."},
+        headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1786478400"},
+    )
+    request = AsyncMock(return_value=response)
+    with patch.object(github_checks, "_github_request", new=request):
+        result = await github_checks.dispatch_workflow_run_outcome(
+            "token", "owner", "repo", "prepromotion-rehearsal.yml", "main"
+        )
+
+    assert result == "ambiguous"
+    assert request.await_count == 1
+    assert request.await_args.kwargs["max_retries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_workflow_dispatch_secondary_rate_limit_body_is_retryable():
+    response = _make_response(
+        403,
+        json_data={
+            "message": "You have exceeded a secondary rate limit. Please wait."
+        },
+    )
+    request = AsyncMock(return_value=response)
+    with patch.object(github_checks, "_github_request", new=request):
+        result = await github_checks.dispatch_workflow_run_outcome(
+            "token", "owner", "repo", "prepromotion-rehearsal.yml", "main"
+        )
+
+    assert result == "ambiguous"
+    assert request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_workflow_dispatch_permission_403_is_terminal_rejection():
+    response = _make_response(
+        403,
+        json_data={"message": "Resource not accessible by integration"},
+        headers={"X-RateLimit-Remaining": "4999"},
+    )
+    request = AsyncMock(return_value=response)
+    with patch.object(github_checks, "_github_request", new=request):
+        result = await github_checks.dispatch_workflow_run_outcome(
+            "token", "owner", "repo", "prepromotion-rehearsal.yml", "main"
+        )
+
+    assert result == "rejected"
+    assert request.await_count == 1
 
 
 @pytest.mark.asyncio

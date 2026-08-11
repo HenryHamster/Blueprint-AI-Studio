@@ -23,6 +23,47 @@ from app.github import logger
 # log noise such as ``[STRATEGIC] ... FAILED (failure #1)`` (no ``::``).
 _PYTEST_FAILED_SELECTOR_RE = re.compile(r"FAILED\s+(\S+::\S+)")
 
+# GitHub returns both primary and secondary rate limits as HTTP 403 for some
+# endpoints.  A permission failure is also a 403, so status alone is not
+# enough to decide whether a workflow dispatch can be retried.
+_GITHUB_RATE_LIMIT_BODY_MARKERS = (
+    "rate limit",
+    "too many requests",
+    "abuse detection mechanism",
+)
+
+
+def _dispatch_response_is_rate_limited(response) -> bool:
+    """Return whether a 403 carries GitHub's rate-limit evidence.
+
+    The dispatch POST deliberately makes one transport attempt.  This helper
+    only classifies the returned response; it must not turn a transient 403
+    into a second POST or treat an ordinary permission 403 as retryable.
+    """
+    if response.status_code != 403:
+        return False
+
+    headers = getattr(response, "headers", {}) or {}
+    remaining = headers.get("X-RateLimit-Remaining")
+    if remaining is not None and str(remaining).strip() == "0":
+        return True
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None and str(retry_after).strip():
+        return True
+
+    message = ""
+    try:
+        body = response.json()
+    except (ValueError, TypeError, AttributeError):
+        body = None
+    if isinstance(body, Mapping):
+        message = str(body.get("message") or "")
+    if not message:
+        text = getattr(response, "text", "")
+        message = text if isinstance(text, str) else ""
+    message = message.casefold()
+    return any(marker in message for marker in _GITHUB_RATE_LIMIT_BODY_MARKERS)
+
 
 def _extract_pytest_selectors(raw_log: str, cap: int = 50) -> list[str]:
     """Deduped pytest ``path::test`` selectors from a raw CI job log.
@@ -675,9 +716,11 @@ async def dispatch_workflow_run_outcome(
     """Return accepted, rejected, permanent-404, or ambiguous for a workflow dispatch POST.
 
     GitHub's endpoint returns no run id or idempotency token. Transport errors,
-    throttling, and server errors are therefore ambiguous: the server may have
-    enqueued the run before the response was lost. Callers must reconcile a
-    workflow-visible correlation id before retrying an ambiguous outcome.
+    rate limits, and server errors are therefore retryable/ambiguous: the
+    server may have enqueued the run before the response was lost, or the
+    request may be accepted after the rate-limit window clears. Callers must
+    reconcile a workflow-visible correlation id before retrying an ambiguous
+    outcome.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -721,6 +764,8 @@ async def dispatch_workflow_run_outcome(
     )
     if response.status_code == 404:
         return "rejected_permanent_404"
+    if _dispatch_response_is_rate_limited(response):
+        return "ambiguous"
     if 400 <= response.status_code < 500 and response.status_code not in {
         408,
         409,
