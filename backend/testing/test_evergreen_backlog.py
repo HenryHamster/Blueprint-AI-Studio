@@ -719,7 +719,7 @@ async def test_deferred_memo_enrollment_flag_gated(db_session, mocker):
     from unittest.mock import AsyncMock
     import app.research_completion as _rc
     from app.research_completion import _handle_research_completion
-    from app.models import Project
+    from app.models import Project, TaskStatus
     from test_autonomous_research import (
         _active_direction,
         _make_research_task,
@@ -740,7 +740,9 @@ async def test_deferred_memo_enrollment_flag_gated(db_session, mocker):
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
-        task = await _make_research_task(project, direction, db_session)
+        task = await _make_research_task(
+            project, direction, db_session, status=TaskStatus.COMPLETED
+        )
         return project, direction, task
 
     def _low_finding(dir_suffix=""):

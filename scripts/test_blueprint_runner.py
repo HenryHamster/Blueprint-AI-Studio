@@ -1026,7 +1026,10 @@ class UninstallTests(unittest.TestCase):
         with patch.object(br, "_user_unit_path", return_value=self.unit_path), \
              patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
              patch("os.remove", side_effect=OSError("permission denied")):
-            rc = br.do_uninstall(system=False)
+            rc = br.do_uninstall(
+                system=False,
+                _run=_systemctl_recorder(record=[]),
+            )
         self.assertEqual(rc, 1)
         # The unit file must still exist (removal failed).
         self.assertTrue(os.path.isfile(self.unit_path))
@@ -1740,9 +1743,8 @@ class StatusCommandTests(unittest.TestCase):
             status_path = os.path.join(tmpdir, "status.json")
             with open(status_path, "w") as f:
                 f.write("{}")
-            # Make file unreadable
-            os.chmod(status_path, 0o000)
-            with patch.object(br, "_credential_dir", return_value=tmpdir):
+            with patch.object(br, "_credential_dir", return_value=tmpdir), \
+                 patch("builtins.open", side_effect=OSError("permission denied")):
                 fake_stderr = io.StringIO()
                 with patch.object(br.sys, "stderr", fake_stderr):
                     rc = br.do_status()

@@ -1762,6 +1762,9 @@ class TestEmptyRepoOnboardToResearchCompletionEndToEnd:
                 return_value=False,
             ),
         ):
+            research_task.status = TaskStatus.COMPLETED
+            db_session.add(research_task)
+            await db_session.commit()
             await _handle_research_completion(research_task, logs, db_session)
 
         # Parent flipped EVALUATING with live children — the wedge to prevent

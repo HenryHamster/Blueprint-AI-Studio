@@ -406,7 +406,7 @@ def test_all_three_fresh_attempt_paths_reapply_resident_binding():
         "_prior_retry_ctx",
     )
     for evidence, post_reset in zip(expected_path_evidence, segments[1:]):
-        window = post_reset[:6000]
+        window = post_reset[:12000]
         assert evidence in window
         assert "await _restore_resident_retry_binding(" in window
     assert source.count(

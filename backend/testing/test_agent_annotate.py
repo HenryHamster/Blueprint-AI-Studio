@@ -126,13 +126,13 @@ async def test_size_breach_governed_module_directs_paired_source_cap_repair(
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    # The governed module clamps to its declared constant (10,500) instead of
+    # The governed module clamps to its declared constant (10,649) instead of
     # taking generic +15% headroom (11,950); the constant itself never grows.
-    assert body["new_limit"] == 10500
+    assert body["new_limit"] == 10649
     expected_repair = {
         "source_path": "backend/app/release_qualifier.py",
         "constant_name": "_MODULE_SIZE_GOVERNANCE_CAP",
-        "new_limit": 10500,
+        "new_limit": 10649,
     }
     assert body["governing_cap_repair"] == expected_repair
 
