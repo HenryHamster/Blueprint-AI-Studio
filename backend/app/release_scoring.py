@@ -13,6 +13,7 @@ keep working unchanged.
 
 from __future__ import annotations
 
+
 import hashlib
 import logging
 import re
@@ -24,6 +25,7 @@ from app.ci_resolution import (
 from app.migration_reconciliation import effective_authorized_divergences
 
 logger = logging.getLogger(__name__)
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3229
 
 
 # Canonical fleet default for the promotion confidence gate.  The packaged

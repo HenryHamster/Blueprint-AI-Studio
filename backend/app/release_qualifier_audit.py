@@ -8,6 +8,7 @@ existing callers keep working unchanged.
 
 from __future__ import annotations
 
+
 import asyncio
 import json
 import logging
@@ -68,6 +69,7 @@ from app.release_scoring import (
 # Preserve the historical logger name so existing caplog filters and log
 # processing continue to see these events under release_qualifier.
 logger = logging.getLogger("backend.app.release_qualifier")
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2339
 
 # Minimum consecutive qualifier infrastructure errors (FAILED/CANCELLED
 # required child tasks) before raising a dedicated infra-failure alert.

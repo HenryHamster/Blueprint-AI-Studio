@@ -14,6 +14,7 @@ for all callers. This module depends only on :mod:`app.models_base` and
 :mod:`app.time_utils`, never on :mod:`app.models`, so no import cycle forms.
 """
 
+
 from typing import Any, Dict, List
 
 import uuid
@@ -41,6 +42,7 @@ from sqlmodel.sql.sqltypes import GUID
 
 from app.models_base import NaiveUTCDateTime
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1587
 
 
 class ReleaseVersion(SQLModel, table=True):

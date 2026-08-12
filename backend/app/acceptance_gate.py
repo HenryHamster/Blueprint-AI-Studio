@@ -35,6 +35,7 @@ same way the reproduce-on-HEAD verdict does.
 
 from __future__ import annotations
 
+
 import hashlib
 import json
 import logging
@@ -87,6 +88,7 @@ from app.acceptance_provenance import (
     stamp_commit_range_derived_changed_files_signal as _stamp_commit_range_signal,
     stamp_changed_files_skip_reason,
 )
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3448
 
 logger = logging.getLogger(__name__)
 

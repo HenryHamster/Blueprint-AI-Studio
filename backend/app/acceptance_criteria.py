@@ -7,6 +7,7 @@ classifier and a version-level coverage summary query.
 
 from __future__ import annotations
 
+
 import enum
 import logging
 import re
@@ -29,6 +30,7 @@ from app.models import (
     VersionAcceptanceCriterion,
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 5223
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession

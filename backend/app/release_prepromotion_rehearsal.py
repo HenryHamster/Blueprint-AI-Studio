@@ -8,6 +8,7 @@ while reading qualification evidence.
 
 from __future__ import annotations
 
+
 import asyncio
 import re
 import time
@@ -23,6 +24,7 @@ from app import github
 from app.database import AsyncSessionLocal
 from app.models import Project, ReleasePrepromotionDispatch, ReleaseVersion
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1072
 
 PREPROMOTION_REHEARSAL_KIND = "blueprint.prepromotion_ci_build_smoke.v1"
 PREPROMOTION_REHEARSAL_SCHEMA_VERSION = 1

@@ -28,6 +28,7 @@ unchanged.
 
 from __future__ import annotations
 
+
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -49,6 +50,7 @@ from app.shared_state import (
     get_project_promotion_target as _get_project_promotion_target,
 )
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2374
 
 logger = logging.getLogger(__name__)
 

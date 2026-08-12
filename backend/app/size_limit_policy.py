@@ -134,17 +134,115 @@ class GoverningCapRepair(TypedDict):
     new_limit: int
 
 
-# Most modules use the generic headroom policy above.  A small number are
-# deliberately governed more tightly in their source module as well as in the
-# JSON guardrail.  Keep this mapping explicit: both repair paths consume it,
-# which prevents a future caller from silently applying the generic 15% rule to
-# a module whose governance contract says otherwise.
+# Most modules use the generic headroom policy above.  The release and
+# acceptance surface is deliberately governed more tightly in each source
+# module as well as in the JSON guardrail.  Keep this mapping explicit: both
+# repair paths consume it, which prevents a future caller from silently
+# applying the generic 15% rule to a module whose governance contract says
+# otherwise.
 _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
-    (
-        "backend",
-        "release_qualifier.py",
-    ): GoverningCap(
+    ("backend", "acceptance_criteria.py"): GoverningCap(
+        source_path="backend/app/acceptance_criteria.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "acceptance_gate.py"): GoverningCap(
+        source_path="backend/app/acceptance_gate.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "acceptance_provenance.py"): GoverningCap(
+        source_path="backend/app/acceptance_provenance.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "acceptance_window_invariants.py"): GoverningCap(
+        source_path="backend/app/acceptance_window_invariants.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "approved_pr_stranding.py"): GoverningCap(
+        source_path="backend/app/approved_pr_stranding.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_activation.py"): GoverningCap(
+        source_path="backend/app/release_activation.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_artifacts.py"): GoverningCap(
+        source_path="backend/app/release_artifacts.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_commit_authorship.py"): GoverningCap(
+        source_path="backend/app/release_commit_authorship.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_hotfix_promotion.py"): GoverningCap(
+        source_path="backend/app/release_hotfix_promotion.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_models.py"): GoverningCap(
+        source_path="backend/app/release_models.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_policy_projection.py"): GoverningCap(
+        source_path="backend/app/release_policy_projection.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_prepromotion_rehearsal.py"): GoverningCap(
+        source_path="backend/app/release_prepromotion_rehearsal.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_promotion.py"): GoverningCap(
+        source_path="backend/app/release_promotion.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_promotion_pending.py"): GoverningCap(
+        source_path="backend/app/release_promotion_pending.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier.py"): GoverningCap(
         source_path="backend/app/release_qualifier.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier_audit.py"): GoverningCap(
+        source_path="backend/app/release_qualifier_audit.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier_audit_surface.py"): GoverningCap(
+        source_path="backend/app/release_qualifier_audit_surface.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier_hotfix_audit.py"): GoverningCap(
+        source_path="backend/app/release_qualifier_hotfix_audit.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier_redrive.py"): GoverningCap(
+        source_path="backend/app/release_qualifier_redrive.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier_sweep.py"): GoverningCap(
+        source_path="backend/app/release_qualifier_sweep.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_readiness.py"): GoverningCap(
+        source_path="backend/app/release_readiness.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_reconciliation.py"): GoverningCap(
+        source_path="backend/app/release_reconciliation.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_scoring.py"): GoverningCap(
+        source_path="backend/app/release_scoring.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_serving_confirmation.py"): GoverningCap(
+        source_path="backend/app/release_serving_confirmation.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_stall_alerts.py"): GoverningCap(
+        source_path="backend/app/release_stall_alerts.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_version.py"): GoverningCap(
+        source_path="backend/app/release_version.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
 }

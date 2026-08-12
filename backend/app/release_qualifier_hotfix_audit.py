@@ -8,6 +8,7 @@ import surface remains stable.
 
 from __future__ import annotations
 
+
 from typing import Any
 
 from sqlalchemy import select
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert
+_MODULE_SIZE_GOVERNANCE_CAP: int = 183
 
 
 def _hotfix_audit_was_attempted(qual: dict[str, Any]) -> bool:

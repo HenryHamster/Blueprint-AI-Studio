@@ -7,6 +7,7 @@ receipt against that version's immutable identity and never call GitHub.
 
 from __future__ import annotations
 
+
 import asyncio
 import json
 import logging
@@ -26,6 +27,7 @@ from app.models import Project, ReleaseAuthorshipReconciliationState, ReleaseVer
 
 
 logger = logging.getLogger(__name__)
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1265
 
 BOT_COMMIT_AUTHOR = "blueprintagentorchestrator[bot]"
 BLUEPRINT_GITHUB_BOT_ID = 272093198

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -23,6 +24,7 @@ from app.models import (
 )
 
 logger = logging.getLogger(__name__)
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1253
 
 BACKEND_REVISION_ARTIFACT_KIND = "backend_revision"
 AGENT_IMAGE_ARTIFACT_KIND = "agent_image"

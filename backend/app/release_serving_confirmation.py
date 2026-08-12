@@ -13,6 +13,7 @@ and the test suites) keep resolving them through the canonical module.
 
 from __future__ import annotations
 
+
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -44,6 +45,7 @@ from app.release_artifacts import (
 )
 from app.release_promotion import _DEPLOY_CONFIRM_WINDOW_SECONDS
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1050
 
 logger = logging.getLogger(__name__)
 

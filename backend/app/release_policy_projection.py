@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+
 import contextlib
 import hashlib
 import json
 import math
 from typing import Any
+_MODULE_SIZE_GOVERNANCE_CAP: int = 115
 
 _POLICY_PROJECTION_WEIGHT_LIMIT = 8
 _POLICY_PROJECTION_ERROR_CHARS = 512

@@ -16,6 +16,7 @@ tunable caps) remain importable and test-patchable at their original paths, and
 
 from __future__ import annotations
 
+
 import logging
 from datetime import datetime
 
@@ -26,6 +27,7 @@ from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert, AlertSeverity, Project
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1010
 
 logger = logging.getLogger(__name__)
 

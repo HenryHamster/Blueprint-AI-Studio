@@ -7,6 +7,7 @@ normal qualification completion flow.
 
 from __future__ import annotations
 
+
 import logging
 import uuid
 from typing import Any
@@ -81,6 +82,7 @@ from app.release_serving_confirmation import (
 )
 
 logger = logging.getLogger(__name__)
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2841
 
 # Audit C9: hard wall-clock deadline on the ``promotion_pending`` sub-state.
 #
@@ -2837,4 +2839,3 @@ async def _reconcile_if_promotion_pending_timed_out(
 # ---------------------------------------------------------------------------
 # Post-promotion serving confirmation (moved to app.release_serving_confirmation)
 # ---------------------------------------------------------------------------
-

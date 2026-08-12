@@ -14,6 +14,7 @@ constants) remain importable and test-patchable at their original paths.
 
 from __future__ import annotations
 
+
 import logging
 from datetime import datetime
 from typing import Any
@@ -72,6 +73,7 @@ from app.release_qualifier_hotfix_audit import (
 )
 
 logger = logging.getLogger(__name__)
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2034
 
 
 # Audit H2: hard wall-clock bound on a single qualification.  A qualification

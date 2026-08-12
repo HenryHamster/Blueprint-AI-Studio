@@ -6,6 +6,7 @@ The stable public names are re-exported by :mod:`app.release_qualifier`.
 
 from __future__ import annotations
 
+
 import logging
 import uuid
 from typing import Any
@@ -17,6 +18,7 @@ from app import github, hotfix_policy, release_version
 from app.database import AsyncSessionLocal
 from app.models import Project
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 537
 
 logger = logging.getLogger(__name__)
 

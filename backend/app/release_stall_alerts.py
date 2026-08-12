@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import logging
 from datetime import datetime
 
@@ -14,6 +15,7 @@ from app import pause_clock, release_version
 from app.models import Alert, AlertSeverity, DeploymentState
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 715
 
 logger = logging.getLogger(__name__)
 

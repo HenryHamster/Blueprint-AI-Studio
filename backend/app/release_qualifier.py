@@ -319,7 +319,7 @@ from app.release_qualifier_audit_surface import (
 # Keep the JSON entry in sync with this constant — the governance test in
 # test_release_qualifier.py cross-checks them, so an over-loosened cap regresses
 # red instead of silently widening headroom past the point the guardrail fires.
-_MODULE_SIZE_GOVERNANCE_CAP: int = 10800
+_MODULE_SIZE_GOVERNANCE_CAP: int = 10649
 
 # Product probes are opt-in parts of a qualification attempt's decision
 # contract. Keep the set closed: silently dropping an unknown value would let a

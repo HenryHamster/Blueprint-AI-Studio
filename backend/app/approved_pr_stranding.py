@@ -10,6 +10,7 @@ evidence is ``unknown`` rather than ``clean``.
 
 from __future__ import annotations
 
+
 import asyncio
 import logging
 import os
@@ -41,6 +42,7 @@ from app.landed_signal import (
 )
 from app.models import Alert, AlertSeverity, Project, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _is_cadence_due, _strip_tz_assume_utc, _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1956
 
 logger = logging.getLogger(__name__)
 

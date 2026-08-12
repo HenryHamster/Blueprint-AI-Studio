@@ -13,6 +13,7 @@ from sqlalchemy import select
 from app import ci_compliance
 from app.auth import create_agent_token
 from app.models import Alert, Project, Task, TaskStatus
+from app.size_limit_policy import GovernanceCapExceededError
 from app.strategic_spawning import (
     _maybe_spawn_ci_compliance_cap_bump_fix,
     _spawn_strategic_review,
@@ -60,6 +61,29 @@ def _rules_json() -> str:
             "admin-ui": {"allowlist": []},
         }
     )
+
+
+def test_governance_cap_breach_fails_closed_without_auto_bump(tmp_path):
+    """A declared source cap rejects growth instead of applying headroom."""
+    source = tmp_path / "backend" / "app" / "governed.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "_MODULE_SIZE_GOVERNANCE_CAP: int = 3\n"
+        "# baseline line 1\n"
+        "# baseline line 2\n"
+    )
+    source.write_text(source.read_text() + "# appended line 1\n# appended line 2\n")
+
+    with pytest.raises(GovernanceCapExceededError, match="beyond its governing cap 3"):
+        csl._bump_size_limit(
+            csl.count_lines(str(source)),
+            "governed.py",
+            "backend",
+            str(tmp_path),
+        )
+
+    assert csl.count_lines(str(source)) == 5
+    assert "_MODULE_SIZE_GOVERNANCE_CAP: int = 3" in source.read_text()
 
 
 def _fake_reader(module_line_count: int):

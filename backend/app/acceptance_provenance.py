@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+
 import enum
 from collections.abc import Callable
 from typing import Any
+_MODULE_SIZE_GOVERNANCE_CAP: int = 67
 
 PARENT_DERIVED_CHANGED_FILES_KEY = "_pr_changed_files_from_rollup_parent"
 COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY = "_pr_changed_files_from_rollup_commit_range"
