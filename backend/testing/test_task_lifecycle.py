@@ -4118,7 +4118,7 @@ async def test_process_post_commit_transient_handler_failure_requeues_after_roll
     }
     await session.commit()
 
-    async def _failing_handler(t, logs, sess):
+    async def _failing_handler(t, logs, sess, **_kwargs):
         # Mirror the real handler: stage partial uncommitted work (a child task,
         # like a spawned finding) and then hit a transient DB error (statement
         # timeout). The partial work must NOT survive recovery, and the requeue
@@ -4194,7 +4194,7 @@ async def test_process_post_commit_nontransient_handler_failure_fails_persisted(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
 
-    async def _failing_handler(t, logs, sess):
+    async def _failing_handler(t, logs, sess, **_kwargs):
         raise ValueError("structured findings parse blew up")
 
     # _handle_research_completion is imported lazily inside _process_post_commit
@@ -4349,7 +4349,7 @@ async def test_process_post_commit_handler_genuine_poison_still_requeues(tl_db, 
     )
     poison = _poison_session_factory(project.id)
 
-    async def _failing_handler(t, logs, sess):
+    async def _failing_handler(t, logs, sess, **_kwargs):
         await poison(sess)
         sess.expire(t)
         raise Exception("canceling statement due to statement timeout")

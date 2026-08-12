@@ -55,6 +55,12 @@ def _governing_caps_for_module(
     if source_root_parts is None:
         return []
     source_root = os.path.abspath(os.path.join(root, *source_root_parts))
+    if section == "backend" and not os.path.isdir(source_root):
+        # The production backend image installs the package at /app/app rather
+        # than carrying a full repository checkout. Keep source-adjacent
+        # governance effective there instead of silently applying generic
+        # headroom.
+        source_root = os.path.abspath(os.path.dirname(__file__))
     source_path = os.path.abspath(os.path.join(source_root, module_key))
     try:
         if os.path.commonpath((source_root, source_path)) != source_root:
@@ -411,7 +417,10 @@ _bump_history_cache: dict[
 _CACHE_TTL_SECONDS: float = 60.0
 
 # Repo root: backend/app/ -> ../../
-_REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_SOURCE_TREE_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
+)
+_REPO_ROOT = "/repo" if os.path.isdir("/repo/backend/app") else _SOURCE_TREE_ROOT
 _TESTING_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "testing"))
 _MODULE_SIZE_LIMITS_RELPATH = "backend/testing/module_size_limits.json"
 _MODULE_SIZE_LIMITS_PATH = os.path.join(_TESTING_DIR, "module_size_limits.json")

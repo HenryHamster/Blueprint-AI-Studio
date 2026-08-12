@@ -51,8 +51,17 @@ _VERDICT = {
 }
 
 
+def _repo_root() -> Path:
+    candidates = (Path(__file__).resolve().parents[2], Path("/repo"))
+    return next(
+        candidate
+        for candidate in candidates
+        if (candidate / "scripts" / "blueprint.py").is_file()
+    )
+
+
 def test_disabled_host_rehearsal_shell_is_gone_and_fail_closed_stubs_remain():
-    repo_root = Path(__file__).parents[2]
+    repo_root = _repo_root()
     blueprint_source = (repo_root / "scripts" / "blueprint.py").read_text(
         encoding="utf-8"
     )
@@ -287,7 +296,7 @@ async def test_dispatch_uses_trusted_main_workflow_and_exact_candidate(mocker):
 
 def test_trusted_workflow_keeps_candidate_execution_in_ephemeral_containers():
     workflow = (
-        Path(__file__).parents[2]
+        _repo_root()
         / ".github"
         / "workflows"
         / "prepromotion-rehearsal.yml"

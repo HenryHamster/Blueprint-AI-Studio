@@ -535,7 +535,7 @@ async def test_terminal_requeue_atomic_manual_rebind_sanitizes_effective_context
     assert exc_info.value.detail == (
         "Apply status separately from generic payload, context, or topology mutation"
     )
-    assert get_pr.await_count == 0
+    get_pr.assert_not_awaited()
 
     await db_session.refresh(parent)
     assert parent.status == TaskStatus.FAILED

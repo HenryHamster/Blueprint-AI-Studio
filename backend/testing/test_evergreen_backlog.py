@@ -37,7 +37,6 @@ from app.models import (
     EvergreenFillDecisionLog,
     Project,
     Task,
-    TaskStatus,
 )
 
 
@@ -725,7 +724,7 @@ async def test_deferred_memo_enrollment_flag_gated(db_session, mocker):
     from unittest.mock import AsyncMock
     import app.research_completion as _rc
     from app.research_completion import _handle_research_completion
-    from app.models import Project
+    from app.models import Project, TaskStatus
     from test_autonomous_research import (
         _active_direction,
         _make_research_task,
