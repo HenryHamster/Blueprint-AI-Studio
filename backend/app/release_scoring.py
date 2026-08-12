@@ -2240,124 +2240,6 @@ def _audit_finding_key(summary: str, file: str | None) -> str:
     return hashlib.sha256(f"{norm_file}|{norm_summary}".encode()).hexdigest()[:16]
 
 
-def _compute_audit_challenge_synthesis(
-    primary_report: dict[str, Any] | None,
-    challenge_report: dict[str, Any] | None,
-    *,
-    challenge_reason: str | None = None,
-) -> dict[str, Any]:
-    """Compute non-gating release-audit challenge synthesis."""
-    if challenge_reason:
-        return {
-            "status": "unavailable",
-            "reason": challenge_reason,
-            "reported_agreement": None,
-            "agreement_assessment": None,
-            "challenge_severity": None,
-            "agreement": {"findings_both_flagged": [], "count": 0},
-            "disagreement": {
-                "primary_only": [],
-                "challenger_only": [],
-                "overstated_findings": [],
-            },
-            "counts": {
-                "primary_findings": len(
-                    _compact_challenge_findings(_raw_audit_findings(primary_report))[0]
-                ),
-                "challenger_missing": 0,
-                "challenger_overstated": 0,
-            },
-            "challenge_findings_truncated": False,
-        }
-    if not isinstance(challenge_report, dict):
-        return _compute_audit_challenge_synthesis(
-            primary_report, None, challenge_reason="challenge_absent"
-        )
-
-    primary_findings, primary_truncated = _compact_challenge_findings(
-        _raw_audit_findings(primary_report)
-    )
-    missing_raw = challenge_report.get("missing_findings")
-    overstated_raw = challenge_report.get("overstated_findings")
-    missing_findings, missing_truncated = _compact_challenge_findings(
-        missing_raw if isinstance(missing_raw, list) else []
-    )
-    overstated_findings, overstated_truncated = _compact_challenge_findings(
-        overstated_raw if isinstance(overstated_raw, list) else []
-    )
-
-    primary_keys = {_finding_match_key(finding) for finding in primary_findings}
-    missing_keys = {_finding_match_key(finding) for finding in missing_findings}
-    overstated_keys = {_finding_match_key(finding) for finding in overstated_findings}
-
-    reported_agreement_raw = str(challenge_report.get("agreement") or "").lower()
-    reported_agreement = (
-        reported_agreement_raw
-        if reported_agreement_raw in _CHALLENGE_AGREEMENTS
-        else None
-    )
-    severity_raw = str(challenge_report.get("challenge_severity") or "").lower()
-    challenge_severity = (
-        severity_raw if severity_raw in _CHALLENGE_SEVERITIES else "low"
-    )
-    assessment_raw = challenge_report.get("agreement_assessment")
-    agreement_assessment = (
-        str(assessment_raw).strip()[:_CHALLENGE_ASSESSMENT_MAX]
-        if assessment_raw is not None
-        else ""
-    )
-
-    if (
-        reported_agreement == "agree"
-        and not missing_findings
-        and not overstated_findings
-    ):
-        both_flagged = primary_findings
-        primary_only: list[dict[str, str]] = []
-    else:
-        both_flagged = [
-            finding
-            for finding in primary_findings
-            if _finding_match_key(finding) in missing_keys
-        ]
-        primary_only = [
-            finding
-            for finding in primary_findings
-            if _finding_match_key(finding) not in missing_keys | overstated_keys
-        ]
-
-    challenger_only = [
-        finding
-        for finding in missing_findings
-        if _finding_match_key(finding) not in primary_keys
-    ]
-
-    return {
-        "status": "available",
-        "reason": None,
-        "reported_agreement": reported_agreement,
-        "agreement_assessment": agreement_assessment,
-        "challenge_severity": challenge_severity,
-        "agreement": {
-            "findings_both_flagged": both_flagged,
-            "count": len(both_flagged),
-        },
-        "disagreement": {
-            "primary_only": primary_only,
-            "challenger_only": challenger_only,
-            "overstated_findings": overstated_findings,
-        },
-        "counts": {
-            "primary_findings": len(primary_findings),
-            "challenger_missing": len(missing_findings),
-            "challenger_overstated": len(overstated_findings),
-        },
-        "challenge_findings_truncated": primary_truncated
-        or missing_truncated
-        or overstated_truncated,
-    }
-
-
 def _compute_challenge_synthesis_from_binding_verdicts(
     primary_report: dict[str, Any] | None,
     challenge_verdicts: dict[str, Any] | None,
@@ -2367,9 +2249,8 @@ def _compute_challenge_synthesis_from_binding_verdicts(
 ) -> dict[str, Any]:
     """Compute audit-challenge synthesis from the binding RELEASE_AUDIT_CHALLENGE artifact.
 
-    Unlike _compute_audit_challenge_synthesis (advisory format), this function
-    derives its synthesis from the binding verdict artifact emitted by the live
-    audit-challenge handler (challenged_candidate_sha + verdicts[]).
+    This derives its synthesis from the binding verdict artifact emitted by the
+    live audit-challenge handler (challenged_candidate_sha + verdicts[]).
     """
     if challenge_reason or not isinstance(challenge_verdicts, dict):
         return {

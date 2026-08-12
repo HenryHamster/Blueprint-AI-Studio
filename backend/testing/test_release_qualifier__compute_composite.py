@@ -3219,61 +3219,6 @@ class TestComputeAuditReconciliation:
         assert rq._audit_missing_reason(report) == "all_findings_unverified"
 
 
-class TestComputeAuditChallengeSynthesis:
-    def test_agree_marks_primary_findings_as_both_flagged(self):
-        out = rq._compute_audit_challenge_synthesis(
-            {
-                "findings": [
-                    {
-                        "severity": "high",
-                        "summary": "Unsafe migration path.",
-                        "file": "backend/app/models.py",
-                    }
-                ]
-            },
-            {
-                "agreement": "agree",
-                "overstated_findings": [],
-                "challenge_severity": "low",
-            },
-        )
-
-        assert out["status"] == "available"
-        assert out["reported_agreement"] == "agree"
-        assert out["challenge_severity"] == "low"
-        assert out["agreement"]["count"] == 1
-        assert out["agreement"]["findings_both_flagged"][0]["summary"] == (
-            "Unsafe migration path."
-        )
-        assert out["disagreement"]["primary_only"] == []
-        assert out["disagreement"]["challenger_only"] == []
-        assert out["disagreement"]["overstated_findings"] == []
-        assert out["challenge_findings_truncated"] is False
-
-    def test_challenge_findings_truncated_flag_set_when_primary_exceeds_max(self):
-        findings = [
-            {"severity": "high", "summary": f"Finding number {i}"} for i in range(15)
-        ]
-        out = rq._compute_audit_challenge_synthesis(
-            {"findings": findings},
-            {"agreement": "agree", "challenge_severity": "low"},
-        )
-        assert out["challenge_findings_truncated"] is True
-        assert (
-            len(out["agreement"]["findings_both_flagged"]) == rq._CHALLENGE_FINDING_MAX
-        )
-
-    def test_challenge_findings_truncated_false_when_within_max(self):
-        findings = [
-            {"severity": "high", "summary": f"Finding number {i}"} for i in range(5)
-        ]
-        out = rq._compute_audit_challenge_synthesis(
-            {"findings": findings},
-            {"agreement": "agree", "challenge_severity": "low"},
-        )
-        assert out["challenge_findings_truncated"] is False
-
-
 class TestReconcileAuditWithChallengeVerdictConsumedOnce:
     """Each challenge verdict may match at most one deductible finding.
 

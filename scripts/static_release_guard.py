@@ -123,7 +123,6 @@ def _run_static_corpus(
 ) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
-        "BLUEPRINT_STATIC_GUARD_MODE": "1",
         "BLUEPRINT_STATIC_GUARD_JUNIT": str(junit),
         "TESTMON_NO_FETCH": "1",
     }

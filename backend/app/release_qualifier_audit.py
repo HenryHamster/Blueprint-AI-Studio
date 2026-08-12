@@ -1572,114 +1572,6 @@ async def _latest_artifact_logs(
     return parsed if isinstance(parsed, dict) else None
 
 
-async def get_latest_release_audit_report(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    candidate_sha: str | None = None,
-) -> dict[str, Any] | None:
-    """Return the latest ``release_audit`` task's parsed report for a project.
-
-    When ``candidate_sha`` is provided, the lookup is scoped to audit tasks that
-    evaluated that exact candidate. If the open version has no candidate SHA or
-    no matching audit exists, return ``None`` rather than a mismatched report.
-    """
-    if not candidate_sha:
-        return None
-    audit_task = (
-        (
-            await session.execute(
-                select(Task)
-                .where(
-                    Task.project_id == project_id,
-                    Task.payloads[0]["type"].as_string() == "release_audit",
-                    Task.context["candidate_sha"].as_string() == candidate_sha,
-                )
-                .order_by(Task.created_at.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if audit_task is None:
-        return None
-    report = await _latest_artifact_logs(
-        session, audit_task.id, ArtifactType.RELEASE_AUDIT_REPORT
-    )
-    ctx = audit_task.context or {}
-    status_val = (
-        audit_task.status.value
-        if hasattr(audit_task.status, "value")
-        else str(audit_task.status)
-    )
-    return {
-        "audit_task_id": str(audit_task.id),
-        "task_status": status_val,
-        "candidate_sha": ctx.get("candidate_sha"),
-        "created_at": audit_task.created_at.isoformat()
-        if audit_task.created_at
-        else None,
-        "report": report,
-    }
-
-
-async def get_latest_release_audit_challenge(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    candidate_sha: str | None = None,
-) -> dict[str, Any] | None:
-    """Return the latest ``release_audit_challenge`` task's parsed verdict.
-
-    Mirrors :func:`get_latest_release_audit_report` but scoped to the advisory
-    challenge child and its ``RELEASE_AUDIT_CHALLENGE`` artifact.  When
-    ``candidate_sha`` is provided, the lookup is restricted to challenge tasks
-    that evaluated that exact candidate so a fresh version never inherits an
-    older candidate's challenge verdicts.  Returns ``None`` when no candidate is
-    supplied or no matching challenge exists (the consumer treats a missing
-    challenge as "no second opinion available", never as a confirmation).
-    """
-    if not candidate_sha:
-        return None
-    challenge_task = (
-        (
-            await session.execute(
-                select(Task)
-                .where(
-                    Task.project_id == project_id,
-                    Task.payloads[0]["type"].as_string() == "release_audit_challenge",
-                    Task.context["candidate_sha"].as_string() == candidate_sha,
-                )
-                .order_by(Task.created_at.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if challenge_task is None:
-        return None
-    verdict = await _latest_artifact_logs(
-        session, challenge_task.id, ArtifactType.RELEASE_AUDIT_CHALLENGE
-    )
-    ctx = challenge_task.context or {}
-    status_val = (
-        challenge_task.status.value
-        if hasattr(challenge_task.status, "value")
-        else str(challenge_task.status)
-    )
-    return {
-        "challenge_task_id": str(challenge_task.id),
-        "task_status": status_val,
-        "candidate_sha": ctx.get("candidate_sha"),
-        "created_at": challenge_task.created_at.isoformat()
-        if challenge_task.created_at
-        else None,
-        "verdict": verdict,
-    }
-
-
 async def _audit_report_for_task(
     session: AsyncSession,
     task: Task,
@@ -1740,11 +1632,10 @@ async def resolve_lifecycle_audit_evidence(
 ) -> dict[str, Any]:
     """Resolve audit evidence scoped to an open version's evaluated candidate.
 
-    Unlike :func:`get_latest_release_audit_report` (which returns the newest
-    ``release_audit`` anywhere in the project), this scopes evidence to the
-    given version via ``Task.context['release_version_id']`` and classifies it
-    against the version's evaluated candidate SHA so a fresh or newly-cut
-    version never inherits another version's findings.
+    This scopes evidence to the given version via
+    ``Task.context['release_version_id']`` and classifies it against the
+    version's evaluated candidate SHA so a fresh or newly-cut version never
+    inherits another version's findings.
 
     Returns a dict:
 
@@ -2260,44 +2151,6 @@ async def _handle_independent_blocker(
         "status": "not_promoted",
         "blocker": "audit_challenge_independent_blocker",
         "audit_findings": independent_blocker_findings,
-    }
-
-
-async def get_infra_failure_stats(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    window: int = 50,
-) -> dict[str, Any]:
-    """Return infra-failure summary for a project over the most-recent versions."""
-    stmt = (
-        select(ReleaseVersion.last_qualification)
-        .where(
-            ReleaseVersion.project_id == project_id,
-            ReleaseVersion.last_qualification.is_not(None),
-        )
-        .order_by(ReleaseVersion.updated_at.desc())
-        .limit(window)
-    )
-    rows = list((await session.execute(stmt)).scalars().all())
-
-    infra_failure_count = sum(
-        1 for q in rows if isinstance(q, dict) and q.get("status") == "infra_failure"
-    )
-    consecutive_infra_errors = 0
-    for q in rows:
-        if not isinstance(q, dict):
-            continue
-        if q.get("status") == "pending":
-            consecutive_infra_errors = int(q.get("prior_infra_streak") or 0)
-            break
-        if q.get("status") == "infra_failure":
-            consecutive_infra_errors = int(q.get("consecutive_infra_errors") or 1)
-            break
-
-    return {
-        "infra_failure_count": infra_failure_count,
-        "consecutive_infra_errors": consecutive_infra_errors,
     }
 
 

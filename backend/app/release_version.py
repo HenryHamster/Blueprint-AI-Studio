@@ -728,8 +728,8 @@ def _audit_child_crashed(audit_child: dict[str, Any] | None) -> bool:
     """Return True when the audit child reached a terminal-failed state with no report.
 
     ``audit_child`` is the version-scoped audit-evidence envelope (the
-    ``latest_audit`` dict resolved by ``resolve_lifecycle_audit_evidence`` /
-    ``get_latest_release_audit_report``), carrying ``task_status`` and ``report``.
+    ``latest_audit`` dict resolved by ``resolve_lifecycle_audit_evidence``),
+    carrying ``task_status`` and ``report``.
     ``None`` (no current audit child resolved) → not a crash, so callers that
     pass no signal preserve the prior ``qualifying`` behavior. Pure/sync — no I/O.
     """

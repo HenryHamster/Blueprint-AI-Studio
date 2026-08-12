@@ -150,10 +150,7 @@ from app.release_qualifier_audit import (
     _spawn_direction_merge_grade_task,  # noqa: F401 — re-exported for callers/tests
     _spawn_qualifier_walkthrough_task,
     record_direction_merge_grade,  # noqa: F401 — re-exported for callers/tests
-    get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
-    get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
-    get_latest_release_audit_report,  # noqa: F401 — re-exported for callers/tests
     resolve_lifecycle_audit_evidence,  # noqa: F401 — re-exported for callers/tests
     snapshot_stranded_approved_prs,
     required_children_terminal as _required_children_terminal,
@@ -195,7 +192,6 @@ from app.release_scoring import (
     _clamp01,  # noqa: F401
     coerce_completion_debt_weight,
     _compute_audit_reconciliation,
-    _compute_audit_challenge_synthesis,  # noqa: F401 — re-exported for callers/tests
     _compute_challenge_synthesis_from_binding_verdicts,
     _extract_audit_findings,
     _extract_excluded_audit_findings,
