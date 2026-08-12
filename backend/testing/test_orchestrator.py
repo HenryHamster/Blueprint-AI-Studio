@@ -23,8 +23,8 @@ import app.shared_state as _shared_state
 from app.reaper import reaper_service
 from app.autonomous_research import _spawn_research_task
 from app.failure_classification import classify_failure
-from test_autonomous_research import (
-    _handle_research_completion,
+from app.research_completion import (
+    _handle_research_completion as _handle_research_completion_impl,
 )
 from app.max_plan_pool import (
     load_max_plan_pool,
@@ -37,6 +37,16 @@ from app.models import Project, Task, TaskStatus, MaxPlanAccount
 from testing.factories import make_project, make_task
 
 _TEST_USER = "test-user-123"
+
+
+async def _handle_research_completion(task, logs, session, **kwargs):
+    """Enter the handler at its production post-agent status boundary."""
+
+    if task.status == TaskStatus.IN_PROGRESS:
+        task.status = TaskStatus.COMPLETED
+        session.add(task)
+        await session.commit()
+    return await _handle_research_completion_impl(task, logs, session, **kwargs)
 
 
 def test_resolved_red_ci_status_handoff_preserves_failed_logs():
@@ -4316,7 +4326,7 @@ class TestResearchCompletion:
     def _findings_json(*findings):
         """Serialize a list of finding dicts to a log string for _handle_research_completion."""
         return json.dumps(
-            [{"type": "improvement", **finding} for finding in findings]
+            tuple({"type": "improvement", **finding} for finding in findings)
         )
 
     # ── Test 5: duplicate findings are skipped ───────────────────────────────

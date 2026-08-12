@@ -187,7 +187,8 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
         "required backend verification must fail when PostgreSQL is unavailable; "
         f"got exit {result.returncode} with output:\n{combined}"
     )
-    assert "required backend verification FAILED — PostgreSQL runtime unavailable" in combined
+    assert "required backend verification state=runtime_unavailable" in combined
+    assert "backend verification: runtime_unavailable" in combined
     assert "GATE-ENVIRONMENT: required backend verification skipped" not in combined
     assert "[check] PASS" not in combined
 

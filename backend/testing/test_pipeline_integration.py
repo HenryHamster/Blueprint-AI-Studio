@@ -1864,15 +1864,11 @@ async def test_review_fix_cap_sets_status_message(
         logs="Review: more changes needed",
     )
 
-    # The abandon-candidate path supersedes the old iteration-cap wording.
+    # An unpreservable PR is closed and surfaced for manual review.
     await db_session.refresh(original_task)
     msg = original_task.latest_status_message or ""
-    assert "abandon candidate" in msg.lower(), (
-        f"Status message should identify an abandon candidate, got: {msg!r}"
-    )
-    assert "cycle(s)" in msg.lower() and "automatic fix spawning stopped" in msg.lower(), (
-        f"Status message should preserve cycle count and stop signal, got: {msg!r}"
-    )
+    assert "reached limit" in msg.lower(), msg
+    assert "auto-closed" in msg.lower() and "manual review required" in msg.lower(), msg
 
 
 # ---------------------------------------------------------------------------

@@ -268,7 +268,20 @@ def test_checker_new_ledger_finding_still_fails(tmp_path, capsys, mocker, findin
 
 def test_self_heal_clamps_governed_release_qualifier_cap(tmp_path, mocker):
     """The real fix path honors release_qualifier.py's declared cap relationship."""
-    repo_root = Path(__file__).parents[2]
+    source_repo_root = next(
+        candidate
+        for candidate in (Path(__file__).resolve().parents[2], Path("/repo"))
+        if (candidate / "backend" / "app" / "release_qualifier.py").is_file()
+    )
+    repo_root = tmp_path / "repo"
+    qualifier_path = repo_root / "backend" / "app" / "release_qualifier.py"
+    qualifier_path.parent.mkdir(parents=True)
+    qualifier_path.write_text(
+        (source_repo_root / "backend" / "app" / "release_qualifier.py").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
     limits_path = tmp_path / "module_size_limits.json"
     limits_path.write_text(
         json.dumps(
@@ -301,11 +314,7 @@ def test_self_heal_clamps_governed_release_qualifier_cap(tmp_path, mocker):
 
     limits = json.loads(limits_path.read_text())
     cap = limits["backend"]["release_qualifier.py"]
-    count = len(
-        (repo_root / "backend/app/release_qualifier.py")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    )
+    count = len(qualifier_path.read_text(encoding="utf-8").splitlines())
     assert cap == 10649
     assert cap == rq._MODULE_SIZE_GOVERNANCE_CAP
     assert count <= cap
@@ -1381,6 +1390,14 @@ def test_phantom_ledger_records_preserves_bump_at_shallow_boundary(
     source = tmp_path / "source"
     source.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=source,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=source, check=True
+    )
     _hermetic_write_cap(str(source), 100)
     _hermetic_commit(str(source), "init", date="2026-01-01T00:00:00+00:00")
     _hermetic_write_cap(str(source), 200)
@@ -1441,6 +1458,14 @@ def test_phantom_ledger_records_preserves_resolvable_bump_beyond_boundary(
     source = tmp_path / "source"
     source.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=source,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=source, check=True
+    )
     _hermetic_write_cap(str(source), 100)
     _hermetic_commit(str(source), "init", date="2026-01-01T00:00:00+00:00")
     _hermetic_write_cap(str(source), 200)
