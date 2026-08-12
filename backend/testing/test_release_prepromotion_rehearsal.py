@@ -107,7 +107,7 @@ async def test_permanent_dispatch_404_terminalizes_with_named_target(db_session,
     assert row.status == "rejected"
     assert row.last_error == (
         "permanent 404: dispatch target absent "
-        "acme/widget/actions/workflows/prepromotion-rehearsal.yml@main"
+        "acme/widget/actions/workflows/prepromotion-rehearsal.yml@automain"
     )
 
 
@@ -259,7 +259,7 @@ def test_central_contract_normalizer_accepts_only_closed_ci_shape():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_uses_trusted_main_workflow_and_exact_candidate(mocker):
+async def test_dispatch_uses_integration_workflow_and_exact_candidate(mocker):
     dispatch = mocker.patch(
         "app.release_prepromotion_rehearsal.github.dispatch_workflow_run_outcome",
         new=AsyncMock(return_value="accepted"),
@@ -276,7 +276,7 @@ async def test_dispatch_uses_trusted_main_workflow_and_exact_candidate(mocker):
         "owner",
         "repo",
         PREPROMOTION_REHEARSAL_WORKFLOW,
-        PREPROMOTION_REHEARSAL_WORKFLOW_REF,
+        "automain",
     )
     assert dispatch.await_args.kwargs["inputs"] == {
         "candidate_sha": _CANDIDATE,
@@ -430,7 +430,7 @@ async def test_ambiguous_dispatch_reconciles_before_retry(db_session, mocker):
                 "status": "completed",
                 "conclusion": "success",
                 "head_sha": "b" * 40,
-                "head_branch": "main",
+                "head_branch": PREPROMOTION_REHEARSAL_WORKFLOW_REF,
                 "event": "workflow_dispatch",
                 "path": ".github/workflows/prepromotion-rehearsal.yml",
                 "run_attempt": 1,
@@ -572,7 +572,7 @@ async def test_repository_flip_during_lookup_cannot_misattribute_receipt(
             "status": "completed",
             "conclusion": "success",
             "head_sha": "b" * 40,
-            "head_branch": "main",
+            "head_branch": PREPROMOTION_REHEARSAL_WORKFLOW_REF,
             "event": "workflow_dispatch",
             "path": ".github/workflows/prepromotion-rehearsal.yml",
             "run_attempt": 1,
@@ -628,7 +628,7 @@ async def test_due_observation_is_not_starved_by_fresh_claims(db_session, mocker
         release_version_id=version.id,
         project_id=project.id,
         candidate_sha=_CANDIDATE,
-        workflow_ref="main",
+        workflow_ref=PREPROMOTION_REHEARSAL_WORKFLOW_REF,
         status="dispatched",
         dispatch_attempts=1,
         next_retry_at=_utcnow() - timedelta(minutes=5),
@@ -640,7 +640,7 @@ async def test_due_observation_is_not_starved_by_fresh_claims(db_session, mocker
                 release_version_id=version.id,
                 project_id=project.id,
                 candidate_sha=f"{index + 1:x}" * 40,
-                workflow_ref="main",
+                workflow_ref=PREPROMOTION_REHEARSAL_WORKFLOW_REF,
                 status="claimed",
                 claimed_at=_utcnow() + timedelta(seconds=index),
             )
@@ -737,7 +737,7 @@ async def test_dispatcher_terminalizes_stale_candidate_without_github(
         release_version_id=version.id,
         project_id=project.id,
         candidate_sha=_CANDIDATE,
-        workflow_ref="main",
+        workflow_ref=PREPROMOTION_REHEARSAL_WORKFLOW_REF,
         status="claimed",
     )
     db_session.add(version)
@@ -768,7 +768,7 @@ async def test_stale_prefix_does_not_starve_current_candidate_across_bounded_swe
                 release_version_id=version.id,
                 project_id=project.id,
                 candidate_sha=f"{index + 1:x}" * 40,
-                workflow_ref="main",
+                workflow_ref=PREPROMOTION_REHEARSAL_WORKFLOW_REF,
                 status="claimed",
                 claimed_at=base_time + timedelta(seconds=index),
             )
@@ -777,7 +777,7 @@ async def test_stale_prefix_does_not_starve_current_candidate_across_bounded_swe
         release_version_id=version.id,
         project_id=project.id,
         candidate_sha=_CANDIDATE,
-        workflow_ref="main",
+        workflow_ref=PREPROMOTION_REHEARSAL_WORKFLOW_REF,
         status="claimed",
         claimed_at=base_time + timedelta(seconds=5),
     )
