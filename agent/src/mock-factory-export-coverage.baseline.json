@@ -1938,6 +1938,7 @@
       "buildFilteredFindingsSection",
       "buildScopeCalibrationSignal",
       "buildThinkerPrompt",
+      "buildWorkHeadroomSection",
       "calcMessageAge",
       "classifyFailureCategory",
       "formatCochangeHints",

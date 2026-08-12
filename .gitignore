@@ -63,3 +63,6 @@ research-*.md
 .ruff-module/
 .backend-venv/
 .pgbin/
+
+# Local build sources and extracted trees; never commit scratch artifacts.
+/.scratch/

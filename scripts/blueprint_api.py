@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 CONFIG_FILE = ".blueprint-config.json"
+SCOPED_PROJECT_PAGE_LIMIT = 50
+SCOPED_PROJECT_CATALOG_MAX = 10_000
 
 _config_cache: dict | None = None
 
@@ -104,10 +106,13 @@ def _bootstrap_from_gcloud() -> dict | None:
 
 
 def load_config() -> dict:
-    """Load API config. Search order: $BLUEPRINT_CONFIG -> repo root -> ~/ -> env vars.
+    """Load API config. Explicit config/env credentials beat ambient files.
 
-    Prefer ~/.blueprint-config.json or BLUEPRINT_API_URL/BLUEPRINT_API_KEY env
-    vars so credentials never live in the (gitignored-but-still-local) repo tree.
+    Search order is ``$BLUEPRINT_CONFIG`` (when it names an existing file),
+    ``BLUEPRINT_API_URL`` + ``BLUEPRINT_API_KEY``, the repo-root config, then
+    the home config. Environment credentials must win over ambient files so a
+    coding-agent process can deliberately select a scoped service credential
+    even when an operator has a broader local config.
 
     Read-only fallback: if all admin-credential tiers fail but ORCHESTRATOR_URL
     (or BLUEPRINT_API_URL) and AGENT_SECRET_TOKEN are set, returns a read-only
@@ -118,10 +123,14 @@ def load_config() -> dict:
     global _config_cache
     if _config_cache is not None:
         return _config_cache
-    for config_path in _config_search_paths():
-        if config_path.exists():
-            _config_cache = json.loads(config_path.read_text())
-            return _config_cache
+    config_paths = _config_search_paths()
+    explicit_config = os.environ.get("BLUEPRINT_CONFIG")
+    if explicit_config:
+        explicit_path = Path(explicit_config).expanduser()
+        if not explicit_path.exists():
+            raise APIError(f"BLUEPRINT_CONFIG does not exist: {explicit_path}")
+        _config_cache = json.loads(explicit_path.read_text())
+        return _config_cache
     env_url, env_key = os.environ.get("BLUEPRINT_API_URL"), os.environ.get("BLUEPRINT_API_KEY")
     if env_url and env_key:
         _config_cache = {
@@ -131,6 +140,10 @@ def load_config() -> dict:
             "default_base_branch": os.environ.get("BLUEPRINT_DEFAULT_BASE_BRANCH", "main"),
         }
         return _config_cache
+    for config_path in config_paths:
+        if config_path.exists():
+            _config_cache = json.loads(config_path.read_text())
+            return _config_cache
     bootstrapped = _bootstrap_from_gcloud()
     if bootstrapped is not None:
         _config_cache = bootstrapped
@@ -151,14 +164,18 @@ def load_config() -> dict:
         }
         return _config_cache
     searched = "\n  ".join(str(p) for p in _config_search_paths())
-    print("ERROR: no Blueprint API config found. Searched:\n  " + searched)
-    print("Fix with any of:")
-    print("  - run `gcloud auth login` (config auto-bootstraps from Secret Manager), or")
-    print("  - create ~/.blueprint-config.json "
-          "(keys: api_url, api_key, default_repo, default_base_branch), or")
-    print("  - export BLUEPRINT_API_URL + BLUEPRINT_API_KEY, or")
-    print("  - export ORCHESTRATOR_URL + AGENT_SECRET_TOKEN (read-only metric access only).")
-    sys.exit(1)
+    message = (
+        "ERROR: no Blueprint API config found. Searched:\n  " + searched + "\n"
+        "Fix with any of:\n"
+        "  - run `gcloud auth login` (config auto-bootstraps from Secret Manager), or\n"
+        "  - create ~/.blueprint-config.json "
+        "(keys: api_url, api_key, default_repo, default_base_branch), or\n"
+        "  - export BLUEPRINT_API_URL + BLUEPRINT_API_KEY, or\n"
+        "  - export ORCHESTRATOR_URL + AGENT_SECRET_TOKEN "
+        "(read-only metric access only)."
+    )
+    print(message, file=sys.stderr)
+    raise APIError("no Blueprint API config found")
 
 
 def api(method: str, path: str, body: dict | None = None, timeout: int = 30) -> Any:
@@ -188,12 +205,21 @@ def api(method: str, path: str, body: dict | None = None, timeout: int = 30) -> 
                 "verify the key is correct.",
                 file=sys.stderr,
             )
-        elif e.code == 403 and cfg.get("read_only"):
-            print(
-                "HTTP 403 Forbidden — this action requires admin credentials "
-                "(current config is read-only / agent-JWT).",
-                file=sys.stderr,
-            )
+        elif e.code == 403:
+            if str(cfg.get("api_key") or "").startswith("bpsc_"):
+                print(
+                    "HTTP 403 Forbidden — this scoped ServiceCredential does not "
+                    f"permit {method.upper()} {path}. Select an explicitly authorized "
+                    "project-operator credential for supported project actions; "
+                    "platform-admin commands remain unavailable.",
+                    file=sys.stderr,
+                )
+            elif cfg.get("read_only"):
+                print(
+                    "HTTP 403 Forbidden — the current config is read-only. Select "
+                    "a separate operator BLUEPRINT_CONFIG for authorized mutations.",
+                    file=sys.stderr,
+                )
         print(f"API error {e.code}: {body}", file=sys.stderr)
         raise APIError(f"HTTP {e.code}: {body}")
     except urllib.error.URLError as e:
@@ -328,8 +354,66 @@ def get_project_id(project_id: str | None = None) -> str:
 
 def list_projects() -> list[dict]:
     """Return all projects (each dict carries at least ``id`` and ``name``)."""
-    resp = api("GET", "/api/admin/projects")
-    return resp.get("items", []) if isinstance(resp, dict) else (resp or [])
+    config = load_config()
+    if str(config.get("api_key") or "").startswith("bpsc_"):
+        projects: list[dict] = []
+        offset = 0
+        while True:
+            profile = api(
+                "GET",
+                "/api/agent-access/v1/me"
+                f"?limit={SCOPED_PROJECT_PAGE_LIMIT}&offset={offset}",
+            )
+            if not isinstance(profile, dict) or not isinstance(
+                profile.get("projects"), list
+            ):
+                raise APIError("Agent access profile did not return a project list")
+            page = profile["projects"]
+            projects.extend(page)
+            if not profile.get("has_more"):
+                return projects
+            if not page:
+                raise APIError(
+                    "Agent access profile reported has_more=true but returned "
+                    "no projects"
+                )
+            if len(projects) >= SCOPED_PROJECT_CATALOG_MAX:
+                raise APIError(
+                    "Scoped project catalog exceeds the bounded CLI lookup limit; "
+                    "set BLUEPRINT_PROJECT_ID or project_id explicitly"
+                )
+            next_offset = profile.get("next_offset", offset + len(page))
+            if (
+                isinstance(next_offset, bool)
+                or not isinstance(next_offset, int)
+                or next_offset <= offset
+                or next_offset > SCOPED_PROJECT_CATALOG_MAX
+            ):
+                raise APIError(
+                    "Agent access profile returned an invalid next project offset"
+                )
+            offset = next_offset
+
+    projects: list[dict] = []
+    offset = 0
+    limit = 500
+    while True:
+        resp = api(
+            "GET",
+            f"/api/admin/projects?limit={limit}&offset={offset}",
+        )
+        if not isinstance(resp, dict):
+            return resp or []
+
+        page = resp.get("items") or []
+        projects.extend(page)
+        if not resp.get("has_more"):
+            return projects
+        if not page:
+            raise APIError(
+                "Project listing reported has_more=true but returned no items"
+            )
+        offset += len(page)
 
 
 def resolve_project_id_by_name(name: str) -> str:

@@ -33,8 +33,8 @@ Hard invariants (mirrors the proven pattern exactly):
   durably committed. The DB write to ``DeploymentState.runtime_config_json``
   commits BEFORE the in-memory ``runtime_config`` mutation.
 * **Monotonic.** Only advances ``off → observe → enforce``; never regresses.
-* **Opt-in.** Gated behind a single dedicated ``mode_knob_graduation_enabled``
-  flag (default ``False``). Independent of any single knob's own mode — the
+* **Single arm.** Gated behind a single dedicated ``mode_knob_graduation_enabled``
+  flag (default ``True``). Independent of any single knob's own mode — the
   driver does NOT require the target knob (or the metrics-integrity sweep) to
   already be enforcing to run.
 * **Isolated.** Each knob is driven inside its own try/except; a crash records an
@@ -55,8 +55,7 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
-#: Single dedicated opt-in flag for the whole harness (default False). Mirrors
-#: ``capability_proof_gate_auto_graduation_enabled``.
+#: Single dedicated arm for the whole harness (default True).
 MODE_KNOB_GRADUATION_ENABLED_KEY = "mode_knob_graduation_enabled"
 
 #: Monotonic mode ladder. A knob may only advance to the NEXT rung.
@@ -1059,7 +1058,7 @@ async def run_mode_knob_graduation(
     Returns the list of per-knob decisions (empty when the harness is disabled).
     Each knob is driven inside its own try/except; a crash records an ``ERROR``
     decision and never aborts the driver. Independent of any single knob's own
-    mode — gated ONLY by ``mode_knob_graduation_enabled`` (default False).
+    mode — gated ONLY by ``mode_knob_graduation_enabled`` (default True).
     """
     from app.shared_state import runtime_config
 

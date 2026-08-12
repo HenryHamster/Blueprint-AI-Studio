@@ -42,6 +42,7 @@ from app.models import (
     Task,
     TaskHistory,
     TaskStatus,
+    task_lifetime_attempt_ordinal,
 )
 from app.deploy_identity import project_is_deploy_repo
 from app.repo_bootstrap import (
@@ -112,6 +113,20 @@ from app.json_extract import (  # noqa: F401  (re-exported; callers import from 
 )
 
 logger = logging.getLogger(__name__)
+
+
+def checkpoint_owner_metadata(task: Task, branch_name: str) -> dict[str, str]:
+    """Return the stable owner identity for an agent checkpoint branch.
+
+    Checkpoint commits carry the task id, but the branch name is also part of
+    the ownership fence: a valid commit on an unrelated branch must never be
+    adopted by a task merely because its trailer names that task.
+    """
+    return {
+        "project_id": str(task.project_id),
+        "task_id": str(task.id),
+        "branch": branch_name,
+    }
 
 
 _COMPUTE_WAKE_POST_COMMIT_META_KEY = "_compute_wake_post_commit_meta"
@@ -522,19 +537,47 @@ def _compute_first_attempt_succeeded(
     attempt_count: int,
     status: "TaskStatus",
     merge_verification: "str | None" = None,
-) -> bool:
-    """Return True if the task completed successfully on its first attempt.
+    *,
+    banked_attempt_count: int = 0,
+    lifetime_attempt_ordinal: int | None = None,
+    task_type: "str | None" = None,
+) -> "bool | None":
+    """Return the first-attempt outcome, or None when success is unadjudicated.
 
     A degraded-unverified merge (environment/setup failure blocked real
     verification) does NOT count as a first-attempt success even if
-    attempt_count <= 1 and status == COMPLETED — the claim was never proven on
+    attempt_count == 0 and status == COMPLETED — the claim was never proven on
     HEAD.  Pass ``merge_verification`` as the
     :func:`~app.landed_signal.merge_verification_status` result at write time
     so the flag is accurate when the merge context is already available.
+
+    A ``strategic_review`` completion proves only that the review protocol ran;
+    it does not prove that the review's factual claims or portfolio decisions
+    were correct.  The completion path currently has no independent semantic
+    adjudicator, so every completed Strategic review returns ``None`` and is
+    excluded from positive learning and generic success-rate denominators.
+    Self-reported completion data must not be promoted into that authority.
     """
+    if (
+        task_type == "strategic_review"
+        and status == TaskStatus.COMPLETED
+    ):
+        return None
     if merge_verification == "unverified_degraded":
         return False
-    return attempt_count <= 1 and status == TaskStatus.COMPLETED
+    # ``attempt_count`` is the number of retries consumed in the current retry
+    # epoch.  Manual fresh-attempt requeues reset it, while attempt history keeps
+    # the closed prior executions.  Either source proving a retry makes this a
+    # later-attempt outcome.
+    ordinal = (
+        lifetime_attempt_ordinal
+        if isinstance(lifetime_attempt_ordinal, int)
+        and not isinstance(lifetime_attempt_ordinal, bool)
+        and lifetime_attempt_ordinal > 0
+        else task_lifetime_attempt_ordinal(attempt_count, banked_attempt_count)
+    )
+    completed_first_attempt = ordinal == 1 and status == TaskStatus.COMPLETED
+    return completed_first_attempt
 
 
 def _stamp_orphan_remediation_outcome(
@@ -5082,7 +5125,10 @@ async def _handle_design_doc_completion(
         STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY,
     )
     from app.alert_dispatch import _create_strategic_alert
-    from app.task_locking import lock_project_for_strategic_transition
+    from app.task_locking import (
+        lock_project_for_strategic_transition,
+        lock_project_then_task,
+    )
     from app.strategic_events import emit_strategic_cycle_completed
 
     # Phase 1 emitted strategic_cycle_started at spawn time. Every path out of
@@ -5274,7 +5320,34 @@ async def _handle_design_doc_completion(
             flag_modified(project, "vision")
             session.add(project)
     except Exception as chain_exc:
-        # Only pre-captured identifiers in here — task may be expired (see above).
+        # _spawn_strategic_review performs advisory DB work while building the
+        # Phase-2 payload.  A failed flush can leave this AsyncSession in
+        # pending-rollback state; logging and then writing the alert/marker on
+        # that same transaction only masks the root error with
+        # PendingRollbackError.  Roll back unconditionally, then re-acquire the
+        # Project -> Task pair in canonical order so every recovery write below
+        # uses current, live ORM instances on a clean transaction.
+        await session.rollback()
+        # Do not refresh the caller's ORM object here. A failed spawn may have
+        # detached it, and the canonical Project -> Task lock below is already
+        # the authoritative async-safe refetch boundary. Only identifiers
+        # captured before the failed transaction are trusted until then.
+        async with lock_project_then_task(
+            session,
+            task_project_id,
+            task_id_value,
+            skip_locked=False,
+        ) as (recovered_project, recovered_task):
+            if recovered_project is None or recovered_task is None:
+                raise RuntimeError(
+                    "design-doc Phase-2 recovery could not refetch project/task"
+                ) from chain_exc
+            project = recovered_project
+            task = recovered_task
+        base_vision = dict(project.vision or {})
+
+        # Only pre-captured identifiers are used before the canonical refetch
+        # above — the original task/project may have been expired by rollback.
         phase2_spawn_failed = True
         phase2_failure_reason = str(chain_exc)[:200]
         logger.error(

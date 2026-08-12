@@ -1864,15 +1864,11 @@ async def test_review_fix_cap_sets_status_message(
         logs="Review: more changes needed",
     )
 
-    # The original task's status message must contain the expected keywords
+    # An unpreservable PR is closed and surfaced for manual review.
     await db_session.refresh(original_task)
     msg = original_task.latest_status_message or ""
-    assert "iteration" in msg.lower(), (
-        f"Status message should mention 'iteration', got: {msg!r}"
-    )
-    assert "manual review" in msg.lower(), (
-        f"Status message should mention 'manual review', got: {msg!r}"
-    )
+    assert "reached limit" in msg.lower(), msg
+    assert "auto-closed" in msg.lower() and "manual review required" in msg.lower(), msg
 
 
 # ---------------------------------------------------------------------------

@@ -74,9 +74,10 @@ describePosix('writePrHelper', () => {
           env: {
             ...process.env,
             // The generated pr script resolves GATE_TIMEOUT_SECONDS from this
-            // env; tests assert the DEFAULT (600s) timeout-blocking contract, so
-            // scrub any operator-level override the ambient shell carries.
+            // env; tests assert the DEFAULT 600s soft / 1800s hard contract, so
+            // scrub any operator-level overrides the ambient shell carries.
             PR_GATE_TIMEOUT_SECONDS: '',
+            PR_GATE_HARD_TIMEOUT_SECONDS: '',
             WORKSPACE: dir,
             PATH: `${realPath.join(dir, 'bin')}:${process.env.PATH ?? ''}`,
             ORCHESTRATOR_URL: 'https://orchestrator.example',
@@ -786,13 +787,17 @@ esac
     expect(result.stdout).not.toContain('check must not run');
     expect(result.stderr).not.toContain('push must not run');
     expect(result.stderr).not.toContain('PR create must not run');
-    expect(realFs.readFileSync(argsPath, 'utf8')).toContain('--kill-after=10s 600s ./check');
+    expect(realFs.readFileSync(argsPath, 'utf8')).toContain(
+      '--kill-after=10s 1800s timeout --preserve-status --signal=CONT 600s ./check',
+    );
     // Receipt written with timed_out status and authoritative_ci_required: false
     // (we are blocking, not deferring).
     expect(JSON.parse(realFs.readFileSync(receiptPath, 'utf8'))).toMatchObject({
       status: 'timed_out',
       command: './check',
       timeout_seconds: 600,
+      hard_timeout_seconds: 1800,
+      deadline_extended: false,
       exit_code: 124,
       authoritative_ci_required: false,
     });
@@ -801,6 +806,145 @@ esac
     realFs.rmSync(receiptPath, { force: true });
     realFs.rmSync(argsPath, { force: true });
   });
+
+  it('allows a healthy gate to finish after the soft deadline but before the hard bound', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const receiptPath = '/tmp/pr_gate_receipt_task-gate-progress.json';
+    const prPath = '/tmp/pr_url_task-gate-progress';
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+
+    const script = writeScript({
+      taskId: 'task-gate-progress',
+      workBranch: 'blueprint/task-gate-progress',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const result = await runScript(
+      script,
+      ['open', '--title', 'title', '--body', 'body', '--with-tests'],
+      (dir, rfs) => {
+        const bin = `${dir}/bin`;
+        rfs.mkdirSync(bin, { recursive: true });
+        rfs.writeFileSync(
+          `${dir}/check`,
+          '#!/bin/sh\nprintf "%s\\n" "$*" > "$WORKSPACE/check.args"\nsleep 2\nexit 0\n',
+          { mode: 0o755 },
+        );
+        rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) printf '%s\\n' 'M src/app.ts'; exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-gate-progress"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+        rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/github/token?task_id=task-gate-progress"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/77"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/77"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+        rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/77\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
+      },
+      { PR_GATE_TIMEOUT_SECONDS: '1', PR_GATE_HARD_TIMEOUT_SECONDS: '4' },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('completed after the soft 1s deadline');
+    expect(result.checkArgs).toBe('test');
+    expect(JSON.parse(realFs.readFileSync(receiptPath, 'utf8'))).toMatchObject({
+      status: 'passed',
+      command: './check test',
+      timeout_seconds: 1,
+      hard_timeout_seconds: 4,
+      deadline_extended: true,
+      exit_code: 0,
+    });
+    expect(realFs.existsSync(prPath)).toBe(true);
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+  }, 15_000);
+
+  it('still terminates a genuinely wedged gate at the absolute hard bound', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const receiptPath = '/tmp/pr_gate_receipt_task-gate-wedge.json';
+    const prPath = '/tmp/pr_url_task-gate-wedge';
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+
+    const script = writeScript({
+      taskId: 'task-gate-wedge',
+      workBranch: 'blueprint/task-gate-wedge',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const result = await runScript(
+      script,
+      ['open', '--title', 'title', '--body', 'body'],
+      (dir, rfs) => {
+        const bin = `${dir}/bin`;
+        rfs.mkdirSync(bin, { recursive: true });
+        rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nsleep 5\nexit 0\n', { mode: 0o755 });
+        rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"push --force-with-lease"*) printf 'push must not run\\n' >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+        rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+case "$*" in
+  *"/api/agent/github/pull-requests"*) printf 'PR create must not run\\n' >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+        rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\nprintf \'{}\\n\'\n', { mode: 0o755 });
+      },
+      { PR_GATE_TIMEOUT_SECONDS: '1', PR_GATE_HARD_TIMEOUT_SECONDS: '2' },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('exceeded its bounded 2s hard deadline');
+    expect(result.stderr).not.toContain('push must not run');
+    expect(result.stderr).not.toContain('PR create must not run');
+    expect(JSON.parse(realFs.readFileSync(receiptPath, 'utf8'))).toMatchObject({
+      status: 'timed_out',
+      command: './check',
+      timeout_seconds: 1,
+      hard_timeout_seconds: 2,
+      deadline_extended: true,
+      exit_code: 124,
+    });
+    expect(realFs.existsSync(prPath)).toBe(false);
+    realFs.rmSync(receiptPath, { force: true });
+  }, 15_000);
 
   it('keeps a deterministic local-gate failure fail-closed', async () => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -824,7 +968,7 @@ esac
       rfs.writeFileSync(`${bin}/timeout`, `#!/bin/sh
 while [ $# -gt 0 ]; do
   case "$1" in
-    --signal=*|--kill-after=*) shift ;;
+    --signal=*|--kill-after=*|--preserve-status) shift ;;
     *s) shift; break ;;
     *) break ;;
   esac
@@ -843,6 +987,90 @@ exec "$@"
     });
     expect(realFs.existsSync(prPath)).toBe(false);
     realFs.rmSync(receiptPath, { force: true });
+  });
+
+  // A blocked ./check is RETRYABLE — ./pr open tells the agent to fix the
+  // failures and re-run. So the receipt must be persisted through the
+  // non-terminal heartbeat channel: posting status=FAILED with
+  // failure_category=BLOCKED_PRECONDITION would take the backend's BLOCKED
+  // branch, which releases the account slot and deletes the VM the agent is
+  // still running on.
+  it('records the gate receipt durably when the gate blocks publication', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const receiptPath = '/tmp/pr_gate_receipt_task-gate-durable.json';
+    const blockerPath = '/tmp/pr_gate_blocker_task-gate-durable.json';
+    const curlArgsPath = '/tmp/pr_gate_blocker_args_task-gate-durable.txt';
+    const prPath = '/tmp/pr_url_task-gate-durable';
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(blockerPath, { force: true });
+    realFs.rmSync(curlArgsPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+
+    const script = writeScript({
+      taskId: 'task-gate-durable',
+      workBranch: 'blueprint/task-gate-durable',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 23\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/timeout`, `#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --signal=*|--kill-after=*|--preserve-status) shift ;;
+    *s) shift; break ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+printf '%s\\n' "$@" > ${curlArgsPath}
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cat > ${blockerPath}
+[ -n "$OUT" ] && : > "$OUT"
+printf '200'
+`, { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(1);
+    const payload = JSON.parse(realFs.readFileSync(blockerPath, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(payload).toMatchObject({
+      task_id: 'task-gate-durable',
+      publication_gate_receipt: {
+        status: 'failed',
+        command: './check',
+        timeout_seconds: 600,
+        hard_timeout_seconds: 1800,
+        exit_code: 23,
+        authoritative_ci_required: false,
+      },
+    });
+    // No terminal status transition: these keys would drive the task to
+    // BLOCKED and tear down the still-running VM.
+    expect(payload.status).toBeUndefined();
+    expect(payload.failure_category).toBeUndefined();
+    expect(payload.artifact_type).toBeUndefined();
+    const curlArgs = realFs.readFileSync(curlArgsPath, 'utf8');
+    expect(curlArgs).toContain('/api/agent/heartbeat');
+    expect(curlArgs).not.toContain('/api/agent/status');
+    expect(realFs.existsSync(prPath)).toBe(false);
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(blockerPath, { force: true });
+    realFs.rmSync(curlArgsPath, { force: true });
   });
   // Regression test: when the timeout tool itself fails (exits 127 — command not
   // found inside timeout, or timeout's own internal error), the gate must BLOCK.
@@ -979,7 +1207,7 @@ describe('writePrHelper — run_pr_gate timeout-absent fallback (static)', () =>
     expect(timeoutBlock).not.toContain('return 0');
     expect(timeoutBlock).toContain('return "$GATE_STATUS"');
     // Error message must explain what happened and how to fix it.
-    expect(timeoutBlock).toContain('did not complete within the time limit');
+    expect(timeoutBlock).toContain('did not complete within the absolute time limit');
     expect(timeoutBlock).toContain('no verdict was produced');
   });
 });
@@ -1009,8 +1237,11 @@ describe('writePrHelper — generated script content', () => {
     // All gate failures block — a deterministic red, a timeout, or an unavailable
     // tool all prevent ./pr open from writing the PR URL. Only exit 0 passes.
     expect(script).toContain('if ! run_pr_gate test; then');
-    expect(script).toContain('timeout --signal=TERM --kill-after=10s "${GATE_TIMEOUT_SECONDS}s" ./check "$@"');
+    expect(script).toContain(
+      'timeout --signal=TERM --kill-after=10s "${GATE_HARD_TIMEOUT_SECONDS}s" timeout --preserve-status --signal=CONT "${GATE_TIMEOUT_SECONDS}s" ./check "$@"',
+    );
     expect(script).toContain('PR_GATE_TIMEOUT_SECONDS:-600');
+    expect(script).toContain('PR_GATE_HARD_TIMEOUT_SECONDS:-1800');
     expect(script).toContain('authoritative_ci_required');
     expect(script).toContain('write_gate_receipt failed "$GATE_STATUS" false');
     expect(script).toContain('<!-- blueprint:local-gate -->');

@@ -1963,9 +1963,9 @@ describe('readAgentSourceSha', () => {
     expect(readAgentSourceSha()).toBe('0123456789abcdef0123456789abcdef01234567');
   });
 
-  it('accepts an abbreviated 7-hex SHA', () => {
+  it('rejects an abbreviated marker SHA as unobservable', () => {
     mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=abc1234');
-    expect(readAgentSourceSha()).toBe('abc1234');
+    expect(readAgentSourceSha()).toBeNull();
   });
 
   it('returns null for the unknown fallback', () => {
@@ -2000,7 +2000,7 @@ describe('readAgentSourceSha', () => {
   it('falls back to the marker for a malformed env value', () => {
     process.env.AGENT_SOURCE_SHA = 'not-a-sha';
     mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=abc1234');
-    expect(readAgentSourceSha()).toBe('abc1234');
+    expect(readAgentSourceSha()).toBeNull();
   });
 
   it('returns null when env is malformed and the marker is the unknown fallback', () => {
@@ -2020,7 +2020,7 @@ describe('readAgentSourceSha', () => {
   it('falls back to the marker when the env var is absent', () => {
     delete process.env.AGENT_SOURCE_SHA;
     mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=abc1234');
-    expect(readAgentSourceSha()).toBe('abc1234');
+    expect(readAgentSourceSha()).toBeNull();
   });
 });
 
@@ -2142,6 +2142,7 @@ describe('claimTask retry contract', () => {
   it('refreshes an expired task token and retries the claim with the new token', async () => {
     _setAgentTokenForTesting('stale-task-token');
     const claimTokens: string[] = [];
+    const researchContractVersions: string[] = [];
     let claimCalls = 0;
     const fetchMock = makeFetchMock().mockImplementation((input, init) => {
       const url = String(input);
@@ -2149,6 +2150,7 @@ describe('claimTask retry contract', () => {
         claimCalls += 1;
         const headers = init?.headers as Record<string, string> | undefined;
         claimTokens.push(headers?.['X-Agent-Token'] ?? '');
+        researchContractVersions.push(headers?.['X-Research-Output-Contract-Version'] ?? '');
         if (claimCalls === 1) {
           return Promise.resolve({
             ok: false,
@@ -2181,6 +2183,7 @@ describe('claimTask retry contract', () => {
 
     await expect(claimTask()).resolves.toEqual({ task_id: 'task-1' });
     expect(claimTokens).toEqual(['stale-task-token', 'fresh-task-token']);
+    expect(researchContractVersions).toEqual(['2', '2']);
     expect(getAgentToken()).toBe('fresh-task-token');
   });
 
@@ -2362,6 +2365,33 @@ describe('agent runtime fingerprint heartbeats', () => {
     expect(body.task_id).toBe('task-runtime-fp');
     expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
     expect(body.agent_source_sha).toBe(sourceSha);
+  });
+
+  it('reports structured active-tool progress when task prose replaces the tool prefix', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({}),
+    });
+    const subprogressAt = '2026-08-09T03:03:33.000Z';
+
+    _startHeartbeatForTesting(
+      'task-active-tool-progress',
+      () => 'The publication gate remains clean (8m elapsed, last sub-progress 24s ago)',
+      () => subprogressAt,
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const heartbeatCall = fetchMock.mock.calls.find(
+      ([url]) => String(url).endsWith('/api/agent/heartbeat'),
+    );
+    expect(heartbeatCall).toBeDefined();
+    const heartbeatBody = heartbeatCall?.[1]?.body;
+    expect(typeof heartbeatBody).toBe('string');
+    const body = JSON.parse(
+      defined(typeof heartbeatBody === 'string' ? heartbeatBody : undefined),
+    ) as { status_message?: string; active_tool_progress_at?: string };
+    expect(body.status_message).toContain('The publication gate remains clean');
+    expect(body.active_tool_progress_at).toBe(subprogressAt);
   });
 
   it('omits agent_source_sha from task and VM heartbeats when identity absent', async () => {

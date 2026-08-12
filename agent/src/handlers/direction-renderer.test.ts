@@ -7,7 +7,11 @@ vi.mock('../index.js', () => ({
 
 vi.mock('./research-plan.js', () => {
   return {
+    RESEARCH_CARRIED_WORK_CHAR_BUDGET: 12_000,
+    buildCarriedResearchWorkSection: vi.fn(),
     buildResearchScopeGuidance: vi.fn(),
+    buildResearchToolGuidance: vi.fn(),
+    buildWorkHeadroomSection: vi.fn(),
     aggregateDirectionStats: (history: Array<Record<string, unknown>>, agg: Record<string, unknown>) => {
       const total = history.length + ((agg.total_cycles as number) || 0);
       if (total === 0) return '';
@@ -49,6 +53,7 @@ vi.mock('./research-plan.js', () => {
       }
       return items.length > 0 ? `\n  Recently filtered (avoid): ${items.join(', ')}` : '';
     },
+    validateComputeFindingContract: vi.fn(),
   };
 });
 

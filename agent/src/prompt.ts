@@ -873,6 +873,7 @@ export function writeMessagesHelper(
     replyKeyPath?: string;
     replyReceiptPath?: string;
     stagedReplyPath?: string;
+    privateTurnMarkerPath?: string;
   } = {},
 ): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
@@ -889,6 +890,9 @@ export function writeMessagesHelper(
     (options.stagedReplyPath
       ?? path.resolve(workspace, '.resident-reply-staged-message.json')).replace(/\\/g, '/'),
   );
+  const privateTurnMarkerPath = options.privateTurnMarkerPath
+    ? shellEscapeDoubleQuoted(options.privateTurnMarkerPath.replace(/\\/g, '/'))
+    : '';
   const helperScript = `#!/bin/bash
 # Message tool — send messages to the project owner or resolve open messages
 # Usage:
@@ -912,10 +916,15 @@ RESIDENT_REPLY_ONLY="${residentReplyOnly ? '1' : '0'}"
   REPLY_KEY_PATH="\${BLUEPRINT_RESIDENT_REPLY_KEY_PATH:-${replyKeyPath}}"
   REPLY_RECEIPT_PATH="\${BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH:-${replyReceiptPath}}"
   STAGED_REPLY_PATH="\${BLUEPRINT_RESIDENT_STAGED_REPLY_PATH:-${stagedReplyPath}}"
+  PRIVATE_TURN_MARKER_PATH="\${BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH:-${privateTurnMarkerPath}}"
 NODE_BIN="\${NODE_BINARY:-node}"
 ${boundedRegularReadShellFn()}
 ${retryPostShellFn()}
 if [ "$OP" = "send" ]; then
+  if [ -e "$PRIVATE_TURN_MARKER_PATH" ] || [ -L "$PRIVATE_TURN_MARKER_PATH" ]; then
+    echo "[ERROR] send: private Workday turns cannot publish project messages" >&2
+    exit 2
+  fi
   if [ "\${2:-}" = "--stdin" ]; then
     MSG_TYPE="\${3:-NOTE}"
     CONTENT="$(cat)"
@@ -1484,19 +1493,16 @@ function buildConfigCheckIntro(buildConfig: BuildConfig): string {
     .filter((x): x is { path: string; cmd: string } => !!x.cmd)
     .map(x => `\`${x.path.replace(/\/$/, '')}/\` (\`${x.cmd}\`)`);
   const testList = testParts.length ? testParts.join(', ') : 'any configured test commands';
-  // Mirrors buildPytestGateInner in prompts/check-helper.ts: a pytest-style
-  // test command gets the honest gate (sanctioned-harness preference +
-  // GATE-ENVIRONMENT fallback), so tell the agent what that note means.
+  // A pytest-style command remains a normal configured test command. Projects
+  // that explicitly declare the retained project-verification contract get
+  // its base-attributed verification block from the generated check helper.
   const effectiveTestCmds = dirs.map(d => effectiveTestCmd(d)).filter((c): c is string => !!c);
   const hasPytestGate = effectiveTestCmds.some(c => isPytestCmd(c));
   const pytestGateNote = hasPytestGate
-    ? `  A pytest-style test command runs honestly: \`./check test\` prefers the
-  project's Docker test harness (\`scripts/test-<dir>.sh\`) when Docker can
-  run it; if this VM can faithfully run neither the harness nor a
-  Postgres-backed pytest, the gate logs a GATE-ENVIRONMENT note instead of
-  failing on pre-existing environment-only failures. When you see that
-  note, record your own faithful test evidence in the PR body — do NOT
-  treat the environment artifact as a blocker for validated work.
+    ? `  A pytest-style test command runs as the configured command under
+  \`./check test\`. A project that declares the \`blueprint-v1\` verification
+  contract gets the retained base-attributed verification block instead of a
+  duplicate generic pytest gate.
 `
     : '';
   return `- \`./check\` — runs this project's configured lint/build commands for the

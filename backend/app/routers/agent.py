@@ -80,6 +80,16 @@ from app.compute_experiment_contract import (
     resolve_compute_spend_direction,
 )
 from app.resource_envelope import resolve_project_require_local_runner
+from app.research_execution_authority import (
+    MAX_RESEARCH_DEPTH,
+    is_server_owned_research_context_key,
+)
+from app.research_output_contract import (
+    RESEARCH_OUTPUT_CONTRACT_VERSION as _RESEARCH_OUTPUT_CONTRACT_VERSION,
+    RESEARCH_OUTPUT_CONTRACT_VERSION_HEADER as _RESEARCH_OUTPUT_CONTRACT_VERSION_HEADER,
+    RESEARCH_OUTPUT_CONTRACT_VERSION_KEY as _RESEARCH_OUTPUT_CONTRACT_VERSION_KEY,
+)
+from app.sidecar_authority import is_server_owned_sidecar_context_key
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
 from app.artifact_prerequisites import (
     ARTIFACT_PREREQUISITES_KEY,
@@ -391,6 +401,9 @@ _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS = frozenset(
         "pr_merged",
         "pr_closed_unmerged",
         "pr_rejected",
+        # Recursion authority is derived from persisted ancestry below. Trusting
+        # an agent-supplied negative value bypasses MAX_SPAWN_DEPTH indefinitely.
+        "spawn_depth",
     }
 )
 
@@ -1038,6 +1051,28 @@ async def claim_task(
             "claimed_at": claim_started_at.isoformat(),
             "token_jti": str(token.get("jti") or ""),
         }
+        _reported_research_contract = request.headers.get(
+            _RESEARCH_OUTPUT_CONTRACT_VERSION_HEADER, ""
+        )
+        # This capability belongs to the current execution attempt. A task
+        # requeued after a v2 claim must not remain strict when its next fresh
+        # claimant is a stale runner. Idempotent replays skip this block and
+        # retain the original attempt's negotiated contract.
+        claim_context.pop(_RESEARCH_OUTPUT_CONTRACT_VERSION_KEY, None)
+        if (
+            str((task.first_payload or {}).get("type") or "").lower()
+            == "research"
+            and _reported_research_contract
+            == str(_RESEARCH_OUTPUT_CONTRACT_VERSION)
+        ):
+            # Capability handshake: completion enforces the strict
+            # claims/sources/acceptance-evidence contract only when this exact
+            # agent release advertises it. A stale runner claiming after a
+            # backend rollout stays on the legacy parser instead of being
+            # mislabeled merely because the server was upgraded first.
+            claim_context[_RESEARCH_OUTPUT_CONTRACT_VERSION_KEY] = (
+                _RESEARCH_OUTPUT_CONTRACT_VERSION
+            )
         task.context = claim_context
         # Immediate heartbeat — don't wait 30s for agent interval.
         stamp_cold_claim_timing(task, claimed_at=claim_started_at)
@@ -1155,12 +1190,29 @@ async def claim_task(
     project_integration_branch = (
         get_project_integration_branch(project) if project else None
     )
+    task_type = _claimed_first_payload.get("type", "")
+    _claim_current_effective_policy: dict | None = None
+    if task_type == "strategic_review":
+        # A Strategic task may sit queued after its launch payload was assembled.
+        # Refresh only the mutable "current" projection at the final claim
+        # boundary; the frozen active/last-attempt projection remains launch-time
+        # provenance and must not be rewritten.  This is response-only: the
+        # durable Task payload stays an honest record of what was originally
+        # queued, while cold, pool, local-runner, and warm roles all receive the
+        # same claim-time policy truth.
+        from app.release_qualifier import (  # noqa: PLC0415
+            current_effective_policy_projection,
+        )
+
+        _claim_current_effective_policy = current_effective_policy_projection(
+            project
+        )
 
     _claim_runtime_model = _claimed_context.get("llm_model")
     _claim_runtime_execution_mode = _claimed_context.get("llm_execution_mode")
 
     response_payloads: list = []
-    for entry in _claimed_payloads:
+    for entry_index, entry in enumerate(_claimed_payloads):
         if isinstance(entry, dict):
             patched = dict(entry)
             if isinstance(_claim_runtime_model, str) and _claim_runtime_model.strip():
@@ -1177,6 +1229,18 @@ async def claim_task(
             if _claimed_discovery_cycle_id is not None:
                 patched["discovery_cycle_id"] = str(_claimed_discovery_cycle_id)
                 patched["discovery_mode"] = "bounded_cycle"
+            if entry_index == 0 and _claim_current_effective_policy is not None:
+                patched["current_effective_policy"] = dict(
+                    _claim_current_effective_policy
+                )
+                version_phase = patched.get("version_phase")
+                if isinstance(version_phase, dict):
+                    patched["version_phase"] = {
+                        **version_phase,
+                        "current_effective_policy": dict(
+                            _claim_current_effective_policy
+                        ),
+                    }
             response_payloads.append(patched)
         else:
             response_payloads.append(entry)
@@ -1242,7 +1306,6 @@ async def claim_task(
             ),
         }
 
-    task_type = _claimed_first_payload.get("type", "")
     task_capability = agent_capability_slice(task_type)
     if task_capability is not None:
         response["task_capability"] = task_capability
@@ -2936,10 +2999,13 @@ async def claim_task(
                     response["project_context"] = {}
                 response["project_context"]["direction_quality"] = direction_quality
 
-            # Inject direction context (title, goals, failed approaches) for implementing agents
-            if task_type in ("create", "fix", "refactor"):
+            # Inject direction context (title, goals, failed approaches) for agents
+            # that implement or research the direction. Research adds its own
+            # analytics below, but those should augment this shared context.
+            if task_type in ("create", "fix", "refactor", "research"):
                 failed_approaches: list = []
-                rc_text = direction.get("research_context", "") or ""
+                rc_raw = direction.get("research_context")
+                rc_text = rc_raw if isinstance(rc_raw, str) else ""
                 in_failed_section = False
                 for rc_line in rc_text.splitlines():
                     rc_stripped = rc_line.strip()
@@ -3246,7 +3312,7 @@ async def claim_task(
                     )
 
                 response["direction_context"] = {
-                    "title": direction.get("title", ""),
+                    "title": direction.get("title") or direction.get("text", ""),
                     "priority": direction.get("priority", ""),
                     "failed_approaches": structured_failed_approaches,
                     "recent_outcomes": recent_outcomes,
@@ -3432,19 +3498,33 @@ async def claim_task(
                 )
 
                 prompt_quality_patterns = synthesize_prompt_quality_patterns(history)
-                response["direction_context"] = {
-                    "possibly_saturated": bool(
-                        direction.get("possibly_saturated", False)
-                    ),
-                    "deadlock_detected": bool(deadlocked),
-                    "already_fixed_deadlock_detected": bool(af_deadlocked),
-                    "recent_outcomes": research_recent_outcomes,
-                    "failure_stage_pattern": research_failure_stage_pattern,
-                    "scope_success_rates": research_scope_rates,
-                    "top_first_review_issues": research_top_review_issues,
-                    "success_patterns": success_summary,
-                    "review_effectiveness": research_review_effectiveness,
+                direction_context = response.setdefault("direction_context", {})
+                existing_scope_rates = direction_context.get("scope_success_rates")
+                if not isinstance(existing_scope_rates, dict):
+                    existing_scope_rates = {}
+                merged_scope_rates = {
+                    scope_name: dict(values)
+                    for scope_name, values in existing_scope_rates.items()
+                    if isinstance(values, dict)
                 }
+                for scope_name, values in research_scope_rates.items():
+                    if isinstance(values, dict):
+                        merged_scope_rates.setdefault(scope_name, {}).update(values)
+                direction_context.update(
+                    {
+                        "possibly_saturated": bool(
+                            direction.get("possibly_saturated", False)
+                        ),
+                        "deadlock_detected": bool(deadlocked),
+                        "already_fixed_deadlock_detected": bool(af_deadlocked),
+                        "recent_outcomes": research_recent_outcomes,
+                        "failure_stage_pattern": research_failure_stage_pattern,
+                        "scope_success_rates": merged_scope_rates,
+                        "top_first_review_issues": research_top_review_issues,
+                        "success_patterns": success_summary,
+                        "review_effectiveness": research_review_effectiveness,
+                    }
+                )
                 if co_batch_sibling_count >= 3:
                     response["direction_context"]["co_batch_sibling_count"] = (
                         co_batch_sibling_count
@@ -4124,7 +4204,9 @@ async def claim_task(
             # direction they serve, not just its narrative/contract bodies.
             if narrative or contract:
                 response["direction_context"].setdefault(
-                    "title", _narrative_direction.get("title", "")
+                    "title",
+                    _narrative_direction.get("title")
+                    or _narrative_direction.get("text", ""),
                 )
 
     # Inject build_config so the agent knows how to lint/test/build
@@ -4746,6 +4828,39 @@ def _parse_latest_tool_use_at(tool_trace) -> datetime | None:
         return None
 
 
+def _latest_heartbeat_progress_at(
+    tool_trace,
+    active_tool_progress_at: datetime | None,
+) -> datetime | None:
+    """Return the newest trustworthy progress stamp carried by a heartbeat.
+
+    ``tool_trace`` records top-level tool invocations.  A long-running command
+    can keep producing output after that invocation stamp while task-authored
+    status prose replaces the agent's literal ``Using tool:`` prefix.  The
+    structured ``active_tool_progress_at`` stamp carries that sub-progress so
+    the reaper does not mistake productive verification for an agent stall.
+
+    Future values are ignored instead of poisoning the monotonic off-row clock:
+    both VmContact and TaskContact use ``GREATEST``, so accepting a wildly
+    future producer timestamp would otherwise suppress stall detection until
+    wall-clock time caught up.  Five minutes permits ordinary host clock skew.
+    """
+    trace_at = _parse_latest_tool_use_at(tool_trace)
+    progress_at = active_tool_progress_at
+    if progress_at is not None:
+        if progress_at.tzinfo is not None:
+            progress_at = progress_at.astimezone(timezone.utc).replace(tzinfo=None)
+        if progress_at > _utcnow() + timedelta(minutes=5):
+            logger.warning(
+                "[HEARTBEAT] active_tool_progress_at is implausibly future-dated "
+                "(%s); ignoring it to preserve the monotonic progress clock",
+                progress_at.isoformat(),
+            )
+            progress_at = None
+    candidates = [stamp for stamp in (trace_at, progress_at) if stamp is not None]
+    return max(candidates) if candidates else None
+
+
 async def _record_vm_contact(
     vm_instance_id: str | None,
     last_tool_use_at: datetime | None = None,
@@ -5004,7 +5119,10 @@ async def agent_heartbeat(
     # advanced by ANY agent on that runner and a hung agent beside a working
     # sibling reads as "progressing" forever. ``req.task_id`` is already proven
     # equal to the JWT ``sub`` above, so this key is as trusted as the vm id.
-    _latest_tool_use_at = _parse_latest_tool_use_at(req.tool_trace)
+    _latest_tool_use_at = _latest_heartbeat_progress_at(
+        req.tool_trace,
+        req.active_tool_progress_at,
+    )
     await _record_vm_contact(
         token.get("vm_instance_id"), _latest_tool_use_at, task_id=req.task_id
     )
@@ -5217,6 +5335,26 @@ async def agent_heartbeat(
                 )
         if validated:
             apply_fix_loop_events(task, validated)
+
+    if req.publication_gate_receipt is not None:
+        # Durably record the local publication-gate verdict WITHOUT any state
+        # transition. ./pr open sends this when the bounded ./check gate blocks
+        # publication: that outcome is retryable (the agent fixes the failures
+        # and re-runs ./pr open), so it must NOT take the status endpoint's
+        # BLOCKED_PRECONDITION path, which releases the account slot, retires the
+        # warm-pool member and deletes the VM the agent is still running on.
+        # Overwrite: the latest gate run is the authoritative verdict.
+        from app.task_blocked import (  # noqa: PLC0415
+            PUBLICATION_GATE_RECEIPT_KEY,
+            sanitize_publication_gate_receipt,
+        )
+
+        _receipt = sanitize_publication_gate_receipt(req.publication_gate_receipt)
+        if _receipt is not None:
+            ctx = dict(task.context or {})
+            if ctx.get(PUBLICATION_GATE_RECEIPT_KEY) != _receipt:
+                ctx[PUBLICATION_GATE_RECEIPT_KEY] = _receipt
+                task.context = ctx
 
     # Persist prompt fingerprint on the dedicated column. Mirror to context only
     # when needed for older readers / backfills, so repeated heartbeats stay
@@ -5557,21 +5695,49 @@ async def spawn_subtask(
 
     # Depth guard: prevent unbounded recursive spawning
     MAX_SPAWN_DEPTH = 5
-    spawn_depth = (req.context or {}).get("spawn_depth", 0)
-    if not spawn_depth:
-        # Infer depth from parent chain
-        depth = 0
-        current = parent_task
-        while current.parent_task_id and depth < MAX_SPAWN_DEPTH:
-            current = await session.get(Task, current.parent_task_id)
-            if not current:
-                break
-            depth += 1
-        spawn_depth = depth
+    # Infer depth exclusively from backend-owned ancestry. ``req.context`` is
+    # agent-controlled; a negative spawn_depth is truthy and previously bypassed
+    # the cap forever because ``-1 >= MAX_SPAWN_DEPTH`` is false.
+    spawn_depth = 0
+    current = parent_task
+    persisted_ancestry = [parent_task]
+    seen_ancestor_ids = {parent_task.id}
+    while current.parent_task_id and spawn_depth < MAX_SPAWN_DEPTH:
+        current = (
+            await session.execute(
+                select(Task).where(
+                    Task.id == current.parent_task_id,
+                    Task.project_id == parent_task.project_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if current is None or current.id in seen_ancestor_ids:
+            # Missing/foreign ancestry and cycles are corrupt authority data;
+            # fail closed instead of under-counting an unverifiable chain.
+            spawn_depth = MAX_SPAWN_DEPTH
+            break
+        seen_ancestor_ids.add(current.id)
+        persisted_ancestry.append(current)
+        spawn_depth += 1
     if spawn_depth >= MAX_SPAWN_DEPTH:
         raise HTTPException(
             status_code=400, detail=f"Spawn depth limit ({MAX_SPAWN_DEPTH}) exceeded"
         )
+
+    # Research recursion/provenance is authority too.  Derive it from the same
+    # fully verified, same-project persisted ancestry used above rather than
+    # trusting a context value supplied by the running agent.  Count every
+    # research ancestor (not only a consecutive suffix), so inserting an
+    # implementation task between research generations cannot reset the cap.
+    research_ancestors = [
+        ancestor
+        for ancestor in persisted_ancestry
+        if (ancestor.first_payload or {}).get("type") == "research"
+    ]
+    research_depth = len(research_ancestors)
+    parent_research_task_id = (
+        research_ancestors[0].id if research_ancestors else None
+    )
 
     # Plan-spawned children are created by _handle_plan_completion AFTER branch creation,
     # so they get the correct base_branch. Don't pre-spawn them here.
@@ -5588,7 +5754,11 @@ async def spawn_subtask(
     # we can spot the attack pattern in production.
     raw_context = req.context or {}
     forbidden_present = [
-        k for k in raw_context if k in _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS
+        k
+        for k in raw_context
+        if k in _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS
+        or is_server_owned_sidecar_context_key(k)
+        or is_server_owned_research_context_key(k)
     ]
     if forbidden_present:
         logger.warning(
@@ -5600,6 +5770,8 @@ async def spawn_subtask(
         k: v
         for k, v in raw_context.items()
         if k not in _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS
+        and not is_server_owned_sidecar_context_key(k)
+        and not is_server_owned_research_context_key(k)
     }
 
     new_tasks = []
@@ -5615,6 +5787,26 @@ async def spawn_subtask(
             raise HTTPException(
                 status_code=422, detail=format_payload_validation_error(exc)
             ) from exc
+        if payload.get("type") == "research" and research_depth > MAX_RESEARCH_DEPTH:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Research depth limit ({MAX_RESEARCH_DEPTH}) exceeded"
+                ),
+            )
+        research_lineage_context: dict[str, object] = {}
+        if payload.get("type") == "research" or parent_research_task_id is not None:
+            research_lineage_context["research_depth"] = research_depth
+        if parent_research_task_id is not None:
+            # ``research_task_id`` is downstream attribution while
+            # ``parent_research_task_id`` drives research-recursion state.  Both
+            # name the nearest persisted research ancestor and are server-owned.
+            research_lineage_context.update(
+                {
+                    "research_task_id": str(parent_research_task_id),
+                    "parent_research_task_id": str(parent_research_task_id),
+                }
+            )
         parent_payload = parent_task.first_payload
         parent_context = {
             "parent_task_id": str(parent_task.id),
@@ -5759,6 +5951,7 @@ async def spawn_subtask(
             context={
                 **sanitized_context,
                 "spawn_depth": spawn_depth + 1,
+                **research_lineage_context,
                 "parent_context": parent_context,
                 **(
                     {"review_loop": _spawn_review_loop}

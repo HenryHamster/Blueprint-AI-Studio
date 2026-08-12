@@ -67,56 +67,20 @@ async def _auto_resolve_audit_findings_on_merge(
     resolving_ref: str | None,
     session,
 ) -> None:
-    """Auto-resolve AuditFindingResolution ledger rows for a merged fix task.
+    """Retain the historical seam without granting merge-time evidence.
 
-    Called on a successful PR merge when the (orig) task context carries
-    ``resolving_finding_keys``.  Best-effort: commits its own work and logs
-    failures per key; never re-raises (callers wrap in try/except).  Skips
-    silently when no open version exists for the project.
+    Finding-resolution keys are a claim, not current-tree verification. The
+    explicit audit/operator resolution paths remain responsible for ledger
+    writes; this compatibility helper is intentionally a no-op.
+
+    The machine evidence a merged claim CAN earn is produced elsewhere:
+    ``acceptance_gate.verify_finding_clearance_at_landing`` re-checks each
+    claimed finding against the exact landed commit on every async landing lane
+    (``landed_signal._verify_finding_clearance_before_landing``) and stamps
+    ``finding_clearance_verification``, which
+    ``acceptance_gate.finding_clearance_blocks_success`` reads.
     """
-    if not finding_keys:
-        return
-    from app.release_readiness import apply_finding_resolution
-    from app.release_version import current_open_version
-
-    version = await current_open_version(session, project_id)
-    if version is None:
-        logger.info(
-            "[CI] audit-finding auto-resolve: no open version for project %s — skipping",
-            project_id,
-        )
-        return
-
-    resolved = []
-    for key in finding_keys:
-        if not key or not isinstance(key, str):
-            continue
-        try:
-            await apply_finding_resolution(
-                session,
-                project_id,
-                version.id,
-                key,
-                "resolved",
-                resolving_ref=resolving_ref,
-            )
-            resolved.append(key)
-        except Exception:
-            logger.warning(
-                "[CI] audit-finding auto-resolve: failed for key %r (project %s) — continuing",
-                key,
-                project_id,
-                exc_info=True,
-            )
-    if resolved:
-        await session.commit()
-        logger.info(
-            "[CI] auto-resolved %d audit finding(s) for project %s version %s: %s",
-            len(resolved),
-            project_id,
-            version.id,
-            resolved,
-        )
+    return None
 
 
 async def _refresh_empty_build_config_after_integration_landing(
@@ -862,76 +826,6 @@ async def _attempt_merge_with_retry_and_escalation(
                                 _orig_ctx = dict(orig.context or {})
                                 _orig_ctx["test_coverage_result"] = _tcov
                                 orig.context = _orig_ctx
-                            # Stamp the merged PR's GitHub-verified changed-file list
-                            # onto the original task BEFORE the acceptance verdict is
-                            # recorded (record_code_acceptance_verdict runs inside
-                            # apply_merged_landed_signal, below). This pipeline merges
-                            # PRs programmatically here, so GitHub's
-                            # ``pull_request.closed`` webhook — the only OTHER writer of
-                            # ``_pr_changed_files_github_verified`` — never fires. Without
-                            # this stamp the named_test gate evaluates every declared
-                            # acceptance test against an EMPTY diff, classifies it
-                            # ``named_test_missing_from_diff`` -> ``declared_unsatisfied``,
-                            # and the acceptance window stays permanently 0-proven no
-                            # matter how much real, co-changed test evidence landed. We
-                            # reuse the already-authenticated ``gh_token`` and mirror the
-                            # webhook helper's fail-silent contract: a transient GitHub
-                            # error must never block the merged-landed signal, so the gate
-                            # simply falls back to the agent self-report on failure. Skip
-                            # if an authoritative list is already present (idempotent
-                            # re-processing / a real webhook delivery).
-                            if ci_pr_number and not (orig.context or {}).get(
-                                "_pr_changed_files_github_verified"
-                            ):
-                                try:
-                                    from app.acceptance_gate import (
-                                        stamp_changed_files_signal,
-                                    )
-                                    from app.github import get_pr_files
-
-                                    _raw_files = await get_pr_files(
-                                        gh_token,
-                                        owner,
-                                        repo,
-                                        ci_pr_number,
-                                        str(orig.project_id),
-                                    )
-                                    _file_paths = [
-                                        f["filename"]
-                                        for f in (_raw_files or [])
-                                        if isinstance(f, dict)
-                                        and isinstance(f.get("filename"), str)
-                                    ]
-                                    if _file_paths:
-                                        _gv_ctx = dict(orig.context or {})
-                                        _gv_ctx.update(
-                                            stamp_changed_files_signal(
-                                                _file_paths, github_verified=True
-                                            )
-                                        )
-                                        # Fresh authoritative provenance re-admits the
-                                        # task to the acceptance backfill sweep.
-                                        _gv_ctx.pop("_backfill_checked_at", None)
-                                        _gv_ctx.pop(
-                                            "_backfill_missing_diff_terminal_at", None
-                                        )
-                                        orig.context = _gv_ctx
-                                        logger.info(
-                                            "[CI-MERGE] Stamped %d GitHub-verified "
-                                            "changed files for orig task %s (PR #%s)",
-                                            len(_file_paths),
-                                            orig.id,
-                                            ci_pr_number,
-                                        )
-                                except Exception:
-                                    logger.warning(
-                                        "[CI-MERGE] get_pr_files failed for orig task "
-                                        "%s (PR #%s); acceptance gate falls back to the "
-                                        "agent self-reported diff",
-                                        getattr(orig, "id", "?"),
-                                        ci_pr_number,
-                                        exc_info=True,
-                                    )
                             _orig_landed_on_integration = await corroborate_and_apply_merged_landed_signal(
                                 orig,
                                 orig_project,
@@ -943,6 +837,8 @@ async def _attempt_merge_with_retry_and_escalation(
                                 ),
                                 non_merge_reason="merged_pr_non_integration_branch",
                                 merge_commit_sha=merge_result.get("sha"),
+                                pr_number=ci_pr_number,
+                                github_credentials=(gh_token, owner, repo),
                             )
                             # Membership-based merge-credit propagation across the
                             # nested-rollup + squash boundary. apply_merged_landed_signal
@@ -1061,56 +957,10 @@ async def _attempt_merge_with_retry_and_escalation(
                         # refresh_direction_outcomes_after_merge (direction_outcomes.py)
                         # — no separate call needed here.
 
-                        # Auto-resolve audit findings tagged on the fix task.
-                        # The finding keys live in the ORIG task's context under
-                        # ``resolving_finding_keys``; for direct merges (orig == task)
-                        # the same context applies. Best-effort: isolated try/except
-                        # so a resolution failure never aborts the merge.
-                        _resolving_keys = (orig.context or {}).get(
-                            "resolving_finding_keys"
-                        ) or []
-                        if _resolving_keys and orig.project_id:
-                            try:
-                                await _auto_resolve_audit_findings_on_merge(
-                                    orig.project_id,
-                                    list(_resolving_keys),
-                                    str(ci_pr_number) if ci_pr_number else None,
-                                    _orig_session,
-                                )
-                            except Exception:
-                                logger.warning(
-                                    "[CI] audit-finding auto-resolve failed for "
-                                    "PR #%s (non-fatal)",
-                                    ci_pr_number,
-                                    exc_info=True,
-                                )
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True
                 )
-        # Fallback: auto-resolve finding keys on the parking task itself when
-        # there is no orig task (ci_orig_id absent) — covers rare cases where
-        # the task directly carries resolving_finding_keys without a parent orig.
-        if not ci_orig_id:
-            _direct_keys = (task.context or {}).get("resolving_finding_keys") or []
-            if _direct_keys and task.project_id:
-                try:
-                    from app.database import AsyncSessionLocal
-
-                    async with AsyncSessionLocal() as _direct_resolve_session:
-                        await _auto_resolve_audit_findings_on_merge(
-                            task.project_id,
-                            list(_direct_keys),
-                            str(ci_pr_number) if ci_pr_number else None,
-                            _direct_resolve_session,
-                        )
-                except Exception:
-                    logger.warning(
-                        "[CI] audit-finding auto-resolve (no-orig path) failed for "
-                        "PR #%s (non-fatal)",
-                        ci_pr_number,
-                        exc_info=True,
-                    )
         # Once a bootstrapped repo gains a project structure on its landed
         # integration branch, refresh an empty build_config so verification
         # commands exist without a manual step. Keep this isolated from the

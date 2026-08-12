@@ -8,7 +8,13 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 from app.time_utils import _utcnow
-from app.models import Project, Task, TaskStatus, Alert
+from app.models import (
+    Alert,
+    Project,
+    Task,
+    TaskStatus,
+    get_task_lifetime_attempt_ordinal,
+)
 from app.reaper import reaper_service, _reaper_skip_counts
 from app.broadcast import broadcast_to_project, manager
 from app.branch_cleanup import _run_stale_branch_cleanup
@@ -3200,6 +3206,8 @@ async def test_infra_recovery_resurrects_provision_failure_when_zone_available(
     assert "failure_category" not in ctx
     # Attempt count reset
     assert task.attempt_count == 0
+    assert get_task_lifetime_attempt_ordinal(task) == 5
+    assert task.attempt_history[-1]["attempt_ordinal"] == 4
     assert task.vm_instance_id is not None
     assert task.latest_status_message.startswith("Auto-resurrected")
 

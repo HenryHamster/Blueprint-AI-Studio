@@ -39,6 +39,7 @@ vi.mock('../workspacePrep.js', () => ({
 vi.mock('./strategic-resident.js', () => ({
   CALL_OPERATOR_RECONNECT_GRACE_MS: 30_000,
   handleStrategicResident: vi.fn().mockResolvedValue(undefined),
+  withPrivateWorkdayTurnFence: vi.fn(),
   residentReplyRuntimePaths: vi.fn(),
   partitionTypedFastMessages: vi.fn(),
   selectTypedFastClaimMessages: vi.fn(),

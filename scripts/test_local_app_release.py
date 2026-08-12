@@ -61,7 +61,6 @@ class LocalAppReleaseTests(unittest.TestCase):
                     "RW": False,
                 }
             ],
-            "State": {"Running": True},
         }
 
     @staticmethod
@@ -797,6 +796,7 @@ class LocalAppReleaseTests(unittest.TestCase):
                 ),
             }
             stack.enter_context(patch.object(release, "_is_root", return_value=True))
+            stack.enter_context(patch.object(release, "verify_privilege_boundary"))
             stack.enter_context(
                 patch.dict(os.environ, {"SUDO_USER": "henry_hamster"}, clear=True)
             )
@@ -867,6 +867,9 @@ class LocalAppReleaseTests(unittest.TestCase):
             )
             mocks["database_schema"] = stack.enter_context(
                 patch.object(release, "_database_schema_revision", return_value="0742")
+            )
+            mocks["preflight"] = stack.enter_context(
+                patch.object(release, "_preflight_local_migration_inputs")
             )
             stack.enter_context(patch.object(release, "_verify_services_stable"))
             stack.enter_context(patch.object(release, "_verify_worker_ready"))
@@ -1032,6 +1035,74 @@ class LocalAppReleaseTests(unittest.TestCase):
                 mocks["evidence"].call_args.args[1]["outcome"],
                 "rollback_refused",
             )
+
+    def test_bad_migration_inputs_abort_before_any_downtime(self):
+        """A deterministic input defect (e.g. a malformed worker secrets file)
+        must fail the release BEFORE any Restart=always unit is stopped, so the
+        control plane is never taken down for an error a preflight can catch.
+        This is the v31 outage class: the worker-secret validation ran only
+        inside the post-stop migration, so a rejected value stopped the control
+        plane and then aborted with nothing to restart across the migration."""
+        with self._release_patches() as mocks:
+            mocks["image_schema"].return_value = "0743"
+            mocks["database_schema"].return_value = "0742"
+            mocks["preflight"].side_effect = ValueError(
+                "worker secrets must be non-empty string keys mapping to string "
+                "values without embedded NUL bytes"
+            )
+            with (
+                patch.object(release, "_stop_unit_container") as stop,
+                patch.object(release, "_run_local_migration") as migrate,
+                self.assertRaisesRegex(Exception, "worker secrets"),
+            ):
+                release.release(IMAGE_REF, REVISION)
+        mocks["preflight"].assert_called_once_with(IMAGE_REF)
+        # Zero downtime, zero mutation: the preflight fired before the choreography.
+        stop.assert_not_called()
+        migrate.assert_not_called()
+        mocks["atomic"].assert_not_called()
+        mocks["restart"].assert_not_called()
+
+    def test_pre_stop_rehearsal_reports_checked_and_deferred_preconditions(self):
+        with (
+            patch.object(release, "verify_privilege_boundary") as boundary,
+            patch.object(release, "_preflight_local_migration_inputs") as inputs,
+            patch.object(release, "_target_schema_refusal", return_value=None),
+        ):
+            report = release._run_pre_stop_rehearsal(
+                NEW_IMAGE,
+                IMAGE_REF,
+                REVISION,
+                "henry_hamster",
+                "0743",
+                "0742",
+            )
+
+        boundary.assert_called_once_with(
+            "henry_hamster",
+            agent_unit="blueprint-deploy-agent.service",
+            release_unit="blueprint-release.service",
+            run=release._run,
+        )
+        inputs.assert_called_once_with(IMAGE_REF)
+        self.assertFalse(report.units_stopped)
+        self.assertIn("worker secret", report.checked[1])
+        self.assertIn("migration apply", report.deferred[0])
+        self.assertEqual(report.as_dict()["units_stopped"], False)
+
+    def test_standalone_rehearsal_refuses_before_candidate_io(self):
+        with (
+            patch.object(release, "_pull_candidate_for_rehearsal") as pull,
+            patch.object(
+                release,
+                "_run_pre_stop_rehearsal",
+            ) as rehearsal,
+            self.assertRaisesRegex(RuntimeError, "host rehearsal disabled"),
+        ):
+            release.rehearse(IMAGE_REF, REVISION)
+
+        pull.assert_not_called()
+        rehearsal.assert_not_called()
 
     def test_worker_activation_failure_rolls_back_only_touched_worker(self):
         def restart(unit: str, image: str, **_kwargs) -> None:

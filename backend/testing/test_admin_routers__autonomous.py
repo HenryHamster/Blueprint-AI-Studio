@@ -688,6 +688,144 @@ class TestAutonomyDebug:
         assert data["global_rate_limit"]["global_headroom"] == 0
 
     @pytest.mark.asyncio
+    async def test_autonomy_debug_reports_total_research_cap_guard(
+        self, client: AsyncClient, db_session
+    ):
+        """The debug endpoint reports the total-research cap
+        (`_spawn_research_task_inner`'s second cap) as its own blocking guard —
+        previously this cap was enforced but entirely absent from the debug view,
+        so an operator staring at "why isn't research spawning" could not see it.
+
+        The debug view must count exactly the statuses enforcement counts. With
+        the headroom relaxation on (the default) AND the fleet above the
+        min-free-slots floor, EVALUATING parents are excluded from the total;
+        with the operator escape hatch set to false they are included. Both are
+        asserted here so the debug view cannot drift from the spawn path.
+        """
+        from app.shared_state import runtime_config
+
+        project = await _make_project(db_session, name="AutonomyDebug TotalCap")
+        # `max_total_research` (not `..._per_project`) is the build_config
+        # override key `project_parallelism_cap` reads — `..._per_project` is
+        # only the global runtime_config fallback key.
+        project.build_config = {"max_total_research": 2}
+        await db_session.commit()
+
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "research", "current_direction_id": "d1"}],
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+                created_at=_utcnow() - timedelta(minutes=5),
+            )
+        )
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "research", "current_direction_id": "d2"}],
+                status=TaskStatus.EVALUATING,
+                created_by="ORCHESTRATOR",
+                created_at=_utcnow() - timedelta(minutes=3),
+            )
+        )
+        await db_session.commit()
+
+        async def _guards():
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/autonomy-debug"
+            )
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            return {g["guard"]: g for g in data["blocking_guards"]}
+
+        original = runtime_config.get("research_headroom_ignores_evaluating", True)
+
+        # Escape hatch OFF (relaxation disabled) → EVALUATING counts, so
+        # QUEUED + EVALUATING = 2 reaches the cap and the guard fires. This is
+        # the branch enforcement takes when the fleet is below the floor too.
+        runtime_config["research_headroom_ignores_evaluating"] = False
+        try:
+            guards = await _guards()
+            assert "total_research_active" in guards, (
+                "Expected total_research_active guard when QUEUED+EVALUATING "
+                "research (2) reaches max_total_research (2) with the "
+                f"relaxation disabled; got guards: {list(guards)}"
+            )
+            assert guards["total_research_active"]["total_research_count"] == 2
+            assert guards["total_research_active"]["max_total_research"] == 2
+            assert "including EVALUATING" in guards["total_research_active"]["reason"]
+            # The parallel-research cap (default 6) must NOT also fire — only one
+            # of the two tasks (QUEUED) counts against it, well under the cap —
+            # so the new guard exercises a genuinely distinct enforcement path.
+            assert "research_task_active" not in guards
+
+            # Relaxation ON (the default) with the fleet above the floor →
+            # EVALUATING is excluded, so only the QUEUED task counts (1 < 2) and
+            # the guard must NOT fire. Mirrors `_spawn_research_task_inner`,
+            # which would admit here.
+            runtime_config["research_headroom_ignores_evaluating"] = True
+            guards = await _guards()
+            assert "vm_slots_full" not in guards, (
+                "precondition: this assertion only holds while the fleet is "
+                f"above the min-free-slots floor; got guards: {list(guards)}"
+            )
+            assert "total_research_active" not in guards, (
+                "With the relaxation on and headroom above the floor the "
+                "EVALUATING parent must not count, leaving 1 < 2; got: "
+                f"{guards.get('total_research_active')}"
+            )
+
+            # ...and the guard is still reported under the default once the
+            # statuses enforcement DOES count reach the cap.
+            db_session.add(
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "research", "current_direction_id": "d3"}],
+                    status=TaskStatus.QUEUED,
+                    created_by="ORCHESTRATOR",
+                    created_at=_utcnow() - timedelta(minutes=1),
+                )
+            )
+            await db_session.commit()
+            guards = await _guards()
+            assert "total_research_active" in guards, (
+                "Expected total_research_active guard when two QUEUED research "
+                f"tasks reach max_total_research (2); got guards: {list(guards)}"
+            )
+            assert guards["total_research_active"]["total_research_count"] == 2
+            assert "excluding EVALUATING" in guards["total_research_active"]["reason"]
+        finally:
+            runtime_config["research_headroom_ignores_evaluating"] = original
+
+    @pytest.mark.asyncio
+    async def test_autonomy_debug_max_per_hour_default_matches_enforcement(
+        self, client: AsyncClient, db_session
+    ):
+        """The debug endpoint's default `max_per_hour` (no override, no runtime
+        override) must match the spawn path's default of 12, not a stale 5 —
+        otherwise the debug view can report a rate-limit block enforcement
+        would not actually apply (or vice versa)."""
+        from app.shared_state import runtime_config
+
+        project = await _make_project(db_session, name="AutonomyDebug PerHourDefault")
+        await db_session.commit()
+
+        original = runtime_config.get("max_autonomous_tasks_per_hour")
+        runtime_config.pop("max_autonomous_tasks_per_hour", None)
+        try:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/autonomy-debug"
+            )
+        finally:
+            if original is not None:
+                runtime_config["max_autonomous_tasks_per_hour"] = original
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["rate_limit"]["max_per_hour"] == 12
+
+    @pytest.mark.asyncio
     async def test_autonomy_debug_reports_total_research_guard(
         self, client: AsyncClient, db_session
     ):
@@ -695,7 +833,14 @@ class TestAutonomyDebug:
         it fires once total non-terminal research reaches max_total_research, but
         excludes EVALUATING parents that still have active (non-terminal)
         children — those are productive in-flight work, not stuck backlog.
+
+        The EVALUATING-counting path only applies when the headroom relaxation
+        is not in effect (that relaxation excludes EVALUATING entirely — see
+        test_autonomy_debug_reports_total_research_cap_guard), so the escape
+        hatch is pinned off here to exercise the productive-children exclusion.
         """
+        from app.shared_state import runtime_config
+
         project = await _make_project(db_session, name="AutonomyDebug Total Research")
         project.build_config = {"max_total_research": 1}
         await db_session.commit()
@@ -711,39 +856,49 @@ class TestAutonomyDebug:
         db_session.add(stuck_parent)
         await db_session.commit()
 
-        resp = await client.get(f"/api/admin/projects/{project.id}/autonomy-debug")
-        assert resp.status_code == 200, resp.text
-        data = resp.json()
-        guards = {guard["guard"]: guard for guard in data["blocking_guards"]}
-        assert "total_research_active" in guards, (
-            "Expected total_research_active guard with a stuck EVALUATING parent "
-            f"and max_total_research=1. Got guards: {list(guards)}"
-        )
-        assert guards["total_research_active"]["total_research_count"] == 1
-        assert guards["total_research_active"]["max_total_research"] == 1
-
-        # Now give the EVALUATING parent an active (non-terminal) child — it
-        # becomes productive in-flight work and must be excluded from the count,
-        # dropping total_research_count back to 0 and clearing the guard.
-        db_session.add(
-            Task(
-                project_id=project.id,
-                parent_task_id=stuck_parent.id,
-                payloads=[{"type": "create"}],
-                status=TaskStatus.IN_PROGRESS,
-                created_by="ORCHESTRATOR",
+        original = runtime_config.get("research_headroom_ignores_evaluating", True)
+        runtime_config["research_headroom_ignores_evaluating"] = False
+        try:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/autonomy-debug"
             )
-        )
-        await db_session.commit()
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            guards = {guard["guard"]: guard for guard in data["blocking_guards"]}
+            assert "total_research_active" in guards, (
+                "Expected total_research_active guard with a stuck EVALUATING parent "
+                f"and max_total_research=1. Got guards: {list(guards)}"
+            )
+            assert guards["total_research_active"]["total_research_count"] == 1
+            assert guards["total_research_active"]["max_total_research"] == 1
 
-        resp = await client.get(f"/api/admin/projects/{project.id}/autonomy-debug")
-        assert resp.status_code == 200, resp.text
-        data = resp.json()
-        guards = {guard["guard"]: guard for guard in data["blocking_guards"]}
-        assert "total_research_active" not in guards, (
-            "EVALUATING parent with an active child is productive in-flight work "
-            f"and must not count against max_total_research. Got guards: {list(guards)}"
-        )
+            # Now give the EVALUATING parent an active (non-terminal) child — it
+            # becomes productive in-flight work and must be excluded from the
+            # count, dropping total_research_count back to 0 and clearing the
+            # guard.
+            db_session.add(
+                Task(
+                    project_id=project.id,
+                    parent_task_id=stuck_parent.id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.IN_PROGRESS,
+                    created_by="ORCHESTRATOR",
+                )
+            )
+            await db_session.commit()
+
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/autonomy-debug"
+            )
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            guards = {guard["guard"]: guard for guard in data["blocking_guards"]}
+            assert "total_research_active" not in guards, (
+                "EVALUATING parent with an active child is productive in-flight "
+                f"work and must not count against max_total_research. Got guards: {list(guards)}"
+            )
+        finally:
+            runtime_config["research_headroom_ignores_evaluating"] = original
 
         # And the endpoint's max_per_hour default must match enforcement's 12,
         # not the stale 5 the debug endpoint previously reported.

@@ -7,7 +7,9 @@ existing imports keep working.
 import asyncio
 import re
 import time
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 from fastapi import HTTPException, status
 
@@ -20,6 +22,47 @@ from app.github import logger
 # --postgres``). The ``\S+::\S+`` shape isolates a real selector from captured
 # log noise such as ``[STRATEGIC] ... FAILED (failure #1)`` (no ``::``).
 _PYTEST_FAILED_SELECTOR_RE = re.compile(r"FAILED\s+(\S+::\S+)")
+
+# GitHub returns both primary and secondary rate limits as HTTP 403 for some
+# endpoints.  A permission failure is also a 403, so status alone is not
+# enough to decide whether a workflow dispatch can be retried.
+_GITHUB_RATE_LIMIT_BODY_MARKERS = (
+    "rate limit",
+    "too many requests",
+    "abuse detection mechanism",
+)
+
+
+def _dispatch_response_is_rate_limited(response) -> bool:
+    """Return whether a 403 carries GitHub's rate-limit evidence.
+
+    The dispatch POST deliberately makes one transport attempt.  This helper
+    only classifies the returned response; it must not turn a transient 403
+    into a second POST or treat an ordinary permission 403 as retryable.
+    """
+    if response.status_code != 403:
+        return False
+
+    headers = getattr(response, "headers", {}) or {}
+    remaining = headers.get("X-RateLimit-Remaining")
+    if remaining is not None and str(remaining).strip() == "0":
+        return True
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None and str(retry_after).strip():
+        return True
+
+    message = ""
+    try:
+        body = response.json()
+    except (ValueError, TypeError, AttributeError):
+        body = None
+    if isinstance(body, Mapping):
+        message = str(body.get("message") or "")
+    if not message:
+        text = getattr(response, "text", "")
+        message = text if isinstance(text, str) else ""
+    message = message.casefold()
+    return any(marker in message for marker in _GITHUB_RATE_LIMIT_BODY_MARKERS)
 
 
 def _extract_pytest_selectors(raw_log: str, cap: int = 50) -> list[str]:
@@ -637,15 +680,47 @@ async def dispatch_workflow_run(
     workflow_file: str,
     ref: str,
     project_id: str | None = None,
+    inputs: Mapping[str, str] | None = None,
 ) -> bool:
     """Trigger a ``workflow_dispatch`` run of ``workflow_file`` on ``ref``.
 
     POSTs to ``/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches``
-    with body ``{"ref": ref}``.  Returns True on GitHub's documented 204 success,
+    with body ``{"ref": ref, "inputs": inputs}`` when inputs are supplied,
+    otherwise the legacy ``{"ref": ref}`` body. Returns True on GitHub's documented 204 success,
     False (with a warning log) on any other status or on any transport error.
     Never raises — graceful degradation, mirroring the sibling read-only helpers
     (:func:`get_workflow_run_for_sha`, :func:`rerun_failed_jobs`).  The workflow
     file must expose a ``workflow_dispatch:`` trigger for this to succeed.
+    """
+    outcome = await dispatch_workflow_run_outcome(
+        token,
+        owner,
+        repo,
+        workflow_file,
+        ref,
+        project_id=project_id,
+        inputs=inputs,
+    )
+    return outcome == "accepted"
+
+
+async def dispatch_workflow_run_outcome(
+    token: str,
+    owner: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    project_id: str | None = None,
+    inputs: Mapping[str, str] | None = None,
+) -> str:
+    """Return accepted, rejected, permanent-404, or ambiguous for a workflow dispatch POST.
+
+    GitHub's endpoint returns no run id or idempotency token. Transport errors,
+    rate limits, and server errors are therefore retryable/ambiguous: the
+    server may have enqueued the run before the response was lost, or the
+    request may be accepted after the rate-limit window clears. Callers must
+    reconcile a workflow-visible correlation id before retrying an ambiguous
+    outcome.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -658,9 +733,14 @@ async def dispatch_workflow_run(
             f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/"
             f"{workflow_file}/dispatches",
             headers,
-            json={"ref": ref},
+            json=(
+                {"ref": ref, "inputs": dict(inputs)}
+                if inputs is not None
+                else {"ref": ref}
+            ),
             project_id=project_id,
             timeout=10.0,
+            max_retries=1,
         )
     except Exception:  # noqa: BLE001
         logger.exception(
@@ -670,9 +750,9 @@ async def dispatch_workflow_run(
             workflow_file,
             ref,
         )
-        return False
+        return "ambiguous"
     if response.status_code == 204:
-        return True
+        return "accepted"
     logger.warning(
         "[GITHUB] dispatch_workflow_run: %s/%s workflow=%s ref=%s returned %s: %s",
         owner,
@@ -682,7 +762,94 @@ async def dispatch_workflow_run(
         response.status_code,
         response.text[:200],
     )
-    return False
+    if response.status_code == 404:
+        return "rejected_permanent_404"
+    if _dispatch_response_is_rate_limited(response):
+        return "ambiguous"
+    if 400 <= response.status_code < 500 and response.status_code not in {
+        408,
+        409,
+        425,
+        429,
+    }:
+        return "rejected"
+    return "ambiguous"
+
+
+async def get_workflow_run_for_dispatch_request(
+    token: str,
+    owner: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    request_id: str,
+    candidate_sha: str,
+    *,
+    project_id: str | None = None,
+    max_pages: int = 5,
+) -> dict:
+    """Reconcile a dispatch by the request id embedded in its trusted run title."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    expected_title = f"Prepromotion rehearsal {request_id} {candidate_sha}"
+    bounded_pages = max(1, min(int(max_pages), 10))
+    for page in range(1, bounded_pages + 1):
+        query = urlencode(
+            {
+                "branch": ref,
+                "event": "workflow_dispatch",
+                "per_page": 100,
+                "page": page,
+            }
+        )
+        try:
+            response = await _github_request(
+                "GET",
+                f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/"
+                f"{workflow_file}/runs?{query}",
+                headers,
+                project_id=project_id,
+                timeout=10.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"state": "unavailable", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+        if response.status_code != 200:
+            return {
+                "state": "unavailable",
+                "detail": f"github returned {response.status_code}",
+            }
+        try:
+            runs = response.json().get("workflow_runs", [])
+        except (ValueError, TypeError, AttributeError):
+            return {"state": "unavailable", "detail": "malformed workflow-runs response"}
+        if not isinstance(runs, list):
+            return {"state": "unavailable", "detail": "malformed workflow-runs response"}
+        for run in runs:
+            if not isinstance(run, dict) or run.get("display_title") != expected_title:
+                continue
+            run_id = run.get("id")
+            if isinstance(run_id, bool) or not isinstance(run_id, int):
+                return {"state": "unavailable", "detail": "matched run has invalid id"}
+            return {
+                "state": "found",
+                "run_id": run_id,
+                "status": run.get("status"),
+                "conclusion": run.get("conclusion"),
+                "html_url": run.get("html_url", ""),
+                "head_sha": run.get("head_sha"),
+                "head_branch": run.get("head_branch"),
+                "event": run.get("event"),
+                "path": run.get("path"),
+                "run_attempt": run.get("run_attempt"),
+                "created_at": run.get("created_at"),
+                "updated_at": run.get("updated_at"),
+            }
+        if len(runs) < 100:
+            return {"state": "not_found"}
+    return {"state": "not_found"}
 
 
 async def get_workflow_run_for_sha(

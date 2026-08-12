@@ -16,6 +16,7 @@ _SAMPLE_CAPS = {
         "models.py": 500,
         "rollup_management.py": 5550,
         "routers/admin_agent_ops.py": 4600,
+        "release_qualifier.py": 10500,
     },
     "agent": {
         "handlers/strategic.ts": 1200,
@@ -23,6 +24,7 @@ _SAMPLE_CAPS = {
     "frontend": {
         "components/FleetRunnersPanel.tsx": 2000,
     },
+    "testing": {"deleted_test.py": 500},
 }
 
 _CAPS_JSON = json.dumps(_SAMPLE_CAPS, indent=2) + "\n"
@@ -108,6 +110,92 @@ async def test_preflight_breach_auto_bumps_and_returns_bumped():
     assert _CAPS_JSON_PATH in call_kwargs.kwargs["upserts"]
     updated = json.loads(call_kwargs.kwargs["upserts"][_CAPS_JSON_PATH])
     assert updated["backend"]["models.py"] > 500
+
+
+@pytest.mark.asyncio
+async def test_preflight_governed_breach_updates_json_source_and_ledger_together():
+    """A governed repair commits all three artifacts at the pinned SHA.
+
+    The repaired cap clamps to the module's declared governance constant rather
+    than taking generic headroom, and the constant is committed unchanged: a
+    governed module is never granted a larger ceiling by the self-heal.
+    """
+    qualifier_content = "line\n" * 10400
+    qualifier_source = "_MODULE_SIZE_GOVERNANCE_CAP: int = 10649\n"
+    caps = json.loads(_CAPS_JSON)
+    caps["backend"]["release_qualifier.py"] = 10300
+    caps_json = json.dumps(caps, indent=2) + "\n"
+
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
+    ):
+        mock_pr_files.return_value = _pr_files("backend/app/release_qualifier.py")
+        mock_fetch.side_effect = [
+            caps_json,
+            qualifier_content,
+            qualifier_source,
+            _LEDGER_JSON,
+        ]
+
+        verdict, reason = await preflight_rollup_size_caps(
+            "tok", "owner", "repo", 42, "staging/branch-1"
+        )
+
+    assert verdict == "bumped"
+    assert "10300 -> 10649" in reason
+    upserts = mock_commit.call_args.kwargs["upserts"]
+    repaired_caps = json.loads(upserts[_CAPS_JSON_PATH])
+    assert repaired_caps["backend"]["release_qualifier.py"] == 10649
+    assert "_MODULE_SIZE_GOVERNANCE_CAP: int = 10649" in upserts[
+        "backend/app/release_qualifier.py"
+    ]
+    repaired_ledger = json.loads(upserts["backend/testing/cap_bump_history.json"])
+    record = repaired_ledger["history"]["backend"]["release_qualifier.py"][-1]
+    assert (record["old_cap"], record["new_cap"]) == (10300, 10649)
+
+
+@pytest.mark.asyncio
+async def test_preflight_prunes_deleted_testing_cap_and_ledger_history():
+    """Deleted capped testing files are repaired through the preflight commit."""
+    ledger = {
+        "schema_version": 1,
+        "history": {
+            "testing": {
+                "deleted_test.py": [
+                    {
+                        "commit_sha": "unattributed",
+                        "commit_date": "2026-01-01T00:00:00+00:00",
+                        "old_cap": 400,
+                        "new_cap": 500,
+                    }
+                ]
+            }
+        },
+    }
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+    ):
+        mock_pr_files.return_value = [
+            {"filename": "backend/testing/deleted_test.py", "status": "removed"}
+        ]
+        mock_fetch.side_effect = [_CAPS_JSON, json.dumps(ledger)]
+
+        verdict, reason = await preflight_rollup_size_caps(
+            "tok", "owner", "repo", 42, "staging/branch-1"
+        )
+
+    assert verdict == "bumped"
+    assert "remove testing/deleted_test.py" in reason
+    upserts = mock_commit.call_args.kwargs["upserts"]
+    repaired_caps = json.loads(upserts[_CAPS_JSON_PATH])
+    assert "deleted_test.py" not in repaired_caps["testing"]
+    repaired_ledger = json.loads(upserts["backend/testing/cap_bump_history.json"])
+    assert "deleted_test.py" not in repaired_ledger["history"].get("testing", {})
 
 
 @pytest.mark.asyncio
@@ -397,8 +485,8 @@ async def test_preflight_per_file_fetch_returns_none_defers():
 
 
 @pytest.mark.asyncio
-async def test_preflight_removed_file_skipped_returns_ok():
-    """A capped file with status 'removed' is intentionally skipped — no defer or breach."""
+async def test_preflight_removed_file_prunes_cap_and_returns_bumped():
+    """A deleted capped file is committed out of the static guard artifacts."""
     with (
         patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
         patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
@@ -406,17 +494,21 @@ async def test_preflight_removed_file_skipped_returns_ok():
     ):
         # models.py is capped but marked removed in the PR.
         mock_pr_files.return_value = [{"filename": "backend/app/models.py", "status": "removed"}]
-        mock_fetch.return_value = _CAPS_JSON  # only caps JSON is fetched
+        mock_fetch.side_effect = [_CAPS_JSON, _LEDGER_JSON]
 
         verdict, reason = await preflight_rollup_size_caps(
             "tok", "owner", "repo", 42, "staging/branch-1"
         )
 
-    assert verdict == "ok"
-    assert reason is None
-    mock_commit.assert_not_called()
-    # Only the caps JSON was fetched — per-file content was never requested.
-    assert mock_fetch.await_count == 1
+    assert verdict == "bumped"
+    assert "remove backend/models.py" in reason
+    repaired = json.loads(mock_commit.call_args.kwargs["upserts"][_CAPS_JSON_PATH])
+    assert "models.py" not in repaired["backend"]
+    # The ledger joins the same commit, but deleted source content is never fetched.
+    assert mock_fetch.await_count == 2
+    assert all(
+        call.args[0] != "backend/app/models.py" for call in mock_fetch.await_args_list
+    )
 
 
 def _chronic_history() -> list[BumpRecord]:
@@ -701,4 +793,3 @@ async def test_preflight_idempotent_commit_result_does_not_rearm_bump(
 
     mock_commit.assert_awaited_once()
     mock_commit.assert_awaited_once()
-

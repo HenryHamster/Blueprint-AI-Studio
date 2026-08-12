@@ -16,6 +16,7 @@ tunable caps) remain importable and test-patchable at their original paths, and
 
 from __future__ import annotations
 
+
 import logging
 from datetime import datetime
 
@@ -26,72 +27,9 @@ from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert, AlertSeverity, Project
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1010
 
 logger = logging.getLogger(__name__)
-
-# Cooldown between full-suite CI preflight dispatches for the SAME integration
-# HEAD.  The promotion_failed re-driver runs every sweep; without this bound a red
-# candidate whose HEAD is unchanged would re-dispatch ci.yml on every cycle. A
-# fresh run is still dispatched immediately whenever HEAD advances past the marker.
-_PROMOTION_CI_PREFLIGHT_COOLDOWN_SECONDS = 30 * 60
-
-
-def _should_dispatch_ci_preflight(
-    marker: dict | None,
-    head_sha: str | None,
-    now: datetime,
-) -> bool:
-    """Decide whether to dispatch a fresh CI preflight run (pure; no I/O).
-
-    Dispatch when there is no prior marker, when the integration HEAD advanced
-    past the marker's recorded sha, or when the cooldown has elapsed since the
-    last dispatch.  An unparseable / missing timestamp errs toward dispatching
-    (the safe direction — a missing green signal keeps re-qualification deferred).
-    """
-    if not isinstance(marker, dict):
-        return True
-    if marker.get("sha") != head_sha:
-        return True
-    dispatched_at = marker.get("dispatched_at")
-    if not dispatched_at:
-        return True
-    try:
-        prev = datetime.fromisoformat(dispatched_at)
-    except (ValueError, TypeError):
-        return True
-    return (now - prev).total_seconds() >= _PROMOTION_CI_PREFLIGHT_COOLDOWN_SECONDS
-
-
-async def _maybe_dispatch_ci_preflight(session, version, head_sha: str | None) -> None:
-    """Dispatch a fresh full-suite ci.yml run for the integration HEAD, if due.
-
-    Bounded by the per-SHA marker + cooldown in
-    ``last_qualification.promotion_ci_preflight`` so frequent sweeps cannot storm
-    ``workflow_dispatch``.  Persists (but does NOT commit — the caller owns the
-    commit) an updated marker whenever a dispatch is attempted.  Best-effort: a
-    dispatch failure only means the next sweep re-tries.
-    """
-    from app.release_readiness import compute_promotion_ci_green_gate
-
-    qual = version.last_qualification if isinstance(version.last_qualification, dict) else {}
-    marker = qual.get("promotion_ci_preflight") or {}
-    now = _utcnow()
-    if not _should_dispatch_ci_preflight(marker, head_sha, now):
-        return
-    gate = await compute_promotion_ci_green_gate(
-        session, version.project_id, dispatch=True
-    )
-    version.last_qualification = {
-        **qual,
-        "promotion_ci_preflight": {
-            "sha": head_sha,
-            "run_id": gate.get("run_id"),
-            "dispatched_at": now.isoformat(),
-        },
-    }
-    flag_modified(version, "last_qualification")
-    session.add(version)
-
 
 # Maximum number of sweep-driven re-entries for a ``status=error`` version.
 # A single transient GitHub outage (sha_error, no_credentials) or a walkthrough

@@ -54,8 +54,12 @@ from app.models import (
     TaskWakeRegistration,
     DeploymentState,
     DeploymentStatus,
+    TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY,
+    TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY,
     _utcnow,
+    get_task_lifetime_attempt_ordinal,
     get_task_total_vm_cost_usd_or_none,
+    task_lifetime_attempt_ordinal,
 )
 from app.auth import get_current_user
 from app.task_locking import task_lock
@@ -117,6 +121,9 @@ from app.admin_task_mutations import (
     _mark_admin_cancelled,
     modify_task_apply,
 )
+from app.admin_task_contracts import CreateTaskPayload
+from app.direct_research_spawn import enrich_direct_research_payload
+from app.discovery_admission import direction_authority_snapshot
 from app.task_blocked import reset_task_for_fresh_attempt
 from app.llm_cost_attribution import _task_llm_cost as _calc_task_llm_cost
 from app.routers.admin_operator_triggers import (  # noqa: F401
@@ -427,7 +434,7 @@ async def get_all_tasks(
     query = (
         select(Task)
         .options(load_only(*_TASK_LIST_COLS, raiseload=True))
-        .order_by(Task.created_at.desc())
+        .order_by(Task.created_at.desc(), Task.id.desc())
         .offset(offset)
         .limit(limit)
     )
@@ -439,6 +446,35 @@ async def get_all_tasks(
 
     # Join artifacts to include all artifacts per task
     task_ids = [t.id for t in tasks]
+
+    # ``attempt_count`` is a retry-budget counter and can be reset for a fresh
+    # operator retry epoch.  Project the durable banked-history length in one
+    # bounded query for only this page; do not load the attempt-history JSONB
+    # blob into every list-row Task object.
+    attempt_history_count_map: Dict[str, int | None] = {}
+    if task_ids:
+        if resolve_dialect_name(session) == "sqlite":
+            attempt_history_count_expr = case(
+                (
+                    func.json_type(Task.attempt_history_db) == "array",
+                    func.json_array_length(Task.attempt_history_db),
+                ),
+                else_=None,
+            )
+        else:
+            attempt_history_count_expr = case(
+                (
+                    func.jsonb_typeof(Task.attempt_history_db) == "array",
+                    func.jsonb_array_length(Task.attempt_history_db),
+                ),
+                else_=None,
+            )
+        attempt_history_count_stmt = select(
+            Task.id,
+            attempt_history_count_expr.label("banked_attempt_count"),
+        ).where(Task.id.in_(task_ids))
+        for _row in (await session.execute(attempt_history_count_stmt)).all():
+            attempt_history_count_map[str(_row.id)] = _row.banked_attempt_count
 
     # Fetch slim payload display fields (type, pr_number, spend_cap_usd) without
     # loading the full payloads blob (which carries large agent prompt text and
@@ -611,6 +647,26 @@ async def get_all_tasks(
     result_list = []
     for t in tasks:
         _slim_payload = slim_payload_map.get(str(t.id), {})
+        _banked_attempt_count = attempt_history_count_map.get(str(t.id))
+        if _banked_attempt_count is None:
+            # Rollout compatibility for rows whose history still lives in the
+            # legacy context key rather than the dedicated JSONB column.
+            _legacy_attempt_history = (t.context or {}).get("attempt_history")
+            _banked_attempt_count = (
+                len(_legacy_attempt_history)
+                if isinstance(_legacy_attempt_history, list)
+                else 0
+            )
+        _attempt_number = task_lifetime_attempt_ordinal(
+            t.attempt_count,
+            _banked_attempt_count,
+            current_attempt_ordinal=(t.context or {}).get(
+                TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY
+            ),
+            last_banked_attempt_ordinal=(t.context or {}).get(
+                TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY
+            ),
+        )
         # Stash slim payload so task.first_payload returns it without accessing
         # the deferred Task.payloads column (which is not in _TASK_LIST_COLS).
         object.__setattr__(t, "_projected_first_payload", _slim_payload)
@@ -641,6 +697,7 @@ async def get_all_tasks(
             if t.last_tool_use_at
             else None,
             "attempt_count": t.attempt_count,
+            "attempt_number": _attempt_number,
             # Durable BLOCKED-state metadata (alembic 0137). Nullable for any
             # non-BLOCKED or pre-migration task; the admin UI guards on presence.
             "blocker_kind": t.blocker_kind,
@@ -1021,10 +1078,14 @@ async def _bulk_retry_one_task(
     delete after commit, or ``None`` for parent-type tasks (which clone
     children rather than spinning a VM here).
     """
+    from contextlib import AsyncExitStack
+
     from sqlalchemy.ext.asyncio import async_sessionmaker
+
     from app.review_execution_ownership import has_pending_pr_continuation
     from app.routers.agent import _terminated_task_ids
     from app.task_lifecycle import _requeue_parent_task
+    from app.task_locking import lock_project_then_task
 
     scoped_factory = async_sessionmaker(
         resolve_async_engine(request_session),
@@ -1033,9 +1094,16 @@ async def _bulk_retry_one_task(
     )
     async with scoped_factory() as scoped_session:
         admitted_fix_target: dict | None = None
+        admitted_review_target: dict | None = None
         preloaded_task = await scoped_session.get(Task, task_id)
         preloaded_payload = (
             _task_payload_dict(preloaded_task) if preloaded_task is not None else {}
+        )
+        preloaded_task_type = str(preloaded_payload.get("type") or "").lower()
+        preloaded_uses_pr_task_order = preloaded_task_type in {"review", "fix"}
+        prelocked_requeue_ancestors: list[Task] | None = None
+        prelocked_requeue_parent_id = (
+            preloaded_task.parent_task_id if preloaded_task is not None else None
         )
         if preloaded_task is not None and has_pending_pr_continuation(preloaded_task):
             task_type = str(preloaded_payload.get("type") or "review/fix")
@@ -1047,84 +1115,91 @@ async def _bulk_retry_one_task(
                     "task first"
                 ),
             )
-        if preloaded_task is not None and preloaded_payload.get("type") == "fix":
-            from app.fix_admission import prepare_direct_fix_admission
-            from app.github import get_pull_request
-            from app.routers.agent import get_github_token_for_task
+        if preloaded_task is not None and preloaded_uses_pr_task_order:
+            from app.admin_retry_admission import prepare_bulk_pr_retry_boundary
 
-            pr_number = preloaded_payload.get("pr_number")
-            if pr_number is None:
-                raise HTTPException(status_code=409, detail="Cannot retry fix without PR")
-            gh_token, owner, repo = await get_github_token_for_task(
-                preloaded_task.id, scoped_session
-            )
+            (
+                admitted_fix_target,
+                admitted_review_target,
+                prelocked_requeue_ancestors,
+                prelocked_requeue_parent_id,
+            ) = await prepare_bulk_pr_retry_boundary(scoped_session, preloaded_task)
 
-            async def _fetch_bulk_retry_pr() -> dict:
-                return await get_pull_request(
-                    gh_token,
-                    owner,
-                    repo,
-                    int(pr_number),
-                    project_id=str(preloaded_task.project_id),
+        # Non-PR retry decisions use the same canonical Project -> Task pair as
+        # the manual endpoint. Research/plan depends on child topology, and any
+        # terminal descendant retry may need to invalidate locked ancestors;
+        # taking Project first makes both operations safe. The request-level
+        # child boolean is only a hint and may predate atomic publication.
+        # Review/fix deliberately retains its established PR -> Task admission
+        # order and must never be pre-locked behind Project/Task here.
+        async with AsyncExitStack() as lock_stack:
+            locked_project = None
+            if preloaded_task is not None and not preloaded_uses_pr_task_order:
+                locked_project, task = await lock_stack.enter_async_context(
+                    lock_project_then_task(
+                        scoped_session,
+                        preloaded_task.project_id,
+                        task_id,
+                        skip_locked=False,
+                        timeout=10,
+                    )
                 )
-
-            admission = await prepare_direct_fix_admission(
-                scoped_session,
-                project_id=preloaded_task.project_id,
-                pr_number=int(pr_number),
-                fix_task_id=preloaded_task.id,
-                fetch_live_pr=_fetch_bulk_retry_pr,
-            )
-            if not admission.allowed:
-                await scoped_session.rollback()
-                raise HTTPException(status_code=409, detail=admission.reason)
-            admitted_fix_target = dict(admission.fix_target or {})
-        async with task_lock(
-            scoped_session, task_id, skip_locked=False, timeout=10
-        ) as task:
+            else:
+                task = await lock_stack.enter_async_context(
+                    task_lock(
+                        scoped_session,
+                        task_id,
+                        skip_locked=False,
+                        timeout=10,
+                    )
+                )
             if task is None:
                 # Row missing or unreachable — the caller already validated
                 # membership in the claim-IDs phase, so this is a genuine
                 # "deleted between phases" race; report it.
                 raise HTTPException(status_code=404, detail="Task not found")
+            if not preloaded_uses_pr_task_order and (
+                locked_project is None or task.project_id != locked_project.id
+            ):
+                raise HTTPException(status_code=404, detail="Task not found")
+            invalidated_ancestors: list[str] = []
+            if preloaded_uses_pr_task_order:
+                from app.admin_retry_admission import apply_bulk_pr_retry_boundary
 
-            # Revalidate under the definitive row lock: a terminal status
-            # request can set the write-ahead marker after the unlocked preload.
-            if has_pending_pr_continuation(task):
-                task_type = str(_task_payload_dict(task).get("type") or "review/fix")
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Cannot retry {task_type} task while its post-commit "
-                        "continuation is pending; wait for recovery or cancel "
-                        "the task first"
-                    ),
+                invalidated_ancestors = await apply_bulk_pr_retry_boundary(
+                    scoped_session,
+                    task,
+                    expected_parent_id=prelocked_requeue_parent_id,
+                    prelocked_ancestors=prelocked_requeue_ancestors or [],
+                    fix_target=admitted_fix_target,
+                    review_target=admitted_review_target,
+                )
+            else:
+                from app.admin_retry_admission import (
+                    apply_bulk_non_pr_retry_boundary,
+                )
+
+                invalidated_ancestors = await apply_bulk_non_pr_retry_boundary(
+                    scoped_session, task
                 )
 
             task.status = TaskStatus.QUEUED
             task.archived = False
-            if admitted_fix_target is not None:
-                fix_loop = dict((task.context or {}).get("review_loop") or {})
-                fix_loop["fix_target"] = admitted_fix_target
-                task.context = {**(task.context or {}), "review_loop": fix_loop}
-                flag_modified(task, "context")
             # If the task was FAILED/CANCELLED, the SQLAlchemy set event added
             # task.id to _terminated_task_ids, revoking any outstanding JWT.
             # Drop the cache entry so the next provisioned VM can claim.
             _terminated_task_ids.pop(str(task.id), None)
-            task_type = _task_payload_dict(task).get("type", "")
+            task_type = str(_task_payload_dict(task).get("type") or "").lower()
             is_parent_type = task_type in ("research", "plan")
-            if preloaded_has_children is not None:
-                # Use pre-fetched boolean (batch query in bulk_action_tasks)
-                # to avoid a per-task child query. _requeue_parent_task does
-                # its own children query internally when called.
-                has_children = preloaded_has_children
-            elif is_parent_type:
+            if is_parent_type:
                 has_children = bool(
                     (
                         await scoped_session.execute(
                             select(Task.id)
-                            .where(Task.parent_task_id == task.id)
+                            .where(
+                                Task.parent_task_id == task.id,
+                                Task.project_id == task.project_id,
+                            )
                             .limit(1)
                         )
                     )
@@ -1133,6 +1208,18 @@ async def _bulk_retry_one_task(
                 )
             else:
                 has_children = False
+            if (
+                is_parent_type
+                and preloaded_has_children is not None
+                and bool(preloaded_has_children) != has_children
+            ):
+                logger.info(
+                    "[ADMIN] Bulk retry refreshed stale child-existence hint "
+                    "for parent %s: preloaded=%s current=%s",
+                    task.id,
+                    bool(preloaded_has_children),
+                    has_children,
+                )
             old_vm: str | None = None
             if has_children:
                 await _requeue_parent_task(task, scoped_session)
@@ -1141,10 +1228,15 @@ async def _bulk_retry_one_task(
                 reset_task_for_fresh_attempt(task)
                 task.attempt_count = 0
                 task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+            history_changes: dict[str, Any] = {"status": "QUEUED"}
+            if invalidated_ancestors:
+                history_changes["invalidated_ancestor_rollups"] = (
+                    invalidated_ancestors
+                )
             history = TaskHistory(
                 task_id=task.id,
                 action="MODIFIED",
-                details={"changes": {"status": "QUEUED"}, "modified_by": "BULK_ACTION"},
+                details={"changes": history_changes, "modified_by": "BULK_ACTION"},
             )
             scoped_session.add(task)
             scoped_session.add(history)
@@ -1445,8 +1537,9 @@ async def bulk_action_tasks(
     else:
         fetched = {}
 
-    # Pre-fetch which retry parent-type tasks have children (single query).
-    # Passed into _bulk_retry_one_task to skip its per-task child query.
+    # Pre-fetch a request-level child-existence hint for retry parent tasks.
+    # The scoped mutation revalidates under its canonical lock; this hint is
+    # retained only to make a concurrently changed publication visible in logs.
     _retry_parent_has_children: dict[uuid.UUID, bool] = {}
     if body.action == "retry":
         _parent_type_ids = [
@@ -2237,6 +2330,7 @@ async def get_task(
         if task.last_tool_use_at
         else None,
         "attempt_count": task.attempt_count,
+        "attempt_number": get_task_lifetime_attempt_ordinal(task),
         # Durable BLOCKED-state metadata (alembic 0137). Nullable for any
         # non-BLOCKED or pre-migration task; the admin UI guards on presence.
         "blocker_kind": task.blocker_kind,
@@ -2427,133 +2521,6 @@ async def get_task_pr_files(
         include_patch=include_patch,
     )
     return {"files": files, "pr_number": pr_number}
-
-
-class CreateTaskPayload(BaseModel):
-    github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
-    title: str = Field(..., min_length=1, max_length=200)
-    prompt: str = Field(..., min_length=1, max_length=50000)
-    base_branch: str | None = Field(
-        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
-    )
-    # Sequenced-task (campaign) fields, mirrored into payloads[0] verbatim.
-    # require_deps_landed_on: hold dispatch until every depends_on dependency
-    # has LANDED on the named branch (deterministic, heuristic-free gate).
-    # release_base_branch: repoint base_branch to the named branch when the
-    # dependency gate opens, so the task starts FROM that branch's state
-    # including its dependencies' merged work. depends_on edges themselves are
-    # attached via PATCH /tasks/{id} (cycle-checked there).
-    require_deps_landed_on: str | None = Field(
-        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
-    )
-    release_base_branch: str | None = Field(
-        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
-    )
-    task_type: TaskType = Field(default=TaskType.create)
-    pr_number: int | None = None
-    branch: str | None = Field(
-        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
-    )
-    model: str | None = Field(default=None, min_length=1)
-    effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
-    # Optional client-supplied idempotency key for deduping retried requests.
-    # When provided, the endpoint returns the existing task if one with the same
-    # key already exists in an active state, instead of creating a duplicate.
-    idempotency_key: str | None = Field(
-        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
-    )
-    # Hotfix path (Phase 5 / automain-LTS): set hotfix=True together with
-    # base_branch="main" to mark a plan task as an expedited fix off main.
-    # The agent handler branches hotfix/* off main and the orchestrator
-    # back-merges main → automain after the hotfix lands.
-    hotfix: bool = False
-    # Plan-time acceptance_evidence declaration for code-producing task types
-    # (create / fix / refactor / qa / migrate / deps / docs). Required for those
-    # types: validate_task_payload rejects a code payload that omits it, so a
-    # merged task has a proof the acceptance gate can check and mint criterion
-    # credit from. The raw dict is validated strictly against
-    # payload_schemas.AcceptanceEvidence at validate_task_payload time.
-    acceptance_evidence: dict[str, Any] | None = None
-    # Optional originating ProjectMessage (e.g. a BUG_REPORT) this task is being
-    # spawned from. Additive and backward compatible — omitted by existing
-    # callers. When provided for an ``investigate`` task, the message's citations
-    # are RE-VALIDATED against current HEAD and any "cited code is absent" signal
-    # is injected into the spawned task's context + prompt so the investigating
-    # agent discounts a stale report. Ignored for all other task types.
-    source_message_id: uuid.UUID | None = None
-    # Research-only empirical planning envelope. Ordinary task types reject
-    # these fields instead of silently carrying research-process boilerplate.
-    work_class: Literal["exploratory", "confirmatory", "productization"] | None = None
-    stop_or_pivot_condition: str | None = Field(
-        default=None, min_length=1, max_length=4000
-    )
-
-    @field_validator("work_class", "stop_or_pivot_condition", mode="before")
-    @classmethod
-    def normalize_empirical_text(cls, v: Any) -> Any:
-        if isinstance(v, str):
-            normalized = v.strip()
-            if not normalized:
-                raise ValueError("must not be blank")
-            return normalized
-        return v
-
-    @field_validator(
-        "base_branch", "branch", "require_deps_landed_on", "release_base_branch"
-    )
-    @classmethod
-    def validate_branch_name(cls, v: str | None) -> str | None:
-        if v is None:
-            return v
-        for part in v.split("/"):
-            if part in (".git", ".lock"):
-                raise ValueError(f"Branch name contains reserved component: {part}")
-            if part.startswith("."):
-                raise ValueError(f"Branch component cannot start with a dot: {part}")
-            if ".." in part:
-                raise ValueError(f"Branch component cannot contain '..': {part}")
-        return v
-
-    @model_validator(mode="after")
-    def validate_pr_metadata_required_for_pr_tasks(self) -> "CreateTaskPayload":
-        empirical_fields_present = any(
-            value is not None
-            for value in (
-                self.work_class,
-                self.stop_or_pivot_condition,
-            )
-        )
-        if empirical_fields_present and self.task_type not in (
-            TaskType.research,
-            TaskType.web_research,
-        ):
-            raise ValueError(
-                "empirical work contract fields are only supported for research "
-                "and web_research tasks"
-            )
-        if (
-            self.task_type
-            in (
-                TaskType.review,
-                TaskType.fix,
-            )
-            and self.pr_number is None
-        ):
-            raise ValueError(
-                f"pr_number is required for task_type '{self.task_type.value}'"
-            )
-        if (
-            self.task_type
-            in (
-                TaskType.review,
-                TaskType.fix,
-            )
-            and not self.branch
-        ):
-            raise ValueError(
-                f"branch is required for task_type '{self.task_type.value}'"
-            )
-        return self
 
 
 class ComputeRunnerTargetPayload(BaseModel):
@@ -2759,15 +2726,40 @@ async def create_task_manually(
     # Parse owner/repo
     github_owner, github_repo = payload.github_repo.split("/", 1)
 
-    # Find the project for this repo the caller may WRITE to (member+), else
-    # create one. Viewers are documented read-only, so creating work on a
-    # viewer-only project is a 403 — and must NOT fall through into the
-    # auto-create branch below, which would hand the viewer a shadow project
-    # they own. See _resolve_repo_project_for_write for why the member+ lookup
-    # has to come first (duplicate projects per repo are legitimate).
-    project = await _resolve_repo_project_for_write(
-        session, current_user["user_id"], github_owner, github_repo
-    )
+    # An explicit project selector is authoritative. Duplicate Blueprint
+    # projects may legitimately point at the same GitHub repository, so an
+    # agent/operator that selected project B must never silently enqueue work
+    # on the resolver's older project A. The repository remains in the payload
+    # as a cross-check because downstream task setup consumes both identities.
+    if payload.project_id is not None:
+        project = await _get_user_project_with_role(
+            payload.project_id,
+            current_user["user_id"],
+            session,
+            "member",
+        )
+        if (
+            str(project.github_owner or "").casefold() != github_owner.casefold()
+            or str(project.github_repo or "").casefold() != github_repo.casefold()
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"project_id {payload.project_id} is configured for "
+                    f"{project.github_owner}/{project.github_repo}, not "
+                    f"{payload.github_repo}"
+                ),
+            )
+    else:
+        # Find the project for this repo the caller may WRITE to (member+), else
+        # create one. Viewers are documented read-only, so creating work on a
+        # viewer-only project is a 403 — and must NOT fall through into the
+        # auto-create branch below, which would hand the viewer a shadow project
+        # they own. See _resolve_repo_project_for_write for why the member+ lookup
+        # has to come first (duplicate projects per repo are legitimate).
+        project = await _resolve_repo_project_for_write(
+            session, current_user["user_id"], github_owner, github_repo
+        )
 
     if project is None:
         project = Project(
@@ -2796,10 +2788,15 @@ async def create_task_manually(
     # Auto-generate VM instance ID so orchestrator worker picks up the task
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
 
-    # Resolve base_branch: explicit client value takes precedence; omitted → project promotion_target
-    resolved_base_branch = (
-        payload.base_branch or _get_project_promotion_target_for_task(project)
+    # Research inspects the integration state that its findings will improve.
+    # Other manually launched work retains the established promotion-target
+    # default, and every explicit branch remains authoritative.
+    default_base_branch = (
+        get_project_integration_branch(project)
+        if payload.task_type == TaskType.research
+        else _get_project_promotion_target_for_task(project)
     )
+    resolved_base_branch = payload.base_branch or default_base_branch
 
     # Build payload based on task type
     task_payload = {
@@ -2833,13 +2830,9 @@ async def create_task_manually(
         task_payload["branch"] = payload.branch
         if payload.task_type == TaskType.review:
             task_payload["original_prompt"] = payload.prompt
-    # Research tasks auto-include project directions. For ad-hoc manual
-    # spawns we ship lightweight direction summaries (id/text/priority/
-    # status/system + truncated research_context) — full
-    # research_context + research_history can be tens of KB per direction
-    # and easily blow past validate_task_payload's 190 KB cap on projects
-    # with many fat directions. The agent can fetch full direction state
-    # via ``./fetch direction <id>`` when it needs it.
+    # Research tasks auto-include canonical spawn-time direction authority.
+    # Research history remains API-fetched; a large context value is represented
+    # by a bounded semantic excerpt so the task stays below the payload cap.
     if payload.task_type in (TaskType.research, TaskType.web_research):
         for empirical_key in (
             "work_class",
@@ -2850,25 +2843,33 @@ async def create_task_manually(
                 task_payload[empirical_key] = empirical_value
     if payload.task_type == TaskType.research:
         active_directions = [
-            d for d in (project.directions or []) if d.get("status") == "active"
+            d
+            for d in (project.directions or [])
+            if isinstance(d, dict) and d.get("status") == "active"
         ]
-        trimmed_directions = []
+        canonical_directions = []
         for d in active_directions:
-            if not isinstance(d, dict):
-                continue
-            ctx = d.get("research_context") or ""
-            entry = {
-                "id": d.get("id"),
-                "text": d.get("text"),
-                "priority": d.get("priority"),
-                "status": d.get("status"),
-            }
-            if d.get("system"):
-                entry["system"] = d.get("system")
-            if isinstance(ctx, str) and ctx:
-                entry["research_context"] = ctx[:2000]
-            trimmed_directions.append(entry)
-        task_payload["directions"] = trimmed_directions
+            entry = direction_authority_snapshot(d)
+            context = entry.get("research_context")
+            if isinstance(context, str):
+                entry["research_context"] = context[:2000]
+            elif context is not None:
+                rendered = json.dumps(context, default=str, separators=(",", ":"))
+                if len(rendered) > 2000:
+                    entry["research_context"] = {
+                        "semantic_excerpt": rendered[:2000],
+                        "truncated": True,
+                    }
+            canonical_directions.append(entry)
+        task_payload["directions"] = canonical_directions
+        enrich_direct_research_payload(
+            task_payload,
+            project=project,
+            direction_entry=None,
+            direction_id=None,
+            direct_cycle=None,
+            runtime_config=_runtime_config,
+        )
 
     # Reproduce-on-HEAD citation gate for investigation tasks spawned from a
     # bug-report message. The decision-critical moment: a full agent run is
@@ -2955,28 +2956,6 @@ async def create_task_manually(
             status_code=422, detail=format_payload_validation_error(exc)
         )
 
-    # Guard: cap active tasks per project to prevent queue explosion
-    active_count = (
-        await session.execute(
-            select(func.count(Task.id)).where(
-                Task.project_id == project.id,
-                Task.status.in_(
-                    [
-                        TaskStatus.QUEUED,
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.EVALUATING,
-                    ]
-                ),
-            )
-        )
-    ).scalar() or 0
-    if active_count >= 200:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Project has {active_count} active tasks (limit: 200)",
-        )
-
     # Idempotency check: if client supplied an idempotency_key, check for
     # existing active task with that key and return it instead of creating a duplicate.
     # The stored key is namespaced with the project id so a client key that collides
@@ -3017,9 +2996,35 @@ async def create_task_manually(
                 "project_id": str(existing.project_id),
                 "title": existing.title,
                 "status": existing.status,
+                "task_type": _task_payload_dict(existing).get("type", "create"),
                 "vm_instance_id": existing.vm_instance_id,
                 "is_duplicate": True,
             }
+
+    # Guard: cap active tasks per project to prevent queue explosion. This is
+    # intentionally after the idempotency lookup: replaying a request that
+    # already succeeded must return the original task even when the queue has
+    # since reached its cap.
+    active_count = (
+        await session.execute(
+            select(func.count(Task.id)).where(
+                Task.project_id == project.id,
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    ]
+                ),
+            )
+        )
+    ).scalar() or 0
+    if active_count >= 200:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Project has {active_count} active tasks (limit: 200)",
+        )
 
     new_task_id = uuid.uuid4()
     direct_review_loop: dict | None = None
@@ -3072,6 +3077,7 @@ async def create_task_manually(
                     "project_id": str(existing.project_id),
                     "title": existing.title,
                     "status": existing.status,
+                    "task_type": _task_payload_dict(existing).get("type", "review"),
                     "vm_instance_id": existing.vm_instance_id,
                     "is_duplicate": True,
                 }
@@ -3156,6 +3162,7 @@ async def create_task_manually(
                     "project_id": str(existing.project_id),
                     "title": existing.title,
                     "status": existing.status,
+                    "task_type": _task_payload_dict(existing).get("type", "create"),
                     "vm_instance_id": existing.vm_instance_id,
                     "is_duplicate": True,
                 }
@@ -3181,6 +3188,7 @@ async def create_task_manually(
         "project_id": str(project.id),
         "title": new_task.title,
         "status": new_task.status,
+        "task_type": payload.task_type.value,
         "vm_instance_id": new_task.vm_instance_id,
     }
 
@@ -4393,6 +4401,11 @@ async def reset_iteration_cap(
         "email", current_user["user_id"]
     )
     new_ctx["review_loop"] = new_review_loop
+    # An abandon-candidate hold is a recoverable episode stop. Resetting the
+    # existing iteration budget explicitly starts a fresh census window; keep
+    # the immutable pre-reset rows for audit, but remove the active stop marker
+    # so the next orchestrator cycle can resume the PR.
+    new_ctx.pop("review_loop_abandon_candidate", None)
     task.context = new_ctx
     flag_modified(task, "context")
 

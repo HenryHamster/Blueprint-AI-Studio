@@ -31,6 +31,11 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import frontend_release_manifest as frontend_manifest
+from release_preconditions import (
+    PRE_STOP_PRECONDITIONS,
+    RehearsalReport,
+    verify_privilege_boundary,
+)
 
 _IMAGE_PREFIX = (
     "us-central1-docker.pkg.dev/blueprint-orchestrator/blueprint-repo/"
@@ -134,6 +139,7 @@ _REGISTRY_HOST = "us-central1-docker.pkg.dev"
 _WORKER_REGISTRY_READER = (
     "blueprint-local-worker-runtime@blueprint-orchestrator.iam.gserviceaccount.com"
 )
+RUNBOOK_ENTRYPOINT = "release"
 
 
 class _TransientNotReady(RuntimeError):
@@ -430,6 +436,37 @@ def _cleanup_stale_registry_auth(expected_uid: int) -> None:
         if re.fullmatch(r"blueprint-registry-auth-[A-Za-z0-9_-]{6,16}", directory.name) is None:
             raise RuntimeError("unexpected registry credential directory name")
         _remove_registry_auth_directory(directory, expected_uid)
+
+
+def _pull_candidate_for_rehearsal(image_ref: str, install_user: str) -> None:
+    """Pull the exact candidate using the same ephemeral auth as activation."""
+    node_root = Path("/etc/blueprint/nodes") / install_user
+    worker_path = node_root / "roles" / "worker" / "role.env"
+    for directory in (
+        Path("/etc/blueprint"),
+        Path("/etc/blueprint/nodes"),
+        node_root,
+        node_root / "roles",
+        node_root / "roles" / "worker",
+    ):
+        _trusted_root_directory(directory)
+    worker_role = _secure_role_file(worker_path)
+    install_uid = _uid_for_user(install_user)
+    credential = _secure_registry_credential(
+        _role_value(worker_role, "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE"),
+        install_uid,
+    )
+    with _registry_auth(credential) as registry_config:
+        _run(
+            [
+                "/usr/bin/docker",
+                "--config",
+                str(registry_config),
+                "pull",
+                image_ref,
+            ],
+            timeout=600,
+        )
 
 
 @contextlib.contextmanager
@@ -1224,6 +1261,75 @@ def _run_local_migration(image_ref: str) -> None:
         raise RuntimeError(f"local migration exited {result}")
 
 
+def _preflight_local_migration_inputs(image_ref: str) -> None:
+    """Validate migration inputs that depend only on static host state.
+
+    The worker-secret validation (`_migration_worker_values`) is a pure function
+    of the on-disk worker role.env and secrets JSON, so a malformed secrets file
+    fails deterministically whether checked now or inside the post-stop
+    migration.  Running it here — BEFORE any Restart=always unit is stopped —
+    means such a defect aborts the release with ZERO downtime, instead of after
+    the control plane is already down.  (A too-strict version of that validation,
+    reached only inside the post-stop migration, is exactly what turned the v31
+    schema deploy into a control-plane outage.)  This mirrors the Namespace
+    `_run_local_migration` hands `cmd_migrate`; the call is side-effect free, so
+    the real migration re-runs it harmlessly.
+    """
+    import blueprint
+
+    blueprint._migration_worker_values(
+        argparse.Namespace(
+            local=True,
+            image=image_ref,
+            sha=None,
+            worker_env_file=None,
+            worker_secrets_file=None,
+            registry_credential_file=None,
+            network=None,
+        )
+    )
+
+
+def _run_pre_stop_rehearsal(
+    image_id: str,
+    image_ref: str,
+    revision: str,
+    install_user: str,
+    target_schema_revision: str,
+    database_schema_before: str,
+) -> RehearsalReport:
+    """Prove all deterministic release preconditions before stopping units."""
+    verify_privilege_boundary(
+        install_user,
+        agent_unit="blueprint-deploy-agent.service",
+        release_unit="blueprint-release.service",
+        run=_run,
+    )
+    _preflight_local_migration_inputs(image_ref)
+    target_refusal = _target_schema_refusal(
+        image_id, target_schema_revision, database_schema_before
+    )
+    if target_refusal is not None:
+        raise RuntimeError(target_refusal)
+    return RehearsalReport(
+        candidate=image_ref,
+        revision=revision,
+        checked=PRE_STOP_PRECONDITIONS,
+        deferred=(
+            "migration apply and post-migration schema verification (mutates live DB)",
+            "unit stop/start and application health verification (requires downtime)",
+        ),
+    )
+
+
+def rehearse(image_ref: str, revision: str) -> RehearsalReport:
+    """Refuse standalone candidate execution on the production host."""
+    del image_ref, revision
+    raise RuntimeError(
+        "host rehearsal disabled; use trusted CI build/smoke evidence"
+    )
+
+
 def _schema_mismatch_refusal(
     image_id: str,
     image_label: str,
@@ -1452,14 +1558,26 @@ def release(image_ref: str, revision: str) -> Path:
             "untouched_unit_markers_match": markers_match,
         }
 
-    target_refusal = _target_schema_refusal(
-        image_id, target_schema_revision, database_schema_before
-    )
-    if target_refusal is not None:
+    try:
+        _run_pre_stop_rehearsal(
+            image_id,
+            image_ref,
+            revision,
+            install_user,
+            target_schema_revision,
+            database_schema_before,
+        )
+    except Exception as precondition_error:
+        target_refusal = str(precondition_error)
+        outcome = (
+            "rollback_refused"
+            if "release refused before stopping" in target_refusal
+            else "precondition_failed"
+        )
         try:
             evidence = _write_evidence(
                 _EVIDENCE_ROOT,
-                receipt("rollback_refused", target_refusal, False),
+                receipt(outcome, target_refusal, False),
             )
         except Exception as evidence_exc:
             raise RuntimeError(
@@ -1659,12 +1777,29 @@ def _locked_release(image_ref: str, revision: str) -> Path:
         return release(image_ref, revision)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-revision", required=True)
+    parser.add_argument(
+        "--rehearse",
+        action="store_true",
+        help="validate candidate preconditions without stopping or changing units",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.rehearse:
+            report = rehearse(args.image, args.expected_revision)
+            print(
+                "LOCAL_APP_RELEASE_REHEARSAL "
+                + json.dumps(report.as_dict(), sort_keys=True)
+            )
+            return 0
         evidence = _locked_release(args.image, args.expected_revision)
     except (OSError, ValueError, RuntimeError, PermissionError) as exc:
         print(f"ERROR: {exc}", file=os.sys.stderr)

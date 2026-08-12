@@ -114,7 +114,7 @@ def _safe_tar_extractall(tar: tarfile.TarFile, dest: str) -> None:
                     f"tarfile special member {member.name!r} is not allowed"
                 )
             safe_members.append(member)
-        tar.extractall(dest, members=safe_members)
+        tar.extractall(dest, members=safe_members, filter="data")
 
 
 # ('ok'|'block'|'defer', detail). Mirrors check_qualification_migration_identity.
@@ -227,7 +227,7 @@ _CANDIDATE_METADATA_SCRIPT = textwrap.dedent(
                         f"tarfile special member {member.name!r} is not allowed"
                     )
                 safe_members.append(member)
-            tar.extractall(work_dir, members=safe_members)
+            tar.extractall(work_dir, members=safe_members, filter="data")
 
     roots = sorted(path for path in work_dir.iterdir() if path.is_dir())
     if not roots:

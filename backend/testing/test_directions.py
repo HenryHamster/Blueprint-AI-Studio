@@ -31,7 +31,7 @@ from app.models import (
 from app.autonomous_research import _spawn_research_task
 from app.direction_lifecycle import _process_direction_lifecycle
 from app.research_completion import (
-    _handle_research_completion,
+    _handle_research_completion as _handle_research_completion_impl,
     _calibrate_scope,
     predict_spawn_success,
     _poor_decomp_history,
@@ -48,6 +48,16 @@ from app.direction_refractory import (
     stamp_direction_refractory,
 )
 from app.max_plan_pool import _max_plan_pools, _account_by_id
+
+
+async def _handle_research_completion(task: Task, logs: str, db_session, **kwargs):
+    """Invoke research completion after the lifecycle's terminal transition."""
+
+    if task.status == TaskStatus.IN_PROGRESS:
+        task.status = TaskStatus.COMPLETED
+        db_session.add(task)
+        await db_session.commit()
+    return await _handle_research_completion_impl(task, logs, db_session, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -1465,12 +1475,27 @@ async def test_manual_research_409_when_research_parked_legacy(
 async def test_manual_research_stamps_current_direction_id(
     client: AsyncClient, db_session, mocker
 ):
-    """The manual research payload must carry current_direction_id so the task
-    is visible to the autonomous busy-direction dedup (otherwise the autonomous
-    loop spawns a concurrent duplicate on the same direction)."""
+    """Manual research uses the same complete envelope as every other root."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.discovery_admission import direction_authority_snapshot
+    from app.research_completion import effective_research_finding_headroom
+    from app.shared_state import runtime_config
+
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id, text="Stamp the direction id")
     direction_id = direction["id"]
+    project = await db_session.get(Project, uuid.UUID(project_id))
+    project.problem_model = {
+        "capabilities": [{"name": "research-envelope", "status": "working"}]
+    }
+    flag_modified(project, "problem_model")
+    db_session.add(project)
+    await db_session.commit()
+    mocker.patch.dict(
+        runtime_config.setdefault("agent_prompt_suffixes", {}),
+        {"research": "Preserve the canonical root envelope."},
+    )
 
     resp = await client.post(
         f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
@@ -1480,7 +1505,15 @@ async def test_manual_research_stamps_current_direction_id(
 
     created = await db_session.get(Task, uuid.UUID(task_id))
     assert created is not None
-    assert created.first_payload.get("current_direction_id") == direction_id
+    payload = created.first_payload
+    assert payload["current_direction_id"] == direction_id
+    assert payload["directions"] == [direction_authority_snapshot(direction)]
+    assert created.discovery_cycle_id is not None
+    assert payload["discovery_intent_snapshot"]
+    assert payload["discovery_bet_snapshot"]
+    assert payload["work_headroom"] == effective_research_finding_headroom(0)
+    assert payload["available_capabilities"][0]["name"] == "research-envelope"
+    assert payload["prompt_suffix"] == "Preserve the canonical root envelope."
 
 
 @pytest.mark.asyncio

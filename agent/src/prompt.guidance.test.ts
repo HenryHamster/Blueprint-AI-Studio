@@ -878,14 +878,13 @@ describe('buildCodeChangeHelperGuidance', () => {
     expect(g).toContain('vite build');
   });
 
-  it('build_config variant explains the honest pytest gate only when a pytest test_cmd is configured', () => {
-    // FOREIGN_BUILD_CONFIG carries `api` with `pytest -q` → ./check routes it
-    // through the honest gate (harness preference + GATE-ENVIRONMENT), so the
-    // intro must tell the agent what that note means and how to act on it.
+  it('build_config variant explains retained verification only when a pytest test_cmd is configured', () => {
+    // FOREIGN_BUILD_CONFIG carries `api` with `pytest -q` → ./check keeps the
+    // configured command and uses the retained verifier only when explicitly
+    // declared, so the intro must describe that contract accurately.
     const g = buildCodeChangeHelperGuidance({ buildConfig: FOREIGN_BUILD_CONFIG, ...FOREIGN });
-    expect(checkIntroOf(g)).toContain('GATE-ENVIRONMENT');
-    expect(checkIntroOf(g)).toContain('scripts/test-<dir>.sh');
-    expect(checkIntroOf(g)).toContain('record your own faithful test evidence');
+    expect(checkIntroOf(g)).toContain('configured command under');
+    expect(checkIntroOf(g)).toContain('blueprint-v1');
     // A config with no pytest-style test command gets no pytest-gate prose.
     const nodeOnly = {
       directories: [{ path: 'web', type: 'node', test_cmd: 'vitest run' }],

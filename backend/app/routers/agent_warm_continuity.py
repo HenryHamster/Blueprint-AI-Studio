@@ -30,6 +30,7 @@ from sqlmodel import select
 
 from app.auth import (
     create_agent_token,
+    verify_agent_jwt,
     AGENT_TOKEN_TTL_HOURS,
     AGENT_BOOTSTRAP_TOKEN_TTL_HOURS,
     VM_SCOPED_TOKEN_SCOPE,
@@ -43,7 +44,12 @@ from app.claim_analytics import stamp_warm_claim_timing
 from app.database import get_session, resolve_dialect_name
 from app.execution_principal import resolve_project_execution_principal
 from app.models import Task, TaskStatus, _utcnow
-from app.routers.agent import verify_agent_token
+from app.research_output_contract import (
+    RESEARCH_OUTPUT_CONTRACT_VERSION,
+    RESEARCH_OUTPUT_CONTRACT_VERSION_HEADER,
+    RESEARCH_OUTPUT_CONTRACT_VERSION_KEY,
+)
+from app.routers.agent import _CLAIM_REPLAY_CONTEXT_KEY, verify_agent_token
 from app.shared_state import limiter
 from app.task_capabilities import get_task_capability
 import app.shared_state as _shared_state
@@ -530,6 +536,7 @@ async def _finalize_warm_claim(
     refresh_capable: bool,
     vm_boot: dict | None = None,
     boot_account: dict | None = None,
+    research_output_contract_version: str | None = None,
 ) -> dict:
     """Flip a locked QUEUED task to IN_PROGRESS for a warm VM and build the
     /next-role claim response.
@@ -911,6 +918,22 @@ async def _finalize_warm_claim(
             origin=origin,
             vm_instance_id=vm_instance_id,
         )
+        # Warm continuation is an authoritative fresh claim, so renegotiate
+        # the attempt-scoped producer contract even if a manually requeued task
+        # still carries a marker from an earlier v2 attempt.
+        ctx.pop(RESEARCH_OUTPUT_CONTRACT_VERSION_KEY, None)
+        if (
+            task_type.strip().lower() == "research"
+            and research_output_contract_version
+            == str(RESEARCH_OUTPUT_CONTRACT_VERSION)
+        ):
+            # /next-role is the authoritative first claim for warm/pool work.
+            # Stamp the same capability-negotiated contract marker as the cold
+            # /claim path so its subsequent idempotent replay cannot lose strict
+            # research validation.
+            ctx[RESEARCH_OUTPUT_CONTRACT_VERSION_KEY] = (
+                RESEARCH_OUTPUT_CONTRACT_VERSION
+            )
         # Ground warm-resume receipts in actual outcome: stamp only here, at the
         # warm-claim site, so a cold-fallback fix (reserved member reaped, lease
         # expired, or pool fallback) leaves the receipt absent. Gate receipt stamping
@@ -931,9 +954,6 @@ async def _finalize_warm_claim(
         # completion path now owns the active reservation and must release only
         # concurrency, preserving the daily charge.
         ctx.pop(WARM_POOL_RESERVATION_ACCOUNT_KEY, None)
-        task.context = ctx
-        task.llm_account_id = ctx.get("llm_account_id")
-        flag_modified(task, "context")
         agent_token = create_agent_token(
             task_id=str(task.id),
             vm_instance_id=vm_instance_id,
@@ -941,6 +961,20 @@ async def _finalize_warm_claim(
             project_id=str(task.project_id) if task.project_id else "",
             ttl_hours=ttl_hours,
         )
+        token_jti = str(verify_agent_jwt(agent_token).get("jti") or "")
+        if not token_jti:
+            raise RuntimeError("warm claim token is missing jti")
+        # runRoleOnce enters the normal /claim path immediately after
+        # /next-role. Persist the same bounded replay receipt as a cold claim so
+        # that second request returns the authoritative task projection instead
+        # of rejecting the already-IN_PROGRESS task.
+        ctx[_CLAIM_REPLAY_CONTEXT_KEY] = {
+            "claimed_at": task.last_heartbeat.isoformat(),
+            "token_jti": token_jti,
+        }
+        task.context = ctx
+        task.llm_account_id = ctx.get("llm_account_id")
+        flag_modified(task, "context")
         session.add(task)
         await session.commit()
     except Exception as exc:
@@ -1036,6 +1070,9 @@ async def next_role(
     """
     if req.vm_instance_id != token.get("vm_instance_id"):
         raise HTTPException(status_code=403, detail="vm_instance_mismatch")
+    reported_research_output_contract_version = request.headers.get(
+        RESEARCH_OUTPUT_CONTRACT_VERSION_HEADER, ""
+    )
 
     # Liveness signal: receiving the request itself proves the VM is alive.
     _shared_state.record_vm_heartbeat(req.vm_instance_id)
@@ -1282,6 +1319,9 @@ async def next_role(
                     origin=WARM_POOL_ORIGIN,
                     refresh_capable=vm_refresh_capable,
                     boot_account=run_account,
+                    research_output_contract_version=(
+                        reported_research_output_contract_version
+                    ),
                 )
             except Exception:
                 from app.warm_vm_state import record_pool_claim_failure
@@ -1385,6 +1425,9 @@ async def next_role(
                 origin="next_role_endpoint",
                 refresh_capable=vm_refresh_capable,
                 vm_boot=vm_boot,
+                research_output_contract_version=(
+                    reported_research_output_contract_version
+                ),
             )
             from app.warm_backlog_reuse import (
                 record_chain_claimed as _record_chain_claimed,
@@ -1484,6 +1527,9 @@ async def next_role(
                             origin="backlog_reuse",
                             refresh_capable=vm_refresh_capable,
                             vm_boot=vm_boot,
+                            research_output_contract_version=(
+                                reported_research_output_contract_version
+                            ),
                         )
                     except Exception:
                         _shared_state.record_backlog_reuse_failure("finalize_error")

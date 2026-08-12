@@ -910,14 +910,50 @@ export async function handleReleaseAudit(
     ? payload.version_goal
     : null;
   const categories = Array.isArray(payload.categories)
-    ? payload.categories.filter((row): row is { category_key: string; text: string } => (
+    ? payload.categories.filter((row): row is { category_key: string; text: string; evidence_contract?: unknown } => (
         !!row && typeof row === 'object'
         && typeof (row as Record<string, unknown>).category_key === 'string'
         && typeof (row as Record<string, unknown>).text === 'string'
       ))
     : [];
   const categoryContractSection = categories.length > 0
-    ? `\nAssess each acceptance category below against the FULL version delta (\`git diff ${goalCategoryDiffRange}\`), NOT the narrowed code-quality range — every supplied criterion grades the whole version the promotion PR would carry. Emit one \`category_verdicts\` entry for every supplied key, with \`status\` (\`met\` | \`partial\` | \`not_met\`), a concrete \`gap\` (null when met), and diff-grounded \`citations\` (file paths or commit/PR references). Also emit \`residual_uncaptured_gap\` for any important goal gap not represented by a category, else null.\n\nAcceptance categories:\n${categories.map((row) => `- ${row.category_key}: ${row.text}`).join('\n')}\n`
+    ? `\nAssess each acceptance category below against the FULL version delta (\`git diff ${goalCategoryDiffRange}\`), NOT the narrowed code-quality range — every supplied criterion grades the whole version the promotion PR would carry. Emit one \`category_verdicts\` entry for every supplied key, with \`status\` (\`met\` | \`partial\` | \`not_met\`), a concrete \`gap\` (null when met), and diff-grounded \`citations\` (file paths or commit/PR references). Also emit \`residual_uncaptured_gap\` for any important goal gap not represented by a category, else null.\n\nAcceptance categories:\n${categories.map((row) => `- ${row.category_key}: ${row.text}${row.evidence_contract ? ` (structured evidence contract: ${JSON.stringify(row.evidence_contract)})` : ''}`).join('\n')}\n`
+    : '';
+  const releaseEvidence = payload.release_evidence && typeof payload.release_evidence === 'object'
+    ? payload.release_evidence as Record<string, unknown>
+    : null;
+  const normalizedReleaseEvidence = releaseEvidence
+    ? {
+        operator_authored_commits: {
+          state: typeof releaseEvidence.operator_authored_commits === 'object'
+            && releaseEvidence.operator_authored_commits !== null
+            && !Array.isArray(releaseEvidence.operator_authored_commits)
+            ? (releaseEvidence.operator_authored_commits as Record<string, unknown>).state
+            : 'missing_or_invalid',
+          count: typeof releaseEvidence.operator_authored_commits === 'object'
+            && releaseEvidence.operator_authored_commits !== null
+            && !Array.isArray(releaseEvidence.operator_authored_commits)
+            && typeof (releaseEvidence.operator_authored_commits as Record<string, unknown>).count === 'number'
+            ? (releaseEvidence.operator_authored_commits as Record<string, unknown>).count
+            : null,
+          offender_shas: typeof releaseEvidence.operator_authored_commits === 'object'
+            && releaseEvidence.operator_authored_commits !== null
+            && !Array.isArray(releaseEvidence.operator_authored_commits)
+            && Array.isArray((releaseEvidence.operator_authored_commits as Record<string, unknown>).offender_shas)
+            ? ((releaseEvidence.operator_authored_commits as Record<string, unknown>).offender_shas as unknown[]).filter((sha): sha is string => typeof sha === 'string').slice(0, 10)
+            : [],
+        },
+        range: releaseEvidence.range && typeof releaseEvidence.range === 'object' && !Array.isArray(releaseEvidence.range)
+          ? {
+              base_sha: typeof (releaseEvidence.range as Record<string, unknown>).base_sha === 'string' ? (releaseEvidence.range as Record<string, unknown>).base_sha : null,
+              head_sha: typeof (releaseEvidence.range as Record<string, unknown>).head_sha === 'string' ? (releaseEvidence.range as Record<string, unknown>).head_sha : null,
+            }
+          : { base_sha: null, head_sha: null },
+        contracts: Array.isArray(releaseEvidence.contracts) ? releaseEvidence.contracts : [],
+      }
+    : null;
+  const releaseEvidenceSection = normalizedReleaseEvidence
+    ? `\n## Authoritative release evidence\n\nThe backend supplied this immutable, latest-promoted release evidence. Use it as a machine-backed input when grading any explicitly contracted acceptance category; do not replace it with an inference from the candidate diff. Missing, invalid, unresolved, or terminal authorship evidence is not a pass:\n\n\`\`\`json\n${JSON.stringify(normalizedReleaseEvidence, null, 2)}\n\`\`\`\n`
     : '';
   // The acceptance-category contract grades the FULL version delta and is
   // emitted whenever an active rubric is supplied — independent of whether a
@@ -958,7 +994,7 @@ IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge th
    - Architecture drift (patterns inconsistent with the existing codebase conventions)
    - Test coverage gaps for new behavior
    - Documentation / comment accuracy
-${versionGoalSection}${categoryContractSection}
+${versionGoalSection}${categoryContractSection}${releaseEvidenceSection}
 4. **Score and emit results.** Write your findings as a JSON object to \`/tmp/release_audit_report_${taskId}.json\` with EXACTLY this structure:
 
 \`\`\`json

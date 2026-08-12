@@ -1010,6 +1010,10 @@ class TestAgentPlan(unittest.TestCase):
         host_bin = "/host/tools"
         self.assertLess(path_dirs.index(venv_bin), path_dirs.index(host_bin))
         self.assertLess(path_dirs.index(pg_bin), path_dirs.index(host_bin))
+        self.assertEqual(plan.env["BLUEPRINT_SANDBOX_PYTHON"], verification_toolchain.python_path)
+        self.assertEqual(plan.env["BLUEPRINT_SANDBOX_PG_BINDIR"], verification_toolchain.postgres_bindir)
+        self.assertIn(verification_toolchain.root, plan.argv)
+        self.assertNotIn(iso.PROJECT_VERIFICATION_VENV, plan.argv)
 
     def test_decline_without_bwrap(self):
         plan = iso.plan_agent_execution(

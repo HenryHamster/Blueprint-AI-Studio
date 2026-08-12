@@ -4467,6 +4467,59 @@ class TestRunnerEndpoints:
         normal.payloads = [{"type": "create"}]
         assert decline_exclusion_is_advisory(normal, "create") is False
 
+    def test_strategic_runtime_incompatibility_never_waives_decline_exclusion(self):
+        """One deterministic decline must not retry the same Strategic runner."""
+        from app.runner_decline import (
+            DECLINE_EXCLUSION_SECONDS,
+            decline_record_for_runner,
+            decline_exclusion_is_advisory,
+            recently_declined_runner_ids,
+            record_runner_decline,
+        )
+
+        project_id = uuid.uuid4()
+        runner_id = uuid.uuid4()
+        snap = orch.RunnerDispatchSnapshot(
+            id=runner_id,
+            project_id=project_id,
+            capabilities={"task_types": "all"},
+        )
+        task = Task(
+            project_id=project_id,
+            payloads=[{"type": "design_doc_update"}],
+            status=TaskStatus.QUEUED,
+            context={},
+        )
+        now = _utcnow()
+        record_runner_decline(
+            task,
+            str(runner_id),
+            reason="runtime_unavailable: strict MCP cannot run tool-less",
+            same_runner_retryable=False,
+            now=now - timedelta(seconds=DECLINE_EXCLUSION_SECONDS + 1),
+        )
+
+        excluded = recently_declined_runner_ids(task, now=now)
+        assert excluded == {str(runner_id)}
+        active_record = decline_record_for_runner(task, str(runner_id), now=now)
+        assert active_record is not None
+        assert active_record["task_lifetime"] is True
+        assert active_record["seconds_left"] is None
+        assert decline_exclusion_is_advisory(task, "design_doc_update") is False
+        assert (
+            orch._select_eligible_runner(
+                {project_id: [snap]},
+                project_id,
+                "design_doc_update",
+                None,
+                {},
+                dispatch_seed=task.id.int,
+                declined_runner_ids=excluded,
+                declined_exclusion_advisory=False,
+            )
+            is None
+        )
+
     def test_strategic_waiver_survives_an_ineligible_second_runner(self):
         """The waiver must key on ELIGIBILITY, not on a runner ROW merely existing.
 

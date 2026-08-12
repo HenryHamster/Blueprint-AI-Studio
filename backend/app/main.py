@@ -108,6 +108,9 @@ from app.routers.admin_operator_attention import router as admin_operator_attent
 from app.routers.admin_service_credentials import (
     router as admin_service_credentials_router,
 )
+from app.routers.agent_access import router as agent_access_router
+from app.routers.agent_access_directions import router as agent_access_directions_router
+from app.routers.operator_access import router as operator_access_router
 from app.shared_state import limiter
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -120,7 +123,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0751"
+EXPECTED_SCHEMA_REVISION = "0757"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -174,9 +177,8 @@ from app.max_plan_pool import (  # noqa: F401
 
 # Current revision from Cloud Run (set on startup)
 _current_revision: str = os.getenv("K_REVISION", "local-dev")
-# Default SHA; overwritten at startup by resolve_deployed_sha() when running on
-# Cloud Run (DEPLOY_SHA is never set by the deploy pipeline, so this is "unknown"
-# until _init_deployment_state resolves the real serving SHA from the revision).
+# Default SHA; the local API and worker services stamp DEPLOY_SHA from the
+# release manifest, and startup still resolves the real serving SHA when needed.
 _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
 
 # When this process actually started serving the current revision — captured
@@ -1065,6 +1067,9 @@ app.include_router(admin_state_router)
 app.include_router(admin_acceptance_criteria_router)
 app.include_router(admin_operator_attention_router)
 app.include_router(admin_service_credentials_router)
+app.include_router(agent_access_router)
+app.include_router(agent_access_directions_router)
+app.include_router(operator_access_router)
 app.include_router(admin_evergreen_router)
 app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)

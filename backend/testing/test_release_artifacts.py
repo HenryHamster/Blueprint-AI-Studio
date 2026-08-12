@@ -16,12 +16,14 @@ All pure / mocked — no DB.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from app import release_artifacts as artifact_registry
+from app.models import Project, ReleaseDeployArtifact, ReleaseVersion
 from app.release_artifacts import (
     AGENT_IMAGE_ARTIFACT_KIND,
     AGENT_IMAGE_FLEET_SOURCE_UNOBSERVABLE_REASON,
@@ -29,10 +31,12 @@ from app.release_artifacts import (
     PROMOTION_MERGE_ARTIFACT_KIND,
     _check_agent_image_serving,
     _check_promotion_merge_serving,
+    aggregate_required_artifact_status,
     observable_release_artifact_providers,
     summarize_release_artifacts,
     summarize_required_artifact_gap,
 )
+from app.release_qualifier_sweep import _serving_confirmation_candidate_ids
 
 _SHA = "a" * 40
 
@@ -243,6 +247,79 @@ def test_gap_reports_armed_pending_required_row():
     assert gap == "waiting on required artifacts: promotion_merge"
 
 
+def test_lagging_agent_fleet_is_reported_without_gating_backend_serving():
+    """A fleet that has not rebaked cannot block confirmed backend evidence."""
+    version = _Version(serving_status="serving_confirmed", served_sha=_SHA)
+    artifacts = [
+        _Artifact(
+            BACKEND_REVISION_ARTIFACT_KIND,
+            "serving_confirmed",
+            served_identifier=_SHA,
+        ),
+        _Artifact(
+            AGENT_IMAGE_ARTIFACT_KIND,
+            "confirmation_timed_out",
+            reason_code="agent_image_fleet_not_yet_serving",
+        ),
+        _Artifact(
+            PROMOTION_MERGE_ARTIFACT_KIND,
+            "serving_confirmed",
+            served_identifier=_SHA,
+        ),
+    ]
+
+    aggregate, evidence = summarize_release_artifacts(version, artifacts)
+
+    assert aggregate == {
+        "serving_status": "serving_confirmed",
+        "reason_code": None,
+        "fleet_freshness": {
+            "artifact_kind": AGENT_IMAGE_ARTIFACT_KIND,
+            "freshness": "stale",
+            "serving_status": "confirmation_timed_out",
+            "served_identifier": None,
+            "served_at": None,
+            "reason_code": "agent_image_fleet_not_yet_serving",
+        },
+    }
+    by_kind = {entry["artifact_kind"]: entry for entry in evidence}
+    assert by_kind[AGENT_IMAGE_ARTIFACT_KIND] == {
+        "artifact_kind": AGENT_IMAGE_ARTIFACT_KIND,
+        "required": False,
+        "serving_status": "confirmation_timed_out",
+        "served_identifier": None,
+        "served_at": None,
+        "reason_code": "agent_image_fleet_not_yet_serving",
+    }
+
+
+def test_timeout_reason_names_the_unsatisfied_artifact():
+    """Aggregate timeout reporting preserves the artifact-specific reason."""
+    status, reason = aggregate_required_artifact_status(
+        [
+            (
+                SimpleNamespace(
+                    artifact_kind=BACKEND_REVISION_ARTIFACT_KIND, required=True
+                ),
+                _Artifact(
+                    BACKEND_REVISION_ARTIFACT_KIND,
+                    "confirmation_timed_out",
+                    reason_code="backend_revision_serving_unobservable",
+                ),
+            ),
+            (
+                SimpleNamespace(
+                    artifact_kind=PROMOTION_MERGE_ARTIFACT_KIND, required=True
+                ),
+                _Artifact(PROMOTION_MERGE_ARTIFACT_KIND, "serving_confirmed"),
+            ),
+        ]
+    )
+
+    assert status == "confirmation_timed_out"
+    assert reason == "backend_revision_serving_unobservable"
+
+
 def test_gap_reports_failed_over_none():
     evidence = [
         {
@@ -294,6 +371,85 @@ def test_summarize_legacy_caller_projects_backend_scalar():
     by_kind = {e["artifact_kind"]: e for e in evidence}
     assert by_kind[BACKEND_REVISION_ARTIFACT_KIND]["serving_status"] == "unconfirmed"
     assert aggregate["serving_status"] == "unconfirmed"
+
+
+@pytest.mark.asyncio
+async def test_optional_agent_image_freshness_continues_after_required_artifacts_confirm(
+    db_session,
+):
+    """The sweep keeps selecting a confirmed release for its pending optional row.
+
+    Required backend/merge evidence is already terminal, so the aggregate must
+    remain serving-confirmed.  The persisted unconfirmed agent-image row is
+    nevertheless a live candidate for the next provider observation.
+    """
+    project = Project(
+        name="Artifact-Sweep-Test",
+        user_id="artifact-sweep-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    promoted_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        promoted_at=promoted_at,
+        promoted_sha=_SHA,
+        serving_status="serving_confirmed",
+        served_sha=_SHA,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    db_session.add_all(
+        [
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                serving_status="serving_confirmed",
+                served_identifier=_SHA,
+            ),
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind=PROMOTION_MERGE_ARTIFACT_KIND,
+                serving_status="serving_confirmed",
+                served_identifier=_SHA,
+            ),
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind=AGENT_IMAGE_ARTIFACT_KIND,
+                serving_status="unconfirmed",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    aggregate, _evidence = summarize_release_artifacts(
+        version,
+        [
+            _Artifact(BACKEND_REVISION_ARTIFACT_KIND, "serving_confirmed"),
+            _Artifact(PROMOTION_MERGE_ARTIFACT_KIND, "serving_confirmed"),
+            _Artifact(AGENT_IMAGE_ARTIFACT_KIND, "unconfirmed"),
+        ],
+    )
+    assert aggregate == {
+        "serving_status": "serving_confirmed",
+        "reason_code": None,
+        "fleet_freshness": {
+            "artifact_kind": AGENT_IMAGE_ARTIFACT_KIND,
+            "freshness": "stale",
+            "serving_status": "unconfirmed",
+            "served_identifier": None,
+            "served_at": None,
+            "reason_code": None,
+        },
+    }
+    assert await _serving_confirmation_candidate_ids(db_session) == [version.id]
 
 
 def test_summarize_deploy_identity_projects_backend_scalar(monkeypatch):
@@ -600,10 +756,8 @@ def test_effective_confirm_deadline_backstops_null_from_promoted_at():
         # unavailable) → the soft ancestry timeout, never an infinite defer.
         (None, timedelta(minutes=5), timedelta(hours=2), ("confirmation_timed_out", "backend_revision_ancestry_indeterminate", None)),
         # Past the derived window + determinately NOT a descendant, and the live
-        # revision predates the promotion → the honest no_new_revision timeout,
-        # substantiated via the deploy-workflow run listing (no deploy.yml run
-        # for the promoted SHA → never dispatched).
-        (False, timedelta(minutes=-5), timedelta(hours=2), ("confirmation_timed_out", "deploy_workflow_never_dispatched", None)),
+        # revision predates the promotion → an explicit backend-artifact timeout.
+        (False, timedelta(minutes=-5), timedelta(hours=2), ("confirmation_timed_out", "backend_revision_serving_unobservable", None)),
         # Within the derived window → still defers; the backstop bounds the
         # wait, it does not make the reclassifier eager.
         (None, timedelta(minutes=5), timedelta(minutes=30), None),
@@ -640,12 +794,6 @@ async def test_supersession_null_deadline_times_out_not_defers(
         new=AsyncMock(return_value=("tok", "acme", "widget")),
     )
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=ancestry))
-    # No deploy.yml run for the promoted SHA — the predates-promotion timeout
-    # is substantiated as never-dispatched rather than the bare no_new_revision.
-    mocker.patch(
-        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=None)
-    )
-
     out = await _check_backend_revision_serving(
         session,
         version,
@@ -690,23 +838,18 @@ def _predates_promotion_stale_mismatch(mocker):
 
 
 @pytest.mark.asyncio
-async def test_no_new_revision_substantiated_when_deploy_workflow_never_dispatched(
+async def test_backend_revision_timeout_names_artifact_not_deploy_workflow(
     mocker,
 ):
-    """A promotion whose deploy never happened no longer resolves to a bare
-    no_new_revision: the deploy-workflow run listing for the promoted SHA shows
-    NO deploy.yml run, so the timeout is substantiated as
-    deploy_workflow_never_dispatched — distinct from 'ran and failed' and from
-    'ran and the revision is stale'."""
+    """A stale backend signal reports the artifact, not a serving workflow."""
     from unittest.mock import AsyncMock
 
     from app.release_artifacts import _check_backend_revision_serving
 
     session, version = _predates_promotion_stale_mismatch(mocker)
-    # No deploy.yml run exists for the promoted SHA — the deploy workflow was
-    # never dispatched.
-    mocker.patch(
-        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=None)
+    workflow_lookup = mocker.patch(
+        "app.github.get_workflow_run_for_sha",
+        new=AsyncMock(side_effect=AssertionError("serving is not workflow-backed")),
     )
 
     out = await _check_backend_revision_serving(
@@ -717,112 +860,10 @@ async def test_no_new_revision_substantiated_when_deploy_workflow_never_dispatch
     )
     assert out == (
         "confirmation_timed_out",
-        "deploy_workflow_never_dispatched",
+        "backend_revision_serving_unobservable",
         None,
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("run", "expected_reason"),
-    [
-        # Completed non-success → the deploy workflow ran and failed.
-        (
-            {"run_id": 11, "status": "completed", "conclusion": "failure", "html_url": "u"},
-            "deploy_workflow_failed",
-        ),
-        (
-            {"run_id": 12, "status": "completed", "conclusion": "cancelled", "html_url": "u"},
-            "deploy_workflow_failed",
-        ),
-        # Completed success → the pipeline shipped but the promoted revision
-        # never served (stale revision).
-        (
-            {"run_id": 13, "status": "completed", "conclusion": "success", "html_url": "u"},
-            "deploy_workflow_succeeded_stale_revision",
-        ),
-        # Still in flight past the deadline → the deploy is stuck in the pipeline.
-        (
-            {"run_id": 14, "status": "in_progress", "conclusion": None, "html_url": "u"},
-            "deploy_workflow_in_progress",
-        ),
-    ],
-)
-async def test_no_new_revision_substantiated_by_deploy_workflow_conclusion(
-    mocker, run, expected_reason
-):
-    """The deploy-workflow run conclusion names the specific gate behind the
-    no_new_revision timeout: failed, succeeded-but-stale, or still-in-progress."""
-    from unittest.mock import AsyncMock
-
-    from app.release_artifacts import _check_backend_revision_serving
-
-    session, version = _predates_promotion_stale_mismatch(mocker)
-    mocker.patch(
-        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=run)
-    )
-
-    out = await _check_backend_revision_serving(
-        session,
-        version,
-        _Artifact(BACKEND_REVISION_ARTIFACT_KIND, None),
-        _now(),
-    )
-    assert out == ("confirmation_timed_out", expected_reason, None)
-
-
-@pytest.mark.asyncio
-async def test_no_new_revision_keeps_backstop_when_deploy_workflow_unavailable(mocker):
-    """A credential/API failure on the deploy-workflow lookup keeps the honest
-    no_new_revision backstop — never fabricate a specific gate from a failed
-    lookup (conservative: report, never silently confirm)."""
-    from unittest.mock import AsyncMock
-
-    from app.release_artifacts import _check_backend_revision_serving
-
-    session, version = _predates_promotion_stale_mismatch(mocker)
-    # The reclassifier resolves credentials once to run the ancestry check;
-    # the substantiation's own credential resolution then fails (e.g. a
-    # transient gap), so the deploy-workflow lookup cannot run — keep the
-    # honest no_new_revision backstop rather than fabricating a specific gate.
-    mocker.patch(
-        "app.release_promotion._resolve_github_with_session",
-        new=AsyncMock(side_effect=[("tok", "acme", "widget"), None]),
-    )
-    mocker.patch(
-        "app.github.get_workflow_run_for_sha",
-        new=AsyncMock(side_effect=AssertionError("must not be called without creds")),
-    )
-
-    out = await _check_backend_revision_serving(
-        session,
-        version,
-        _Artifact(BACKEND_REVISION_ARTIFACT_KIND, None),
-        _now(),
-    )
-    assert out == ("confirmation_timed_out", "no_new_revision", None)
-
-
-@pytest.mark.asyncio
-async def test_no_new_revision_keeps_backstop_when_workflow_lookup_raises(mocker):
-    """An exception from the deploy-workflow lookup keeps no_new_revision."""
-    from unittest.mock import AsyncMock
-
-    from app.release_artifacts import _check_backend_revision_serving
-
-    session, version = _predates_promotion_stale_mismatch(mocker)
-    mocker.patch(
-        "app.github.get_workflow_run_for_sha",
-        new=AsyncMock(side_effect=RuntimeError("github exploded")),
-    )
-
-    out = await _check_backend_revision_serving(
-        session,
-        version,
-        _Artifact(BACKEND_REVISION_ARTIFACT_KIND, None),
-        _now(),
-    )
-    assert out == ("confirmation_timed_out", "no_new_revision", None)
+    workflow_lookup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -919,12 +960,6 @@ async def test_redetection_tick_cannot_latch_deploy_failed(mocker):
             new=AsyncMock(return_value=("tok", "acme", "widget")),
         )
         mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
-        # No deploy.yml run for the promoted SHA — the timeout is substantiated
-        # as never-dispatched rather than the bare no_new_revision backstop.
-        mocker.patch(
-            "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=None)
-        )
-
         out = await _check_backend_revision_serving(
             session_dispatch,
             version,
@@ -935,7 +970,7 @@ async def test_redetection_tick_cannot_latch_deploy_failed(mocker):
         assert out[0] != "deploy_failed"
         assert out == (
             "confirmation_timed_out",
-            "deploy_workflow_never_dispatched",
+            "backend_revision_serving_unobservable",
             None,
         )
     finally:

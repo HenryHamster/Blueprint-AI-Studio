@@ -39,6 +39,7 @@ from app.models import (
     TaskStatus,
     TaskWakeRegistration,
     WakeDeliveryState,
+    get_task_lifetime_attempt_ordinal,
 )
 from app.auth import create_agent_token, create_vm_scoped_token
 from app.schemas import AgentStatusPayload
@@ -205,6 +206,85 @@ async def test_agent_claim_includes_compute_experiment_capability_slice(
         "compute_experiment"
     ]
     assert data["task_capability"] == expected
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_refreshes_only_current_strategic_policy(
+    client: AsyncClient, db_session
+):
+    """Queued Strategic work gets claim-time policy without rewriting provenance."""
+    from app.release_qualifier import _runtime_config
+
+    project = Project(name="Strategic Claim Policy", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_current = {
+        "threshold": 0.90,
+        "weights": {"audit": 0.6, "test_erosion": 0.4},
+        "source": "runtime_config",
+        "fallback_error": None,
+        "policy_hash": "stale-current-policy",
+    }
+    frozen_attempt = {
+        "threshold": 0.90,
+        "weights": {"audit": 0.6, "test_erosion": 0.4},
+        "source": "runtime_config",
+        "fallback_error": None,
+        "policy_hash": "frozen-attempt-policy",
+    }
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "strategic_review",
+                "current_effective_policy": stale_current,
+                "active_or_last_attempt_policy": frozen_attempt,
+                "version_phase": {
+                    "phase": "stabilize",
+                    "current_effective_policy": stale_current,
+                    "active_or_last_attempt_policy": frozen_attempt,
+                },
+            }
+        ],
+        vm_instance_id="agent-vm-strategic-policy",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-strategic-policy")
+    with patch.dict(
+        _runtime_config,
+        {
+            "promotion_threshold": 0.81,
+            "promotion_weights": {"audit": 0.6, "test_erosion": 0.4},
+        },
+        clear=False,
+    ):
+        response = await client.post(
+            "/api/agent/claim", headers={"x-agent-token": token}
+        )
+
+    assert response.status_code == 200, response.text
+    claimed = response.json()["payloads"][0]
+    assert claimed["current_effective_policy"]["threshold"] == pytest.approx(0.81)
+    assert claimed["current_effective_policy"]["source"] == "runtime_config"
+    assert claimed["version_phase"]["current_effective_policy"] == claimed[
+        "current_effective_policy"
+    ]
+    assert claimed["active_or_last_attempt_policy"] == frozen_attempt
+    assert (
+        claimed["version_phase"]["active_or_last_attempt_policy"]
+        == frozen_attempt
+    )
+
+    await db_session.refresh(task)
+    stored = task.first_payload
+    assert stored["current_effective_policy"] == stale_current
+    assert stored["version_phase"]["current_effective_policy"] == stale_current
+    assert stored["active_or_last_attempt_policy"] == frozen_attempt
 
 
 @pytest.mark.smoketest
@@ -651,24 +731,17 @@ async def test_agent_compute_job_launch_reuses_existing_active_job(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("artifact_status", "reason_code", "expected_aggregate", "expected_message"),
+    ("artifact_status", "reason_code"),
     [
-        ("unconfirmed", None, "unconfirmed", "waiting on required artifacts"),
-        (
-            "deploy_failed",
-            "image_not_live",
-            "deploy_failed",
-            "required artifacts failed",
-        ),
+        ("unconfirmed", None),
+        ("deploy_failed", "image_not_live"),
     ],
 )
-async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed(
+async def test_agent_compute_job_live_proof_ignores_optional_agent_image(
     client: AsyncClient,
     db_session,
     artifact_status,
     reason_code,
-    expected_aggregate,
-    expected_message,
 ):
     project = Project(name="Agent Compute Live Proof Gate", user_id="test-user-123")
     db_session.add(project)
@@ -723,17 +796,11 @@ async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed
         },
     )
 
-    assert resp.status_code == 412
-    detail = resp.json()["error"]["message"]
-    assert detail["error"] == "live_release_precondition_failed"
-    assert detail["reason"] == "release_not_serving_confirmed"
-    assert expected_message in detail["message"]
-    assert "agent_image" in detail["message"]
-    evidence = detail["live_release_evidence"]
-    assert evidence["release_version_number"] == 3
-    assert evidence["aggregate_serving_status"] == expected_aggregate
+    # agent_image remains observable, but #17189 deliberately removed it from
+    # the required serving aggregate so worker-fleet freshness cannot gate jobs.
+    assert resp.status_code == 200
     jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
-    assert jobs == []
+    assert len(jobs) == 1
 
 
 @pytest.mark.asyncio
@@ -1098,6 +1165,74 @@ async def test_agent_claim_retry_is_idempotent(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_research_contract_marker_is_not_backfilled_on_legacy_claim_replay(
+    client: AsyncClient,
+    db_session,
+):
+    """An already-running pre-release task keeps the legacy output contract."""
+
+    project = Project(name="Legacy Research Claim Replay", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "Inspect the existing system"}],
+        vm_instance_id="agent-vm-legacy-research-replay",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    headers = {
+        "x-agent-token": token,
+        "x-research-output-contract-version": "2",
+    }
+    first = await client.post("/api/agent/claim", headers=headers)
+    assert first.status_code == 200
+    assert first.json()["context"]["research_output_contract_version"] == 2
+
+    # Model a task whose original claim happened before the marker release while
+    # retaining the real immutable replay receipt/token binding.
+    await db_session.refresh(task)
+    legacy_context = dict(task.context or {})
+    legacy_context.pop("research_output_contract_version", None)
+    task.context = legacy_context
+    db_session.add(task)
+    await db_session.commit()
+
+    replay = await client.post("/api/agent/claim", headers=headers)
+    assert replay.status_code == 200
+    assert "research_output_contract_version" not in replay.json()["context"]
+    await db_session.refresh(task)
+    assert "research_output_contract_version" not in (task.context or {})
+
+    stale_runner_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "Claim from a stale runner"}],
+        vm_instance_id="agent-vm-stale-research-runner",
+        context={"research_output_contract_version": 2},
+    )
+    db_session.add(stale_runner_task)
+    await db_session.commit()
+    await db_session.refresh(stale_runner_task)
+    stale_token = create_agent_token(
+        str(stale_runner_task.id), stale_runner_task.vm_instance_id
+    )
+    stale_claim = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": stale_token}
+    )
+    assert stale_claim.status_code == 200
+    assert "research_output_contract_version" not in stale_claim.json()["context"]
+    await db_session.refresh(stale_runner_task)
+    assert "research_output_contract_version" not in (
+        stale_runner_task.context or {}
+    )
+
+
+@pytest.mark.asyncio
 async def test_resident_claim_survives_aborted_retry_projection_session(
     client: AsyncClient,
     db_session,
@@ -1267,6 +1402,93 @@ async def test_agent_heartbeat_updates_last_heartbeat(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
+    client: AsyncClient, db_session
+):
+    """A blocked local gate is retryable: persist the receipt, change no state.
+
+    ``./pr open`` reports the bounded ./check verdict when the publication gate
+    blocks before a PR exists. That outcome is retryable — the agent fixes the
+    failures and re-runs ./pr open — so it must NOT travel through the status
+    endpoint's BLOCKED_PRECONDITION branch, which releases the account slot,
+    retires the warm-pool member and deletes the VM the agent is still using.
+    """
+    project = Project(name="Gate Receipt Heartbeat", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-gate-receipt",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-gate-receipt")
+    headers = {"x-agent-token": token}
+    receipt = {
+        "status": "failed",
+        "command": "./check test",
+        "timeout_seconds": 600,
+        "hard_timeout_seconds": 1800,
+        "elapsed_seconds": 42,
+        "deadline_extended": False,
+        "exit_code": 23,
+        "authoritative_ci_required": False,
+        "recorded_at": "2026-08-11T00:00:00Z",
+    }
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "status_message": "local publication gate blocked with status failed",
+            "publication_gate_receipt": receipt,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert (task.context or {}).get("publication_gate_receipt") == receipt
+    # Non-terminal: the task keeps running on the same VM.
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.vm_instance_id == "agent-vm-gate-receipt"
+    assert task.vm_stopped_at is None
+    assert (task.context or {}).get("blocker") is None
+    assert (task.context or {}).get("_slot_released") is None
+
+    # A later gate run overwrites the receipt: the latest verdict is the
+    # authoritative one.
+    passed = {**receipt, "status": "passed", "exit_code": 0}
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "publication_gate_receipt": passed},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("publication_gate_receipt") == passed
+
+    # A malformed receipt is dropped, never partially persisted, and never
+    # 422s the heartbeat itself.
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "publication_gate_receipt": {"status": "failed"},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert (task.context or {}).get("publication_gate_receipt") == passed
+
+
+@pytest.mark.asyncio
 async def test_agent_heartbeat_upserts_vm_contact(client: AsyncClient, db_session):
     """Heartbeat false-reap fix (option B): a heartbeat upserts an uncontended
     vmcontact row keyed on vm_instance_id, independent of the contended task-row
@@ -1390,6 +1612,101 @@ async def test_agent_heartbeat_upserts_vm_contact_tool_use(
     contact3 = await db_session.get(VmContact, vm_id)
     assert contact3.last_tool_use_at is not None
     assert contact3.last_tool_use_at >= recorded
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_records_active_tool_subprogress_after_status_override(
+    client: AsyncClient, db_session, mocker
+):
+    """A productive long command is not stalled when status prose changes.
+
+    Regression: task 90e7f3c8 kept heartbeating during ``./check test`` and
+    reported recent sub-progress, but task-authored prose had replaced the
+    literal ``Using tool: Bash`` prefix.  Its tool_trace invocation timestamp
+    therefore stayed eight minutes old and the reaper killed healthy work.
+    The explicit active-tool stamp must advance both the task-scoped and shared
+    progress clocks independently of display text.
+    """
+    from app.models import TaskContact, VmContact
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    # _record_vm_contact intentionally commits through an independent session
+    # so task-row lock contention cannot drop the liveness signal. Bind that
+    # session to this test database as well as the request-scoped fixture.
+    contact_session = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    mocker.patch("app.routers.agent.AsyncSessionLocal", contact_session)
+
+    project = Project(name="Active Tool Progress", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "runner:active-tool-progress"
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=vm_id,
+        started_at=_utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow(),
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    headers = {"x-agent-token": create_agent_token(str(task.id), vm_id)}
+    invocation_at = _utcnow() - timedelta(minutes=9)
+    subprogress_at = _utcnow() - timedelta(seconds=20)
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "status_message": (
+                "The publication gate remains clean "
+                "(8m 0s elapsed, last sub-progress 20s ago)"
+            ),
+            "tool_trace": [
+                {
+                    "t": invocation_at.isoformat(),
+                    "tool": "Bash",
+                    "input_preview": "./check test",
+                }
+            ],
+            "active_tool_progress_at": subprogress_at.isoformat(),
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    shared = await db_session.get(VmContact, vm_id)
+    scoped = await db_session.get(TaskContact, task.id)
+    assert task.last_tool_use_at is not None
+    assert abs((task.last_tool_use_at - subprogress_at).total_seconds()) < 1
+    assert shared is not None
+    assert shared.last_tool_use_at is not None
+    assert abs((shared.last_tool_use_at - subprogress_at).total_seconds()) < 1
+    assert scoped is not None
+    assert scoped.last_tool_use_at is not None
+    assert abs((scoped.last_tool_use_at - subprogress_at).total_seconds()) < 1
+
+
+def test_latest_heartbeat_progress_ignores_implausible_future_active_stamp():
+    """A producer clock bug cannot pin the monotonic reaper clock in future."""
+    from app.routers.agent import _latest_heartbeat_progress_at
+    from app.schemas import ToolTraceEntry
+
+    trace_at = _utcnow() - timedelta(seconds=10)
+    trace = [
+        ToolTraceEntry(
+            t=trace_at.isoformat(), tool="Bash", input_preview="./check test"
+        )
+    ]
+    result = _latest_heartbeat_progress_at(
+        trace,
+        _utcnow() + timedelta(hours=1),
+    )
+    assert result is not None
+    assert abs((result - trace_at).total_seconds()) < 1
 
 
 @pytest.mark.asyncio
@@ -7904,10 +8221,37 @@ async def test_claim_injects_saturation_signals_for_research_task(
     project.directions = [
         {
             "id": direction_id,
-            "title": "Saturated direction",
+            "text": "Saturated direction",
             "priority": "low",
             "possibly_saturated": True,
+            "research_context": (
+                "## Failed Approaches\n"
+                "- Re-running the same broad repository scan\n"
+            ),
+            "context": {
+                "implementation_constraints": (
+                    "Preserve direction evidence while pivoting."
+                )
+            },
+            "recent_findings_evidence": [
+                {
+                    "claim": "The broad scan is already exhausted.",
+                    "sources": [{"type": "task", "ref": "prior-research"}],
+                }
+            ],
             "research_history": [
+                {
+                    "tasks_created": 2,
+                    "prs_merged": 1,
+                    "scope_breakdown": {
+                        "medium": {
+                            "created": 2,
+                            "merged": 1,
+                            "failed": 1,
+                            "avg_expansion_ratio_merged": 1.5,
+                        }
+                    },
+                },
                 {"tasks_created": 0, "filter_breakdown": {"hash_dedup": 2}},
                 {"tasks_created": 0, "filter_breakdown": {"hash_dedup": 1}},
                 {"tasks_created": 0, "filter_breakdown": {"word_overlap_dedup": 3}},
@@ -7930,14 +8274,35 @@ async def test_claim_injects_saturation_signals_for_research_task(
     await db_session.refresh(task)
 
     token = create_agent_token(str(task.id), "agent-vm-research-sat")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/claim",
+        headers={
+            "x-agent-token": token,
+            "x-research-output-contract-version": "2",
+        },
+    )
     assert resp.status_code == 200
+    assert resp.json()["context"]["research_output_contract_version"] == 2
+    await db_session.refresh(task)
+    assert task.context["research_output_contract_version"] == 2
     dc = resp.json().get("direction_context")
     assert dc is not None
     assert dc["possibly_saturated"] is True
     assert dc["deadlock_detected"] is True
-    # Research tasks should not get implementer-specific fields
-    assert "failed_approaches" not in dc
+    # Research analytics augment rather than replace the shared direction context.
+    assert dc["title"] == "Saturated direction"
+    assert dc["priority"] == "low"
+    assert dc["failed_approaches"][0]["text"] == (
+        "Re-running the same broad repository scan"
+    )
+    assert (
+        dc["implementation_constraints"]
+        == "Preserve direction evidence while pivoting."
+    )
+    assert dc["recent_findings_evidence"][0]["claim"] == (
+        "The broad scan is already exhausted."
+    )
+    assert dc["scope_success_rates"]["medium"]["avg_expansion_ratio"] == 1.5
 
 
 @pytest.mark.asyncio
@@ -10714,6 +11079,17 @@ async def test_blocker_persists_structured_need_into_context(
         "status": "FAILED",
         "failure_category": "BLOCKED_PRECONDITION",
         "logs": "BLOCKER: waiting on the shared auth foundation",
+        "publication_gate_receipt": {
+            "status": "failed",
+            "command": "./check test",
+            "timeout_seconds": 600,
+            "hard_timeout_seconds": 1800,
+            "elapsed_seconds": 42,
+            "deadline_extended": False,
+            "exit_code": 23,
+            "authoritative_ci_required": False,
+            "recorded_at": "2026-08-11T00:00:00Z",
+        },
         # kind=task requires an EXACT ref (UUID / finding hash) under the shared
         # exact-task-ref policy.
         "blocked_need": {"kind": "task", "ref": foundation_ref, "label": "auth"},
@@ -10726,6 +11102,10 @@ async def test_blocker_persists_structured_need_into_context(
     assert task.status == TaskStatus.BLOCKED
     need = ((task.context or {}).get("blocker") or {}).get("need")
     assert need == {"kind": "task", "ref": foundation_ref, "label": "auth"}
+    receipt = ((task.context or {}).get("blocker") or {}).get(
+        "publication_gate_receipt"
+    )
+    assert receipt == payload["publication_gate_receipt"]
 
 
 @pytest.mark.asyncio
@@ -13194,6 +13574,62 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
 
 
 @pytest.mark.asyncio
+async def test_strategic_review_completion_does_not_create_success_learning(
+    client: AsyncClient, db_session, mocker
+):
+    """Completing a Strategic review is not semantic proof of its decisions."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    capture_mock = mocker.patch(
+        "app.playbook_learning.capture_success_pattern",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Strategic Learning Containment",
+        user_id="test-user-strategic-learning",
+    )
+    project.design_doc = {
+        "playbook/strategic-guidance": {
+            "content": "Inspect current evidence before retiring a direction",
+            "applicable_types": ["strategic_review"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 2,
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review direction truth"}],
+        vm_instance_id="agent-vm-strategic-learning-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        context={"_shown_playbook_keys": ["strategic-guidance"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-strategic-learning-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED", "logs": "review ran"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    await db_session.refresh(project)
+    assert task.status == TaskStatus.COMPLETED
+    assert "_first_attempt_succeeded" not in task.context
+    assert project.design_doc["playbook/strategic-guidance"]["confirmed_count"] == 2
+    capture_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_completion_persists_when_playbook_capture_hits_lock_timeout(
     client: AsyncClient, db_session, mocker
 ):
@@ -14515,6 +14951,106 @@ async def test_rate_limit_requeue_clears_terminated_cache(
 
     # Clean up to avoid polluting other tests
     _terminated_task_ids.pop(task_id_str, None)
+
+
+@pytest.mark.asyncio
+async def test_runtime_unavailable_local_runner_records_decline_without_retry_burn(
+    client: AsyncClient, db_session, mocker
+):
+    """A post-claim provider/runtime mismatch must move to different hardware.
+
+    Discovery review is intentionally pinned to Anthropic.  Changing provider
+    would weaken its strict text-only contract, so the backend must preserve the
+    payload pin while recording the incapable local runner in the same
+    ``declined_by`` ledger used by pre-claim declines.
+    """
+    from app.routers.agent import _terminated_task_ids
+    from app.runner_decline import recently_declined_runner_ids
+
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    restore_resident_binding = mocker.patch(
+        "app.routers.agent_status._restore_resident_retry_binding",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="Runtime Runner Decline Test",
+        user_id="test-user-runtime-runner-decline",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = uuid.uuid4()
+    runner_vm_id = f"runner:{runner_id}"
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "discovery_review",
+                "prompt": "Judge the frozen discovery bet",
+                "provider_preference": ["anthropic"],
+            }
+        ],
+        vm_instance_id=runner_vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        context={
+            "runner_target_id": str(runner_id),
+            "runner_hostname": "iconlab-test",
+            "llm_provider": "anthropic",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    _terminated_task_ids.pop(task_id, None)
+    token = create_agent_token(task_id, runner_vm_id)
+    response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id,
+            "status": "FAILED",
+            "failure_category": "runtime_unavailable",
+            "logs": (
+                "Fatal error: text_only_provider_unavailable:anthropic:"
+                "cli_cannot_prove_toolless_strict_mcp_turn_cap"
+            ),
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "retrying"
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1, "runner incompatibility must not burn a code retry"
+    assert task.attempt_history[-1]["attempt_ordinal"] == 2
+    assert get_task_lifetime_attempt_ordinal(task) == 3
+    assert task.retry_after_until is None
+    assert task.first_payload["provider_preference"] == ["anthropic"]
+    assert recently_declined_runner_ids(task) == {str(runner_id)}
+    record = task.context["declined_by"][str(runner_id)]
+    assert record["count"] == 1
+    assert record["hostname"] == "iconlab-test"
+    assert record["same_runner_retryable"] is False
+    assert "text_only_provider_unavailable:anthropic" in record["reason"]
+    assert "runner_target_id" not in task.context
+    assert "runner_hostname" not in task.context
+    assert task_id not in _terminated_task_ids
+    restore_resident_binding.assert_awaited_once()
+    assert restore_resident_binding.await_args.kwargs["excluded_runner_ids"] == {
+        str(runner_id)
+    }
+
+    _terminated_task_ids.pop(task_id, None)
 
 
 @pytest.mark.asyncio
@@ -17879,6 +18415,79 @@ async def test_next_role_claims_warm_pinned_queued_task(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("advertise_contract", [True, False])
+async def test_next_role_research_contract_capability_handshake(
+    client: AsyncClient,
+    db_session,
+    advertise_contract: bool,
+):
+    """The authoritative warm claim negotiates strict output per attempt."""
+    project = Project(
+        name=f"Warm Research Contract {advertise_contract}",
+        user_id="test-user-123",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = f"agent-vm-warm-research-contract-{advertise_contract}"
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.COMPLETED,
+    )
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "research", "prompt": "Inspect the bounded direction"}
+        ],
+        status=TaskStatus.QUEUED,
+        # Seed a prior-attempt marker to prove a stale claimant clears it.
+        context={
+            "warm_target_vm_id": vm_id,
+            "warm_handoff_deadline": (
+                _utcnow() + timedelta(seconds=240)
+            ).isoformat(),
+            "research_output_contract_version": 2,
+        },
+    )
+    db_session.add_all([prior_task, pinned_task])
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+
+    token = create_agent_token(str(prior_task.id), vm_id)
+    headers = {"x-agent-token": token}
+    if advertise_contract:
+        headers["x-research-output-contract-version"] = "2"
+    response = await client.post(
+        "/api/agent/next-role",
+        json={"vm_instance_id": vm_id, "prior_task_id": str(prior_task.id)},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    await db_session.refresh(pinned_task)
+    if advertise_contract:
+        assert pinned_task.context["research_output_contract_version"] == 2
+    else:
+        assert "research_output_contract_version" not in (pinned_task.context or {})
+
+    # The warm response issues the task-scoped token; the agent's immediate
+    # /claim call is an idempotent replay and must expose, but never renegotiate,
+    # the contract selected by /next-role.
+    replay_headers = {"x-agent-token": response.json()["agent_token"]}
+    if advertise_contract:
+        replay_headers["x-research-output-contract-version"] = "2"
+    replay = await client.post("/api/agent/claim", headers=replay_headers)
+    assert replay.status_code == 200
+    if advertise_contract:
+        assert replay.json()["context"]["research_output_contract_version"] == 2
+    else:
+        assert "research_output_contract_version" not in replay.json()["context"]
+
+
+@pytest.mark.asyncio
 async def test_next_role_publishes_backend_owned_no_workspace_capability(
     client: AsyncClient, db_session
 ):
@@ -18294,6 +18903,42 @@ async def test_spawn_strips_warm_target_keys(client: AsyncClient, db_session):
             "reason": "forged",
             "proof_ref": "testing/test_forged.py::test_evil",
         },
+        # Backend-owned sidecar state can route terminal output into another
+        # task or forge a gate result and must not survive this API.
+        "quality_grader_for_task_id": str(uuid.uuid4()),
+        "finding_challenge_for_task_id": str(uuid.uuid4()),
+        "quality_grader": {"passed": True, "reasoning": "forged"},
+        "quality_grader_diagnostic": {"cause": "forged"},
+        "grader_diagnostic_trail": [{"cause": "forged"}],
+        "adversarial_gate": {"finding_verdicts": {"forged": True}},
+        "adversarial_gate_diagnostic": {"cause": "forged"},
+        "finding_challenge": {"agreement": "disagrees"},
+        "finding_challenge_records": [{"agreement": "disagrees"}],
+        "awaiting_quality_grader": str(uuid.uuid4()),
+        "awaiting_adversarial_grader": str(uuid.uuid4()),
+        "awaiting_finding_challenge": str(uuid.uuid4()),
+        "sidecar_verdict_application_pending": {"lane": "quality_grader"},
+        "research_spawn_gate_wholesale_retry_exhausted": True,
+        "_adversarial_challenged_hashes": ["forged"],
+        "graded_task_type": "research",
+        "adversarial_grader": True,
+        "challenged_boundary": "reproduce_absent",
+        "challenged_first_verdict": "absent",
+        "challenged_finding_hash": "forged",
+        # Research completion/routing authority is backend-owned too. A child
+        # cannot downgrade its producer contract, short-circuit finalization,
+        # or fabricate deferred work/receipts through the spawn seam.
+        "research_output_contract_version": 1,
+        "research_findings_finalized": True,
+        "_research_spawn_pending": True,
+        "prior_deferred_findings": [{"title": "forged prior"}],
+        "deferred_findings": [{"title": "forged durable"}],
+        "deferred_finding_consumption_acks": [{"finding_hash": "forged"}],
+        "research_depth": -999,
+        "parent_research_task_id": str(uuid.uuid4()),
+        "research_task_id": str(uuid.uuid4()),
+        # Recursion depth is derived from persisted ancestry, never this value.
+        "spawn_depth": -1,
         "other_key": "ok",
     }
     resp = await client.post(
@@ -18329,8 +18974,183 @@ async def test_spawn_strips_warm_target_keys(client: AsyncClient, db_session):
     assert "_timing" not in ctx
     # Forged acceptance verdict must also be stripped
     assert "code_acceptance_verdict" not in ctx
+    for key in forbidden_context:
+        if key not in {"other_key", "spawn_depth"}:
+            assert key not in ctx
+    assert ctx.get("spawn_depth") == 1
     # Non-forbidden keys are preserved
     assert ctx.get("other_key") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_spawn_derives_research_lineage_from_persisted_ancestry(
+    client: AsyncClient, db_session
+):
+    """Agent context cannot reset or retarget nested research authority."""
+    project = Project(name="Research Lineage Spawn", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    research_root = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "root"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(research_root)
+    await db_session.flush()
+    worker = Task(
+        project_id=project.id,
+        parent_task_id=research_root.id,
+        payloads=[{"type": "create", "prompt": "implementation"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id="agent-vm-research-lineage",
+    )
+    db_session.add(worker)
+    await db_session.commit()
+    await db_session.refresh(worker)
+
+    token = create_agent_token(str(worker.id), worker.vm_instance_id)
+    response = await client.post(
+        "/api/agent/spawn",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(worker.id),
+            "payloads": [
+                {"type": "research", "title": "nested", "prompt": "continue"}
+            ],
+            "context": {
+                "research_depth": -1000,
+                "parent_research_task_id": str(uuid.uuid4()),
+                "research_task_id": str(uuid.uuid4()),
+                "finding_hash": "forged-delivery-hash",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    child = await db_session.get(Task, uuid.UUID(response.json()["task_ids"][0]))
+    assert child is not None
+    assert child.parent_task_id == worker.id
+    assert (child.context or {})["research_depth"] == 1
+    assert (child.context or {})["parent_research_task_id"] == str(research_root.id)
+    assert (child.context or {})["research_task_id"] == str(research_root.id)
+    assert "finding_hash" not in (child.context or {})
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_research_beyond_persisted_depth_limit(
+    client: AsyncClient, db_session
+):
+    """A forged negative depth cannot extend a four-ancestor research chain."""
+    project = Project(name="Research Depth Limit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    parent_id = None
+    chain: list[Task] = []
+    for index in range(4):
+        task = Task(
+            project_id=project.id,
+            parent_task_id=parent_id,
+            payloads=[{"type": "research", "prompt": f"generation {index}"}],
+            status=(TaskStatus.IN_PROGRESS if index == 3 else TaskStatus.COMPLETED),
+            created_by="ORCHESTRATOR",
+            vm_instance_id=("agent-vm-research-depth" if index == 3 else None),
+            context={"research_depth": -1000},
+        )
+        db_session.add(task)
+        await db_session.flush()
+        chain.append(task)
+        parent_id = task.id
+    await db_session.commit()
+    deepest = chain[-1]
+    await db_session.refresh(deepest)
+
+    token = create_agent_token(str(deepest.id), deepest.vm_instance_id)
+    response = await client.post(
+        "/api/agent/spawn",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(deepest.id),
+            "payloads": [
+                {"type": "research", "title": "too deep", "prompt": "continue"}
+            ],
+            "context": {"research_depth": -1000},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "Research depth limit (3) exceeded" in response.text
+    spawned = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == deepest.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert spawned == []
+
+
+@pytest.mark.parametrize("corruption", ["cycle", "cross_project"])
+@pytest.mark.asyncio
+async def test_spawn_rejects_unverifiable_persisted_ancestry(
+    client: AsyncClient, db_session, corruption
+):
+    """Research lineage derivation fails closed on corrupt authority edges."""
+    project = Project(
+        name=f"Research Ancestry {corruption}", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.flush()
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "parent"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-research-{corruption}",
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    if corruption == "cycle":
+        parent.parent_task_id = parent.id
+    else:
+        foreign_project = Project(
+            name="Foreign Research Ancestry", user_id="test-user-123"
+        )
+        db_session.add(foreign_project)
+        await db_session.flush()
+        foreign_parent = Task(
+            project_id=foreign_project.id,
+            payloads=[{"type": "research", "prompt": "foreign"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(foreign_parent)
+        await db_session.flush()
+        parent.parent_task_id = foreign_parent.id
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    token = create_agent_token(str(parent.id), parent.vm_instance_id)
+    response = await client.post(
+        "/api/agent/spawn",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(parent.id),
+            "payloads": [
+                {"type": "research", "title": "child", "prompt": "continue"}
+            ],
+            "context": {"research_depth": -1000},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "Spawn depth limit (5) exceeded" in response.text
 
 
 @pytest.mark.asyncio
@@ -23399,6 +24219,137 @@ async def test_failed_status_without_report_drops_stale_report(
     # classifies CODE_ERROR and burns the retry — same as the no-report test.
     assert ctx.get("agent_failure_category_raw") == "claude_code_failed"
     assert task.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_two_failed_retries_bank_distinct_attempt_diagnostics(
+    client: AsyncClient, db_session, mocker
+):
+    """Each failed agent run keeps its own report/message before fresh reset."""
+    import app.max_plan_pool as pool_mod
+
+    account_id = "aaaaaaaa-0001-4000-a000-00000000er04"
+    pool = _healthy_account_pool_and_task_ctx(account_id)
+    mocker.patch.object(pool_mod, "_account_by_id", pool)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(
+        name="Per-attempt Failure Diagnostics Test",
+        user_id="test-user-attempt-diagnostics-001",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first_vm_id = "agent-vm-attempt-diagnostics-001"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test retry forensics"}],
+        vm_instance_id=first_vm_id,
+        vm_provisioned_at=_utcnow() - timedelta(minutes=2),
+        started_at=_utcnow() - timedelta(minutes=2),
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": account_id, "llm_model": "claude-sonnet-4-6"},
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    first_response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id_str,
+            "status": "FAILED",
+            "failure_category": "test_failed",
+            "logs": "first attempt unit tests failed",
+            "error_report": {
+                "schema": 1,
+                "task_id": task_id_str,
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "exit_code": 1,
+                "duration_ms": 120_000,
+                "model_output_seen": True,
+                "result_event_seen": True,
+                "provider_errors": [],
+                "stderr_tail": "first structured stderr",
+                "last_stream_event": "result",
+            },
+        },
+        headers={"x-agent-token": create_agent_token(task_id_str, first_vm_id)},
+    )
+    assert first_response.status_code == 200, first_response.text
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1
+    assert task.attempt_history is not None
+    assert len(task.attempt_history) == 1
+    first_snapshot = task.attempt_history[0]
+    assert first_snapshot["attempt_ordinal"] == 1
+    assert first_snapshot["retry_count_at_bank"] == 1
+    assert first_snapshot["failure_class"] == "CODE_ERROR"
+    assert first_snapshot["agent_failure_category_raw"] == "test_failed"
+    assert first_snapshot["failure_message_tail"] == "first attempt unit tests failed"
+    assert first_snapshot["agent_error_report"]["stderr_tail"] == (
+        "first structured stderr"
+    )
+
+    # Model a fresh dispatch of the queued retry.  The first report was stripped
+    # by reset_task_for_fresh_attempt; the second status deliberately omits one.
+    second_vm_id = "agent-vm-attempt-diagnostics-002"
+    task.status = TaskStatus.IN_PROGRESS
+    task.vm_instance_id = second_vm_id
+    task.vm_provisioned_at = _utcnow() - timedelta(minutes=1)
+    task.started_at = _utcnow() - timedelta(minutes=1)
+    task.context = {
+        **(task.context or {}),
+        "llm_account_id": account_id,
+        "llm_model": "claude-sonnet-4-6",
+    }
+    pool[account_id]["active_tasks"] = 1
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    second_response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id_str,
+            "status": "FAILED",
+            "failure_category": "incomplete",
+            "logs": "second attempt exited before publishing",
+        },
+        headers={"x-agent-token": create_agent_token(task_id_str, second_vm_id)},
+    )
+    assert second_response.status_code == 200, second_response.text
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 2
+    assert task.attempt_history is not None
+    assert len(task.attempt_history) == 2
+    first_snapshot, second_snapshot = task.attempt_history
+    assert [
+        first_snapshot["attempt_ordinal"],
+        second_snapshot["attempt_ordinal"],
+    ] == [1, 2]
+    assert [
+        first_snapshot["retry_count_at_bank"],
+        second_snapshot["retry_count_at_bank"],
+    ] == [1, 2]
+    assert second_snapshot["failure_class"] == "CODE_ERROR"
+    assert second_snapshot["agent_failure_category_raw"] == "incomplete"
+    assert second_snapshot["failure_message_tail"] == (
+        "second attempt exited before publishing"
+    )
+    assert "agent_error_report" in first_snapshot
+    assert "agent_error_report" not in second_snapshot, (
+        "a report-less retry must not inherit the previous attempt's report"
+    )
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ constants) remain importable and test-patchable at their original paths.
 
 from __future__ import annotations
 
+
 import logging
 from datetime import datetime
 from typing import Any
@@ -32,7 +33,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
-from app.release_artifacts import required_release_artifact_kinds
+from app.release_artifacts import iter_release_artifact_providers
 from app.release_promotion import _notify_operator, _resolve_github_with_session
 from app.release_reconciliation import (
     _confirm_serving_or_fail,
@@ -65,8 +66,14 @@ from app.release_qualifier_redrive import (
     _redrive_rubric_changed_qualification,
     _redrive_walkthrough_contract_qualification,
 )
+from app.release_qualifier_hotfix_audit import (
+    _hotfix_audit_recovery_candidate_ids,
+    _hotfix_audit_was_attempted,  # noqa: F401 — re-exported for tests
+    _reconcile_hotfix_audit_trail,
+)
 
 logger = logging.getLogger(__name__)
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2034
 
 
 # Audit H2: hard wall-clock bound on a single qualification.  A qualification
@@ -100,167 +107,51 @@ _MAX_SWEEP_CRASH_STREAK = 3
 _DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS = 24 * 3600
 
 
-def _hotfix_audit_was_attempted(qual: dict[str, Any]) -> bool:
-    """Recognize promoted and durably persisted hotfix wait states."""
-    promotion_pending = qual.get("promotion_pending")
-    persisted_wait = (
-        qual.get("status") == "pending"
-        and isinstance(promotion_pending, dict)
-        and promotion_pending.get("pr_number") is not None
-    )
-    return qual.get("status") == "promoted" or persisted_wait
+async def _serving_confirmation_candidate_ids(session) -> list:
+    """Return promoted versions whose serving evidence still needs a check.
 
-
-async def _reconcile_hotfix_audit_trail(
-    version_id: Any, *, session_factory=None
-) -> bool:
-    """Restore a hotfix's debt/Alert after its request session was lost.
-
-    The hotfix promotion commits in its own session because ``promote`` releases
-    its lock mid-flight.  Re-read the committed provenance under a fresh
-    transaction and repair only the missing artifact while holding the version
-    lock.  The request path uses this same function, so it cannot race the
-    periodic recovery writer.
+    The legacy version scalar remains a fast path for newly promoted releases,
+    but it is not the complete candidate state: optional provider rows remain
+    observable after the required aggregate confirms.  Include every persisted
+    row for a registered provider with a NULL/unconfirmed status so an optional
+    dimension such as ``agent_image`` cannot freeze after backend serving is
+    confirmed.  There is intentionally no fixed row cap: every candidate is
+    visited each sweep, in deterministic promoted-at/id order, and each
+    provider check already has its own confirmation deadline bound.
     """
-    from app import release_qualifier
-    from app.completion_debt import (
-        hotfix_deploy_alert_dedupe_key,
-        hotfix_deploy_debt_dedupe_key,
+    registered_artifact_kinds = tuple(
+        provider.artifact_kind for provider in iter_release_artifact_providers()
     )
-    from app.models import CompletionDebtEntry
-
-    factory = session_factory or AsyncSessionLocal
-    async with factory() as audit_session:
-        version = (
-            (
-                await audit_session.execute(
-                    select(release_version.ReleaseVersion)
-                    .where(release_version.ReleaseVersion.id == version_id)
-                    .with_for_update()
-                )
-            )
-            .scalars()
-            .first()
-        )
-        qual = dict(version.last_qualification or {}) if version else {}
-        candidate_sha = qual.get("candidate_sha")
-        if not (
-            qual.get("hotfix_promote") is True
-            and isinstance(candidate_sha, str)
-            and candidate_sha
-            and _hotfix_audit_was_attempted(qual)
-        ):
-            return False
-        debt_key = hotfix_deploy_debt_dedupe_key(version.project_id, candidate_sha)
-        alert_key = hotfix_deploy_alert_dedupe_key(version.project_id, candidate_sha)
-        debt = (
-            await audit_session.execute(
-                select(CompletionDebtEntry).where(
-                    CompletionDebtEntry.dedupe_key == debt_key
-                )
-            )
-        ).scalars().first()
-        alert = (
-            await audit_session.execute(
-                select(Alert).where(
-                    Alert.project_id == version.project_id,
-                    Alert.dedupe_key == alert_key,
-                )
-            )
-        ).scalars().first()
-        if debt is not None and alert is not None:
-            return False
-        await release_qualifier._record_hotfix_audit_trail(
-            audit_session,
-            version.project_id,
-            candidate_sha=candidate_sha,
-            actor=qual.get("hotfix_promote_by"),
-            reason=qual.get("hotfix_promote_reason"),
-            scope_modules=qual.get("hotfix_promote_scope_modules"),
-            diff_file_list=qual.get("hotfix_promote_diff_file_list"),
-            prior_deployed_sha=qual.get("hotfix_promote_prior_deployed_sha"),
-            record_debt=debt is None,
-            record_alert=alert is None,
-        )
-        await audit_session.commit()
-        return True
-
-
-async def _hotfix_audit_recovery_candidate_ids(session: AsyncSession) -> list[Any]:
-    """Return hotfix versions whose debt or Alert is missing.
-
-    The first query uses JSON provenance to exclude ordinary release history.
-    Two bulk artifact reads then exclude completed hotfixes before the sweep
-    opens a dedicated transaction or takes a row lock.  The under-lock helper
-    remains the authority because request completion can race this snapshot.
-    """
-    from app.completion_debt import (
-        hotfix_deploy_alert_dedupe_key,
-        hotfix_deploy_debt_dedupe_key,
-    )
-    from app.models import CompletionDebtEntry
-
-    hotfix_rows = list(
-        (
-            await session.execute(
-                select(
-                    release_version.ReleaseVersion.id,
-                    release_version.ReleaseVersion.project_id,
-                    release_version.ReleaseVersion.last_qualification,
-                ).where(
-                    release_version.ReleaseVersion.status.in_(("open", "promoted")),
-                    release_version.ReleaseVersion.last_qualification[
-                        "hotfix_promote"
-                    ]
-                    .as_boolean()
-                    .is_(True),
-                )
-            )
-        ).all()
-    )
-    candidates: list[tuple[Any, str, str]] = []
-    for version_id, project_id, raw_qual in hotfix_rows:
-        qual = dict(raw_qual or {})
-        candidate_sha = qual.get("candidate_sha")
-        if not (
-            isinstance(candidate_sha, str)
-            and candidate_sha
-            and _hotfix_audit_was_attempted(qual)
-        ):
-            continue
-        candidates.append(
-            (
-                version_id,
-                hotfix_deploy_debt_dedupe_key(project_id, candidate_sha),
-                hotfix_deploy_alert_dedupe_key(project_id, candidate_sha),
+    unresolved_filter = release_version.ReleaseVersion.serving_status == "unconfirmed"
+    if registered_artifact_kinds:
+        pending_artifact_exists = exists(
+            select(ReleaseDeployArtifact.id).where(
+                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
+                ReleaseDeployArtifact.artifact_kind.in_(registered_artifact_kinds),
+                or_(
+                    ReleaseDeployArtifact.serving_status.is_(None),
+                    ReleaseDeployArtifact.serving_status == "unconfirmed",
+                ),
             )
         )
-    if not candidates:
-        return []
-
-    debt_keys = {debt_key for _, debt_key, _ in candidates}
-    alert_keys = {alert_key for _, _, alert_key in candidates}
-    existing_debt_keys = set(
+        unresolved_filter = or_(unresolved_filter, pending_artifact_exists)
+    return list(
         (
             await session.execute(
-                select(CompletionDebtEntry.dedupe_key).where(
-                    CompletionDebtEntry.dedupe_key.in_(debt_keys)
+                select(release_version.ReleaseVersion.id)
+                .where(
+                    release_version.ReleaseVersion.status == "promoted",
+                    unresolved_filter,
+                )
+                .order_by(
+                    release_version.ReleaseVersion.promoted_at.asc().nullsfirst(),
+                    release_version.ReleaseVersion.id.asc(),
                 )
             )
-        ).scalars()
+        )
+        .scalars()
+        .all()
     )
-    existing_alert_keys = set(
-        (
-            await session.execute(
-                select(Alert.dedupe_key).where(Alert.dedupe_key.in_(alert_keys))
-            )
-        ).scalars()
-    )
-    return [
-        version_id
-        for version_id, debt_key, alert_key in candidates
-        if debt_key not in existing_debt_keys or alert_key not in existing_alert_keys
-    ]
 
 
 def _parse_started_at(qual: dict[str, Any]) -> datetime | None:
@@ -1179,6 +1070,36 @@ async def _recheck_ci_compliance_blocked_version(
         return True
 
 
+async def _current_integration_audited_surface(
+    session: AsyncSession, project: Project
+) -> dict[str, str] | None:
+    """Read the audited-surface map for the live integration HEAD."""
+    resolved = await _resolve_github_with_session(session, project)
+    if resolved is None:
+        return None
+    token, owner, repo = resolved
+    from app import github, release_qualifier
+    from app.release_qualifier_audit_surface import audited_surface_path_map
+    try:
+        integration_branch, _ = release_qualifier._lts_branch_names(project)
+        head_sha = await github.get_branch_sha(
+            token, owner, repo, integration_branch
+        )
+        if not head_sha:
+            return None
+        entries = await github.list_repo_tree_paths_at_ref(
+            token, owner, repo, head_sha, project_id=str(project.id)
+        )
+    except Exception:  # noqa: BLE001 — readiness remains fail-open on GitHub errors
+        logger.warning(
+            "[RELEASE_QUALIFIER] integration audited-surface lookup failed for %s",
+            project.id,
+            exc_info=True,
+        )
+        return None
+    return None if entries is None else audited_surface_path_map(entries)
+
+
 async def _fire_auto_triggered_qualification(
     version_id: Any,
     *,
@@ -1319,13 +1240,28 @@ async def _fire_auto_triggered_qualification(
             return False
         try:
             from app import category_verdict_ledger as _cvl
-            from app.release_readiness import compute_requalification_readiness
+            from app.release_readiness import (
+                auto_mark_stale_audit_findings,
+                compute_requalification_readiness,
+            )
 
             _is_candidate_fully_met = await _cvl.is_candidate_fully_met(
                 fire_session, version.id, qual.get("candidate_sha")
             )
+            current_surface = await _current_integration_audited_surface(
+                fire_session, project
+            )
+            if current_surface:
+                await auto_mark_stale_audit_findings(
+                    fire_session,
+                    version.project_id,
+                    version.id,
+                    current_surface,
+                )
             _readiness = await compute_requalification_readiness(
-                fire_session, version.project_id
+                fire_session,
+                version.project_id,
+                candidate_surface_paths=current_surface,
             )
         except Exception:  # noqa: BLE001 — best-effort sweep; defer to next cycle
             logger.exception(
@@ -1518,6 +1454,34 @@ async def sweep_stuck_qualifications(
             logger.exception(
                 "[RELEASE_QUALIFIER] sweep: acceptance evidence refresh failed "
                 "for version %s",
+                version_id,
+            )
+
+    # The durable rehearsal dispatcher runs before this sweep. Once it has
+    # persisted a candidate-bound receipt, resume only the qualification that
+    # was explicitly parked waiting for that receipt. This path is independent
+    # of the general auto-trigger knob: it completes an already-authorized
+    # attempt and remains inert for missing, invalid, or stale evidence.
+    from app.release_prepromotion_rehearsal import (
+        redrive_rehearsal_ready_qualification,
+    )
+
+    for version_id in version_ids:
+        try:
+            redriven = await redrive_rehearsal_ready_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: rehearsal-ready re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove rehearsal-ready version %s",
                 version_id,
             )
 
@@ -1920,42 +1884,7 @@ async def sweep_stuck_qualifications(
     # dedicated session, and either confirm it serving or land a distinct loud
     # deploy-failed state.  Unlike the loops above this scans PROMOTED versions
     # (the rest target ``open`` ones), so it runs its own narrow query.
-    required_artifact_kinds = required_release_artifact_kinds()
-    unresolved_filter = release_version.ReleaseVersion.serving_status == "unconfirmed"
-    if required_artifact_kinds:
-        pending_artifact_exists = exists(
-            select(ReleaseDeployArtifact.id).where(
-                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
-                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
-                or_(
-                    ReleaseDeployArtifact.serving_status.is_(None),
-                    ReleaseDeployArtifact.serving_status == "unconfirmed",
-                ),
-            )
-        )
-        # NOTE: We do NOT compare artifact row count against len(required_artifact_kinds).
-        # Per-project observable arming intentionally creates only the observable provider
-        # subset (e.g. only promotion_merge for non-deploy GitHub projects). Comparing
-        # against the global required count would always match external projects as
-        # "missing rows" and re-enter _confirm_serving_or_fail forever after resolution.
-        # The serving_status=="unconfirmed" scalar catches newly-promoted versions before
-        # any rows exist; pending_artifact_exists catches versions with unresolved rows.
-        unresolved_filter = or_(
-            unresolved_filter,
-            pending_artifact_exists,
-        )
-    unconfirmed_ids = list(
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion.id).where(
-                    release_version.ReleaseVersion.status == "promoted",
-                    unresolved_filter,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    unconfirmed_ids = await _serving_confirmation_candidate_ids(session)
     for version_id in unconfirmed_ids:
         try:
             resolved = await _confirm_serving_or_fail(
@@ -2025,6 +1954,22 @@ async def sweep_stuck_qualifications(
                 "(promoted SHA confirmed serving after a prior latch)",
                 version_id,
             )
+
+    # Serving confirmation predates the authorship receipt on some releases.
+    # Retry only a bounded promoted/serving-confirmed subset; the receipt writer
+    # itself is idempotent and CAS-protected, so this also upgrades legacy and
+    # retryable receipts without changing serving or promotion truth.
+    try:
+        from app.release_commit_authorship import reconcile_serving_authorship_evidence
+
+        await reconcile_serving_authorship_evidence(
+            session_factory=session_factory,
+            limit=25,
+        )
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] sweep: serving authorship reconciliation failed"
+        )
 
     # Standing full-suite drift sentinel: canonical and ON by default, dispatch
     # ci.yml on the integration branch for each open version (the only opt-out

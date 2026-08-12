@@ -21,6 +21,7 @@ import pytest
 from sqlmodel import select
 
 from app import hotfix_backmerge as hb
+from app import release_qualifier as rq
 from app import size_limit_policy as slp
 from app.models import Alert, Project
 from app.size_limit_policy import (
@@ -35,6 +36,7 @@ from app.size_limit_policy import (
     classify_breach,
     parse_bump_history,
 )
+from testing import check_size_limits as csl
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +108,254 @@ async def _alerts_for(db_session, project_id) -> list[Alert]:
         .scalars()
         .all()
     )
+
+
+def _write_lines(path: Path, count: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(f"line {i}" for i in range(count)) + "\n")
+
+
+def _checker_repo(root: Path, *, source_exists: bool = True) -> Path:
+    """Create the minimal checker checkout used by baseline attribution tests."""
+    testing_dir = root / "backend" / "testing"
+    testing_dir.mkdir(parents=True)
+    (root / "backend" / "app").mkdir(parents=True)
+    (testing_dir / "module_size_limits.json").write_text(
+        json.dumps(
+            {"_doc": "fixture", "backend": {"deleted.py": 100}},
+            indent=2,
+        )
+        + "\n"
+    )
+    if source_exists:
+        _write_lines(root / "backend" / "app" / "deleted.py", 20)
+    return root
+
+
+def _ledger_finding(
+    *,
+    status: str,
+    sha: str = "deadbeef" * 5,
+) -> tuple:
+    if status == "phantom":
+        return (
+            "backend",
+            "deleted.py",
+            50,
+            100,
+            sha,
+            "commit's diff shows no recorded bump for this key/pair",
+        )
+    return (
+        "backend",
+        "deleted.py",
+        50,
+        100,
+        sha,
+        "2026-01-01T00:00:00+00:00",
+        status,
+    )
+
+
+def _run_checker(repo: Path, base: Path) -> int:
+    return csl.main(
+        [
+            "--json",
+            str(repo / "backend" / "testing" / "module_size_limits.json"),
+            "--repo-root",
+            str(repo),
+            "--base-root",
+            str(base),
+            "--sections",
+            "backend",
+        ]
+    )
+
+
+def test_checker_inherited_stale_cap_does_not_fail_unrelated_diff(tmp_path, capsys):
+    """A stale cap already present on base is advisory, not task-owned drift."""
+    repo = _checker_repo(tmp_path / "repo", source_exists=False)
+    base = _checker_repo(tmp_path / "base", source_exists=False)
+
+    assert _run_checker(repo, base) == 0
+    output = capsys.readouterr().out
+    assert "[pre-existing] backend/deleted.py" in output
+    assert "[stale-cap]" not in output
+
+
+def test_checker_stale_cap_introduced_by_diff_still_fails(tmp_path, capsys):
+    """Deleting a file on the task branch keeps the stale-cap finding blocking."""
+    repo = _checker_repo(tmp_path / "repo", source_exists=False)
+    base = _checker_repo(tmp_path / "base", source_exists=True)
+
+    assert _run_checker(repo, base) == 1
+    output = capsys.readouterr().out
+    assert "[stale-cap] backend/deleted.py" in output
+    assert "[pre-existing]" not in output
+
+
+@pytest.mark.parametrize("finding_kind", ["phantom", "absent"])
+def test_checker_inherited_ledger_finding_does_not_fail_unrelated_diff(
+    tmp_path, capsys, mocker, finding_kind
+):
+    """The same phantom or absent record on base is not blamed on this task."""
+    repo = _checker_repo(tmp_path / "repo")
+    base = _checker_repo(tmp_path / "base")
+    finding = _ledger_finding(
+        status=(
+            slp.LEDGER_BUMP_ABSENT
+            if finding_kind == "absent"
+            else "phantom"
+        )
+    )
+
+    def findings_for(*, repo_root, **_kwargs):
+        return [finding]
+
+    mocker.patch(
+        "app.size_limit_policy.phantom_ledger_records",
+        side_effect=(findings_for if finding_kind == "phantom" else lambda **_kwargs: []),
+    )
+    mocker.patch(
+        "app.size_limit_policy.missing_ledger_bump_records",
+        side_effect=(findings_for if finding_kind == "absent" else lambda **_kwargs: []),
+    )
+    mocker.patch("app.size_limit_policy._mainline_git_ref", return_value="main")
+    (repo / ".git").mkdir()
+    (base / ".git").mkdir()
+
+    assert _run_checker(repo, base) == 0
+    output = capsys.readouterr().out
+    marker = "[ledger-phantom]" if finding_kind == "phantom" else "[ledger-missing]"
+    assert "[pre-existing] backend/deleted.py" in output
+    assert marker not in output
+
+
+@pytest.mark.parametrize("finding_kind", ["phantom", "absent"])
+def test_checker_new_ledger_finding_still_fails(tmp_path, capsys, mocker, finding_kind):
+    """A ledger finding absent from base remains attributed to this task."""
+    repo = _checker_repo(tmp_path / "repo")
+    base = _checker_repo(tmp_path / "base")
+    finding = _ledger_finding(
+        status=(
+            slp.LEDGER_BUMP_ABSENT
+            if finding_kind == "absent"
+            else "phantom"
+        )
+    )
+
+    def findings_for(*, repo_root, **_kwargs):
+        return [finding] if Path(repo_root) == repo else []
+
+    mocker.patch(
+        "app.size_limit_policy.phantom_ledger_records",
+        side_effect=(findings_for if finding_kind == "phantom" else lambda **_kwargs: []),
+    )
+    mocker.patch(
+        "app.size_limit_policy.missing_ledger_bump_records",
+        side_effect=(findings_for if finding_kind == "absent" else lambda **_kwargs: []),
+    )
+    mocker.patch("app.size_limit_policy._mainline_git_ref", return_value="main")
+    (repo / ".git").mkdir()
+    (base / ".git").mkdir()
+
+    assert _run_checker(repo, base) == 1
+    output = capsys.readouterr().out
+    marker = "[ledger-phantom]" if finding_kind == "phantom" else "[ledger-missing]"
+    assert marker in output
+    assert "[pre-existing]" not in output
+
+
+def test_self_heal_clamps_governed_release_qualifier_cap(tmp_path, mocker):
+    """The real fix path honors release_qualifier.py's declared cap relationship."""
+    source_repo_root = next(
+        candidate
+        for candidate in (Path(__file__).resolve().parents[2], Path("/repo"))
+        if (candidate / "backend" / "app" / "release_qualifier.py").is_file()
+    )
+    repo_root = tmp_path / "repo"
+    qualifier_path = repo_root / "backend" / "app" / "release_qualifier.py"
+    qualifier_path.parent.mkdir(parents=True)
+    qualifier_path.write_text(
+        (source_repo_root / "backend" / "app" / "release_qualifier.py").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    limits_path = tmp_path / "module_size_limits.json"
+    limits_path.write_text(
+        json.dumps(
+            {
+                "_doc": "fixture",
+                "backend": {"release_qualifier.py": 10300},
+            }
+        )
+        + "\n"
+    )
+
+    # A generic 15% bump for the current file would exceed 12,000 lines. The
+    # production fixer must discover and clamp to the module's measured 10649
+    # line governance constant.
+    mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[])
+    assert (
+        csl.main(
+            [
+                "--fix",
+                "--sections",
+                "backend",
+                "--repo-root",
+                str(repo_root),
+                "--json",
+                str(limits_path),
+            ]
+        )
+        == 0
+    )
+
+    limits = json.loads(limits_path.read_text())
+    cap = limits["backend"]["release_qualifier.py"]
+    count = len(qualifier_path.read_text(encoding="utf-8").splitlines())
+    assert cap == 10649
+    assert cap == rq._MODULE_SIZE_GOVERNANCE_CAP
+    assert count <= cap
+    assert cap - count < cap * 0.10
+
+
+def test_self_heal_removes_cap_for_deleted_file(tmp_path):
+    """--fix removes stale entries once a capped source file is deleted."""
+    repo_root = tmp_path / "repo"
+    source_root = repo_root / "backend" / "app"
+    _write_lines(source_root / "kept.py", 20)
+    limits_path = repo_root / "backend" / "testing" / "module_size_limits.json"
+    limits_path.parent.mkdir(parents=True)
+    limits_path.write_text(
+        json.dumps(
+            {
+                "_doc": "fixture",
+                "backend": {"deleted.py": 100, "kept.py": 100},
+            }
+        )
+        + "\n"
+    )
+
+    assert (
+        csl.main(
+            [
+                "--fix",
+                "--sections",
+                "backend",
+                "--repo-root",
+                str(repo_root),
+                "--json",
+                str(limits_path),
+            ]
+        )
+        == 0
+    )
+
+    limits = json.loads(limits_path.read_text())
+    assert "deleted.py" not in limits["backend"]
+    assert limits["backend"]["kept.py"] == 100
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +489,68 @@ def test_classify_size_record_delegates_breach_to_policy():
     assert not classify_size_record(
         "m.py", None, 1180, "backend", with_verdict=False
     )["breach"]
+
+
+def test_fix_respects_declared_governing_cap(tmp_path, mocker):
+    """``--fix`` keeps a governed source constant, JSON cap, and ledger aligned.
+
+    This is intentionally an end-to-end checker test: it exercises the shared
+    routine-breach classifier, the local repair writer, and the pending ledger
+    record rather than merely asserting the clamp helper in isolation. The
+    repaired cap CLAMPS to the module's declared constant instead of taking
+    generic headroom, and the declared constant itself is never raised — a
+    governed module that outgrows its constant must be decomposed, not bumped.
+    """
+    repo = tmp_path / "repo"
+    source_path = repo / "backend" / "app" / "release_qualifier.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(
+        "_MODULE_SIZE_GOVERNANCE_CAP: int = 10500\n"
+        + "pass\n" * 10400,
+        encoding="utf-8",
+    )
+    testing_dir = repo / "backend" / "testing"
+    testing_dir.mkdir()
+    limits_path = testing_dir / "module_size_limits.json"
+    limits_path.write_text(
+        json.dumps(
+            {"_doc": "test", "backend": {"release_qualifier.py": 10300}},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # Hermetic fixture: no mainline checkout means only this repair's pending
+    # evidence should be present in the regenerated mirror.
+    mocker.patch("app.size_limit_policy._git_reads_history_here", return_value=False)
+    mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[])
+
+    assert csl.main(
+        [
+            "--json",
+            str(limits_path),
+            "--repo-root",
+            str(repo),
+            "--sections",
+            "backend",
+            "--fix",
+        ]
+    ) == 0
+
+    repaired = json.loads(limits_path.read_text(encoding="utf-8"))
+    # A generic +15% bump for a 10,401-line file would be 11,950; the governed
+    # module clamps to its declared 10,500 constant instead.
+    assert repaired["backend"]["release_qualifier.py"] == 10500
+    assert "_MODULE_SIZE_GOVERNANCE_CAP: int = 10500" in source_path.read_text(
+        encoding="utf-8"
+    )
+    ledger = json.loads(
+        (testing_dir / "cap_bump_history.json").read_text(encoding="utf-8")
+    )
+    record = ledger["history"]["backend"]["release_qualifier.py"][-1]
+    assert record["commit_sha"] == UNATTRIBUTED_COMMIT_SHA
+    assert (record["old_cap"], record["new_cap"]) == (10300, 10500)
+    assert record["commit_date"]
 
 
 # ---------------------------------------------------------------------------
@@ -484,9 +796,8 @@ def test_parse_bump_history_raises_on_git_failure(real_git_checkout):
     with patch(
         "app.size_limit_policy.subprocess.run",
         side_effect=FileNotFoundError("git not found"),
-    ):
-        with pytest.raises(BumpHistoryUnavailableError):
-            parse_bump_history("raises_git.py", "backend")
+    ), pytest.raises(BumpHistoryUnavailableError):
+        parse_bump_history("raises_git.py", "backend")
 
 
 def test_parse_bump_history_raises_on_nonzero_git_exit(real_git_checkout):
@@ -497,9 +808,10 @@ def test_parse_bump_history_raises_on_nonzero_git_exit(real_git_checkout):
     result = subprocess.CompletedProcess(
         args=[], returncode=128, stdout="", stderr="fatal: bad revision"
     )
-    with patch("app.size_limit_policy.subprocess.run", return_value=result):
-        with pytest.raises(BumpHistoryUnavailableError):
-            parse_bump_history("raises_rc.py", "backend")
+    with patch("app.size_limit_policy.subprocess.run", return_value=result), pytest.raises(
+        BumpHistoryUnavailableError
+    ):
+        parse_bump_history("raises_rc.py", "backend")
 
 
 def test_classify_breach_git_read_failure_refuses_bump(real_git_checkout):
@@ -582,12 +894,14 @@ def test_classify_breach_reaches_history_readable_branch_in_deployed_layout(
     # readable at its shipped path under the deployed layout.
     assert os.path.isfile(ledger_path)
 
-    # A real chronic offender recorded in the ledger (4 bumps — fires the growth
-    # trigger regardless of the 180-day window aging).
-    history = parse_bump_history("test_release_qualifier.py", "testing")
+    # A real chronic capped testing file recorded in the ledger.  Do not use a
+    # deleted file here: stale cap/ledger records are now intentionally pruned
+    # by --fix, and this test's purpose is the deployed-layout fallback rather
+    # than preserving obsolete history.
+    history = parse_bump_history("test_acceptance_criteria.py", "testing")
     assert len(history) >= 3
 
-    verdict = classify_breach("test_release_qualifier.py", 2400, section="testing")
+    verdict = classify_breach("test_acceptance_criteria.py", 16000, section="testing")
 
     assert verdict["history_unavailable"] is False  # readable branch REACHED
     assert verdict["is_chronic"] is True
@@ -659,6 +973,42 @@ def test_ledger_with_pending_bumps_appends_and_dedups():
         UNATTRIBUTED_COMMIT_SHA
     )
     assert all(record["commit_sha"] for record in updated["history"]["backend"]["m.py"])
+
+
+def test_ledger_with_pending_bumps_preserves_observed_provenance():
+    """Observed git evidence upgrades a matching unattributed placeholder."""
+    ledger = {
+        "history": {
+            "backend": {
+                "m.py": [
+                    {
+                        "commit_sha": UNATTRIBUTED_COMMIT_SHA,
+                        "commit_date": "2026-01-01T00:00:00+00:00",
+                        "old_cap": 100,
+                        "new_cap": 200,
+                    }
+                ]
+            }
+        }
+    }
+
+    updated = slp.ledger_with_pending_bumps(
+        ledger,
+        [
+            (
+                "backend",
+                "m.py",
+                100,
+                200,
+                "realcommitsha",
+                "2026-02-03T04:05:06+00:00",
+            )
+        ],
+    )
+
+    record = updated["history"]["backend"]["m.py"][0]
+    assert record["commit_sha"] == "realcommitsha"
+    assert record["commit_date"] == "2026-02-03T04:05:06+00:00"
 
 
 def test_restored_cap_bumps_keep_strategic_resident_session_chronic():
@@ -923,9 +1273,46 @@ def test_phantom_ledger_records_flags_wrong_old_cap(tmp_path, mocker):
         },
     )
     assert len(phantoms) == 1
-    section, key, old_cap, new_cap, sha, reason = phantoms[0]
+    section, key, old_cap, new_cap, _sha, reason = phantoms[0]
     assert (section, key, old_cap, new_cap) == ("backend", "m.py", 50, 200)
     assert "no recorded bump" in reason
+
+
+def test_phantom_ledger_records_preserves_merge_commit_provenance(tmp_path, mocker):
+    """A merge commit does not provide an attributable single-parent cap diff.
+
+    ``git show`` renders a merge as a combined diff (or no file diff at all),
+    so the ordinary ``- old/+ new`` parser cannot establish that the ledger
+    record is fabricated.  The verifier must preserve the record and wait for
+    evidence from the side-parent bump commit instead of deleting it.
+    """
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+
+    subprocess.run(["git", "checkout", "-q", "-b", "cap-bump"], cwd=repo, check=True)
+    _hermetic_write_cap(repo, 200)
+    _hermetic_commit(repo, "bump to 200", date="2026-01-02T00:00:00+00:00")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "-q", "cap-bump", "-m", "merge cap bump"],
+        cwd=repo,
+        check=True,
+    )
+    merge_sha = _hermetic_head_sha(repo)
+
+    phantoms = _phantom_ledger(
+        repo,
+        "m.py",
+        {
+            "commit_sha": merge_sha,
+            "commit_date": "2026-01-03T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    )
+
+    assert phantoms == []
 
 
 def test_phantom_ledger_records_skips_empty_sha_pending(tmp_path, mocker):
@@ -988,6 +1375,161 @@ def test_phantom_ledger_records_skips_beyond_boundary_on_shallow(tmp_path, mocke
         },
     )
     assert phantoms == []
+
+
+def test_phantom_ledger_records_preserves_bump_at_shallow_boundary(
+    tmp_path, mocker
+):
+    """A real bump at the shallow boundary is unverifiable, not a phantom.
+
+    Depth-one clones hide the bump commit's parent. Git consequently renders
+    ``module_size_limits.json`` as a whole-file addition, which contains no
+    parseable ``old -> new`` pair even though the full repository proves the
+    ledger record. This is the production task-VM shape.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=source,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=source, check=True
+    )
+    _hermetic_write_cap(str(source), 100)
+    _hermetic_commit(str(source), "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(str(source), 200)
+    _hermetic_commit(
+        str(source), "bump at boundary", date="2026-01-02T00:00:00+00:00"
+    )
+    bump_sha = _hermetic_head_sha(str(source))
+
+    checkout = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth=1", f"file://{source}", str(checkout)],
+        check=True,
+    )
+
+    phantoms = _phantom_ledger(
+        str(checkout),
+        "m.py",
+        {
+            "commit_sha": bump_sha,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    )
+
+    assert phantoms == []
+    linked = tmp_path / "linked-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "--detach", str(linked), "HEAD"],
+        cwd=checkout,
+        check=True,
+    )
+    assert (linked / ".git").is_file()
+    assert slp._git_history_is_truncated(str(linked)) is True
+    assert _phantom_ledger(
+        str(linked),
+        "m.py",
+        {
+            "commit_sha": bump_sha,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    ) == []
+
+
+def test_phantom_ledger_records_preserves_resolvable_bump_beyond_boundary(
+    tmp_path, mocker
+):
+    """A reference clone must not turn a truncated ancestry probe into proof.
+
+    Task VMs clone with a shallow mainline plus a baked object-store reference.
+    An older ledger SHA therefore resolves even though Git will not traverse
+    the mainline past its newer shallow boundary; ``merge-base --is-ancestor``
+    returns 1 in that ambiguous graph. Preserve the row until a complete
+    checkout can adjudicate it.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=source,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=source, check=True
+    )
+    _hermetic_write_cap(str(source), 100)
+    _hermetic_commit(str(source), "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(str(source), 200)
+    _hermetic_commit(
+        str(source), "real bump", date="2026-01-02T00:00:00+00:00"
+    )
+    bump_sha = _hermetic_head_sha(str(source))
+    (source / "module_size_limits.json").write_text(
+        json.dumps({"backend": {"m.py": 200, "later.py": 1}}, indent=2),
+        encoding="utf-8",
+    )
+    _hermetic_commit(
+        str(source), "newer boundary", date="2026-01-03T00:00:00+00:00"
+    )
+
+    checkout = tmp_path / "shallow-reference"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "-q",
+            "--depth=1",
+            "--reference-if-able",
+            str(source),
+            f"file://{source}",
+            str(checkout),
+        ],
+        check=True,
+    )
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{bump_sha}^{{commit}}"],
+        cwd=checkout,
+        check=False,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", bump_sha, "main"],
+        cwd=checkout,
+        check=False,
+    ).returncode == 1
+
+    phantoms = _phantom_ledger(
+        str(checkout),
+        "m.py",
+        {
+            "commit_sha": bump_sha,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    )
+
+    assert phantoms == []
+    wrong_pair = _phantom_ledger(
+        str(checkout),
+        "m.py",
+        {
+            "commit_sha": bump_sha,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 50,
+            "new_cap": 200,
+        },
+    )
+    assert len(wrong_pair) == 1
+    assert "diff shows no recorded bump" in wrong_pair[0][-1]
 
 
 def test_phantom_ledger_records_flags_non_ancestor_commit(tmp_path, mocker):

@@ -55,7 +55,33 @@ def direction_authority_snapshot(direction: Mapping[str, Any]) -> dict[str, Any]
         }
         if proof_contract:
             snapshot["context"] = proof_contract
+    direction_paths = direction.get("paths")
+    if isinstance(direction_paths, list):
+        snapshot["paths"] = [
+            path.strip()[:500]
+            for path in direction_paths[:50]
+            if isinstance(path, str) and path.strip()
+        ]
     return snapshot
+
+
+def _discovery_bet_snapshot(
+    direction: Mapping[str, Any], direction_key: str, commissioned_question: str | None
+) -> dict[str, Any]:
+    """Build the immutable decision contract for one discovery commission."""
+
+    bounded_commission = str(commissioned_question or "").strip()
+    return {
+        "direction": direction_authority_snapshot(direction),
+        "claim": (bounded_commission or str(direction.get("text") or ""))[:2_000],
+        "decision_question": str(
+            bounded_commission
+            or direction.get("completion_criteria")
+            or f"Did work on {direction.get('text') or direction_key} create "
+            "goal-relevant, inspectable progress?"
+        )[:4_000],
+        "alternatives": list(direction.get("alternatives") or [])[:12],
+    }
 
 
 def _as_uuid(value: Any, *, field_name: str) -> uuid.UUID:
@@ -75,6 +101,7 @@ async def ensure_discovery_cycle_for_research(
     direction: Mapping[str, Any],
     runtime_config: Mapping[str, Any] | None = None,
     candidate_sha: str | None = None,
+    commissioned_question: str | None = None,
     now: datetime | None = None,
     join_open_cycle: bool = False,
 ) -> DiscoveryCycle | None:
@@ -113,6 +140,38 @@ async def ensure_discovery_cycle_for_research(
         ):
             if candidate_sha:
                 live.candidate_sha = candidate_sha
+            # A source-free cycle is only a reservation. When a direct
+            # commission legitimately takes that reservation, freeze the
+            # question it will actually ask. A conflict later in the same
+            # transaction rolls this mutation back; an occupied source keeps
+            # its original immutable bet for exact replay.
+            pending_request_id = None
+            bounded_commission = str(commissioned_question or "").strip()
+            if live.source_research_task_id is None and bounded_commission:
+                pending_request_id = (
+                    await session.execute(
+                        select(StrategicSpawnRequest.id)
+                        .where(
+                            StrategicSpawnRequest.project_id == project.id,
+                            StrategicSpawnRequest.discovery_cycle_id == live.id,
+                            StrategicSpawnRequest.state.in_({"accepted", "deferred"}),
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+            if (
+                live.source_research_task_id is None
+                and pending_request_id is None
+                and bounded_commission
+            ):
+                live.bet_snapshot = _discovery_bet_snapshot(
+                    direction, key, commissioned_question
+                )
+                live.mechanism_fingerprint = hashlib.sha256(
+                    json.dumps(live.bet_snapshot, sort_keys=True, default=str).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
             return live
         raise DiscoveryCycleUnavailable(
             f"direction {key} already has cycle {live.id} in state {live.state}"
@@ -134,17 +193,20 @@ async def ensure_discovery_cycle_for_research(
             f"direction {key} is awaiting policy resolution after {latest.verdict}"
         )
 
-    generation = int(
-        (
-            await session.execute(
-                select(func.max(DiscoveryCycle.generation)).where(
-                    DiscoveryCycle.project_id == project.id,
-                    DiscoveryCycle.direction_key == key,
+    generation = (
+        int(
+            (
+                await session.execute(
+                    select(func.max(DiscoveryCycle.generation)).where(
+                        DiscoveryCycle.project_id == project.id,
+                        DiscoveryCycle.direction_key == key,
+                    )
                 )
-            )
-        ).scalar_one_or_none()
-        or 0
-    ) + 1
+            ).scalar_one_or_none()
+            or 0
+        )
+        + 1
+    )
     config = runtime_config or {}
     opened_at = now or _utcnow()
     from app.problem_model import resolve_project_purpose
@@ -153,17 +215,7 @@ async def ensure_discovery_cycle_for_research(
     problem_model = dict(project.problem_model or {})
     intent = dict(problem_model.get("intent") or {})
     release = await current_open_version(session, project.id)
-    direction_snapshot = direction_authority_snapshot(direction)
-    bet_snapshot = {
-        "direction": direction_snapshot,
-        "claim": str(direction.get("text") or "")[:2_000],
-        "decision_question": str(
-            direction.get("completion_criteria")
-            or f"Did work on {direction.get('text') or key} create "
-            "goal-relevant, inspectable progress?"
-        )[:4_000],
-        "alternatives": list(direction.get("alternatives") or [])[:12],
-    }
+    bet_snapshot = _discovery_bet_snapshot(direction, key, commissioned_question)
     cycle = DiscoveryCycle(
         project_id=project.id,
         direction_key=key,
@@ -217,6 +269,12 @@ async def resolve_discovery_cycle_lineage(
 ) -> uuid.UUID | None:
     """Resolve the provenance cycle inherited by a task or spawn request."""
 
+    normalized_project_id = (
+        _as_uuid(project_id, field_name="project_id")
+        if project_id is not None
+        else None
+    )
+
     if explicit_cycle_id is not None:
         return _as_uuid(explicit_cycle_id, field_name="explicit_cycle_id")
 
@@ -225,12 +283,17 @@ async def resolve_discovery_cycle_lineage(
             strategic_spawn_request_id,
             field_name="strategic_spawn_request_id",
         )
+        request_filters = [StrategicSpawnRequest.id == request_id]
+        if normalized_project_id is not None:
+            request_filters.append(
+                StrategicSpawnRequest.project_id == normalized_project_id
+            )
         request_lineage = (
             await session.execute(
                 select(
                     StrategicSpawnRequest.discovery_cycle_id,
                     StrategicSpawnRequest.parent_task_id,
-                ).where(StrategicSpawnRequest.id == request_id)
+                ).where(*request_filters)
             )
         ).one_or_none()
         if request_lineage is not None:
@@ -248,10 +311,13 @@ async def resolve_discovery_cycle_lineage(
             if current_id in seen:
                 raise RuntimeError("cycle detected in task parent lineage")
             seen.add(current_id)
+            task_filters = [Task.id == current_id]
+            if normalized_project_id is not None:
+                task_filters.append(Task.project_id == normalized_project_id)
             row = (
                 await session.execute(
                     select(Task.discovery_cycle_id, Task.parent_task_id).where(
-                        Task.id == current_id
+                        *task_filters
                     )
                 )
             ).one_or_none()
@@ -266,11 +332,11 @@ async def resolve_discovery_cycle_lineage(
         else:
             raise RuntimeError("task parent lineage exceeds maximum depth")
 
-    if project_id is None and direction_key is None:
+    if direction_key is None:
         return None
-    if project_id is None or not str(direction_key or "").strip():
+    if project_id is None or not str(direction_key).strip():
         raise ValueError("project_id and direction_key must be supplied together")
-    normalized_project_id = _as_uuid(project_id, field_name="project_id")
+    assert normalized_project_id is not None
     return (
         await session.execute(
             select(DiscoveryCycle.id).where(

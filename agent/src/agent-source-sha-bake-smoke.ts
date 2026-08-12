@@ -53,7 +53,7 @@ function runSmoke(): void {
     throw new Error(
       `readAgentSourceSha() returned null but the marker carries a real value ` +
         `(${JSON.stringify(baked)}). The write line in agent.pkr.hcl and the ` +
-        '/^AGENT_SOURCE_SHA=([0-9a-f]{7,40})$/ regex in agent/src/index.ts have drifted.',
+        '/^AGENT_SOURCE_SHA=([0-9a-f]{40})$/ regex in agent/src/index.ts have drifted.',
     );
   }
   if (parsed !== baked) {

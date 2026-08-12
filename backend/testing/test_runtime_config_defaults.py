@@ -166,7 +166,6 @@ class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
         ("app/release_qualifier.py", 8238, "env_preflight_enabled"),
         ("app/research_completion.py", 6300, "capability_proof_gate_mode"),
         ("app/research_completion.py", 6334, "capability_proof_gate_mode"),
-        ("app/routers/admin_debug.py", 966, "max_concurrent_vms"),
         ("app/routers/admin_health.py", 585, "warm_continuity_enabled"),
         ("app/routers/admin_health.py", 613, "warm_backlog_reuse_enabled"),
         ("app/routers/admin_health.py", 1167, "warm_continuity_enabled"),
@@ -226,7 +225,6 @@ class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
         ("app/release_promotion.py", "smoketest_enabled", True): 1,
         ("app/release_qualifier.py", "capability_proof_gate_mode", "off"): 2,
         ("app/research_completion.py", "capability_proof_gate_mode", "off"): 2,
-        ("app/routers/admin_debug.py", "max_concurrent_vms", 5): 1,
         ("app/routers/admin_health.py", "warm_backlog_reuse_enabled", False): 2,
         ("app/routers/admin_health.py", "warm_continuity_enabled", False): 2,
         ("app/routers/admin_settings.py", "capability_proof_execution_trials_enabled", False): 2,
@@ -313,4 +311,50 @@ class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
             f"{dict(unexpected)}; resolved/decreased entries that should be "
             "removed from the pinned baseline: "
             f"{dict(resolved_without_baseline_update)}"
+        )
+
+
+def test_dormant_release_declarations_have_owner_reason_and_rearm_condition():
+    """Every disabled release path is an owned, observable rollback declaration."""
+    from app.runtime_config_state import (
+        _DORMANT_OFF_FLAGS,
+        iter_dormant_knob_debts,
+        runtime_config,
+    )
+
+    assert _DORMANT_OFF_FLAGS, "disabled release paths must not be silently unregistered"
+    missing = [
+        key
+        for key, declaration in _DORMANT_OFF_FLAGS.items()
+        if not isinstance(declaration, dict)
+        or not str(declaration.get("owner", "")).strip()
+        or not str(declaration.get("reason", "")).strip()
+        or not str(declaration.get("rearm_condition", "")).strip()
+    ]
+    assert not missing, (
+        "Dormant release declarations require non-empty owner, reason, and "
+        f"rearm_condition: {missing}"
+    )
+    debts = {
+        item["detail"]["knob"]: item for item in iter_dormant_knob_debts()
+    }
+    for key, declaration in _DORMANT_OFF_FLAGS.items():
+        if key == "mode_knob_graduation_enabled":
+            assert runtime_config[key] is True, "the graduation harness must be armed"
+            continue
+        assert key in debts, f"inactive release declaration {key} was not ledgered"
+        assert debts[key]["detail"]["owner"] == declaration["owner"]
+        assert debts[key]["detail"]["rearm_condition"] == declaration["rearm_condition"]
+
+
+def test_unarmed_promotion_required_dimension_is_declared():
+    """A merge-grade blocker that cannot fire must have a registry disposition."""
+    from app.runtime_config_state import _DORMANT_OFF_FLAGS, _read_promotion_policy_file
+
+    policy = _read_promotion_policy_file() or {}
+    threshold = float(policy.get("merge_grade_block_threshold", 0.0) or 0.0)
+    if threshold <= 0.0:
+        assert "merge_grade_block_threshold" in _DORMANT_OFF_FLAGS, (
+            "merge_grade is promotion-required, but its blocker is unarmed and "
+            "has no dormant-off declaration"
         )

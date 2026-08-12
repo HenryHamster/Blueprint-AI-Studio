@@ -6104,14 +6104,8 @@ def test_arm_ci_wait_asserts_pr_number_present():
 
 
 @pytest.mark.asyncio
-async def test_merge_auto_resolves_finding_keys_on_orig_task(db_session, mocker):
-    """When the original (fix) task carries resolving_finding_keys and a PR
-    merges, apply_finding_resolution must write resolved ledger rows for the
-    open ReleaseVersion.  Exercises the primary path inside _orig_session.
-
-    Credit is tied to the DECLARED keys: only findings the merged work said it
-    addressed are credited.  Merges that declare nothing credit nothing (see
-    ``test_merge_auto_resolve_no_keys_writes_no_rows``)."""
+async def test_merge_does_not_auto_resolve_finding_keys_on_orig_task(db_session, mocker):
+    """A merge declaration is not current-HEAD evidence for carried findings."""
     from sqlmodel import select as _select
 
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
@@ -6169,8 +6163,8 @@ async def test_merge_auto_resolves_finding_keys_on_orig_task(db_session, mocker)
     assert result is True
     assert task.status == TaskStatus.COMPLETED
 
-    # The auto-resolve writes run in the _orig_session (dedicated session).
-    # Read the committed rows back through the test session.
+    # No merge-time helper may write resolution rows. An explicit audit or
+    # operator resolution remains the only path that can advance this ledger.
     rows = (
         (
             await db_session.execute(
@@ -6182,17 +6176,7 @@ async def test_merge_auto_resolves_finding_keys_on_orig_task(db_session, mocker)
         .scalars()
         .all()
     )
-    resolved_keys = {r.finding_key for r in rows}
-    assert finding_key_a in resolved_keys, (
-        "finding_key_a must be marked resolved after merge"
-    )
-    assert finding_key_b in resolved_keys, (
-        "finding_key_b must be marked resolved after merge"
-    )
-    for row in rows:
-        assert row.state == "resolved"
-        assert row.project_id == project.id
-        assert row.release_version_id == version.id
+    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -6274,7 +6258,14 @@ async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
     unrelated refactor/rollup merge would drive ``gating_resolved`` to
     ``gating_total`` and promote the version with the findings unaddressed.
     Crediting requires an explicit declaration: task-context keys, or the
-    ``record_finding_resolution`` strategic op / operator trigger."""
+    ``record_finding_resolution`` strategic op / operator trigger.
+
+    This also pins the narrower rule that TOUCHING a finding's file is not
+    evidence the finding was addressed: the merged PR's verified changed-file
+    list here contains the exact path every carried finding sits on, and the
+    ledger must still be empty.  A changed blob may prove STALENESS (see
+    ``auto_mark_stale_audit_findings``, which requires a recorded ``blob_sha``
+    and a SHA mismatch against the audited surface), never a fix."""
     from sqlmodel import select as _select
 
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
@@ -6302,16 +6293,19 @@ async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
                     "key": "aaaabbbbccccdddd",
                     "severity": "critical",
                     "summary": "genuine unresolved critical finding",
+                    "file": "backend/app/touched.py",
                 },
                 {
                     "key": "eeeeffff00001111",
                     "severity": "high",
                     "summary": "genuine unresolved high finding",
+                    "file": "backend/app/touched.py",
                 },
                 {
                     "key": "2222333344445555",
                     "severity": "medium",
                     "summary": "genuine unresolved medium finding",
+                    "file": "backend/app/touched.py",
                 },
             ]
         },
@@ -6324,7 +6318,13 @@ async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
         project_id=project.id,
         title="Ordinary fix task (no finding keys)",
         payloads=[{"type": "fix", "prompt": "fix something"}],
-        context={},  # No resolving_finding_keys
+        # No resolving_finding_keys.  The PR *did* touch the exact file every
+        # carried finding sits on, and that touch is GitHub-verified — still
+        # not evidence of a fix.
+        context={
+            "_pr_changed_files": ["backend/app/touched.py"],
+            "_pr_changed_files_github_verified": True,
+        },
         vm_instance_id=f"agent-vm-orig-nokeys-{uuid.uuid4().hex[:8]}",
         status=TaskStatus.EVALUATING,
     )

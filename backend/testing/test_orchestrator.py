@@ -23,7 +23,9 @@ import app.shared_state as _shared_state
 from app.reaper import reaper_service
 from app.autonomous_research import _spawn_research_task
 from app.failure_classification import classify_failure
-from app.research_completion import _handle_research_completion
+from app.research_completion import (
+    _handle_research_completion as _handle_research_completion_impl,
+)
 from app.max_plan_pool import (
     load_max_plan_pool,
     select_max_plan_account,
@@ -35,6 +37,16 @@ from app.models import Project, Task, TaskStatus, MaxPlanAccount
 from testing.factories import make_project, make_task
 
 _TEST_USER = "test-user-123"
+
+
+async def _handle_research_completion(task, logs, session, **kwargs):
+    """Enter the handler at its production post-agent status boundary."""
+
+    if task.status == TaskStatus.IN_PROGRESS:
+        task.status = TaskStatus.COMPLETED
+        session.add(task)
+        await session.commit()
+    return await _handle_research_completion_impl(task, logs, session, **kwargs)
 
 
 def test_resolved_red_ci_status_handoff_preserves_failed_logs():
@@ -788,6 +800,11 @@ _BACKEND_VERIFICATION_BUILD_CONFIG = {"directories": [{
     },
 }]}
 
+_BACKEND_BUILD_CONFIG_WITHOUT_VERIFICATION = {"directories": [{
+    "path": "backend", "type": "python", "lint_cmd": "ruff check .",
+    "test_cmd": "python3 -m pytest",
+}]}
+
 
 def test_project_verification_requirement_comes_from_capability_and_build_config():
     from app.runner_eligibility import (
@@ -1021,6 +1038,114 @@ async def test_try_runner_dispatch_falls_through_to_cloud_without_verification(
     assert dispatched is False
     assert task.status == TaskStatus.QUEUED
     assert (task.context or {}).get("runner_target_id") is None
+
+
+@pytest.mark.parametrize("identity_source", ["deploy-identity", "legacy-flag"])
+@pytest.mark.asyncio
+async def test_deploy_repo_dispatch_requires_proof_without_build_config_declaration(
+    db_session, monkeypatch, identity_source,
+):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _try_runner_dispatch,
+    )
+
+    if identity_source == "deploy-identity":
+        monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "blueprint/blueprint")
+        legacy_self_repo = False
+    else:
+        monkeypatch.delenv("DEPLOY_REPO_IDENTITY", raising=False)
+        monkeypatch.setattr(
+            "app.orchestrator_runner_dispatch.deploy_repo_identity", lambda: None
+        )
+        legacy_self_repo = True
+    project = make_project(
+        name="deploy-repo-authoring",
+        user_id=_TEST_USER,
+        github_owner="Blueprint",
+        github_repo="Blueprint",
+        is_self_repo=legacy_self_repo,
+        build_config=_BACKEND_BUILD_CONFIG_WITHOUT_VERIFICATION,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "fix", "prompt": "author backend"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    incapable = RunnerDispatchSnapshot(
+        uuid.uuid4(), project.id, {"task_types": "all", "max_concurrent": 1}
+    )
+    capable = RunnerDispatchSnapshot(
+        uuid.uuid4(),
+        project.id,
+        {
+            "task_types": "all",
+            "max_concurrent": 1,
+            "project_verification": _passing_project_verification(),
+        },
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [incapable, capable]}, {}
+    )
+
+    assert dispatched is True
+    assert task.status == TaskStatus.PROVISIONING
+    assert (task.context or {}).get("runner_target_id") == str(capable.id)
+
+
+@pytest.mark.parametrize(
+    ("github_owner", "github_repo", "task_type"),
+    [
+        pytest.param("customer", "service", "create", id="external-authoring"),
+        pytest.param("Blueprint", "Blueprint", "research", id="deploy-read-only"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tasks_without_self_repo_authoring_contract_keep_legacy_eligibility(
+    db_session, monkeypatch, github_owner, github_repo, task_type,
+):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _try_runner_dispatch,
+    )
+
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "blueprint/blueprint")
+    project = make_project(
+        name=f"legacy-{task_type}",
+        user_id=_TEST_USER,
+        github_owner=github_owner,
+        github_repo=github_repo,
+        build_config=_BACKEND_BUILD_CONFIG_WITHOUT_VERIFICATION,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": task_type, "prompt": "run task"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    legacy_runner = RunnerDispatchSnapshot(
+        uuid.uuid4(), project.id, {"task_types": "all", "max_concurrent": 1}
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [legacy_runner]}, {}
+    )
+
+    assert dispatched is True
+    assert task.status == TaskStatus.PROVISIONING
+    assert (task.context or {}).get("runner_target_id") == str(legacy_runner.id)
 
 
 @pytest.mark.asyncio
@@ -2867,6 +2992,14 @@ class TestReaperService:
         class _StopLoop(Exception):
             pass
 
+        # These cases exercise the steady-state reaper decisions. Startup
+        # reconnect grace has dedicated coverage in test_reaper.py; disabling
+        # it here prevents process import time from masking the behavior each
+        # test is asserting.
+        mocker.patch.dict(
+            _main_module._runtime_config,
+            {"reaper_startup_orphan_grace_seconds": 0},
+        )
         mocker.patch("asyncio.sleep", side_effect=_StopLoop)
         return _StopLoop
 
@@ -4192,7 +4325,9 @@ class TestResearchCompletion:
     @staticmethod
     def _findings_json(*findings):
         """Serialize a list of finding dicts to a log string for _handle_research_completion."""
-        return json.dumps(findings)
+        return json.dumps(
+            tuple({"type": "improvement", **finding} for finding in findings)
+        )
 
     # ── Test 5: duplicate findings are skipped ───────────────────────────────
 
@@ -10547,6 +10682,44 @@ class TestClassifyStuckTasksSharedPolicy:
         assert out[0][2] is not None and out[0][2].id == dep.id
 
     @pytest.mark.asyncio
+    async def test_cross_project_tasks_are_not_misclassified_as_a_cycle(
+        self, db_session
+    ):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project_a = make_project(name="Stuck project A", user_id="u1")
+        project_b = make_project(name="Stuck project B", user_id="u1")
+        db_session.add_all([project_a, project_b])
+        await db_session.flush()
+        task_a = make_task(
+            project_id=project_a.id,
+            payloads=[{"type": "create", "prompt": "A"}],
+            status=TaskStatus.QUEUED,
+        )
+        task_b = make_task(
+            project_id=project_b.id,
+            payloads=[{"type": "create", "prompt": "B"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([task_a, task_b])
+        await db_session.flush()
+        task_a.depends_on = [str(task_b.id)]
+        task_b.depends_on = [str(task_a.id)]
+        await db_session.commit()
+
+        out = await _classify_stuck_tasks(
+            [task_a, task_b],
+            {task_a.id: {task_b.id}, task_b.id: {task_a.id}},
+            {task_a.id: task_a, task_b.id: task_b},
+            {task_a.id, task_b.id},
+            db_session,
+            self._noop_verify,
+        )
+
+        assert {entry[0] for entry in out} == {task_a.id, task_b.id}
+        assert {entry[1] for entry in out} == {"cascade_cancel"}
+
+    @pytest.mark.asyncio
     async def test_scope_empty_dep_is_satisfied(self, db_session):
         from app.failure_classification import SCOPE_EMPTY
         from app.orchestrator_health import _classify_stuck_tasks
@@ -10770,6 +10943,35 @@ class TestClassifyStuckTasksSharedPolicy:
         # Parked foundation strands the dependent → surface for escalation, never
         # silently waiting and never cleared-and-dispatched.
         assert out == [(stuck.id, "stranded_parked")]
+
+    @pytest.mark.asyncio
+    async def test_parked_foundation_lookup_ignores_foreign_dependency_edge(
+        self, db_session
+    ):
+        from app.orchestrator_health import find_parked_blocked_foundation
+
+        own_project = make_project(name="OwnBlockedFence", user_id="u1")
+        foreign_project = make_project(name="ForeignBlockedFence", user_id="u2")
+        db_session.add_all([own_project, foreign_project])
+        await db_session.flush()
+        foreign_foundation = make_task(
+            project_id=foreign_project.id,
+            payloads=[{"type": "create", "prompt": "foreign foundation"}],
+            status=TaskStatus.BLOCKED,
+            context={"_blocked_escalated": True},
+        )
+        db_session.add(foreign_foundation)
+        await db_session.flush()
+        dependent = make_task(
+            project_id=own_project.id,
+            payloads=[{"type": "create", "prompt": "own dependent"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(foreign_foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.flush()
+
+        assert await find_parked_blocked_foundation(dependent, db_session) is None
 
     @pytest.mark.asyncio
     async def test_recovering_blocked_foundation_keeps_dependent_waiting(
@@ -11091,6 +11293,41 @@ class TestCrossBaseDependencyGate:
             dependent, [dep], [dep.id], db_session, self._verify_true
         )
         assert result2 == "eligible"
+
+    @pytest.mark.asyncio
+    async def test_cross_project_dependency_cannot_authorize_dispatch(self, db_session):
+        from app.orchestrator import _check_candidate_task_deps
+        from app.landed_signal import mark_landed_on_integration
+
+        dependent_project = make_project(name="Dependent project", user_id="u1")
+        foreign_project = make_project(name="Foreign dep project", user_id="u1")
+        db_session.add_all([dependent_project, foreign_project])
+        await db_session.flush()
+        foreign_dep = make_task(
+            project_id=foreign_project.id,
+            payloads=[{"type": "create", "base_branch": "automain"}],
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(foreign_dep)
+        dependent = make_task(
+            project_id=dependent_project.id,
+            payloads=[{"type": "create", "base_branch": "automain"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(foreign_dep.id)],
+        )
+        db_session.add_all([foreign_dep, dependent])
+        await db_session.commit()
+
+        result, remapped = await _check_candidate_task_deps(
+            dependent,
+            [foreign_dep],
+            [foreign_dep.id],
+            db_session,
+            self._verify_true,
+        )
+
+        assert result == "cascade_cancel"
+        assert remapped == {}
 
     @pytest.mark.asyncio
     async def test_cross_base_genuine_code_dep_in_flight_is_held(self, db_session):
@@ -12437,6 +12674,424 @@ class TestFinishBeforeStartPriority:
         assert out == ["rollup_rv", "ordinary_rv", "plan_child", "new_research"], (
             f"Expected tier 1,2,3,4 order; got {out}"
         )
+
+    def test_evaluating_delivery_owner_child_gets_started_tree_priority(self):
+        """An EVALUATING owner affects ordering without becoming active work."""
+        from app.orchestrator_filters import apply_completion_priority
+
+        active_task_ids = set()
+        out = apply_completion_priority(
+            ["new_research", "implementation_child"],
+            {"new_research": "research", "implementation_child": "create"},
+            {"new_research": None, "implementation_child": "research-owner"},
+            active_task_ids,
+            set(),
+            {"research-owner"},
+        )
+
+        assert out == ["implementation_child", "new_research"]
+        assert active_task_ids == set(), "ordering must not mutate active accounting"
+
+    def test_evaluating_owner_child_survives_reserved_reorder_with_one_slot(self):
+        """A fresh reserved root cannot evict an EVALUATING owner's dependency."""
+        from app.orchestrator_filters import (
+            apply_completion_priority,
+            reserve_slots_for_types,
+        )
+
+        class _Candidate:
+            def __init__(self, task_id, task_type, parent_task_id=None):
+                self.id = task_id
+                self.first_payload = {"type": task_type}
+                self.parent_task_id = parent_task_id
+
+        eligible = ["fresh_research", "delivery_child"]
+        candidates = [
+            _Candidate("fresh_research", "research"),
+            _Candidate("delivery_child", "investigate", "research-owner"),
+        ]
+        reordered = apply_completion_priority(
+            eligible,
+            {task.id: task.first_payload["type"] for task in candidates},
+            {task.id: task.parent_task_id for task in candidates},
+            set(),
+            set(),
+            {"research-owner"},
+        )
+
+        after_reservation = reserve_slots_for_types(
+            reordered,
+            candidates,
+            {"reserved_slots_for_types": {"research": 1}},
+            slots_available=1,
+        )
+
+        assert after_reservation == ["delivery_child", "fresh_research"]
+        assert sorted(after_reservation) == sorted(eligible)
+
+    def test_slot_reservation_preserves_displaced_ids(self):
+        """Reservation is a permutation even when it promotes past the cutoff."""
+        from app.orchestrator_filters import reserve_slots_for_types
+
+        class _Candidate:
+            def __init__(self, task_id, task_type):
+                self.id = task_id
+                self.first_payload = {"type": task_type}
+
+        eligible = ["ordinary_one", "ordinary_two", "fresh_research"]
+        candidates = [
+            _Candidate("ordinary_one", "investigate"),
+            _Candidate("ordinary_two", "docs"),
+            _Candidate("fresh_research", "research"),
+        ]
+
+        result = reserve_slots_for_types(
+            eligible,
+            candidates,
+            {"reserved_slots_for_types": {"research": 1}},
+            slots_available=1,
+        )
+
+        assert result == ["fresh_research", "ordinary_one", "ordinary_two"]
+        assert sorted(result) == sorted(eligible)
+
+    @pytest.mark.asyncio
+    async def test_wrapper_discovers_only_evaluating_research_and_plan_owners(self):
+        """Research/plan owners in EVALUATING are tier 3; other parents are not."""
+        from app.orchestrator_filters import reorder_by_completion_priority
+
+        project_id = uuid.uuid4()
+
+        class _Candidate:
+            def __init__(self, task_id, task_type, parent_task_id=None):
+                self.id = task_id
+                self.first_payload = {"type": task_type}
+                self.parent_task_id = parent_task_id
+                self.project_id = project_id
+                self.context = {}
+                self.created_by = "ORCHESTRATOR"
+
+        eligible = [
+            "new_research",
+            "unrelated_child",
+            "research_child",
+            "plan_child",
+        ]
+        candidates = [
+            _Candidate("new_research", "research"),
+            _Candidate("unrelated_child", "create", "create-owner"),
+            _Candidate("research_child", "create", "research-owner"),
+            _Candidate("plan_child", "create", "plan-owner"),
+        ]
+        query_result = MagicMock()
+        query_result.all.return_value = [
+            (
+                "create-owner",
+                {},
+                TaskStatus.EVALUATING,
+                [{"type": "create"}],
+                project_id,
+            ),
+            (
+                "research-owner",
+                {},
+                TaskStatus.EVALUATING,
+                [{"type": "research"}],
+                project_id,
+            ),
+            (
+                "plan-owner",
+                {},
+                TaskStatus.EVALUATING,
+                [{"type": "plan"}],
+                project_id,
+            ),
+        ]
+        session = AsyncMock()
+        session.execute.return_value = query_result
+        active_task_ids = set()
+
+        out = await reorder_by_completion_priority(
+            eligible, candidates, active_task_ids, session
+        )
+
+        assert out == [
+            "research_child",
+            "plan_child",
+            "new_research",
+            "unrelated_child",
+        ]
+        assert active_task_ids == set(), "EVALUATING owners must not consume slots"
+        session.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cross_project_parent_does_not_gain_completion_priority(self):
+        """A corrupt foreign parent edge cannot borrow rollup/evaluation priority."""
+        from app.orchestrator_filters import reorder_by_completion_priority
+
+        candidate_project_id = uuid.uuid4()
+        foreign_project_id = uuid.uuid4()
+        foreign_owner_id = uuid.uuid4()
+        fresh_research_id = uuid.uuid4()
+        foreign_child_id = uuid.uuid4()
+
+        class _Candidate:
+            def __init__(self, task_id, task_type, parent_task_id=None):
+                self.id = task_id
+                self.first_payload = {"type": task_type}
+                self.parent_task_id = parent_task_id
+                self.project_id = candidate_project_id
+                self.context = {}
+                self.created_by = "ORCHESTRATOR"
+
+        candidates = [
+            _Candidate(fresh_research_id, "research"),
+            _Candidate(foreign_child_id, "create", foreign_owner_id),
+        ]
+        query_result = MagicMock()
+        query_result.all.return_value = [
+            (
+                foreign_owner_id,
+                {"rollup_pr_number": 42},
+                TaskStatus.EVALUATING,
+                [{"type": "research"}],
+                foreign_project_id,
+            )
+        ]
+        session = AsyncMock()
+        session.execute.return_value = query_result
+
+        reordered = await reorder_by_completion_priority(
+            [fresh_research_id, foreign_child_id], candidates, set(), session
+        )
+
+        assert reordered == [fresh_research_id, foreign_child_id]
+
+    @pytest.mark.parametrize(
+        ("source_context_key", "awaiting_key", "extra_context"),
+        [
+            (
+                "quality_grader_for_task_id",
+                "awaiting_quality_grader",
+                {},
+            ),
+            (
+                "quality_grader_for_task_id",
+                "awaiting_adversarial_grader",
+                {"adversarial_grader": True},
+            ),
+            (
+                "finding_challenge_for_task_id",
+                "awaiting_finding_challenge",
+                {},
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_parentless_sidecar_inherits_evaluating_source_priority(
+        self, source_context_key, awaiting_key, extra_context
+    ):
+        """Each parentless sidecar source-link survives reserved reordering."""
+        from app.orchestrator_filters import (
+            reorder_by_completion_priority,
+            reserve_slots_for_types,
+        )
+
+        source_id = uuid.uuid4()
+        grader_id = uuid.uuid4()
+        research_id = uuid.uuid4()
+        project_id = uuid.uuid4()
+
+        class _Candidate:
+            def __init__(
+                self,
+                task_id,
+                task_type,
+                *,
+                context=None,
+                created_by="ORCHESTRATOR",
+                project_id=project_id,
+            ):
+                self.id = task_id
+                self.first_payload = {"type": task_type}
+                self.parent_task_id = None
+                self.context = context or {}
+                self.created_by = created_by
+                self.project_id = project_id
+
+        candidates = [
+            _Candidate(research_id, "research"),
+            _Candidate(
+                grader_id,
+                "investigate",
+                context={source_context_key: str(source_id), **extra_context},
+            ),
+        ]
+        query_result = MagicMock()
+        query_result.all.return_value = [
+            (
+                source_id,
+                {awaiting_key: str(grader_id)},
+                TaskStatus.EVALUATING,
+                [{"type": "research"}],
+                project_id,
+            )
+        ]
+        session = AsyncMock()
+        session.execute.return_value = query_result
+
+        reordered = await reorder_by_completion_priority(
+            [research_id, grader_id], candidates, set(), session
+        )
+        after_reservation = reserve_slots_for_types(
+            reordered,
+            candidates,
+            {"reserved_slots_for_types": {"research": 1}},
+            slots_available=1,
+        )
+
+        assert after_reservation == [grader_id, research_id]
+        assert set(after_reservation) == {grader_id, research_id}
+        session.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_projected_candidate_loads_sidecar_creator_for_priority(
+        self, db_session
+    ):
+        """The real raiseloaded candidate projection includes auth columns."""
+
+        from sqlalchemy import select
+        from sqlalchemy.orm import load_only
+
+        from app.orchestrator import CANDIDATE_LIGHT_COLUMNS
+        from app.orchestrator_filters import reorder_by_completion_priority
+
+        project = make_project(name="SidecarProjection", user_id=_TEST_USER)
+        db_session.add(project)
+        await db_session.flush()
+        source_id = uuid.uuid4()
+        sidecar_id = uuid.uuid4()
+        fresh_id = uuid.uuid4()
+        source = Task(
+            id=source_id,
+            project_id=project.id,
+            title="Evaluating research owner",
+            payloads=[{"type": "research"}],
+            context={"awaiting_quality_grader": str(sidecar_id)},
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+        )
+        sidecar = Task(
+            id=sidecar_id,
+            project_id=project.id,
+            title="Forward quality sidecar",
+            payloads=[{"type": "investigate"}],
+            context={"quality_grader_for_task_id": str(source_id)},
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        fresh = Task(
+            id=fresh_id,
+            project_id=project.id,
+            title="Fresh research",
+            payloads=[{"type": "research"}],
+            context={},
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add_all([source, sidecar, fresh])
+        await db_session.commit()
+        db_session.expire_all()
+
+        candidates = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(Task.id.in_([sidecar_id, fresh_id]))
+                    .options(load_only(*CANDIDATE_LIGHT_COLUMNS, raiseload=True))
+                    .order_by(Task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        reordered = await reorder_by_completion_priority(
+            [fresh_id, sidecar_id], candidates, set(), db_session
+        )
+
+        assert reordered == [sidecar_id, fresh_id]
+        assert next(task for task in candidates if task.id == sidecar_id).created_by == (
+            "ORCHESTRATOR"
+        )
+
+    @pytest.mark.parametrize(
+        "violation",
+        ["agent_created", "wrong_type", "cross_project", "wrong_awaited_id"],
+    )
+    @pytest.mark.asyncio
+    async def test_forged_sidecar_context_does_not_gain_completion_priority(
+        self, violation
+    ):
+        """A context UUID alone is never an authenticated delivery-owner edge."""
+        from app.orchestrator_filters import reorder_by_completion_priority
+
+        source_id = uuid.uuid4()
+        sidecar_id = uuid.uuid4()
+        research_id = uuid.uuid4()
+        source_project_id = uuid.uuid4()
+        sidecar_project_id = (
+            uuid.uuid4() if violation == "cross_project" else source_project_id
+        )
+
+        class _Candidate:
+            def __init__(
+                self,
+                task_id,
+                task_type,
+                *,
+                context=None,
+                created_by="ORCHESTRATOR",
+                parent_task_id=None,
+                project_id=source_project_id,
+            ):
+                self.id = task_id
+                self.first_payload = {"type": task_type}
+                self.parent_task_id = parent_task_id
+                self.context = context or {}
+                self.created_by = created_by
+                self.project_id = project_id
+
+        candidates = [
+            _Candidate(research_id, "research"),
+            _Candidate(
+                sidecar_id,
+                "create" if violation == "wrong_type" else "investigate",
+                context={"quality_grader_for_task_id": str(source_id)},
+                created_by="AGENT" if violation == "agent_created" else "ORCHESTRATOR",
+                parent_task_id=None,
+                project_id=sidecar_project_id,
+            ),
+        ]
+        awaited_id = uuid.uuid4() if violation == "wrong_awaited_id" else sidecar_id
+        query_result = MagicMock()
+        query_result.all.return_value = [
+            (
+                source_id,
+                {"awaiting_quality_grader": str(awaited_id)},
+                TaskStatus.EVALUATING,
+                [{"type": "research"}],
+                source_project_id,
+            )
+        ]
+        session = AsyncMock()
+        session.execute.return_value = query_result
+
+        reordered = await reorder_by_completion_priority(
+            [research_id, sidecar_id], candidates, set(), session
+        )
+
+        assert reordered == [research_id, sidecar_id]
+        assert getattr(reordered, "reservation_protected_ids", frozenset()) == frozenset()
 
     def test_stable_within_tier(self):
         """Existing order is preserved for tasks within the same tier."""

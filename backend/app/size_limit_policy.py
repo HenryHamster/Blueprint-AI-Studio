@@ -16,6 +16,7 @@ so the checker can import it without any install step or runtime context.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -26,7 +27,78 @@ from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 
 
-def bump_size_limit(current_size: int) -> int:
+class GovernanceCapExceededError(ValueError):
+    """Raised when a file is already beyond its declared governing cap."""
+
+
+_SECTION_SOURCE_DIRS = {
+    "backend": ("backend", "app"),
+    "agent": ("agent", "src"),
+    "frontend": ("admin-ui", "src"),
+    "testing": ("backend", "testing"),
+}
+
+
+def _governing_caps_for_module(
+    module_key: str, section: str, repo_root: str | None = None
+) -> list[int]:
+    """Discover integer ``*_SIZE_GOVERNANCE_CAP`` declarations for a module.
+
+    Governance belongs next to the source it protects. Reading the declaration
+    from the module's AST keeps this policy generic: a future module can opt in
+    by declaring its own governing constant without adding a filename-specific
+    branch here. Invalid or unavailable source is treated as having no
+    discovered relationship; the ordinary cap policy remains available.
+    """
+    root = repo_root or _REPO_ROOT
+    source_root_parts = _SECTION_SOURCE_DIRS.get(section)
+    if source_root_parts is None:
+        return []
+    source_root = os.path.abspath(os.path.join(root, *source_root_parts))
+    if section == "backend" and not os.path.isdir(source_root):
+        # The production backend image installs the package at /app/app rather
+        # than carrying a full repository checkout. Keep source-adjacent
+        # governance effective there instead of silently applying generic
+        # headroom.
+        source_root = os.path.abspath(os.path.dirname(__file__))
+    source_path = os.path.abspath(os.path.join(source_root, module_key))
+    try:
+        if os.path.commonpath((source_root, source_path)) != source_root:
+            return []
+        with open(source_path, encoding="utf-8") as source_file:
+            tree = ast.parse(source_file.read(), filename=source_path)
+    except (OSError, SyntaxError, UnicodeError, ValueError):
+        return []
+
+    caps: list[int] = []
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets.extend(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets.append(node.target)
+            value = node.value
+        else:
+            continue
+        if not isinstance(value, ast.Constant) or isinstance(value.value, bool):
+            continue
+        if not isinstance(value.value, int):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id.endswith(
+                "_SIZE_GOVERNANCE_CAP"
+            ):
+                caps.append(value.value)
+    return caps
+
+
+def bump_size_limit(
+    current_size: int,
+    module_key: str | None = None,
+    section: str = "backend",
+    repo_root: str | None = None,
+) -> int:
     """Return the new cap for a file that breached its size limit.
 
     Policy: the larger of ``current_size + 200`` (a flat floor so a small
@@ -37,7 +109,226 @@ def bump_size_limit(current_size: int) -> int:
     floor = current_size + 200
     proportional = int(current_size * 1.15)
     raw = max(floor, proportional)
-    return ((raw + 49) // 50) * 50
+    proposed = ((raw + 49) // 50) * 50
+    if module_key is None:
+        return proposed
+
+    governing_caps = _governing_caps_for_module(module_key, section, repo_root)
+    if not governing_caps:
+        return proposed
+    governing_cap = min(governing_caps)
+    if current_size > governing_cap:
+        raise GovernanceCapExceededError(
+            f"{section}/{module_key} is already {current_size} lines, beyond "
+            f"its governing cap {governing_cap}"
+        )
+    return min(proposed, governing_cap)
+
+
+class GoverningCap(TypedDict):
+    """A source-declared cap that must move with its JSON counterpart."""
+
+    source_path: str
+    constant_name: str
+
+
+class GoverningCapRepair(TypedDict):
+    """The complete paired-source edit required for a governed cap repair."""
+
+    source_path: str
+    constant_name: str
+    new_limit: int
+
+
+# Most modules use the generic headroom policy above.  The release and
+# acceptance surface is deliberately governed more tightly in each source
+# module as well as in the JSON guardrail.  Keep this mapping explicit: both
+# repair paths consume it, which prevents a future caller from silently
+# applying the generic 15% rule to a module whose governance contract says
+# otherwise.
+_GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
+    ("backend", "acceptance_criteria.py"): GoverningCap(
+        source_path="backend/app/acceptance_criteria.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "acceptance_gate.py"): GoverningCap(
+        source_path="backend/app/acceptance_gate.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "acceptance_provenance.py"): GoverningCap(
+        source_path="backend/app/acceptance_provenance.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "acceptance_window_invariants.py"): GoverningCap(
+        source_path="backend/app/acceptance_window_invariants.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "approved_pr_stranding.py"): GoverningCap(
+        source_path="backend/app/approved_pr_stranding.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_activation.py"): GoverningCap(
+        source_path="backend/app/release_activation.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_artifacts.py"): GoverningCap(
+        source_path="backend/app/release_artifacts.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_commit_authorship.py"): GoverningCap(
+        source_path="backend/app/release_commit_authorship.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_hotfix_promotion.py"): GoverningCap(
+        source_path="backend/app/release_hotfix_promotion.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_models.py"): GoverningCap(
+        source_path="backend/app/release_models.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_policy_projection.py"): GoverningCap(
+        source_path="backend/app/release_policy_projection.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_prepromotion_rehearsal.py"): GoverningCap(
+        source_path="backend/app/release_prepromotion_rehearsal.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_promotion.py"): GoverningCap(
+        source_path="backend/app/release_promotion.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_promotion_pending.py"): GoverningCap(
+        source_path="backend/app/release_promotion_pending.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier.py"): GoverningCap(
+        source_path="backend/app/release_qualifier.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier_audit.py"): GoverningCap(
+        source_path="backend/app/release_qualifier_audit.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier_audit_surface.py"): GoverningCap(
+        source_path="backend/app/release_qualifier_audit_surface.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier_hotfix_audit.py"): GoverningCap(
+        source_path="backend/app/release_qualifier_hotfix_audit.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier_redrive.py"): GoverningCap(
+        source_path="backend/app/release_qualifier_redrive.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualifier_sweep.py"): GoverningCap(
+        source_path="backend/app/release_qualifier_sweep.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_readiness.py"): GoverningCap(
+        source_path="backend/app/release_readiness.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_reconciliation.py"): GoverningCap(
+        source_path="backend/app/release_reconciliation.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_scoring.py"): GoverningCap(
+        source_path="backend/app/release_scoring.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_serving_confirmation.py"): GoverningCap(
+        source_path="backend/app/release_serving_confirmation.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_stall_alerts.py"): GoverningCap(
+        source_path="backend/app/release_stall_alerts.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_version.py"): GoverningCap(
+        source_path="backend/app/release_version.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+}
+
+
+def governing_cap_source_path(section: str, module_key: str) -> str | None:
+    """Return the source path whose cap constant must move, if any."""
+    governing = _GOVERNING_CAPS.get((section, module_key))
+    return governing["source_path"] if governing else None
+
+
+def governing_cap_repair(
+    section: str, module_key: str, new_limit: int
+) -> GoverningCapRepair | None:
+    """Return the source-constant edit paired with a governed JSON cap bump.
+
+    API callers use this complete instruction to keep the agent-facing repair
+    contract coherent: governed modules must update both the JSON cap and the
+    declared source constant in the same task.
+    """
+    governing = _GOVERNING_CAPS.get((section, module_key))
+    if governing is None:
+        return None
+    return GoverningCapRepair(
+        source_path=governing["source_path"],
+        constant_name=governing["constant_name"],
+        new_limit=new_limit,
+    )
+
+
+def rewrite_governing_cap_constant(
+    section: str, module_key: str, source_text: str, new_cap: int
+) -> str:
+    """Return ``source_text`` with its declared governing constant updated.
+
+    A mismatch is a governance configuration error, not permission to update
+    only the JSON cap, so this fails closed rather than writing incoherent
+    artifacts.  Callers use the result in the same staged write / Git commit as
+    the cap JSON and history ledger.
+    """
+    governing = _GOVERNING_CAPS.get((section, module_key))
+    if governing is None:
+        return source_text
+    constant = re.escape(governing["constant_name"])
+    pattern = re.compile(
+        rf"^(?P<prefix>{constant}\s*:\s*int\s*=\s*)\d+(?P<suffix>\s*(?:#.*)?)$",
+        re.MULTILINE,
+    )
+    rewritten, replacements = pattern.subn(
+        rf"\g<prefix>{new_cap}\g<suffix>", source_text
+    )
+    if replacements != 1:
+        raise ValueError(
+            f"governing cap constant {governing['constant_name']} for "
+            f"{section}/{module_key} must occur exactly once (found {replacements})"
+        )
+    return rewritten
+
+
+def prune_ledger_for_current_caps(ledger_data: dict, caps_data: dict) -> dict:
+    """Drop ledger history for cap keys that no longer exist in ``caps_data``.
+
+    Deleting a source file must remove both its cap and its obsolete historical
+    evidence.  This works even in a shallow checkout, where a full git-ledger
+    rebuild deliberately preserves existing records.
+    """
+    result = dict(ledger_data) if isinstance(ledger_data, dict) else {}
+    history: dict[str, dict] = {}
+    raw_history = result.get("history") or {}
+    for section, records in raw_history.items():
+        if not isinstance(records, dict):
+            continue
+        current = caps_data.get(section)
+        if not isinstance(current, dict):
+            continue
+        kept = {key: value for key, value in records.items() if key in current}
+        if kept:
+            history[section] = kept
+    result["history"] = history
+    return result
 
 
 def is_breach(count: int | None, cap: int | None) -> bool:
@@ -95,6 +386,26 @@ class BumpHistoryUnavailableError(Exception):
 # replaces the old empty-string record and is never eligible for pruning.
 UNATTRIBUTED_COMMIT_SHA = "unattributed"
 
+# Statuses returned by :func:`missing_ledger_bump_records`.  The two cases carry
+# very different severity and MUST NOT be collapsed:
+#
+# ``LEDGER_BUMP_ABSENT``
+#     The ledger holds no record at all for a cap raise that HEAD's own ancestry
+#     proves happened.  That is genuine ledger drift — the deployed backend's
+#     chronic-offender classification is missing a bump it should count — and is
+#     a legitimate hard failure.
+# ``LEDGER_BUMP_UNATTRIBUTED``
+#     The ledger DOES hold a matching record for the pair, but it still carries
+#     the ``UNATTRIBUTED_COMMIT_SHA`` (or legacy empty-string) placeholder that
+#     :func:`ledger_with_pending_bumps` necessarily writes when the bump is
+#     staged before its commit exists.  The bump is recorded and counted; only
+#     the provenance is pending.  This is a normal, self-inflicted consequence
+#     of every rollup auto-bump, so it is a reconcile HINT, never a hard failure
+#     — otherwise each auto-bump would turn ``./check`` red fleet-wide until an
+#     operator manually ran ``--fix``.
+LEDGER_BUMP_ABSENT = "absent"
+LEDGER_BUMP_UNATTRIBUTED = "unattributed_placeholder"
+
 
 # Module-level TTL cache: (module_key, section) -> (outcome, monotonic_time)
 # where ``outcome`` is either a ``list[BumpRecord]`` (read succeeded) or a
@@ -106,7 +417,10 @@ _bump_history_cache: dict[
 _CACHE_TTL_SECONDS: float = 60.0
 
 # Repo root: backend/app/ -> ../../
-_REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_SOURCE_TREE_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
+)
+_REPO_ROOT = "/repo" if os.path.isdir("/repo/backend/app") else _SOURCE_TREE_ROOT
 _TESTING_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "testing"))
 _MODULE_SIZE_LIMITS_RELPATH = "backend/testing/module_size_limits.json"
 _MODULE_SIZE_LIMITS_PATH = os.path.join(_TESTING_DIR, "module_size_limits.json")
@@ -124,8 +438,15 @@ _CAP_BUMP_HISTORY_LEDGER_PATH = os.path.join(_TESTING_DIR, "cap_bump_history.jso
 _CAP_BUMP_HISTORY_LEDGER_SCHEMA = 1
 
 
-def _git_reads_history_here() -> bool:
-    """True only when git is on PATH AND ``_REPO_ROOT`` is a git checkout.
+def _is_git_checkout(repo_root: str) -> bool:
+    """Return whether ``repo_root`` has ordinary or linked-worktree Git data."""
+    git_marker = os.path.join(repo_root, ".git")
+    # A linked worktree uses a .git *file* pointing at the common Git dir.
+    return os.path.isdir(git_marker) or os.path.isfile(git_marker)
+
+
+def _git_reads_history_here(repo_root: str | None = None) -> bool:
+    """True only when git is on PATH AND the selected root is a git checkout.
 
     These are the two structural preconditions the deployed backend layout
     fails: the production ``app`` stage has no git binary, and under WORKDIR
@@ -133,9 +454,8 @@ def _git_reads_history_here() -> bool:
     it). When either is false the git evidence source is unreachable and
     :func:`parse_bump_history` reads the committed ledger mirror instead.
     """
-    return shutil.which("git") is not None and os.path.isdir(
-        os.path.join(_REPO_ROOT, ".git")
-    )
+    root = repo_root or _REPO_ROOT
+    return shutil.which("git") is not None and _is_git_checkout(root)
 
 
 # Ref scope for cap-bump history: the mainline integration branch's ancestry,
@@ -194,6 +514,32 @@ def _mainline_git_ref(repo_root: str | None = None) -> str:
     return "HEAD"
 
 
+def _git_shallow_file_path(repo_root: str) -> str:
+    """Resolve Git's shallow-boundary file for clones and linked worktrees."""
+    legacy_path = os.path.join(repo_root, ".git", "shallow")
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "rev-parse",
+                "--git-path",
+                "shallow",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — legacy path still covers ordinary clones
+        return legacy_path
+    resolved = result.stdout.strip() if result.returncode == 0 else ""
+    if not resolved:
+        return legacy_path
+    return resolved if os.path.isabs(resolved) else os.path.join(repo_root, resolved)
+
+
 def _git_history_is_truncated(repo_root: str | None = None) -> bool:
     """True when the MAINLINE history source is truncated by a shallow boundary.
 
@@ -215,7 +561,7 @@ def _git_history_is_truncated(repo_root: str | None = None) -> bool:
     truncated.  A boundary on an unrelated branch must not fail closed.
     """
     root = repo_root or _REPO_ROOT
-    shallow_path = os.path.join(root, ".git", "shallow")
+    shallow_path = _git_shallow_file_path(root)
     if not os.path.isfile(shallow_path):
         return False
     try:
@@ -439,33 +785,52 @@ def _read_cap_bump_history_ledger(section: str, module_key: str) -> list[BumpRec
 
 
 def ledger_with_pending_bumps(
-    ledger_data: dict, pending: list[tuple[str, str, int, int]]
+    ledger_data: dict,
+    pending: list[
+        tuple[str, str, int, int]
+        | tuple[str, str, int, int, str, str]
+    ],
 ) -> dict:
-    """Return a copy of ``ledger_data`` with ``pending`` bumps appended.
+    """Return a copy of ``ledger_data`` with ``pending`` bumps reconciled.
 
-    ``pending`` entries are ``(section, key, old_cap, new_cap)`` — cap bumps
-    not yet in the committed history (an uncommitted ``--fix`` bump, or a rollup
-    auto-bump about to be committed).  They are recorded with the explicit
-    ``UNATTRIBUTED_COMMIT_SHA`` marker; an empty ``commit_sha`` is never
-    appended.  Records already present for the same (key, old_cap, new_cap) are
-    not duplicated, so a retried rollup cycle (or a regenerated ``--fix``) is
-    idempotent. A later complete-history regeneration can replace the marker
-    with the actual commit SHA.
+    Four-field entries represent an uncommitted bump and receive the explicit
+    ``UNATTRIBUTED_COMMIT_SHA`` marker. Six-field entries add observed git
+    provenance for an already-committed bump; that SHA/date is preserved and
+    upgrades an existing unattributed record for the same cap pair.
     """
     result = dict(ledger_data) if isinstance(ledger_data, dict) else {}
     history: dict = {}
     for section, section_data in (result.get("history") or {}).items():
         history[section] = dict(section_data) if isinstance(section_data, dict) else {}
     now_iso = datetime.now(timezone.utc).isoformat()
-    for section, key, old_cap, new_cap in pending:
+    for item in pending:
+        if len(item) == 4:
+            section, key, old_cap, new_cap = item
+            commit_sha = UNATTRIBUTED_COMMIT_SHA
+            commit_date = now_iso
+        elif len(item) == 6:
+            section, key, old_cap, new_cap, commit_sha, commit_date = item
+        else:
+            raise ValueError(f"pending cap bump must contain 4 or 6 fields: {item!r}")
         section_records = history.setdefault(section, {})
         records = list(section_records.get(key) or [])
-        known = {(r.get("old_cap"), r.get("new_cap")) for r in records}
-        if (old_cap, new_cap) not in known:
+        matching = [
+            record
+            for record in records
+            if record.get("old_cap") == old_cap and record.get("new_cap") == new_cap
+        ]
+        if matching:
+            if len(item) == 6 and matching[0].get("commit_sha") in {
+                "",
+                UNATTRIBUTED_COMMIT_SHA,
+            }:
+                matching[0]["commit_sha"] = commit_sha
+                matching[0]["commit_date"] = commit_date
+        else:
             records.append(
                 {
-                    "commit_sha": UNATTRIBUTED_COMMIT_SHA,
-                    "commit_date": now_iso,
+                    "commit_sha": commit_sha,
+                    "commit_date": commit_date,
                     "old_cap": old_cap,
                     "new_cap": new_cap,
                 }
@@ -480,7 +845,10 @@ def rebuild_cap_bump_history_ledger(
     *,
     caps_json_path: str | None = None,
     ledger_path: str | None = None,
-    pending: list[tuple[str, str, int, int]] | None = None,
+    pending: list[
+        tuple[str, str, int, int]
+        | tuple[str, str, int, int, str, str]
+    ] | None = None,
 ) -> dict:
     """Regenerate the cap-bump-history ledger and write it; return the dict.
 
@@ -547,12 +915,21 @@ def rebuild_cap_bump_history_ledger(
         if result is not None and result.returncode == 0:
             git_output = result.stdout
 
-    if git_output is not None:
-        try:
-            with open(caps_path, encoding="utf-8") as f:
-                caps_data = json.load(f)
-        except (OSError, ValueError):
-            caps_data = {}
+    # The caps JSON is read ONCE, and whether the read succeeded is tracked
+    # separately from its contents: "the caps file could not be read" must never
+    # be mistaken for "no caps exist".  An unreadable/malformed caps file makes
+    # both the git regeneration and the deleted-cap prune below unable to tell a
+    # current key from a deleted one, so both are skipped and the existing
+    # mirror is preserved (fail-closed).
+    try:
+        with open(caps_path, encoding="utf-8") as f:
+            caps_data = json.load(f)
+        caps_readable = True
+    except (OSError, ValueError):
+        caps_data = {}
+        caps_readable = False
+
+    if git_output is not None and caps_readable:
         caps_keys: dict[str, set[str]] = {}
         git_histories: dict[str, dict[str, list[BumpRecord]]] = {}
         for section, keys in caps_data.items():
@@ -574,9 +951,20 @@ def rebuild_cap_bump_history_ledger(
         else:
             base_history = git_histories
     else:
-        # git entirely unavailable, or the checkout is truncated — preserve the
-        # existing mirror (a truncated ``git log`` must never truncate it).
+        # git entirely unavailable, the checkout is truncated, or the caps JSON
+        # is unreadable — preserve the existing mirror (a truncated ``git log``,
+        # like an unreadable caps file, must never truncate it).
         base_history = existing_history
+
+    # A deleted cap has no future breach to classify.  Prune its mirror record
+    # before any merge-preservation logic can carry it forward in a shallow
+    # checkout.  Only ever prune against caps we actually read: an unreadable
+    # caps file would otherwise look like "every cap was deleted" and wipe the
+    # whole ledger.
+    if caps_readable:
+        base_history = prune_ledger_for_current_caps(
+            {"history": base_history}, caps_data
+        )["history"]
 
     if git_available:
         # Self-heal: prune ledger records positive mainline evidence proves
@@ -614,6 +1002,190 @@ def rebuild_cap_bump_history_ledger(
         json.dump(ledger, f, indent=2, ensure_ascii=True)
         f.write("\n")
     return ledger
+
+
+def _head_reachable_cap_commits(repo_root: str) -> set[str] | None:
+    """Return the caps-file commits in ``HEAD``'s own ancestry.
+
+    Mainline moves on while a task branch is open, so a cap bump that landed on
+    automain *after* the branch forked is genuinely absent from the branch's
+    ledger — the branch does not contain the commit and cannot have the record.
+    Scoping the git->ledger comparison to this set is what separates real ledger
+    drift (a bump the branch DOES contain but never mirrored) from ordinary
+    branch/mainline skew, which must never turn the guard red.
+
+    Returns ``None`` when the ancestry cannot be determined; callers treat that
+    as "prove nothing" rather than risking a false breach.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "rev-list",
+                "HEAD",
+                "--",
+                _MODULE_SIZE_LIMITS_RELPATH,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=repo_root,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def missing_ledger_bump_records(
+    *,
+    repo_root: str | None = None,
+    caps_json_path: str | None = None,
+    ledger_path: str | None = None,
+) -> list[tuple[str, str, int, int, str, str, str]]:
+    """Return cap raises in HEAD's own ancestry the ledger does not fully record.
+
+    This is the forward half of ledger coherence (git -> ledger).  A shallow
+    history is still useful here: every bump it *does* expose is positive
+    evidence that the mirror must contain the pair.  Callers preserve the
+    existing ledger and append only these proven pairs, never treating absent
+    shallow history as permission to delete an older record.
+
+    Only bumps whose commit is reachable from ``HEAD`` are reported.  A mainline
+    bump that landed after this branch forked is not drift the branch can fix —
+    reporting it would fail ``check_size_limits.py`` (and therefore ``./check``)
+    on every branch that merely forked early, and the ``--fix`` remediation
+    would write mainline-owned records into each task branch's ledger.
+
+    Each entry is ``(section, key, old_cap, new_cap, commit_sha, commit_date,
+    status)`` where ``status`` is :data:`LEDGER_BUMP_ABSENT` (no ledger record
+    for the pair at all — real drift, safe for a caller to fail on) or
+    :data:`LEDGER_BUMP_UNATTRIBUTED` (a matching record exists but still holds
+    the pre-commit placeholder SHA — only the provenance is pending, so callers
+    must treat it as a reconcile hint, NOT a failure).  Both statuses are
+    repairable by the same ``--fix`` rebuild; they differ only in severity.
+    Collapsing them is what made every rollup auto-bump break ``./check``
+    fleet-wide until an operator manually reconciled the ledger.
+    """
+    root = repo_root or _REPO_ROOT
+    caps_path = caps_json_path or _MODULE_SIZE_LIMITS_PATH
+    out_path = ledger_path or _CAP_BUMP_HISTORY_LEDGER_PATH
+    if not _git_reads_history_here(root):
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={root}",
+                "log",
+                _mainline_git_ref(root),
+                "--format=COMMIT %H %aI",
+                "-p",
+                "--",
+                _MODULE_SIZE_LIMITS_RELPATH,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=root,
+        )
+        if result.returncode != 0:
+            return []
+        with open(caps_path, encoding="utf-8") as caps_file:
+            caps_data = json.load(caps_file)
+        with open(out_path, encoding="utf-8") as ledger_file:
+            ledger_data = json.load(ledger_file)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+    # Restrict the mainline evidence to this checkout's own ancestry.  Without
+    # this, a bump merged to mainline after the branch forked reads as ledger
+    # drift the branch caused, and the guard goes red on unrelated work.
+    reachable = _head_reachable_cap_commits(root)
+    if reachable is None:
+        return []
+
+    history = ledger_data.get("history", {}) if isinstance(ledger_data, dict) else {}
+    global_start = min(
+        (
+            _parse_iso(record["commit_date"])
+            for sections in history.values()
+            if isinstance(sections, dict)
+            for records in sections.values()
+            if isinstance(records, list)
+            for record in records
+            if isinstance(record, dict) and record.get("commit_date")
+        ),
+        default=None,
+    )
+    missing: list[tuple[str, str, int, int, str, str, str]] = []
+    for section, keys in caps_data.items():
+        if not isinstance(keys, dict):
+            continue
+        section_history = history.get(section, {}) if isinstance(history, dict) else {}
+        for key in keys:
+            records = section_history.get(key, []) if isinstance(section_history, dict) else []
+            window_start = min(
+                (
+                    _parse_iso(record["commit_date"])
+                    for record in records
+                    if isinstance(record, dict) and record.get("commit_date")
+                ),
+                default=global_start,
+            )
+            for record in _parse_git_diff_output(result.stdout, key):
+                if record["commit_sha"] not in reachable:
+                    # Mainline-only bump: this branch does not contain the
+                    # commit, so its ledger cannot be expected to record it.
+                    continue
+                pair = (record["old_cap"], record["new_cap"])
+                matching_records = [
+                    ledger_record
+                    for ledger_record in records
+                    if (
+                        ledger_record.get("old_cap"),
+                        ledger_record.get("new_cap"),
+                    )
+                    == pair
+                ]
+                if matching_records and matching_records[0].get("commit_sha") not in {
+                    "",
+                    UNATTRIBUTED_COMMIT_SHA,
+                }:
+                    continue
+                # A matching unattributed pair is exactly the record that must
+                # be upgraded with the git provenance we just observed.  Its
+                # placeholder date may have been written after the real
+                # mainline commit, so the ordinary per-key timestamp window
+                # must not hide that pair from reconciliation.
+                if (
+                    not matching_records
+                    and window_start is not None
+                    and _parse_iso(record["commit_date"]) < window_start
+                ):
+                    continue
+                # The bump IS in the ledger whenever a matching pair exists —
+                # only its provenance is still the pre-commit placeholder, so
+                # this is a pending attribution rather than missing evidence.
+                status = (
+                    LEDGER_BUMP_UNATTRIBUTED if matching_records else LEDGER_BUMP_ABSENT
+                )
+                missing.append(
+                    (
+                        section,
+                        key,
+                        record["old_cap"],
+                        record["new_cap"],
+                        record["commit_sha"],
+                        record["commit_date"],
+                        status,
+                    )
+                )
+    return missing
 
 
 def _git_would_drop_ledger_records(
@@ -851,6 +1423,21 @@ def _diff_bump_pairs(diff_text: str) -> dict[str, set[tuple[int, int]]]:
     return out
 
 
+def _is_combined_git_diff(diff_text: str) -> bool:
+    """Return whether ``diff_text`` is a merge commit's combined diff.
+
+    Combined diffs use ``diff --cc``/``diff --combined`` headers and prefix
+    hunk lines with one marker per parent.  They are readable, but they do not
+    provide the single-parent ``- old/+ new`` evidence consumed by
+    :func:`_diff_bump_pairs`; treating that parser miss as proof of a phantom
+    would delete legitimate ledger records attributed to a merge SHA.
+    """
+    return any(
+        line.startswith(("diff --cc ", "diff --combined "))
+        for line in diff_text.splitlines()
+    )
+
+
 def _git_log_bump_map(output: str) -> dict[str, dict[str, set[tuple[int, int]]]]:
     """Build ``commit_sha -> {key: {(old_cap, new_cap)}}`` from ``git log -p`` output.
 
@@ -862,6 +1449,10 @@ def _git_log_bump_map(output: str) -> dict[str, dict[str, set[tuple[int, int]]]]
     """
     result: dict[str, dict[str, set[tuple[int, int]]]] = {}
     for sha, _date, diff_text in _split_git_log_chunks(output):
+        if _is_combined_git_diff(diff_text):
+            # A merge's combined diff is not attributable to one parent and
+            # must be adjudicated as absent evidence by phantom_ledger_records.
+            continue
         pairs = _diff_bump_pairs(diff_text)
         if pairs:
             result[sha] = pairs
@@ -966,6 +1557,49 @@ def _git_show_file_diff(sha: str, repo_root: str) -> str | None:
     return result.stdout
 
 
+def _git_commit_parent_count(sha: str, repo_root: str) -> int | None:
+    """Return a commit's parent count, or ``None`` when it cannot be read."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "show",
+                "-s",
+                "--format=%P",
+                sha,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — unavailable provenance is not contradiction
+        return None
+    if result.returncode != 0:
+        return None
+    return len(result.stdout.split())
+
+
+def _git_commit_is_shallow_boundary(sha: str, repo_root: str) -> bool:
+    """Return whether ``sha`` is an explicit shallow-clone boundary.
+
+    Git hides a shallow boundary's parent and renders ``git show`` as though
+    the boundary were a root commit.  For ``module_size_limits.json`` that is
+    a whole-file addition, so the ordinary ``old -> new`` pair parser cannot
+    adjudicate a ledger record even when the cited commit made the real bump.
+    The shallow file is positive evidence of that loss; an unreadable or
+    absent shallow file is not treated as a boundary.
+    """
+    shallow_path = _git_shallow_file_path(repo_root)
+    try:
+        with open(shallow_path, encoding="utf-8") as f:
+            return any(line.strip() == sha for line in f)
+    except OSError:
+        return False
+
+
 def phantom_ledger_records(
     *,
     repo_root: str | None = None,
@@ -1002,7 +1636,7 @@ def phantom_ledger_records(
     ``ledger_path``; ``repo_root`` defaults to ``_REPO_ROOT``.
     """
     root = repo_root or _REPO_ROOT
-    if not _git_reads_history_here():
+    if not _git_reads_history_here(root):
         # No git checkout — nothing to verify the ledger against.  The ledger
         # is the only history source in the deployed layout by design.
         return []
@@ -1048,6 +1682,7 @@ def phantom_ledger_records(
     if result.returncode != 0:
         return []
     bump_map = _git_log_bump_map(result.stdout)
+    mainline_history_truncated = _git_history_is_truncated(root)
 
     # Collect records and the SHAs they cite, then resolve all SHAs in one batch.
     records: list[tuple[str, str, int, int, str]] = []
@@ -1101,26 +1736,46 @@ def phantom_ledger_records(
             continue
         ancestry = _commit_in_mainline_ancestry(sha, root)
         if ancestry is False:
-            phantoms.append(
-                (
-                    section,
-                    key,
-                    old_cap,
-                    new_cap,
-                    sha,
-                    "commit is not in the mainline ancestry",
+            if not mainline_history_truncated:
+                phantoms.append(
+                    (
+                        section,
+                        key,
+                        old_cap,
+                        new_cap,
+                        sha,
+                        "commit is not in the mainline ancestry",
+                    )
                 )
-            )
-            continue
+                continue
+            # ``merge-base --is-ancestor`` also exits 1 when the connecting
+            # path lies beyond a shallow boundary. A reference clone can still
+            # resolve the older commit object, so suppress only the ambiguous
+            # ancestry verdict and continue to inspect its direct diff below.
         if ancestry is None:
             # An ancestry probe failure is evidence loss, not proof of a fake
             # record. Never delete on this polarity.
+            continue
+        if _git_commit_is_shallow_boundary(sha, root):
+            # The parent is deliberately hidden, so ``git show`` synthesizes a
+            # root/full-file-add diff. A missing pair there is evidence loss,
+            # not proof that the ledger row is fabricated.
+            continue
+        parent_count = _git_commit_parent_count(sha, root)
+        if parent_count is None or parent_count > 1:
+            # A merge commit has no single-parent diff that can attribute a
+            # cap pair. Likewise, a failed parent probe leaves the provenance
+            # absent. Neither case is positive evidence of a phantom.
             continue
         # A beyond-boundary ancestor whose objects are present in this (possibly
         # shallow) checkout: render its diff directly and verify the pair.
         diff_text = _git_show_file_diff(sha, root)
         if diff_text is None:
             # An unreadable diff cannot establish fabrication.
+            continue
+        if _is_combined_git_diff(diff_text):
+            # A merge commit is readable, but its combined diff does not expose
+            # the single-parent pair format required for attribution.
             continue
         shown_pairs = _diff_bump_pairs(diff_text).get(key, set())
         if pair not in shown_pairs:
@@ -1205,6 +1860,7 @@ def classify_breach(
     section: str = "backend",
     *,
     override_chronic: bool = False,
+    repo_root: str | None = None,
 ) -> BreachVerdict:
     """Classify a size breach as routine or chronic-offender escalation.
 
@@ -1234,9 +1890,21 @@ def classify_breach(
         # (override_chronic=True) still grants the bump — it is the documented
         # human-approval escape hatch, identical to a verified chronic offender.
         if override_chronic:
+            try:
+                suggested_new_limit = bump_size_limit(
+                    current_size, module_key, section, repo_root
+                )
+            except GovernanceCapExceededError as exc:
+                return BreachVerdict(
+                    is_chronic=True,
+                    suggested_new_limit=None,
+                    bump_count=0,
+                    history_unavailable=True,
+                    reason=f"Refusing cap bump: {exc}.",
+                )
             return BreachVerdict(
                 is_chronic=True,
-                suggested_new_limit=bump_size_limit(current_size),
+                suggested_new_limit=suggested_new_limit,
                 bump_count=0,
                 history_unavailable=True,
                 reason=(
@@ -1270,9 +1938,22 @@ def classify_breach(
             ),
         )
 
+    try:
+        suggested_new_limit = bump_size_limit(
+            current_size, module_key, section, repo_root
+        )
+    except GovernanceCapExceededError as exc:
+        return BreachVerdict(
+            is_chronic=True,
+            suggested_new_limit=None,
+            bump_count=bump_count,
+            history_unavailable=False,
+            reason=f"Refusing cap bump: {exc}.",
+        )
+
     return BreachVerdict(
         is_chronic=chronic,
-        suggested_new_limit=bump_size_limit(current_size),
+        suggested_new_limit=suggested_new_limit,
         bump_count=bump_count,
         history_unavailable=False,
         reason=(

@@ -35,6 +35,7 @@ same way the reproduce-on-HEAD verdict does.
 
 from __future__ import annotations
 
+
 import hashlib
 import json
 import logging
@@ -81,9 +82,13 @@ from app.acceptance_window_invariants import (  # noqa: F401
 from app.acceptance_provenance import (
     COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
     PARENT_DERIVED_CHANGED_FILES_KEY,
+    PR_CHANGED_FILES_STAMP_SKIPPED_KEY,
+    ChangedFilesStampSkipReason,
     stamp_parent_derived_changed_files_signal as _stamp_parent_derived_signal,
     stamp_commit_range_derived_changed_files_signal as _stamp_commit_range_signal,
+    stamp_changed_files_skip_reason,
 )
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3448
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +148,11 @@ def criterion_met(value: Any, op: str, threshold: Any) -> bool:
 # means "no acceptance verdict was recorded" and preserves prior bare-merge
 # scoring exactly.
 CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
+
+# A finding-derived fix is not proven merely because its PR landed. This marker
+# is reserved for an explicit current-tree verification result. The verifier
+# must name every finding it checked and the exact landed commit.
+FINDING_CLEARANCE_VERIFICATION_KEY = "finding_clearance_verification"
 
 # Durable rule-version stamped onto every recorded acceptance verdict (rungs
 # 1-2 of design doc c50453ef). A later qualification reads this field to tell
@@ -328,6 +338,124 @@ def stamp_commit_range_derived_changed_files_signal(paths: list[str]) -> dict[st
         stamp_changed_files_signal=stamp_changed_files_signal,
         parent_derived_key=PARENT_DERIVED_CHANGED_FILES_KEY,
     )
+
+
+async def stamp_pr_changed_files_at_landing(
+    task: Task,
+    session: Any,
+    *,
+    pr_number: int | str | None = None,
+    github_credentials: tuple[str, str, str] | None = None,
+) -> bool:
+    """Stamp GitHub's changed-file list before recording a landing verdict.
+
+    The landed-signal writer is the single consumer of code acceptance verdicts,
+    but many merge lanes reach it. Keeping this acquisition here makes every
+    lane use the same authoritative PR diff while preserving the merge contract:
+    a credential, PR lookup, or GitHub failure records a bounded reason and never
+    prevents the real landing from being written.
+
+    ``github_credentials`` is accepted for callers that already resolved the
+    merge PR (notably CI completion); other callers resolve credentials from the
+    task and session. A parent-derived rollup child is deliberately left alone:
+    its parent union is a known lower-confidence signal and must not be replaced
+    with a lookup for the parent's PR.
+    """
+    context = dict(task.context or {})
+    if context.get("_pr_changed_files_github_verified") is True:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.already_stamped
+        )
+        task.context = context
+        return False
+    if context.get(PARENT_DERIVED_CHANGED_FILES_KEY) is True:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.rollup_parent_pr
+        )
+        task.context = context
+        return False
+
+    if pr_number is None:
+        from app.ci_merge_helpers import effective_pr_number
+
+        pr_number = effective_pr_number(task)
+    if pr_number is None or isinstance(pr_number, bool) or not str(pr_number).strip():
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.pr_number_unavailable
+        )
+        task.context = context
+        return False
+
+    credentials = github_credentials
+    if credentials is None:
+        try:
+            from app.routers.agent import get_github_token_for_task
+
+            credentials = await get_github_token_for_task(task.id, session)
+        except Exception:  # provenance is best-effort at landing
+            stamp_changed_files_skip_reason(
+                context, ChangedFilesStampSkipReason.github_credentials_unavailable
+            )
+            task.context = context
+            logger.warning(
+                "changed-file provenance credentials unavailable for landed task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
+            return False
+
+    if (
+        not isinstance(credentials, tuple)
+        or len(credentials) != 3
+        or not all(isinstance(value, str) and value.strip() for value in credentials)
+    ):
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.github_credentials_unavailable
+        )
+        task.context = context
+        return False
+
+    try:
+        from app.github import get_pr_files
+
+        raw_files = await get_pr_files(
+            credentials[0],
+            credentials[1],
+            credentials[2],
+            int(pr_number),
+            str(task.project_id) if task.project_id is not None else None,
+        )
+        paths = [
+            item["filename"]
+            for item in (raw_files or [])
+            if isinstance(item, dict)
+            and isinstance(item.get("filename"), str)
+            and item["filename"].strip()
+        ]
+    except Exception:  # provenance must never abort a landing
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.diff_fetch_failed
+        )
+        task.context = context
+        logger.warning(
+            "changed-file provenance fetch failed for landed task %s (PR #%s)",
+            getattr(task, "id", None),
+            pr_number,
+            exc_info=True,
+        )
+        return False
+
+    if not paths:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.no_diff_returned
+        )
+        task.context = context
+        return False
+
+    context.pop(PR_CHANGED_FILES_STAMP_SKIPPED_KEY, None)
+    context.update(stamp_changed_files_signal(paths, github_verified=True))
+    task.context = context
+    return True
 
 
 def _is_test_path(path: str) -> bool:
@@ -923,7 +1051,7 @@ async def corroborate_acceptance_for_landing(
                 ACCEPTANCE_TEST_CORROBORATED_KEY: result,
             }
         return result
-    except Exception:  # noqa: BLE001 — corroboration must never abort a landing
+    except Exception:
         logger.warning(
             "corroborate_acceptance_for_landing failed for task %s",
             getattr(task, "id", None),
@@ -1575,7 +1703,7 @@ def _evaluate_coverage_delta(
         return AcceptanceGateVerdict(
             True, False, evidence.kind,
             "coverage_delta acceptance evidence requires a numeric threshold "
-            "(coverage percentage 0–100)",
+            "(coverage percentage 0-100)",
         )
 
     result = (context or {}).get(TEST_COVERAGE_RESULT_KEY)
@@ -1673,31 +1801,30 @@ def evaluate_acceptance(
     # specific, actionable reason instead of a misleading generic one.
     block_describes_other_test = False
     declared_path = _declared_named_test_path(payload)
-    if evidence.kind == "named_test":
-        if declared_path:
-            block = _merge_acceptance_test_block(context)
-            block_describes_other_test = (
-                block is not None
-                and not acceptance_test_block_matches_declared(block, declared_path)
-            )
-            if not block_describes_other_test:
-                # A targeted-green signal without a persisted block (older
-                # monitor) must still name the declared test — corroborate the
-                # distilled descriptor the monitor stamped alongside it.
-                review_loop = (context or {}).get(REVIEW_LOOP_KEY)
-                if (
-                    isinstance(review_loop, dict)
-                    and review_loop.get(ACCEPTANCE_TEST_TARGETED_GREEN_KEY) is True
-                    and not isinstance(review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY), dict)
-                ):
-                    descriptor = review_loop.get(ACCEPTANCE_TEST_TARGETED_DESCRIPTOR_KEY)
-                    block_describes_other_test = (
-                        isinstance(descriptor, str)
-                        and bool(descriptor.strip())
-                        and not acceptance_test_block_matches_declared(
-                            {"selector": descriptor}, declared_path
-                        )
+    if evidence.kind == "named_test" and declared_path:
+        block = _merge_acceptance_test_block(context)
+        block_describes_other_test = (
+            block is not None
+            and not acceptance_test_block_matches_declared(block, declared_path)
+        )
+        if not block_describes_other_test:
+            # A targeted-green signal without a persisted block (older monitor)
+            # must still name the declared test — corroborate the distilled
+            # descriptor the monitor stamped alongside it.
+            review_loop = (context or {}).get(REVIEW_LOOP_KEY)
+            if (
+                isinstance(review_loop, dict)
+                and review_loop.get(ACCEPTANCE_TEST_TARGETED_GREEN_KEY) is True
+                and not isinstance(review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY), dict)
+            ):
+                descriptor = review_loop.get(ACCEPTANCE_TEST_TARGETED_DESCRIPTOR_KEY)
+                block_describes_other_test = (
+                    isinstance(descriptor, str)
+                    and bool(descriptor.strip())
+                    and not acceptance_test_block_matches_declared(
+                        {"selector": descriptor}, declared_path
                     )
+                )
     targeted_green = _acceptance_test_targeted_green(context, declared_path)
     test_exists = _acceptance_test_exists_at_merge(context, declared_path)
     ran_green = _acceptance_test_ran_green_at_merge(context, declared_path)
@@ -1767,6 +1894,7 @@ _ACCEPTANCE_INPUT_CONTEXT_KEYS = (
     PARENT_DERIVED_CHANGED_FILES_KEY,
     COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
     "_pr_changed_files_provenance",
+    PR_CHANGED_FILES_STAMP_SKIPPED_KEY,
     ACCEPTANCE_TEST_CORROBORATED_KEY,
     TEST_COVERAGE_RESULT_KEY,
     "viewport_failure_screenshot_uri",
@@ -2169,6 +2297,182 @@ def acceptance_blocks_success(recorded: Any) -> bool:
     if not isinstance(recorded, dict):
         return False
     return recorded.get("satisfied") is False
+
+
+def finding_clearance_blocks_success(context: Mapping[str, Any] | None) -> bool:
+    """Whether a merged finding-clearing claim lacks authoritative proof.
+
+    ``resolving_finding_keys`` is an explicit claim that a write task addresses
+    carried audit findings. It is deliberately insufficient on its own: a PR
+    merge proves delivery, not that the findings disappeared from the current
+    tree. Credit is allowed only when a marker covers every claimed key and its
+    ``verified_against_sha`` equals the task's exact landed commit. Missing,
+    malformed, partial, or stale markers fail closed.
+    """
+    ctx = context if isinstance(context, Mapping) else {}
+    raw_keys = ctx.get("resolving_finding_keys")
+    if not isinstance(raw_keys, list):
+        return False
+    finding_keys = {
+        key.strip() for key in raw_keys if isinstance(key, str) and key.strip()
+    }
+    if not finding_keys:
+        return False
+
+    verification = ctx.get(FINDING_CLEARANCE_VERIFICATION_KEY)
+    if not isinstance(verification, Mapping):
+        return True
+    verified_keys = verification.get("finding_keys")
+    if not isinstance(verified_keys, list):
+        return True
+    verified_key_set = {
+        key.strip()
+        for key in verified_keys
+        if isinstance(key, str) and key.strip()
+    }
+    landed_sha = ctx.get(LANDED_MERGE_SHA_KEY)
+    verified_sha = verification.get("verified_against_sha")
+    return not (
+        verification.get("state") == "verified"
+        and finding_keys.issubset(verified_key_set)
+        and isinstance(landed_sha, str)
+        and bool(landed_sha.strip())
+        and isinstance(verified_sha, str)
+        and verified_sha.strip() == landed_sha.strip()
+    )
+
+
+def _claimed_finding_keys(context: Mapping[str, Any] | None) -> set[str]:
+    """Normalize a task's ``resolving_finding_keys`` claim into a key set."""
+    ctx = context if isinstance(context, Mapping) else {}
+    raw_keys = ctx.get("resolving_finding_keys")
+    if not isinstance(raw_keys, list):
+        return set()
+    return {key.strip() for key in raw_keys if isinstance(key, str) and key.strip()}
+
+
+async def verify_finding_clearance_at_landing(
+    task: Task,
+    session: Any,
+    *,
+    merge_commit_sha: str | None = None,
+    github_credentials: tuple[str, str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Stamp the current-tree proof behind a merged finding-clearing claim.
+
+    This is the producer :func:`finding_clearance_blocks_success` consumes. It
+    replaces the old merge-time auto-resolve, which credited the *claim*
+    (``resolving_finding_keys``) and never looked at the tree. Here each claimed
+    finding is re-checked against the exact landed commit using the same
+    identity the qualifier's audited-surface map records: a finding is cleared
+    only when the blob it was graded against is provably no longer at its cited
+    path (changed blob SHA, or the file deleted).
+
+    Every unavailable input — no open version, truncated finding list, missing
+    ``blob_sha``, unreadable path, no landed sha — leaves the marker
+    ``unverified``, which the gate reads as "no credit". Nothing here can turn
+    an unverified claim into credit, and nothing here can abort a landing:
+    callers wrap it, and the marker is additive context.
+
+    Returns the stamped marker, or ``None`` when the task claims no findings.
+    """
+    finding_keys = _claimed_finding_keys(getattr(task, "context", None))
+    if not finding_keys:
+        return None
+
+    sha = merge_commit_sha.strip()[:64] if isinstance(merge_commit_sha, str) else ""
+    marker: dict[str, Any] = {
+        "state": "unverified",
+        "finding_keys": [],
+        "claimed_finding_keys": sorted(finding_keys),
+        "verified_against_sha": sha or None,
+        "checked_at": _utcnow().isoformat(),
+    }
+
+    def _stamp(reason: str | None = None) -> dict[str, Any]:
+        if reason:
+            marker["reason"] = reason
+        context = dict(getattr(task, "context", None) or {})
+        context[FINDING_CLEARANCE_VERIFICATION_KEY] = marker
+        task.context = context
+        return marker
+
+    if not sha:
+        return _stamp("landed commit sha unavailable")
+
+    from app.release_version import current_open_version
+
+    version = await current_open_version(session, task.project_id)
+    if version is None:
+        return _stamp("no open release version")
+
+    from app.release_readiness import _latest_carried_audit_findings
+
+    carried, truncated, _provenance = await _latest_carried_audit_findings(
+        session, version
+    )
+    if truncated:
+        # A clipped list cannot prove a claimed key is absent from it.
+        return _stamp("carried finding list truncated")
+    by_key = {
+        str(finding.get("key")): finding
+        for finding in carried
+        if isinstance(finding, dict) and finding.get("key")
+    }
+
+    credentials = github_credentials
+    if credentials is None:
+        try:
+            from app.routers.agent import get_github_token_for_task
+
+            credentials = await get_github_token_for_task(task.id, session)
+        except Exception:  # verification is never a landing gate
+            logger.warning(
+                "finding-clearance credentials unavailable for landed task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
+            credentials = None
+    if (
+        not isinstance(credentials, tuple)
+        or len(credentials) != 3
+        or not all(isinstance(value, str) and value.strip() for value in credentials)
+    ):
+        return _stamp("github credentials unavailable")
+
+    from app.github import get_file_blob_sha_at_ref
+
+    token, owner, repo = credentials
+    verified: list[str] = []
+    for key in sorted(finding_keys):
+        finding = by_key.get(key)
+        if not isinstance(finding, dict):
+            continue
+        path = str(finding.get("file") or finding.get("path") or "").strip()
+        recorded_blob = finding.get("blob_sha")
+        if not path or not isinstance(recorded_blob, str) or not recorded_blob.strip():
+            # A cross-cutting finding with no single blob has no current-tree
+            # identity to check; it cannot be machine-cleared.
+            continue
+        exists, current_blob = await get_file_blob_sha_at_ref(
+            path,
+            token=token,
+            owner=owner,
+            repo=repo,
+            ref=sha,
+            project_id=str(task.project_id) if task.project_id else None,
+        )
+        if exists is False:
+            verified.append(key)
+            continue
+        if exists is True and current_blob and current_blob != recorded_blob.strip():
+            verified.append(key)
+
+    marker["finding_keys"] = verified
+    if set(verified) >= finding_keys:
+        marker["state"] = "verified"
+        return _stamp()
+    return _stamp("claimed findings still present on the landed tree")
 
 
 def acceptance_was_declared(recorded: Any) -> bool:
@@ -2618,7 +2922,7 @@ async def record_artifact_consumptions_for_task(
                 if producer_project is not None:
                     record_capability_proof(producer, producer_project)
                     session.add(producer_project)
-            except Exception:  # noqa: BLE001 — proof recording must never block consumption
+            except Exception:
                 logger.warning(
                     "[ACCEPTANCE_GATE] capability proof recording failed for producer"
                     " task %s after downstream_artifact consumption",
@@ -2669,7 +2973,7 @@ def summarize_version_acceptance_aggregate(
     tasks: Iterable[Task],
 ) -> dict[str, Any]:
     """Summarize one version window's merged tasks into acceptance buckets."""
-    aggregate: dict[str, Any] = {bucket: 0 for bucket in ACCEPTANCE_AGGREGATE_BUCKETS}
+    aggregate: dict[str, Any] = dict.fromkeys(ACCEPTANCE_AGGREGATE_BUCKETS, 0)
     aggregate["total"] = 0
     for task in tasks:
         if task.status != TaskStatus.COMPLETED:
@@ -2725,7 +3029,7 @@ async def _corroborate_soft_named_test(task: Task, session: Any) -> bool:
         result = await corroborate_acceptance_test_at_merge(
             task, session, project=project, commit_sha=sha[:64]
         )
-    except Exception:  # noqa: BLE001 — backfill corroboration must never raise
+    except Exception:
         logger.warning(
             "backfill corroboration failed for task %s",
             getattr(task, "id", None),
@@ -2935,7 +3239,7 @@ async def backfill_acceptance_verdicts(session) -> int:
             # constraint).  Most iterations use the batch-fetched copy.
             try:
                 verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 task = await session.get(Task, task_id)
                 if task is None:
                     marked_ids.append(task_id)
@@ -3022,7 +3326,7 @@ async def backfill_acceptance_verdicts(session) -> int:
                 from app.acceptance_criteria import record_task_merge_evidence
                 try:
                     await record_task_merge_evidence(session, task, task.project_id)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.warning(
                         "backfill_acceptance_verdicts: evidence recording failed for "
                         "task %s",

@@ -5044,6 +5044,52 @@ async def test_get_open_pull_requests_mid_pagination_error_returns_partial(mocke
 
 
 @pytest.mark.asyncio
+async def test_github_retry_boundary_rejects_zero_without_colliding_with_one(mocker):
+    """Zero is rejected before key construction; a concurrent one still dispatches."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls.append(max_retries)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    results = await asyncio.gather(
+        github._github_request(
+            "GET", "https://api.github.com/retry-boundary", {}, max_retries=0
+        ),
+        github._github_request(
+            "GET", "https://api.github.com/retry-boundary", {}, max_retries=1
+        ),
+        return_exceptions=True,
+    )
+
+    assert isinstance(results[0], ValueError)
+    assert results[1].status_code == 200
+    assert calls == [1]
+    assert github._inflight_reads == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_retries", [-1, -3])
+async def test_github_retry_boundary_rejects_negative_values(mocker, invalid_retries):
+    import app.github as github
+
+    dispatch = mocker.patch.object(
+        github,
+        "_github_request_uncoalesced",
+        return_value=MockResponse(200),
+    )
+    with pytest.raises(ValueError, match="greater than or equal to 1"):
+        await github._github_request(
+            "GET", "https://api.github.com/retry-boundary", {}, max_retries=invalid_retries
+        )
+    dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_singleflight_coalesces_concurrent_identical_gets(mocker):
     """N concurrent bodyless GETs to the identical URL collapse to ONE underlying
     request — the 50-VM-hit-the-same-ref fan-out that drains the token budget."""
@@ -5126,6 +5172,103 @@ async def test_singleflight_same_url_distinct_credentials_not_coalesced(mocker):
 
 
 @pytest.mark.asyncio
+async def test_singleflight_same_url_distinct_query_pages_and_heads_not_coalesced(mocker):
+    """Compare pages and query-selected heads are distinct logical reads."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls.append(tuple(sorted(kw.get("params", {}).items())))
+        await asyncio.sleep(0.01)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    await asyncio.gather(
+        github._github_request(
+            "GET", "https://api.github.com/repos/o/r/compare/a...b", {},
+            params={"page": 1, "per_page": 100},
+        ),
+        github._github_request(
+            "GET", "https://api.github.com/repos/o/r/compare/a...b", {},
+            params={"page": 2, "per_page": 100},
+        ),
+        github._github_request(
+            "GET", "https://api.github.com/repos/o/r/commits", {},
+            params={"sha": "b" * 40, "page": 1},
+        ),
+    )
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_singleflight_query_params_preserve_repeated_values_and_header_variants(mocker):
+    """Repeated query values and response-affecting headers are part of identity."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls.append((headers, kw.get("params")))
+        await asyncio.sleep(0.01)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    await asyncio.gather(
+        github._github_request(
+            "GET",
+            "https://api.github.com/search",
+            {"authorization": "Bearer same", "ACCEPT": "application/json"},
+            params=[("label", "a"), ("label", "b")],
+        ),
+        github._github_request(
+            "GET",
+            "https://api.github.com/search",
+            {"Authorization": "Bearer same", "Accept": "application/json"},
+            params={"label": ["a", "b"]},
+        ),
+        github._github_request(
+            "GET",
+            "https://api.github.com/search",
+            {"Authorization": "Bearer same", "Accept": "application/vnd.github+json"},
+            params=[("label", "a"), ("label", "b")],
+        ),
+    )
+
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_singleflight_cancelled_waiter_does_not_cancel_shared_request(mocker):
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = {"n": 0}
+    started = asyncio.Event()
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls["n"] += 1
+        started.set()
+        await asyncio.sleep(0.03)
+        return MockResponse(200, json_data={"ok": True})
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    owner = asyncio.create_task(github._github_request("GET", "https://api.github.com/x", {}))
+    await started.wait()
+    waiter = asyncio.create_task(github._github_request("GET", "https://api.github.com/x", {}))
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    result = await owner
+
+    assert result.json() == {"ok": True}
+    assert calls["n"] == 1
+    assert github._inflight_reads == {}
+
+
+@pytest.mark.asyncio
 async def test_singleflight_non_get_not_coalesced(mocker):
     """Mutating methods (and body-carrying GETs) are never coalesced."""
     import app.github as github
@@ -5166,6 +5309,75 @@ async def test_singleflight_failure_pops_key_and_reissues(mocker):
     with pytest.raises(RuntimeError):
         await github._github_request("GET", "https://api.github.com/x", {})
     assert calls["n"] == 2, "failure must not be cached — second call re-issues"
+
+
+@pytest.mark.asyncio
+async def test_singleflight_cross_project_consumer_and_retry_policy_are_isolated(mocker):
+    """A coalesced read never inherits another caller's accounting or retry policy."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, consumer=None, **kw):
+        calls.append((project_id, consumer, max_retries))
+        await asyncio.sleep(0.01)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    await asyncio.gather(
+        github._github_request(
+            "GET", "https://api.github.com/repos/o/r/ref", {},
+            max_retries=1, project_id="project-a", consumer="release",
+        ),
+        github._github_request(
+            "GET", "https://api.github.com/repos/o/r/ref", {},
+            max_retries=3, project_id="project-b", consumer="ci",
+        ),
+    )
+    assert sorted(calls) == [("project-a", "release", 1), ("project-b", "ci", 3)]
+
+
+@pytest.mark.asyncio
+async def test_singleflight_isolates_conditional_headers_and_request_options(mocker):
+    """A waiter never inherits conditional headers or httpx request options."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, consumer=None, **kw):
+        calls.append((headers, kw))
+        await asyncio.sleep(0.01)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    await asyncio.gather(
+        github._github_request(
+            "GET",
+            "https://api.github.com/repos/o/r/contents/file",
+            {"Authorization": "Bearer same", "If-None-Match": '"etag-a"'},
+        ),
+        github._github_request(
+            "GET",
+            "https://api.github.com/repos/o/r/contents/file",
+            {"Authorization": "Bearer same", "If-None-Match": '"etag-b"'},
+        ),
+        github._github_request(
+            "GET",
+            "https://api.github.com/repos/o/r/contents/file",
+            {"Authorization": "Bearer same"},
+            timeout=1.0,
+        ),
+    )
+
+    assert len(calls) == 3
+    assert {
+        headers.get("If-None-Match")
+        for headers, _ in calls
+        if "If-None-Match" in headers
+    } == {'"etag-a"', '"etag-b"'}
+    assert any(kw.get("timeout") == 1.0 for _, kw in calls)
 
 
 @pytest.mark.asyncio

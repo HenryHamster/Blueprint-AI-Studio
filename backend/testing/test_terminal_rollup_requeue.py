@@ -4,6 +4,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from fastapi import BackgroundTasks
 from sqlmodel import select
 
@@ -517,43 +518,24 @@ async def test_terminal_requeue_atomic_manual_rebind_sanitizes_effective_context
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
 
     incoming_loop = _stale_loop(15494)
-    await modify_task_apply(
-        parent,
-        {
-            "status": TaskStatus.QUEUED.value,
-            "context": {
-                **_stale_rollup_cycle_context(),
-                "rollup_pr_number": 15494,
-                "blueprint_review_verdict": "APPROVE",
-                "review_loop": incoming_loop,
+    with pytest.raises(HTTPException) as exc_info:
+        await modify_task_apply(
+            parent,
+            {
+                "status": TaskStatus.QUEUED.value,
+                "context": {
+                    **_stale_rollup_cycle_context(),
+                    "rollup_pr_number": 15494,
+                    "blueprint_review_verdict": "APPROVE",
+                    "review_loop": incoming_loop,
+                },
             },
-        },
-        BackgroundTasks(),
-        db_session,
-    )
-
-    await db_session.refresh(parent)
-    assert parent.status == TaskStatus.EVALUATING
-    ctx = parent.context or {}
-    loop = ctx["review_loop"]
-    assert get_pr.await_args.args[3] == 15494
-    assert ctx["rollup_pr_number"] == 15494
-    assert loop["pr_number"] == 15494
-    assert loop["head_sha"] == "replacement-head"
-    assert loop["ci_wait_pause_baseline"] == 7.0
-    assert loop["ci_wait_started"] != incoming_loop["ci_wait_started"]
-    for stale_key in (
-        "ci_passed",
-        "review_approved",
-        "verify_tests_task_id",
-        "verify_tests_verdict",
-        "escalated",
-        "merge_failures",
-    ):
-        assert stale_key not in loop
-    assert "blueprint_review_verdict" not in ctx
-    for stale_key in _stale_rollup_cycle_context():
-        assert stale_key not in ctx
+            BackgroundTasks(),
+            db_session,
+        )
+    assert exc_info.value.status_code == 400
+    assert "Apply status separately" in str(exc_info.value.detail)
+    get_pr.assert_not_awaited()
 
 
 def test_attempt_reset_preserves_chain_metadata_only():

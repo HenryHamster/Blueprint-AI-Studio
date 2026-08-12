@@ -13,6 +13,7 @@ and the test suites) keep resolving them through the canonical module.
 
 from __future__ import annotations
 
+
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -44,6 +45,7 @@ from app.release_artifacts import (
 )
 from app.release_promotion import _DEPLOY_CONFIRM_WINDOW_SECONDS
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1050
 
 logger = logging.getLogger(__name__)
 
@@ -443,14 +445,16 @@ async def _confirm_serving_or_fail(
                 provider_rows
             )
             # Undecidable corruption: a promotion with NO recorded promoted_sha
-            # can never confirm by SHA-match — every required provider that needs
-            # it returns "no decision" (the backend times out, but agent_image
-            # bails on the missing SHA), so the aggregate sits "unconfirmed"
-            # forever and wedges the next version (the real v7 case). Once the
-            # (backstopped) confirmation window has elapsed, resolve it as a
-            # TIMEOUT, not a permanent wedge and not a deploy_failed: nothing went
-            # wrong, we simply cannot verify what shipped.
-            if aggregate_status == "unconfirmed" and not version.promoted_sha:
+            # can never confirm by SHA-match. Once the (backstopped)
+            # confirmation window has elapsed, resolve it as the explicit
+            # promoted_sha_missing TIMEOUT, regardless of whether one provider
+            # already emitted its generic serving-unobservable timeout. This is
+            # not a deploy_failed: nothing went wrong, we simply cannot verify
+            # what shipped.
+            if (
+                aggregate_status in ("unconfirmed", "confirmation_timed_out")
+                and not version.promoted_sha
+            ):
                 _deadline = _to_naive_utc(version.deploy_confirm_deadline)
                 _now_naive = _to_naive_utc(_now) or _now
                 if _deadline is not None and _now_naive >= _deadline:
@@ -467,6 +471,13 @@ async def _confirm_serving_or_fail(
                 version.serving_status = "serving_confirmed"
                 version.deploy_failure_reason = None
                 session.add(version)
+                from app.release_commit_authorship import (
+                    persist_serving_authorship_evidence,
+                )
+
+                authorship_plan = await persist_serving_authorship_evidence(
+                    session, version
+                )
                 await _record_post_promotion_outcome(
                     session, version, "serving_confirmed", _now
                 )
@@ -498,6 +509,15 @@ async def _confirm_serving_or_fail(
                     idempotency_key=f"release:{version.id}:serving:confirmed",
                 )
                 await session.commit()
+                if authorship_plan is not None:
+                    from app.release_commit_authorship import (
+                        measure_serving_authorship_evidence,
+                    )
+
+                    await measure_serving_authorship_evidence(
+                        version.id,
+                        expected_receipt_identity=authorship_plan["receipt_identity"],
+                    )
                 logger.info(
                     "[RELEASE_QUALIFIER] serving confirmed for promoted v%d "
                     "(served_sha=%s)",
@@ -694,7 +714,7 @@ async def _recover_serving_confirmed(
     now: datetime,
     *,
     confirmed_reason_code: str | None = None,
-) -> None:
+) -> dict[str, Any] | None:
     """Flip a deploy_failed version back to serving_confirmed and clear surfaces.
 
     Shared mutation helper for the deploy-failure recovery path.  Given a version
@@ -716,8 +736,9 @@ async def _recover_serving_confirmed(
     latched sha_mismatch as supersession); left ``None`` the confirmation clears
     the artifact reason code, exactly as before.
 
-    Runs entirely on the caller's already-locked session; does NOT commit (the
-    caller commits under the SAME per-version row lock).
+    Runs on the caller's session.  Authorship evidence deliberately commits its
+    pending marker before GitHub I/O and performs its final write under a short
+    CAS lock; the remaining recovery projection is committed by the caller.
     """
     backend_artifact, _created = await get_or_create_release_deploy_artifact(
         session,
@@ -734,6 +755,11 @@ async def _recover_serving_confirmed(
     project_backend_revision_artifact(version, backend_artifact)
     version.deploy_failure_reason = None
     session.add(version)
+    from app.release_commit_authorship import (
+        persist_serving_authorship_evidence,
+    )
+
+    authorship_plan = await persist_serving_authorship_evidence(session, version)
     await _record_post_promotion_outcome(session, version, "serving_confirmed", now)
     # Resolve the loud deploy-failed operator alert — it no longer describes a
     # real condition once the promoted SHA is confirmed serving.  Best-effort and
@@ -767,6 +793,11 @@ async def _recover_serving_confirmed(
             "v%d (non-fatal)",
             version.version_number,
         )
+
+    # The caller commits the serving truth and all recovery projections.  Only
+    # after that durable boundary may the external authorship measurement run.
+    # Recovery callers that need the plan can consume this private return value.
+    return authorship_plan
 
 
 async def _record_activation_receipt(
@@ -848,7 +879,7 @@ async def _record_activation_receipt(
         provider_rows
     )
     if aggregate_status == "serving_confirmed":
-        await _recover_serving_confirmed(
+        authorship_plan = await _recover_serving_confirmed(
             session,
             version,
             served_sha,
@@ -860,6 +891,7 @@ async def _record_activation_receipt(
             "mode": "approved_activation" if version.activation_requested_at else "cli_activation",
             "serving_status": "serving_confirmed",
             "served_sha": served_sha,
+            "_authorship_plan": authorship_plan,
         }
     if backend_artifact is not None and project_backend_revision_artifact(
         version, backend_artifact
@@ -972,7 +1004,7 @@ async def _reconcile_if_deploy_failed_recovered(
                 if mutated:
                     await session.commit()
                 return False
-            await _recover_serving_confirmed(
+            authorship_plan = await _recover_serving_confirmed(
                 session,
                 version,
                 backend_artifact.served_identifier,
@@ -984,6 +1016,15 @@ async def _reconcile_if_deploy_failed_recovered(
                 confirmed_reason_code=backend_artifact.reason_code,
             )
             await session.commit()
+            if authorship_plan is not None:
+                from app.release_commit_authorship import (
+                    measure_serving_authorship_evidence,
+                )
+
+                await measure_serving_authorship_evidence(
+                    version.id,
+                    expected_receipt_identity=authorship_plan["receipt_identity"],
+                )
             logger.info(
                 "[RELEASE_QUALIFIER] deploy-failed RECOVERED for promoted v%d "
                 "(served_sha=%s) — promoted SHA confirmed serving after a prior "
@@ -1007,4 +1048,3 @@ async def _reconcile_if_deploy_failed_recovered(
                     version_id,
                 )
             return False
-

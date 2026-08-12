@@ -20,10 +20,12 @@ harness without Postgres.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
 from app import release_scoring as rs
+from app.release_commit_authorship import AUTHORSHIP_RECEIPT_SCHEMA_VERSION
 
 # Fixed policy mirroring promotion_policy.yaml; threshold pinned low so the
 # judged-tier penalty (a few %) never crosses the promote boundary by accident.
@@ -54,6 +56,74 @@ def _perfect_kwargs(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def _authorship_receipt(base_sha: str, head_sha: str, count: int) -> dict:
+    return {
+        "source": "github_compare",
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        "state": "resolved",
+        "count": count,
+        "offenders": [
+            {"sha": "d" * 12, "author": "Operator"}
+            for _ in range(count)
+        ],
+        "range": {"base_sha": base_sha, "head_sha": head_sha},
+        "measured_at": "2026-08-11T00:00:00+00:00",
+        "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+    }
+
+
+def test_prior_authorship_gate_uses_only_the_promote_to_serving_window():
+    """Development commits before promotion never enter the release gate."""
+    development_sha = "a" * 40
+    promoted_sha = "b" * 40
+    served_sha = "c" * 40
+    prior_version = {
+        "status": "promoted",
+        "serving_status": "serving_confirmed",
+        "base_sha": development_sha,
+        "promoted_sha": promoted_sha,
+        "served_sha": served_sha,
+        "last_qualification": {
+            "operator_authored_commits": _authorship_receipt(
+                promoted_sha, served_sha, 0
+            )
+        },
+    }
+
+    clean_window = rs.evaluate_prior_operator_authorship_gate(prior_version)
+
+    assert clean_window["status"] == "passed"
+    assert clean_window["count"] == 0
+
+    in_window_operator_commit = {
+        **prior_version,
+        "last_qualification": {
+            "operator_authored_commits": _authorship_receipt(
+                promoted_sha, served_sha, 1
+            )
+        },
+    }
+    blocked_window = rs.evaluate_prior_operator_authorship_gate(
+        in_window_operator_commit
+    )
+
+    assert blocked_window["status"] == "blocked"
+    assert blocked_window["count"] == 1
+
+    whole_version_receipt = {
+        **prior_version,
+        "last_qualification": {
+            "operator_authored_commits": _authorship_receipt(
+                development_sha, served_sha, 1
+            )
+        },
+    }
+    rejected_range = rs.evaluate_prior_operator_authorship_gate(whole_version_receipt)
+
+    assert rejected_range["status"] == "unresolved"
+    assert rejected_range["reason"] == "prior_promoted_version_authorship_receipt_invalid"
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +304,28 @@ def test_blocked_verdict_reports_all_gates_and_confidence_ceiling():
     assert result["confidence_ceiling"] < _POLICY["threshold"]
 
 
+def test_attempt_five_reports_required_audit_score_from_scoring_math():
+    """The 0.38 / 7-of-9 shape names the audit score needed to clear 0.81."""
+    policy = {**_POLICY, "threshold": 0.81}
+    categories = [_cat(f"c-{index}", "met") for index in range(7)] + [
+        _cat("c-7", "not_met"),
+        _cat("c-8", "not_met"),
+    ]
+    result = rs.compute_composite(
+        **_perfect_kwargs(
+            audit_score=0.38,
+            category_verdicts=categories,
+            policy=policy,
+        )
+    )
+
+    assert "criterion_coverage_incomplete" in result["failing_gates"]
+    assert result["confidence_ceiling"] == pytest.approx(0.6134)
+    assert result["confidence_ceiling"] < policy["threshold"]
+    assert result["required_sub_scores"] == {"audit": pytest.approx(0.7421)}
+    assert result["sub_scores"]["required_sub_scores"] == result["required_sub_scores"]
+
+
 def test_walkthrough_failure_is_added_to_persisted_gate_diagnostics():
     from app.release_qualifier import _apply_walkthrough_decision
 
@@ -344,6 +436,49 @@ class TestEvaluateMergeGradeCategories:
         # The holistic signal it DID produce is preserved for observability.
         assert out["covers_goal"] is True
         assert out["coverage"] == 0.9
+
+    def test_machine_evidence_can_replace_omitted_grader_only_when_complete(self):
+        art = {"covers_goal": True, "coverage_score": 1.0}
+        evidence = [
+            {
+                "category_key": key,
+                "status": "met",
+                "tier": "machine",
+                "citations": [{"kind": "test", "ref": f"trusted:{key}"}],
+                "authoritative": True,
+            }
+            for key in ("c-1", "c-2")
+        ]
+        out = rs.evaluate_merge_grade(
+            "ship the widget",
+            art,
+            self._CATS,
+            authoritative_category_evidence=evidence,
+        )
+        assert out["status"] == "pass"
+        assert {item["category_key"] for item in out["category_verdicts"]} == {
+            "c-1",
+            "c-2",
+        }
+
+    def test_partial_machine_evidence_does_not_fabricate_ungraded_human_verdict(self):
+        art = {"covers_goal": True, "coverage_score": 1.0}
+        out = rs.evaluate_merge_grade(
+            "ship the widget",
+            art,
+            self._CATS,
+            authoritative_category_evidence=[
+                {
+                    "category_key": "c-1",
+                    "status": "met",
+                    "tier": "machine",
+                    "citations": [{"kind": "test", "ref": "trusted:c-1"}],
+                    "authoritative": True,
+                }
+            ],
+        )
+        assert out["status"] == "category_grade_unsupported"
+        assert out["category_verdicts"] is None
 
     def test_empty_goal_with_active_rubric_grades_categories(self):
         """A version with NO goal string but an ACTIVE rubric is still graded
@@ -715,6 +850,72 @@ class TestScoreAuditFailClosed:
         assert audit == round(1.0 - 0.02, 4)
 
 
+class TestPromotionProjection:
+    """The readiness projection must use the same full-list audit arithmetic."""
+
+    _PROJECTION_POLICY: ClassVar[dict] = {
+        "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
+        "threshold": 0.81,
+    }
+
+    @staticmethod
+    def _finding(severity: str) -> dict:
+        finding = {"severity": severity, "summary": f"{severity} finding"}
+        if severity in {"high", "medium"}:
+            finding["verification_note"] = _VNOTE
+        return finding
+
+    def test_v32_full_finding_list_projects_to_045_and_06514(self):
+        findings = [self._finding("high")]
+        findings += [self._finding("medium") for _ in range(4)]
+        findings += [self._finding("low") for _ in range(6)]
+
+        audit = rs.project_audit_score(findings)
+        projection = rs.project_promotion_confidence(audit, self._PROJECTION_POLICY)
+
+        assert audit == pytest.approx(0.45)
+        assert projection["projected_confidence"] == pytest.approx(0.6514)
+        assert projection["required_audit_score"] == pytest.approx(0.7421)
+
+    def test_v29_three_low_findings_projects_to_094_and_09174(self):
+        audit = rs.project_audit_score([self._finding("low") for _ in range(3)])
+        projection = rs.project_promotion_confidence(audit, self._PROJECTION_POLICY)
+
+        assert audit == pytest.approx(0.94)
+        assert projection["projected_confidence"] == pytest.approx(0.9174)
+        assert projection["promotion_confidence_threshold"] == pytest.approx(0.81)
+
+    def test_projection_matches_composite_with_debt_pressure_weight(self):
+        policy = {
+            "weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+                "completion_debt": 0.10,
+            },
+            "threshold": 0.75,
+        }
+        projection = rs.project_promotion_confidence(
+            1.0,
+            policy,
+            debt_pressure_score=0.0,
+        )
+        composite = rs.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=policy,
+            category_verdicts=[{"status": "met", "tier": "judged"}],
+            debt_pressure_score=0.0,
+        )
+
+        assert projection["projected_confidence"] == pytest.approx(
+            composite["confidence"]
+        )
+        assert projection["projected_promotion_ready"] is composite["promote"]
+
+
 # ---------------------------------------------------------------------------
 # Finding 67ac7f64df47b7a4 — three paths where category_verdicts=None reaches
 # compute_composite and the per-category gate does not engage.
@@ -956,6 +1157,11 @@ class TestCategoryGateNonEngagingPaths:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": {
+                "status": "bootstrap",
+                "passed": True,
+                "count": None,
+            },
             "category_verdicts": None,  # no rubric or exempt at finalize time
         }
         out = _recover_confidence_from_ci_unresolved(record)
@@ -980,6 +1186,11 @@ class TestCategoryGateNonEngagingPaths:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": {
+                "status": "bootstrap",
+                "passed": True,
+                "count": None,
+            },
             "category_verdicts": [
                 {
                     "category_key": "c-1",
@@ -1015,6 +1226,11 @@ class TestCategoryGateNonEngagingPaths:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": {
+                "status": "bootstrap",
+                "passed": True,
+                "count": None,
+            },
             "category_verdicts": [
                 {
                     "category_key": "c-1",

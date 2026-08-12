@@ -14,6 +14,7 @@ for all callers. This module depends only on :mod:`app.models_base` and
 :mod:`app.time_utils`, never on :mod:`app.models`, so no import cycle forms.
 """
 
+
 from typing import Any, Dict, List
 
 import uuid
@@ -21,6 +22,7 @@ from datetime import datetime
 
 from pydantic import BaseModel
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -40,6 +42,7 @@ from sqlmodel.sql.sqltypes import GUID
 
 from app.models_base import NaiveUTCDateTime
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1587
 
 
 class ReleaseVersion(SQLModel, table=True):
@@ -322,6 +325,14 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(255), nullable=True),
     )
 
+    # Immutable backend-authored trusted-CI candidate build/smoke evidence. The
+    # receipt is request/run/candidate-bound and read by qualification; unlike
+    # last_qualification it survives later qualification projections.
+    prepromotion_rehearsal_receipt: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     deploy_artifacts: List["ReleaseDeployArtifact"] = Relationship(
         back_populates="version"
     )
@@ -372,6 +383,79 @@ class ReleaseVersion(SQLModel, table=True):
     )
 
 
+class ReleasePrepromotionDispatch(SQLModel, table=True):
+    """Durable outbox claim for one candidate-bound rehearsal dispatch."""
+
+    __tablename__ = "releaseprepromotiondispatch"
+    __table_args__ = (
+        UniqueConstraint(
+            "release_version_id",
+            "candidate_sha",
+            name="uq_releaseprepromotiondispatch_version_candidate",
+        ),
+        Index(
+            "ix_releaseprepromotiondispatch_status_retry",
+            "status",
+            "next_retry_at",
+            "claimed_at",
+        ),
+    )
+
+    # The primary key is also the public workflow correlation/request id.
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    project_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False)
+    )
+    candidate_sha: str = Field(sa_column=Column(String(40), nullable=False))
+    workflow_ref: str = Field(
+        default="main",
+        sa_column=Column(String(255), nullable=False, server_default="main"),
+    )
+    # claimed | attempting | dispatched | uncertain | observed | rejected
+    # Rejected is terminal until an authenticated operator explicitly rearms it.
+    status: str = Field(
+        default="claimed",
+        sa_column=Column(String(32), nullable=False, server_default="claimed"),
+    )
+    dispatch_attempts: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    workflow_run_id: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    claimed_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    attempted_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    next_retry_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    observed_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    last_error: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+
 class VersionAcceptanceCriterion(SQLModel, table=True):
     """A single verifiable acceptance criterion scoped to a release version.
 
@@ -417,6 +501,23 @@ class VersionAcceptanceCriterion(SQLModel, table=True):
     # Human-readable criterion description.
     text: str = Field(sa_column=Column(Text, nullable=False))
 
+    # Optional machine evidence contract.  This is deliberately separate from
+    # ``text``: free-form rubric prose must never select a deterministic
+    # evidence producer by substring matching.
+    evidence_contract: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    evidence_contract_updated_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    evidence_contract_updated_by: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+
     # Lifecycle status: 'active' | 'retracted' | 'superseded'.
     status: str = Field(
         default="active",
@@ -451,6 +552,45 @@ class VersionAcceptanceCriterion(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
+class ReleaseAuthorshipReconciliationState(SQLModel, table=True):
+    """Durable singleton keyset cursor for serving-authorship reconciliation.
+
+    The row is deliberately global: the sweep covers every project and the row
+    lock is the short cross-process CAS that assigns one scan page at a time.
+    ``cursor_partition`` is 0 for the NULL ``served_at`` prefix and 1 for the
+    timestamp/id suffix.  ``generation`` records each EOF wrap so a restarted
+    worker cannot mistake a wrapped cursor for forward progress.
+    """
+
+    __tablename__ = "releaseauthorshipreconciliationstate"
+
+    id: int = Field(default=1, primary_key=True)
+    cursor_partition: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    null_cursor_id: uuid.UUID | None = Field(
+        default=None, sa_column=Column(GUID(), nullable=True)
+    )
+    served_at_cursor: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    served_id_cursor: uuid.UUID | None = Field(
+        default=None, sa_column=Column(GUID(), nullable=True)
+    )
+    generation: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
     )
 
 
@@ -1268,6 +1408,13 @@ class CategoryVerdict(SQLModel, table=True):
     # Supporting citations (file paths, PR refs, evidence blobs) backing the
     # verdict.  Free-form JSON (list or dict).
     citations: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Truthful source for deterministic evidence.  Machine projections do not
+    # borrow the LLM grader task id as their provenance.
+    evidence_provenance: Any | None = Field(
         default=None,
         sa_column=Column(JSONB, nullable=True),
     )

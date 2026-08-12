@@ -5,6 +5,7 @@
 
 Split from test_release_qualifier.py."""
 from _release_qualifier_testhelpers import *  # noqa: F403
+from typing import ClassVar
 
 
 @pytest.fixture(autouse=True)
@@ -493,7 +494,7 @@ async def test_stabilize_stall_fires_for_low_attempt_hard_blocker_strand(db_sess
     must fire as the backstop once the version is old enough."""
     from datetime import timedelta
 
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.phase_changed_at = rq._utcnow() - timedelta(
         days=rq._STABILIZE_STALL_AGE_DAYS + 5
     )
@@ -2743,152 +2744,6 @@ async def test_promotion_pending_timeout_respects_runtime_config_override(db_ses
         shared_state.runtime_config.pop("promotion_pending_timeout_seconds", None)
 
 
-@pytest.mark.asyncio
-async def test_get_latest_release_audit_report_none_when_no_audit_task(db_session):
-    """No release_audit task → None (a fresh project has no audit history)."""
-    project, _version = await _make_project_and_version(db_session)
-
-    result = await rq.get_latest_release_audit_report(
-        db_session, project.id, candidate_sha="feed" * 10
-    )
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_get_latest_release_audit_report_returns_parsed_report(db_session):
-    """A release_audit task with a RELEASE_AUDIT_REPORT artifact → parsed
-    report plus task metadata (id, status, candidate_sha, created_at)."""
-    project, version = await _make_project_and_version(db_session)
-
-    report_logs = {
-        "audit_score": 0.74,
-        "test_erosion": {
-            "deleted_test_files": [],
-            "assertion_delta": 12,
-            "test_count_delta": 3,
-        },
-        "findings": [
-            {"severity": "high", "description": "Diff is unusually large."},
-        ],
-    }
-    audit_task = Task(
-        project_id=project.id,
-        title="release audit",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
-        status=TaskStatus.COMPLETED,
-        context={
-            "release_version_id": str(version.id),
-            "candidate_sha": "feed" * 10,
-        },
-    )
-    db_session.add(audit_task)
-    await db_session.commit()
-    await db_session.refresh(audit_task)
-    db_session.add(
-        Artifact(
-            task_id=audit_task.id,
-            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
-            logs=json.dumps(report_logs),
-        )
-    )
-    await db_session.commit()
-
-    result = await rq.get_latest_release_audit_report(
-        db_session, project.id, candidate_sha="feed" * 10
-    )
-
-    assert result is not None
-    assert result["audit_task_id"] == str(audit_task.id)
-    assert result["task_status"] == "COMPLETED"
-    assert result["candidate_sha"] == "feed" * 10
-    assert result["created_at"] is not None
-    assert result["report"] == report_logs
-
-
-@pytest.mark.asyncio
-async def test_get_latest_release_audit_report_report_none_when_no_artifact(db_session):
-    """A release_audit task that crashed without posting a report → the task
-    metadata is returned but ``report`` is None (not an error)."""
-    project, _version = await _make_project_and_version(db_session)
-
-    audit_task = Task(
-        project_id=project.id,
-        title="crashed audit",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
-        status=TaskStatus.FAILED,
-        context={"candidate_sha": "feed" * 10},
-    )
-    db_session.add(audit_task)
-    await db_session.commit()
-    await db_session.refresh(audit_task)
-
-    result = await rq.get_latest_release_audit_report(
-        db_session, project.id, candidate_sha="feed" * 10
-    )
-
-    assert result is not None
-    assert result["audit_task_id"] == str(audit_task.id)
-    assert result["task_status"] == "FAILED"
-    assert result["report"] is None
-
-
-@pytest.mark.asyncio
-async def test_get_latest_release_audit_report_scopes_to_candidate_sha(db_session):
-    """With several release_audit tasks, the latest matching candidate SHA wins."""
-    from datetime import timedelta
-
-    from app.time_utils import _utcnow
-
-    project, _version = await _make_project_and_version(db_session)
-    base = _utcnow()
-    candidate_sha = "feed" * 10
-
-    old_task = Task(
-        project_id=project.id,
-        title="old audit",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
-        status=TaskStatus.COMPLETED,
-        created_at=base - timedelta(hours=2),
-        context={"candidate_sha": candidate_sha},
-    )
-    new_task = Task(
-        project_id=project.id,
-        title="new audit",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
-        status=TaskStatus.COMPLETED,
-        created_at=base,
-        context={"candidate_sha": "beef" * 10},
-    )
-    # A non-audit task that must be ignored even though it is the newest.
-    other_task = Task(
-        project_id=project.id,
-        title="some smoketest",
-        payloads=[{"type": "smoketest", "base_branch": "automain"}],
-        status=TaskStatus.COMPLETED,
-        created_at=base + timedelta(hours=1),
-    )
-    db_session.add_all([old_task, new_task, other_task])
-    await db_session.commit()
-    await db_session.refresh(old_task)
-    db_session.add(
-        Artifact(
-            task_id=old_task.id,
-            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
-            logs=json.dumps({"audit_score": 0.91}),
-        )
-    )
-    await db_session.commit()
-
-    result = await rq.get_latest_release_audit_report(
-        db_session, project.id, candidate_sha=candidate_sha
-    )
-
-    assert result is not None
-    assert result["audit_task_id"] == str(old_task.id)
-    assert result["report"] == {"audit_score": 0.91}
-
-
 # ---------------------------------------------------------------------------
 # resolve_lifecycle_audit_evidence / _select_lifecycle_audit — version-scoped
 # audit evidence
@@ -3061,26 +2916,6 @@ async def test_resolve_lifecycle_audit_evidence_current_report_none_no_artifact(
 
 
 @pytest.mark.asyncio
-async def test_get_latest_release_audit_report_none_when_candidate_missing(db_session):
-    """No open-version candidate SHA means there is no comparable audit scope."""
-    project, _version = await _make_project_and_version(db_session)
-
-    audit_task = Task(
-        project_id=project.id,
-        title="candidate-scoped audit",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
-        status=TaskStatus.COMPLETED,
-        context={"candidate_sha": "feed" * 10},
-    )
-    db_session.add(audit_task)
-    await db_session.commit()
-
-    result = await rq.get_latest_release_audit_report(db_session, project.id)
-
-    assert result is None
-
-
-@pytest.mark.asyncio
 async def test_run_qualification_uses_project_integration_branch(db_session, mocker):
     """run_qualification must snapshot the candidate SHA from the project's
     configured integration_branch, not the global runtime_config default.
@@ -3133,6 +2968,68 @@ async def test_run_qualification_uses_project_integration_branch(db_session, moc
     assert "main" not in branch_sha_calls, (
         "Got unexpected call for 'main' — should use per-project integration_branch"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_queues_ci_rehearsal_only_for_explicit_contract(
+    db_session, mocker
+):
+    from app import shared_state
+    from app.models import ReleasePrepromotionDispatch
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="stabilize",
+    )
+    db_session.add(
+        VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key="ci-build-smoke",
+            text="Trusted main builds and smoke-tests the exact candidate.",
+            evidence_contract={
+                "type": "prepromotion_ci_build_smoke",
+                "predicate": {"required": True},
+            },
+            status="active",
+            created_by="test",
+        )
+    )
+    await db_session.commit()
+    candidate = "a" * 40
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(
+        db_session, project.id, version, explicit_request=True
+    )
+    await db_session.commit()
+
+    assert result["status"] == "rehearsal_dispatch_pending"
+    assert result["candidate_sha"] == candidate
+    dispatches = (
+        await db_session.execute(
+            select(ReleasePrepromotionDispatch).where(
+                ReleasePrepromotionDispatch.release_version_id == version.id,
+                ReleasePrepromotionDispatch.candidate_sha == candidate,
+            )
+        )
+    ).scalars().all()
+    assert len(dispatches) == 1
+    assert dispatches[0].status == "claimed"
 
 
 @pytest.mark.asyncio
@@ -4338,6 +4235,12 @@ async def test_acceptance_window_aggregate_all_verified(db_session):
     assert agg["acceptance_window_total"] == 2
     assert agg["acceptance_window_verified"] == 2
     assert agg["acceptance_window_fraction"] == pytest.approx(1.0)
+    assert len(agg["acceptance_window_task_records"]) == 2
+    assert all(
+        record["credited"] is True
+        and record["_pr_changed_files_stamp_skipped"] is None
+        for record in agg["acceptance_window_task_records"]
+    )
 
 
 @pytest.mark.asyncio
@@ -4369,6 +4272,7 @@ async def test_acceptance_window_aggregate_unsatisfied_excluded(db_session):
         status=TaskStatus.COMPLETED,
         context={
             "pr_merged": True,
+            "_pr_changed_files_stamp_skipped": "no_diff_returned",
             CODE_ACCEPTANCE_VERDICT_KEY: {
                 "satisfied": False,
                 "proven": False,
@@ -4385,6 +4289,13 @@ async def test_acceptance_window_aggregate_unsatisfied_excluded(db_session):
     assert agg["acceptance_window_total"] == 2
     assert agg["acceptance_window_verified"] == 1
     assert agg["acceptance_window_fraction"] == pytest.approx(0.5)
+    blocked_record = next(
+        record
+        for record in agg["acceptance_window_task_records"]
+        if record["task_id"] == str(task_blocked.id)
+    )
+    assert blocked_record["credited"] is False
+    assert blocked_record["_pr_changed_files_stamp_skipped"] == "no_diff_returned"
 
 
 @pytest.mark.asyncio
@@ -5972,6 +5883,13 @@ async def test_requalification_no_open_version(db_session):
 class TestRecoverConfidenceFromCiUnresolved:
     """Unit tests for release_promotion._recover_confidence_from_ci_unresolved."""
 
+    _PASSING_PRIOR_OPERATOR_GATE: ClassVar[dict[str, object]] = {
+        "status": "passed",
+        "passed": True,
+        "count": 0,
+        "reason": "prior_promoted_version_operator_authored_count_zero",
+    }
+
     def _fn(self, base_record, policy=None):
         from app.release_promotion import _recover_confidence_from_ci_unresolved
 
@@ -5996,6 +5914,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
         }
         out = self._fn(record)
         # Recovered confidence should be >0 (all sub_scores perfect)
@@ -6079,6 +5998,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0},
             "smoketest_enabled": False,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
         }
         out = self._fn(record)
         assert out.get("confidence_recovered_from_ci_unresolved") is True
@@ -6093,6 +6013,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
             # The finalize persists the sha-keyed per-category verdicts on the
             # base_record; the recompute re-runs the SAME gate over them.
             "category_verdicts": [
@@ -6113,6 +6034,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
             "migration_safety": "block",
         }
         out = self._fn(record)
@@ -6126,6 +6048,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
             "criterion_coverage": {
                 "total": 0,
                 "covered": 0,
@@ -6146,6 +6069,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
             "merge_grade_status": "fail",
             "merge_grade": {"blocked": True},
         }
@@ -6196,6 +6120,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": sub_scores,
             "smoketest_enabled": True,
+            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
         }
 
         # Recovery applies the debt blend.

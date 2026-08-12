@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
@@ -61,8 +61,10 @@ from app.strategic_payload_compaction import (
     _OUTCOME_DIRECTION_OUTCOMES_KEEP,
     _VERSION_PHASE_RECENT_VERSIONS_CAP,
     _direction_activity_score,  # noqa: F401 — re-exported for test imports
+    _directions_section_decision_value,
     _directions_summary_floor,
     _enrich_drift_with_trend,
+    _payload_currency_decision_value,
     _summarize_directions,
     _summarize_drift_signals,
     _summarize_version_phase,
@@ -146,6 +148,11 @@ from app.strategic_authority_locks import (
     LegacyEngineAuthorityExpired,
     commit_legacy_authorized,
     lock_and_validate_legacy_authority,
+)
+from app.research_cycle_cadence import (
+    STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY,
+    normalize_strategic_cadence_accepted_count,
+    stamp_strategic_cadence_fire,
 )
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_evaluators import (
@@ -2195,6 +2202,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "typed_fast_models": {"priority": "critical", "exempt": True},
     "typed_fast_effort": {"priority": "critical"},
     "typed_fast_qualification": {"priority": "critical"},
+    # Small authoritative decision contract. The live policy is critical so a
+    # stale qualification threshold can never outlive the runtime truth under
+    # payload pressure; the launch-time snapshot is separately labeled.
+    "current_effective_policy": {"priority": "critical", "exempt": True},
+    "active_or_last_attempt_policy": {"priority": "high", "exempt": True},
     # Trim-proof authoritative direction counts (true active/paused/total computed
     # before any trimming) and the operator's real max-active ceiling. Critical
     # tier with no summarize_fn: tiny scalars the packer ships verbatim, so the
@@ -2269,6 +2281,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # detail degrades before the active-direction core disappears entirely.
     "directions_summary": {
         "priority": "high",
+        "decision_value": _directions_section_decision_value,
         "summarize": _summarize_directions,
         "floor": _directions_summary_floor,
         "fetch_verb": "direction",
@@ -2444,7 +2457,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # Cycle-start SHA divergence check: present only when _resolve_candidate_currency
     # resolves.  Small dict of scalars — no summarize_fn, drops whole under extreme
     # pressure.  High priority so it ships alongside version_phase.
-    "payload_staleness": {"priority": "high", "exempt": True},
+    "payload_staleness": {
+        "priority": "high",
+        "decision_value": _payload_currency_decision_value,
+        "exempt": True,
+    },
     # What is actually deployed (running live on the promotion target) vs what
     # has merged to the integration branch but is not yet promoted. High
     # priority: it is load-bearing for every runtime-metric judgment, and small.
@@ -4206,6 +4223,7 @@ async def _spawn_design_doc_update(
     *,
     apply_spawn_budget_guard: bool = False,
     expected_legacy_generation: int | None = None,
+    cadence_accepted_count: object | None = None,
 ) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
@@ -4375,6 +4393,10 @@ async def _spawn_design_doc_update(
         "design_doc_update",
     )
     task_context: dict = {"strategic_cycle_id": cycle_id, **local_runner_intent}
+    if cadence_accepted_count is not None:
+        task_context[STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY] = (
+            normalize_strategic_cadence_accepted_count(cadence_accepted_count)
+        )
     if not apply_spawn_budget_guard:
         # Manual / operator-triggered cycles should not inherit the autonomous
         # budget backstop when Phase 1 completes.
@@ -4424,6 +4446,12 @@ async def _spawn_design_doc_update(
         baseline_problem_model=sanitize_problem_model_raw(project.problem_model or {}),
         baseline_running_update=project.running_update,
     )
+    if cadence_accepted_count is not None:
+        await stamp_strategic_cadence_fire(
+            session,
+            project.id,
+            accepted_count=cadence_accepted_count,
+        )
     await commit_legacy_authorized(
         session, project.id, expected_legacy_generation
     )
@@ -5473,6 +5501,7 @@ async def _finalize_strategic_review_spawn(
     effort_tier: str | None = None,
     effort_reason: str | None = None,
     expected_legacy_generation: int | None = None,
+    cadence_accepted_count: object | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail for the cadence spawn path.
 
@@ -5579,6 +5608,12 @@ async def _finalize_strategic_review_spawn(
     # context so an explicit caller value wins on collision.
     if extra_context:
         task_context.update(extra_context)
+    if cadence_accepted_count is not None:
+        # This server-owned birth receipt is audit/recovery evidence for the
+        # exact accepted-count boundary represented by the durable task.
+        task_context[STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY] = (
+            normalize_strategic_cadence_accepted_count(cadence_accepted_count)
+        )
 
     # Runner-pin AT BIRTH (``runner_pin_id`` is None for every cadence caller,
     # leaving their QUEUED + fresh ``agent-vm`` id and normal VM-dispatch entry
@@ -5654,6 +5689,12 @@ async def _finalize_strategic_review_spawn(
     if _cycle_row is not None and effort_tier is not None:
         strategic_cycle.record_effort_tier(_cycle_row, effort_tier, effort_reason)
         session.add(_cycle_row)
+    if cadence_accepted_count is not None:
+        await stamp_strategic_cadence_fire(
+            session,
+            project_id,
+            accepted_count=cadence_accepted_count,
+        )
     await commit_legacy_authorized(
         session, project_id, expected_legacy_generation
     )
@@ -5690,6 +5731,7 @@ async def _spawn_strategic_review(
     launched_by_user_id: str | None = None,
     apply_spawn_budget_guard: bool = False,
     expected_legacy_generation: int | None = None,
+    cadence_accepted_count: object | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -5835,6 +5877,17 @@ async def _spawn_strategic_review(
             _project_id,
             "strategic_review",
         )
+
+    # Resolve the exact project-aware policy the qualifier would enforce now.
+    # This is intentionally outside the LTS/version-phase branch: both cadence
+    # and the context-light Resident must receive the same current policy truth.
+    from app.release_qualifier import (  # noqa: PLC0415
+        current_effective_policy_projection,
+        qualification_attempt_policy_projection,
+    )
+
+    _current_effective_policy = current_effective_policy_projection(project)
+    _active_or_last_attempt_policy: dict[str, Any] | None = None
 
     if resident_minimal:
         # A resident strategic session runs SYNCHRONOUSLY inside the operator's
@@ -6003,6 +6056,7 @@ async def _spawn_strategic_review(
                     "effective_purpose": resolve_project_purpose(project),
                     "problem_model": _agent_view_problem_model(project.problem_model),
                     "running_update": project.running_update or "",
+                    "current_effective_policy": _current_effective_policy,
                     # Pure-computation direction grounding (no I/O).
                     "directions_summary": _res_direction_stats,
                     **(
@@ -6088,6 +6142,7 @@ async def _spawn_strategic_review(
             effort_tier=_res_effort_tier,
             effort_reason=_res_effort_reason,
             expected_legacy_generation=expected_legacy_generation,
+            cadence_accepted_count=cadence_accepted_count,
         )
 
     # Build direction stats with rich data (pure over ``project.directions``).
@@ -6379,6 +6434,11 @@ async def _spawn_strategic_review(
                     promotion_target=_promotion_target,
                 )
             if _open_version is not None:
+                _active_or_last_attempt_policy = (
+                    qualification_attempt_policy_projection(
+                        _open_version.last_qualification
+                    )
+                )
                 _open_aggregate, _open_artifacts = _version_serving_summary(
                     _open_version, project
                 )
@@ -6429,6 +6489,16 @@ async def _spawn_strategic_review(
                     )
                 _version_phase_block = {
                     **_phase_block,
+                    "current_effective_policy": _current_effective_policy,
+                    **(
+                        {
+                            "active_or_last_attempt_policy": (
+                                _active_or_last_attempt_policy
+                            )
+                        }
+                        if _active_or_last_attempt_policy
+                        else {}
+                    ),
                     "tasks_merged_this_version": _tasks_merged,
                     "qualification_attempts": _open_version.qualification_attempts,
                     "qualification_retry_episode": (
@@ -7458,6 +7528,13 @@ async def _spawn_strategic_review(
                         "gating_total",
                         "gating_resolved",
                         "audit_findings_truncated",
+                        "finding_total",
+                        "resolved_finding_total",
+                        "projected_audit_score",
+                        "required_audit_score",
+                        "projected_confidence",
+                        "promotion_confidence_threshold",
+                        "projected_promotion_ready",
                         "reason",
                     )
                     if _readiness.get(key) is not None
@@ -7497,7 +7574,10 @@ async def _spawn_strategic_review(
                         f"high/medium finding is resolved-or-stale "
                         f"({_readiness.get('gating_resolved', 0)}/"
                         f"{_readiness.get('gating_total', 0)}), so the pre-registered "
-                        f"re-qualification trigger is MET. PREFER emitting a fresh "
+                        f"re-qualification trigger is MET and the projected confidence "
+                        f"({_readiness.get('projected_confidence', 0):.4f}) reaches its "
+                        f"threshold ({_readiness.get('promotion_confidence_threshold', 0):.4f}). "
+                        f"PREFER emitting a fresh "
                         f"qualify_request to re-qualify the current HEAD; a new audit "
                         f"against the current snapshot will confirm the findings are "
                         f"cleared. Prior list (against {_cand_short}) in "
@@ -7511,8 +7591,10 @@ async def _spawn_strategic_review(
                     _stabilize_hint += _stale_preamble + (
                         f" The finding-resolution ledger shows {_outstanding} of "
                         f"{_gating_total} gating high/medium finding(s) still "
-                        f"UNRESOLVED, so the re-qualification trigger is NOT met. Do "
-                        f"NOT emit a blanket qualify_request yet — it would just "
+                        f"UNRESOLVED, or the full-list projected confidence is below "
+                        f"the required audit score ({_readiness.get('projected_audit_score', 0):.4f} "
+                        f"vs {_readiness.get('required_audit_score', 0):.4f}), so the "
+                        f"re-qualification trigger is NOT met. Do NOT emit a blanket qualify_request yet — it would just "
                         f"re-flag the unresolved finding(s). Instead, prioritize the "
                         f"outstanding fix-first work: scope audit/fundamentals-mode "
                         f"remediation at the unresolved finding(s) and record each as "
@@ -7964,19 +8046,42 @@ async def _spawn_strategic_review(
     _ci_compliance_block: dict[str, Any] | None = None
     try:
         from app import ci_compliance as _ci_compliance
+        from app.database import resolve_async_engine
 
-        _ci_status = await _ci_compliance.ensure_current_ci_compliance(session, project)
-        if _ci_status.get("status") == "success":
-            _ci_compliance_block = _ci_compliance.compact_ci_compliance(
-                _ci_status.get("data")
-            )
-            _ci_gate = ci_compliance_qualify_gate(
-                project, _ci_status.get("head_sha")
-            )
-            if _ci_gate.get("blocked"):
-                await _maybe_spawn_ci_compliance_cap_bump_fix(
-                    session, project, _ci_gate
+        # CI compliance is advisory context for the strategist.  It performs a
+        # JSONB write + flush when the integration HEAD is not cached.  Keeping
+        # that flush on the strategic-spawn session makes a transient DB error
+        # poison the *entire* Phase-2 transaction: the broad fail-open below
+        # then logs "continuing", but every subsequent query raises
+        # PendingRollbackError.  Use a short independent transaction bound to
+        # the same engine (including test-engine overrides) so an advisory
+        # signal can fail without invalidating the authoritative spawn.
+        _ci_factory = async_sessionmaker(
+            resolve_async_engine(session),
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with _ci_factory() as _ci_session:
+            _ci_project = await _ci_session.get(Project, project.id)
+            if _ci_project is None:
+                raise RuntimeError(
+                    f"project {project.id} disappeared while building CI compliance"
                 )
+            _ci_status = await _ci_compliance.ensure_current_ci_compliance(
+                _ci_session, _ci_project
+            )
+            if _ci_status.get("status") == "success":
+                _ci_compliance_block = _ci_compliance.compact_ci_compliance(
+                    _ci_status.get("data")
+                )
+                _ci_gate = ci_compliance_qualify_gate(
+                    _ci_project, _ci_status.get("head_sha")
+                )
+                if _ci_gate.get("blocked"):
+                    await _maybe_spawn_ci_compliance_cap_bump_fix(
+                        _ci_session, _ci_project, _ci_gate
+                    )
+            await _ci_session.commit()
     except Exception:
         logger.exception("[STRATEGIC] ci_compliance signal build failed; continuing")
     _open_completion_debt_block: dict[str, Any] | None = None
@@ -8224,6 +8329,16 @@ async def _spawn_strategic_review(
                 else {}
             ),
             **({"drift_signals": drift_summary} if drift_summary else {}),
+            "current_effective_policy": _current_effective_policy,
+            **(
+                {
+                    "active_or_last_attempt_policy": (
+                        _active_or_last_attempt_policy
+                    )
+                }
+                if _active_or_last_attempt_policy
+                else {}
+            ),
             **({"version_phase": _version_phase_block} if _version_phase_block else {}),
             **({"payload_staleness": _payload_staleness} if _payload_staleness else {}),
             **({"ci_compliance": _ci_compliance_block} if _ci_compliance_block else {}),
@@ -8332,6 +8447,7 @@ async def _spawn_strategic_review(
         effort_tier=_effort_tier,
         effort_reason=_effort_reason,
         expected_legacy_generation=expected_legacy_generation,
+        cadence_accepted_count=cadence_accepted_count,
     )
 
 

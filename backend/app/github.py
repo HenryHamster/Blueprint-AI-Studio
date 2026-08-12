@@ -17,7 +17,7 @@ import hashlib
 import random
 import re as _re
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from collections import OrderedDict
 
 import httpx
@@ -48,7 +48,10 @@ _github_client: httpx.AsyncClient | None = None
 # than a live request would. Collapses the ~50-VM fan-out that hammers a shared
 # ref (e.g. every rollup parent reading automain's tip in the same sweep), a
 # dominant install-token-budget drain.
-_inflight_reads: dict[tuple[str, str, str], "asyncio.Future[httpx.Response]"] = {}
+_inflight_reads: dict[
+    tuple[str, str, str, str, str, str, str, str],
+    "asyncio.Future[httpx.Response]",
+] = {}
 
 # File-content cache: memoizes get_file_text_at_ref results by
 # (owner, repo, ref, path) for a short TTL, but only when ``ref`` is a full
@@ -397,10 +400,8 @@ def _deferrable_quota_active() -> bool:
     if remaining is None or remaining >= DEFERRABLE_QUOTA_FLOOR:
         return False
     reset_at = q.get("reset_at")
-    if reset_at is not None and int(reset_at) <= int(time.time()):
-        # Window already rolled over; stale low reading is meaningless.
-        return False
-    return True
+    # Window already rolled over; stale low reading is meaningless.
+    return reset_at is None or int(reset_at) > int(time.time())
 
 
 def _synthetic_rate_limited_response(bucket: dict) -> httpx.Response:
@@ -440,8 +441,57 @@ def is_github_rate_limited_response(response: httpx.Response) -> bool:
 def _github_auth_fingerprint(headers: dict | None) -> str:
     """Return a non-reversible single-flight identity; never retain the credential."""
 
-    authorization = (headers or {}).get("Authorization", "")
+    authorization = httpx.Headers(headers or {}).get("authorization", "")
     return hashlib.sha256(authorization.encode("utf-8")).hexdigest()
+
+
+def _request_header_fingerprint(headers: dict | None) -> str:
+    """Hash every request header without retaining credential material.
+
+    ``Accept`` and the API version are the common response-shaping headers, but
+    conditional headers (for example ``If-None-Match``) and future GitHub
+    media-type headers also change the result.  A digest keeps the single-flight
+    key request-isolated without putting bearer tokens or header values in the
+    in-memory key.
+    """
+    normalized = httpx.Headers(headers or {})
+    parts = sorted(
+        f"{name.lower()}\0{value}" for name, value in normalized.multi_items()
+    )
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _canonical_query_params(params) -> str:
+    """Return a stable, credential-free representation of request params.
+
+    ``httpx`` accepts mappings, ``QueryParams``, and repeated key/value pairs.
+    Sorting the encoded pairs makes equivalent mappings coalesce while keeping
+    page, head, and other semantically distinct reads separate.
+    """
+    if params is None:
+        return ""
+    try:
+        # QueryParams is the one canonical parser for mappings, repeated pairs,
+        # and already-encoded query values.  In particular, it avoids treating
+        # a list value as one Python string and avoids collisions between
+        # ``[("label", "a"), ("label", "b")]`` and ``{"label": ["a", "b"]}``.
+        items = list(httpx.QueryParams(params).multi_items())
+    except (TypeError, ValueError):
+        return repr(params)
+    normalized = [(str(key), str(value)) for key, value in items]
+    normalized.sort()
+    return urlencode(normalized, doseq=True)
+
+
+def _normalize_max_retries(max_retries: int) -> int:
+    """Validate the retry boundary once at the public request dispatcher."""
+    try:
+        normalized = int(max_retries)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_retries must be an integer greater than or equal to 1") from exc
+    if normalized < 1:
+        raise ValueError("max_retries must be greater than or equal to 1")
+    return normalized
 
 
 async def _github_request(
@@ -465,18 +515,27 @@ async def _github_request(
     depend on; the done-callback pops the key on success AND failure, so a failed
     read is never memoized past its in-flight window.
     """
-    if (
-        method.upper() != "GET"
-        or "json" in kwargs
-        or "data" in kwargs
-        or "content" in kwargs
-    ):
+    max_retries = _normalize_max_retries(max_retries)
+    # ``params`` is the only non-body option used by the read helpers.  Other
+    # httpx options (timeout, auth, cookies, extensions, redirects, ...) are
+    # caller-specific request semantics; bypass coalescing rather than letting
+    # a waiter inherit the first caller's option.
+    if method.upper() != "GET" or set(kwargs) - {"params"}:
         return await _github_request_uncoalesced(
             method, url, headers, max_retries, project_id, consumer=consumer, **kwargs
         )
     # The same URL can return different repository sets and permissions for two
     # user/App credentials. Coalesce only within one credential identity.
-    key = ("GET", url, _github_auth_fingerprint(headers))
+    key = (
+        "GET",
+        url,
+        _github_auth_fingerprint(headers),
+        _canonical_query_params(kwargs.get("params")),
+        _request_header_fingerprint(headers),
+        project_id or "",
+        consumer or "",
+        str(max_retries),
+    )
     existing = _inflight_reads.get(key)
     if existing is not None:
         import app.shared_state as _ss
@@ -484,15 +543,19 @@ async def _github_request(
         _ss.github_cache_hits["read_singleflight"] = (
             _ss.github_cache_hits.get("read_singleflight", 0) + 1
         )
-        return await existing
+        return await asyncio.shield(existing)
     task = asyncio.ensure_future(
         _github_request_uncoalesced(
             method, url, headers, max_retries, project_id, consumer=consumer, **kwargs
         )
     )
     _inflight_reads[key] = task
-    task.add_done_callback(lambda t: _inflight_reads.pop(key, None))
-    return await task
+    def _forget_completed(done_task: asyncio.Future) -> None:
+        if _inflight_reads.get(key) is done_task:
+            _inflight_reads.pop(key, None)
+
+    task.add_done_callback(_forget_completed)
+    return await asyncio.shield(task)
 
 
 async def _github_request_uncoalesced(
@@ -772,6 +835,75 @@ async def get_file_content_at_ref(
         return None, None
 
 
+async def get_file_blob_sha_at_ref(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    project_id: str | None = None,
+) -> tuple[bool | None, str | None]:
+    """Fetch the git blob SHA of *path* at ``owner/repo@ref``.
+
+    The blob SHA is the same identity the qualifier's audited-surface map
+    records per path, so comparing it against a finding's recorded ``blob_sha``
+    answers "did the cited surface actually change at this commit?" without a
+    checkout.
+
+    Returns ``(exists, blob_sha)`` with a tri-state ``exists``:
+
+      * ``True``  — the path is a file on ``ref``; ``blob_sha`` is its git blob
+        SHA (``None`` only if GitHub omitted it).
+      * ``False`` — ``ref`` unambiguously has no such file (HTTP 404);
+        ``blob_sha`` is ``None``.
+      * ``None``  — indeterminate (non-200/non-404 status, a non-file payload,
+        or any error). Callers MUST NOT read ``None`` as absence or as change.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_path = quote(path, safe="/")
+    encoded_ref = quote(ref, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_ref}"
+    )
+    try:
+        response = await _github_request(
+            "GET", url, headers, max_retries=2, project_id=project_id
+        )
+        if response.status_code == 404:
+            return False, None
+        if response.status_code != 200:
+            logger.warning(
+                "[GITHUB] blob-sha fetch for %s on %s/%s@%s: HTTP %s",
+                path,
+                owner,
+                repo,
+                ref,
+                response.status_code,
+            )
+            return None, None
+        payload = response.json()
+        if not (isinstance(payload, dict) and payload.get("type") == "file"):
+            return None, None
+        blob_sha = payload.get("sha")
+        return True, blob_sha if isinstance(blob_sha, str) and blob_sha else None
+    except Exception as e:  # noqa: BLE001 — never let a fetch error read as change
+        logger.warning(
+            "[GITHUB] Failed blob-sha fetch for %s on %s/%s@%s: %s",
+            path,
+            owner,
+            repo,
+            ref,
+            e,
+        )
+        return None, None
+
+
 async def _list_versions_dir_entries(
     token: str,
     owner: str,
@@ -938,7 +1070,7 @@ async def get_file_text_at_ref(
                 import app.shared_state as _ss
                 _ss.github_cache_hits["read_content"] = _ss.github_cache_hits.get("read_content", 0) + 1
                 return cached[0]
-        except Exception:
+        except (AttributeError, KeyError, TypeError, ValueError):
             pass  # Cache miss / stale — fall through to fetch.
 
     import base64
@@ -986,7 +1118,7 @@ async def get_file_text_at_ref(
                 # Evict oldest entries over the size cap.
                 while len(_file_content_cache) > _FILE_CONTENT_CACHE_MAX_SIZE:
                     _file_content_cache.popitem(last=False)  # Least recently used
-            except Exception:
+            except (AttributeError, KeyError, TypeError, ValueError):
                 pass  # Cache write failure is non-critical.
 
         return text
@@ -1311,6 +1443,8 @@ from app.github_checks import (  # noqa: F401
     AGENT_BAKE_WORKFLOW_FILE,
     CI_WORKFLOW_FILE,
     dispatch_workflow_run,
+    dispatch_workflow_run_outcome,
+    get_workflow_run_for_dispatch_request,
     invalidate_check_runs_cache,
     get_check_runs_cached,
     _CHECK_RUNS_CACHE_TTL_S,

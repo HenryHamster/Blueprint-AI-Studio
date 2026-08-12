@@ -1,9 +1,9 @@
 """Pre-spawn effort classifier for strategic_review cycles.
 
 Every strategic_review cycle historically ran at effort 'max' (gpt-5.6-sol / xhigh
-via the 'strategic' category default), costing ~$4.43 per cycle while the entire
-productive fleet that merged 75 PRs cost $15.46. Over a 7-day window,
-strategic_review was 94.4% of total LLM spend. This module decides, from signals
+via the 'strategic' category default). Measured baseline (see
+docs/strategic-cycle-cost-baseline.md): mean cost ~$7.52 per cycle; strategic_review
+is approximately 47% of total LLM spend. This module decides, from signals
 available BEFORE the LLM call, whether a cycle is ROUTINE (a cheaper tier suffices)
 or CONSEQUENTIAL (stays at 'max').
 

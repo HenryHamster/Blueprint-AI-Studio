@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -27,6 +28,16 @@ from app.release_stall_alerts import (
 )
 from app.time_utils import _utcnow
 from sqlalchemy import select
+
+
+def test_retired_pending_activation_reason_is_absent_from_alert_module():
+    """The alert module cannot retain the removed activation-only branch."""
+    source = Path(__file__).parents[1].joinpath(
+        "app", "release_stall_alerts.py"
+    ).read_text()
+
+    assert "PENDING_OPERATOR_ACTIVATION_REASON" not in source
+    assert "Approve activation" not in source
 
 
 async def _make_project_and_version(db_session):
@@ -299,6 +310,46 @@ async def test_deploy_failed_alert_first_fire(db_session, mocker):
 
     await db_session.refresh(version)
     assert version.deploy_confirm_alerted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_deploy_failed_operator_message_uses_shared_outcome_sentence(
+    db_session, mocker
+):
+    """The alert and operator callers compose the full outcome sentence once."""
+    mocker.patch(
+        "app.release_stall_alerts._release_qualifier_module",
+        return_value=rq,
+    )
+    notify = mocker.patch(
+        "app.release_promotion._notify_operator",
+        return_value=None,
+        create=True,
+    )
+    _project, version = await _make_project_and_version(db_session)
+    version.serving_status = "deploy_failed"
+    version.deploy_failure_reason = "rolled_back"
+    version.promoted_sha = "abc123" * 3
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _alert_promotion_deploy_failed(db_session, version)
+    await db_session.commit()
+
+    alert = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    operator_message = notify.await_args.args[3]
+    for message in (alert.message, operator_message):
+        assert "This The" not in message
+        assert "The promotion did NOT ship" in message
 
 
 @pytest.mark.asyncio

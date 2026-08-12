@@ -188,6 +188,35 @@ def test_write_merged_no_acceptance_key_is_success_legacy():
     assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
 
 
+def test_write_merged_finding_clearance_without_current_head_proof_is_neutral():
+    """Naming findings on a fix is not proof that the merged code cleared them."""
+    task = _make_task(
+        "fix",
+        context={**_merged_context(), "resolving_finding_keys": ["finding-a"]},
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is False
+
+
+def test_write_merged_finding_clearance_requires_complete_landed_sha_proof():
+    """Only an explicit all-keys marker tied to the landed commit can pass."""
+    merge_sha = "a" * 40
+    task = _make_task(
+        "fix",
+        context={
+            **_merged_context(),
+            "merge_commit_sha": merge_sha,
+            "resolving_finding_keys": ["finding-a", "finding-b"],
+            "finding_clearance_verification": {
+                "state": "verified",
+                "finding_keys": ["finding-a", "finding-b"],
+                "verified_against_sha": merge_sha,
+            },
+        },
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Research family
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1166,8 +1195,8 @@ def test_first_attempt_succeeded_verified_is_unaffected():
     )
 
 
-def test_first_attempt_succeeded_none_verification_backward_compat():
-    """Passing None merge_verification preserves pre-change semantics."""
+def test_first_attempt_succeeded_none_verification_uses_retry_count():
+    """None verification still requires zero consumed retries."""
     from app.task_completion import _compute_first_attempt_succeeded
 
     assert (
@@ -1180,7 +1209,7 @@ def test_first_attempt_succeeded_none_verification_backward_compat():
         _compute_first_attempt_succeeded(
             1, TaskStatus.COMPLETED, merge_verification=None
         )
-        is True
+        is False
     )
     assert (
         _compute_first_attempt_succeeded(

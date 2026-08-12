@@ -1,31 +1,25 @@
-Check the status of Blueprint tasks on the deployed orchestrator.
+Check Blueprint task state using the scoped, read-only Blueprint MCP tools.
 
 Arguments (optional): $ARGUMENTS
-- No arguments: list the 10 most recent tasks
-- A task ID: show details for that specific task
-- "active": show only running/queued tasks
+- No arguments: show the 10 most recent tasks.
+- A task UUID: show that exact task, including failure/history evidence.
+- `active`: show QUEUED, PROVISIONING, IN_PROGRESS, and EVALUATING tasks.
 
 ## How to execute
 
-### 1. Load config
-Read `.blueprint-config.json` from the project root for `api_url` and `api_key`.
-If missing, tell the user to create it.
+1. Use `get_project_snapshot` first to resolve the project and establish current
+   attention, causal pipeline state, and execution capacity.
+2. For a UUID, call `get_task`. Otherwise call `list_tasks` with `limit: 10`;
+   for `active`, pass all four active statuses listed above.
+3. Present status, exact task ID, title, timing, latest causal status, and PR URL
+   when present. If a task failed, include the bounded failure/history evidence
+   returned by `get_task`.
 
-### 2. Fetch tasks
-```bash
-# List recent tasks
-curl -s "${api_url}/api/admin/tasks?limit=10" \
-  -H "Authorization: Bearer ${api_key}"
-
-# Or with status filter
-curl -s "${api_url}/api/admin/tasks?limit=10&status=IN_PROGRESS" \
-  -H "Authorization: Bearer ${api_key}"
-```
-
-### 3. Display
-The API returns `{"tasks": [...], "total": N}`. Extract the `tasks` array.
-Show a clean summary table with: status icon, title, status, time, and PR URL if available.
-
-Status icons: QUEUED=waiting, PROVISIONING=starting, IN_PROGRESS=running, COMPLETED=done, FAILED=error, CANCELLED=stopped.
-
-If a specific task ID was requested and it has error logs, show them.
+Do not read `.blueprint-config.json`, expose a bearer token, or issue raw `curl`
+requests. If the MCP server is unavailable, report that clearly and map
+`BLUEPRINT_AGENT_CONFIG` to `BLUEPRINT_CONFIG` only for the read-only CLI
+invocation. Use `./blueprint tasks list --limit 10 --json` for no arguments,
+`./blueprint tasks list --active --limit 10 --json` for `active`, or
+`./blueprint tasks show TASK-UUID --json` for a UUID (and `.\blueprint.ps1` in
+place of `./blueprint` on Windows). Do not leave the scoped config selected for
+an operator mutation.

@@ -906,6 +906,7 @@ _ESCALATION_REASON_LABELS = {
     "stuck": "stuck cycle",
     "standoff": "dispute standoff",
     "repeat-fingerprint": "repeat-fingerprint halt",
+    "abandon-candidate": "abandon candidate",
 }
 
 
@@ -917,13 +918,15 @@ async def _maybe_create_escalation_alert(
     reason: str,
     iteration: int,
     severity: AlertSeverity = AlertSeverity.WARNING,
+    detail: str | None = None,
 ) -> None:
     """Create a deduplicated operator Alert for a review-fix early escalation.
 
-    Surfaces the three early-escalation outcomes that fire BEFORE the iteration
+    Surfaces early-escalation outcomes that fire BEFORE the iteration
     cap is hit — ``stuck`` (same blocking issues recur), ``standoff`` (the fix
     agent disputed an issue and the reviewer re-raised it), and
-    ``repeat-fingerprint`` (identical failure signature across attempts) — in the
+    ``repeat-fingerprint`` (identical failure signature across attempts), and
+    ``abandon-candidate`` (a PR crossed the cumulative cross-episode burden) — in the
     same Alerts banner as cap-exhaustion, *regardless* of whether manual approval
     gates are enabled.
 
@@ -951,7 +954,8 @@ async def _maybe_create_escalation_alert(
         title=title,
         message=(
             f"{pr_label} escalated for human attention after {iteration} "
-            f"review-fix iteration(s): {label}. Manual review or strategic-agent "
+            f"review-fix iteration(s): {label}. "
+            f"{detail + ' ' if detail else ''}Manual review or strategic-agent "
             f"decision required."
         ),
         task_id=task.id,

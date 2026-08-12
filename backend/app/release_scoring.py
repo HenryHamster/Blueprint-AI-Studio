@@ -13,6 +13,7 @@ keep working unchanged.
 
 from __future__ import annotations
 
+
 import hashlib
 import logging
 import re
@@ -24,6 +25,7 @@ from app.ci_resolution import (
 from app.migration_reconciliation import effective_authorized_divergences
 
 logger = logging.getLogger(__name__)
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3229
 
 
 # Canonical fleet default for the promotion confidence gate.  The packaged
@@ -130,6 +132,74 @@ def promotion_threshold_for_policy(policy: dict[str, Any]) -> float:
     keeping fallback behavior and the enforcement path on the same definition.
     """
     return float(policy.get("threshold", PROMOTION_CONFIDENCE_THRESHOLD))
+
+
+def _active_quality_weights(policy: dict[str, Any]) -> tuple[float, float]:
+    """Return the normalized audit and test-erosion weights used by the gate."""
+    weights = policy.get("weights") or _DEFAULT_POLICY["weights"]
+    from decimal import Decimal
+
+    active_audit = Decimal(str(float(weights.get("audit", _DEFAULT_POLICY["weights"]["audit"]))))
+    active_test = Decimal(
+        str(float(weights.get("test_erosion", _DEFAULT_POLICY["weights"]["test_erosion"])))
+    )
+    active_sum = active_audit + active_test
+    if active_sum <= 0:
+        return (
+            _DEFAULT_POLICY["weights"]["audit"],
+            _DEFAULT_POLICY["weights"]["test_erosion"],
+        )
+    return float(active_audit / active_sum), float(active_test / active_sum)
+
+
+def project_promotion_confidence(
+    audit_score: float,
+    policy: dict[str, Any] | None = None,
+    *,
+    test_erosion: float = 1.0,
+    judged_tier_met_fraction: float = 1.0,
+    debt_pressure_score: float | None = None,
+) -> dict[str, float | bool]:
+    """Project the promotion score after audit findings are resolved.
+
+    Re-qualification readiness has no new test-erosion or category-grade result
+    yet, so this is the best-case projection for those dimensions while retaining
+    the all-judged tier penalty used by the scored candidate.  All weights and the
+    promotion bar come from the same policy helpers as ``compute_composite``.
+    """
+    resolved_policy = policy or _DEFAULT_POLICY
+    w_audit, w_test = _active_quality_weights(resolved_policy)
+    threshold = promotion_threshold_for_policy(resolved_policy)
+    audit = _clamp01(audit_score)
+    erosion = _clamp01(test_erosion)
+    judged_fraction = _clamp01(judged_tier_met_fraction)
+    penalty_factor = 1.0 - JUDGED_TIER_PENALTY_WEIGHT * judged_fraction
+    existing_confidence = w_audit * audit + w_test * erosion
+    debt_weight = coerce_completion_debt_weight((resolved_policy.get("weights") or {}))
+    if debt_weight > 0.0 and debt_pressure_score is not None:
+        confidence_before_penalty = (
+            (1.0 - debt_weight) * existing_confidence
+            + debt_weight * _clamp01(debt_pressure_score)
+        )
+    else:
+        confidence_before_penalty = existing_confidence
+    confidence = _clamp01(confidence_before_penalty * penalty_factor)
+    target = threshold / penalty_factor
+    if debt_weight > 0.0 and debt_pressure_score is not None:
+        target = (
+            target - debt_weight * _clamp01(debt_pressure_score)
+        ) / (1.0 - debt_weight)
+    required_audit = (
+        (target - w_test * erosion) / w_audit
+        if w_audit > 0.0
+        else float("inf")
+    )
+    return {
+        "projected_confidence": round(confidence, 4),
+        "promotion_confidence_threshold": round(threshold, 4),
+        "required_audit_score": round(required_audit, 4),
+        "projected_promotion_ready": confidence >= threshold,
+    }
 
 
 # Default coverage threshold used ONLY when the merge-grade artifact omits an
@@ -245,6 +315,7 @@ def _normalize_category_verdicts(
     artifact: dict[str, Any] | None,
     active_categories: list[dict[str, Any]],
     verified_merge_evidence: dict[str, Any] | None = None,
+    authoritative_category_evidence: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Grade the artifact's per-category verdicts against the ACTIVE rubric.
 
@@ -282,13 +353,22 @@ def _normalize_category_verdicts(
                 key = str(item.get("category_key") or item.get("key") or "").strip()
                 if key:
                     emitted[key] = item
+    authoritative = {
+        str(item.get("category_key") or item.get("criterion_key")): {
+            **item,
+            "_backend_machine_evidence": True,
+        }
+        for item in (authoritative_category_evidence or [])
+        if isinstance(item, dict)
+        and item.get("category_key") is not None
+    }
 
     verdicts: list[dict[str, Any]] = []
     for cat in active_categories:
         key = str(cat.get("category_key") or cat.get("criterion_key") or "").strip()
         if not key:
             continue
-        raw = emitted.get(key)
+        raw = authoritative.get(key) or emitted.get(key)
         if not isinstance(raw, dict):
             verdicts.append(
                 {
@@ -321,13 +401,16 @@ def _normalize_category_verdicts(
         # Tier: a MET category whose test citation is machine-validated against the
         # candidate's verified merges earns the machine tier; everything else stays
         # judged (fail toward the lower tier).
-        tier = "judged"
-        if status == "met" and _cited_test_is_machine_verified(
+        tier = (
+            "machine"
+            if raw.get("_backend_machine_evidence") is True
+            else "judged"
+        )
+        if tier != "machine" and status == "met" and _cited_test_is_machine_verified(
             citations, verified_merge_evidence
         ):
             tier = "machine"
-        verdicts.append(
-            {
+        verdict = {
                 "category_key": key,
                 "status": status,
                 "tier": tier,
@@ -335,7 +418,11 @@ def _normalize_category_verdicts(
                 "gap": gap if status != "met" else (gap or None),
                 "citations": citations,
             }
-        )
+        if raw.get("_backend_machine_evidence") is True and isinstance(
+            raw.get("evidence_provenance"), dict
+        ):
+            verdict["evidence_provenance"] = raw["evidence_provenance"]
+        verdicts.append(verdict)
 
     residual_raw: Any = None
     if isinstance(artifact, dict):
@@ -355,6 +442,7 @@ def evaluate_merge_grade(
     artifact: dict[str, Any] | None,
     active_categories: list[dict[str, Any]] | None = None,
     verified_merge_evidence: dict[str, Any] | None = None,
+    authoritative_category_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Normalise a blind merge-grade artifact into a goal-coverage verdict.
 
@@ -415,6 +503,22 @@ def evaluate_merge_grade(
     category_verdicts, residual_uncaptured_gap}``. ``status`` is one of ``pass`` |
     ``fail`` | ``not_applicable`` | ``unparseable`` | ``category_grade_unsupported``.
     """
+    active_category_keys = {
+        str(item.get("category_key") or item.get("criterion_key") or "").strip()
+        for item in (active_categories or [])
+        if isinstance(item, dict)
+    }
+    active_category_keys.discard("")
+    authoritative_category_keys = {
+        str(item.get("category_key") or item.get("criterion_key") or "").strip()
+        for item in (authoritative_category_evidence or [])
+        if isinstance(item, dict)
+    }
+    authoritative_category_keys.discard("")
+    authoritative_covers_all = bool(active_category_keys) and (
+        active_category_keys <= authoritative_category_keys
+    )
+
     goal_text = (goal or "").strip()
     if not goal_text or is_contentless_goal(goal_text):
         # A contentless/unset goal normally means there is nothing to grade
@@ -431,7 +535,13 @@ def evaluate_merge_grade(
         # stays ``not_applicable`` so the holistic ``merge_grade_misses`` gate
         # stays inert.
         if active_categories:
-            if not isinstance(artifact, dict) or "category_verdicts" not in artifact:
+            if (
+                not isinstance(artifact, dict)
+                or (
+                    "category_verdicts" not in artifact
+                    and not authoritative_covers_all
+                )
+            ):
                 # The grader cannot produce per-category output (a non-dict
                 # artifact, or a dict with no ``category_verdicts`` key at all —
                 # a stale agent image predating the per-category protocol).  Same
@@ -449,7 +559,10 @@ def evaluate_merge_grade(
                     "residual_uncaptured_gap": None,
                 }
             category_verdicts, residual_uncaptured_gap = _normalize_category_verdicts(
-                artifact, active_categories, verified_merge_evidence
+                artifact,
+                active_categories,
+                verified_merge_evidence,
+                authoritative_category_evidence,
             )
             return {
                 "status": "not_applicable",
@@ -517,7 +630,7 @@ def evaluate_merge_grade(
     category_verdicts: list[dict[str, Any]] | None = None
     residual_uncaptured_gap: str | None = None
     if active_categories:
-        if "category_verdicts" not in artifact:
+        if "category_verdicts" not in artifact and not authoritative_covers_all:
             # The grader returned a usable HOLISTIC verdict but omitted the
             # per-category section ENTIRELY — not one key, not an empty list.  A
             # grader that ACTUALLY assessed the rubric always emits the key (the
@@ -548,7 +661,10 @@ def evaluate_merge_grade(
                 "residual_uncaptured_gap": None,
             }
         category_verdicts, residual_uncaptured_gap = _normalize_category_verdicts(
-            artifact, active_categories, verified_merge_evidence
+            artifact,
+            active_categories,
+            verified_merge_evidence,
+            authoritative_category_evidence,
         )
     return {
         "status": "pass" if covers_goal else "fail",
@@ -844,6 +960,82 @@ def _score_env_preflight(
     return 1.0, [], deploy_target_scope
 
 
+def evaluate_prior_operator_authorship_gate(
+    prior_promoted_version: Any | None,
+) -> dict[str, Any]:
+    """Evaluate the persisted receipt from the prior promoted release.
+
+    The current candidate cannot have a post-promotion serving window yet, so
+    its own authorship count is unavailable at qualification time. This gate
+    consumes only the prior promoted ``ReleaseVersion`` record and never calls
+    GitHub. ``None`` is the explicit first-promotion bootstrap case; once a
+    promoted row exists, every missing, unserved, or invalid receipt fails closed.
+    """
+    if prior_promoted_version is None:
+        return {
+            "status": "bootstrap",
+            "passed": True,
+            "count": None,
+            "reason": "no_prior_promoted_version",
+        }
+
+    if isinstance(prior_promoted_version, dict):
+        get_value = prior_promoted_version.get
+    else:
+        def get_value(key: str, default: Any = None) -> Any:
+            return getattr(prior_promoted_version, key, default)
+
+    status = get_value("status")
+    serving_status = get_value("serving_status")
+    qualification = get_value("last_qualification")
+    from app.release_commit_authorship import serving_authorship_range
+
+    promoted_sha, served_sha = serving_authorship_range(prior_promoted_version)
+    receipt = (
+        qualification.get("operator_authored_commits")
+        if isinstance(qualification, dict)
+        else None
+    )
+
+    # Reuse the exact server-receipt contract used by the read API. The import
+    # stays lazy so this pure scoring module has no ORM or I/O dependency.
+    from app.release_commit_authorship import validate_authorship_receipt
+
+    validated = (
+        validate_authorship_receipt(receipt, promoted_sha, served_sha)
+        if status == "promoted" and serving_status == "serving_confirmed"
+        else None
+    )
+    if validated is None or validated.get("state") != "resolved":
+        return {
+            "status": "unresolved",
+            "passed": False,
+            "count": None,
+            "blocker": "prior_operator_authorship_evidence_missing",
+            "reason": (
+                "prior_promoted_version_authorship_receipt_invalid"
+                if receipt is not None
+                else "prior_promoted_version_authorship_receipt_absent"
+            ),
+        }
+
+    count = validated.get("count")
+    if count == 0:
+        return {
+            "status": "passed",
+            "passed": True,
+            "count": 0,
+            "reason": "prior_promoted_version_operator_authored_count_zero",
+        }
+    return {
+        "status": "blocked",
+        "passed": False,
+        "count": count,
+        "blocker": "prior_operator_authorship_nonzero",
+        "reason": "prior_promoted_version_operator_authored_count_nonzero",
+    }
+
+
 def compute_composite(
     ci_green: bool,
     audit_score: float,
@@ -866,6 +1058,7 @@ def compute_composite(
     env_preflight_score: float | None = None,
     env_preflight_missing: list[str] | None = None,
     env_preflight_ack_override: bool = False,
+    prior_operator_authorship_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -898,6 +1091,11 @@ def compute_composite(
         caller precomputes this via
         ``migration_apply_gate.run_migration_apply_gate`` — this function stays
         pure and only consumes the boolean.
+      * ``prior_operator_authorship_gate`` is the persisted receipt result from
+        the prior promoted release. A non-zero count blocks with
+        ``"prior_operator_authorship_nonzero"``; absent or invalid evidence
+        blocks with ``"prior_operator_authorship_evidence_missing"``. The
+        explicit ``"bootstrap"`` result is the only no-prior-version pass.
       * ``merge_grade_misses`` is True — the required blind merge-grade ran and
         found that the candidate misses the frozen version goal
         (``"merge_grade_misses"``).  Checked before the category gate so an
@@ -994,25 +1192,10 @@ def compute_composite(
     ``blocker`` remains the first failing gate, while a hard-blocked
     ``confidence`` remains exactly ``0.0``.
     """
-    weights = policy.get("weights") or _DEFAULT_POLICY["weights"]
     threshold = promotion_threshold_for_policy(policy)
     # Qualifier VM smoke is retired. Accept legacy three-key policies, ignore
     # their smoke weight, and renormalize the two active deterministic signals.
-    w_audit = float(weights.get("audit", _DEFAULT_POLICY["weights"]["audit"]))
-    w_test = float(
-        weights.get("test_erosion", _DEFAULT_POLICY["weights"]["test_erosion"])
-    )
-    from decimal import Decimal
-
-    active_audit = Decimal(str(w_audit))
-    active_test = Decimal(str(w_test))
-    active_sum = active_audit + active_test
-    if active_sum <= 0:
-        w_audit = _DEFAULT_POLICY["weights"]["audit"]
-        w_test = _DEFAULT_POLICY["weights"]["test_erosion"]
-    else:
-        w_audit = float(active_audit / active_sum)
-        w_test = float(active_test / active_sum)
+    w_audit, w_test = _active_quality_weights(policy)
 
     # Hard blockers — checked before any weighting. ``None`` is the sentinel
     # for "this active dimension hit an irrecoverable blocker"; the caller
@@ -1057,6 +1240,14 @@ def compute_composite(
         # candidate failing both reports the identity collision first.
         blocker = "migration_apply_drift"
         failing_gates.append(blocker)
+    if prior_operator_authorship_gate is not None:
+        prior_gate_status = prior_operator_authorship_gate.get("status")
+        if prior_gate_status == "blocked":
+            blocker = "prior_operator_authorship_nonzero"
+            failing_gates.append(blocker)
+        elif prior_gate_status not in {"passed", "bootstrap"}:
+            blocker = "prior_operator_authorship_evidence_missing"
+            failing_gates.append(blocker)
     if env_preflight_enabled and env_preflight_score is None:
         # No boot/env-prerequisite evidence was produced by the candidate — the
         # evidence producer never ran, or ran but produced no usable manifest.
@@ -1169,6 +1360,13 @@ def compute_composite(
             if env_preflight_ack_override:
                 sub_scores["env_preflight_ack_override"] = True
 
+    if prior_operator_authorship_gate is not None:
+        sub_scores["prior_operator_authorship"] = {
+            "status": prior_operator_authorship_gate.get("status"),
+            "count": prior_operator_authorship_gate.get("count"),
+            "reason": prior_operator_authorship_gate.get("reason"),
+        }
+
     # Goal-verification observability (redesign): surface the per-category grade
     # and residual so operators see WHY the gate fired (or would fire), not just
     # the blocker string.  Recorded whenever a per-category grade was supplied,
@@ -1216,17 +1414,39 @@ def compute_composite(
         )
     else:
         confidence_ceiling = existing_confidence
+    category_penalty_factor = 1.0
     if category_verdicts:
         _met = [v for v in category_verdicts if (v or {}).get("status") == "met"]
         if _met:
             _judged = sum(
                 1 for v in _met if (v or {}).get("tier", "judged") != "machine"
             )
-            confidence_ceiling *= 1.0 - JUDGED_TIER_PENALTY_WEIGHT * (
+            category_penalty_factor = 1.0 - JUDGED_TIER_PENALTY_WEIGHT * (
                 _judged / len(_met)
             )
+            confidence_ceiling *= category_penalty_factor
     confidence_ceiling = round(_clamp01(confidence_ceiling), 4)
     sub_scores["confidence_ceiling"] = confidence_ceiling
+
+    # Solve the active scoring equation here, beside its canonical weights, so
+    # reports can name the actionable term instead of inferring it from the
+    # primary blocker. Only feasible, currently unmet requirements are emitted;
+    # a term needing more than 1.0 is not independently actionable.
+    required_sub_scores: dict[str, float] = {}
+    if confidence_ceiling < threshold:
+        target = threshold / category_penalty_factor
+        if w_debt > 0.0 and debt_pressure_score is not None:
+            target = (target - w_debt * sub_scores["debt_pressure"]) / (1.0 - w_debt)
+        if w_audit > 0.0:
+            required_audit = (target - w_test * sub_scores["test_erosion"]) / w_audit
+            if sub_scores["audit"] < required_audit <= 1.0:
+                required_sub_scores["audit"] = round(required_audit, 4)
+        if w_test > 0.0:
+            required_test = (target - w_audit * sub_scores["audit"]) / w_test
+            if sub_scores["test_erosion"] < required_test <= 1.0:
+                required_sub_scores["test_erosion"] = round(required_test, 4)
+    if required_sub_scores:
+        sub_scores["required_sub_scores"] = required_sub_scores
 
     if blocker is not None:
         return {
@@ -1236,6 +1456,7 @@ def compute_composite(
             "blocker": blocker,
             "failing_gates": failing_gates,
             "confidence_ceiling": confidence_ceiling,
+            "required_sub_scores": required_sub_scores,
         }
 
     # Debt-pressure weight (defaults to 0.0 = observe mode: recorded but not
@@ -1274,6 +1495,7 @@ def compute_composite(
         "blocker": None,
         "failing_gates": failing_gates,
         "confidence_ceiling": confidence,
+        "required_sub_scores": required_sub_scores,
     }
 
 
@@ -1303,6 +1525,8 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     # once the version itself promotes, so a fix on automain is inert until then.
     "migration_identity_collision": EXECUTION_SITE_DEPLOYED,
     "migration_apply_drift": EXECUTION_SITE_DEPLOYED,
+    "prior_operator_authorship_nonzero": EXECUTION_SITE_DEPLOYED,
+    "prior_operator_authorship_evidence_missing": EXECUTION_SITE_DEPLOYED,
     # Operator-env site (Slice 4, design 245212a4): the env-preflight judge runs in
     # the DEPLOYED process and compares the candidate's declared boot prerequisites
     # against the deployed process's OWN environ (a presence-proxy of the deploy
@@ -1540,6 +1764,39 @@ def _finding_matches_candidate_surface(
     return candidate_blob == blob_sha.strip()
 
 
+def project_audit_score(
+    findings: list[dict[str, Any]] | None,
+    *,
+    resolved_finding_keys: set[str] | frozenset[str] = frozenset(),
+    candidate_surface_paths: dict[str, str] | None = None,
+) -> float:
+    """Score the complete finding list after applying durable resolutions.
+
+    This is the shared findings-derived arithmetic used by the audit scorer and
+    the re-qualification readiness projection.  Resolution state removes a
+    finding's deduction; low/info findings remain in the calculation, so a
+    gating-only view can never overstate readiness.
+    """
+    derived = 1.0
+    if not isinstance(findings, list):
+        return derived
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        finding_key = str(finding.get("key") or "__keyless__")
+        if finding_key in resolved_finding_keys:
+            continue
+        if not _finding_matches_candidate_surface(finding, candidate_surface_paths):
+            continue
+        severity = str(finding.get("severity") or finding.get("level") or "").lower()
+        if not severity or not _finding_is_verified(finding, severity):
+            continue
+        if _finding_subject_is_authorized_divergence(finding):
+            continue
+        derived -= _AUDIT_DEDUCTIONS.get(severity, _AUDIT_DEDUCTION_UNKNOWN)
+    return _clamp01(derived)
+
+
 def _score_audit(
     report: dict[str, Any] | None,
     *,
@@ -1574,21 +1831,10 @@ def _score_audit(
     findings = report.get("findings")
     if not isinstance(findings, list):
         findings = report.get("issues")
-    derived: float = 1.0
-    if isinstance(findings, list):
-        for f in findings:
-            if isinstance(f, dict):
-                if not _finding_matches_candidate_surface(f, candidate_surface_paths):
-                    continue
-                sev = str(f.get("severity") or f.get("level") or "").lower()
-                if not sev or not _finding_is_verified(f, sev):
-                    continue
-                if _finding_subject_is_authorized_divergence(f):
-                    # Owned by the deterministic migration-identity gate — do
-                    # not double-count it as an audit deduction.
-                    continue
-                derived -= _AUDIT_DEDUCTIONS.get(sev, _AUDIT_DEDUCTION_UNKNOWN)
-    derived = _clamp01(derived)
+    derived = project_audit_score(
+        findings,
+        candidate_surface_paths=candidate_surface_paths,
+    )
     missing_reason = _audit_missing_reason(report)
     audit_score: float | None = derived
     if missing_reason in (
@@ -1996,124 +2242,6 @@ def _audit_finding_key(summary: str, file: str | None) -> str:
     return hashlib.sha256(f"{norm_file}|{norm_summary}".encode()).hexdigest()[:16]
 
 
-def _compute_audit_challenge_synthesis(
-    primary_report: dict[str, Any] | None,
-    challenge_report: dict[str, Any] | None,
-    *,
-    challenge_reason: str | None = None,
-) -> dict[str, Any]:
-    """Compute non-gating release-audit challenge synthesis."""
-    if challenge_reason:
-        return {
-            "status": "unavailable",
-            "reason": challenge_reason,
-            "reported_agreement": None,
-            "agreement_assessment": None,
-            "challenge_severity": None,
-            "agreement": {"findings_both_flagged": [], "count": 0},
-            "disagreement": {
-                "primary_only": [],
-                "challenger_only": [],
-                "overstated_findings": [],
-            },
-            "counts": {
-                "primary_findings": len(
-                    _compact_challenge_findings(_raw_audit_findings(primary_report))[0]
-                ),
-                "challenger_missing": 0,
-                "challenger_overstated": 0,
-            },
-            "challenge_findings_truncated": False,
-        }
-    if not isinstance(challenge_report, dict):
-        return _compute_audit_challenge_synthesis(
-            primary_report, None, challenge_reason="challenge_absent"
-        )
-
-    primary_findings, primary_truncated = _compact_challenge_findings(
-        _raw_audit_findings(primary_report)
-    )
-    missing_raw = challenge_report.get("missing_findings")
-    overstated_raw = challenge_report.get("overstated_findings")
-    missing_findings, missing_truncated = _compact_challenge_findings(
-        missing_raw if isinstance(missing_raw, list) else []
-    )
-    overstated_findings, overstated_truncated = _compact_challenge_findings(
-        overstated_raw if isinstance(overstated_raw, list) else []
-    )
-
-    primary_keys = {_finding_match_key(finding) for finding in primary_findings}
-    missing_keys = {_finding_match_key(finding) for finding in missing_findings}
-    overstated_keys = {_finding_match_key(finding) for finding in overstated_findings}
-
-    reported_agreement_raw = str(challenge_report.get("agreement") or "").lower()
-    reported_agreement = (
-        reported_agreement_raw
-        if reported_agreement_raw in _CHALLENGE_AGREEMENTS
-        else None
-    )
-    severity_raw = str(challenge_report.get("challenge_severity") or "").lower()
-    challenge_severity = (
-        severity_raw if severity_raw in _CHALLENGE_SEVERITIES else "low"
-    )
-    assessment_raw = challenge_report.get("agreement_assessment")
-    agreement_assessment = (
-        str(assessment_raw).strip()[:_CHALLENGE_ASSESSMENT_MAX]
-        if assessment_raw is not None
-        else ""
-    )
-
-    if (
-        reported_agreement == "agree"
-        and not missing_findings
-        and not overstated_findings
-    ):
-        both_flagged = primary_findings
-        primary_only: list[dict[str, str]] = []
-    else:
-        both_flagged = [
-            finding
-            for finding in primary_findings
-            if _finding_match_key(finding) in missing_keys
-        ]
-        primary_only = [
-            finding
-            for finding in primary_findings
-            if _finding_match_key(finding) not in missing_keys | overstated_keys
-        ]
-
-    challenger_only = [
-        finding
-        for finding in missing_findings
-        if _finding_match_key(finding) not in primary_keys
-    ]
-
-    return {
-        "status": "available",
-        "reason": None,
-        "reported_agreement": reported_agreement,
-        "agreement_assessment": agreement_assessment,
-        "challenge_severity": challenge_severity,
-        "agreement": {
-            "findings_both_flagged": both_flagged,
-            "count": len(both_flagged),
-        },
-        "disagreement": {
-            "primary_only": primary_only,
-            "challenger_only": challenger_only,
-            "overstated_findings": overstated_findings,
-        },
-        "counts": {
-            "primary_findings": len(primary_findings),
-            "challenger_missing": len(missing_findings),
-            "challenger_overstated": len(overstated_findings),
-        },
-        "challenge_findings_truncated": primary_truncated
-        or missing_truncated
-        or overstated_truncated,
-    }
-
-
 def _compute_challenge_synthesis_from_binding_verdicts(
     primary_report: dict[str, Any] | None,
     challenge_verdicts: dict[str, Any] | None,
@@ -2123,9 +2251,8 @@ def _compute_challenge_synthesis_from_binding_verdicts(
 ) -> dict[str, Any]:
     """Compute audit-challenge synthesis from the binding RELEASE_AUDIT_CHALLENGE artifact.
 
-    Unlike _compute_audit_challenge_synthesis (advisory format), this function
-    derives its synthesis from the binding verdict artifact emitted by the live
-    audit-challenge handler (challenged_candidate_sha + verdicts[]).
+    This derives its synthesis from the binding verdict artifact emitted by the
+    live audit-challenge handler (challenged_candidate_sha + verdicts[]).
     """
     if challenge_reason or not isinstance(challenge_verdicts, dict):
         return {

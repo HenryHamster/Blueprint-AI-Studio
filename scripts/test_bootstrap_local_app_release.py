@@ -301,9 +301,17 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             payload.index("StartLimitBurst=3"), payload.index("[Service]")
         )
         self.assertIn("User=henry_hamster", payload)
+        # NoNewPrivileges must be set EXPLICITLY: systemctl's property getter
+        # reports the configured field, not the value implied by the sandbox
+        # options, so _verify_release_execution_boundary only reads "yes" when
+        # the unit states it outright. Guard against a regression to implicit.
+        self.assertIn("NoNewPrivileges=yes", payload)
         self.assertIn("RuntimeDirectory=blueprint-deploy-agent", payload)
         self.assertIn("RuntimeDirectoryMode=0750", payload)
         self.assertIn("StateDirectory=blueprint-deploy-agent", payload)
+        self.assertIn(
+            "Environment=GH_CONFIG_DIR=/var/lib/blueprint-deploy-agent/gh", payload
+        )
         self.assertIn(
             "--state-path /var/lib/blueprint-deploy-agent/deploy-agent.state", payload
         )
@@ -311,6 +319,67 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             "--lock-path /run/blueprint-deploy-agent/deploy-agent.lock", payload
         )
         self.assertIn("--poll-interval 30", payload)
+
+    def test_bootstrap_requires_service_account_github_actions_access(self):
+        with tempfile.TemporaryDirectory() as raw_directory:
+            config_dir = Path(raw_directory) / "gh"
+            config_dir.mkdir(mode=0o700)
+            hosts_file = config_dir / "hosts.yml"
+            hosts_file.write_text("github.com: token\n", encoding="utf-8")
+            hosts_file.chmod(0o600)
+            calls = []
+
+            def run(argv, **kwargs):
+                calls.append((argv, kwargs))
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with (
+                unittest.mock.patch.object(
+                    bootstrap, "_GH_CONFIG_DIR", config_dir
+                ),
+                unittest.mock.patch.object(
+                    bootstrap.pwd,
+                    "getpwnam",
+                    return_value=type("Account", (), {"pw_uid": os.getuid()})(),
+                ),
+                unittest.mock.patch.object(bootstrap.subprocess, "run", side_effect=run),
+            ):
+                bootstrap._verify_github_cli_auth("henry_hamster")
+
+            self.assertEqual(len(calls), 2)
+            self.assertIn("auth", calls[0][0])
+            self.assertIn("run", calls[1][0])
+            self.assertIn("GH_CONFIG_DIR=" + str(config_dir), calls[0][0])
+
+    def test_bootstrap_copies_gh_credential_into_service_state(self):
+        with tempfile.TemporaryDirectory() as raw_directory:
+            root = Path(raw_directory)
+            source_dir = root / "source-gh"
+            target_dir = root / "state-gh"
+            source_dir.mkdir(mode=0o700)
+            source = source_dir / "hosts.yml"
+            source.write_text("github.com: token\n", encoding="utf-8")
+            source.chmod(0o600)
+            account = type(
+                "Account",
+                (),
+                {"pw_uid": os.getuid(), "pw_gid": os.getgid(), "pw_dir": str(root)},
+            )()
+            with (
+                unittest.mock.patch.object(
+                    bootstrap, "_source_gh_config_dir", return_value=source_dir
+                ),
+                unittest.mock.patch.object(bootstrap, "_GH_CONFIG_DIR", target_dir),
+                unittest.mock.patch.object(
+                    bootstrap.pwd, "getpwnam", return_value=account
+                ),
+            ):
+                bootstrap._provision_github_cli_config("henry_hamster")
+
+            installed = target_dir / "hosts.yml"
+            self.assertEqual(installed.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+            self.assertEqual(stat.S_IMODE(target_dir.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o600)
 
     def test_deploy_agent_unit_has_one_repository_writer(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -380,6 +449,10 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         socket = bootstrap._release_socket_unit("henry_hamster").decode()
         self.assertIn("User=root", service)
         self.assertIn("ExecStart=/usr/local/sbin/blueprint-release --serve", service)
+        self.assertIn(
+            "TimeoutStartSec=1200s",
+            service,
+        )
         self.assertIn("ListenStream=/run/blueprint-release.sock", socket)
         self.assertIn("SocketGroup=henry_hamster", socket)
         self.assertIn("SocketMode=0660", socket)
@@ -478,6 +551,32 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             ),
         ):
             bootstrap._verify_release_execution_boundary("henry_hamster")
+
+    def test_bootstrap_rehearsal_refuses_before_candidate_tool(self):
+        with unittest.mock.patch(
+            "local_app_release.rehearse"
+        ) as rehearse:
+            with self.assertRaisesRegex(RuntimeError, "host rehearsal disabled"):
+                bootstrap.rehearse("image@digest", "a" * 40)
+        rehearse.assert_not_called()
+
+    def test_root_release_shim_refuses_host_rehearsal_before_exec(self):
+        digest = "sha256:" + "0" * 64
+        with (
+            unittest.mock.patch.object(release.os, "geteuid", return_value=0),
+            unittest.mock.patch.object(
+                release.sys,
+                "argv",
+                ["blueprint-release", "--rehearse", digest, "a" * 40],
+            ),
+            unittest.mock.patch.object(
+                release.os,
+                "execv",
+                side_effect=AssertionError("disabled rehearsal must never exec"),
+            ),
+        ):
+            with self.assertRaisesRegex(SystemExit, "2"):
+                release.main()
 
     def test_approved_activation_rehearses_root_handoff_and_receipt(self):
         deploy_blueprint = blueprint
@@ -689,6 +788,7 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     "version_number": promoted["version_number"],
                     "promoted_sha": revision,
                     "revision": revision,
+                    "activation_requested_at": promoted["activation_requested_at"],
                     "phase": "started",
                 }),
                 encoding="utf-8",
@@ -727,6 +827,137 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     "host": "control-plane",
                 },
             )
+            self.assertFalse(state_path.exists())
+
+    def test_legacy_started_marker_without_attempt_token_does_not_re_release(self):
+        """An agent upgrade preserves a pre-token marker as the release fence."""
+        revision = "0" * 40
+        promoted = {
+            "version_number": 13,
+            "status": "promoted",
+            "promoted_sha": revision,
+            "serving_status": "unconfirmed",
+            "activation_requested_at": "2026-08-09T00:00:00Z",
+        }
+        calls = []
+
+        def fake_api(method, path, body=None, timeout=30):
+            calls.append((method, path, body))
+            return {"serving_status": "serving_confirmed", "served_sha": revision}
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            state_path = Path(raw_directory) / "deploy-agent.state"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version_number": promoted["version_number"],
+                        "promoted_sha": revision,
+                        "revision": revision,
+                        "phase": "started",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = type(
+                "Args",
+                (),
+                {"project_id": None, "state_path": str(state_path)},
+            )()
+            with (
+                unittest.mock.patch.object(blueprint, "_require_write_config"),
+                unittest.mock.patch.object(
+                    blueprint, "_read_live_approved_activation", return_value=promoted
+                ),
+                unittest.mock.patch.object(
+                    blueprint, "_local_served_sha", return_value=revision
+                ),
+                unittest.mock.patch.object(
+                    blueprint, "_invoke_release_shim"
+                ) as invoke_release,
+                unittest.mock.patch.object(
+                    blueprint, "get_project_id", return_value="project-1"
+                ),
+                unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
+            ):
+                self.assertTrue(blueprint._deploy_agent_once(args))
+
+            invoke_release.assert_not_called()
+            self.assertEqual(
+                [item for item in calls if item[0] == "POST"],
+                [("POST", "/api/admin/projects/project-1/activation-receipt", {
+                    "version_number": promoted["version_number"],
+                    "revision": revision,
+                    "host": "control-plane",
+                })],
+            )
+            self.assertFalse(state_path.exists())
+
+    def test_timeout_reapproval_can_replace_legacy_marker(self):
+        """A timeout re-arm is the explicit boundary for a fresh execution."""
+        revision = "2" * 40
+        promoted = {
+            "version_number": 14,
+            "status": "promoted",
+            "promoted_sha": revision,
+            "serving_status": "confirmation_timed_out",
+            "activation_requested_at": "2026-08-10T00:00:00Z",
+        }
+        release_calls = []
+
+        def fake_api(method, path, body=None, timeout=30):
+            return {"serving_status": "serving_confirmed", "served_sha": revision}
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            state_path = Path(raw_directory) / "deploy-agent.state"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version_number": promoted["version_number"],
+                        "promoted_sha": revision,
+                        "revision": revision,
+                        "phase": "failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = type(
+                "Args",
+                (),
+                {"project_id": None, "state_path": str(state_path)},
+            )()
+            with (
+                unittest.mock.patch.object(blueprint, "_require_write_config"),
+                unittest.mock.patch.object(
+                    blueprint, "_read_live_approved_activation", return_value=promoted
+                ),
+                unittest.mock.patch.object(
+                    blueprint,
+                    "_fetch_deploy_manifest",
+                    return_value={
+                        "run": {},
+                        "digest": "sha256:" + "3" * 64,
+                        "revision": revision,
+                    },
+                ),
+                unittest.mock.patch.object(
+                    blueprint,
+                    "_invoke_release_shim",
+                    side_effect=lambda *call_args, **call_kwargs: (
+                        release_calls.append(call_args),
+                        True,
+                    )[1],
+                ),
+                unittest.mock.patch.object(
+                    blueprint, "_local_served_sha", return_value=revision
+                ),
+                unittest.mock.patch.object(
+                    blueprint, "get_project_id", return_value="project-1"
+                ),
+                unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
+            ):
+                self.assertTrue(blueprint._deploy_agent_once(args))
+
+            self.assertEqual(len(release_calls), 1)
             self.assertFalse(state_path.exists())
 
     def test_deploy_agent_poll_survives_non_api_error(self):
@@ -912,6 +1143,7 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                         "version_number": 11,
                         "promoted_sha": revision,
                         "revision": revision,
+                        "activation_requested_at": promoted["activation_requested_at"],
                         "phase": "completed",
                         "confirmation_deadline_at": deadline.isoformat(),
                     }
@@ -1161,6 +1393,10 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 unittest.mock.patch.object(
                     bootstrap,
                     "_verify_release_execution_boundary",
+                ),
+                unittest.mock.patch.object(
+                    bootstrap,
+                    "_verify_github_cli_auth",
                 ),
             ):
                 bootstrap._install_deploy_agent(

@@ -32,7 +32,17 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.models import Task, TaskStatus, bank_task_current_attempt
+from app.models import (
+    Task,
+    TaskStatus,
+    advance_task_lifetime_attempt,
+    bank_task_current_attempt,
+)
+from app.research_execution_authority import RESEARCH_FRESH_ATTEMPT_CONTEXT_KEYS
+from app.sidecar_authority import (
+    SIDECAR_FRESH_ATTEMPT_CONTEXT_KEYS,
+    authenticated_sidecar_fresh_attempt_preserve_keys,
+)
 from app.time_utils import _utcnow, clear_retry_after
 
 # Canonical failure class for precondition blockers (mirrors
@@ -42,6 +52,54 @@ BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 
 # JSONB key under Task.context that holds the structured blocker metadata.
 BLOCKER_CONTEXT_KEY = "blocker"
+PUBLICATION_GATE_RECEIPT_KEY = "publication_gate_receipt"
+
+
+def sanitize_publication_gate_receipt(raw: object) -> dict[str, object] | None:
+    """Return a bounded local-publication-gate receipt or ``None``.
+
+    Gate receipts arrive from an agent-owned shell script, so the JSONB boundary
+    must not persist arbitrary keys or unbounded strings.  Requiring the full
+    receipt shape also prevents a partial/malformed report from looking like a
+    durable gate verdict.
+    """
+    if not isinstance(raw, dict):
+        return None
+    status = raw.get("status")
+    command = raw.get("command")
+    recorded_at = raw.get("recorded_at")
+    if not all(isinstance(value, str) for value in (status, command, recorded_at)):
+        return None
+    integer_fields = {
+        "timeout_seconds": (raw.get("timeout_seconds"), 1, 900),
+        "hard_timeout_seconds": (raw.get("hard_timeout_seconds"), 1, 1800),
+        "elapsed_seconds": (raw.get("elapsed_seconds"), 0, 86400),
+        "exit_code": (raw.get("exit_code"), 0, 255),
+    }
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper
+        for value, lower, upper in integer_fields.values()
+    ):
+        return None
+    if not isinstance(raw.get("deadline_extended"), bool) or not isinstance(
+        raw.get("authoritative_ci_required"), bool
+    ):
+        return None
+    if not status or len(status) > 50 or not command or len(command) > 200:
+        return None
+    if not recorded_at or len(recorded_at) > 64:
+        return None
+    return {
+        "status": status,
+        "command": command,
+        "timeout_seconds": integer_fields["timeout_seconds"][0],
+        "hard_timeout_seconds": integer_fields["hard_timeout_seconds"][0],
+        "elapsed_seconds": integer_fields["elapsed_seconds"][0],
+        "deadline_extended": raw["deadline_extended"],
+        "exit_code": integer_fields["exit_code"][0],
+        "authoritative_ci_required": raw["authoritative_ci_required"],
+        "recorded_at": recorded_at,
+    }
 
 # Attempt-scoped context keys that must not survive any path returning a task
 # (or clone) to QUEUED. Retry-guidance history such as
@@ -82,6 +140,12 @@ FRESH_ATTEMPT_CONTEXT_STRIP_KEYS: frozenset[str] = frozenset(
         "rate_limit_inferred_from",
         "_requested_payload_model",
         "_resolved_payload_model",
+        *RESEARCH_FRESH_ATTEMPT_CONTEXT_KEYS,
+        # A fresh source artifact must negotiate and receive fresh sidecar
+        # verdicts. Retaining a prior pass bypasses grading; retaining an
+        # awaiting marker strands the new attempt. Source-link keys are absent
+        # from this set so a requeued grader can still route its eventual result.
+        *SIDECAR_FRESH_ATTEMPT_CONTEXT_KEYS,
         "_infra_wait",
         "blacklisted_accounts",
         "provision_failed_accounts",
@@ -332,6 +396,7 @@ def enter_blocked_state(
     escalated: bool = False,
     need: Optional[Dict[str, Any]] = None,
     needs: Optional[list] = None,
+    publication_gate_receipt: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Transition ``task`` into the BLOCKED state and persist blocker metadata.
@@ -364,6 +429,9 @@ def enter_blocked_state(
         "deadline_at": _iso(deadline_at),
         "escalated": bool(escalated),
     }
+    sanitized_receipt = sanitize_publication_gate_receipt(publication_gate_receipt)
+    if sanitized_receipt is not None:
+        meta[PUBLICATION_GATE_RECEIPT_KEY] = sanitized_receipt
     # Normalized machine-resolvable prerequisite(s). A blocked dependent can wait
     # on MORE THAN ONE unresolved prerequisite, so the canonical store is a LIST
     # under ``meta['needs']``. For backward compatibility we ALSO mirror the first
@@ -452,6 +520,7 @@ def strip_fresh_attempt_context(
     *,
     preserve_blocked_optimistic_retries: bool = False,
     preserve_non_blocked_failure_verdict: bool = False,
+    preserve_context_keys: frozenset[str] | None = None,
 ) -> Dict[str, Any]:
     """Return ``context`` with stale per-attempt state removed.
 
@@ -462,7 +531,10 @@ def strip_fresh_attempt_context(
     should use the default and strip all previous verdict keys.
     """
     ctx = dict(context) if isinstance(context, dict) else {}
+    preserved_keys = preserve_context_keys or frozenset()
     for key in FRESH_ATTEMPT_CONTEXT_STRIP_KEYS:
+        if key in preserved_keys:
+            continue
         if key in ("_blocked_optimistic_retries", "_blocked_last_retry_at") and preserve_blocked_optimistic_retries:
             continue
         if key in ("failure_class", "failure_category"):
@@ -548,6 +620,7 @@ def clear_blocker_metadata(task: Task) -> None:
         ctx_src,
         preserve_blocked_optimistic_retries=True,
         preserve_non_blocked_failure_verdict=True,
+        preserve_context_keys=authenticated_sidecar_fresh_attempt_preserve_keys(task),
     )
 
 
@@ -565,6 +638,7 @@ def reset_task_for_fresh_attempt(task: Task) -> None:
         task,
         stopped_at=task.vm_stopped_at or _utcnow(),
     )
+    advance_task_lifetime_attempt(task)
 
     # ``payloads`` is JSONB. Mutating a nested payload in place is not reliably
     # visible to SQLAlchemy, so restore through a copied container and mark the
@@ -575,6 +649,13 @@ def reset_task_for_fresh_attempt(task: Task) -> None:
     if restore_requested_payload_model_for_fresh_attempt(payloads, task.context):
         task.payloads = payloads
         flag_modified(task, "payloads")
+    # Research completion consumes ``plan_output`` as attempt-local agent output
+    # and uses finalized/spawn-pending context markers as idempotency shortcuts.
+    # Reusing either on a true requeue can no-op the new attempt or respawn work
+    # from the prior one. Other task types retain their existing output
+    # semantics.
+    if (task.first_payload or {}).get("type") == "research":
+        task.plan_output = None
     clear_blocker_metadata(task)
     task.last_heartbeat = None
     task.started_at = None
@@ -584,7 +665,12 @@ def reset_task_for_fresh_attempt(task: Task) -> None:
     task.llm_account_id = None
     clear_retry_after(task)
     task.context = {
-        **strip_fresh_attempt_context(task.context or {}),
+        **strip_fresh_attempt_context(
+            task.context or {},
+            preserve_context_keys=authenticated_sidecar_fresh_attempt_preserve_keys(
+                task
+            ),
+        ),
         "_fresh_attempt_started_at": _utcnow().isoformat(),
     }
 

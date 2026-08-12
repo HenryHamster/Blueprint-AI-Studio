@@ -140,11 +140,16 @@ ROLLBACK_FLOW_ALLOWLIST: frozenset[str] = frozenset({
     #     post-try code at L4624 (_runtime_config dict write) is only reached when
     #     the commit succeeded (no rollback occurred on that path).
     "metrics_integrity_sweep.py::check_capability_proof_gate_auto_graduation",
+    # The Phase-2 recovery path at task_completion.py:L5316 immediately
+    # re-fetches the Project -> Task pair through lock_project_then_task after
+    # rollback before reading either ORM instance; the scanner cannot follow
+    # that helper-mediated refetch.
+    "task_completion.py::_handle_design_doc_completion",
 })
 
 # Monotonic ceiling for the rollback-flow allowlist: can only shrink as entries
 # are fixed at the production code level. Bump when adding a new entry.
-ROLLBACK_FLOW_ALLOWLIST_CEILING: int = 10
+ROLLBACK_FLOW_ALLOWLIST_CEILING: int = 11
 
 
 def rollback_flow_allowlist_within_ceiling() -> bool:

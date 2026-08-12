@@ -3647,6 +3647,97 @@ describe('VersionLifecyclePanel', () => {
       expect(mockRefresh).not.toHaveBeenCalled();
     });
 
+    it('offers a fresh approval after the confirmation deadline expires', async () => {
+      const approveMock = vi.fn().mockResolvedValue({
+        version_number: 3,
+        project_id: 'proj-1',
+        promoted_sha: 'promoted-sha',
+        activation_requested_at: '2026-06-01T12:35:00Z',
+        activation_requested_by: 'admin@example.com',
+        serving_status: 'unconfirmed',
+      } satisfies api.ApproveActivationResponse);
+      vi.mocked(api.approveActivation).mockImplementation(approveMock);
+      const awaitingVersion: api.RecentVersion = {
+        version_number: 3,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        serving_status: 'unconfirmed',
+        activation_requested_at: '2026-06-01T12:05:00Z',
+        activation_requested_by: 'admin@example.com',
+        deploy_confirm_deadline: new Date(Date.now() - 60_000).toISOString(),
+      };
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 4 }),
+            recent_versions: [awaitingVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByTestId('approve-activation')).toHaveTextContent(
+        'Retry activation approval',
+      );
+      fireEvent.click(screen.getByTestId('approve-activation'));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+      await waitFor(() => expect(approveMock).toHaveBeenCalledWith('proj-1'));
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
+    it('keeps approval retryable after the backend records confirmation_timed_out', async () => {
+      const approveMock = vi.fn().mockResolvedValue({
+        version_number: 3,
+        project_id: 'proj-1',
+        promoted_sha: 'promoted-sha',
+        activation_requested_at: '2026-06-01T12:35:00Z',
+        activation_requested_by: 'admin@example.com',
+        serving_status: 'confirmation_timed_out',
+      } satisfies api.ApproveActivationResponse);
+      vi.mocked(api.approveActivation).mockImplementation(approveMock);
+      const timedOutVersion: api.RecentVersion = {
+        version_number: 3,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        serving: { status: 'confirmation_timed_out' },
+        activation_requested_at: '2026-06-01T12:05:00Z',
+        activation_requested_by: 'admin@example.com',
+      };
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 4 }),
+            recent_versions: [timedOutVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByTestId('promoted-awaiting-activation')).toHaveTextContent(
+        'previous approval did not receive a serving receipt',
+      );
+      expect(screen.getByTestId('approve-activation')).toHaveTextContent(
+        'Retry activation approval',
+      );
+      fireEvent.click(screen.getByTestId('approve-activation'));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      await waitFor(() => expect(approveMock).toHaveBeenCalledWith('proj-1'));
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
     it('hides approval from non-platform admins even while activation is awaiting', () => {
       const awaitingVersion: api.RecentVersion = {
         version_number: 3,

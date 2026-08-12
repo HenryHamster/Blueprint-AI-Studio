@@ -23,9 +23,16 @@ _TERMINAL_STATUSES = frozenset(
 
 
 async def _locked_ancestors(task: Task, session: AsyncSession) -> list[Task]:
-    """Return the task's ancestor chain, locked nearest-first."""
+    """Lock the task's ancestor chain root-first; return it nearest-first.
 
-    ancestors: list[Task] = []
+    The unlocked discovery pass is only a receipt.  Each edge is checked again
+    as its row is locked, so a concurrent topology rewrite fails closed.  Lock
+    acquisition itself must run root-to-leaf: a parent cancellation owns that
+    direction, and taking the immediate parent before a grandparent recreates
+    the same hierarchy inversion this fence exists to prevent.
+    """
+
+    ancestry_snapshot: list[tuple[uuid.UUID, uuid.UUID | None]] = []
     parent_id = task.parent_task_id
     seen = {task.id}
     while parent_id is not None:
@@ -35,11 +42,37 @@ async def _locked_ancestors(task: Task, session: AsyncSession) -> list[Task]:
                 detail=f"Task hierarchy cycle detected at ancestor {parent_id}",
             )
         seen.add(parent_id)
+        ancestor_edge = (
+            (
+                await session.execute(
+                    select(Task.id, Task.parent_task_id)
+                    .where(
+                        Task.id == parent_id,
+                        Task.project_id == task.project_id,
+                    )
+                )
+            )
+            .first()
+        )
+        if ancestor_edge is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Task {task.id} references missing ancestor {parent_id}",
+            )
+        ancestor_id, next_parent_id = ancestor_edge
+        ancestry_snapshot.append((ancestor_id, next_parent_id))
+        parent_id = next_parent_id
+
+    locked_by_id: dict[uuid.UUID, Task] = {}
+    for ancestor_id, expected_parent_id in reversed(ancestry_snapshot):
         ancestor = (
             (
                 await session.execute(
                     select(Task)
-                    .where(Task.id == parent_id)
+                    .where(
+                        Task.id == ancestor_id,
+                        Task.project_id == task.project_id,
+                    )
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
@@ -47,14 +80,68 @@ async def _locked_ancestors(task: Task, session: AsyncSession) -> list[Task]:
             .scalars()
             .first()
         )
-        if ancestor is None:
+        if ancestor is None or ancestor.parent_task_id != expected_parent_id:
             raise HTTPException(
                 status_code=409,
-                detail=f"Task {task.id} references missing ancestor {parent_id}",
+                detail=(
+                    f"Task {task.id} ancestry changed during retry admission; "
+                    "retry the operation"
+                ),
             )
-        ancestors.append(ancestor)
-        parent_id = ancestor.parent_task_id
-    return ancestors
+        locked_by_id[ancestor.id] = ancestor
+
+    return [locked_by_id[ancestor_id] for ancestor_id, _ in ancestry_snapshot]
+
+
+async def lock_ancestor_rollups_for_requeue(
+    task: Task,
+    session: AsyncSession,
+) -> list[Task]:
+    """Pre-lock the exact ancestor chain before a PR-owned child is locked.
+
+    Review/fix retry admission owns the repository PR lock and then locks the
+    same-PR task rows.  Parent cancellation owns the opposite *hierarchy*
+    direction (ancestor, then descendants), so a retry must acquire its
+    ancestors before admission takes the child row or the two operations can
+    deadlock.  The caller keeps this transaction open, definitively re-reads
+    the child, verifies its parent edge did not change, and passes the returned
+    rows back to :func:`invalidate_ancestor_rollups_for_requeue`.
+    """
+
+    return await _locked_ancestors(task, session)
+
+
+def _validate_prelocked_ancestor_chain(
+    task: Task,
+    ancestors: list[Task],
+) -> None:
+    """Fail closed unless ``ancestors`` is the complete current task lineage."""
+
+    expected_parent_id = task.parent_task_id
+    seen = {task.id}
+    for ancestor in ancestors:
+        if (
+            ancestor.project_id != task.project_id
+            or ancestor.id != expected_parent_id
+            or ancestor.id in seen
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Task {task.id} ancestry changed during retry admission; "
+                    "retry the operation"
+                ),
+            )
+        seen.add(ancestor.id)
+        expected_parent_id = ancestor.parent_task_id
+    if expected_parent_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Task {task.id} ancestry changed during retry admission; "
+                "retry the operation"
+            ),
+        )
 
 
 def _fresh_rollup_context(
@@ -90,6 +177,8 @@ def _fresh_rollup_context(
 async def invalidate_ancestor_rollups_for_requeue(
     task: Task,
     session: AsyncSession,
+    *,
+    prelocked_ancestors: list[Task] | None = None,
 ) -> list[str]:
     """Fence stale ancestor merge proof before requeueing a terminal descendant.
 
@@ -99,7 +188,13 @@ async def invalidate_ancestor_rollups_for_requeue(
     attempt proof and receive a new lineage generation.
     """
 
-    ancestors = await _locked_ancestors(task, session)
+    ancestors = (
+        await _locked_ancestors(task, session)
+        if prelocked_ancestors is None
+        else list(prelocked_ancestors)
+    )
+    if prelocked_ancestors is not None:
+        _validate_prelocked_ancestor_chain(task, ancestors)
     terminal = next(
         (ancestor for ancestor in ancestors if ancestor.status in _TERMINAL_STATUSES),
         None,

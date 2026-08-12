@@ -213,6 +213,7 @@
         "test_terminal_reconciler_exposes_start_after_replacement_failure",
         "test_terminal_reconciler_never_restarts_superseded_or_stopped_worker",
         "test_active_one_shot_records_cycle_reason_then_completion_retries",
+        "test_resident_retry_does_not_restore_task_declined_runner",
         "test_workbench_and_work_session_arming_suppressed_during_resident_session"
       ]
     },
@@ -382,7 +383,8 @@
         "sends only the backend-marked canonical user subset to Fast",
         "stops both lanes when the displaced Workday claim cannot be renewed",
         "uses the retained M1 input while its stable claim is leased",
-        "does not start an autonomous turn while a private Fast consultation owns Workday",
+        "keeps the local message fence installed for the complete %s private turn",
+        "keeps the shared private Workday boundary replyless, silent, and serialized",
         "answers server fast-marked rows through the legacy Workday path when typed Fast is not activated"
       ]
     },
@@ -732,7 +734,10 @@
         "exploration turn is suppressed when nothing is due, runs when a surface is due, and never overrides a real wake",
         "never suppresses the FIRST autonomous turn of a session (empty-session guard)",
         "persists the change-gate signal across serialize → restore (baseline survives restart)",
-        "re-examines a legacy clear record with no stored signal (seeds a baseline once)"
+        "re-examines a legacy clear record with no stored signal (seeds a baseline once)",
+        "renders the backend-resolved effective policy with explicit source precedence",
+        "ignores absent or non-record effective policy payloads",
+        "buildCompactionCheckpoint preserves effective policy authority and freshness rules"
       ]
     },
     {

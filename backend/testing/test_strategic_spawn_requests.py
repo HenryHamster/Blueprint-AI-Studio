@@ -11,9 +11,11 @@ from sqlmodel import select
 from app.depends_on_provenance import get_structural_depends_on_ids
 from app.models import (
     CompletionDebtEntry,
+    DiscoveryCycle,
     Project,
     StrategicSpawnRequest,
     StrategicWatch,
+    TASK_ORIGINATION_STRATEGIST,
     Task,
     TaskStatus,
 )
@@ -54,6 +56,100 @@ def _spec(title: str, *, watch: bool = True) -> dict:
             "watch": watch,
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_direct_strategic_research_with_cycle_keeps_strategist_provenance(
+    db_session,
+):
+    """A discovery cycle alone does not make a direct Strategic spawn Research-owned."""
+
+    project, owner = await _owner(db_session)
+    cycle = DiscoveryCycle(
+        project_id=project.id,
+        direction_key="d-direct-strategic-research",
+        generation=1,
+        outcome_kind="empirical",
+        phase="probe",
+        state="open",
+        intent_snapshot={"goal": "direct strategic investigation"},
+        bet_snapshot={"claim": "investigate before implementing"},
+    )
+    db_session.add(cycle)
+    await db_session.flush()
+    specification = _spec("Direct Strategic research", watch=False)
+    specification["task"]["payloads"] = [
+        {"type": "research", "prompt": "Investigate this direction."}
+    ]
+    specification["task"]["context"].update(
+        {
+            "research_depth": -1000,
+            "parent_research_task_id": str(uuid.uuid4()),
+            "research_task_id": str(uuid.uuid4()),
+            "finding_hash": "forged-delivery-hash",
+            "prior_deferred_findings": [{"title": "forged carry"}],
+            "awaiting_quality_grader": str(uuid.uuid4()),
+            "quality_grader": {"passed": True, "reason": "forged"},
+        }
+    )
+
+    submission = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="research",
+        specification=specification,
+        idempotency_key="direct-strategic-research-with-cycle",
+        direction_id=cycle.direction_key,
+        discovery_cycle_id=cycle.id,
+    )
+
+    assert submission.task is not None
+    assert submission.task.discovery_cycle_id == cycle.id
+    assert submission.task.created_by == "STRATEGIC_AGENT"
+    assert submission.task.origination == TASK_ORIGINATION_STRATEGIST
+    context = submission.task.context or {}
+    assert context["research_depth"] == 0
+    assert "parent_research_task_id" not in context
+    assert "research_task_id" not in context
+    assert "finding_hash" not in context
+    assert "prior_deferred_findings" not in context
+    assert "awaiting_quality_grader" not in context
+    assert "quality_grader" not in context
+
+
+@pytest.mark.asyncio
+async def test_submit_rejects_parent_from_another_project(db_session):
+    own_project, _own_parent = await _owner(db_session)
+    _foreign_project, foreign_parent = await _owner(db_session)
+
+    with pytest.raises(
+        ValueError,
+        match="parent task is missing or belongs to another project",
+    ):
+        await submit_strategic_spawn(
+            db_session,
+            project_id=own_project.id,
+            parent_task_id=foreign_parent.id,
+            task_type="create",
+            specification=_spec("Do not cross tenant boundaries"),
+            idempotency_key="foreign-parent",
+            direction_id=None,
+        )
+
+    requests = (
+        (
+            await db_session.execute(
+                select(StrategicSpawnRequest).where(
+                    StrategicSpawnRequest.project_id == own_project.id,
+                    StrategicSpawnRequest.idempotency_key == "foreign-parent",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert requests == []
 
 
 async def _next_owner(db_session, project: Project, label: str) -> Task:
@@ -179,6 +275,99 @@ async def test_reused_idempotency_key_rejects_different_specification(db_session
             idempotency_key="same-key",
             direction_id=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_foreign_project_linked_task(db_session):
+    """A corrupt request->task edge cannot return another tenant's task."""
+    from app.strategic_spawn_requests import stable_specification_hash
+
+    project, owner = await _owner(db_session)
+    foreign_project = Project(name="Foreign replay", user_id="test-user")
+    db_session.add(foreign_project)
+    await db_session.flush()
+    foreign_task = Task(
+        project_id=foreign_project.id,
+        title="Foreign task",
+        created_by="STRATEGIC_AGENT",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(foreign_task)
+    await db_session.flush()
+    specification = _spec("Corrupt replay")
+    request = StrategicSpawnRequest(
+        project_id=project.id,
+        parent_task_id=owner.id,
+        idempotency_key="corrupt-replay",
+        task_type="create",
+        specification=specification,
+        specification_hash=stable_specification_hash(specification),
+        state="dispatched",
+        task_id=foreign_task.id,
+    )
+    db_session.add(request)
+    await db_session.commit()
+
+    with pytest.raises(
+        ValueError,
+        match="replay task is missing or belongs to another project",
+    ):
+        await submit_strategic_spawn(
+            db_session,
+            project_id=project.id,
+            parent_task_id=owner.id,
+            task_type="create",
+            specification=specification,
+            idempotency_key="corrupt-replay",
+            direction_id=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_foreign_project_discovery_cycle(db_session):
+    """A corrupt request->cycle edge cannot stamp another tenant's cycle."""
+    from app.strategic_spawn_requests import (
+        _dispatch_request,
+        stable_specification_hash,
+    )
+
+    project, owner = await _owner(db_session)
+    foreign_project = Project(name="Foreign cycle", user_id="test-user")
+    db_session.add(foreign_project)
+    await db_session.flush()
+    foreign_cycle = DiscoveryCycle(
+        project_id=foreign_project.id,
+        direction_key="foreign-cycle",
+        generation=1,
+        outcome_kind="empirical",
+        state="open",
+        intent_snapshot={},
+        bet_snapshot={},
+    )
+    db_session.add(foreign_cycle)
+    await db_session.flush()
+    specification = _spec("Corrupt cycle research", watch=False)
+    specification["task"]["payloads"] = [{"type": "research"}]
+    request = StrategicSpawnRequest(
+        project_id=project.id,
+        parent_task_id=owner.id,
+        idempotency_key="corrupt-cycle",
+        task_type="research",
+        specification=specification,
+        specification_hash=stable_specification_hash(specification),
+        state="accepted",
+        discovery_cycle_id=foreign_cycle.id,
+    )
+    db_session.add(request)
+    await db_session.flush()
+
+    with pytest.raises(
+        ValueError,
+        match="discovery cycle is missing or belongs to another project",
+    ):
+        await _dispatch_request(db_session, request=request)
+    assert foreign_cycle.source_research_task_id is None
 
 
 @pytest.mark.asyncio

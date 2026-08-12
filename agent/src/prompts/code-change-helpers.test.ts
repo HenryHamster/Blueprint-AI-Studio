@@ -653,7 +653,7 @@ describe('writeCheckHelper — config-driven build_config path', () => {
     const checkScript = capturedScripts['/tmp/workspace/check'];
     // test_cmd is wrapped in a WITH_TESTS guard.
     expect(checkScript).toContain('if [ "$WITH_TESTS" = "1" ]; then');
-    expect(checkScript).toContain(`( cd "service/api" && pytest -q )`);
+    expect(checkScript).toContain(`run "service/api test" bash -c 'cd "service/api" && pytest -q'`);
     // The directory with no test_cmd produces no test run line.
     expect(checkScript).not.toContain('web test');
   });

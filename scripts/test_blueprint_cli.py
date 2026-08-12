@@ -11,6 +11,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -74,6 +75,112 @@ def test_get_project_id_refuses_ambiguous_unconfigured_fallback(
         blueprint_api.get_project_id()
 
     assert "multiple projects" in capsys.readouterr().err.lower()
+
+
+def test_list_projects_follows_all_pages(monkeypatch):
+    requests = []
+
+    def fake_api(method, path, body=None):
+        requests.append((method, path, body))
+        if "offset=0" in path:
+            return {
+                "items": [{"id": "project-1", "name": "First"}],
+                "has_more": True,
+            }
+        return {
+            "items": [{"id": "project-2", "name": "Second"}],
+            "has_more": False,
+        }
+
+    monkeypatch.setattr(
+        blueprint_api,
+        "load_config",
+        lambda: {"api_key": "operator-admin-key"},
+    )
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+
+    assert blueprint_api.list_projects() == [
+        {"id": "project-1", "name": "First"},
+        {"id": "project-2", "name": "Second"},
+    ]
+    assert requests == [
+        ("GET", "/api/admin/projects?limit=500&offset=0", None),
+        ("GET", "/api/admin/projects?limit=500&offset=1", None),
+    ]
+
+
+def test_list_projects_rejects_nonadvancing_page(monkeypatch):
+    monkeypatch.setattr(
+        blueprint_api,
+        "load_config",
+        lambda: {"api_key": "operator-admin-key"},
+    )
+    monkeypatch.setattr(
+        blueprint_api,
+        "api",
+        lambda *_args, **_kwargs: {"items": [], "has_more": True},
+    )
+
+    with pytest.raises(blueprint_api.APIError, match="returned no items"):
+        blueprint_api.list_projects()
+
+
+def test_list_projects_scoped_credential_uses_access_profile(monkeypatch):
+    calls = []
+    projects = [{"id": "project-1", "name": "Blueprint", "role": "viewer"}]
+    monkeypatch.setattr(
+        blueprint_api,
+        "load_config",
+        lambda: {"api_key": "bpsc_scoped-token"},
+    )
+    monkeypatch.setattr(
+        blueprint_api,
+        "api",
+        lambda method, path, body=None: calls.append((method, path, body))
+        or {"projects": projects, "has_more": False},
+    )
+
+    assert blueprint_api.list_projects() == projects
+    assert calls == [
+        ("GET", "/api/agent-access/v1/me?limit=50&offset=0", None)
+    ]
+
+
+def test_list_projects_scoped_credential_follows_bounded_pages(monkeypatch):
+    calls = []
+    first_page = [
+        {"id": f"project-{index}", "name": f"Project {index}"}
+        for index in range(50)
+    ]
+    final_project = {"id": "project-50", "name": "Target on page two"}
+
+    def fake_api(method, path, body=None):
+        calls.append((method, path, body))
+        if "offset=0" in path:
+            return {
+                "projects": first_page,
+                "has_more": True,
+                "next_offset": 50,
+            }
+        return {"projects": [final_project], "has_more": False}
+
+    monkeypatch.setattr(
+        blueprint_api,
+        "load_config",
+        lambda: {"api_key": "bpsc_scoped-token"},
+    )
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+
+    assert blueprint_api.list_projects() == [*first_page, final_project]
+    assert blueprint_api.resolve_project_id_by_name("Target on page two") == (
+        "project-50"
+    )
+    assert calls == [
+        ("GET", "/api/agent-access/v1/me?limit=50&offset=0", None),
+        ("GET", "/api/agent-access/v1/me?limit=50&offset=50", None),
+        ("GET", "/api/agent-access/v1/me?limit=50&offset=0", None),
+        ("GET", "/api/agent-access/v1/me?limit=50&offset=50", None),
+    ]
 
 
 def test_strategic_chat_sends_required_idempotency_key(monkeypatch):
@@ -148,6 +255,102 @@ def test_blueprint_wrapper_help_exits_zero():
     assert len(result.stdout) > 0, "./blueprint --help produced no output"
 
 
+def test_blueprint_python_entrypoint_help_exits_zero_cross_platform():
+    """The documented Python entrypoint imports and parses help on any OS."""
+    script = os.path.join(REPO_ROOT, "scripts", "blueprint.py")
+    result = subprocess.run(
+        [sys.executable, script, "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Unified Blueprint operator CLI" in result.stdout
+
+
+def test_blueprint_powershell_launcher_contract_is_platform_neutral():
+    """The Windows launcher resolves Python and forwards the CLI arguments."""
+    launcher = Path(REPO_ROOT) / "blueprint.ps1"
+    source = launcher.read_text()
+
+    assert "$cliScript = Join-Path $repoRoot \"scripts\\blueprint.py\"" in source
+    assert "Get-Command -Name $env:BLUEPRINT_PYTHON" in source
+    assert "& $pythonCommand @pythonArgs $cliScript @args" in source
+    assert "exit $LASTEXITCODE" in source
+
+
+def test_blueprint_powershell_launcher_contract_is_not_platform_skipped():
+    """Linux CI must execute the launcher contract instead of skipping it."""
+    source = Path(__file__).read_text()
+    skip_marker = "@pytest.mark.skipif(os.name != " + chr(34) + "nt" + chr(34)
+    assert skip_marker not in source
+
+
+def test_deploy_agent_lock_reports_platform_requirement_without_fcntl(monkeypatch):
+    """A Linux-only daemon command must not make every Windows command fail."""
+    monkeypatch.setattr(blueprint, "fcntl", None)
+    with pytest.raises(blueprint.APIError, match="POSIX advisory locking"):
+        blueprint._acquire_deploy_agent_lock("unused.lock")
+
+
+def test_load_config_environment_credentials_override_ambient_files(
+    monkeypatch, tmp_path
+):
+    """A scoped agent token can override an operator's broader local config."""
+    ambient = tmp_path / ".blueprint-config.json"
+    ambient.write_text(
+        json.dumps({"api_url": "https://ambient.example", "api_key": "admin-key"})
+    )
+    monkeypatch.delenv("BLUEPRINT_CONFIG", raising=False)
+    monkeypatch.setenv("BLUEPRINT_API_URL", "https://scoped.example")
+    monkeypatch.setenv("BLUEPRINT_API_KEY", "bpsc_scoped")
+    monkeypatch.setattr(blueprint_api, "_config_search_paths", lambda: [ambient])
+    monkeypatch.setattr(blueprint_api, "_config_cache", None)
+
+    config = blueprint_api.load_config()
+
+    assert config["api_url"] == "https://scoped.example"
+    assert config["api_key"] == "bpsc_scoped"
+
+
+def test_load_config_explicit_missing_file_does_not_fall_back_to_ambient(
+    monkeypatch, tmp_path
+):
+    missing = tmp_path / "missing-agent-config.json"
+    ambient = tmp_path / "ambient-admin-config.json"
+    ambient.write_text(
+        json.dumps({"api_url": "https://ambient", "api_key": "ambient-admin"})
+    )
+    monkeypatch.setenv("BLUEPRINT_CONFIG", str(missing))
+    monkeypatch.setattr(blueprint_api, "_config_cache", None)
+    monkeypatch.setattr(blueprint_api, "_config_search_paths", lambda: [ambient])
+
+    with pytest.raises(
+        blueprint_api.APIError, match="BLUEPRINT_CONFIG does not exist"
+    ):
+        blueprint_api.load_config()
+
+
+def test_load_config_missing_raises_library_error(monkeypatch, tmp_path, capsys):
+    """Library consumers such as MCP receive an exception, never SystemExit."""
+    missing = tmp_path / "missing.json"
+    for name in (
+        "BLUEPRINT_CONFIG",
+        "BLUEPRINT_API_URL",
+        "BLUEPRINT_API_KEY",
+        "ORCHESTRATOR_URL",
+        "AGENT_SECRET_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(blueprint_api, "_config_search_paths", lambda: [missing])
+    monkeypatch.setattr(blueprint_api, "_bootstrap_from_gcloud", lambda: None)
+    monkeypatch.setattr(blueprint_api, "_config_cache", None)
+
+    with pytest.raises(blueprint_api.APIError, match="no Blueprint API config"):
+        blueprint_api.load_config()
+
+    assert "no Blueprint API config found" in capsys.readouterr().err
+
+
 def test_check_test_delegates_to_standalone_harness():
     """./check test script delegates to scripts/test-backend.sh --standalone --no-postgres."""
     check_path = os.path.join(REPO_ROOT, "check")
@@ -204,6 +407,12 @@ def test_blueprint_wrapper_resolves_via_symlink(tmp_path):
 
 HELP_INVOCATIONS = [
     [],
+    ["agent-access"],
+    ["agent-access", "whoami"],
+    ["agent-access", "snapshot"],
+    ["agent-access", "grant"],
+    ["agent-access", "list"],
+    ["agent-access", "revoke"],
     ["status"],
     ["diagnostics"],
     ["ops"],
@@ -608,6 +817,22 @@ def mock_api(monkeypatch):
                     {"id": "acct-0002-efgh", "name": "evan", "enabled": False,
                      "active_tasks": 0, "rl_hit_count": 1, "disabled_models": {}},
                 ],
+            }
+        if "/admin/task-capabilities" in path:
+            launchable = {
+                "create", "plan", "research", "web_research", "review", "fix",
+                "refactor", "qa", "migrate", "deps", "docs", "investigate",
+            }
+            evidence = {"create", "fix", "refactor", "qa", "migrate", "deps", "docs"}
+            return {
+                "task_capabilities": {
+                    task_type: {
+                        "type": task_type,
+                        "user_launchable": True,
+                        "requires_acceptance_evidence": task_type in evidence,
+                    }
+                    for task_type in launchable
+                }
             }
         if "/messages/" in path and method == "PATCH":
             msg_id = path.split("/messages/")[1].split("?")[0]
@@ -1274,6 +1499,75 @@ def test_tasks_list_blocked_appends_to_status(mock_api, capsys):
     assert any("status=QUEUED" in p and "status=BLOCKED" in p for p in paths)
 
 
+def test_tasks_list_status_is_repeatable(mock_api, capsys):
+    rc = blueprint.main([
+        "--json", "tasks", "list",
+        "--status", "FAILED", "--status", "BLOCKED",
+    ])
+    assert rc == 0
+    assert any(
+        "status=FAILED" in path and "status=BLOCKED" in path
+        for _method, path, _body in mock_api
+    )
+
+
+def test_tasks_list_active_expands_all_active_statuses(mock_api, capsys):
+    rc = blueprint.main(["--json", "tasks", "list", "--active"])
+    assert rc == 0
+    task_paths = [path for _method, path, _body in mock_api if "/tasks?" in path]
+    assert any(
+        all(f"status={status}" in path for status in (
+            "QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"
+        ))
+        for path in task_paths
+    )
+
+
+def test_tasks_list_scoped_credential_uses_bounded_projection(
+    monkeypatch, capsys
+):
+    calls = []
+    response = {
+        "schema_version": "blueprint.agent-tasks.v1",
+        "complete": True,
+        "tasks": [{"id": "task-1", "status": "IN_PROGRESS"}],
+        "total": 1,
+        "truncation": {},
+    }
+    monkeypatch.setattr(
+        blueprint,
+        "load_config",
+        lambda: {"api_key": "bpsc_scoped-token", "read_only": True},
+    )
+    monkeypatch.setattr(blueprint, "_SCOPED_PROFILE_CACHE", None)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _value=None: "project-1")
+
+    def api_fake(method, path, body=None):
+        calls.append((method, path, body))
+        if path == "/api/agent-access/v1/me":
+            return {"credential": {"scopes": ["coding-agent:read"]}}
+        return response
+
+    monkeypatch.setattr(
+        blueprint,
+        "api",
+        api_fake,
+    )
+
+    rc = blueprint.main(["--json", "tasks", "list", "--active", "--limit", "10"])
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == response
+    assert calls[1][0] == "GET"
+    assert calls[1][1].startswith(
+        "/api/agent-access/v1/tasks?project_id=project-1&limit=10"
+    )
+    assert all(
+        f"status={status}" in calls[1][1]
+        for status in ("QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING")
+    )
+
+
 def test_tasks_list_approval_needed_flag(mock_api, capsys):
     """`tasks list --approval-needed` threads approval_needed=true."""
     rc = blueprint.main(["--json", "tasks", "list", "--approval-needed"])
@@ -1344,11 +1638,56 @@ def test_tasks_list_invalid_failure_class_rejected(mock_api, capsys):
     assert exc.value.code == 2
 
 
-def test_tasks_show_json(mock_api, capsys):
+def test_tasks_show_json(mock_api, capsys, monkeypatch):
+    monkeypatch.setattr(
+        blueprint,
+        "load_config",
+        lambda: {"api_key": "operator-admin-key"},
+    )
     rc = blueprint.main(["--json", "tasks", "show", "task-123"])
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["id"] == "task-123"
+    assert ("GET", "/api/admin/tasks/task-123", None) in mock_api
+
+
+def test_tasks_show_scoped_credential_uses_bounded_projection(
+    monkeypatch, capsys
+):
+    calls = []
+    projection = {
+        "schema_version": "blueprint.agent-task.v1",
+        "task": {"id": "task-123", "status": "FAILED"},
+        "truncation": {},
+    }
+
+    monkeypatch.setattr(
+        blueprint,
+        "load_config",
+        lambda: {"api_key": "bpsc_scoped-token", "read_only": True},
+    )
+    monkeypatch.setattr(blueprint, "_SCOPED_PROFILE_CACHE", None)
+
+    def api_fake(method, path, body=None):
+        calls.append((method, path, body))
+        if path == "/api/agent-access/v1/me":
+            return {"credential": {"scopes": ["coding-agent:read"]}}
+        return projection
+
+    monkeypatch.setattr(
+        blueprint,
+        "api",
+        api_fake,
+    )
+
+    rc = blueprint.main(["--json", "tasks", "show", "task-123"])
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == projection
+    assert calls == [
+        ("GET", "/api/agent-access/v1/me", None),
+        ("GET", "/api/agent-access/v1/tasks/task-123", None),
+    ]
 
 
 def test_versions_show_json(mock_api, capsys):
@@ -3183,6 +3522,11 @@ def test_tasks_health_autonomy_debug_deprecation(capsys):
 def test_messages_group(mock_api, monkeypatch, capsys):
     """messages list (human + --json, status filter) and send (POST body, type
     passthrough, read-only refused) via blueprint.main with mocked api."""
+    monkeypatch.setattr(
+        blueprint,
+        "load_config",
+        lambda: {"api_url": "x", "api_key": "operator-admin-key"},
+    )
 
     # --- list human render ---
     rc = blueprint.main(["messages", "list"])
@@ -3195,7 +3539,7 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     assert "msg-001" in out        # message ID
     assert "msg-002" in out        # message ID
     # default status=open must be sent
-    assert any("/messages?status=open" in path for _, path, _ in mock_api)
+    assert any("status=open" in path for _, path, _ in mock_api)
 
     # --- list --json output ---
     mock_api.clear()
@@ -3210,7 +3554,7 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     mock_api.clear()
     rc = blueprint.main(["messages", "list", "--status", "all"])
     assert rc == 0
-    assert any("/messages?status=all" in path for _, path, _ in mock_api)
+    assert any("status=all" in path for _, path, _ in mock_api)
 
     # --- send posts correct body and type ---
     mock_api.clear()
@@ -3232,6 +3576,67 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         blueprint.main(["messages", "send", "blocked send"])
     assert exc.value.code == 1
+
+
+def test_messages_list_scoped_credential_uses_operator_projection(
+    monkeypatch, capsys
+):
+    calls = []
+    response = {
+        "messages": [
+            {
+                "id": "msg-1",
+                "message_type": "BLOCKER",
+                "from_type": "system",
+                "content": "runner unavailable",
+                "status": "open",
+            }
+        ],
+        "total": 1,
+    }
+
+    monkeypatch.setattr(
+        blueprint,
+        "load_config",
+        lambda: {"api_key": "bpsc_scoped-token", "read_only": True},
+    )
+    monkeypatch.setattr(blueprint, "_SCOPED_PROFILE_CACHE", None)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _value=None: "project-1")
+
+    def api_fake(method, path, body=None):
+        calls.append((method, path, body))
+        if path == "/api/agent-access/v1/me":
+            return {"credential": {"scopes": ["coding-agent:read"]}}
+        return response
+
+    monkeypatch.setattr(
+        blueprint,
+        "api",
+        api_fake,
+    )
+
+    rc = blueprint.main(
+        [
+            "--json", "messages", "list", "--status", "open",
+            "--limit", "25", "--offset", "75",
+        ]
+    )
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == response
+    assert calls == [
+        ("GET", "/api/agent-access/v1/me", None),
+        (
+            "GET",
+            "/api/agent-access/v1/messages?project_id=project-1&status=open&limit=25&offset=75",
+            None,
+        )
+    ]
+
+    blueprint._render_messages(response)
+    rendered = capsys.readouterr().out
+    assert "[BLOCK]" in rendered
+    assert "system" in rendered
 
 
 def test_messages_answer(mock_api, monkeypatch, capsys):
@@ -5232,7 +5637,11 @@ def test_tasks_create_posts_task(mock_api, monkeypatch, capsys):
         "api_url": "x", "api_key": "y",
         "default_repo": "owner/repo", "default_base_branch": "main",
     })
-    rc = blueprint.main(["tasks", "create", "My new task", "Do the thing.", "--yes"])
+    rc = blueprint.main([
+        "tasks", "create", "My new task", "Do the thing.",
+        "--acceptance-test", "backend/testing/test_new_task.py::test_behavior",
+        "--idempotency-key", "test-create-1", "--yes",
+    ])
     assert rc == 0
     create_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/api/admin/tasks" in p and "compute-experiment" not in p]
     assert create_calls, "Expected a POST to /api/admin/tasks"
@@ -5240,8 +5649,18 @@ def test_tasks_create_posts_task(mock_api, monkeypatch, capsys):
     assert body["title"] == "My new task"
     assert body["prompt"] == "Do the thing."
     assert body["github_repo"] == "owner/repo"
+    assert body["project_id"] == "proj-1"
     assert body["task_type"] == "create"
-    assert body["base_branch"] == "main"
+    assert "base_branch" not in body
+    assert body["acceptance_evidence"] == {
+        "kind": "named_test",
+        "test_path": "backend/testing/test_new_task.py::test_behavior",
+    }
+    assert body["idempotency_key"] == "test-create-1"
+    assert any(
+        method == "GET" and path == "/api/admin/task-capabilities"
+        for method, path, _body in mock_api
+    )
 
 
 def test_tasks_create_custom_type_and_repo(mock_api, monkeypatch, capsys):
@@ -5256,7 +5675,9 @@ def test_tasks_create_custom_type_and_repo(mock_api, monkeypatch, capsys):
     })
     rc = blueprint.main([
         "tasks", "create", "Fix bug", "Patch the thing.",
-        "--type", "fix", "--repo", "myorg/myrepo", "--base-branch", "dev", "--yes",
+        "--type", "fix", "--repo", "myorg/myrepo", "--base-branch", "dev",
+        "--pr-number", "123", "--branch", "fix/pr-123",
+        "--acceptance-behavior", "The reported bug no longer reproduces.", "--yes",
     ])
     assert rc == 0
     create_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/api/admin/tasks" in p and "compute-experiment" not in p]
@@ -5265,6 +5686,210 @@ def test_tasks_create_custom_type_and_repo(mock_api, monkeypatch, capsys):
     assert body["task_type"] == "fix"
     assert body["github_repo"] == "myorg/myrepo"
     assert body["base_branch"] == "dev"
+    assert body["pr_number"] == 123
+    assert body["branch"] == "fix/pr-123"
+    assert body["acceptance_evidence"] == {
+        "kind": "observable_behavior",
+        "description": "The reported bug no longer reproduces.",
+    }
+
+
+def test_tasks_create_explicit_project_derives_its_repository(
+    mock_api, monkeypatch
+):
+    monkeypatch.setattr(
+        blueprint,
+        "load_config",
+        lambda: {
+            "api_url": "x",
+            "api_key": "operator-admin-key",
+            "default_repo": "default/repo",
+            "default_base_branch": "main",
+        },
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "get_project_id",
+        lambda project_id=None: project_id or "default-project",
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "list_projects",
+        lambda: [
+            {
+                "id": "selected-project",
+                "name": "Other",
+                "github_owner": "other-owner",
+                "github_repo": "other-repo",
+            }
+        ],
+    )
+
+    rc = blueprint.main(
+        [
+            "tasks",
+            "create",
+            "Target exact project",
+            "Make the requested change.",
+            "--project-id",
+            "selected-project",
+            "--acceptance-behavior",
+            "The requested behavior is present after the change.",
+            "--yes",
+        ]
+    )
+
+    assert rc == 0
+    create_call = next(
+        (method, path, body)
+        for method, path, body in mock_api
+        if method == "POST" and path == "/api/admin/tasks"
+    )
+    assert create_call[2]["project_id"] == "selected-project"
+    assert create_call[2]["github_repo"] == "other-owner/other-repo"
+    assert "base_branch" not in create_call[2]
+
+
+def test_tasks_create_configured_project_derives_its_repository(
+    mock_api, monkeypatch
+):
+    monkeypatch.setattr(
+        blueprint,
+        "load_config",
+        lambda: {
+            "api_url": "x",
+            "api_key": "operator-admin-key",
+            "project_id": "configured-project",
+            "default_repo": "stale-default/repo",
+            "default_base_branch": "main",
+        },
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "get_project_id",
+        lambda project_id=None: project_id or "configured-project",
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "list_projects",
+        lambda: [
+            {
+                "id": "configured-project",
+                "name": "Configured",
+                "github_owner": "configured-owner",
+                "github_repo": "configured-repo",
+            }
+        ],
+    )
+
+    rc = blueprint.main(
+        [
+            "tasks",
+            "create",
+            "Use configured project",
+            "Make the requested change.",
+            "--acceptance-behavior",
+            "The requested behavior is present after the change.",
+            "--yes",
+        ]
+    )
+
+    assert rc == 0
+    create_call = next(
+        (method, path, body)
+        for method, path, body in mock_api
+        if method == "POST" and path == "/api/admin/tasks"
+    )
+    assert create_call[2]["project_id"] == "configured-project"
+    assert create_call[2]["github_repo"] == "configured-owner/configured-repo"
+    assert "base_branch" not in create_call[2]
+
+
+def test_tasks_create_rejects_type_missing_from_server_registry(
+    mock_api, monkeypatch, capsys
+):
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "owner/repo"
+    })
+    rc = blueprint.main([
+        "tasks", "create", "T", "P", "--type", "invented", "--yes",
+    ])
+    assert rc == 1
+    assert "server capability registry" in capsys.readouterr().err
+    assert not any(method == "POST" for method, _path, _body in mock_api)
+
+
+def test_tasks_create_reports_idempotent_reuse(monkeypatch, capsys):
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if path == "/api/admin/task-capabilities":
+            return {
+                "task_capabilities": {
+                    "create": {
+                        "user_launchable": True,
+                        "requires_acceptance_evidence": True,
+                    }
+                }
+            }
+        if method == "POST" and path == "/api/admin/tasks":
+            return {
+                "id": "task-existing",
+                "title": "Existing task",
+                "task_type": "create",
+                "is_duplicate": True,
+            }
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "_require_write_config", lambda _op: None)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _value=None: "project-b")
+    monkeypatch.setattr(
+        blueprint,
+        "list_projects",
+        lambda: [
+            {
+                "id": "project-b",
+                "github_owner": "owner",
+                "github_repo": "repo",
+            }
+        ],
+    )
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "owner/repo"
+    })
+    rc = blueprint.main([
+        "tasks", "create", "Existing task", "Do it",
+        "--acceptance-behavior", "The change works", "--yes",
+    ])
+    assert rc == 0
+    assert "task reused: task-existing  [create]" in capsys.readouterr().out
+
+
+def test_tasks_create_code_task_requires_acceptance_evidence(
+    mock_api, monkeypatch, capsys
+):
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "owner/repo"
+    })
+    rc = blueprint.main(["tasks", "create", "T", "P", "--yes"])
+    assert rc == 1
+    assert "requires acceptance evidence" in capsys.readouterr().err
+    assert not any(method == "POST" for method, _path, _body in mock_api)
+
+
+def test_tasks_create_fix_requires_pr_metadata(mock_api, monkeypatch, capsys):
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "owner/repo"
+    })
+    rc = blueprint.main([
+        "tasks", "create", "T", "P", "--type", "fix",
+        "--acceptance-behavior", "The pull request defect is corrected.", "--yes",
+    ])
+    assert rc == 1
+    assert "requires --pr-number and --branch" in capsys.readouterr().err
+    assert not any(method == "POST" for method, _path, _body in mock_api)
 
 
 def test_tasks_create_read_only_refused(mock_api, monkeypatch):
@@ -5287,7 +5912,16 @@ def test_tasks_create_aborts_without_yes(mock_api, monkeypatch, capsys):
         "default_repo": "owner/repo", "default_base_branch": "main",
     })
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
-    rc = blueprint.main(["tasks", "create", "T", "P"])
+    rc = blueprint.main(
+        [
+            "tasks",
+            "create",
+            "T",
+            "P",
+            "--acceptance-behavior",
+            "The requested behavior is observable.",
+        ]
+    )
     assert rc == 0
     out = capsys.readouterr().out
     assert "Aborted" in out
@@ -5919,9 +6553,19 @@ def test_migration_worker_values_rejects_untrusted_secret_shapes_and_accepts_val
     secrets = tmp_path / "secrets.json"
 
     args = argparse.Namespace(worker_env_file=str(role))
+    # A legitimately multi-line secret (PEM-encoded private key) must be accepted:
+    # worker secrets reach the migration container via the OS environment, which
+    # forwards newlines verbatim. Rejecting these caused a control-plane outage
+    # (units stopped, then the migration aborted on the secret validation).
+    multiline_pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        + "\n".join(["MIIEow" + "A" * 58 for _ in range(24)])
+        + "\n-----END RSA PRIVATE KEY-----\n"
+    )
     valid = {
         "DATABASE_URL": "postgresql+asyncpg://worker:p%40ss@ignored:5432/blueprint",
         "GITHUB_PAT_ENCRYPTION_KEY": "x" * 43,
+        "GITHUB_PRIVATE_KEY": multiline_pem,
     }
     secrets.write_text(json.dumps(valid), encoding="utf-8")
     secrets.chmod(0o600)
@@ -5929,6 +6573,9 @@ def test_migration_worker_values_rejects_untrusted_secret_shapes_and_accepts_val
     assert values["DATABASE_URL"] == (
         "postgresql+asyncpg://worker:p%40ss@blueprint-postgres:5432/blueprint?ssl=disable"
     )
+    # The multi-line value must survive untouched (not stripped, not rejected).
+    assert values["GITHUB_PRIVATE_KEY"] == multiline_pem
+    assert "\n" in values["GITHUB_PRIVATE_KEY"]
     assert credential_path == credential
     assert secrets_path == secrets
     assert network == "blueprint-control-plane"
@@ -5936,7 +6583,11 @@ def test_migration_worker_values_rejects_untrusted_secret_shapes_and_accepts_val
     for invalid in (
         ["not", "an", "object"],
         {"DATABASE_URL": ["not a string"]},
-        {"DATABASE_URL": "postgresql://worker:password@db:5432/blueprint\x1f"},
+        # An embedded NUL is the one byte the OS environment cannot carry, so it
+        # is the only value shape still rejected.
+        {"DATABASE_URL": "postgresql://worker:password@db:5432/blueprint\x00"},
+        # An empty key is not a usable env-var name.
+        {"DATABASE_URL": "postgresql://worker:password@db:5432/blueprint", "": "x"},
     ):
         secrets.write_text(json.dumps(invalid), encoding="utf-8")
         with pytest.raises(ValueError, match="worker secrets"):
@@ -6005,7 +6656,24 @@ def test_migration_deploy_stops_units_before_migrate_and_starts_after(monkeypatc
         "_registry_auth",
         lambda _credential: contextlib.nullcontext(Path("/tmp/registry")),
     )
-    monkeypatch.setattr(local_release, "_run", lambda *_args, **_kwargs: SimpleNamespace())
+    def fake_run(argv, **_kwargs):
+        if argv[:3] == [
+            "/usr/bin/systemctl", "show", "blueprint-deploy-agent.service"
+        ]:
+            return subprocess.CompletedProcess(
+                argv, 0, "NoNewPrivileges=yes\nUser=henry_hamster\n", ""
+            )
+        if argv[:3] == [
+            "/usr/bin/systemctl", "show", "blueprint-release.service"
+        ]:
+            return subprocess.CompletedProcess(
+                argv, 0, "NoNewPrivileges=no\nUser=root\n", ""
+            )
+        if argv[:2] == ["/usr/bin/docker", "run"]:
+            return subprocess.CompletedProcess(argv, 0, "reachable\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(local_release, "_run", fake_run)
     monkeypatch.setattr(local_release, "_verify_frontend", lambda *_args: "e" * 64)
     monkeypatch.setattr(local_release, "_inspect_candidate", lambda *_args: "sha256:" + "c" * 64)
     monkeypatch.setattr(local_release, "_retain_prior_image", lambda _image: "retained:old")
@@ -6027,6 +6695,16 @@ def test_migration_deploy_stops_units_before_migrate_and_starts_after(monkeypatc
         return 0
 
     monkeypatch.setattr(blueprint, "cmd_migrate", migrate)
+    monkeypatch.setattr(
+        blueprint,
+        "_migration_worker_values",
+        lambda _args: (
+            {"DATABASE_URL": "postgresql://user:pass/db"},
+            Path("/safe/credential.json"),
+            Path("/safe/secrets.json"),
+            "blueprint-network",
+        ),
+    )
     monkeypatch.setattr(local_release, "_atomic_write", lambda *_args: None)
     monkeypatch.setattr(
         local_release,
@@ -6342,7 +7020,9 @@ def test_deploy_agent_retries_failed_activation_phase_then_confirms(
 def _write_accepted_activation_state(state_path):
     state_path.write_text(json.dumps({
         "version_number": 7, "promoted_sha": _DEPLOY_PROMOTED_SHA,
-        "revision": _DEPLOY_PROMOTED_SHA, "phase": "accepted",
+        "revision": _DEPLOY_PROMOTED_SHA,
+        "activation_requested_at": "2026-06-15T00:00:00Z",
+        "phase": "accepted",
     }), encoding="utf-8")
 
 
@@ -6351,6 +7031,19 @@ def _approved_activation():
         "version_number": 7, "status": "promoted", "promoted_sha": _DEPLOY_PROMOTED_SHA,
         "serving_status": "unconfirmed", "activation_requested_at": "2026-06-15T00:00:00Z",
     }
+
+
+def test_read_live_approved_activation_rearms_confirmation_timeout(monkeypatch):
+    """The host reader consumes an approved timeout after the API re-arms it."""
+    promoted = {
+        **_approved_activation(),
+        "serving_status": "confirmation_timed_out",
+    }
+    monkeypatch.setattr(
+        blueprint, "_read_latest_promoted_version", lambda _args: promoted
+    )
+
+    assert blueprint._read_live_approved_activation(argparse.Namespace()) == promoted
 
 
 def _root_activation_retry(monkeypatch, state_path, served_sha, now=None):
@@ -6395,6 +7088,16 @@ def test_deploy_agent_confirms_when_served_sha_matches(monkeypatch, tmp_path):
     assert blueprint._deploy_agent_once(args) is True
     assert len(posted) == 1
     assert not state_path.exists()
+
+
+def test_deploy_agent_lock_reports_posix_requirement_without_fcntl(
+    monkeypatch, tmp_path
+):
+    """Importing the operator CLI on Windows must not fail at module import."""
+    monkeypatch.setattr(blueprint, "fcntl", None)
+
+    with pytest.raises(blueprint.APIError, match="POSIX advisory locking"):
+        blueprint._acquire_deploy_agent_lock(str(tmp_path / "deploy-agent.lock"))
 
 
 @pytest.mark.parametrize(

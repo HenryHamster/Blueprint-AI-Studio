@@ -1,5 +1,6 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
+import type { DirectoryConfig } from '../utils/test-runners.js';
 
 describe('tracked root check receipt contract', () => {
   it('uses one runtime-derived receipt path for cleanup and publication', async () => {
@@ -642,13 +643,11 @@ describe('writeCheckHelper — visual acceptance capture+upload (success path)',
   });
 });
 
-// ── Config-driven pytest gate — sanctioned harness + GATE-ENVIRONMENT ────────
-// Regression guard for the trapped-task bug (22cb9d94 / 6b14ec01, 2026-06-06):
-// a configured bare `pytest` ran verbatim on VMs without the Postgres test
-// env, silently degrading to in-memory SQLite where ~70 pre-existing
-// Postgres-only tests fail regardless of the diff — the mandatory ./pr gate
-// then blocked finished, harness-validated work indefinitely.
-describe('writeCheckHelper — config-driven pytest gate', () => {
+// ── Config-driven test commands ──────────────────────────────────────────────
+// The generic pytest decision ladder was retired in favor of the retained
+// project-verification attributor. Ordinary configured commands still use the
+// shared run wrapper, so a genuinely failing test remains blocking.
+describe('writeCheckHelper — configured test commands', () => {
   let capturedScripts: Record<string, string> = {};
 
   beforeEach(() => {
@@ -659,7 +658,10 @@ describe('writeCheckHelper — config-driven pytest gate', () => {
     });
   });
 
-  const writeBackendPytestCheck = async (testCmd: string, taskId = 'task-pygate-1'): Promise<string> => {
+  const render = async (
+    directory: DirectoryConfig,
+    taskId = 'configured-test-1',
+  ): Promise<string> => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId,
@@ -668,271 +670,49 @@ describe('writeCheckHelper — config-driven pytest gate', () => {
       owner: 'acme',
       repo: 'other-repo',
       testsOnMainBranch: true,
-      buildConfig: {
-        directories: [{ path: 'backend', type: 'python', test_cmd: testCmd }],
-      },
+      taskCapability: { agent_mode: 'write', run_shape: 'workflow', output_kind: 'pr' },
+      buildConfig: { directories: [directory] },
     });
     const script = capturedScripts['/tmp/workspace/check'];
     expect(script).toBeDefined();
     return script;
   };
 
-  it('prefers the sanctioned Docker harness over bare pytest for a top-level directory', async () => {
-    const script = await writeBackendPytestCheck('pytest');
-    // Harness preference is probed at runtime: file exists + Docker available.
-    expect(script).toContain('if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1; then');
-    // Both harness modes are generated as cases...
-    expect(script).toContain(`run "backend test (sanctioned harness)" bash -c 'set -o pipefail; bash scripts/test-backend.sh 2>&1 | tail -200'`);
-    expect(script).toContain('MemAvailable');
-    expect(script).toContain(`run "backend test (harness standalone)" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'`);
-  });
-
-  it('prefers the standalone partial over the full suite whenever the harness offers --standalone', async () => {
-    // Regression for the 2026-06-07 gate wart: the old probe selected the FULL
-    // suite when `MemAvailable >= 4096`, so an 8 GB agent VM (which clears 4 GB
-    // at gate-start) ran the full Docker/Postgres suite locally — the run that
-    // OOMs (exit 137) and that CI already covers. The local gate is a smoke
-    // check; when the harness advertises --standalone, that must win regardless
-    // of free memory. The `>= 4096 -> full harness` branch is now reachable only
-    // when the harness has NO standalone mode.
-    const script = await writeBackendPytestCheck('pytest');
-    const standaloneAt = script.indexOf("grep -qs -- '--standalone'");
-    const fullByMemAt = script.indexOf('-ge 4096');
-    expect(standaloneAt).toBeGreaterThan(-1);
-    expect(fullByMemAt).toBeGreaterThan(-1);
-    // The --standalone preference is evaluated BEFORE the memory-gated full run.
-    expect(standaloneAt).toBeLessThan(fullByMemAt);
-    // The full harness locally is now an explicit opt-in only (ALLOW_LOW_MEM),
-    // not an incidental consequence of free memory.
-    expect(script).toContain('if [ -n "${ALLOW_LOW_MEM:-}" ]; then');
-  });
-
-  it('keeps the configured command verbatim for faithful environments (mandatory gate intact)', async () => {
-    const script = await writeBackendPytestCheck('pytest');
-    // The bare run still exists — taken when the Postgres test env is present
-    // or the suite does not select its DB from env at all.
-    expect(script).toContain(`( cd "backend" && pytest )`);
-    // Faithfulness probes: Postgres env detection + env-gated-conftest grep.
-    expect(script).toContain('USE_TEST_POSTGRES');
-    expect(script).toContain('postgresql*)');
-    expect(script).toContain('grep -qs USE_TEST_POSTGRES "backend/conftest.py" "backend"/*/conftest.py');
-  });
-
-  it('emits the GATE-ENVIRONMENT marker path instead of an unfaithful SQLite run', async () => {
-    const script = await writeBackendPytestCheck('pytest');
-    expect(script).toContain('GATE-ENVIRONMENT: backend test gate cannot run faithfully on this VM');
-    expect(script).toContain('in-memory SQLite fallback');
-    // Marker file ./pr surfaces after a passing gate; cleared fresh per run.
-    expect(script).toContain('>> /tmp/check_gate_env_task-pygate-1.txt');
-    expect(script).toContain('rm -f /tmp/check_gate_env_task-pygate-1.txt');
-    // The skip is advisory-with-evidence, never a silent pass: it points the
-    // agent at harness evidence and the structured ./blocked escape hatch.
-    expect(script).toContain('record that evidence in the PR body');
-    expect(script).toContain('./blocked');
-    // The whole gate stays behind `./check test` (WITH_TESTS).
-    expect(script).toMatch(/if \[ "\$WITH_TESTS" = "1" \]; then[\s\S]*GATE-ENVIRONMENT/);
-  });
-
-  it('routes python -m pytest variants through the honest gate too', async () => {
-    const script = await writeBackendPytestCheck('python3 -m pytest -x -q');
-    expect(script).toContain('GATE-ENVIRONMENT');
-    expect(script).toContain(`( cd "backend" && python3 -m pytest -x -q )`);
-  });
-
-  it('leaves non-pytest test commands byte-for-byte on the verbatim path', async () => {
-    const { writeCheckHelper } = await import('./check-helper.js');
-    writeCheckHelper({
-      taskId: 'task-pygate-2',
-      workBranch: 'blueprint/task-pygate-2',
-      baseBranch: 'main',
-      owner: 'acme',
-      repo: 'other-repo',
-      testsOnMainBranch: true,
-      buildConfig: {
-        directories: [{ path: 'web', type: 'node', test_cmd: 'npm test' }],
-      },
-    });
-    const script = capturedScripts['/tmp/workspace/check'];
-    expect(script).toContain(`run "web test" bash -c 'cd "web" && npm test'`);
-    // No gate machinery for non-pytest commands (the shared header's marker
-    // cleanup line mentions GATE-ENVIRONMENT in a comment, so scope the
-    // negative checks to the decision ladder + its outputs).
+  it('keeps an ordinary pytest command on the shared fail-closed run path', async () => {
+    const script = await render({ path: 'backend', type: 'python', test_cmd: 'pytest' });
+    expect(script).toContain(`run "backend test" bash -c 'cd "backend" && pytest'`);
     expect(script).not.toContain('_GATE_MODE');
     expect(script).not.toContain('GATE-ENVIRONMENT:');
     expect(script).not.toContain('test (sanctioned harness)');
   });
 
-  it('skips the harness convention (but keeps faithfulness checks) for nested directory paths', async () => {
-    const { writeCheckHelper } = await import('./check-helper.js');
-    writeCheckHelper({
-      taskId: 'task-pygate-3',
-      workBranch: 'blueprint/task-pygate-3',
-      baseBranch: 'main',
-      owner: 'acme',
-      repo: 'other-repo',
-      testsOnMainBranch: true,
-      buildConfig: {
-        directories: [{ path: 'service/api', type: 'python', test_cmd: 'pytest -q' }],
+  it('routes an explicit project-verification target to the retained attributor', async () => {
+    const script = await render({
+      path: 'backend',
+      type: 'python',
+      lint_cmd: 'ruff check .',
+      test_cmd: 'pytest',
+      project_verification: {
+        protocol: 'blueprint-v1',
+        harness: 'scripts/test-backend.sh',
       },
-    });
-    const script = capturedScripts['/tmp/workspace/check'];
-    // scripts/test-service/api.sh would be nonsense — no harness run branch
-    // (the prose in the gate-env message may still mention the harness).
-    expect(script).not.toContain('scripts/test-service');
-    expect(script).not.toContain('test (sanctioned harness)');
-    // The faithfulness ladder still applies.
-    expect(script).toContain('GATE-ENVIRONMENT');
-    expect(script).toContain('grep -qs USE_TEST_POSTGRES "service/api/conftest.py" "service/api"/*/conftest.py');
-    expect(script).toContain(`( cd "service/api" && pytest -q )`);
+    }, 'configured-verification-1');
+    // The retained block is capability-gated; ordinary external config does
+    // not accidentally mint the receipt contract.
+    expect(script).toContain('required backend-authoring verification');
+    expect(script).toContain('backend-test-route.sh');
+    expect(script).not.toContain(`run "backend test" bash -c 'cd "backend" && pytest'`);
   });
 
-  it('generated pytest-gate ./check passes `bash -n` syntax check', async () => {
-    const script = await writeBackendPytestCheck('pytest', 'task-pygate-bashn');
+  it('preserves generated bash syntax and a genuinely failing configured test', async () => {
+    const script = await render({ path: 'service', type: 'python', test_cmd: 'pytest -q' }, 'configured-failure-1');
+    expect(script).toContain(`run "service test" bash -c 'cd "service" && pytest -q'`);
+    expect(script).toContain('FAILED+=("$label")');
     const { execSync } = await import('child_process');
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
-
-  // ── Runtime behavior ────────────────────────────────────────────────────────
-  // Executes the REAL generated ./check under shims (no /tmp cross-process
-  // handoff, so this runs on every platform — invocations are recorded via an
-  // env-passed LOGFILE inside the sandbox dir).
-  const runCheck = async (
-    script: string,
-    scenario: 'gate-env' | 'bare' | 'harness',
-    opts?: { pytestExit?: number },
-  ): Promise<{ status: number; stdout: string; log: string }> => {
-    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
-    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
-    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
-    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
-    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'pygate-'));
-    // bash on Windows (Git Bash/msys) wants /d/... style paths; no-op on Linux.
-    const posix = (p: string): string =>
-      p.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, (_m, d: string) => `/${d.toLowerCase()}/`);
-    try {
-      const bin = realPath.join(dir, 'bin');
-      realFs.mkdirSync(bin, { recursive: true });
-      realFs.mkdirSync(realPath.join(dir, 'backend', 'testing'), { recursive: true });
-      // git shim: valid repo whose diff vs origin/main touched backend/x.py.
-      realFs.writeFileSync(realPath.join(bin, 'git'), `#!/bin/sh
-case "$*" in
-  *"rev-parse --git-dir"*) echo .git; exit 0 ;;
-  *"rev-parse --verify origin/main"*) exit 0 ;;
-  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'backend/x.py'; exit 0 ;;
-  *) exit 0 ;;
-esac
-`, { mode: 0o755 });
-      // pytest shim: records that the bare command actually ran, exits with caller-supplied code.
-      const pytestExit = opts?.pytestExit ?? 0;
-      realFs.writeFileSync(realPath.join(bin, 'pytest'), `#!/bin/sh\necho pytest-ran >> "$LOGFILE"\nexit ${pytestExit}\n`, { mode: 0o755 });
-      if (scenario === 'gate-env') {
-        // Env-gated conftest (the Blueprint shape) + no harness + no Postgres
-        // env: a bare run would be the unfaithful SQLite fallback.
-        realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'conftest.py'), 'USE_TEST_POSTGRES = os.getenv("USE_TEST_POSTGRES")\n');
-      } else {
-        realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'conftest.py'), 'plain conftest\n');
-      }
-      if (scenario === 'harness') {
-        realFs.mkdirSync(realPath.join(dir, 'scripts'), { recursive: true });
-        // Harness shim: does NOT advertise --standalone so the memory-based
-        // routing branch is exercised (BLUEPRINT_MEM_AVAIL_MB overrides /proc/meminfo).
-        realFs.writeFileSync(realPath.join(dir, 'scripts', 'test-backend.sh'), '#!/bin/sh\necho harness-ran "$@" >> "$LOGFILE"\nexit 0\n', { mode: 0o755 });
-        realFs.writeFileSync(realPath.join(bin, 'docker'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-      }
-      const scriptPath = realPath.join(dir, 'check');
-      realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
-      const logfile = realPath.join(dir, 'run.log');
-      realFs.writeFileSync(logfile, '');
-      let stdout = '';
-      let status = 0;
-      try {
-        stdout = realCp.execFileSync('bash', [posix(scriptPath), 'test'], {
-          cwd: dir,
-          env: {
-            PATH: `${posix(bin)}:${process.env.PATH ?? ''}`,
-            WORKSPACE: posix(dir),
-            LOGFILE: posix(logfile),
-            HOME: process.env.HOME ?? '',
-            // Inject synthetic memory so the harness routing branch fires
-            // deterministically on any VM (overrides /proc/meminfo reading).
-            ...(scenario === 'harness' ? { BLUEPRINT_MEM_AVAIL_MB: '8192' } : {}),
-          },
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
-      } catch (err: unknown) {
-        const e = err as { status?: number; stdout?: string; stderr?: string };
-        status = e.status ?? -1;
-        stdout = (e.stdout ?? '') + (e.stderr ?? '');
-      }
-      const log = realFs.readFileSync(logfile, 'utf8');
-      return { status, stdout, log };
-    } finally {
-      realFs.rmSync(dir, { recursive: true, force: true });
-    }
-  };
-
-  it('runtime: env-gated conftest with no harness and no Postgres env -> GATE-ENVIRONMENT skip, never an unfaithful red', async () => {
-    const script = await writeBackendPytestCheck('pytest', 'smoke-ge');
-    const r = await runCheck(script, 'gate-env');
-    expect(r.stdout).toContain('GATE-ENVIRONMENT');
-    // The unfaithful SQLite run is skipped, not executed-and-red.
-    expect(r.log).not.toContain('pytest-ran');
-    // ./check still passes — the marker (surfaced by ./pr) carries the signal.
-    expect(r.status).toBe(0);
-    expect(r.stdout).toContain('PASS — all checks green');
-  });
-
-  it('runtime: non-env-gated suite -> configured pytest runs verbatim (gate stays mandatory)', async () => {
-    const script = await writeBackendPytestCheck('pytest', 'smoke-bare');
-    const r = await runCheck(script, 'bare');
-    expect(r.log).toContain('pytest-ran');
-    expect(r.status).toBe(0);
-  });
-
-  it('runtime: harness + Docker available -> sanctioned harness runs instead of bare pytest', async () => {
-    const script = await writeBackendPytestCheck('pytest', 'smoke-harness');
-    const r = await runCheck(script, 'harness');
-    expect(r.log).toContain('harness-ran');
-    expect(r.log).not.toContain('pytest-ran');
-    expect(r.status).toBe(0);
-  });
-
-  // ── Exit-code non-blocking: exit 5 / exit 2 pass, exit 1 blocks ─────────────
-  // On external repos (e.g. stsbot2) the suite may collect no tests (exit 5) or
-  // fail collection because deps aren't installed (exit 2). Both were previously
-  // treated as test failures by `run`, hard-blocking `./pr open`. They should be
-  // non-blocking (a GATE-ENVIRONMENT marker is written); a real test failure
-  // (exit 1) must still block.
-
-  it('runtime: bare pytest exit 5 (no tests collected) is non-blocking — ./check passes', async () => {
-    const script = await writeBackendPytestCheck('pytest', 'smoke-exit5');
-    const r = await runCheck(script, 'bare', { pytestExit: 5 });
-    expect(r.log).toContain('pytest-ran');
-    // Exit 5 is non-blocking: ./check must pass so ./pr open can proceed.
-    expect(r.status).toBe(0);
-    expect(r.stdout).toContain('PASS — all checks green');
-    expect(r.stdout).toContain('exit 5');
-  });
-
-  it('runtime: bare pytest exit 2 (collection error) is non-blocking — ./check passes', async () => {
-    const script = await writeBackendPytestCheck('pytest', 'smoke-exit2');
-    const r = await runCheck(script, 'bare', { pytestExit: 2 });
-    expect(r.log).toContain('pytest-ran');
-    expect(r.status).toBe(0);
-    expect(r.stdout).toContain('PASS — all checks green');
-    expect(r.stdout).toContain('exit 2');
-  });
-
-  it('runtime: bare pytest exit 1 (real test failure) still blocks — ./check fails', async () => {
-    const script = await writeBackendPytestCheck('pytest', 'smoke-exit1');
-    const r = await runCheck(script, 'bare', { pytestExit: 1 });
-    expect(r.log).toContain('pytest-ran');
-    // A real test failure must block ./check (and therefore ./pr open).
-    expect(r.status).not.toBe(0);
-    expect(r.stdout).toContain('FAIL');
-  });
 });
+
 
 describe('writeCheckHelper — required backend-authoring verification', () => {
   let capturedScripts: Record<string, string> = {};

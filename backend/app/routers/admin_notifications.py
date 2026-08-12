@@ -721,6 +721,7 @@ async def list_messages(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     q: str | None = Query(None),
+    include_guaranteed: bool = Query(True, include_in_schema=False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -796,7 +797,7 @@ async def list_messages(
     # Covers: user-authored, BLOCKER/FEEDBACK/BUG_REPORT, and system NOTE messages whose
     # event_type is classified as high_signal in the event-type snapshot.
     guaranteed_msgs: list = []
-    if status in (None, "open", "all"):
+    if include_guaranteed and status in (None, "open", "all"):
         pid_uuid = uuid.UUID(project_id) if project_id else None
         # Cap at 100 to prevent unbounded result sets when high-signal volume is abnormally
         # high. Clients should treat the returned list as "up to 100 most recent" rather
@@ -828,7 +829,7 @@ async def list_messages(
     result = await session.execute(
         select(ProjectMessage)
         .where(*filters)
-        .order_by(ProjectMessage.created_at.desc())
+        .order_by(ProjectMessage.created_at.desc(), ProjectMessage.id.desc())
         .offset(offset)
         .limit(limit)
         .options(_LIST_LOAD_ONLY)

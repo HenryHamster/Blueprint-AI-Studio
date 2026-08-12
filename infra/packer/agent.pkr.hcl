@@ -78,9 +78,10 @@ source "googlecompute" "agent_image" {
   # a baked image back to its commit via the GCP image API with no VM cooperation
   # (compute.get_image_source_git_sha). GCP label values must match
   # [a-z0-9_-]{0,63}; a 40-char lowercase hex SHA fits. Fall back to `unknown`
-  # when the variable is empty so the bake never fails on a missing label value.
+  # when the variable is missing or abbreviated so short identities never enter
+  # the serving comparison path.
   image_labels = {
-    "source-git-sha" = var.source_git_sha != "" ? var.source_git_sha : "unknown"
+    "source-git-sha" = can(regex("^[0-9a-f]{40}$", var.source_git_sha)) ? var.source_git_sha : "unknown"
   }
 }
 
@@ -162,6 +163,16 @@ build {
     destination = "/tmp/project-verification-probe.sh"
   }
 
+  provisioner "file" {
+    source      = "../../scripts/verification-toolchain.json"
+    destination = "/tmp/verification-toolchain.json"
+  }
+
+  provisioner "file" {
+    source      = "../../scripts/provision-verification-toolchain.sh"
+    destination = "/tmp/provision-verification-toolchain.sh"
+  }
+
   # Upload the backend deps build context (Dockerfile + requirements.txt) so the
   # next shell provisioner can bake the expensive `deps` stage into the VM's
   # local docker store. The `deps` stage only COPYs requirements.txt, so these
@@ -239,6 +250,9 @@ build {
     inline = [
       "sudo useradd -m -s /bin/bash agent",
       "sudo usermod -aG docker agent",
+      "sudo chown -R packer:packer /opt/blueprint-backend-venv",
+      "sudo -u packer bash /tmp/provision-verification-toolchain.sh /tmp/verification-toolchain.json /opt/blueprint-backend-venv",
+      "sudo chown -R root:root /opt/blueprint-backend-venv",
       "# Passwordless sudo for the agent user. Justification: agent VMs are",
       "# ephemeral (one task per VM, destroyed at end), single-tenant, and",
       "# isolated by GCP service account scope. The real authority that",
@@ -268,7 +282,7 @@ build {
       "# Bake the source git commit as an on-disk marker the agent reads at boot",
       "# and reports in its heartbeat (signal b, complementing the image label).",
       "# Tolerate an empty/unknown value so a local/dev bake never fails here.",
-      "SOURCE_SHA='${var.source_git_sha}'; [ -n \"$SOURCE_SHA\" ] || SOURCE_SHA=unknown; echo \"AGENT_SOURCE_SHA=$SOURCE_SHA\" | sudo tee /opt/agent/AGENT_SOURCE_SHA && echo PACKER_SOURCE_SHA_OK",
+      "SOURCE_SHA='${var.source_git_sha}'; if ! printf '%s' \"$SOURCE_SHA\" | grep -Eq '^[0-9a-f]{40}$'; then SOURCE_SHA=unknown; fi; echo \"AGENT_SOURCE_SHA=$SOURCE_SHA\" | sudo tee /opt/agent/AGENT_SOURCE_SHA && echo PACKER_SOURCE_SHA_OK",
       "sudo chown -R agent:agent /opt/agent",
       "sudo install -D -o root -g root -m 0755 /tmp/project-verification-probe.sh /opt/agent/bin/project-verification-probe.sh",
       "sudo touch /etc/agent.env",

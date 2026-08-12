@@ -11,6 +11,8 @@ import ast
 import io
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import symtable
 import sys
@@ -29,6 +31,170 @@ if str(BACKEND_ROOT) not in sys.path:
 # backend test conftest.
 os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check-x")
 os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
+
+
+def _script_test_harness() -> Path:
+    """Resolve the roster owner in both the CI mount and local checkout."""
+    candidates = (
+        Path("/repo/scripts/test-backend.sh"),
+        BACKEND_ROOT.parent / "scripts" / "test-backend.sh",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    pytest.fail("scripts/test-backend.sh is unavailable; roster cannot be checked")
+
+
+def _parse_test_module_roots(harness: Path) -> tuple[Path, ...]:
+    """Resolve the test-module roots declared by the backend harness."""
+    source = harness.read_text(encoding="utf-8")
+    match = re.search(
+        r"^CI_TEST_MODULE_ROOTS=\((?P<body>.*?)(?:\n\)|\))",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"{harness} must define CI_TEST_MODULE_ROOTS"
+    roots = []
+    for raw_line in match.group("body").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        values = shlex.split(line, comments=True)
+        assert len(values) == 1, f"test module root must be one shell word: {line!r}"
+        roots.append(harness.parent.parent / values[0])
+    assert roots, f"{harness} must declare at least one test module root"
+    assert all(root.is_dir() for root in roots), (
+        f"{harness} declares missing test module root(s): "
+        + ", ".join(str(root) for root in roots if not root.is_dir())
+    )
+    return tuple(roots)
+
+
+def _test_module_has_executing_tests(path: Path) -> bool:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test_"):
+                return True
+        elif isinstance(node, ast.ClassDef) and any(
+            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name.startswith("test_")
+            for member in node.body
+        ):
+            return True
+    return False
+
+
+def _test_module_has_intentional_zero_test_marker(path: Path) -> bool:
+    source = path.read_text(encoding="utf-8")
+    return bool(
+        re.search(
+            r"^#\s*blueprint-test-module:\s*intentional-zero-tests\s+--\s+\S.+$",
+            source,
+            re.MULTILINE,
+        )
+    )
+
+
+def _parse_script_test_roster(
+    harness: Path,
+) -> tuple[set[str], dict[str, str]]:
+    """Parse the shell discovery policy and its documented exemptions."""
+    source = harness.read_text(encoding="utf-8")
+
+    glob_match = re.search(
+        r'^CI_SCRIPT_TEST_DISCOVERY_GLOB="(?P<glob>[^"\n]+)"$',
+        source,
+        re.MULTILINE,
+    )
+    assert glob_match is not None, (
+        f"{harness} must define CI_SCRIPT_TEST_DISCOVERY_GLOB"
+    )
+    discovery_glob = glob_match.group("glob")
+
+    match = re.search(
+        r"^CI_SCRIPT_TEST_EXEMPTIONS=\((?P<body>.*?)(?:\n\)|\))",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"{harness} must define CI_SCRIPT_TEST_EXEMPTIONS"
+
+    def _entries(body: str) -> list[str]:
+        entries: list[str] = []
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            values = shlex.split(line, comments=True)
+            assert len(values) == 1, f"roster entry must be one shell word: {line!r}"
+            entries.append(values[0])
+        return entries
+
+    exemptions: dict[str, str] = {}
+    for entry in _entries(match.group("body")):
+        path, separator, reason = entry.partition("|")
+        assert separator and reason.strip(), (
+            f"CI script exemption {entry!r} must include an individual reason"
+        )
+        assert path not in exemptions, f"duplicate CI script exemption: {path}"
+        exemptions[path] = reason.strip()
+    return {discovery_glob}, exemptions
+
+
+def _script_test_roster_residue(
+    scripts_root: Path, roster: set[str], exemptions: dict[str, str]
+) -> list[str]:
+    on_disk = {
+        path.name
+        for path in scripts_root.glob("test_*.py")
+        if path.is_file()
+    }
+    return sorted(on_disk - roster - set(exemptions))
+
+
+def _script_test_has_discoverable_tests(source: str, *, filename: str) -> bool:
+    """Return whether pytest or unittest can discover a test in ``source``."""
+    try:
+        tree = ast.parse(source, filename=filename)
+    except (SyntaxError, UnicodeError):
+        return False
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test_"):
+                return True
+            continue
+        if not isinstance(node, ast.ClassDef):
+            continue
+
+        is_pytest_class = node.name.startswith("Test")
+        is_unittest_class = any(
+            (isinstance(base, ast.Name) and base.id == "TestCase")
+            or (isinstance(base, ast.Attribute) and base.attr == "TestCase")
+            for base in node.bases
+        )
+        if (is_pytest_class or is_unittest_class) and any(
+            isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and method.name.startswith("test_")
+            for method in node.body
+        ):
+            return True
+    return False
+
+
+def _script_test_execution_residue(
+    scripts_root: Path, filenames: set[str]
+) -> list[str]:
+    """Return classified script tests that cannot execute any test."""
+    residue: list[str] = []
+    for filename in sorted(filenames):
+        path = scripts_root / filename
+        if not path.is_file() or not _script_test_has_discoverable_tests(
+            path.read_text(encoding="utf-8"), filename=str(path)
+        ):
+            residue.append(filename)
+    return residue
+
 
 def _assert_backmerge_modules_do_not_import_rollup_management(
     source: str, *, filename: str
@@ -4766,7 +4932,8 @@ class TestOperatorMessageArmingGateCoverage:
                 if not fname.endswith(".py"):
                     continue
                 fpath = os.path.join(root, fname)
-                rel = os.path.relpath(fpath, app_dir)
+                # Keep exemption keys stable across POSIX and Windows runners.
+                rel = os.path.relpath(fpath, app_dir).replace(os.sep, "/")
                 with open(fpath, encoding="utf-8") as f:
                     source = f.read()
 
@@ -5601,10 +5768,23 @@ def _size_breach_message(
         f"     change_summary describing what your diff added to this file.\n"
         f"  2. Apply the new_limit returned in the response to\n"
         f"     backend/testing/module_size_limits.json under '{module_kind}'.\n"
-        f"  3. Commit both the source change and the JSON edit.\n\n"
+        f"  3. If the response includes governing_cap_repair, also update its\n"
+        f"     source_path's constant_name to new_limit in the same task.\n"
+        f"  4. Commit both the source change and every required cap edit.\n\n"
         f"If your diff is bundling unrelated code, shrink it to only what the\n"
         f"task asked for. Do NOT refactor or extract code in this PR — that's\n"
         f"a strategic decision, not a create/fix one."
+    )
+
+
+def _stale_size_cap_message(rel_path: str, module_kind: str) -> str:
+    """Tell maintainers how to repair a cap whose source file was deleted."""
+    return (
+        f"Stale {module_kind} size-cap record for missing file {rel_path!r}.\n\n"
+        "Remove this stale cap and its cap-bump-history evidence with:\n"
+        "  python3 backend/testing/check_size_limits.py --fix\n\n"
+        "Commit the repaired module_size_limits.json and cap_bump_history.json; "
+        "do not leave a missing-file exception to obscure this remediation."
     )
 
 class TestBackendModuleSizeGuardrails:
@@ -5618,6 +5798,7 @@ class TestBackendModuleSizeGuardrails:
     def _check_module(self, relative_path: str) -> None:
         max_lines = MODULE_SIZE_LIMITS[relative_path]
         path = os.path.join(os.path.dirname(__file__), "..", "app", relative_path)
+        assert os.path.isfile(path), _stale_size_cap_message(relative_path, "backend")
         with open(path, encoding="utf-8") as f:
             count = len(f.readlines())
         assert count <= max_lines, _size_breach_message(
@@ -5706,6 +5887,7 @@ class TestAgentModuleSizeGuardrails:
         self._require_agent_src()
         max_lines = AGENT_SIZE_LIMITS[relative_path]
         path = os.path.join(_AGENT_SRC_ROOT, relative_path)
+        assert os.path.isfile(path), _stale_size_cap_message(relative_path, "agent")
         with open(path) as f:
             count = len(f.readlines())
         assert count <= max_lines, _size_breach_message(
@@ -5800,6 +5982,7 @@ class TestFrontendSizeGuardrails:
         self._require_admin_ui_src()
         max_lines = FRONTEND_SIZE_LIMITS[relative_path]
         path = _get_frontend_path(relative_path)
+        assert os.path.isfile(path), _stale_size_cap_message(relative_path, "frontend")
         with open(path) as f:
             count = len(f.readlines())
         assert count <= max_lines, _size_breach_message(
@@ -5838,6 +6021,7 @@ class TestTestFileSizeGuardrails:
     def _check_test_file(self, relative_path: str) -> None:
         max_lines = TESTING_SIZE_LIMITS[relative_path]
         path = os.path.join(os.path.dirname(__file__), relative_path)
+        assert os.path.isfile(path), _stale_size_cap_message(relative_path, "testing")
         with open(path, encoding="utf-8") as f:
             count = len(f.readlines())
         assert count <= max_lines, _size_breach_message(
@@ -10838,6 +11022,9 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         # Approved-PR stranding compares the reviewed commit against the live
         # integration tip; a cached tip could misclassify a just-landed PR.
         "approved_pr_stranding.py:_inspect_approved_pr_with_github",
+        # Checkpoint recovery compares the checkpoint commit against the live
+        # integration tip before deciding whether to requeue or alert its owner.
+        "approved_pr_stranding.py:_github_checkpoint_evidence",
 
         "release_reconciliation.py:_reconcile_if_promotion_failed_landed",
         "release_reconciliation.py:_reconcile_if_not_promoted_but_pr_merged",
@@ -12941,19 +13128,19 @@ class TestProblemModelWritePathInvariants:
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
-        ("routers/admin_agent_ops.py", 1993): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2419): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2866): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2979): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 3234): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2018): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2444): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2891): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 3004): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 3259): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4860): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4910): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4888): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4938): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5419): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5469): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5501): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5551): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):
@@ -13274,3 +13461,427 @@ def test_no_duplicate_test_ids_across_backend_modules() -> None:
         + "\n\nRemove the duplicate from the base or the companion — both files "
         "must not define the same test function or class name."
     )
+
+
+# ---------------------------------------------------------------------------
+# Freshness-graded fixture guard
+# ---------------------------------------------------------------------------
+
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+)
+
+_FRESHNESS_GRADED_FILES = [
+    "testing/test_blocked_need_resolution.py",
+]
+
+
+def _is_iso_datetime_literal(value: str) -> bool:
+    """Return True when ``value`` looks like an absolute ISO datetime literal."""
+    return bool(_ISO_DATETIME_RE.match(value))
+
+
+def _collect_proved_at_literal_violations(source: str, filename: str) -> list[str]:
+    """Scan ``source`` for ``proved_at`` dict keys whose values are absolute ISO
+    datetime string literals.
+
+    Returns a list of human-readable violation strings (``filename:line: ...``).
+
+    **Allowed cases (not flagged):**
+    - ``"proved_at": _utcnow().isoformat()`` — a call expression, not a constant.
+    - ``"proved_at": some_variable`` — a name reference (e.g. a pre-computed stale
+      timestamp variable in an expiry-testing helper).
+    - ``"proved_at": ""`` — an empty string is not a valid timestamp.
+
+    **Forbidden:**
+    - ``"proved_at": "2026-07-16T00:00:00Z"`` — a direct ISO datetime constant
+      that will silently age past :data:`PROOF_FRESHNESS_TTL` and detonate at a
+      future promotion, attributable to no diff. This applies even in a test whose
+      name indicates a freshness or expiry case: derive stale timestamps relative to
+      the runtime clock and store them in a variable instead.
+    """
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return []
+
+    violations: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, val in zip(node.keys, node.values):
+            if key is None:
+                continue
+            key_str: str | None = None
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                key_str = key.value
+            if key_str != "proved_at":
+                continue
+            if not isinstance(val, ast.Constant):
+                continue
+            if not isinstance(val.value, str):
+                continue
+            raw = val.value
+            if not _is_iso_datetime_literal(raw):
+                continue
+            line = getattr(val, "lineno", getattr(node, "lineno", "?"))
+            violations.append(
+                f"  {filename}:{line}: "
+                f'"proved_at": "{raw}" — use _utcnow().isoformat() so the fixture '
+                f"stays inside PROOF_FRESHNESS_TTL on every promotion date"
+            )
+
+    return violations
+
+
+def test_no_absolute_datetime_literals_in_freshness_graded_fixtures():
+    """Static tripwire: freshness-graded proof fixtures must not embed absolute
+    ISO datetime literals as ``proved_at`` values.
+
+    A ``proved_at`` field seeded with a hardcoded date (e.g.
+    ``"2026-07-16T00:00:00Z"``) silently ages past
+    :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL` (30 days) and detonates
+    at an arbitrary later promotion — attributable to no diff and with no clear
+    failure message. Deriving the timestamp from the same runtime clock used by
+    the grading seam (``_utcnow().isoformat()``) keeps the fixture semantically
+    fresh on every date the suite runs.
+
+    **What is checked:** the small set of files that seed ``proved_at`` fields
+    consumed by the TTL-graded freshness path
+    (:data:`_FRESHNESS_GRADED_FILES`). Only direct ISO datetime string constants
+    (e.g. ``"2026-07-16T00:00:00Z"``) are flagged; call expressions such as
+    ``_utcnow().isoformat()``, variable references to pre-computed stale
+    timestamps, and other non-literal values are allowed regardless of their
+    enclosing function names.
+
+    **Synthetic self-test:** this test includes an in-process check that the
+    detector itself correctly distinguishes a forbidden literal from an allowed
+    runtime-derived fixture, so a broken detector cannot silently pass.
+    """
+    import textwrap
+
+    forbidden_snippet = textwrap.dedent('''
+        def _some_helper():
+            records = {
+                "task_id": "proof:foo",
+                "proof_kind": "named_test",
+                "proved_at": "2026-07-16T00:00:00Z",
+                "commit_sha": "a" * 40,
+            }
+    ''')
+    allowed_snippet = textwrap.dedent('''
+        def _some_helper():
+            from app.time_utils import _utcnow
+            records = {
+                "task_id": "proof:foo",
+                "proof_kind": "named_test",
+                "proved_at": _utcnow().isoformat(),
+                "commit_sha": "a" * 40,
+            }
+    ''')
+    freshness_name_snippet = textwrap.dedent('''
+        def test_freshness_proof_is_current():
+            records = {
+                "task_id": "proof:foo",
+                "proof_kind": "named_test",
+                "proved_at": "2026-07-16T00:00:00Z",
+                "commit_sha": "a" * 40,
+            }
+    ''')
+    stale_relative_snippet = textwrap.dedent('''
+        def test_stale_proof_expires():
+            stale_proved_at = make_stale_timestamp()
+            records = {
+                "task_id": "proof:foo",
+                "proof_kind": "named_test",
+                "proved_at": stale_proved_at,
+                "commit_sha": "a" * 40,
+            }
+    ''')
+
+    assert _collect_proved_at_literal_violations(forbidden_snippet, "<synthetic>"), (
+        "Detector self-test FAILED: a direct ISO datetime literal in 'proved_at' "
+        "was NOT flagged — the tripwire would be silent and never catch real regressions"
+    )
+    assert not _collect_proved_at_literal_violations(allowed_snippet, "<synthetic>"), (
+        "Detector self-test FAILED: _utcnow().isoformat() was incorrectly flagged — "
+        "the tripwire must allow runtime-derived timestamps"
+    )
+    assert _collect_proved_at_literal_violations(freshness_name_snippet, "<synthetic>"), (
+        "Detector self-test FAILED: a direct ISO datetime literal in a freshness-named "
+        "test was exempted — function names must not bypass the tripwire"
+    )
+    assert not _collect_proved_at_literal_violations(stale_relative_snippet, "<synthetic>"), (
+        "Detector self-test FAILED: a runtime-relative stale timestamp variable was "
+        "incorrectly flagged"
+    )
+
+    all_violations: list[str] = []
+    for rel_path in _FRESHNESS_GRADED_FILES:
+        target = BACKEND_ROOT / rel_path
+        if not target.exists():
+            continue
+        source = target.read_text(encoding="utf-8")
+        all_violations.extend(_collect_proved_at_literal_violations(source, rel_path))
+
+    assert not all_violations, (
+        f"Found {len(all_violations)} absolute ISO datetime literal(s) seeded into "
+        f"freshness-graded 'proved_at' fixture field(s).\n\n"
+        "These will silently age past PROOF_FRESHNESS_TTL (30 days) and fail at a "
+        "future promotion attributable to no diff.\n\n"
+        "Replace each with _utcnow().isoformat() so the fixture stays inside the "
+        "freshness window on every promotion date:\n\n"
+        + "\n".join(all_violations)
+    )
+
+
+def test_script_roster_tripwire_detects_an_unclassified_file(tmp_path: Path):
+    """A newly created scripts test must fail closed until classified."""
+    scripts_root = tmp_path / "scripts"
+    scripts_root.mkdir()
+    (scripts_root / "test_existing.py").write_text(
+        "def test_existing():\n    pass\n", encoding="utf-8"
+    )
+    (scripts_root / "test_dark.py").write_text("", encoding="utf-8")
+
+    assert _script_test_roster_residue(
+        scripts_root, {"test_existing.py"}, {}
+    ) == ["test_dark.py"]
+    assert not _script_test_roster_residue(
+        scripts_root,
+        {"test_existing.py"},
+        {"test_dark.py": "requires a separately provisioned host"},
+    )
+    assert _script_test_execution_residue(
+        scripts_root, {"test_existing.py", "test_dark.py"}
+    ) == ["test_dark.py"]
+
+
+def test_script_roster_tripwire_accepts_pytest_async_and_unittest_tests(
+    tmp_path: Path,
+):
+    """The execution check recognizes each supported Python test shape."""
+    scripts_root = tmp_path / "scripts"
+    scripts_root.mkdir()
+    (scripts_root / "test_pytest.py").write_text(
+        "def test_sync():\n    pass\n", encoding="utf-8"
+    )
+    (scripts_root / "test_async.py").write_text(
+        "async def test_async():\n    pass\n", encoding="utf-8"
+    )
+    (scripts_root / "test_unittest.py").write_text(
+        "import unittest\n\n"
+        "class LegacyCase(unittest.TestCase):\n"
+        "    def test_case(self):\n"
+        "        pass\n",
+        encoding="utf-8",
+    )
+
+    assert _script_test_execution_residue(
+        scripts_root,
+        {"test_pytest.py", "test_async.py", "test_unittest.py"},
+    ) == []
+
+
+def test_script_roster_tripwire_rejects_non_test_and_malformed_modules(
+    tmp_path: Path,
+):
+    """Syntax errors and ordinary helpers cannot satisfy the execution gate."""
+    scripts_root = tmp_path / "scripts"
+    scripts_root.mkdir()
+    (scripts_root / "test_helper.py").write_text(
+        "def helper():\n    pass\n", encoding="utf-8"
+    )
+    (scripts_root / "test_broken.py").write_text(
+        "def test_broken(:\n    pass\n", encoding="utf-8"
+    )
+
+    assert _script_test_execution_residue(
+        scripts_root, {"test_helper.py", "test_broken.py"}
+    ) == ["test_broken.py", "test_helper.py"]
+
+
+def test_every_script_test_is_discovered_or_has_a_written_exemption():
+    """Runtime discovery cannot silently drift from scripts/test_*.py on disk."""
+    harness = _script_test_harness()
+    discovery_globs, exemptions = _parse_script_test_roster(harness)
+    scripts_root = harness.parent
+    on_disk = {
+        path.name
+        for path in scripts_root.glob("test_*.py")
+        if path.is_file()
+    }
+
+    assert discovery_globs == {"test_*.py"}, (
+        "CI script discovery must cover the complete scripts/test_*.py corpus: "
+        + ", ".join(sorted(discovery_globs))
+    )
+    assert set(exemptions) <= on_disk, (
+        "CI script exemptions name missing files: "
+        + ", ".join(sorted(set(exemptions) - on_disk))
+    )
+
+
+def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path):
+    """Docker-less standalone execution must not silently drop discovered entries."""
+    harness = _script_test_harness()
+    _discovery_globs, exemptions = _parse_script_test_roster(harness)
+    scripts_root = harness.parent
+    on_disk = {
+        path.name
+        for path in scripts_root.glob("test_*.py")
+        if path.is_file()
+    }
+
+    # CI mounts both /app and /repo read-only.  Run the harness from a
+    # read-only checkout so its setup cannot fail before the roster is
+    # exercised.  Copy only the harness boundary; fake executables keep this
+    # invariant focused on the harness argv.
+    run_root = tmp_path / "checkout"
+    run_scripts = run_root / "scripts"
+    run_backend = run_root / "backend"
+    run_scripts.mkdir(parents=True)
+    run_backend.mkdir()
+    shutil.copy2(harness, run_scripts / harness.name)
+    shutil.copy2(
+        harness.parent / "backend-test-route.sh", run_scripts / "backend-test-route.sh"
+    )
+    bootstrap_test = harness.parent / "test_bootstrap_local_app_release.py"
+    if bootstrap_test.is_file():
+        shutil.copy2(bootstrap_test, run_scripts / bootstrap_test.name)
+    root_claude = harness.parent.parent / "CLAUDE.md"
+    if root_claude.is_file():
+        shutil.copy2(root_claude, run_root / "CLAUDE.md")
+    # The real checkout contains the discovered files.  Empty stand-ins are
+    # enough here because fake_python records argv rather than collecting them.
+    for filename in sorted(on_disk):
+        (run_scripts / filename).write_text("", encoding="utf-8")
+    run_harness = run_scripts / harness.name
+
+    for path in sorted(
+        run_root.rglob("*"), key=lambda item: len(item.parts), reverse=True
+    ):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log_path = tmp_path / "python-argv.log"
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ROSTER_PROBE_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_docker.chmod(0o755)
+
+    env = os.environ.copy()
+    env.pop("CI", None)
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "ROSTER_PROBE_LOG": str(log_path),
+            "TESTMON_NO_FETCH": "1",
+            "ALLOW_LOW_MEM": "1",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(run_harness), "--standalone", "--no-postgres"],
+        cwd=run_backend,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert not (run_backend / "CLAUDE.md").exists(), (
+        "read-only harness execution must not stage CLAUDE.md into backend/"
+    )
+
+    pytest_commands = [
+        line for line in log_path.read_text(encoding="utf-8").splitlines()
+        if "-m pytest" in line
+    ]
+    assert pytest_commands, "standalone harness did not invoke pytest"
+    invoked = "\n".join(pytest_commands)
+    expected = on_disk - set(exemptions)
+    missing = sorted(
+        name for name in expected if f"../scripts/{name}" not in invoked
+    )
+    assert not missing, (
+        "Docker-less standalone execution omitted non-exempt discovered entries: "
+        + ", ".join(missing)
+    )
+    execution_residue = _script_test_execution_residue(scripts_root, on_disk)
+    assert not execution_residue, (
+        "classified scripts/test_*.py files contain no discoverable pytest or "
+        "unittest tests: "
+        + ", ".join(execution_residue)
+    )
+
+
+def test_every_test_module_has_executing_tests_or_an_explicit_zero_test_marker():
+    """A collected test module cannot silently become a docstring-only stub."""
+    harness = _script_test_harness()
+    roots = _parse_test_module_roots(harness)
+    declared_roots = {
+        root.relative_to(harness.parent.parent).as_posix() for root in roots
+    }
+    assert {"scripts", "backend/testing"} <= declared_roots, (
+        "CI_TEST_MODULE_ROOTS must cover both scripts/ and backend/testing/: "
+        + ", ".join(sorted(declared_roots))
+    )
+    dark_modules = [
+        path.relative_to(harness.parent.parent).as_posix()
+        for root in roots
+        for path in sorted(root.glob("test_*.py"))
+        if path.is_file()
+        and not _test_module_has_executing_tests(path)
+        and not _test_module_has_intentional_zero_test_marker(path)
+    ]
+    assert not dark_modules, (
+        "test modules with zero executing tests must be removed or carry a "
+        "reviewable '# blueprint-test-module: intentional-zero-tests -- reason' "
+        "marker: "
+        + ", ".join(dark_modules)
+    )
+
+
+def test_dark_test_detector_requires_a_marker_for_intentional_zero_tests(
+    tmp_path: Path,
+):
+    """The detector distinguishes real tests from explicit helper/retirement markers."""
+    dark = tmp_path / "test_dark.py"
+    dark.write_text('"""retired"""\n', encoding="utf-8")
+    nested = tmp_path / "test_nested.py"
+    nested.write_text(
+        "def helper():\n    def test_nested():\n        pass\n",
+        encoding="utf-8",
+    )
+    marked = tmp_path / "test_helper.py"
+    marked.write_text(
+        "# blueprint-test-module: intentional-zero-tests -- imported helpers\n",
+        encoding="utf-8",
+    )
+    real = tmp_path / "test_real.py"
+    real.write_text("def test_real():\n    pass\n", encoding="utf-8")
+
+    assert not _test_module_has_executing_tests(dark)
+    assert not _test_module_has_intentional_zero_test_marker(dark)
+    assert not _test_module_has_executing_tests(nested)
+    assert _test_module_has_intentional_zero_test_marker(marked)
+    assert _test_module_has_executing_tests(real)
+
+
+def test_script_roster_selection_uses_capability_not_ci_marker():
+    """Discovery must use filesystem capability, never CI labeling."""
+    source = _script_test_harness().read_text(encoding="utf-8")
+    assert 'for script_path in "$SCRIPT_TEST_ROOT"/$CI_SCRIPT_TEST_DISCOVERY_GLOB; do' in source
+    assert (
+        'if [ "$script_test_exempt" = "1" ] && [ "$USE_DOCKER" != "1" ]; then'
+    ) in source
+    assert '"${CI:-}" = "true"' not in source
+    assert '"${CI:-}" = "1"' not in source

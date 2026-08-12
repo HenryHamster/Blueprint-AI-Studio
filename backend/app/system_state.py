@@ -50,6 +50,7 @@ class ServingSnapshot:
     sha: str | None
     confirmed_at: datetime | None
     failure_reason: str | None
+    fleet_freshness: dict[str, Any] | None = None
     artifacts: list[ArtifactServingSnapshot] = field(default_factory=list)
 
 
@@ -212,6 +213,7 @@ async def compute_system_state(
                     if aggregate_serving_status == "deploy_failed"
                     else None
                 ),
+                fleet_freshness=agg_dict.get("fleet_freshness"),
                 artifacts=artifact_snaps,
             )
 

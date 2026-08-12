@@ -8,13 +8,14 @@ existing callers keep working unchanged.
 
 from __future__ import annotations
 
+
 import asyncio
 import json
 import logging
 import uuid
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -38,6 +39,10 @@ from app.models import (
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.qualification_dimensions import LEDGER_DIMENSION_KEYS
 from app.release_promotion import _lts_branch_names, _record_qualification_verdict
+from app.release_commit_authorship import (
+    normalized_authorship_prompt_evidence,
+    serving_authorship_range,
+)
 from app.runner_eligibility import (
     RunnerDispatchSnapshot,
     _runner_accepting_new_work,
@@ -64,6 +69,7 @@ from app.release_scoring import (
 # Preserve the historical logger name so existing caplog filters and log
 # processing continue to see these events under release_qualifier.
 logger = logging.getLogger("backend.app.release_qualifier")
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2339
 
 # Minimum consecutive qualifier infrastructure errors (FAILED/CANCELLED
 # required child tasks) before raising a dedicated infra-failure alert.
@@ -79,6 +85,7 @@ _INFRA_WEBHOOK_TASKS: set[asyncio.Task[Any]] = set()
 
 _STRANDED_APPROVED_PR_SCAN_LIMIT = 101
 _STRANDED_APPROVED_PR_PREVIEW_LIMIT = 20
+_STRANDING_OBSERVATION_KEY = "approved_pr_stranding"
 
 # Approvals on a cancelled task are deliberate abandonment, not stranding.
 _STRANDED_APPROVED_PR_EXCLUDED_STATUSES = (TaskStatus.CANCELLED,)
@@ -89,26 +96,52 @@ def _unavailable_stranded_approved_pr_snapshot(
 ) -> dict[str, Any]:
     return {
         "status": "unavailable", "count": None, "pr_numbers": [],
-        "details": [], "observed_at": observed_at, "reason": reason[:240],
+        "details": [],
+        "unlanded_approved_pr_count": None,
+        "reland_inflight_count": None,
+        "superseded_count": None,
+        "observed_at": observed_at,
+        "reason": reason[:240],
     }
 
 
-def _stranded_approved_pr_columns(session: AsyncSession) -> tuple[Any, Any]:
-    """Return the (approved-flag, review-target) SQL expressions for the scan.
+def _stranded_approved_pr_columns(
+    session: AsyncSession,
+) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any]:
+    """Return the narrow JSON fields needed to mirror CI-monitor eligibility.
 
-    Only the narrow ``review_loop.review_target`` sub-object is selected — a
-    Task's ``context`` JSONB is permitted up to 100KB, so hydrating whole rows
-    (or even the whole ``context`` column) is far too heavy for the badge-poll
-    and qualification-launch call sites.
+    A Task's ``context`` JSONB is permitted up to 100KB, so the badge-poll and
+    qualification-launch call sites select only the monitor's narrow JSON
+    fields rather than hydrating whole rows or the whole ``context`` column.
     """
     if resolve_dialect_name(session) == "sqlite":
         return (
             func.json_extract(Task.context, "$.review_loop.review_approved"),
             func.json_extract(Task.context, "$.review_loop.review_target"),
+            func.json_extract(Task.context, "$.approved_pr_reland"),
+            func.json_extract(Task.context, "$.review_loop.ci_waiting"),
+            func.json_extract(Task.context, "$.review_loop.conflict_fix_spawned"),
+            func.json_extract(Task.context, "$.review_loop.ci_fix_spawned"),
+            func.json_extract(Task.context, "$.review_loop.merge_rule_blocked"),
+            func.json_extract(Task.context, "$.review_loop.pr_number"),
+            func.json_extract(Task.context, "$.rollup_pr_number"),
+            func.json_extract(Task.context, f"$.{_STRANDING_OBSERVATION_KEY}.state"),
+            func.json_extract(
+                Task.context, f"$.{_STRANDING_OBSERVATION_KEY}.rollup_subsumed"
+            ),
         )
     return (
         Task.context["review_loop"]["review_approved"].as_boolean(),
         Task.context["review_loop"]["review_target"],
+        Task.context["approved_pr_reland"],
+        Task.context["review_loop"]["ci_waiting"].as_boolean(),
+        Task.context["review_loop"]["conflict_fix_spawned"],
+        Task.context["review_loop"]["ci_fix_spawned"],
+        Task.context["review_loop"]["merge_rule_blocked"].as_boolean(),
+        Task.context["review_loop"]["pr_number"].as_integer(),
+        Task.context["rollup_pr_number"].as_integer(),
+        Task.context[_STRANDING_OBSERVATION_KEY]["state"].as_string(),
+        Task.context[_STRANDING_OBSERVATION_KEY]["rollup_subsumed"].as_boolean(),
     )
 
 
@@ -120,6 +153,32 @@ def _coerce_review_target(raw: Any) -> dict[str, Any] | None:
         except (TypeError, ValueError):
             return None
     return raw if isinstance(raw, dict) else None
+
+
+def _ci_monitor_can_poll_reland(
+    *,
+    task_status: TaskStatus,
+    ci_waiting: Any,
+    requires_approval: bool,
+    conflict_fix_spawned: Any,
+    ci_fix_spawned: Any,
+    merge_rule_blocked: Any,
+    pr_number: Any,
+    rollup_pr_number: Any,
+) -> bool:
+    """Match the canonical monitor's early skip gates for a re-land receipt."""
+    return (
+        task_status == TaskStatus.EVALUATING
+        and bool(ci_waiting)
+        and not conflict_fix_spawned
+        and not ci_fix_spawned
+        and not merge_rule_blocked
+        and (
+            not requires_approval
+            or not _runtime_config.get("require_approval_gates", True)
+        )
+        and bool(pr_number or rollup_pr_number)
+    )
 
 
 async def snapshot_stranded_approved_prs(
@@ -143,15 +202,51 @@ async def snapshot_stranded_approved_prs(
     """
     observed = observed_at or _utcnow().isoformat()
     try:
-        approved, review_target = _stranded_approved_pr_columns(session)
+        (
+            approved,
+            review_target,
+            reland_receipt,
+            ci_waiting,
+            conflict_fix_spawned,
+            ci_fix_spawned,
+            merge_rule_blocked,
+            pr_number,
+            rollup_pr_number,
+            stranding_observation_state,
+            stranding_observation_rollup_subsumed,
+        ) = _stranded_approved_pr_columns(session)
         # ``landed_signal_predicate`` evaluates to NULL (not FALSE) on a row
         # missing the JSON keys entirely, and ``NOT NULL`` is NULL — which would
         # silently drop exactly the unlanded rows this snapshot exists to find.
-        not_landed = func.coalesce(landed_signal_predicate(session), False).is_(
-            False
-        )
+        direct_not_landed = func.coalesce(
+            landed_signal_predicate(session), False
+        ).is_(False)
+        # The reaper persists rollup ancestry evidence because a squash-merged
+        # child does not carry a direct integration-branch landing marker.  Use
+        # that durable observation before applying the bounded scan cap; the
+        # direct marker remains the fallback for rows with no reconciliation.
+        reconciled_landed = func.coalesce(
+            or_(
+                stranding_observation_state == "landed",
+                stranding_observation_rollup_subsumed.is_(True),
+            ),
+            False,
+        ).is_(False)
+        not_landed = and_(direct_not_landed, reconciled_landed)
         stmt = (
-            select(Task.id, review_target)
+            select(
+                Task.id,
+                Task.status,
+                Task.requires_approval,
+                review_target,
+                reland_receipt,
+                ci_waiting,
+                conflict_fix_spawned,
+                ci_fix_spawned,
+                merge_rule_blocked,
+                pr_number,
+                rollup_pr_number,
+            )
             .where(
                 Task.project_id == project_id,
                 Task.archived.is_(False),
@@ -182,9 +277,28 @@ async def snapshot_stranded_approved_prs(
     # oldest-first, so legacy rows are exactly the ones most likely to lack it.
     # One unparseable row must not void the whole project readout.
     by_pr_number: dict[int, dict[str, Any]] = {}
+    superseded_count = 0
+    reland_inflight_count = 0
     unparseable = 0
-    for task_id, raw_target in rows:
+    for (
+        task_id,
+        task_status,
+        requires_approval,
+        raw_target,
+        raw_receipt,
+        raw_ci_waiting,
+        raw_conflict_fix_spawned,
+        raw_ci_fix_spawned,
+        raw_merge_rule_blocked,
+        raw_pr_number,
+        raw_rollup_pr_number,
+    ) in rows:
         target = _coerce_review_target(raw_target)
+        receipt = _coerce_review_target(raw_receipt)
+        receipt_state = receipt.get("state") if receipt else None
+        if receipt_state == "superseded":
+            superseded_count += 1
+            continue
         pr_number = target.get("pr_number") if target else None
         if (
             isinstance(pr_number, bool)
@@ -193,22 +307,55 @@ async def snapshot_stranded_approved_prs(
         ):
             unparseable += 1
             continue
+        assert target is not None
+        is_live_reland = receipt_state == "in_flight" and _ci_monitor_can_poll_reland(
+            task_status=task_status,
+            ci_waiting=raw_ci_waiting,
+            requires_approval=bool(requires_approval),
+            conflict_fix_spawned=raw_conflict_fix_spawned,
+            ci_fix_spawned=raw_ci_fix_spawned,
+            merge_rule_blocked=raw_merge_rule_blocked,
+            pr_number=raw_pr_number,
+            rollup_pr_number=raw_rollup_pr_number,
+        )
+        # A receipt records that the one allowed handoff happened; it does not
+        # mean recovery is still live after the canonical monitor terminalizes
+        # the task.  Surface that stale in-flight marker as exhausted so the
+        # actionable count cannot hide a closed-but-unmerged re-drive forever.
+        effective_reland_state = (
+            "exhausted"
+            if receipt_state == "in_flight" and not is_live_reland
+            else receipt_state
+        )
+        detail = {
+            "pr_number": pr_number,
+            "task_id": str(task_id),
+            "head_sha": target.get("head_sha"),
+            "base_sha": target.get("base_sha"),
+            "reland_state": effective_reland_state,
+        }
+        if is_live_reland:
+            reland_inflight_count += 1
         by_pr_number.setdefault(
             pr_number,
-            {
-                "pr_number": pr_number,
-                "task_id": str(task_id),
-                "head_sha": target.get("head_sha"),
-                "base_sha": target.get("base_sha"),
-            },
+            detail,
         )
 
     details = [by_pr_number[number] for number in sorted(by_pr_number)]
+    unresolved_details = [
+        detail for detail in details if detail.get("reland_state") != "in_flight"
+    ]
     return {
         "status": "available",
-        "count": len(details),
-        "pr_numbers": [item["pr_number"] for item in details],
-        "details": details[:_STRANDED_APPROVED_PR_PREVIEW_LIMIT],
+        # ``count`` is the operator-actionable residual.  Recovery in flight
+        # remains visible separately and is still included in the unlanded
+        # total, but must not masquerade as a PR waiting for human requeue.
+        "count": len(unresolved_details),
+        "pr_numbers": [item["pr_number"] for item in unresolved_details],
+        "details": unresolved_details[:_STRANDED_APPROVED_PR_PREVIEW_LIMIT],
+        "unlanded_approved_pr_count": len(details),
+        "reland_inflight_count": reland_inflight_count,
+        "superseded_count": superseded_count,
         "unparseable_approvals": unparseable,
         "observed_at": observed,
     }
@@ -513,6 +660,37 @@ async def _spawn_release_audit_task(
         payload["version_goal"] = version_goal
     payload["categories"] = list(categories or [])
     payload["rubric_fingerprint"] = rubric_fingerprint
+    # Feed the normal audit/grader contract with the immutable latest-promoted
+    # receipt.  The qualifier still validates and persists the resulting
+    # category verdict through its ordinary ledger path; this is context, not a
+    # synthetic CriterionEvidence write.
+    latest_promoted = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "promoted",
+                )
+                .order_by(ReleaseVersion.version_number.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    promoted_qualification = (
+        latest_promoted.last_qualification if latest_promoted is not None else None
+    )
+    payload["release_evidence"] = normalized_authorship_prompt_evidence(
+        (
+            promoted_qualification.get("operator_authored_commits")
+            if isinstance(promoted_qualification, dict)
+            else None
+        ),
+        *serving_authorship_range(latest_promoted),
+        list(categories or []),
+    )
     if audit_base_sha:
         # A hint, not an assertion: the agent verifies ancestry/range
         # resolvability and falls back to base_branch...candidate_sha if stale.
@@ -1350,7 +1528,7 @@ async def record_direction_merge_grade(
                 project_id=project_id,
             )
             ledger_writes = True
-        except Exception:  # noqa: BLE001 — ledger write failure must not break grading
+        except Exception:  # ledger write failure must not break grading
             logger.warning(
                 "[RELEASE_QUALIFIER] failed to persist direction-scoped "
                 "merge-grade verdicts for direction %s — grading continues with "
@@ -1394,114 +1572,6 @@ async def _latest_artifact_logs(
         )
         return None
     return parsed if isinstance(parsed, dict) else None
-
-
-async def get_latest_release_audit_report(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    candidate_sha: str | None = None,
-) -> dict[str, Any] | None:
-    """Return the latest ``release_audit`` task's parsed report for a project.
-
-    When ``candidate_sha`` is provided, the lookup is scoped to audit tasks that
-    evaluated that exact candidate. If the open version has no candidate SHA or
-    no matching audit exists, return ``None`` rather than a mismatched report.
-    """
-    if not candidate_sha:
-        return None
-    audit_task = (
-        (
-            await session.execute(
-                select(Task)
-                .where(
-                    Task.project_id == project_id,
-                    Task.payloads[0]["type"].as_string() == "release_audit",
-                    Task.context["candidate_sha"].as_string() == candidate_sha,
-                )
-                .order_by(Task.created_at.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if audit_task is None:
-        return None
-    report = await _latest_artifact_logs(
-        session, audit_task.id, ArtifactType.RELEASE_AUDIT_REPORT
-    )
-    ctx = audit_task.context or {}
-    status_val = (
-        audit_task.status.value
-        if hasattr(audit_task.status, "value")
-        else str(audit_task.status)
-    )
-    return {
-        "audit_task_id": str(audit_task.id),
-        "task_status": status_val,
-        "candidate_sha": ctx.get("candidate_sha"),
-        "created_at": audit_task.created_at.isoformat()
-        if audit_task.created_at
-        else None,
-        "report": report,
-    }
-
-
-async def get_latest_release_audit_challenge(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    candidate_sha: str | None = None,
-) -> dict[str, Any] | None:
-    """Return the latest ``release_audit_challenge`` task's parsed verdict.
-
-    Mirrors :func:`get_latest_release_audit_report` but scoped to the advisory
-    challenge child and its ``RELEASE_AUDIT_CHALLENGE`` artifact.  When
-    ``candidate_sha`` is provided, the lookup is restricted to challenge tasks
-    that evaluated that exact candidate so a fresh version never inherits an
-    older candidate's challenge verdicts.  Returns ``None`` when no candidate is
-    supplied or no matching challenge exists (the consumer treats a missing
-    challenge as "no second opinion available", never as a confirmation).
-    """
-    if not candidate_sha:
-        return None
-    challenge_task = (
-        (
-            await session.execute(
-                select(Task)
-                .where(
-                    Task.project_id == project_id,
-                    Task.payloads[0]["type"].as_string() == "release_audit_challenge",
-                    Task.context["candidate_sha"].as_string() == candidate_sha,
-                )
-                .order_by(Task.created_at.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if challenge_task is None:
-        return None
-    verdict = await _latest_artifact_logs(
-        session, challenge_task.id, ArtifactType.RELEASE_AUDIT_CHALLENGE
-    )
-    ctx = challenge_task.context or {}
-    status_val = (
-        challenge_task.status.value
-        if hasattr(challenge_task.status, "value")
-        else str(challenge_task.status)
-    )
-    return {
-        "challenge_task_id": str(challenge_task.id),
-        "task_status": status_val,
-        "candidate_sha": ctx.get("candidate_sha"),
-        "created_at": challenge_task.created_at.isoformat()
-        if challenge_task.created_at
-        else None,
-        "verdict": verdict,
-    }
 
 
 async def _audit_report_for_task(
@@ -1564,11 +1634,10 @@ async def resolve_lifecycle_audit_evidence(
 ) -> dict[str, Any]:
     """Resolve audit evidence scoped to an open version's evaluated candidate.
 
-    Unlike :func:`get_latest_release_audit_report` (which returns the newest
-    ``release_audit`` anywhere in the project), this scopes evidence to the
-    given version via ``Task.context['release_version_id']`` and classifies it
-    against the version's evaluated candidate SHA so a fresh or newly-cut
-    version never inherits another version's findings.
+    This scopes evidence to the given version via
+    ``Task.context['release_version_id']`` and classifies it against the
+    version's evaluated candidate SHA so a fresh or newly-cut version never
+    inherits another version's findings.
 
     Returns a dict:
 
@@ -1698,6 +1767,9 @@ async def _handle_infra_failure(
     failing_dimension = _infer_dimension_from_infra_error(infra_error)
 
     record: dict[str, Any] = {
+        **_release_qualifier_module().qualification_attempt_policy_record_fields(
+            qual
+        ),
         "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "retry_episode": qual.get("retry_episode", 0),
         "retry_episode_cap": qual.get("retry_episode_cap"),
@@ -1782,7 +1854,7 @@ async def _handle_infra_failure(
             hotfix_preview = await _release_qualifier_module().check_hotfix_scope_preview(
                 session, version.project_id, candidate_sha=qual.get("candidate_sha")
             )
-        except Exception:  # noqa: BLE001 — remediation guidance is best-effort
+        except Exception:  # remediation guidance is best-effort
             logger.warning(
                 "[RELEASE_QUALIFIER] hotfix scope preview failed for v%d",
                 version.version_number,
@@ -2002,6 +2074,9 @@ async def _handle_independent_blocker(
     """
     finalized_at = _utcnow().isoformat()
     record: dict[str, Any] = {
+        **_release_qualifier_module().qualification_attempt_policy_record_fields(
+            qual
+        ),
         "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "retry_episode": qual.get("retry_episode", 0),
         "retry_episode_cap": qual.get("retry_episode_cap"),
@@ -2078,44 +2153,6 @@ async def _handle_independent_blocker(
         "status": "not_promoted",
         "blocker": "audit_challenge_independent_blocker",
         "audit_findings": independent_blocker_findings,
-    }
-
-
-async def get_infra_failure_stats(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    window: int = 50,
-) -> dict[str, Any]:
-    """Return infra-failure summary for a project over the most-recent versions."""
-    stmt = (
-        select(ReleaseVersion.last_qualification)
-        .where(
-            ReleaseVersion.project_id == project_id,
-            ReleaseVersion.last_qualification.is_not(None),
-        )
-        .order_by(ReleaseVersion.updated_at.desc())
-        .limit(window)
-    )
-    rows = list((await session.execute(stmt)).scalars().all())
-
-    infra_failure_count = sum(
-        1 for q in rows if isinstance(q, dict) and q.get("status") == "infra_failure"
-    )
-    consecutive_infra_errors = 0
-    for q in rows:
-        if not isinstance(q, dict):
-            continue
-        if q.get("status") == "pending":
-            consecutive_infra_errors = int(q.get("prior_infra_streak") or 0)
-            break
-        if q.get("status") == "infra_failure":
-            consecutive_infra_errors = int(q.get("consecutive_infra_errors") or 1)
-            break
-
-    return {
-        "infra_failure_count": infra_failure_count,
-        "consecutive_infra_errors": consecutive_infra_errors,
     }
 
 

@@ -1196,6 +1196,7 @@ def test_mark_blocker_escalated_sets_marker():
 
 
 def test_fresh_attempt_context_strip_preserves_retry_guidance_history():
+    from app.sidecar_authority import SIDECAR_FRESH_ATTEMPT_CONTEXT_KEYS
     from app.task_blocked import strip_fresh_attempt_context
 
     ctx = strip_fresh_attempt_context(
@@ -1213,8 +1214,22 @@ def test_fresh_attempt_context_strip_preserves_retry_guidance_history():
             "agent_error_report": {"exit_code": 1},
             "_requested_payload_model": "gpt-5.6-sol",
             "_resolved_payload_model": "claude-sonnet-4-6",
+            "research_output_contract_version": 2,
+            "research_findings_finalized": True,
+            "_research_spawn_pending": True,
             "_previous_failure_class": "SCOPE_OVERFLOW",
             "_failure_class_history": ["SCOPE_OVERFLOW"],
+            **{key: {"stale": True} for key in SIDECAR_FRESH_ATTEMPT_CONTEXT_KEYS},
+            # Source-link and sidecar-interpretation markers are not themselves
+            # attempt results. The task-aware reset helper below decides whether
+            # the overlapping challenged-hashes key is source state or immutable
+            # sidecar state.
+            "quality_grader_for_task_id": "source-task-id",
+            "finding_challenge_for_task_id": "source-task-id",
+            "adversarial_grader": True,
+            "challenged_boundary": "reproduce_absent",
+            "challenged_first_verdict": "absent",
+            "challenged_finding_hash": "finding-hash",
         }
     )
 
@@ -1231,8 +1246,129 @@ def test_fresh_attempt_context_strip_preserves_retry_guidance_history():
     assert "agent_error_report" not in ctx
     assert "_requested_payload_model" not in ctx
     assert "_resolved_payload_model" not in ctx
+    assert "research_output_contract_version" not in ctx
+    assert "research_findings_finalized" not in ctx
+    assert "_research_spawn_pending" not in ctx
+    assert SIDECAR_FRESH_ATTEMPT_CONTEXT_KEYS.isdisjoint(ctx)
     assert ctx["_previous_failure_class"] == "SCOPE_OVERFLOW"
     assert ctx["_failure_class_history"] == ["SCOPE_OVERFLOW"]
+    assert ctx["quality_grader_for_task_id"] == "source-task-id"
+    assert ctx["finding_challenge_for_task_id"] == "source-task-id"
+    assert ctx["adversarial_grader"] is True
+    assert ctx["challenged_boundary"] == "reproduce_absent"
+    assert ctx["challenged_first_verdict"] == "absent"
+    assert ctx["challenged_finding_hash"] == "finding-hash"
+
+
+def test_fresh_attempt_reset_strips_source_gate_state_but_preserves_sidecar_shape():
+    from app.task_blocked import reset_task_for_fresh_attempt
+
+    project_id = uuid.uuid4()
+    source_id = uuid.uuid4()
+    source = Task(
+        project_id=project_id,
+        payloads=[{"type": "research"}],
+        created_by="ORCHESTRATOR",
+        plan_output=[{"title": "stale attempt output"}],
+        context={
+            "quality_grader": {"passed": True},
+            "awaiting_quality_grader": str(uuid.uuid4()),
+            "_adversarial_challenged_hashes": ["stale-source-hash"],
+            "research_findings_finalized": True,
+            "_research_spawn_pending": True,
+            "prior_deferred_findings": [{"title": "durable retry input"}],
+            "deferred_findings": [{"title": "durable cycle handoff"}],
+        },
+        vm_instance_id="agent-vm-source-attempt",
+        status=TaskStatus.FAILED,
+    )
+    reset_task_for_fresh_attempt(source)
+
+    assert "quality_grader" not in (source.context or {})
+    assert "awaiting_quality_grader" not in (source.context or {})
+    assert "_adversarial_challenged_hashes" not in (source.context or {})
+    assert "research_findings_finalized" not in (source.context or {})
+    assert "_research_spawn_pending" not in (source.context or {})
+    assert source.plan_output is None
+    assert (source.context or {})["prior_deferred_findings"] == [
+        {"title": "durable retry input"}
+    ]
+    assert (source.context or {})["deferred_findings"] == [
+        {"title": "durable cycle handoff"}
+    ]
+
+    adversarial = Task(
+        project_id=project_id,
+        payloads=[{"type": "investigate"}],
+        created_by="ORCHESTRATOR",
+        parent_task_id=None,
+        context={
+            "quality_grader_for_task_id": str(source_id),
+            "graded_task_type": "research",
+            "adversarial_grader": True,
+            "_adversarial_challenged_hashes": ["immutable-sidecar-hash"],
+            "adversarial_gate": {"forged": "stale-result"},
+        },
+        vm_instance_id="agent-vm-sidecar-attempt",
+        status=TaskStatus.FAILED,
+    )
+    reset_task_for_fresh_attempt(adversarial)
+
+    sidecar_ctx = adversarial.context or {}
+    assert sidecar_ctx["quality_grader_for_task_id"] == str(source_id)
+    assert sidecar_ctx["graded_task_type"] == "research"
+    assert sidecar_ctx["adversarial_grader"] is True
+    assert sidecar_ctx["_adversarial_challenged_hashes"] == [
+        "immutable-sidecar-hash"
+    ]
+    assert "adversarial_gate" not in sidecar_ctx
+
+
+def test_fresh_attempt_reset_preserves_authenticated_challenge_markers_only():
+    from app.task_blocked import reset_task_for_fresh_attempt
+
+    project_id = uuid.uuid4()
+    source_id = uuid.uuid4()
+    immutable = {
+        "finding_challenge_for_task_id": str(source_id),
+        "challenged_boundary": "reproduce_absent",
+        "challenged_first_verdict": "absent",
+        "challenged_finding_hash": "immutable-finding-hash",
+    }
+    challenge = Task(
+        project_id=project_id,
+        payloads=[{"type": "investigate"}],
+        created_by="ORCHESTRATOR",
+        parent_task_id=None,
+        context={**immutable, "finding_challenge": {"agreement": "stale"}},
+        vm_instance_id="agent-vm-challenge-attempt",
+        status=TaskStatus.FAILED,
+    )
+    reset_task_for_fresh_attempt(challenge)
+
+    assert all(
+        (challenge.context or {}).get(key) == value
+        for key, value in immutable.items()
+    )
+    assert "finding_challenge" not in (challenge.context or {})
+
+    forged = Task(
+        project_id=project_id,
+        payloads=[{"type": "investigate"}],
+        created_by="AGENT",
+        parent_task_id=None,
+        context={
+            **immutable,
+            "_adversarial_challenged_hashes": ["forged"],
+        },
+        vm_instance_id="agent-vm-forged-sidecar",
+        status=TaskStatus.FAILED,
+    )
+    reset_task_for_fresh_attempt(forged)
+
+    # Non-overlapping markers are harmless without an authenticated source
+    # shape, but attempt-local challenged hashes must never survive by key alone.
+    assert "_adversarial_challenged_hashes" not in (forged.context or {})
 
 
 @pytest.mark.asyncio
@@ -3982,7 +4118,7 @@ async def test_process_post_commit_transient_handler_failure_requeues_after_roll
     }
     await session.commit()
 
-    async def _failing_handler(t, logs, sess):
+    async def _failing_handler(t, logs, sess, **_kwargs):
         # Mirror the real handler: stage partial uncommitted work (a child task,
         # like a spawned finding) and then hit a transient DB error (statement
         # timeout). The partial work must NOT survive recovery, and the requeue
@@ -4058,7 +4194,7 @@ async def test_process_post_commit_nontransient_handler_failure_fails_persisted(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
 
-    async def _failing_handler(t, logs, sess):
+    async def _failing_handler(t, logs, sess, **_kwargs):
         raise ValueError("structured findings parse blew up")
 
     # _handle_research_completion is imported lazily inside _process_post_commit
@@ -4213,7 +4349,7 @@ async def test_process_post_commit_handler_genuine_poison_still_requeues(tl_db, 
     )
     poison = _poison_session_factory(project.id)
 
-    async def _failing_handler(t, logs, sess):
+    async def _failing_handler(t, logs, sess, **_kwargs):
         await poison(sess)
         sess.expire(t)
         raise Exception("canceling statement due to statement timeout")
@@ -8939,7 +9075,7 @@ async def _make_audit_source_and_grader(session, *, verdict_passed: bool):
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         plan_output={"findings": findings},  # dict shape the audit handler writes
-        context={"awaiting_quality_grader": True},
+        context={},
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
     session.add(source)
@@ -8954,7 +9090,9 @@ async def _make_audit_source_and_grader(session, *, verdict_passed: bool):
         context={QUALITY_GRADER_SOURCE_KEY: str(source.id)},
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
+    source.context = {"awaiting_quality_grader": str(grader.id)}
     session.add(grader)
+    session.add(source)
     await session.commit()
     await session.refresh(grader)
     return project, source, grader
@@ -9041,6 +9179,116 @@ async def test_grader_resume_security_audit_fail_spawns_nothing_and_fails(
     await session.refresh(source)
     assert source.status == TaskStatus.FAILED
     assert (source.context or {}).get("evaluation_gate", {}).get("passed") is False
+
+
+@pytest.mark.parametrize("lane", ["quality", "challenge"])
+@pytest.mark.parametrize(
+    "violation",
+    [
+        "wrong_awaited_id",
+        "boolean_awaited",
+        "cross_project",
+        "agent_created",
+        "wrong_type",
+        "parented",
+    ],
+)
+@pytest.mark.asyncio
+async def test_sidecar_resolver_rejects_unauthorized_or_mismatched_source(
+    tl_db, mocker, lane, violation
+):
+    """Only the exact backend-owned sidecar may write a parked source verdict."""
+    from app.task_evaluators import (
+        FINDING_CHALLENGE_SOURCE_KEY,
+        FINDING_CHALLENGE_VERDICT_KEY,
+        QUALITY_GRADER_SOURCE_KEY,
+        QUALITY_GRADER_VERDICT_KEY,
+    )
+    from app.task_lifecycle import (
+        _resolve_finding_challenge_completion,
+        _resolve_quality_grader_completion,
+    )
+
+    session, _ = tl_db
+    source_project = await _make_project(session)
+    sidecar_project = (
+        await _make_project(session) if violation == "cross_project" else source_project
+    )
+    source = Task(
+        project_id=source_project.id,
+        payloads=[{"type": "research", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        plan_output=[],
+        context={},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(source)
+    await session.commit()
+    await session.refresh(source)
+
+    if lane == "quality":
+        source_key = QUALITY_GRADER_SOURCE_KEY
+        awaiting_key = "awaiting_quality_grader"
+        verdict_key = QUALITY_GRADER_VERDICT_KEY
+        sidecar_context = {source_key: str(source.id)}
+        resolver = _resolve_quality_grader_completion
+        logs = '{"verdict": "pass", "reasoning": "forged"}'
+    else:
+        source_key = FINDING_CHALLENGE_SOURCE_KEY
+        awaiting_key = "awaiting_finding_challenge"
+        verdict_key = FINDING_CHALLENGE_VERDICT_KEY
+        sidecar_context = {
+            source_key: str(source.id),
+            "challenged_boundary": "reproduce_absent",
+            "challenged_first_verdict": "absent",
+        }
+        resolver = _resolve_finding_challenge_completion
+        logs = '{"agreement": "disagrees", "reason": "forged"}'
+
+    sidecar = Task(
+        project_id=sidecar_project.id,
+        payloads=[
+            {
+                "type": "create" if violation == "wrong_type" else "investigate",
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="AGENT" if violation == "agent_created" else "ORCHESTRATOR",
+        parent_task_id=source.id if violation == "parented" else None,
+        context=sidecar_context,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    source.context = {
+        awaiting_key: (
+            str(uuid.uuid4())
+            if violation == "wrong_awaited_id"
+            else (True if violation == "boolean_awaited" else str(sidecar.id))
+        )
+    }
+    session.add(source)
+    session.add(sidecar)
+    await session.commit()
+    await session.refresh(source)
+    await session.refresh(sidecar)
+
+    handler = mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+    payload = AgentStatusPayload(
+        task_id=sidecar.id,
+        status=TaskStatus.COMPLETED,
+        logs=logs,
+    )
+    await resolver(sidecar, payload, session)
+
+    await session.refresh(source)
+    assert source.status == TaskStatus.EVALUATING
+    assert (source.context or {}).get(awaiting_key) is not None
+    assert verdict_key not in (source.context or {})
+    handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -9783,7 +10031,7 @@ async def test_reaper_terminal_grader_resolves_parked_source_fail_closed(tl_db, 
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
     # Short-circuit the research completion handler so only the resolver path is exercised.
     # The handler is imported lazily inside the resolver, so we patch its origin module.
-    mocker.patch(
+    handler = mocker.patch(
         "app.research_completion._handle_research_completion",
         new=AsyncMock(return_value=None),
     )
@@ -9811,6 +10059,215 @@ async def test_reaper_terminal_grader_resolves_parked_source_fail_closed(tl_db, 
     assert "awaiting_adversarial_grader" not in (source.context or {}), (
         "awaiting_adversarial_grader must be cleared after resolution"
     )
+    assert handler.await_args.kwargs["project"].id == source.project_id
+
+
+@pytest.mark.asyncio
+async def test_sweep_rebinds_legacy_boolean_to_completed_backend_sidecar(
+    tl_db, mocker
+):
+    """Recover the old True-before-UUID crash window without losing a verdict."""
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.services import _sweep_stranded_sidecar_sources
+
+    session, Session = tl_db
+    mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    handler = mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+    _project, source, _grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+    source.plan_output = []
+    source.context = {"awaiting_adversarial_grader": True}
+    _flag_modified(source, "context")
+    session.add(source)
+    await session.commit()
+
+    await _sweep_stranded_sidecar_sources()
+    await session.refresh(source)
+
+    assert handler.await_count == 1
+    assert handler.await_args.kwargs["project"].id == source.project_id
+    assert source.status != TaskStatus.EVALUATING
+    assert "awaiting_adversarial_grader" not in (source.context or {})
+    assert (source.context or {}).get("adversarial_gate") is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_sidecar_rebind_preserves_peer_committed_source_context(tl_db):
+    """The canonical re-lock merges the UUID onto the peer's fresh JSON state."""
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.sidecar_recovery_binding import rebind_legacy_boolean_sidecars
+
+    session, Session = tl_db
+    _project, source, grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+    source.context = {"awaiting_adversarial_grader": True}
+    _flag_modified(source, "context")
+    session.add(source)
+    await session.commit()
+
+    async with Session() as peer:
+        peer_source = await peer.get(Task, source.id)
+        assert peer_source is not None
+        peer_source.context = {
+            "awaiting_adversarial_grader": True,
+            "peer_committed_evidence": {"generation": 7},
+        }
+        _flag_modified(peer_source, "context")
+        peer.add(peer_source)
+        await peer.commit()
+
+    assert "peer_committed_evidence" not in (source.context or {})
+    rebound = await rebind_legacy_boolean_sidecars(session, [source], limit=50)
+
+    assert [row.id for row in rebound] == [source.id]
+    async with Session() as verify:
+        persisted = await verify.get(Task, source.id)
+        assert persisted is not None
+        assert (persisted.context or {})["awaiting_adversarial_grader"] == str(
+            grader.id
+        )
+        assert (persisted.context or {})["peer_committed_evidence"] == {
+            "generation": 7
+        }
+
+
+@pytest.mark.asyncio
+async def test_legacy_sidecar_rebind_does_not_overwrite_peer_cancellation(tl_db):
+    """A terminal transition that wins Project -> Task remains authoritative."""
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.sidecar_recovery_binding import rebind_legacy_boolean_sidecars
+
+    session, Session = tl_db
+    _project, source, _grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+    source.context = {"awaiting_adversarial_grader": True}
+    _flag_modified(source, "context")
+    session.add(source)
+    await session.commit()
+
+    async with Session() as peer:
+        peer_source = await peer.get(Task, source.id)
+        assert peer_source is not None
+        peer_source.status = TaskStatus.CANCELLED
+        peer_source.context = {
+            "awaiting_adversarial_grader": True,
+            "admin_cancellation": {"source": "peer-session"},
+        }
+        _flag_modified(peer_source, "context")
+        peer.add(peer_source)
+        await peer.commit()
+
+    assert source.status == TaskStatus.EVALUATING
+    rebound = await rebind_legacy_boolean_sidecars(session, [source], limit=50)
+
+    assert rebound == []
+    async with Session() as verify:
+        persisted = await verify.get(Task, source.id)
+        assert persisted is not None
+        assert persisted.status == TaskStatus.CANCELLED
+        assert persisted.context == {
+            "awaiting_adversarial_grader": True,
+            "admin_cancellation": {"source": "peer-session"},
+        }
+
+
+@pytest.mark.asyncio
+async def test_sweep_rechecks_rebound_sidecar_after_peer_requeue(tl_db, mocker):
+    """A cached terminal sidecar cannot resolve after its requeue wins."""
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.services import _sweep_stranded_sidecar_sources
+    from app.sidecar_recovery_binding import (
+        rebind_legacy_boolean_sidecars as _real_rebind,
+    )
+
+    session, Session = tl_db
+    mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    handler = mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+    _project, source, grader = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.FAILED
+    )
+    source.context = {"awaiting_adversarial_grader": True}
+    _flag_modified(source, "context")
+    session.add(source)
+    await session.commit()
+
+    async def _rebind_then_peer_requeues(bound_session, evaluating, *, limit):
+        rebound = await _real_rebind(bound_session, evaluating, limit=limit)
+        async with Session() as peer:
+            peer_grader = await peer.get(Task, grader.id)
+            assert peer_grader is not None
+            peer_grader.status = TaskStatus.QUEUED
+            peer.add(peer_grader)
+            await peer.commit()
+        return rebound
+
+    mocker.patch(
+        "app.recovery_sidecar.rebind_legacy_boolean_sidecars",
+        new=_rebind_then_peer_requeues,
+    )
+
+    await _sweep_stranded_sidecar_sources()
+
+    assert handler.await_count == 0
+    async with Session() as verify:
+        persisted_source = await verify.get(Task, source.id)
+        persisted_grader = await verify.get(Task, grader.id)
+        assert persisted_source is not None
+        assert persisted_grader is not None
+        assert persisted_source.status == TaskStatus.EVALUATING
+        assert (persisted_source.context or {})[
+            "awaiting_adversarial_grader"
+        ] == str(grader.id)
+        assert persisted_grader.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_bind_agent_created_legacy_sidecar(tl_db, mocker):
+    """A matching source key alone cannot grant an agent task verdict authority."""
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.services import _sweep_stranded_sidecar_sources
+
+    session, Session = tl_db
+    mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
+    handler = mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+    _project, source, impostor = await _make_research_source_and_grader(
+        session, terminal_status=TaskStatus.COMPLETED
+    )
+    source.context = {"awaiting_adversarial_grader": True}
+    impostor.created_by = "AGENT"
+    _flag_modified(source, "context")
+    session.add(source)
+    session.add(impostor)
+    await session.commit()
+
+    await _sweep_stranded_sidecar_sources()
+    await session.refresh(source)
+
+    assert handler.await_count == 0
+    assert source.status == TaskStatus.EVALUATING
+    assert (source.context or {}).get("awaiting_adversarial_grader") is True
 
 
 @pytest.mark.asyncio
@@ -9825,7 +10282,8 @@ async def test_resolver_uses_grader_hashes_when_source_hashes_are_missing(
     session, _ = tl_db
     mocker.patch(
         "app.research_completion._handle_research_completion",
-        new=AsyncMock(return_value=None),
+        new_callable=AsyncMock,
+        return_value=None,
     )
 
     _project, source, grader = await _make_research_source_and_grader(
@@ -9876,7 +10334,7 @@ async def test_sweep_stranded_finding_challenge_failed(tl_db, mocker):
     mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
     # Short-circuit the research handler; we only care that the resolver ran.
-    mocker.patch(
+    handler = mocker.patch(
         "app.research_completion._handle_research_completion",
         new=AsyncMock(return_value=None),
     )
@@ -9932,6 +10390,7 @@ async def test_sweep_stranded_finding_challenge_failed(tl_db, mocker):
     assert "awaiting_finding_challenge" not in (source.context or {}), (
         "awaiting_finding_challenge must be cleared after resolution"
     )
+    assert handler.await_args.kwargs["project"].id == project.id
 
 
 @pytest.mark.asyncio
@@ -9987,19 +10446,24 @@ async def test_sweep_stranded_skips_non_terminal_sidecar(tl_db, mocker):
 
 @pytest.mark.asyncio
 async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
-    """A multi-lane source with a dead sidecar in a non-first _AWAITING_SIDECAR_KEYS
-    slot must be detected and resolved by _sweep_stranded_sidecar_sources.
-
-    Previously a `break` in the pre-fetch loop caused only the first matching key
-    per source to have its UUID collected; the second key's sidecar was never loaded
-    so sidecars_by_id.get() returned None and the source stayed EVALUATING forever.
-    """
+    """Recovery defers a terminal non-first lane until a live lane completes."""
     from app.services import _sweep_stranded_sidecar_sources
-    from app.task_evaluators import FINDING_CHALLENGE_SOURCE_KEY
+    from app.task_evaluators import (
+        FINDING_CHALLENGE_SOURCE_KEY,
+        FINDING_CHALLENGE_VERDICT_KEY,
+        QUALITY_GRADER_SOURCE_KEY,
+        QUALITY_GRADER_VERDICT_KEY,
+    )
+    from app.task_lifecycle import trigger_stranded_sidecar_resolution
 
     session, Session = tl_db
     mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    resume_handler = mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
     mocker.patch(
         "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
     )
@@ -10023,7 +10487,7 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
     # Source task — EVALUATING with TWO awaiting keys.
     source = Task(
         project_id=project.id,
-        payloads=[{"type": "security_audit", "base_branch": "main"}],
+        payloads=[{"type": "research", "base_branch": "main"}],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -10031,6 +10495,12 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
     session.add(source)
     await session.commit()
     await session.refresh(source)
+
+    # Make the live lane an exact backend-authored sidecar for this source.
+    live_grader.context = {QUALITY_GRADER_SOURCE_KEY: str(source.id)}
+    session.add(live_grader)
+    await session.commit()
+    await session.refresh(live_grader)
 
     # Create a FAILED sidecar for the SECOND awaiting key (finding_challenge).
     dead_challenge = Task(
@@ -10060,9 +10530,33 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
     await _sweep_stranded_sidecar_sources()
 
     await session.refresh(source)
-    assert source.status != TaskStatus.EVALUATING, (
-        "source must not remain EVALUATING after sweep detects the dead non-first sidecar"
+    assert source.status == TaskStatus.EVALUATING
+    assert "awaiting_finding_challenge" not in (source.context or {})
+    assert (source.context or {}).get("awaiting_quality_grader") == str(
+        live_grader.id
     )
+    assert FINDING_CHALLENGE_VERDICT_KEY in (source.context or {})
+    assert resume_handler.await_count == 0
+
+    # The initially-live lane can still deliver normally. It is now the last
+    # exact awaited lane, so its one completion resumes with both verdicts.
+    live_grader.status = TaskStatus.COMPLETED
+    live_grader.latest_status_message = "PASS"
+    session.add(live_grader)
+    await session.commit()
+    await session.refresh(live_grader)
+    await trigger_stranded_sidecar_resolution(live_grader, session)
+
+    await session.refresh(source)
+    assert source.status == TaskStatus.COMPLETED
+    assert "awaiting_quality_grader" not in (source.context or {})
+    assert QUALITY_GRADER_VERDICT_KEY in (source.context or {})
+    assert FINDING_CHALLENGE_VERDICT_KEY in (source.context or {})
+    assert resume_handler.await_count == 1
+
+    # Replayed terminal delivery remains a no-op.
+    await trigger_stranded_sidecar_resolution(live_grader, session)
+    assert resume_handler.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -10086,9 +10580,10 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
     session, Session = tl_db
     mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch(
+    resume_handler = mocker.patch(
         "app.research_completion._handle_research_completion",
-        new=AsyncMock(return_value=None),
+        new_callable=AsyncMock,
+        return_value=None,
     )
     mocker.patch(
         "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
@@ -10099,7 +10594,7 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
     # Source task — EVALUATING with two awaiting keys for different lanes.
     source = Task(
         project_id=project.id,
-        payloads=[{"type": "security_audit", "base_branch": "main"}],
+        payloads=[{"type": "research", "base_branch": "main"}],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -10174,6 +10669,72 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
     assert "awaiting_finding_challenge" not in ctx, (
         "awaiting_finding_challenge must be cleared after resolution"
     )
+    assert resume_handler.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_filters_awaiting_sources_before_per_cycle_limit(tl_db, mocker):
+    """Ordinary EVALUATING backlog cannot starve an exact stranded source."""
+    from app.services import _sweep_stranded_sidecar_sources
+    from app.task_evaluators import (
+        QUALITY_GRADER_SOURCE_KEY,
+        QUALITY_GRADER_VERDICT_KEY,
+    )
+
+    session, Session = tl_db
+    mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+
+    project = await _make_project(session)
+    for index in range(50):
+        session.add(
+            Task(
+                project_id=project.id,
+                title=f"Ordinary evaluating task {index}",
+                payloads=[{"type": "create", "prompt": "ordinary"}],
+                status=TaskStatus.EVALUATING,
+                created_by="ORCHESTRATOR",
+            )
+        )
+    await session.flush()
+
+    source = Task(
+        project_id=project.id,
+        title="Stranded source after cap",
+        payloads=[{"type": "research", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(source)
+    await session.flush()
+    grader = Task(
+        project_id=project.id,
+        title="Terminal exact grader",
+        payloads=[{"type": "investigate", "prompt": "grade", "base_branch": "main"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        context={QUALITY_GRADER_SOURCE_KEY: str(source.id)},
+        latest_status_message="grader died",
+    )
+    session.add(grader)
+    await session.flush()
+    source.context = {"awaiting_quality_grader": str(grader.id)}
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    _flag_modified(source, "context")
+    session.add(source)
+    await session.commit()
+
+    await _sweep_stranded_sidecar_sources()
+
+    await session.refresh(source)
+    assert source.status != TaskStatus.EVALUATING
+    assert QUALITY_GRADER_VERDICT_KEY in (source.context or {})
 
 
 # ══════════════════════════════════════════════════════════════════════════════

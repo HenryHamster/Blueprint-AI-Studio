@@ -82,6 +82,7 @@ from app.branch_resolution import (
     merged_pr_counts_as_integration_landing,
 )
 from app.landed_signal import (
+    FORCE_DROP_UNBLOCK_REASONS,
     LANDED_MERGE_SHA_KEY,
     corroborate_and_apply_merged_landed_signal,
     mark_unblocked_non_merge,
@@ -421,9 +422,7 @@ def _task_owns_staging_branch(task: Task, staging_branch: str | None) -> bool:
     return tail == str(task.id).replace("-", "")[:8]
 
 
-_FORCE_DROP_REASONS = frozenset(
-    {"rollup_no_pr_artifact", "malformed_pr_url", "review_respawn_cap"}
-)
+_FORCE_DROP_REASONS = FORCE_DROP_UNBLOCK_REASONS
 
 
 async def _stamp_child_commit_range(
@@ -432,6 +431,16 @@ async def _stamp_child_commit_range(
 ) -> bool:
     """Stamp exact child-PR provenance when the rollup is landed."""
     if credentials is None:
+        from app.acceptance_provenance import (
+            ChangedFilesStampSkipReason,
+            stamp_changed_files_skip_reason,
+        )
+
+        context = dict(child.context or {})
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.github_credentials_unavailable
+        )
+        child.context = context
         return False
     try:
         from app.acceptance_criteria import stamp_rollup_child_commit_range
@@ -574,6 +583,8 @@ async def _propagate_landed_to_staging_merged_descendants(
     # to descendants; coverage_delta acceptance evidence needs this key
     # present on each child task's context at verdict time.
     _parent = await session.get(Task, parent_task_id)
+    if _parent is None:
+        return []
     _parent_ctx: dict = (_parent.context or {}) if _parent is not None else {}
     _parent_coverage: dict | None = _parent_ctx.get("test_coverage_result")
     # The rollup's own project, loaded once so the corroboration twin can
@@ -626,7 +637,10 @@ async def _propagate_landed_to_staging_merged_descendants(
         rows = (
             (
                 await session.execute(
-                    select(Task).where(Task.parent_task_id.in_(queue))
+                    select(Task).where(
+                        Task.parent_task_id.in_(queue),
+                        Task.project_id == _parent.project_id,
+                    )
                 )
             )
             .scalars()
@@ -1703,7 +1717,10 @@ async def _check_and_trigger_rollup(
         (
             await session.execute(
                 select(Task)
-                .where(Task.id == child_task.parent_task_id)
+                .where(
+                    Task.id == child_task.parent_task_id,
+                    Task.project_id == child_task.project_id,
+                )
                 .with_for_update(skip_locked=True)
             )
         )
@@ -1749,7 +1766,10 @@ async def _check_and_trigger_rollup(
     all_children = (
         (
             await session.execute(
-                select(Task).where(Task.parent_task_id == parent.id)
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.project_id == parent.project_id,
+                )
             )
         )
         .scalars()

@@ -575,8 +575,16 @@ describe('park directives and warm continuation', () => {
     expect(process.env.TASK_ID).toBe('');
   });
 
-  it('declines warm polling after a clone-failed role leaves no git workspace', async () => {
-    const pollForNextRole = vi.fn();
+  it('polls and cold-starts the next repository role when the warm workspace is invalid', async () => {
+    const pollForNextRole = vi.fn().mockResolvedValue({
+      action: 'claim',
+      taskId: 'cold-start-task',
+      agentToken: 'rotated-cold-start-jwt',
+      workspaceRequirement: 'repo',
+    });
+    const resetForNextRole = vi.fn();
+    const activateClaimedRole = vi.fn();
+    const materializeClaimCredentialState = vi.fn();
 
     const result = await continueWarmContinuation({
       priorTaskId: 'clone-failed-task',
@@ -584,16 +592,50 @@ describe('park directives and warm continuation', () => {
       baseBranch: 'main',
     }, {
       pollForNextRole,
-      resetForNextRole: vi.fn(),
-      activateClaimedRole: vi.fn(),
-      materializeClaimCredentialState: vi.fn(),
+      resetForNextRole,
+      activateClaimedRole,
+      materializeClaimCredentialState,
       performWarmRetarget: vi.fn(),
       resolveVmInstanceId: () => 'vm-clone-failed',
       isWorkspaceValid: () => false,
     });
 
-    expect(result).toEqual({ action: 'exit' });
-    expect(pollForNextRole).not.toHaveBeenCalled();
+    expect(result).toEqual({ action: 'continue' });
+    expect(pollForNextRole).toHaveBeenCalledOnce();
+    expect(activateClaimedRole).toHaveBeenCalledWith(
+      expect.objectContaining({ taskId: 'cold-start-task' }),
+      'reset_failed: warm-claim',
+    );
+    expect(resetForNextRole).not.toHaveBeenCalled();
+    expect(materializeClaimCredentialState).toHaveBeenCalledOnce();
+  });
+
+  it('continues into repository preparation when warm reset fails after claim', async () => {
+    const resetForNextRole = vi.fn().mockRejectedValue(new Error('corrupt git metadata'));
+    const materializeClaimCredentialState = vi.fn();
+
+    const result = await continueWarmContinuation({
+      priorTaskId: 'prior-task',
+      priorPrNumber: null,
+      baseBranch: 'main',
+    }, {
+      pollForNextRole: () => Promise.resolve({
+        action: 'claim',
+        taskId: 'claimed-before-reset',
+        agentToken: 'rotated-reset-jwt',
+        workspaceRequirement: 'repo',
+      }),
+      resetForNextRole,
+      activateClaimedRole: vi.fn(),
+      materializeClaimCredentialState,
+      performWarmRetarget: vi.fn(),
+      resolveVmInstanceId: () => 'vm-reset-fallback',
+      isWorkspaceValid: () => true,
+    });
+
+    expect(result).toEqual({ action: 'continue' });
+    expect(resetForNextRole).toHaveBeenCalledOnce();
+    expect(materializeClaimCredentialState).toHaveBeenCalledOnce();
   });
 
   it('falls back to the task JWT vm id and re-targets after reclaim', async () => {
@@ -831,6 +873,7 @@ describe('pollForNextRole', () => {
     // Authorization header must be the X-Agent-Token (matches existing apiPost).
     const headers = (heartbeatCalls[0][1] as { headers?: Record<string, string> } | undefined)?.headers ?? {};
     expect(headers['X-Agent-Token']).toBe('jwt-tok');
+    expect(headers['X-Research-Output-Contract-Version']).toBe('2');
     expect(clearIntervalSpy).toHaveBeenCalled();
   });
 

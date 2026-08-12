@@ -62,6 +62,8 @@ from app.release_models import (  # noqa: F401
     QualificationDimensionResult,
     QualificationVerdict,
     ReleaseDeployArtifact,
+    ReleaseAuthorshipReconciliationState,
+    ReleasePrepromotionDispatch,
     ReleaseVersion,
     ResidualVerdict,
     VersionAcceptanceCriterion,
@@ -90,6 +92,8 @@ _TASK_BANKED_LLM_INPUT_TOKENS_KEY = "llm_input_tokens_banked"
 _TASK_BANKED_LLM_OUTPUT_TOKENS_KEY = "llm_output_tokens_banked"
 _TASK_BANKED_LLM_CALL_COUNT_KEY = "llm_call_count_banked"
 _TASK_ATTEMPT_HISTORY_KEY = "attempt_history"
+TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY = "_lifetime_attempt_ordinal"
+TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY = "_last_banked_attempt_ordinal"
 
 
 def _coerce_provider_context_values(raw: object) -> list[str]:
@@ -2122,6 +2126,93 @@ def _coerce_nonnegative_int(value: Any) -> int:
     return 0
 
 
+def task_lifetime_attempt_ordinal(
+    attempt_count: Any,
+    banked_attempt_count: Any,
+    *,
+    current_attempt_ordinal: Any = 0,
+    last_banked_attempt_ordinal: Any = 0,
+) -> int:
+    """Return the task's authoritative, one-based lifetime attempt ordinal.
+
+    ``Task.attempt_count`` is the retry-budget counter for the current retry
+    epoch and is intentionally reset by an operator fresh-attempt requeue.
+    ``attempt_history`` banks closed executions across those epoch resets.  A
+    normal retry advances both values, so they must be combined with ``max``
+    rather than added; budget-only pre-claim failures and budget-exempt runtime
+    retries are then covered by whichever source is larger.
+    """
+
+    return max(
+        _coerce_nonnegative_int(attempt_count) + 1,
+        _coerce_nonnegative_int(banked_attempt_count) + 1,
+        _coerce_nonnegative_int(current_attempt_ordinal),
+        _coerce_nonnegative_int(last_banked_attempt_ordinal) + 1,
+    )
+
+
+def _attempt_history_last_ordinal(history: Any) -> int:
+    """Return the strongest closed-attempt ordinal carried by history."""
+
+    if not isinstance(history, list):
+        return 0
+    highest = len(history)
+    for snapshot in history:
+        if not isinstance(snapshot, dict):
+            continue
+        highest = max(
+            highest,
+            _coerce_nonnegative_int(snapshot.get("attempt_ordinal")),
+        )
+    return highest
+
+
+def get_task_lifetime_attempt_ordinal(task: Task) -> int:
+    """Return the current one-based lifetime ordinal for a loaded task."""
+
+    history = task.attempt_history or []
+    ctx = task.context or {}
+    return task_lifetime_attempt_ordinal(
+        task.attempt_count,
+        len(history),
+        current_attempt_ordinal=ctx.get(
+            TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY
+        ),
+        last_banked_attempt_ordinal=max(
+            _attempt_history_last_ordinal(history),
+            _coerce_nonnegative_int(
+                ctx.get(TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY)
+            ),
+        ),
+    )
+
+
+def advance_task_lifetime_attempt(task: Task) -> int:
+    """Idempotently mark that ``task`` is entering its next fresh attempt."""
+
+    history = task.attempt_history or []
+    ctx = dict(task.context or {})
+    last_banked = max(
+        _attempt_history_last_ordinal(history),
+        _coerce_nonnegative_int(
+            ctx.get(TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY)
+        ),
+    )
+    current = _coerce_nonnegative_int(
+        ctx.get(TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY)
+    )
+    next_ordinal = max(
+        current,
+        last_banked + 1,
+        _coerce_nonnegative_int(task.attempt_count) + 1,
+        len(history) + 1,
+    )
+    ctx[TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY] = next_ordinal
+    ctx[TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY] = last_banked
+    task.context = ctx
+    return next_ordinal
+
+
 def get_task_current_attempt_llm_totals(task: Task) -> tuple[int, int, int]:
     summary = task.api_call_summary or {}
     return (
@@ -2308,6 +2399,17 @@ def with_task_attempt_banking(
     else:
         merged[_TASK_ATTEMPT_HISTORY_KEY] = list(attempt_history)
 
+    task_ctx = task.context or {}
+    for marker_key in (
+        TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY,
+        TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY,
+    ):
+        marker_value = _coerce_nonnegative_int(task_ctx.get(marker_key))
+        if marker_value > 0:
+            merged[marker_key] = marker_value
+        else:
+            merged.pop(marker_key, None)
+
     return merged
 
 
@@ -2316,6 +2418,7 @@ def bank_task_current_attempt(
     *,
     stopped_at: datetime | None = None,
     clear_current_attempt: bool = True,
+    attempt_ordinal: int | None = None,
 ) -> Dict[str, Any] | None:
     effective_stop = stopped_at or task.vm_stopped_at
     vm_cost = get_task_current_attempt_vm_cost_usd(task, stopped_at=effective_stop)
@@ -2331,7 +2434,44 @@ def bank_task_current_attempt(
         or output_tokens > 0
         or call_count > 0
     )
-    if not has_attempt_data:
+    history = list(task.attempt_history or [])
+    task_context = dict(task.context or {})
+    history_last_ordinal = _attempt_history_last_ordinal(history)
+    last_banked_ordinal = max(
+        history_last_ordinal,
+        _coerce_nonnegative_int(
+            task_context.get(TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY)
+        ),
+    )
+    stored_current_ordinal = _coerce_nonnegative_int(
+        task_context.get(TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY)
+    )
+    if attempt_ordinal is not None:
+        current_ordinal = max(1, _coerce_nonnegative_int(attempt_ordinal))
+    elif stored_current_ordinal:
+        current_ordinal = stored_current_ordinal
+        # New live telemetry after an already-banked ordinal proves that a new
+        # attempt started even if an older direct requeue path did not stamp the
+        # fresh-attempt marker.
+        if has_attempt_data and current_ordinal <= last_banked_ordinal:
+            current_ordinal = max(
+                last_banked_ordinal + 1,
+                _coerce_nonnegative_int(task.attempt_count) + 1,
+            )
+    else:
+        # Legacy rows have no marker. Seed from the strongest available source;
+        # callers that increment retry budget before banking pass the captured
+        # pre-increment ordinal explicitly.
+        current_ordinal = max(
+            _coerce_nonnegative_int(task.attempt_count) + 1,
+            history_last_ordinal + 1,
+        )
+
+    # A fresh-attempt marker is itself durable evidence that the attempt
+    # existed. Bank a minimal placeholder even when provisioning died before
+    # timestamps/token telemetry arrived. When current == last_banked and live
+    # fields were already cleared, this is the repeated-bank idempotency guard.
+    if not has_attempt_data and current_ordinal <= last_banked_ordinal:
         return None
 
     if vm_cost > 0:
@@ -2349,7 +2489,16 @@ def bank_task_current_attempt(
     if call_count > 0:
         task.llm_call_count_banked = int(task.llm_call_count_banked or 0) + call_count
 
+    status_value = (
+        task.status.value if isinstance(task.status, TaskStatus) else str(task.status)
+    )
     snapshot: Dict[str, Any] = {
+        # ``attempt_count`` is a retry-budget counter and some callers increment
+        # it before closing the attempt.  Keep the immutable banked sequence and
+        # the observed retry counter as two explicitly different concepts.
+        "attempt_ordinal": current_ordinal,
+        "retry_count_at_bank": _coerce_nonnegative_int(task.attempt_count),
+        "status": status_value[:50],
         "vm_provisioned_at": task.vm_provisioned_at.isoformat()
         if task.vm_provisioned_at
         else None,
@@ -2363,6 +2512,37 @@ def bank_task_current_attempt(
         "llm_output_tokens": output_tokens,
         "llm_call_count": call_count,
     }
+    failure_class = task_context.get("failure_class") or task_context.get(
+        "failure_category"
+    )
+    if isinstance(failure_class, str) and failure_class:
+        snapshot["failure_class"] = failure_class[:100]
+    raw_failure_category = task_context.get("agent_failure_category_raw")
+    if isinstance(raw_failure_category, str) and raw_failure_category:
+        snapshot["agent_failure_category_raw"] = raw_failure_category[:100]
+
+    # The live message is already sanitized on the agent-status path, but
+    # banking is also called by reapers/provisioning recovery.  Sanitize again
+    # before retaining a small tail so those paths cannot persist credentials.
+    failure_message = task.latest_status_message
+    if isinstance(failure_message, str) and failure_message:
+        from app.broadcast import _sanitize_log
+
+        snapshot["failure_message_tail"] = _sanitize_log(failure_message)[-2000:]
+
+    # Re-validate the current attempt's report rather than copying arbitrary
+    # context.  Omit the key entirely when this attempt supplied no report;
+    # callers/reset logic must never fall back to a previous snapshot's report.
+    from app.failure_classification import (
+        AGENT_ERROR_REPORT_CONTEXT_KEY,
+        sanitize_agent_error_report,
+    )
+
+    agent_error_report = sanitize_agent_error_report(
+        task_context.get(AGENT_ERROR_REPORT_CONTEXT_KEY)
+    )
+    if agent_error_report is not None:
+        snapshot[AGENT_ERROR_REPORT_CONTEXT_KEY] = agent_error_report
     # Carry the cache-class sub-counts only when the live attempt actually had a
     # breakdown, so banked rows that predate cache tracking stay free of the keys
     # and downstream pricing falls back to the base-rate valuation for them.
@@ -2398,9 +2578,12 @@ def bank_task_current_attempt(
     prompt_section_sizes_val = (task.api_call_summary or {}).get("prompt_section_sizes")
     if isinstance(prompt_section_sizes_val, list):
         snapshot["prompt_section_sizes"] = prompt_section_sizes_val
-    history = list(task.attempt_history or [])
     history.append(snapshot)
     task.attempt_history = history
+    marker_ctx = dict(task.context or {})
+    marker_ctx[TASK_CURRENT_ATTEMPT_ORDINAL_CONTEXT_KEY] = current_ordinal
+    marker_ctx[TASK_LAST_BANKED_ATTEMPT_ORDINAL_CONTEXT_KEY] = current_ordinal
+    task.context = marker_ctx
 
     total_vm_cost = float(task.vm_runtime_cost_banked or 0.0)
     task.estimated_cost_usd = round(total_vm_cost, 4) if total_vm_cost > 0 else None

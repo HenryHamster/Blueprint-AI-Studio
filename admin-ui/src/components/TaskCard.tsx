@@ -555,6 +555,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   const [showChangesForm, setShowChangesForm] = useState(false);
   const [changesFeedback, setChangesFeedback] = useState('');
   const [showOverflowMenu, setShowOverflowMenu] = useState(false);
+  const attemptNumber = task.attempt_number ?? ((task.attempt_count ?? 0) + 1);
   const overflowMenuRef = useRef<HTMLDivElement>(null);
   const confirmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const confirmIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -829,8 +830,8 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             <Shield className="w-3 h-3" />Approval
           </span>
         )}
-        <span className={`text-ui-sm px-1.5 py-0.5 rounded font-mono ${(task.attempt_count ?? 0) > 0 ? 'bg-neutral-800 text-neutral-300' : 'bg-neutral-800/50 text-neutral-500'}`}>
-          #{(task.attempt_count ?? 0) + 1}
+        <span className={`text-ui-sm px-1.5 py-0.5 rounded font-mono ${attemptNumber > 1 ? 'bg-neutral-800 text-neutral-300' : 'bg-neutral-800/50 text-neutral-500'}`}>
+          #{attemptNumber}
         </span>
         {task.fix_loop_summary && task.fix_loop_summary.length > 0 && (
           <FixLoopBadge summary={task.fix_loop_summary} />

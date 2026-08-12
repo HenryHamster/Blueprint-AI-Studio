@@ -77,6 +77,16 @@ describe('DetailsTab — sideboard context', () => {
     cleanup();
   });
 
+  it('prefers the lifetime attempt ordinal after a retry-budget reset', () => {
+    render(
+      <DetailsTab
+        task={makeTask({ attempt_count: 0, attempt_number: 2 })}
+      />,
+    );
+
+    expect(screen.getByText('Attempt').parentElement).toHaveTextContent('2');
+  });
+
   it('renders bounded task sideboard context', () => {
     const onNavigateToTask = vi.fn();
     render(

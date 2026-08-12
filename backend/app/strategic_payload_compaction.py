@@ -63,6 +63,26 @@ def _compact_scalar_mapping(value: Any, *, text_cap: int) -> dict | None:
     return out or None
 
 
+def _compact_policy_projection(value: Any, *, text_cap: int) -> dict | None:
+    """Preserve the bounded policy contract, including its nested weights."""
+
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in ("threshold", "source", "fallback_error", "policy_hash"):
+        if key in value:
+            item = value.get(key)
+            out[key] = _bounded_text(item, text_cap) if isinstance(item, str) else item
+    raw_weights = value.get("weights")
+    if isinstance(raw_weights, dict):
+        out["weights"] = {
+            str(key)[:64]: item
+            for key, item in list(sorted(raw_weights.items()))[:8]
+            if isinstance(item, (int, float)) and not isinstance(item, bool)
+        }
+    return out or None
+
+
 def _compact_category_verdicts(value: Any, *, text_cap: int) -> list[dict] | None:
     """Compact per-category grader verdicts to their load-bearing fields.
 
@@ -319,6 +339,28 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
         if isinstance(value.get(source_key), list):
             out.setdefault(count_key, len(value[source_key]))
     sub_scores = _compact_scalar_mapping(value.get("sub_scores"), text_cap=text_cap)
+    raw_sub_scores = value.get("sub_scores")
+    raw_task_records = (
+        raw_sub_scores.get("acceptance_window_task_records")
+        if isinstance(raw_sub_scores, dict)
+        else None
+    )
+    if isinstance(raw_task_records, list):
+        sub_scores = sub_scores or {}
+        sub_scores["acceptance_window_task_records"] = [
+            {
+                key: row[key]
+                for key in (
+                    "task_id",
+                    "bucket",
+                    "credited",
+                    "_pr_changed_files_stamp_skipped",
+                )
+                if key in row
+            }
+            for row in raw_task_records
+            if isinstance(row, dict)
+        ]
     if sub_scores:
         out["sub_scores"] = sub_scores
     # Per-category grader verdicts — WHY each category is unmet. Bounded to the
@@ -443,6 +485,13 @@ def _compact_finding_resolution(value: Any, *, text_cap: int) -> dict | None:
         "gating_total",
         "gating_resolved",
         "audit_findings_truncated",
+        "finding_total",
+        "resolved_finding_total",
+        "projected_audit_score",
+        "required_audit_score",
+        "projected_confidence",
+        "promotion_confidence_threshold",
+        "projected_promotion_ready",
     ):
         if value.get(key) is not None:
             out[key] = value.get(key)
@@ -540,6 +589,15 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     qs = _compact_qualification_state(block.get("qualification_state"), floor=floor)
     if qs:
         out["qualification_state"] = qs
+    for policy_key in (
+        "current_effective_policy",
+        "active_or_last_attempt_policy",
+    ):
+        policy_projection = _compact_policy_projection(
+            block.get(policy_key), text_cap=text_cap
+        )
+        if policy_projection:
+            out[policy_key] = policy_projection
     provenance = _compact_qualification_provenance(
         block.get("qualification_provenance"), text_cap=text_cap
     )
@@ -796,6 +854,57 @@ def _direction_activity_score(stat: dict) -> int:
     return merged * 3 + failed + cycles + priority_bonus + proposed_bonus
 
 
+def _direction_decision_value(stat: dict) -> int:
+    """Rank direction context by the decision it can change this cycle.
+
+    A direction with fresh findings and no task in flight is the strongest
+    spawn signal in the strategic portfolio. Give that signal a separate rank
+    above historical activity so a quiet, actionable direction is not evicted
+    by generic summaries.
+    """
+    if not isinstance(stat, dict):
+        return 0
+    findings = stat.get("recent_findings")
+    finding_count = (
+        len(findings)
+        if isinstance(findings, list)
+        else int(stat.get("recent_findings_total") or 0)
+    )
+    in_flight = stat.get("in_flight", stat.get("tasks_in_flight", 0))
+    try:
+        in_flight_count = max(0, int(in_flight or 0))
+    except (TypeError, ValueError):
+        in_flight_count = 0
+    spawn_signal = (
+        stat.get("status") == "active" and finding_count > 0 and in_flight_count == 0
+    )
+    return (1_000_000 if spawn_signal else 0) + _direction_activity_score(stat)
+
+
+def _directions_section_decision_value(value: Any) -> int:
+    """Return the strongest direction decision signal in a section."""
+    if not isinstance(value, list):
+        return 0
+    # Keep the existing tier/size behavior for ordinary portfolios. Only the
+    # actionable finding-without-work signal changes section ordering; this
+    # prevents a quiet direction's normal activity score from reshuffling
+    # unrelated high-tier lifecycle sections.
+    scores = [_direction_decision_value(item) for item in value]
+    return max((score for score in scores if score >= 1_000_000), default=0)
+
+
+def _payload_currency_decision_value(value: Any) -> int:
+    """Keep resolved currency context ahead of generic high-tier summaries."""
+    if not isinstance(value, dict):
+        return 0
+    verdict = value.get("verdict")
+    if verdict in ("fresh", "stale"):
+        return 900_000
+    if verdict in ("unknown", "api_unreachable"):
+        return 800_000
+    return 700_000
+
+
 def _summarize_directions(stats: list) -> list:
     """Keep top direction_summary entries and compact bulky per-entry evidence.
 
@@ -805,7 +914,7 @@ def _summarize_directions(stats: list) -> list:
     """
     if not isinstance(stats, list):
         return stats
-    sorted_stats = sorted(stats, key=_direction_activity_score, reverse=True)
+    sorted_stats = sorted(stats, key=_direction_decision_value, reverse=True)
     return [
         _compact_direction_summary_entry(stat)
         for stat in sorted_stats[:_DIRECTIONS_SUMMARY_KEEP]
@@ -826,6 +935,11 @@ def _floor_direction_entry(stat: dict) -> dict:
     headline = _bounded_text(stat.get("text"), _DIRECTION_FLOOR_TEXT_CAP)
     if headline:
         out["text"] = headline
+    research_context = _bounded_text(
+        stat.get("research_context"), _DIRECTION_SUMMARY_TEXT_CAP
+    )
+    if research_context:
+        out["research_context"] = research_context
     return out
 
 
@@ -841,7 +955,7 @@ def _directions_summary_floor(stats: list) -> list:
     """
     if not isinstance(stats, list):
         return stats
-    sorted_stats = sorted(stats, key=_direction_activity_score, reverse=True)
+    sorted_stats = sorted(stats, key=_direction_decision_value, reverse=True)
     return [
         _floor_direction_entry(stat)
         for stat in sorted_stats[:_DIRECTIONS_FLOOR_KEEP]
@@ -1016,10 +1130,11 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "outcome_scaffolding_evidence",
     ):
         _put_present(out, stat, key, text_cap=_DIRECTION_SUMMARY_LONG_TEXT_CAP)
-    if stat.get("research_context"):
-        out["research_context_headline"] = _bounded_text(
-            stat.get("research_context"), _DIRECTION_SUMMARY_LONG_TEXT_CAP
-        )
+    research_context = _bounded_text(
+        stat.get("research_context"), _DIRECTION_SUMMARY_LONG_TEXT_CAP
+    )
+    if research_context:
+        out["research_context"] = research_context
     for key in (
         "taxonomy_summary",
         "recent_findings_grade_distribution",

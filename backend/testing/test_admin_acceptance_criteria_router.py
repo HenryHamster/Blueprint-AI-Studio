@@ -114,6 +114,66 @@ async def test_list_criteria_with_open_version(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_update_existing_evidence_contract_is_canonical_audited_and_scoped(
+    client: AsyncClient, db_session
+):
+    """The live-shaped row binds strictly and leaves unrelated criteria untouched."""
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-production1",
+        text="Release authorship is clean",
+        status="active",
+        created_by="strategist",
+    )
+    unrelated = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-unrelated1",
+        text="Unrelated production criterion",
+        status="active",
+        created_by="operator",
+    )
+    db_session.add_all([target, unrelated])
+    await db_session.commit()
+
+    invalid = await client.patch(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}",
+        json={
+            "evidence_contract": {
+                "type": "operator_authored_commits",
+                "predicate": {"max_count": True},
+            }
+        },
+    )
+    assert invalid.status_code == 422
+
+    contract = {
+        "type": "operator_authored_commits",
+        "predicate": {"max_count": 0},
+    }
+    updated = await client.patch(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}/evidence-contract",
+        json={"evidence_contract": contract},
+    )
+    assert updated.status_code == 200, updated.text
+    body = updated.json()
+    assert body["evidence_contract"] == contract
+    assert body["evidence_contract_updated_by"] == TEST_USER_ID
+    assert body["evidence_contract_updated_at"]
+
+    readback = await client.get(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria"
+    )
+    assert readback.status_code == 200
+    by_key = {item["criterion_key"]: item for item in readback.json()["criteria"]}
+    assert by_key[target.criterion_key]["evidence_contract"] == contract
+    assert by_key[unrelated.criterion_key]["evidence_contract"] is None
+
+
+@pytest.mark.asyncio
 async def test_list_criteria_requires_viewer_role(client: AsyncClient, db_session):
     """Project non-member receives 404 (project appears not found)."""
     other_project = Project(name="Other", user_id="other-user")
@@ -122,6 +182,131 @@ async def test_list_criteria_requires_viewer_role(client: AsyncClient, db_sessio
 
     resp = await client.get(f"{_BASE}/projects/{other_project.id}/acceptance-criteria")
     assert resp.status_code in (403, 404)
+
+
+@pytest.mark.asyncio
+async def test_member_can_write_text_but_cannot_activate_or_clear_machine_policy(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-owner-policy",
+        text="Trusted CI must verify the candidate",
+        status="active",
+        created_by="operator",
+        evidence_contract={
+            "type": "prepromotion_ci_build_smoke",
+            "predicate": {"required": True},
+        },
+    )
+    authorship_target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-owner-authorship-policy",
+        text="Operator authorship must remain clean",
+        status="active",
+        created_by="strategist",
+        evidence_contract={
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
+        evidence_contract_updated_by=TEST_USER_ID,
+    )
+    db_session.add_all([target, authorship_target])
+    await db_session.commit()
+
+    ordinary = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria",
+        json={"text": "Member-authored prose criterion"},
+    )
+    assert ordinary.status_code == 200
+
+    machine = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria",
+        json={
+            "text": "Member must not spend Actions authority",
+            "evidence_contract": {
+                "type": "prepromotion_ci_build_smoke",
+                "predicate": {"required": True},
+            },
+        },
+    )
+    assert machine.status_code == 403
+
+    clear = await client.patch(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/"
+        f"{target.criterion_key}/evidence-contract",
+        json={"evidence_contract": None},
+    )
+    assert clear.status_code == 403
+
+    delete = await client.delete(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}"
+    )
+    assert delete.status_code == 403
+
+    target.status = "retracted"
+    db_session.add(target)
+    await db_session.commit()
+    reinstate = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/"
+        f"{target.criterion_key}/reinstate"
+    )
+    assert reinstate.status_code == 403
+
+    delete_authorship = await client.delete(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/"
+        f"{authorship_target.criterion_key}"
+    )
+    assert delete_authorship.status_code == 403
+
+    authorship_target.status = "retracted"
+    db_session.add(authorship_target)
+    await db_session.commit()
+    reinstate_authorship = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/"
+        f"{authorship_target.criterion_key}/reinstate"
+    )
+    assert reinstate_authorship.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_owner_can_reinstate_then_delete_external_ci_policy(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-owner-external-policy",
+        text="Trusted CI verifies the candidate",
+        status="retracted",
+        created_by="strategist",
+        evidence_contract={
+            "type": "prepromotion_ci_build_smoke",
+            "predicate": {"required": True},
+        },
+        evidence_contract_updated_by=TEST_USER_ID,
+    )
+    db_session.add(target)
+    await db_session.commit()
+
+    reinstate = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/"
+        f"{target.criterion_key}/reinstate"
+    )
+    assert reinstate.status_code == 200
+    await db_session.refresh(target)
+    assert target.status == "active"
+
+    delete = await client.delete(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}"
+    )
+    assert delete.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -133,20 +318,39 @@ async def test_list_criteria_requires_viewer_role(client: AsyncClient, db_sessio
 @pytest.mark.asyncio
 async def test_create_and_delete_acceptance_criterion(client: AsyncClient, db_session):
     """Creates and deletes criteria; exercises cap, de-dup, role, and open-version guards."""
-    project = await _make_project_member(db_session, role="member")
+    project = await _make_project_member(db_session, role="owner")
     version = await _make_version(db_session, project)
 
     # --- Create: happy path ---
     resp = await client.post(
         f"{_BASE}/projects/{project.id}/acceptance-criteria",
-        json={"text": "All tests must pass"},
+        json={
+            "text": "All tests must pass",
+            "evidence_contract": {
+                "type": "operator_authored_commits",
+                "predicate": {"max_count": 0},
+            },
+        },
     )
     assert resp.status_code == 200
     data = resp.json()
     assert data["criterion_key"].startswith("c-")
     assert data["text"] == "All tests must pass"
+    assert data["evidence_contract"]["predicate"]["max_count"] == 0
+    assert data["evidence_contract_updated_by"] == TEST_USER_ID
+    assert data["evidence_contract_updated_at"]
     assert data["release_version_id"] == str(version.id)
     key1 = data["criterion_key"]
+    created = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.criterion_key == key1
+            )
+        )
+    ).scalar_one()
+    assert created.created_by == "operator"
+    assert created.evidence_contract_updated_at is not None
+    assert created.evidence_contract_updated_by == TEST_USER_ID
 
     # Create a second distinct criterion.
     resp2 = await client.post(
@@ -982,7 +1186,7 @@ async def test_reconcile_backfill_all_directions_with_merged_task(
     assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
     data = resp.json()
     assert data["status"] == "ok"
-    # 2 evidence rows per direction (task_merge + reachability) × 2 directions = 4
+    # 2 evidence rows per direction (task_merge + reachability) x 2 directions = 4
     assert data["total_evidence_recorded"] == 4
     direction_keys_in_results = {r["direction_key"] for r in data["results"]}
     assert dir_a.direction_key in direction_keys_in_results

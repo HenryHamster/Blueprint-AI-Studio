@@ -28,7 +28,10 @@ from app.shared_state import (
     resolve_project_promotion_enabled,
     runtime_config as _runtime_config,
 )
-from app.release_artifacts import version_serving_summary as _version_serving_summary
+from app.release_artifacts import (
+    is_activation_rearmable_serving_status,
+    version_serving_summary as _version_serving_summary,
+)
 from app.qualification_state_resolver import (
     resolve_effective_qualification_state,
     resolve_newest_qualification_verdict,
@@ -96,6 +99,7 @@ def _compose_serving_block(
         "failure_reason": aggregate.get("reason_code")
         if aggregate_status == "deploy_failed"
         else None,
+        "fleet_freshness": aggregate.get("fleet_freshness"),
         "artifacts": artifacts,
     }
 
@@ -511,9 +515,11 @@ async def get_version_lifecycle(
     Projects with no version lifecycle return ``null`` for ``current_version``
     and an empty ``recent_versions`` list.
 
-    The response is cached per project for 30 seconds (in-flight dedup + stale
-    fallback) to bound the DB work from dashboard polling at ~30s cadence.
-    ``precomputed`` in the response is ``true`` when a cached value was served.
+    The lifecycle body is cached per project for 30 seconds (in-flight dedup +
+    stale fallback) to bound the DB work from dashboard polling at ~30s cadence.
+    Volatile promotion-policy truth is overlaid after the cache lookup so a live
+    runtime/project override is visible immediately. ``precomputed`` in the
+    response is ``true`` when a cached value was served.
     """
     from app.release_version import (  # noqa: PLC0415
         count_merged_since,
@@ -522,26 +528,18 @@ async def get_version_lifecycle(
     )
     from app.release_qualifier import (  # noqa: PLC0415
         compute_promotion_readiness,
+        current_effective_policy_projection,
         resolve_lifecycle_audit_evidence,
-        _resolve_policy_with_provenance,
     )
-    from app.models import Project  # noqa: PLC0415
     from app.strategic_spawning import (  # noqa: PLC0415
         _build_staged_directions_summary,
     )
 
-    await _get_user_project_with_role(
+    project_row = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
     )
 
     async def _compute_lifecycle() -> Dict[str, Any]:
-        project_row = (
-            await session.execute(select(Project).where(Project.id == project_id))
-        ).scalar_one_or_none()
-        _, promotion_policy_source, promotion_policy_error = (
-            _resolve_policy_with_provenance()
-        )
-
         open_row = (
             (
                 await session.execute(
@@ -969,8 +967,6 @@ async def get_version_lifecycle(
                 else "fleet"
             ),
             "promotion_readiness": promotion_readiness,
-            "promotion_policy_source": promotion_policy_source,
-            "promotion_policy_error": promotion_policy_error,
             # Directions deliberately queued (status=staged) to begin only after the
             # current version promotes. Surfaced read-only so an operator can confirm
             # staged work is queued and spot items rotting past their target version.
@@ -984,7 +980,14 @@ async def get_version_lifecycle(
         str(project_id),
         _compute_lifecycle,
     )
-    return {**result, "precomputed": served_stale}
+    current_effective_policy = current_effective_policy_projection(project_row)
+    return {
+        **result,
+        "current_effective_policy": current_effective_policy,
+        "promotion_policy_source": current_effective_policy["source"],
+        "promotion_policy_error": current_effective_policy["fallback_error"],
+        "precomputed": served_stale,
+    }
 
 
 class _SetVersionPhaseBody(BaseModel):
@@ -1769,10 +1772,11 @@ async def clear_deploy_failed(
     if version is None:
         raise HTTPException(status_code=404, detail="Release version not found.")
 
+    authorship_plan = None
     if clear_mode == "verified":
         # Independently confirmed serving — clear with the OBSERVED served SHA.
         # Use pre-captured locals: backend_artifact was expired by expire_all().
-        await _recover_serving_confirmed(
+        authorship_plan = await _recover_serving_confirmed(
             session,
             version,
             verified_served_identifier,
@@ -1782,7 +1786,7 @@ async def clear_deploy_failed(
     else:
         # Operator attestation: clear using the promoted SHA as the served SHA and
         # record the provenance in the durable audit trail.
-        await _recover_serving_confirmed(
+        authorship_plan = await _recover_serving_confirmed(
             session, version, version.promoted_sha, now, now
         )
         _record_deploy_failed_clear_attestation(
@@ -1790,6 +1794,13 @@ async def clear_deploy_failed(
         )
 
     await session.commit()
+    if authorship_plan is not None:
+        from app.release_commit_authorship import measure_serving_authorship_evidence
+
+        await measure_serving_authorship_evidence(
+            version.id,
+            expected_receipt_identity=authorship_plan["receipt_identity"],
+        )
     await session.refresh(version)
     return {
         "version_number": version.version_number,
@@ -1819,10 +1830,12 @@ async def approve_activation(
     path refuses any reported revision that differs, or a receipt once a newer
     promotion supersedes this version.
 
-    Requires ``serving_status == "unconfirmed"`` — the exact predicate the
-    attention item and callout use, so the in-product surface is one unambiguous
-    action.  Already ``serving_confirmed`` / ``deploy_failed`` /
-    ``confirmation_timed_out`` (or a never-armed ``serving_status`` NULL) -> 409.
+    Requires a promoted version whose aggregate serving status is either
+    ``unconfirmed`` or ``confirmation_timed_out``.  The latter is a
+    non-terminal report: its confirmation window elapsed without establishing
+    serving, so the same explicit operator approval remains available to
+    re-arm activation.  Already ``serving_confirmed`` / ``deploy_failed`` (or a
+    never-armed ``serving_status`` NULL) -> 409.
     Idempotent: re-approving a still-unconfirmed version returns the existing
     approval without re-stamping.
     """
@@ -1868,12 +1881,7 @@ async def approve_activation(
             status_code=409,
             detail=f"v{version.version_number} deploy failed; clear the deploy failure before approving activation.",
         )
-    if version.serving_status == "confirmation_timed_out":
-        raise HTTPException(
-            status_code=409,
-            detail=f"v{version.version_number} confirmation window timed out; a fresh promotion is required before activation can be approved.",
-        )
-    if version.serving_status != "unconfirmed":
+    if not is_activation_rearmable_serving_status(aggregate_status):
         raise HTTPException(
             status_code=409,
             detail=f"v{version.version_number} is not awaiting activation (serving_status={version.serving_status}).",
@@ -1882,9 +1890,13 @@ async def approve_activation(
     operator_id = current_user.get("email") or current_user["user_id"]
     now = _utcnow()
 
-    if version.activation_requested_at is not None:
+    if (
+        version.activation_requested_at is not None
+        and aggregate_status != "confirmation_timed_out"
+    ):
         # Idempotent re-approval while still unconfirmed — return the existing
-        # durable approval without re-stamping it.
+        # durable approval without re-stamping it. A timed-out approval is a
+        # new execution attempt and must receive a fresh timestamp token.
         return {
             "version_number": version.version_number,
             "project_id": str(project_id),
@@ -1929,6 +1941,60 @@ class _ActivationReceiptBody(BaseModel):
     revision: str | None = _Field(default=None, max_length=40)
     # SSH host that performed the activation (provenance, informational).
     host: str | None = _Field(default=None, max_length=200)
+@router.post("/projects/{project_id}/release-versions/{version_number}/prepromotion-rehearsal")
+async def request_prepromotion_rehearsal(
+    project_id: uuid.UUID,
+    version_number: int,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Queue trusted-main CI build/smoke for the exact open candidate.
+
+    This writes the same durable outbox intent as automatic qualification. The
+    reaper dispatches the trusted-main workflow after the transaction commits;
+    the request never performs GitHub I/O while holding the release row lock.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="owner"
+    )
+    version = (
+        await session.execute(
+            select(ReleaseVersion)
+            .where(
+                ReleaseVersion.project_id == project_id,
+                ReleaseVersion.version_number == version_number,
+            )
+            .with_for_update()
+        )
+    ).scalars().first()
+    if version is None:
+        raise HTTPException(status_code=404, detail="Release version not found.")
+    if version.status != "open":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Release version {version_number} is not an open candidate.",
+        )
+    candidate_sha = str((version.last_qualification or {}).get("candidate_sha") or "")
+    if not _SHA40_RE.fullmatch(candidate_sha):
+        raise HTTPException(
+            status_code=409,
+            detail="The open release version has no full candidate SHA to rehearse.",
+        )
+
+    from app.release_prepromotion_rehearsal import (
+        prepare_rehearsal_dispatch_intent,
+    )
+
+    ready, dispatch = await prepare_rehearsal_dispatch_intent(
+        session, version, candidate_sha, rearm_terminal=True
+    )
+    await session.commit()
+    return {
+        "version_number": version_number,
+        "candidate_sha": candidate_sha,
+        "dispatch": dispatch,
+        "status": "ready" if ready else "rehearsal_dispatch_pending",
+    }
 
 
 @router.post("/projects/{project_id}/activation-receipt")
@@ -2039,7 +2105,15 @@ async def record_activation_receipt(
         operator_id=operator_id,
         now=now,
     )
+    authorship_plan = receipt.pop("_authorship_plan", None)
     await session.commit()
+    if authorship_plan is not None:
+        from app.release_commit_authorship import measure_serving_authorship_evidence
+
+        await measure_serving_authorship_evidence(
+            version.id,
+            expected_receipt_identity=authorship_plan["receipt_identity"],
+        )
     await session.refresh(version)
     return {
         "version_number": version.version_number,

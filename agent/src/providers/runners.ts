@@ -37,12 +37,14 @@ const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
 
 /**
- * Thrown when a required CLI binary (e.g. `codex`) is absent from PATH.
- * The agent exits with code 42 so the runner does NOT increment its failure
- * streak — a missing-CLI event is an infra decline, not a real task failure.
+ * Thrown when a required provider runtime capability is unavailable (for
+ * example a CLI binary is absent from PATH). The agent exits with code 42 so
+ * the runner does NOT increment its failure streak — this is an infra decline,
+ * not a real task failure.
  */
 export class RuntimeUnavailableError extends Error {
   readonly failureCategory = 'runtime_unavailable' as const;
+  readonly gracefulExitCode = 42 as const;
   constructor(cli: string) {
     super(`runtime_unavailable:${cli}`);
     this.name = 'RuntimeUnavailableError';
@@ -483,6 +485,7 @@ const AUTH_FAILURE_PATTERNS: Readonly<Record<ProviderName, readonly string[]>> =
   anthropic: [
     'invalid x-api-key',
     'x-api-key header is required',
+    'organization has disabled claude subscription access',
     'oauth token has expired',
     'oauth token expired',
     'oauth authentication is currently not supported',
@@ -759,10 +762,14 @@ export interface IsolatedTextOnlyRunOptions {
   maxOutputBytes: number;
 }
 
-export class TextOnlyProviderUnavailableError extends Error {
-  readonly failureCategory = 'runtime_unavailable' as const;
+export class TextOnlyProviderUnavailableError extends RuntimeUnavailableError {
   constructor(provider: ProviderName, detail: string) {
-    super(`text_only_provider_unavailable:${provider}:${detail}`);
+    // RuntimeUnavailableError is the control type runRoleOnce converts to the
+    // graceful exit-42 path. Preserve the more specific diagnostic text while
+    // sharing that control identity so a strict text-only capability miss does
+    // not increment the local runner's failure streak.
+    super(`${provider}:${detail}`);
+    this.message = `text_only_provider_unavailable:${provider}:${detail}`;
     this.name = 'TextOnlyProviderUnavailableError';
   }
 }

@@ -248,7 +248,8 @@ Key test invariants:
 - Schema revision (`EXPECTED_SCHEMA_REVISION` in `backend/app/main.py`) — must match the latest Alembic migration
 - Database migrations are immutable — new migrations must chain from the latest `down_revision`
 - Use `./check` for the fast repo gate; use `./check test` for the lightweight backend smoke pass
-- Use `./blueprint status` (or `./blueprint --help`) to query the operator CLI; `./blueprint` is a thin bash wrapper that forwards to `python3 scripts/blueprint.py`. Run `bash scripts/install-cli.sh` once after cloning to symlink `blueprint` and `blueprint-runner` into `~/.local/bin` so they work as bare commands from any directory. On Windows / PowerShell (where the bash wrapper does not run), call the script directly: `python scripts/blueprint.py status`
+- Use `./blueprint status` (or `./blueprint --help`) to query the operator CLI; `./blueprint` is a thin bash wrapper that forwards to `python3 scripts/blueprint.py`. Run `bash scripts/install-cli.sh` once after cloning to symlink `blueprint` and `blueprint-runner` into `~/.local/bin` so they work as bare commands from any directory. On Windows / PowerShell, use `.\blueprint.ps1 status`; the launcher finds the repo virtualenv or an installed Python 3 interpreter.
+- Developer-hosted coding agents can use Blueprint's typed, project-scoped, read-only MCP tools for orientation and diagnosis instead of reading API keys or assembling raw REST calls. Blueprint-provisioned task workers keep using their existing task-scoped helpers and token; they are not given a reusable service credential. See [Coding-agent access to Blueprint](docs/CODING_AGENT_ACCESS.md) for credential bootstrap, Codex/stdio configuration, and the CLI fallback. Trusted external operators can instead use the non-owner, revocable [project-operator CLI profile](docs/HERMES_OPERATOR_ACCESS.md), whose exact project mutations remain separate from MCP and platform administration.
 
 ### Adding Features
 

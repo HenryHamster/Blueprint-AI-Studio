@@ -197,14 +197,14 @@ def test_registry_wires_autonomous_spawn_budget_knob():
     assert spec.debt_key == DEBT_KEY
 
 
-def test_enabled_flag_defaults_off():
-    """The shared harness enabled flag ships default False.
+def test_enabled_flag_defaults_on():
+    """The shared harness enabled flag ships armed.
 
     ``shared_state.runtime_config`` IS the module-level defaults dict from
     ``runtime_config_state``; the autouse fixture restores it around every test,
     so at test entry the key holds its shipped default.
     """
-    assert _rc.get(mkg.MODE_KNOB_GRADUATION_ENABLED_KEY) is False
+    assert _rc.get(mkg.MODE_KNOB_GRADUATION_ENABLED_KEY) is True
     # And the key is genuinely seeded (not merely absent → falsy via .get()).
     assert mkg.MODE_KNOB_GRADUATION_ENABLED_KEY in _rc
 

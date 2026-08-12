@@ -58,6 +58,11 @@ from app.direction_lifecycle import (
     direction_has_churn_retirement_recommendation,
     reactivate_paused_direction,
 )
+from app.direction_priority import direction_task_priority
+from app.direct_research_spawn import (
+    enrich_direct_research_payload,
+    enforce_direct_research_cycle_occupancy,
+)
 from app.models import (
     KnowledgeDocument,
     MessageHandlingState,
@@ -108,6 +113,7 @@ from app.shared_state import (
 )
 from app.size_limit_policy import bump_size_limit as _bump_size_limit_policy
 from app.size_limit_policy import classify_breach as _classify_breach_policy
+from app.size_limit_policy import governing_cap_repair as _governing_cap_repair
 from app.strategic_completion import (
     _find_matching_direction,
     _normalize_recommended_mode,
@@ -327,7 +333,7 @@ async def _backfill_direction_merge_evidence_after_mapping(
         )
         if recorded:
             await session.commit()
-    except Exception:  # noqa: BLE001 - best-effort post-mapping repair
+    except Exception:
         await session.rollback()
         logger.warning(
             "[STRATEGIC API] criterion_keys backfill failed for direction %s",
@@ -831,6 +837,8 @@ class AgentAnnotation(BaseModel):
     # size_breach fields — programmatic signal from a test-invariant failure.
     # Server bumps the limit (policy-driven, not agent-judgment) and returns
     # new_limit; the agent applies it to module_size_limits.json and commits.
+    # A governed file also receives ``governing_cap_repair`` directing the
+    # paired source-constant edit required in that same task.
     # For chronic offenders the server refuses the silent bump and returns
     # is_chronic=True without new_limit; pass force_chronic_override=True with
     # explicit operator approval to grant the bump anyway.
@@ -957,9 +965,19 @@ async def agent_annotate(
         else:
             new_limit = verdict["suggested_new_limit"]
             assert new_limit is not None
+            governing_cap_repair = _governing_cap_repair(
+                payload.section, file_path.strip(), new_limit
+            )
+            governed_instruction = (
+                f" Also update {governing_cap_repair['source_path']}'s "
+                f"{governing_cap_repair['constant_name']} to {new_limit} in the same task."
+                if governing_cap_repair
+                else ""
+            )
             content = (
                 f"Size breach: {file_path} grew to {current_size} lines. "
-                f"Suggested new limit: {new_limit}. Change: {change_summary.strip()}"
+                f"Suggested new limit: {new_limit}.{governed_instruction} "
+                f"Change: {change_summary.strip()}"
             )
             ctx = {
                 "annotation_type": "size_breach",
@@ -968,6 +986,11 @@ async def agent_annotate(
                 "current_size": current_size,
                 "new_limit": new_limit,
                 "change_summary": change_summary.strip(),
+                **(
+                    {"governing_cap_repair": governing_cap_repair}
+                    if governing_cap_repair
+                    else {}
+                ),
             }
     else:
         content = payload.content.strip()
@@ -1021,6 +1044,8 @@ async def agent_annotate(
     if is_size_breach:
         if "new_limit" in ctx:
             response["new_limit"] = ctx["new_limit"]
+        if "governing_cap_repair" in ctx:
+            response["governing_cap_repair"] = ctx["governing_cap_repair"]
         if ctx.get("is_chronic"):
             response["is_chronic"] = True
             response["bump_count"] = ctx["bump_count"]
@@ -1732,7 +1757,7 @@ async def strategic_operation(
                         project.id,
                         retired_direction_id,
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.warning(
                         "[STRATEGIC] API path: failed to fetch retirement memo for recently-retired "
                         "direction %s on project %s",
@@ -4364,6 +4389,7 @@ async def strategic_operation(
                 status_code=400, detail=f"Unknown direction_id: {direction_id}"
             )
         direct_discovery_cycle_id: uuid.UUID | None = None
+        direct_cycle = None
         if spawn_type in {"research", "web_research"} and direction_entry is not None:
             from app.discovery_admission import (
                 DiscoveryCycleUnavailable,
@@ -4377,6 +4403,7 @@ async def strategic_operation(
                     direction_key=str(direction_id),
                     direction=direction_entry,
                     runtime_config=_runtime_config,
+                    commissioned_question=prompt,
                     join_open_cycle=True,
                 )
             except DiscoveryCycleUnavailable as exc:
@@ -4388,10 +4415,7 @@ async def strategic_operation(
         # jump ahead of unrelated projects/tasks; inherit the direction's real
         # high/medium/low intent instead, with normal medium priority for
         # direction-free bounded work.
-        spawn_priority = {"high": 100, "medium": 50, "low": 0}.get(
-            str((direction_entry or {}).get("priority") or "medium").lower(),
-            50,
-        )
+        spawn_priority = direction_task_priority(direction_entry)
 
         # Optional explicit criterion_ids — validated against active keys at
         # task-creation time (same as direction-row inheritance below). Allows
@@ -4423,6 +4447,14 @@ async def strategic_operation(
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id
+        enrich_direct_research_payload(
+            spawn_payload,
+            project=project,
+            direction_entry=direction_entry,
+            direction_id=direction_id,
+            direct_cycle=direct_cycle,
+            runtime_config=_runtime_config,
+        )
         if declared_landing_gate:
             spawn_payload["require_deps_landed_on"] = declared_landing_gate
         if declared_release_base:
@@ -4504,15 +4536,24 @@ async def strategic_operation(
                     }
                 )
 
-        # Apply per-type model/effort defaults
-        type_model = _runtime_config.get("task_type_models", {}).get(spawn_type) or None
-        type_effort = (
-            _runtime_config.get("task_type_efforts", {}).get(spawn_type) or None
-        )
-        if type_model:
-            spawn_payload["model"] = type_model
-        if type_effort:
-            spawn_payload["effort"] = type_effort
+        # Apply legacy per-type model/effort defaults to task classes that still
+        # consume them. Research is deliberately excluded: payload.model and
+        # payload.effort are explicit per-task pins and outrank the canonical
+        # ``task_type_routing['research']`` frontier route. Copying an old
+        # task_type_efforts value here could silently downgrade a new research
+        # parent from max effort, while copying task_type_models bypasses the
+        # provider/effort model matrix entirely.
+        if spawn_type != "research":
+            type_model = (
+                _runtime_config.get("task_type_models", {}).get(spawn_type) or None
+            )
+            type_effort = (
+                _runtime_config.get("task_type_efforts", {}).get(spawn_type) or None
+            )
+            if type_model:
+                spawn_payload["model"] = type_model
+            if type_effort:
+                spawn_payload["effort"] = type_effort
         try:
             spawn_payload = _validate_internal_payload(
                 spawn_payload, f"strategic_spawn_task:{spawn_type}"
@@ -4625,6 +4666,15 @@ async def strategic_operation(
                 "depends_on": depends_on_ids,
             }
         }
+        await enforce_direct_research_cycle_occupancy(
+            session,
+            project=project,
+            parent_task=task,
+            direct_cycle=direct_cycle,
+            direction_id=direction_id,
+            request_data=data,
+            normalized_specification=normalized_specification,
+        )
         try:
             submission = await submit_strategic_spawn(
                 session,
@@ -5864,8 +5914,11 @@ async def strategic_operation(
             count_active_criteria_for_version as _count_active_criteria,
             get_criteria_by_keys as _get_criteria_by_keys,
             get_criterion_by_text as _get_criterion_by_text,
+            normalize_evidence_contract as _normalize_evidence_contract,
+            update_criterion_evidence_contract as _update_evidence_contract,
             generate_criterion_key as _gen_criterion_key,
             is_operator_authored_criterion as _is_operator_authored_criterion,
+            is_owner_controlled_machine_contract as _is_owner_controlled_machine_contract,
             MAX_CRITERIA_PER_VERSION as _MAX_CRITERIA,
             OperatorAuthoredRetractionError as _OperatorAuthoredRetractionError,
             retract_criterion as _retract_criterion,
@@ -5899,6 +5952,28 @@ async def strategic_operation(
                     status_code=400,
                     detail="set_acceptance_criteria: each criterion must have a non-empty 'text' string",
                 )
+            if "evidence_contract" in item:
+                contract = item.get("evidence_contract")
+                if contract is not None and not isinstance(contract, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="set_acceptance_criteria: 'evidence_contract' must be an object or null when provided",
+                    )
+                if contract is not None:
+                    normalized_contract = _normalize_evidence_contract(contract)
+                    if normalized_contract is None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="set_acceptance_criteria: unsupported or malformed evidence_contract",
+                        )
+                    if normalized_contract.get("type") == "prepromotion_ci_build_smoke":
+                        raise HTTPException(
+                            status_code=403,
+                            detail=(
+                                "set_acceptance_criteria: external CI evidence "
+                                "contracts require an authenticated project owner"
+                            ),
+                        )
         retract_input = data.get("retract", [])
         if not isinstance(retract_input, list):
             raise HTTPException(
@@ -5975,14 +6050,15 @@ async def strategic_operation(
             pre_status_by_key[criterion_key] = (
                 existing.status if existing is not None else None
             )
-            if existing is not None and _is_operator_authored_criterion(
-                existing.created_by
+            if existing is not None and (
+                _is_operator_authored_criterion(existing.created_by)
+                or _is_owner_controlled_machine_contract(existing)
             ):
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        f"set_acceptance_criteria: criterion '{criterion_key}' was "
-                        f"authored by an operator and cannot be retracted by the "
+                        f"set_acceptance_criteria: criterion '{criterion_key}' is "
+                        f"operator-controlled and cannot be retracted by the "
                         f"autonomous loop; operator action is required to retract it"
                     ),
                 )
@@ -6131,12 +6207,35 @@ async def strategic_operation(
             text = item["text"].strip()
             direction_keys_input: list[str] = list(item.get("direction_keys") or [])
 
-            existing = await _get_criterion_by_text(
-                session, project.id, open_version.id, text
-            )
+            try:
+                existing = await _get_criterion_by_text(
+                    session, project.id, open_version.id, text
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             if existing is not None:
                 criterion_key = existing.criterion_key
                 is_new = False
+                if (
+                    "evidence_contract" in item
+                    and not _is_operator_authored_criterion(existing.created_by)
+                    and not _is_owner_controlled_machine_contract(existing)
+                ):
+                    # Operator-authored contracts are an ownership boundary:
+                    # strategic retries may reuse the criterion but may never
+                    # set, clear, or relax its machine contract.
+                    normalized_contract = _normalize_evidence_contract(
+                        item.get("evidence_contract")
+                    )
+                    if normalized_contract != existing.evidence_contract:
+                        await _update_evidence_contract(
+                            session,
+                            project_id=project.id,
+                            release_version_id=open_version.id,
+                            criterion_key=existing.criterion_key,
+                            evidence_contract=item.get("evidence_contract"),
+                            updated_by=f"strategist:{task.id}",
+                        )
             else:
                 if existing_active_count + new_added_count >= _MAX_CRITERIA:
                     skipped_over_cap += 1
@@ -6147,6 +6246,19 @@ async def strategic_operation(
                     release_version_id=open_version.id,
                     criterion_key=criterion_key,
                     text=text,
+                    evidence_contract=(
+                        _normalize_evidence_contract(item.get("evidence_contract"))
+                        if item.get("evidence_contract") is not None
+                        else None
+                    ),
+                    evidence_contract_updated_at=(
+                        _utcnow() if item.get("evidence_contract") is not None else None
+                    ),
+                    evidence_contract_updated_by=(
+                        f"strategist:{task.id}"[:128]
+                        if item.get("evidence_contract") is not None
+                        else None
+                    ),
                     created_by="strategist",
                 )
                 session.add(new_row)
@@ -6162,6 +6274,11 @@ async def strategic_operation(
                 dir_row = _direction_rows.get(dk)
                 if dir_row is None:
                     warnings.append(f"Unknown direction_key: {dk}")
+                    continue
+                if dir_row.status != "active":
+                    warnings.append(
+                        f"Inactive direction_key ignored: {dk} (status={dir_row.status})"
+                    )
                     continue
                 # Scrub stale (inactive/old-version) keys from the existing set,
                 # keeping only keys that are active in this version or were
@@ -6226,7 +6343,7 @@ async def strategic_operation(
             for _dk in _mapped_directions:
                 try:
                     await _backfill(session, project.id, _dk)
-                except Exception:  # noqa: BLE001, PERF203
+                except Exception:  # noqa: PERF203
                     logger.warning(
                         "[STRATEGIC API] set_acceptance_criteria backfill failed "
                         "for direction %s (non-fatal)",

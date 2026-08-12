@@ -246,6 +246,16 @@ async def _apply_ci_merged_landed_signal(
         project = (
             await session.get(Project, ci_task.project_id) if ci_task.project_id else None
         )
+    if project is not None:
+        from app.acceptance_gate import stamp_pr_changed_files_at_landing
+        from app.shared_state import get_project_integration_branch
+
+        if base_branch == get_project_integration_branch(project):
+            await stamp_pr_changed_files_at_landing(
+                ci_task,
+                session,
+                pr_number=review_loop.get("pr_number"),
+            )
     hotfix_lane = bool(
         (ci_task.first_payload or {}).get("hotfix")
         or (ci_task.context or {}).get("hotfix")

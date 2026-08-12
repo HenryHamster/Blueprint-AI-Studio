@@ -2236,7 +2236,7 @@ async def test_run_qualification_stale_verdict_still_blocks_live_promotion(
         release_version_id=version.id,
         candidate_sha="abcd" * 10,
         terminal_status="dry_run",
-        created_at=datetime(2026, 1, 1),  # OLDER than the pending attempt
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),  # OLDER than the pending attempt
     )
     db_session.add(verdict)
 
@@ -2302,7 +2302,7 @@ async def test_abandon_current_version_stale_verdict_still_blocks_live_promotion
         release_version_id=version.id,
         candidate_sha="beef" * 10,
         terminal_status="not_promoted",
-        created_at=datetime(2026, 1, 1),  # OLDER than the pending attempt
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),  # OLDER than the pending attempt
     )
     db_session.add(verdict)
 
@@ -3650,7 +3650,7 @@ def test_scoped_test_erosion_restoration_preserves_other_deletions():
         ],
         "test_count_delta": -5,
     }
-    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(  # noqa: RUF059
         report, prior_detail, prior_blocked=True,
     )
     assert "testing/still_gone.py" in (detail or {}).get("deleted_test_files", [])
@@ -4597,7 +4597,7 @@ async def test_legacy_pending_rubric_reconstructed_from_merge_grade_payload(
 async def test_legacy_pending_without_snapshot_or_task_is_provenance_unknown(
     db_session,
 ):
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     snapshot, provenance, error = await rq._resolve_launched_rubric(
         db_session, version, {"status": "pending"}
     )
@@ -4738,6 +4738,309 @@ async def test_criterion_coverage_incomplete_blocks_qualification(
     }
     assert _cv["c-missing1"]["status"] == "not_met"
     assert _cv["c-covered1"]["status"] == "met"
+
+
+def _authorship_contract_receipt(state: str, *, count: int = 0) -> dict:
+    base, head = "a" * 40, "b" * 40
+    receipt = {
+        "source": "github_compare",
+        "schema_version": 2,
+        "state": state,
+        "count": count if state == "resolved" else None,
+        "offenders": (
+            [{"sha": "c" * 12, "author": "operator"}]
+            if state == "resolved" and count
+            else []
+        ),
+        "range": {"base_sha": base, "head_sha": head},
+        "measured_at": "2026-01-01T00:00:00+00:00",
+        "retry": {
+            "attempt": 1,
+            "retryable": state == "unresolved",
+            "next_retry_at": (
+                "2026-01-02T00:00:00+00:00" if state == "unresolved" else None
+            ),
+        },
+    }
+    if state != "resolved":
+        receipt["reason"] = "github_authorship_timeout"
+    return receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "receipt", "expected_status", "expected_blocker"),
+    [
+        ("resolved_zero", _authorship_contract_receipt("resolved"), "met", None),
+        (
+            "resolved_nonzero",
+            _authorship_contract_receipt("resolved", count=1),
+            "not_met",
+            "prior_operator_authorship_nonzero",
+        ),
+        ("missing", None, "not_met", "prior_operator_authorship_evidence_missing"),
+        (
+            "invalid",
+            {"schema_version": "2", "state": "resolved"},
+            "not_met",
+            "prior_operator_authorship_evidence_missing",
+        ),
+        (
+            "unresolved",
+            _authorship_contract_receipt("unresolved"),
+            "not_met",
+            "prior_operator_authorship_evidence_missing",
+        ),
+        (
+            "terminal",
+            _authorship_contract_receipt("terminal"),
+            "not_met",
+            "prior_operator_authorship_evidence_missing",
+        ),
+        (
+            "spoofed",
+            {**_authorship_contract_receipt("resolved"), "extra": "tampered"},
+            "not_met",
+            "prior_operator_authorship_evidence_missing",
+        ),
+    ],
+)
+async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
+    db_session, mocker, label, receipt, expected_status, expected_blocker
+):
+    """The real finalize path projects only an explicit contract into the ledger."""
+    from app import category_verdict_ledger as cvl
+    from app.models import ReleaseVersion
+
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    project, version = await _make_project_and_version(db_session)
+    prior = ReleaseVersion(
+        project_id=project.id,
+        version_number=0,
+        status="promoted",
+        promoted_sha="a" * 40,
+        served_sha="b" * 40,
+        serving_status="serving_confirmed",
+        last_qualification={"operator_authored_commits": receipt} if receipt else {},
+    )
+    db_session.add(prior)
+    db_session.add(
+        VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key="generated-authorship-key",
+            text="This prose is not the binding machine contract.",
+            evidence_contract={
+                "type": "operator_authored_commits",
+                "predicate": {"max_count": 0},
+            },
+            status="active",
+            created_by="test",
+        )
+    )
+    await db_session.commit()
+
+    # No category_verdicts are preseeded: finalize must derive the verdict from
+    # the promoted receipt, write the category ledger, and apply the gate.
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+            "covers_goal": True,
+            "coverage_score": 1.0,
+            "biggest_gap": None,
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        version_goal="Ship the release-authorship contract",
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+
+    rows = await cvl.get_category_verdicts(db_session, version.id, "feed" * 10)
+    assert len(rows) == 1, label
+    assert rows[0].category_key == "generated-authorship-key"
+    assert rows[0].status == expected_status
+    assert rows[0].grader_run_id is None
+    expected_provenance = {
+        "kind": "machine",
+        "source": "release_authorship",
+        "source_kind": (
+            "github_compare"
+            if label == "resolved_zero" or label == "resolved_nonzero"
+            else (
+                "stored_receipt"
+                if label in {"unresolved", "terminal"}
+                else ("release_record_validation" if label != "missing" else "receipt_unavailable")
+            )
+        ),
+        "receipt_state": (
+            "resolved"
+            if label in {"resolved_zero", "resolved_nonzero"}
+            else (
+                label
+                if label in {"unresolved", "terminal"}
+                else ("missing" if label == "missing" else "missing_or_invalid")
+            )
+        ),
+        "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+    }
+    if label in {"resolved_zero", "resolved_nonzero", "unresolved", "terminal"}:
+        expected_provenance["receipt_source"] = "github_compare"
+        expected_provenance["receipt_measured_at"] = "2026-01-01T00:00:00+00:00"
+        expected_provenance["receipt_attempt"] = 1
+    assert rows[0].evidence_provenance == expected_provenance
+    if expected_blocker:
+        assert result.get("blocker") == expected_blocker
+        promote_spy.assert_not_called()
+    else:
+        promote_spy.assert_awaited_once()
+
+    criterion_evidence = (
+        await db_session.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id
+                == (
+                    await db_session.execute(
+                        select(VersionAcceptanceCriterion.id).where(
+                            VersionAcceptanceCriterion.criterion_key
+                            == "generated-authorship-key"
+                        )
+                    )
+                ).scalar_one()
+            )
+        )
+    ).scalars().all()
+    assert criterion_evidence == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("with_receipt", "expected_status"), [(True, "met"), (False, "not_met")])
+async def test_ci_build_smoke_contract_finalizes_without_grader_category(
+    db_session, mocker, with_receipt, expected_status
+):
+    """Trusted CI evidence inserts its own ledger fact even with no merge grader."""
+    from app import category_verdict_ledger as cvl
+    from app import shared_state
+    from app.release_prepromotion_rehearsal import (
+        PREPROMOTION_REHEARSAL_CHECKS,
+        PREPROMOTION_REHEARSAL_DEFERRED,
+        PREPROMOTION_REHEARSAL_KIND,
+    )
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    project, version = await _make_project_and_version(db_session)
+    criterion_key = "generated-ci-build-smoke-key"
+    db_session.add(
+        VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key=criterion_key,
+            text="Trusted main builds and smoke-tests the exact candidate.",
+            evidence_contract={
+                "type": "prepromotion_ci_build_smoke",
+                "predicate": {"required": True},
+            },
+            status="active",
+            created_by="test",
+        )
+    )
+    if with_receipt:
+        from app.models import ReleasePrepromotionDispatch
+
+        version.prepromotion_rehearsal_receipt = {
+            "kind": PREPROMOTION_REHEARSAL_KIND,
+            "schema_version": 1,
+            "source": "github_actions",
+            "project_id": str(project.id),
+            "release_version_id": str(version.id),
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "candidate_sha": "feed" * 10,
+            "repository": f"{project.github_owner}/{project.github_repo}",
+            "workflow_file": "prepromotion-rehearsal.yml",
+            "workflow_ref": "main",
+            "workflow_head_sha": "b" * 40,
+            "run_id": 42,
+            "run_attempt": 1,
+            "result": "passed",
+            "checks": list(PREPROMOTION_REHEARSAL_CHECKS),
+            "deferred": list(PREPROMOTION_REHEARSAL_DEFERRED),
+            "completed_at": "2026-08-11T12:00:00+00:00",
+        }
+        db_session.add(
+            ReleasePrepromotionDispatch(
+                id=uuid.UUID("33333333-3333-4333-8333-333333333333"),
+                release_version_id=version.id,
+                project_id=project.id,
+                candidate_sha="feed" * 10,
+                workflow_ref="main",
+                status="observed",
+                workflow_run_id=42,
+            )
+        )
+    db_session.add(version)
+    await db_session.commit()
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+            "covers_goal": True,
+            "coverage_score": 1.0,
+            "biggest_gap": None,
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        version_goal="Ship the trusted CI candidate gate",
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+
+    rows = await cvl.get_category_verdicts(db_session, version.id, "feed" * 10)
+    assert len(rows) == 1
+    assert rows[0].category_key == criterion_key
+    assert rows[0].status == expected_status
+    assert rows[0].grader_run_id is None
+    assert rows[0].evidence_provenance["kind"] == "machine"
+    if with_receipt:
+        assert rows[0].evidence_provenance["source_kind"] == "trusted_ci_workflow"
+        promote_spy.assert_awaited_once()
+    else:
+        assert rows[0].evidence_provenance["source_kind"] == (
+            "release_record_validation"
+        )
+        assert result.get("blocker") == "criterion_coverage_incomplete"
+        promote_spy.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -5014,7 +5317,7 @@ async def test_dual_write_tags_blocked_dimension_execution_site(db_session):
     until this version itself promotes — while dimensions that did not block carry
     no execution-site tag.
     """
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     candidate_sha = "deadbeef" * 5  # 40-char candidate SHA
 
     base_record = {
@@ -5295,13 +5598,24 @@ async def test_infra_failure_record_stamps_engine_sha(db_session, monkeypatch):
 
     monkeypatch.setenv("DEPLOY_SHA", "aabbccddeeff001")
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
+    attempt_policy = {
+        "threshold": 0.81,
+        "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
+    }
+    attempt_projection = rq.promotion_policy_projection(
+        attempt_policy,
+        source="runtime_config",
+    )
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": _LEDGER_SHA_A,
         "ci_green": True,
         "smoketest_enabled": True,
         "started_at": "2026-07-10T00:00:00",
+        "promotion_policy_snapshot": attempt_policy,
+        "promotion_policy_source": "runtime_config",
+        "promotion_policy_hash": attempt_projection["policy_hash"],
     }
     db_session.add(version)
     await db_session.commit()
@@ -5323,6 +5637,7 @@ async def test_infra_failure_record_stamps_engine_sha(db_session, monkeypatch):
     assert lq["engine_sha"] == "aabbccddeeff001", (
         f"expected engine_sha 'aabbccddeeff001' in last_qualification record, got {lq.get('engine_sha')!r}"
     )
+    assert rq.qualification_attempt_policy_projection(lq) == attempt_projection
     history = lq["infra_attempt_history"]
     assert history, "infra_attempt_history must be non-empty"
     latest = history[-1]
@@ -5340,7 +5655,7 @@ async def test_infra_failure_engine_sha_none_when_deploy_sha_absent(db_session, 
 
     monkeypatch.delenv("DEPLOY_SHA", raising=False)
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": _LEDGER_SHA_A,
@@ -5388,7 +5703,7 @@ async def test_permanent_gate_incapacity_message_includes_engine_sha(db_session,
 
     monkeypatch.setattr(rq_module, "_notify_operator", _capture_notify)
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     # Compute the expected signature so pre-seeded history entries match.
     _infra_error = "migration_apply_check_unavailable"
     _sig = _infra_failure_signature(_infra_error, [])
@@ -5437,7 +5752,7 @@ async def test_infra_failure_streak_is_per_dimension(db_session):
     burn another gate's retry budget."""
     from app import release_qualifier_audit as rqa
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": _LEDGER_SHA_A,
@@ -6022,7 +6337,7 @@ async def test_infra_failure_does_not_downgrade_resolved_dimension(
     from app.models import QualificationDimensionResult
     from sqlalchemy import select as sa_select
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     candidate_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
     # Seed a pre-resolved dimension row.
@@ -6080,7 +6395,7 @@ async def test_ledger_integrity_infra_failure_does_not_overwrite_passed_audit(
     from app import release_qualifier_audit as rqa
     from app.models import QualificationDimensionResult
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     candidate_sha = "abc123def456abc123def456abc123def456abc1"
     version.qualification_attempts = 2
     db_session.add(version)
@@ -6390,7 +6705,7 @@ async def test_reused_blocked_test_erosion_fact_stays_blocked_not_scored_1_0(
 
     shared_state.runtime_config["promotion_enabled"] = True
 
-    project, version = await _make_project_and_version(db_session)
+    _project, version = await _make_project_and_version(db_session)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
@@ -6674,10 +6989,10 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     ``explain_qualification_trigger`` classifier onto every branch of
     ``agent_fetch_qualification``), end-to-end over the real HTTP route.
     """
-    from httpx import AsyncClient  # noqa: PLC0415
-    from app.auth import create_agent_token  # noqa: PLC0415
-    from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS  # noqa: PLC0415
-    from app.shared_state import runtime_config as _test_runtime_config  # noqa: PLC0415
+    from httpx import AsyncClient
+    from app.auth import create_agent_token
+    from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS
+    from app.shared_state import runtime_config as _test_runtime_config
 
     assert isinstance(client, AsyncClient)
 

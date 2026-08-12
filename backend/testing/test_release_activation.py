@@ -1,7 +1,11 @@
 """Tests for the bounded activation-phase retry contract."""
 
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
 import pytest
 
+from app.operator_attention import _promoted_awaiting_activation_attention_item
 from app.release_activation import ActivationPhaseFailure, retry_activation_phase
 
 
@@ -51,3 +55,30 @@ def test_activation_retries_failed_phase_then_reports_substantiated_failure():
     assert failure.attempts == 3
     assert str(failure.final_exception) == "root release exit 17"
     assert "activation failed after 3 attempts" in str(failure)
+
+
+@pytest.mark.parametrize("approved", [False, True])
+def test_activation_attention_uses_the_single_approval_path(approved):
+    """Attention guidance never adds a hand-typed deploy step."""
+    version = SimpleNamespace(
+        id="version-1",
+        version_number=7,
+        deploy_confirm_deadline=datetime(
+            2026, 1, 1, 11, 0, tzinfo=timezone.utc
+        ),
+        activation_requested_at=(
+            datetime(2026, 1, 1, 10, 5, tzinfo=timezone.utc) if approved else None
+        ),
+        activation_requested_by="operator@example.com" if approved else None,
+        promoted_at=datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc),
+    )
+
+    item = _promoted_awaiting_activation_attention_item("project-1", version)
+
+    assert "blueprint deploy" not in item["detail"]
+    if approved:
+        assert "No further operator action is required." in item["detail"]
+        assert item["activation_state"] == "approved_pending_execution"
+    else:
+        assert "approve activation" in item["detail"]
+        assert item["activation_state"] == "awaiting_approval"

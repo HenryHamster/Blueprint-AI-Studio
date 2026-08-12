@@ -11,6 +11,7 @@ import {
   validateCfgShellSafety,
   isBlueprintSelfRepo,
   projectVerificationTargets,
+  projectVerificationDirectories,
   shouldRunBackendMergeGate,
   sanitizeCiFailureSelectors,
   type CodeChangeHelperConfig,
@@ -765,7 +766,10 @@ ${loadSizeGuardrailScript()}`;
   let stackBlocks: string;
   const isSelfRepo = isBlueprintSelfRepo(cfg.owner, cfg.repo);
   if (cfg.buildConfig?.directories?.length) {
-    stackBlocks = buildConfigDrivenStackBlocks(cfg.buildConfig, cfg.taskId);
+    stackBlocks = buildConfigDrivenStackBlocks(
+      cfg.buildConfig,
+      new Set(projectVerificationDirectories(cfg)),
+    );
   } else if (isSelfRepo) {
     stackBlocks = blueprintStackBlocks;
   } else {
@@ -869,105 +873,6 @@ export function isPytestCmd(testCmd: string): boolean {
   return /^(python3?\s+-m\s+)?pytest(\s|$)/.test(testCmd.trim());
 }
 
-/** Honest pytest gate for a config-driven directory (trapped tasks 22cb9d94 /
- *  6b14ec01, 2026-06-06): a bare pytest run silently degrades to an in-memory
- *  SQLite fallback when the test suite selects its database from the
- *  environment (Blueprint conftest: USE_TEST_POSTGRES=true + a postgresql
- *  DATABASE_URL) and that env isn't set — pre-existing Postgres-only tests
- *  then fail REGARDLESS of the diff and the mandatory ./pr gate blocks
- *  finished work on an environment artifact.
- *
- *  Generated decision ladder (all probes run at gate time, in bash):
- *    1. The conventional per-directory Docker harness (scripts/test-<dir>.sh,
- *       Blueprint: scripts/test-backend.sh) + Docker + enough memory →
- *       run the sanctioned harness instead of bare pytest.
- *    2. Harness + Docker but <4 GB available (the harness's own memory guard
- *       would refuse the full suite) → run the harness's standalone mode when
- *       it advertises one — a genuine partial run, never a silent degrade.
- *    3. Otherwise run the configured command verbatim WHEN it is faithful:
- *       the Postgres test env is present, or the suite does not select its
- *       database from the environment at all (no USE_TEST_POSTGRES in its
- *       conftest) — the gate stays fully mandatory on healthy environments.
- *    4. Only the unfaithful SQLite fallback remains → GATE-ENVIRONMENT:
- *       skip the run loudly, append a marker ./pr surfaces after the gate,
- *       and tell the agent to carry faithful evidence (or ./blocked) —
- *       never an indefinite block on a baseline-red environment. */
-function buildPytestGateInner(dirPrefix: string, testCmd: string, taskId: string): string {
-  // Only a top-level directory maps onto the scripts/test-<dir>.sh harness
-  // convention; nested paths skip straight to the faithfulness checks.
-  const harness = dirPrefix.includes('/') ? '' : `scripts/test-${dirPrefix}.sh`;
-  const harnessProbe = harness
-    ? `    if [ -f ${harness} ] && command -v docker >/dev/null 2>&1; then
-      _AVAIL_MB=\${BLUEPRINT_MEM_AVAIL_MB:-$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 99999)}
-      if [ -n "\${ALLOW_LOW_MEM:-}" ]; then
-        # Explicit opt-in: force the full sanctioned harness regardless of memory.
-        _GATE_MODE="harness"
-      elif grep -qs -- '--standalone' ${harness}; then
-        # Default on the agent VM: the local gate is a SMOKE CHECK; the full
-        # Docker/Postgres suite is CI's job (and OOMs the 8 GB agent VM, exit
-        # 137). When the harness offers its sanctioned standalone partial, always
-        # prefer it — do NOT run the full suite just because memory happens to be
-        # free at gate-start (the old "_AVAIL_MB >= 4096 -> full" rule fired the
-        # full suite on exactly the VMs too small to survive it).
-        _GATE_MODE="harness-standalone"
-      elif [ "\${_AVAIL_MB:-99999}" -ge 4096 ]; then
-        # Harness has no standalone mode — only then run the full harness, and
-        # only with memory headroom for it.
-        _GATE_MODE="harness"
-      fi
-    fi
-`
-    : '';
-  const harnessCases = harness
-    ? `      harness)
-        run "${dirPrefix} test (sanctioned harness)" bash -c 'set -o pipefail; bash ${harness} 2>&1 | tail -200' ;;
-      harness-standalone)
-        echo "[check] note: local gate is a smoke check — full Docker/Postgres suite runs in CI; running the harness standalone mode"
-        run "${dirPrefix} test (harness standalone)" bash -c 'set -o pipefail; bash ${harness} --standalone --no-postgres 2>&1 | tail -200' ;;
-`
-    : '';
-  return `    # Honest pytest gate: prefer the sanctioned Docker harness; if only an
-    # unfaithful SQLite fallback is available, emit GATE-ENVIRONMENT instead
-    # of blocking on pre-existing environment-only failures. CI remains the
-    # authoritative Postgres run either way.
-    _GATE_MODE="bare"
-    _PG_ENV_OK=0
-    case "\${DATABASE_URL:-}" in
-      postgresql*) [ "$(printf '%s' "\${USE_TEST_POSTGRES:-}" | tr '[:upper:]' '[:lower:]')" = "true" ] && _PG_ENV_OK=1 ;;
-    esac
-${harnessProbe}    if [ "$_GATE_MODE" = "bare" ] && [ "$_PG_ENV_OK" = "0" ] && grep -qs USE_TEST_POSTGRES "${dirPrefix}/conftest.py" "${dirPrefix}"/*/conftest.py; then
-      # The suite selects Postgres-vs-SQLite from env, the Postgres test env
-      # is absent, and the sanctioned harness cannot run here — a bare run
-      # would be the unfaithful SQLite fallback.
-      _GATE_MODE="gate-env"
-    fi
-    case "$_GATE_MODE" in
-${harnessCases}      bare)
-        _PYTEST_RC=0
-        echo "[check] ${dirPrefix} test..."
-        ( cd "${dirPrefix}" && ${testCmd} ) || _PYTEST_RC=$?
-        if [ "$_PYTEST_RC" = "0" ]; then
-          echo "[check] ${dirPrefix} test OK"
-        elif [ "$_PYTEST_RC" = "5" ]; then
-          echo "[check] ${dirPrefix} test: no tests collected (pytest exit 5) — non-blocking on this environment"
-          printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${dirPrefix}: pytest exit 5 (no tests collected) — non-blocking" >> /tmp/check_gate_env_${taskId}.txt
-        elif [ "$_PYTEST_RC" = "2" ]; then
-          echo "[check] ${dirPrefix} test: collection error (pytest exit 2, possibly missing deps) — non-blocking"
-          printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${dirPrefix}: pytest exit 2 (collection error) — non-blocking" >> /tmp/check_gate_env_${taskId}.txt
-        else
-          echo "[check] ${dirPrefix} test FAILED (exit $_PYTEST_RC)"
-          FAILED+=("${dirPrefix} test")
-        fi ;;
-      gate-env)
-        echo "[check] GATE-ENVIRONMENT: ${dirPrefix} test gate cannot run faithfully on this VM."
-        echo "[check]   A bare pytest here would select the in-memory SQLite fallback (no Postgres test env, no Docker for the sanctioned harness), where pre-existing Postgres-only tests fail regardless of your diff."
-        echo "[check]   Skipping the unfaithful run instead of blocking on an environment artifact. This is NOT a verdict on your change:"
-        echo "[check]   - Validate the diff where the suite CAN faithfully run (the project's Docker/Postgres harness, or targeted single-file runs) and record that evidence in the PR body."
-        echo "[check]   - CI runs the authoritative Postgres suite on the PR after ./pr open."
-        echo "[check]   - If you have NO faithful test evidence for a test-relevant change, call ./blocked \\"<reason>\\" --needs-capability \\"the test environment this suite requires\\" instead of shipping blind."
-        printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${dirPrefix}: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env; a bare run would be an unfaithful SQLite fallback" >> /tmp/check_gate_env_${taskId}.txt ;;
-    esac`;
-}
 
 /** Generate config-driven per-directory ./check blocks from a project's
  *  build_config. Mirrors the per-directory loop in runProjectLintChecks
@@ -980,7 +885,10 @@ ${harnessCases}      bare)
  *  shell metacharacters (including single quotes), so emitting them as
  *  single-quoted bash literals here is injection-safe — see CLAUDE.md on
  *  generating one language from another. */
-function buildConfigDrivenStackBlocks(buildConfig: BuildConfig, taskId: string): string {
+function buildConfigDrivenStackBlocks(
+  buildConfig: BuildConfig,
+  retainedVerificationDirectories: ReadonlySet<string>,
+): string {
   const dirs = buildConfig.directories ?? [];
   const envLines = Object.entries(buildConfig.env_vars ?? {}).map(
     ([k, v]) => `export ${k}='${v}'`,
@@ -1001,15 +909,11 @@ function buildConfigDrivenStackBlocks(buildConfig: BuildConfig, taskId: string):
     if (safeCmd(dir.install_cmd)) inner.push(`  run "${dirPrefix} install" bash -c 'cd "${dirPrefix}" && ${dir.install_cmd}'`);
     if (safeCmd(dir.lint_cmd)) inner.push(buildLintInner(dirPrefix, dir.lint_cmd));
     if (safeCmd(dir.build_cmd)) inner.push(`  run "${dirPrefix} build" bash -c 'cd "${dirPrefix}" && ${dir.build_cmd}'`);
-    if (safeCmd(dir.test_cmd)) {
+    const normalizedDirPrefix = dirPrefix.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '') || '.';
+    const usesRetainedVerification = retainedVerificationDirectories.has(normalizedDirPrefix);
+    if (safeCmd(dir.test_cmd) && !usesRetainedVerification) {
       inner.push(`  if [ "$WITH_TESTS" = "1" ]; then`);
-      if (isPytestCmd(dir.test_cmd)) {
-        // Bare pytest can silently degrade to an unfaithful SQLite fallback —
-        // route through the honest gate (harness preference + GATE-ENVIRONMENT).
-        inner.push(buildPytestGateInner(dirPrefix, dir.test_cmd, taskId));
-      } else {
-        inner.push(`    run "${dirPrefix} test" bash -c 'cd "${dirPrefix}" && ${dir.test_cmd}'`);
-      }
+      inner.push(`    run "${dirPrefix} test" bash -c 'cd "${dirPrefix}" && ${dir.test_cmd}'`);
       inner.push(`  fi`);
     }
     if (inner.length === 0) continue;

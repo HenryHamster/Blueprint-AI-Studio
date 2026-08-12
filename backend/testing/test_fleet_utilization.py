@@ -717,6 +717,88 @@ async def test_vm_slot_fields_exclude_orphaned_leases(monkeypatch):
     assert snap["vm_saturation"] == "healthy"  # 5/10 = 0.5 < 0.70
 
 
+# ── compute_headroom_spawn_budget ────────────────────────────────────────────
+
+
+def test_headroom_budget_unmeasured_fails_open_to_cap():
+    """No measurable headroom (GCP/warm-pool reads absent) fails open to the cap."""
+    from app.fleet_utilization import compute_headroom_spawn_budget
+
+    result = compute_headroom_spawn_budget(
+        {"vm_slots_available": None, "vm_cap": None, "active_task_vms": None},
+        min_free_slots=2,
+        cap=6,
+    )
+    assert result["budget"] == 6
+    assert result["available"] is None
+    assert result["reason"] == "headroom_unmeasured"
+
+
+def test_headroom_budget_falls_back_to_task_table_capacity():
+    """When vm_slots_available is missing but capacity + active-task counts are
+    known, budget derives from vm_cap - active_task_vms (the old binary gate's view)."""
+    from app.fleet_utilization import compute_headroom_spawn_budget
+
+    result = compute_headroom_spawn_budget(
+        {"vm_slots_available": None, "vm_cap": 10, "active_task_vms": 3},
+        min_free_slots=2,
+        cap=6,
+    )
+    assert result["available"] == 7
+    assert result["budget"] == 6  # min(7, cap)
+    assert result["reason"] == "headroom_scaled"
+
+
+def test_headroom_budget_below_floor_blocks():
+    """available below min_free_slots yields budget 0 — the new 'vm_slots_full' gate."""
+    from app.fleet_utilization import compute_headroom_spawn_budget
+
+    result = compute_headroom_spawn_budget(
+        {"vm_slots_available": 1, "vm_cap": 10, "active_task_vms": 9},
+        min_free_slots=2,
+        cap=6,
+    )
+    assert result["budget"] == 0
+    assert result["reason"] == "headroom_below_floor"
+    # Exactly at the floor is still admissible.
+    result = compute_headroom_spawn_budget(
+        {"vm_slots_available": 2, "vm_cap": 10, "active_task_vms": 8},
+        min_free_slots=2,
+        cap=6,
+    )
+    assert result["budget"] == 2
+    assert result["reason"] == "headroom_scaled"
+
+
+def test_headroom_budget_scales_with_available_and_caps():
+    """budget = min(available, cap): scarce headroom admits proportionally less,
+    abundant headroom admits up to the cap."""
+    from app.fleet_utilization import compute_headroom_spawn_budget
+
+    scarce = compute_headroom_spawn_budget(
+        {"vm_slots_available": 3, "vm_cap": 10, "active_task_vms": 7},
+        min_free_slots=2,
+        cap=6,
+    )
+    assert scarce["budget"] == 3
+    assert scarce["reason"] == "headroom_scaled"
+
+    abundant = compute_headroom_spawn_budget(
+        {"vm_slots_available": 8, "vm_cap": 10, "active_task_vms": 2},
+        min_free_slots=2,
+        cap=6,
+    )
+    assert abundant["budget"] == 6
+    assert abundant["reason"] == "headroom_scaled"
+
+    custom_cap = compute_headroom_spawn_budget(
+        {"vm_slots_available": 20, "vm_cap": 20, "active_task_vms": 0},
+        min_free_slots=2,
+        cap=3,
+    )
+    assert custom_cap["budget"] == 3
+
+
 # ── VM-slot segment in strategic axis formatter ──────────────────────────────
 
 

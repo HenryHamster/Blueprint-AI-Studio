@@ -16,20 +16,78 @@ python scripts/blueprint.py deploy --sha 74bf87c  # a specific main build
 
 The client finds the newest successful "Deploy Blueprint" run on `main`,
 downloads its `local-app-release.json` + `.sha256` artifact, verifies the
-checksum, and invokes the host-side shim over SSH.
+checksum, and invokes the host-side shim over SSH. This remains the supported
+manual/emergency path: `--sha`, `--force`, `--dry-run`, and interactive
+confirmation keep their existing behavior.
 
 ## Host-side shim and root release service (one-time install)
 
 The local-app bootstrap installs the shim root-owned together with an
 ACL-limited socket unit and root service. The deploy agent submits its
 approval-bound digest and revision over that socket; no sudoers grant is used
-by the hardened agent:
+by the hardened agent. The bootstrapper rejects a normal user-owned checkout
+by design, so stage the reviewed inputs into a root-owned, mode-0700 directory
+and execute only that staged copy:
 
 ```bash
-# from a checkout at the reviewed commit
+STAGE=/var/lib/blueprint/bootstrap/local-app-release
+sudo install -d -o root -g root -m 0700 "$STAGE"
+for name in frontend_release_manifest.py local_app_release.py \
+  release_preconditions.py local_api_service.py local_worker_service.py \
+  blueprint.py blueprint_api.py blueprint_release.py \
+  blueprint-edge-system.service bootstrap_local_app_release.py; do
+  sudo install -o root -g root -m 0700 "scripts/$name" "$STAGE/$name"
+done
+sudo install -o root -g root -m 0700 \
+  backend/app/release_activation.py "$STAGE/release_activation.py"
+sudo env -i SUDO_USER=henry_hamster PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  "$STAGE/bootstrap_local_app_release.py" --revision FULL_GIT_SHA
+```
+
+## Approved activation deploy agent
+
+For the normal in-product activation loop, refresh the root-owned staging
+directory above at the reviewed commit, then bootstrap from it:
+
+```bash
 sudo env -i SUDO_USER=henry_hamster PATH=/usr/sbin:/usr/bin:/sbin:/bin \
   /var/lib/blueprint/bootstrap/local-app-release/bootstrap_local_app_release.py \
   --revision FULL_GIT_SHA
+sudo systemctl status blueprint-deploy-agent.service
+```
+
+The bootstrap installs the root-owned shim, the ACL-limited release socket,
+and `blueprint-deploy-agent.service`, then explicitly restarts that auxiliary
+unit so an update cannot leave an old immutable bundle running. The service runs as `henry_hamster` (the
+user that invoked bootstrap via `sudo`), reads that account's existing Blueprint
+admin configuration and copies its owner-only `~/.config/gh/hosts.yml`
+credential into the service-owned `/var/lib/blueprint-deploy-agent/gh` path.
+Bootstrap runs `gh auth status` and the exact private-repository `gh run list`
+query as `henry_hamster` before enabling the unit; authenticate that account
+first with `sudo -u henry_hamster -H gh auth login` and grant it read access to
+Actions artifacts. Thirty seconds is the
+chosen operational cadence: it is prompt enough for an explicit operator click
+without making a transient API/GitHub failure produce a rapid retry loop.
+
+On each poll it reads only the latest promoted version. It proceeds only when
+that version is both still `unconfirmed` and has an
+`activation_requested_at` approval. It downloads and pins the successful CI
+manifest whose revision exactly equals the approved promoted SHA, verifies the
+checksum/digest/revision, rereads the approval before invoking
+`/usr/local/sbin/blueprint-release` locally, and posts the existing activation
+receipt only after that shim succeeds. A failed shim posts no receipt; a failed
+receipt stays visible as an approved-but-unconfirmed lifecycle state and is
+retried from `/var/lib/blueprint-deploy-agent/deploy-agent.state` on the next poll
+without re-running the privileged release. The backend receipt guard is the
+final protection against a superseding promotion racing the local shim.
+
+The unit's lock is `/run/blueprint-deploy-agent/deploy-agent.lock`. Its parent
+directory is created by systemd's `RuntimeDirectory`, owned for the unprivileged
+service account, so the agent never relies on write access to `/run` itself.
+Inspect operational failures with:
+
+```bash
+sudo journalctl -u blueprint-deploy-agent.service -f
 ```
 
 ## Why the passwordless rule is safe

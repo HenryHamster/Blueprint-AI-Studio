@@ -1201,6 +1201,40 @@ async def test_spawn_design_doc_update_includes_knowledge_index_when_docs_exist(
 
 
 @pytest.mark.asyncio
+async def test_design_doc_spawn_commits_cadence_receipt_with_task(db_session):
+    """Architecture-phase cadence receipt is born in the task/cycle commit."""
+    from app.research_cycle_cadence import (
+        STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY,
+        STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY,
+    )
+
+    project = _make_project(
+        vision={"purpose": "test purpose", "_research_spawn_count": 6}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_design_doc_update(
+        project,
+        db_session,
+        cadence_accepted_count=6,
+    )
+
+    assert spawned is True
+    await db_session.refresh(project)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = next(
+        row
+        for row in result.scalars().all()
+        if row.first_payload["type"] == "design_doc_update"
+    )
+    assert task.context[STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY] == 6
+    assert project.vision[STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY] == 6
+    assert project.vision["_research_spawn_count"] == 6
+
+
+@pytest.mark.asyncio
 async def test_spawn_design_doc_update_omits_knowledge_index_when_none(db_session):
     """design_doc_update omits knowledge_index entirely when no documents exist."""
     project = _make_project(vision={"purpose": "test purpose"})
@@ -7328,7 +7362,21 @@ async def test_version_phase_includes_promotion_readiness(
     """When is_self_repo=True and QualificationVerdict rows exist, the strategic
     payload's version_phase block carries promotion_readiness with ready,
     would_promote_rate, and recurring_blockers keys."""
+    from app import release_qualifier as rq
     from app.models import ReleaseVersion, QualificationVerdict
+
+    mocker.patch.dict(
+        rq._runtime_config,
+        {
+            "promotion_threshold": 0.81,
+            "promotion_weights": {
+                "audit": 4 / 7,
+                "test_erosion": 3 / 7,
+            },
+            "completion_debt_weight_mode": "observe",
+        },
+        clear=False,
+    )
 
     await _ensure_releaseversion_table(db_session)
     await _ensure_verdict_table(db_session)
@@ -7349,6 +7397,19 @@ async def test_version_phase_includes_promotion_readiness(
         phase="stabilize",
         status="open",
         opened_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "promotion_policy_snapshot": {
+                "threshold": 0.90,
+                "weights": {
+                    "audit": 0.5,
+                    "test_erosion": 0.25,
+                    "smoketest": 0.25,
+                },
+            },
+            "promotion_policy_source": "yaml_file",
+            "promotion_policy_fallback_error": None,
+        },
     )
     db_session.add(version)
     await db_session.commit()
@@ -7393,6 +7454,16 @@ async def test_version_phase_includes_promotion_readiness(
     assert "recurring_blockers" in pr, (
         "promotion_readiness must have 'recurring_blockers' key"
     )
+
+    current_policy = payload["current_effective_policy"]
+    attempt_policy = payload["active_or_last_attempt_policy"]
+    assert current_policy["threshold"] == pytest.approx(0.81)
+    assert current_policy["source"] == "runtime_config"
+    assert attempt_policy["threshold"] == pytest.approx(0.90)
+    assert attempt_policy["source"] == "yaml_file"
+    assert current_policy["policy_hash"] != attempt_policy["policy_hash"]
+    assert vp["current_effective_policy"] == current_policy
+    assert vp["active_or_last_attempt_policy"] == attempt_policy
 
 
 @pytest.mark.asyncio
@@ -18602,7 +18673,14 @@ async def test_spawn_task_routes_research_through_unified_policy(db_session):
 
 
 @pytest.mark.asyncio
-async def test_direction_research_uses_one_discovery_cycle_without_raw_wake(db_session):
+async def test_direction_research_rejects_second_root_without_raw_wake(db_session):
+    """One Strategic root owns a direction cycle; web research cannot join as a peer.
+
+    A web-research task may be subordinate work spawned beneath the owning
+    research parent. A second direct Strategic spawn has the Strategic review as
+    its parent, however, so accepting it would create a second full-headroom
+    cycle source and split carry/review ownership.
+    """
     project, review_id = await _make_strategic_review_task(db_session)
     project.directions = [
         {
@@ -18639,7 +18717,7 @@ async def test_direction_research_uses_one_discovery_cycle_without_raw_wake(db_s
         )
     ).scalar_one_or_none() is None
 
-    second = await _post_strategic_operation(
+    rejected = await _post_strategic_operation(
         db_session,
         review_id,
         op="spawn_task",
@@ -18651,16 +18729,27 @@ async def test_direction_research_uses_one_discovery_cycle_without_raw_wake(db_s
             "idempotency_key": "research-frontier",
             "watch": True,
         },
+        expect_status=409,
     )
-    second_task = await db_session.get(Task, uuid.UUID(second["task_id"]))
-    assert second_task.discovery_cycle_id == cycle.id
-    assert (
+    assert "refusing to attach a second parent" in rejected["error"]["message"]
+
+    cycle_tasks = (
         await db_session.execute(
-            select(StrategicWatch).where(
-                StrategicWatch.target_task_id == second_task.id
+            select(Task).where(Task.discovery_cycle_id == cycle.id)
+        )
+    ).scalars().all()
+    assert [task.id for task in cycle_tasks] == [first_task.id]
+    cycle_requests = (
+        await db_session.execute(
+            select(StrategicSpawnRequest).where(
+                StrategicSpawnRequest.discovery_cycle_id == cycle.id
             )
         )
-    ).scalar_one().state == "pending"
+    ).scalars().all()
+    assert [request.task_id for request in cycle_requests] == [first_task.id]
+    assert (
+        await db_session.execute(select(StrategicWatch))
+    ).scalars().all() == []
 
 
 @pytest.mark.asyncio
@@ -18851,7 +18940,7 @@ async def test_spawn_strategic_review_includes_ci_compliance_when_available(
         },
         "computed": False,
     }
-    mocker.patch(
+    ensure_ci = mocker.patch(
         "app.ci_compliance.ensure_current_ci_compliance",
         new=AsyncMock(return_value=fake_envelope),
     )
@@ -18863,6 +18952,7 @@ async def test_spawn_strategic_review_includes_ci_compliance_when_available(
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
+    assert ensure_ci.await_args.args[0] is not db_session
 
     result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
@@ -20160,6 +20250,59 @@ async def test_resident_minimal_spawn_payload_ships_knowledge_index(db_session):
     # Raw JSONB note shape ({note, set_at}) must NOT appear.
     for n in notes:
         assert "note" not in n, f"Raw JSONB note shape leaked into spawn payload: {n}"
+
+
+@pytest.mark.asyncio
+async def test_resident_minimal_spawn_ships_bounded_current_policy_only(
+    db_session, mocker
+):
+    """Resident gets live policy truth without cadence/version attempt expansion."""
+    from app import release_qualifier as rq
+
+    mocker.patch.dict(
+        rq._runtime_config,
+        {
+            "promotion_threshold": 0.81,
+            "promotion_weights": {
+                "audit": 4 / 7,
+                "test_erosion": 3 / 7,
+            },
+            "completion_debt_weight_mode": "observe",
+        },
+        clear=False,
+    )
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        integration_branch="main",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session, resident_minimal=True)
+
+    assert spawned is True
+    task = (
+        (await db_session.execute(_select_agent_tasks(project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    policy = payload["current_effective_policy"]
+    assert policy["threshold"] == pytest.approx(0.81)
+    assert policy["source"] == "runtime_config"
+    assert policy["fallback_error"] is None
+    assert len(policy["policy_hash"]) == 64
+    assert set(policy) == {
+        "threshold",
+        "weights",
+        "source",
+        "fallback_error",
+        "policy_hash",
+    }
+    assert "active_or_last_attempt_policy" not in payload
+    assert "version_phase" not in payload
 
 
 @pytest.mark.asyncio

@@ -301,7 +301,10 @@ async def _requeue_parent_task(
         children = (
             (
                 await session.execute(
-                    select(Task).where(Task.parent_task_id == parent.id)
+                    select(Task).where(
+                        Task.parent_task_id == parent.id,
+                        Task.project_id == parent.project_id,
+                    )
                 )
             )
             .scalars()
@@ -434,7 +437,14 @@ async def _requeue_parent_task(
         return 0
 
     children = (
-        (await session.execute(select(Task).where(Task.parent_task_id == parent.id)))
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.project_id == parent.project_id,
+                )
+            )
+        )
         .scalars()
         .all()
     )

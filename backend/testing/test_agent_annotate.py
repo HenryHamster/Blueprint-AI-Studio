@@ -88,6 +88,68 @@ async def test_size_breach_creates_structured_message_and_returns_new_limit(
 
 
 @pytest.mark.asyncio
+async def test_size_breach_governed_module_directs_paired_source_cap_repair(
+    client: AsyncClient,
+    db_session,
+    mocker,
+):
+    """A governed cap repair must direct the JSON and source-constant edits."""
+    project = Project(name="Governed Size Breach", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-governed-size",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-governed-size", task_type="fix")
+    mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[])
+    resp = await client.post(
+        "/api/agent/annotate",
+        json={
+            "task_id": str(task.id),
+            "annotation_type": "size_breach",
+            "file_path": "release_qualifier.py",
+            "current_size": 10400,
+            "change_summary": "Added a governed qualification check",
+            "section": "backend",
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # The governed module clamps to its declared constant (10,649) instead of
+    # taking generic +15% headroom (11,950); the constant itself never grows.
+    assert body["new_limit"] == 10649
+    expected_repair = {
+        "source_path": "backend/app/release_qualifier.py",
+        "constant_name": "_MODULE_SIZE_GOVERNANCE_CAP",
+        "new_limit": 10649,
+    }
+    assert body["governing_cap_repair"] == expected_repair
+
+    msg = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.from_task_id == task.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert msg.context["governing_cap_repair"] == expected_repair
+    assert "_MODULE_SIZE_GOVERNANCE_CAP" in msg.content
+
+
+@pytest.mark.asyncio
 async def test_size_breach_rejects_missing_required_fields(
     client: AsyncClient,
     db_session,

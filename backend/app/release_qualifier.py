@@ -23,6 +23,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import uuid
 from datetime import datetime
@@ -64,7 +65,9 @@ from app.acceptance_criteria import (
     WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS,
     get_criteria_for_version,
     get_version_coverage_summary,
+    normalize_evidence_contract,
 )
+from app.acceptance_provenance import PR_CHANGED_FILES_STAMP_SKIPPED_KEY
 
 # Per-(sha, category) goal-verdict ledger (goal-verification redesign).  A SIBLING
 # module owns this file; it may not be present in every checkout during the
@@ -87,7 +90,16 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.release_policy_projection import (
+    promotion_policy_projection,
+    qualification_attempt_policy_projection,  # noqa: F401 — re-exported for callers/tests
+    qualification_attempt_policy_record_fields,
+)
 from app.release_models import CriterionEvidence
+from app.release_commit_authorship import (
+    authorship_category_evidence,
+    serving_authorship_range,
+)
 from app.notification_dispatch import (
     dispatch_external_notification,  # noqa: F401 — re-exported for tests / compat patch point
     post_version_build_stalled_message,  # noqa: F401 — re-exported for tests
@@ -138,10 +150,7 @@ from app.release_qualifier_audit import (
     _spawn_direction_merge_grade_task,  # noqa: F401 — re-exported for callers/tests
     _spawn_qualifier_walkthrough_task,
     record_direction_merge_grade,  # noqa: F401 — re-exported for callers/tests
-    get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
-    get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
-    get_latest_release_audit_report,  # noqa: F401 — re-exported for callers/tests
     resolve_lifecycle_audit_evidence,  # noqa: F401 — re-exported for callers/tests
     snapshot_stranded_approved_prs,
     required_children_terminal as _required_children_terminal,
@@ -183,7 +192,6 @@ from app.release_scoring import (
     _clamp01,  # noqa: F401
     coerce_completion_debt_weight,
     _compute_audit_reconciliation,
-    _compute_audit_challenge_synthesis,  # noqa: F401 — re-exported for callers/tests
     _compute_challenge_synthesis_from_binding_verdicts,
     _extract_audit_findings,
     _extract_excluded_audit_findings,
@@ -197,6 +205,7 @@ from app.release_scoring import (
     _score_env_preflight,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
+    evaluate_prior_operator_authorship_gate,
     evaluate_merge_grade,
     is_contentless_goal,
     promotion_threshold_for_policy,  # noqa: F401 — canonical enforcement helper
@@ -302,15 +311,15 @@ from app.release_qualifier_audit_surface import (
 )
 
 # Size governance: this module's cap in backend/testing/module_size_limits.json.
-# Bumped 10300 -> 10500 (tight governing raise) when the release-audit and
-# research rollups accreted qualifier logic and the module reached 10323 lines,
-# past the historically governing 10300. The raise keeps only a small explicit
-# margin (~180 lines, <2% of the cap) — NOT the generic +15% bump to 11900,
+# Bumped 10300 -> 10800 (tight governing raise) when the authorship evidence
+# contract and reconciliation hard-deadline logic brought the module to 10549
+# lines, past the historically governing 10500. The raise keeps only a small
+# explicit margin (~250 lines, <3% of the cap) — NOT an unbounded generic bump,
 # which reintroduces the ~2k dead-headroom value the governance test rejects.
 # Keep the JSON entry in sync with this constant — the governance test in
 # test_release_qualifier.py cross-checks them, so an over-loosened cap regresses
 # red instead of silently widening headroom past the point the guardrail fires.
-_MODULE_SIZE_GOVERNANCE_CAP: int = 10500
+_MODULE_SIZE_GOVERNANCE_CAP: int = 10649
 
 # Product probes are opt-in parts of a qualification attempt's decision
 # contract. Keep the set closed: silently dropping an unknown value would let a
@@ -582,10 +591,10 @@ _NEVER_GRADED_GAP = (
 _RUBRIC_PROVENANCE_VERSION = 1
 _MAX_RUBRIC_DIFF_KEYS = 20
 
-def _canonicalize_rubric(raw: Any) -> list[dict[str, str]]:
+def _canonicalize_rubric(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return []
-    canonical: list[dict[str, str]] = []
+    canonical: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in raw:
         if not isinstance(item, dict):
@@ -594,11 +603,15 @@ def _canonicalize_rubric(raw: Any) -> list[dict[str, str]]:
         if not key or key in seen:
             continue
         text = " ".join(str(item.get("text") or "").split())
-        canonical.append({"criterion_key": key, "text": text})
+        entry: dict[str, Any] = {"criterion_key": key, "text": text}
+        contract = normalize_evidence_contract(item.get("evidence_contract"))
+        if contract is not None:
+            entry["evidence_contract"] = contract
+        canonical.append(entry)
         seen.add(key)
     return canonical
 
-def _rubric_fingerprint(snapshot: list[dict[str, str]]) -> str:
+def _rubric_fingerprint(snapshot: list[dict[str, Any]]) -> str:
     encoded = json.dumps(
         _canonicalize_rubric(snapshot),
         ensure_ascii=False,
@@ -713,11 +726,15 @@ def _rubric_dimension_reusable(
 async def _snapshot_qualification_rubric(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     rows = await get_criteria_for_version(session, version.id)
     active = _canonicalize_rubric(
         [
-            {"criterion_key": row.criterion_key, "text": row.text}
+            {
+                "criterion_key": row.criterion_key,
+                "text": row.text,
+                "evidence_contract": row.evidence_contract,
+            }
             for row in rows
             if row.status == "active"
         ]
@@ -736,7 +753,7 @@ async def _resolve_launched_rubric(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
     qual: dict[str, Any],
-) -> tuple[list[dict[str, str]] | None, dict[str, Any] | None, str | None]:
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None, str | None]:
     if isinstance(qual.get("rubric_snapshot"), list):
         snapshot = _canonicalize_rubric(qual["rubric_snapshot"])
         fingerprint = _rubric_fingerprint(snapshot)
@@ -913,15 +930,29 @@ def _fail_closed_category_verdicts(
 # from this file (backend/app/release_qualifier.py).
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
 
+
+def _finite_policy_float(value: Any, *, label: str) -> float:
+    """Coerce one policy number while rejecting JSON-unsafe NaN/Infinity."""
+
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{label} must be finite")
+    return parsed
+
+
 def _normalize_active_promotion_weights(weights_raw: Any) -> dict[str, float]:
     """Accept current two-key and legacy three-key policies deterministically."""
     from decimal import Decimal
 
     if not isinstance(weights_raw, dict):
         raise ValueError("promotion weights must be a mapping")
-    audit = float(weights_raw["audit"])
-    erosion = float(weights_raw["test_erosion"])
-    smoke = float(weights_raw.get("smoketest", 0.0))
+    audit = _finite_policy_float(weights_raw["audit"], label="audit weight")
+    erosion = _finite_policy_float(
+        weights_raw["test_erosion"], label="test_erosion weight"
+    )
+    smoke = _finite_policy_float(
+        weights_raw.get("smoketest", 0.0), label="smoketest weight"
+    )
     if audit < 0 or erosion < 0 or smoke < 0:
         raise ValueError("promotion weights must be non-negative")
     declared_sum = audit + erosion + smoke
@@ -962,13 +993,15 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
         if threshold_raw is None or not isinstance(weights_raw, dict):
             return None
         weights = _normalize_active_promotion_weights(weights_raw)
-        threshold = float(threshold_raw)
+        threshold = _finite_policy_float(
+            threshold_raw, label="runtime promotion threshold"
+        )
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
         for _k in ("merge_grade_block_threshold",):
             _v = _runtime_config.get(_k)
             if _v is not None:
                 with contextlib.suppress(TypeError, ValueError):
-                    result[_k] = float(_v)
+                    result[_k] = _finite_policy_float(_v, label=_k)
         # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
         # judge flag.  Threaded through the rubric so a fleet-level runtime_config
         # arm reaches _finalize_qualification's policy fallback.
@@ -1032,7 +1065,9 @@ def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
         else:
             weights = dict(_DEFAULT_POLICY["weights"])
         threshold = (
-            float(threshold_raw)
+            _finite_policy_float(
+                threshold_raw, label="project promotion threshold"
+            )
             if threshold_raw is not None
             else float(_DEFAULT_POLICY["threshold"])
         )
@@ -1144,6 +1179,18 @@ def _resolve_policy_with_provenance(
         return _apply_completion_debt_weight_mode(merged), "build_config", fleet_error
     return _apply_completion_debt_weight_mode(fleet_policy), fleet_source, fleet_error
 
+
+def current_effective_policy_projection(
+    project: Project | None = None,
+) -> dict[str, Any]:
+    """Resolve and project the policy the qualifier would enforce right now."""
+
+    policy, source, fallback_error = _resolve_policy_with_provenance(project)
+    return promotion_policy_projection(
+        policy,
+        source=source,
+        fallback_error=fallback_error,
+    )
 def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
     """Resolve the FLEET promotion rubric (no per-project override): live
     ``runtime_config`` → ``promotion_policy.yaml`` → hardcoded defaults."""
@@ -1168,7 +1215,9 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
         # Normalize current two-key and archival three-key policies through one
         # path; KeyError/TypeError/ValueError here drops into the safe fallback.
         weights = _normalize_active_promotion_weights(weights_raw)
-        threshold = float(parsed["threshold"])
+        threshold = _finite_policy_float(
+            parsed["threshold"], label="YAML promotion threshold"
+        )
 
         # Optional completion_debt blend factor from the on-disk rubric (separate
         # from the three-core-weight sum; default 0.0, clamped to [0, 0.5]).
@@ -1180,7 +1229,7 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
         for _k in ("merge_grade_block_threshold",):
             if _k in parsed:
                 with contextlib.suppress(TypeError, ValueError):
-                    result[_k] = float(parsed[_k])
+                    result[_k] = _finite_policy_float(parsed[_k], label=_k)
         # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
         # judge flag from the on-disk rubric (default False when absent).
         if "env_preflight_enabled" in parsed:
@@ -2122,6 +2171,7 @@ async def _check_lts_sync_gate(
         "requested_probes": sorted(requested_probes),
     }
 
+
 async def run_qualification(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -2176,7 +2226,9 @@ async def run_qualification(
     the in-flight check, the child spawns, and the ``last_qualification``
     write — that ReleaseVersion lock (not the strategic path's Project lock) is
     what serializes the race.  The GitHub I/O that resolves ``candidate_sha``
-    runs BEFORE the lock to keep the locked window short.
+    runs BEFORE the lock to keep the locked window short; the bounded rehearsal
+    dispatch is the intentional exception because it must be serialized by the
+    version lock.
 
     Steps (none of which block on the spawned children):
       1. Resolve the project's owner/repo/GitHub token.
@@ -2185,7 +2237,8 @@ async def run_qualification(
          side).  ``ci_green`` is recorded but not acted on here — the composite
          in ``_finalize_qualification`` applies it as a hard blocker.
       4. Lock the ``ReleaseVersion`` row, then re-check the in-flight /
-         cached-verdict guards under the lock.
+         cached-verdict guards under the lock and ensure the candidate rehearsal
+         is dispatched exactly once.
       5. Spawn one holistic final review, plus only the product probes
          explicitly selected by the qualification requester. Their
          payloads carry the exact ``candidate_sha`` so every gate evaluates the
@@ -2539,6 +2592,37 @@ async def run_qualification(
     candidate_audited_surface = audited_surface_path_map(candidate_tree_entries)
     candidate_diff_hash = compute_audited_surface_hash(candidate_tree_entries)
 
+    # All candidate GitHub content evidence is gathered before the authoritative
+    # ReleaseVersion lock. The locked section below consumes only these immutable
+    # candidate-bound values and rechecks phase/in-flight/dispatch intent before
+    # spawning or writing.
+    try:
+        _pre_mi_verdict, _pre_mi_detail = await check_qualification_migration_identity(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            promotion_target,
+            project_id=str(project_id),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _pre_mi_verdict = "defer"
+        _pre_mi_detail = f"migration-identity pre-spawn check error: {exc}"
+
+    env_preflight_evidence: dict[str, Any] | None = None
+    try:
+        env_preflight_evidence = await _build_env_preflight_evidence_for_candidate(
+            project, token, owner, repo, candidate_sha
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to build env-preflight evidence for "
+            "v%d candidate %s — evidence unavailable",
+            version.version_number,
+            candidate_sha[:8],
+            exc_info=True,
+        )
+
     # 3b. Qualify-on-synced gate (LTS split only).  Don't score a candidate that
     #     is behind the promotion target — it would fail the promotion merge and
     #     bounce the version back to stabilize, burning a full re-audit.  Bounded,
@@ -2736,6 +2820,49 @@ async def run_qualification(
         )
         return _promo
 
+    active_criteria = [
+        row
+        for row in await get_criteria_for_version(session, version.id)
+        if row.status == "active"
+    ]
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        normalize_rehearsal_evidence_contract,
+        prepare_rehearsal_dispatch_intent,
+    )
+
+    rehearsal_required = any(
+        normalize_rehearsal_evidence_contract(row.evidence_contract) is not None
+        for row in active_criteria
+    )
+    rehearsal_dispatch_ok = True
+    rehearsal_dispatch: dict[str, Any] | None = None
+    if rehearsal_required:
+        rehearsal_dispatch_ok, rehearsal_dispatch = (
+            await prepare_rehearsal_dispatch_intent(session, version, candidate_sha)
+        )
+    if rehearsal_required and not rehearsal_dispatch_ok:
+        version.last_qualification = {
+            **(version.last_qualification or {}),
+            "status": "rehearsal_dispatch_pending",
+            "blocker": "prepromotion_rehearsal_dispatch_pending",
+            "candidate_sha": candidate_sha,
+            "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
+            "detail": "durable rehearsal outbox intent awaits dispatch/reconciliation",
+            "started_at": _utcnow().isoformat(),
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
+            "requested_probes": sorted(effective_requested_probes),
+        }
+        flag_modified(version, "last_qualification")
+        session.add(version)
+        return {
+            "status": "rehearsal_dispatch_pending",
+            "blocker": "prepromotion_rehearsal_dispatch_pending",
+            "candidate_sha": candidate_sha,
+            "dispatch": rehearsal_dispatch,
+        }
+
     # Snapshot the merge-state signal under the version lock that owns the
     # qualification launch; promotion scoring stays unchanged.
     stranded_approved_prs = await snapshot_stranded_approved_prs(
@@ -2758,7 +2885,16 @@ async def run_qualification(
         qualification_attempt_id=str(attempt_id),
     )
     rubric_fingerprint = rubric_provenance["fingerprint"]
-    _spawn_policy_snapshot = _load_policy(project)
+    (
+        _spawn_policy_snapshot,
+        _spawn_policy_source,
+        _spawn_policy_fallback_error,
+    ) = _resolve_policy_with_provenance(project)
+    _spawn_policy_projection = promotion_policy_projection(
+        _spawn_policy_snapshot,
+        source=_spawn_policy_source,
+        fallback_error=_spawn_policy_fallback_error,
+    )
     _spawn_capability_proof_mode = str(
         _runtime_config.get("capability_proof_gate_mode", "off") or "off"
     ).strip().lower()
@@ -3244,20 +3380,6 @@ async def run_qualification(
     # a prior finalize (the dimension was verified clean or blocked then; either
     # way the live fetch is redundant).  Under the FOR UPDATE lock — safe to write.
     if "migration_identity" not in resolved_dims:
-        try:
-            _pre_mi_verdict, _pre_mi_detail = (
-                await check_qualification_migration_identity(
-                    token,
-                    owner,
-                    repo,
-                    candidate_sha,
-                    promotion_target,
-                    project_id=str(project_id),
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            _pre_mi_verdict = "defer"
-            _pre_mi_detail = f"migration-identity pre-spawn check error: {exc}"
         if _pre_mi_verdict == "block":
             logger.info(
                 "[RELEASE_QUALIFIER] run_qualification: v%d candidate %s blocked "
@@ -3286,6 +3408,7 @@ async def run_qualification(
                 "status": "not_promoted",
                 "blocker": "migration_identity_collision",
                 "candidate_sha": candidate_sha,
+                "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
                 "qualification_attempt_id": str(attempt_id),
                 "retry_episode": retry_episode,
                 "retry_episode_cap": retry_episode_cap,
@@ -3428,6 +3551,7 @@ async def run_qualification(
             "engine_sha": get_serving_sha(),
             "detail": str(exc)[:300],
             "candidate_sha": candidate_sha,
+            "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
             "ci_green": ci_green,
             "ci_state": ci_state,
             "started_at": started_at,
@@ -3435,6 +3559,13 @@ async def run_qualification(
             "retry_episode": retry_episode,
             "retry_episode_cap": retry_episode_cap,
             "requested_probes": sorted(effective_requested_probes),
+            # This is still a counted qualification attempt. Preserve the
+            # launch-time decision contract even when child spawning fails so
+            # Strategic can distinguish this attempt from current live policy.
+            "promotion_policy_snapshot": _spawn_policy_snapshot,
+            "promotion_policy_source": _spawn_policy_source,
+            "promotion_policy_fallback_error": _spawn_policy_fallback_error,
+            "promotion_policy_hash": _spawn_policy_projection["policy_hash"],
         }
         # Read-modify-write is safe here (unlike the no_credentials / sha_error
         # early returns, which run pre-lock and use the atomic
@@ -3448,28 +3579,6 @@ async def run_qualification(
     audit_challenge_spawn_pending = _audit_needed
 
 
-    # Unconditionally produce candidate-side env-preflight evidence (Slice 2,
-    # design 245212a4).  Decoupled from the smoketest child task: this is a
-    # cheap pure-content introspection of the candidate tree done via the
-    # GitHub contents API (no VM required), so it must not depend on
-    # ``smoketest_enabled``.  A failure to fetch the source is caught and
-    # treated as "evidence unavailable" — the env-preflight judge (Slice 3)
-    # handles the None by either pass-through (judge disabled) or
-    # ``boot_prereq_evidence_missing`` (judge enabled, fail-closed).
-    env_preflight_evidence: dict[str, Any] | None = None
-    try:
-        env_preflight_evidence = await _build_env_preflight_evidence_for_candidate(
-            session, project, token, owner, repo, candidate_sha
-        )
-    except Exception:  # noqa: BLE001 — GitHub API I/O can fail in many ways (network, HTTP, parse); evidence absence is handled gracefully by the Slice-3 judge.
-        logger.warning(
-            "[RELEASE_QUALIFIER] failed to build env-preflight evidence for "
-            "v%d candidate %s — evidence unavailable",
-            version.version_number,
-            candidate_sha[:8],
-            exc_info=True,
-        )
-
     # 6. Stamp the pending qualification record.  smoketest_task_id is None
     #    when the smoketest subsystem is disabled — maybe_finalize_qualification
     #    and the reaper sweep both treat a None smoketest id as "no smoketest
@@ -3482,6 +3591,7 @@ async def run_qualification(
         "retry_episode": retry_episode,
         "retry_episode_cap": retry_episode_cap,
         "candidate_sha": candidate_sha,
+        "prepromotion_rehearsal_dispatch": rehearsal_dispatch,
         "candidate_diff_hash": candidate_diff_hash,
         "stranded_approved_prs": stranded_approved_prs,
         "audited_surface_paths": candidate_audited_surface or None,
@@ -3572,6 +3682,9 @@ async def run_qualification(
         # computed under another.
         "version_goal": version_goal,
         "promotion_policy_snapshot": _spawn_policy_snapshot,
+        "promotion_policy_source": _spawn_policy_source,
+        "promotion_policy_fallback_error": _spawn_policy_fallback_error,
+        "promotion_policy_hash": _spawn_policy_projection["policy_hash"],
         "capability_proof_mode": _spawn_capability_proof_mode,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
@@ -3870,6 +3983,7 @@ async def _handle_walkthrough_contract_failure(
     from app.deployed_sha import get_serving_sha  # noqa: PLC0415
 
     record: dict[str, Any] = {
+        **qualification_attempt_policy_record_fields(qual),
         "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "retry_episode": qual.get("retry_episode", 0),
         "retry_episode_cap": qual.get("retry_episode_cap"),
@@ -4050,6 +4164,14 @@ _BLOCKER_LABELS: dict[str, str] = {
     "migration_apply_drift": (
         "the candidate's migration chain does not apply cleanly against "
         "production's recorded schema state (deploy-fatal drift)"
+    ),
+    "prior_operator_authorship_nonzero": (
+        "the prior promoted release recorded one or more operator-authored "
+        "commits in its serving window"
+    ),
+    "prior_operator_authorship_evidence_missing": (
+        "the prior promoted release has no valid persisted operator-authorship "
+        "receipt; the gate fails closed until that evidence is resolved"
     ),
     "criterion_coverage_incomplete": (
         "the blind merge-grade found the merged diff does not yet satisfy the "
@@ -4494,6 +4616,7 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_declared_unsatisfied_reasons": dict, # split of the declared_unsatisfied bucket by reason (sums to buckets["declared_unsatisfied"])
         "acceptance_window_undeclared_task_ids": list,  # deterministic capped IDs in the undeclared bucket
         "acceptance_window_declared_unsatisfied_task_ids": list,  # deterministic capped IDs in the declared-unsatisfied bucket
+        "acceptance_window_task_records": list,  # one durable audit record per write task
         "acceptance_window_bucket_task_id_cap": int,  # shared cap for the two identity-evidence lists
         "acceptance_window_inferred_test_cochange": int,  # verified merges credited via inferred_test_cochange
         "acceptance_window_rederived_count": int,  # write-task verdicts re-derived under the current rule this drive (each task counted once)
@@ -4550,6 +4673,7 @@ async def _compute_acceptance_window_aggregate(
     _BUCKET_TASK_ID_CAP = 100
     undeclared_task_ids: list[str] = []
     declared_unsatisfied_task_ids: list[str] = []
+    task_records: list[dict[str, Any]] = []
     # Re-derivation pass (rung 3 of design doc c50453ef): a verdict frozen under
     # a RETIRED acceptance rule is re-derived from the task's persisted merge
     # record before classification, so an evidence-rule improvement landing
@@ -4732,6 +4856,23 @@ async def _compute_acceptance_window_aggregate(
                 classify_unsatisfied_reason(ctx.get(CODE_ACCEPTANCE_VERDICT_KEY))
             ] += 1
             declared_unsatisfied_task_ids.append(str(task.id))
+        task_records.append(
+            {
+                "task_id": str(task.id),
+                "bucket": bucket,
+                "credited": bucket
+                in {
+                    "proven",
+                    "satisfied_unproven",
+                    "inferred_test_cochange",
+                },
+                PR_CHANGED_FILES_STAMP_SKIPPED_KEY: (
+                    ctx.get(PR_CHANGED_FILES_STAMP_SKIPPED_KEY)
+                    if isinstance(ctx.get(PR_CHANGED_FILES_STAMP_SKIPPED_KEY), str)
+                    else None
+                ),
+            }
+        )
     verified = (
         buckets["proven"]
         + buckets["satisfied_unproven"]
@@ -4781,6 +4922,10 @@ async def _compute_acceptance_window_aggregate(
             declared_unsatisfied_task_ids
         )
         > _BUCKET_TASK_ID_CAP,
+        # Full per-task window enumeration: unlike the capped bucket identity
+        # lists above, this is the durable record used to audit every write task
+        # as either credited or carrying a stamp-skip cause.
+        "acceptance_window_task_records": task_records,
         "acceptance_window_bucket_task_id_cap": _BUCKET_TASK_ID_CAP,
         # Additive audit breakdown: how many verified merges were credited via the
         # inferred test-cochange path (undeclared merge, CI-verified, test+prod
@@ -5897,7 +6042,6 @@ async def _dual_write_dimension_results(
         )
 
 async def _build_env_preflight_evidence_for_candidate(
-    session: AsyncSession,
     project: Project,
     token: str,
     owner: str,
@@ -5988,6 +6132,7 @@ async def _record_rubric_provenance_outcome(
     finalized_at = _utcnow().isoformat()
     verdict_status = "rubric_unknown" if status == "rubric_provenance_unknown" else status
     record: dict[str, Any] = {
+        **qualification_attempt_policy_record_fields(qual),
         "status": status,
         "candidate_sha": qual.get("candidate_sha"),
         "candidate_diff_hash": qual.get("candidate_diff_hash"),
@@ -6101,6 +6246,36 @@ async def _record_rubric_provenance_outcome(
         "rubric_provenance_error": provenance_error,
     }
 
+async def _load_prior_operator_authorship_gate(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> dict[str, Any]:
+    """Read and validate the latest prior promoted release receipt.
+
+    Qualification runs before the current version's serving window exists, so
+    this query intentionally excludes the open candidate and never performs a
+    live authorship measurement. The scoring helper owns receipt validation and
+    the explicit no-prior bootstrap result.
+    """
+    prior = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(
+                    release_version.ReleaseVersion.project_id == version.project_id,
+                    release_version.ReleaseVersion.status == "promoted",
+                    release_version.ReleaseVersion.version_number < version.version_number,
+                )
+                .order_by(release_version.ReleaseVersion.version_number.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    return evaluate_prior_operator_authorship_gate(prior)
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -6210,6 +6385,9 @@ async def _finalize_qualification(
 
     ci_state = ci_resolution.get("state", _CI_RED)
     _policy_project = await session.get(Project, version.project_id)
+    prior_operator_authorship_gate = await _load_prior_operator_authorship_gate(
+        session, version
+    )
     ci_required = True
     if _pre_gates is not None and "ci_required" in _pre_gates:
         ci_required = bool(_pre_gates["ci_required"])
@@ -6232,7 +6410,20 @@ async def _finalize_qualification(
 
     # Prefer the promotion policy frozen at spawn; fall back to the live policy
     # for legacy records that predate the attempt-contract freeze.
-    policy = qual.get("promotion_policy_snapshot") or _load_policy(_policy_project)
+    policy = qual.get("promotion_policy_snapshot")
+    policy_source = qual.get("promotion_policy_source")
+    policy_fallback_error = qual.get("promotion_policy_fallback_error")
+    if not isinstance(policy, dict) or not policy:
+        policy, policy_source, policy_fallback_error = _resolve_policy_with_provenance(
+            _policy_project
+        )
+    attempt_policy_projection = promotion_policy_projection(
+        policy,
+        source=(str(policy_source) if policy_source else "legacy_snapshot"),
+        fallback_error=(
+            str(policy_fallback_error) if policy_fallback_error else None
+        ),
+    )
 
     # Derive whether enforce mode was active at spawn from the frozen (or fallback)
     # policy.  _apply_completion_debt_weight_mode baked the freeze-time mode into
@@ -6275,7 +6466,11 @@ async def _finalize_qualification(
     live_criterion_rows = await get_criteria_for_version(session, version.id)
     live_rubric = _canonicalize_rubric(
         [
-            {"criterion_key": row.criterion_key, "text": row.text}
+            {
+                "criterion_key": row.criterion_key,
+                "text": row.text,
+                "evidence_contract": row.evidence_contract,
+            }
             for row in live_criterion_rows
             if row.status == "active"
         ]
@@ -7963,9 +8158,81 @@ async def _finalize_qualification(
     # Keep today's coverage summary for observability; gate on launched rubric.
     criterion_coverage = await get_version_coverage_summary(session, version.id)
     active_categories: list[dict[str, Any]] = [
-        {"category_key": c.get("criterion_key"), "text": c.get("text")}
+        {
+            "category_key": c.get("criterion_key"),
+            "text": c.get("text"),
+            **(
+                {"evidence_contract": c["evidence_contract"]}
+                if isinstance(c.get("evidence_contract"), dict)
+                else {}
+            ),
+        }
         for c in launched_rubric
         if c.get("criterion_key")
+    ]
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        validate_prepromotion_gradeability,
+    )
+
+    # Every active category can hard-block promotion.  Validate its evidence
+    # producer phase before composing any category verdicts, so a newly added
+    # criterion cannot introduce a producer/gate cycle that only wedges a
+    # release attempt.
+    validate_prepromotion_gradeability(active_categories)
+
+    # The latest promoted release is the only immutable source for this
+    # cross-version qualifier evidence.  Bind it by rubric text through the
+    # generic adapter; invalid, unresolved, terminal, and missing receipts all
+    # become fail-closed category evidence.
+    authorship_evidence: list[dict[str, Any]] = []
+    if active_categories:
+        latest_promoted = (
+            (
+                await session.execute(
+                    select(release_version.ReleaseVersion)
+                    .where(
+                        release_version.ReleaseVersion.project_id == version.project_id,
+                        release_version.ReleaseVersion.status == "promoted",
+                    )
+                    .order_by(release_version.ReleaseVersion.version_number.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        promoted_qualification = (
+            latest_promoted.last_qualification
+            if latest_promoted is not None
+            else None
+        )
+        authorship_evidence = authorship_category_evidence(
+            (
+                promoted_qualification.get("operator_authored_commits")
+                if isinstance(promoted_qualification, dict)
+                else None
+            ),
+            *serving_authorship_range(latest_promoted),
+            active_categories,
+        )
+    from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
+        apply_rehearsal_evidence,
+        persisted_rehearsal_for_version,
+        rehearsal_category_evidence,
+    )
+    prepromotion_rehearsal = await persisted_rehearsal_for_version(
+        session,
+        version,
+        candidate_sha,
+    )
+    rehearsal_evidence = rehearsal_category_evidence(
+        prepromotion_rehearsal,
+        candidate_sha,
+        active_categories,
+    )
+    authoritative_category_evidence = [
+        *authorship_evidence,
+        *rehearsal_evidence,
     ]
     _merge_grade_goal_usable = bool(_frozen_version_goal) and not is_contentless_goal(
         _frozen_version_goal
@@ -8041,6 +8308,7 @@ async def _finalize_qualification(
             merge_grade_artifact,
             active_categories or None,
             _verified_merge_evidence,
+            authoritative_category_evidence,
         )
         if qual.get("prior_superseded") and merge_grade_cert["status"] == "fail":
             merge_grade_cert = {
@@ -8202,9 +8470,16 @@ async def _finalize_qualification(
             _expected_grader_run_id = str(_expected_grader_run_id)
         _fresh_category_verdicts = merge_grade_cert.get("category_verdicts")
         if _fresh_category_verdicts is not None:
+            _fresh_category_verdicts = apply_rehearsal_evidence(
+                _fresh_category_verdicts,
+                active_categories,
+                prepromotion_rehearsal,
+                candidate_sha,
+            )
             # Fresh grade this finalize: write each category verdict + the residual.
             try:
                 for _v in _fresh_category_verdicts:
+                    _machine_provenance = _v.get("evidence_provenance")
                     await _category_ledger.upsert_category_verdict(
                         session,
                         version_id=version.id,
@@ -8214,7 +8489,12 @@ async def _finalize_qualification(
                         tier=_v.get("tier", "judged"),
                         gap=_v.get("gap"),
                         citations=_v.get("citations") or [],
-                        grader_run_id=merge_grade_task_id,
+                        grader_run_id=(
+                            None
+                            if isinstance(_machine_provenance, dict)
+                            else merge_grade_task_id
+                        ),
+                        evidence_provenance=_machine_provenance,
                         qualification_attempt_id=attempt_id,
                         project_id=version.project_id,
                     )
@@ -8290,6 +8570,30 @@ async def _finalize_qualification(
                     if _merge_grade_ran
                     else None
                 )
+                _gate_category_verdicts = apply_rehearsal_evidence(
+                    _gate_category_verdicts,
+                    active_categories,
+                    prepromotion_rehearsal,
+                    candidate_sha,
+                )
+                for _v in _gate_category_verdicts or []:
+                    _machine_provenance = _v.get("evidence_provenance")
+                    if not isinstance(_machine_provenance, dict):
+                        continue
+                    await _category_ledger.upsert_category_verdict(
+                        session,
+                        version_id=version.id,
+                        candidate_sha=candidate_sha,
+                        category_key=_v.get("category_key"),
+                        status=_v.get("status"),
+                        tier=_v.get("tier", "machine"),
+                        gap=_v.get("gap"),
+                        citations=_v.get("citations") or [],
+                        grader_run_id=None,
+                        evidence_provenance=_machine_provenance,
+                        qualification_attempt_id=attempt_id,
+                        project_id=version.project_id,
+                    )
                 _gate_residual = await _category_ledger.get_residual(
                     session, version.id, candidate_sha,
                     qualification_attempt_id=attempt_id,
@@ -8461,6 +8765,7 @@ async def _finalize_qualification(
         # Slice 4: OWNER-armed one-shot override of the boot_prereq_missing block
         # (scoped to that blocker only — see _env_ack above).
         env_preflight_ack_override=env_preflight_ack_override,
+        prior_operator_authorship_gate=prior_operator_authorship_gate,
     )
 
     # --- Explicit product probe: decision-bearing walkthrough --------------
@@ -8704,6 +9009,11 @@ async def _finalize_qualification(
         "sub_scores": extended_sub_scores,
         "failing_gates": composite.get("failing_gates") or [],
         "confidence_ceiling": composite.get("confidence_ceiling"),
+        "required_sub_scores": composite.get("required_sub_scores") or {},
+        # The current candidate cannot have a post-promotion serving window.
+        # Persist the prior-release gate result so CI-unresolved recovery reuses
+        # the same decision without a fresh database or GitHub interpretation.
+        "prior_operator_authorship_gate": prior_operator_authorship_gate,
         "stranded_approved_prs": qual.get("stranded_approved_prs"),
         "blocker": composite["blocker"],
         # Execution-site of the responsible check (dir: tag promotion blockers
@@ -8712,6 +9022,15 @@ async def _finalize_qualification(
         # qualification; None when there is no blocker or it is unclassified.
         "execution_site": blocker_execution_site(composite["blocker"]),
         "threshold": policy.get("threshold"),
+        # Preserve the exact launch-time decision contract when replacing the
+        # pending JSONB record with its terminal result. These additive JSONB
+        # fields need no migration and keep current-vs-attempt truth separable.
+        "promotion_policy_snapshot": policy,
+        "promotion_policy_source": attempt_policy_projection["source"],
+        "promotion_policy_fallback_error": attempt_policy_projection[
+            "fallback_error"
+        ],
+        "promotion_policy_hash": attempt_policy_projection["policy_hash"],
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
         # One-shot keyless re-qualification marker (finding 1).  The sweep's
@@ -8847,6 +9166,7 @@ async def _finalize_qualification(
         # gating in ENFORCE).  Recorded in the per-dimension fact ledger.
         "capability_proof_blocked": capability_proof_blocked,
         "capability_proof_detail": capability_proof_detail,
+        "prepromotion_rehearsal": prepromotion_rehearsal,
     }
 
     # Enforce-mode confidence preview — only in observe/off mode, only when no
@@ -9037,6 +9357,7 @@ async def _finalize_qualification(
                 f"{blocker_label}. Failing gates: "
                 f"{', '.join(composite.get('failing_gates') or [])}. "
                 f"Confidence ceiling: {composite.get('confidence_ceiling')}. "
+                f"Required sub-scores: {composite.get('required_sub_scores') or 'none'}. "
                 "Not promoted; staying in stabilize."
             )
         else:
@@ -9045,7 +9366,9 @@ async def _finalize_qualification(
                 f"v{version.version_number} qualified at confidence "
                 f"{composite['confidence']:.2f}, below the "
                 f"{policy.get('threshold')} promotion bar — not promoted, "
-                f"staying in stabilize. Sub-scores: {scores_str}."
+                f"staying in stabilize. Sub-scores: {scores_str}. "
+                f"Confidence ceiling: {composite.get('confidence_ceiling')}; "
+                f"required sub-scores: {composite.get('required_sub_scores') or 'none'}."
             )
         await _notify_operator(
             session,

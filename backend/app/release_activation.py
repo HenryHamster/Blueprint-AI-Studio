@@ -16,6 +16,7 @@ approval stamp; the privileged activation is PULLED and executed host-side.
 
 from __future__ import annotations
 
+
 import logging
 import time
 from collections.abc import Callable
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from app import release_version
 
 logger = logging.getLogger(__name__)
+_MODULE_SIZE_GOVERNANCE_CAP: int = 241
 
 
 DEFAULT_ACTIVATION_ATTEMPTS = 3

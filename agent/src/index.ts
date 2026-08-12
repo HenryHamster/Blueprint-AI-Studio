@@ -352,8 +352,8 @@ export function readAgentRuntimeFingerprint(): string | null {
  *  Returns the commit SHA, or null when neither source yields one — so the agent
  *  never reports a bogus SHA over the wire. The env value is accepted only as a
  *  full 40-hex SHA (a short/dirty/tag value is rejected, matching the serving
- *  gate's full-SHA comparison); the marker's permissive 7-40 hex match also
- *  rejects the literal 'unknown' fallback. */
+ *  gate's full-SHA comparison); the marker uses the same strict full-SHA
+ *  validation and rejects the literal 'unknown' fallback. */
 export function readAgentSourceSha(): string | null {
   const fromEnv = process.env.AGENT_SOURCE_SHA;
   if (fromEnv && /^[0-9a-f]{40}$/.test(fromEnv)) {
@@ -361,7 +361,7 @@ export function readAgentSourceSha(): string | null {
   }
   try {
     const raw = fs.readFileSync('/opt/agent/AGENT_SOURCE_SHA', 'utf-8').trim();
-    const m = /^AGENT_SOURCE_SHA=([0-9a-f]{7,40})$/.exec(raw);
+    const m = /^AGENT_SOURCE_SHA=([0-9a-f]{40})$/.exec(raw);
     return m ? m[1] : null;
   } catch {
     return null;
@@ -377,9 +377,16 @@ export function _setAgentTokenForTesting(value: string): void {
   apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
 }
 
+// Capability handshake consumed by POST /api/agent/claim. The backend stamps
+// the strict research-output contract only when the claiming runner advertises
+// this exact version, so rolling backend deployments do not misclassify stale
+// agent images as contract-v2 producers.
+const RESEARCH_OUTPUT_CONTRACT_VERSION = 2;
+
 const apiHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
   'X-Agent-Token': AGENT_TOKEN,
+  'X-Research-Output-Contract-Version': String(RESEARCH_OUTPUT_CONTRACT_VERSION),
 };
 
 initTokenModule({
@@ -1556,6 +1563,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'X-Agent-Token': agentJwt,
+    'X-Research-Output-Contract-Version': String(RESEARCH_OUTPUT_CONTRACT_VERSION),
   };
 
   // Shared revoke flag — set by either heartbeat path or next-role path on
@@ -2289,7 +2297,11 @@ let heartbeatInFlight = false; // @per-role
 let heartbeatInFlightSince = 0; // @per-role
 let heartbeatGeneration = 0;
 
-function startHeartbeat(taskId: string, getMessage: () => string) {
+function startHeartbeat(
+  taskId: string,
+  getMessage: () => string,
+  getActiveToolProgressAt?: () => string | undefined,
+) {
   // Fire first heartbeat immediately — don't wait 30s.
   // If the agent crashes in the first 30s, at least one heartbeat is recorded.
   // Audit 2026-04-25 (W4/C1+C2): replace `void async` IIFE with explicit
@@ -2303,6 +2315,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
     const fix_loop_events = collectFixLoopEventsForFlush();
     const statusMessage = getMessage();
     const tool_trace = snapshotToolTrace({ refreshLastEntry: statusMessage.startsWith('Using tool:') });
+    const active_tool_progress_at = getActiveToolProgressAt?.();
     const start = Date.now();
     try {
       await apiPost('/api/agent/heartbeat', {
@@ -2310,6 +2323,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         status_message: `[${metrics.heap_used_mb}MB] ${sanitize(statusMessage)}`,
         metrics,
         tool_trace,
+        ...(active_tool_progress_at ? { active_tool_progress_at } : {}),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
@@ -2377,6 +2391,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
     const fix_loop_events = collectFixLoopEventsForFlush();
     const statusMessage = getMessage();
     const tool_trace = snapshotToolTrace({ refreshLastEntry: statusMessage.startsWith('Using tool:') });
+    const active_tool_progress_at = getActiveToolProgressAt?.();
     try {
       // Tighter heartbeat-specific retry/timeout (10s × 2 vs default 30s × 5).
       // Holding the in-flight mutex through the full 150s+ default chain on a
@@ -2388,6 +2403,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         status_message: `[${metrics.heap_used_mb}MB] ${sanitize(statusMessage)}`,
         metrics,
         tool_trace,
+        ...(active_tool_progress_at ? { active_tool_progress_at } : {}),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
@@ -2427,11 +2443,13 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
             const retryMetrics = await collectMetricsAsync();
             const retryStatusMessage = getMessage();
             const retryToolTrace = snapshotToolTrace({ refreshLastEntry: retryStatusMessage.startsWith('Using tool:') });
+            const retryActiveToolProgressAt = getActiveToolProgressAt?.();
             await apiPost('/api/agent/heartbeat', {
               task_id: taskId,
               status_message: `[${retryMetrics.heap_used_mb}MB] ${sanitize(retryStatusMessage)}`,
               metrics: retryMetrics,
               tool_trace: retryToolTrace,
+              ...(retryActiveToolProgressAt ? { active_tool_progress_at: retryActiveToolProgressAt } : {}),
               ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
               ...getLlmTelemetry(),
               ...getFormatComplianceTelemetry(),
@@ -2533,8 +2551,12 @@ export function _buildHeartbeatStatusForTesting(
 }
 
 /** Test-only: drive the heartbeat loop without running main(). */
-export function _startHeartbeatForTesting(taskId: string, getMessage: () => string): void {
-  startHeartbeat(taskId, getMessage);
+export function _startHeartbeatForTesting(
+  taskId: string,
+  getMessage: () => string,
+  getActiveToolProgressAt?: () => string | undefined,
+): void {
+  startHeartbeat(taskId, getMessage, getActiveToolProgressAt);
 }
 
 /** Test-only: stop the heartbeat loop between unit tests. */
@@ -3937,12 +3959,15 @@ export async function continueWarmContinuation(
   },
   deps: WarmContinuationDeps = warmContinuationDeps,
 ): Promise<{ action: 'continue' | 'exit' }> {
-  // A failed clone removes WORKSPACE before its error is reported. Never let a
-  // later warm poll claim an unrelated task into that invalid handoff: it
-  // cannot survive resetForNextRole and should be cold-provisioned instead.
-  if (deps.isWorkspaceValid && !deps.isWorkspaceValid()) {
-    log(`Warm continuation declined: workspace is invalid (missing ${path.join(WORKSPACE, '.git')})`);
-    return { action: 'exit' };
+  // A failed clone can remove WORKSPACE before the role returns. Do not bare-
+  // exit here: a parked/requeued task may already be pinned to this still-live
+  // VM, and leaving without polling strands that lease until the heartbeat
+  // reaper fires. Poll normally, then either skip the repository for a
+  // workspace:none role or let prepareWorkspaceForRole cold-clone it for a
+  // repository-backed role.
+  const workspaceValid = !deps.isWorkspaceValid || deps.isWorkspaceValid();
+  if (!workspaceValid) {
+    log(`Warm continuation workspace is invalid (missing ${path.join(WORKSPACE, '.git')}); next repository role will cold-start`);
   }
   const vmInstanceId = deps.resolveVmInstanceId(!!opts.parkDirective);
   if (!vmInstanceId) {
@@ -3984,6 +4009,11 @@ export async function continueWarmContinuation(
   const noWorkspace = pollResult.workspaceRequirement === 'none';
   if (noWorkspace) {
     log(`Warm-claimed no-workspace task ${pollResult.taskId ?? ''}; skipping repository reset.`);
+  } else if (!workspaceValid) {
+    // Do not call resetForNextRole against a missing repository. The role loop
+    // will fetch the task contract and prepareWorkspaceForRole will take its
+    // existing cold-clone path because WORKSPACE/.git is absent.
+    log(`Warm-claimed repository task ${pollResult.taskId ?? ''} with no reusable workspace; cold-starting repository setup.`);
   } else {
     try {
       await deps.resetForNextRole({
@@ -3993,10 +4023,12 @@ export async function continueWarmContinuation(
       });
     } catch (resetErr) {
       const resetMsg = resetErr instanceof Error ? resetErr.message : String(resetErr);
-      log(`resetForNextRole failed: ${resetMsg}`);
-      const err = new Error(`reset_failed: ${resetMsg}`) as Error & { failureCategory?: FailureCategory };
-      err.failureCategory = 'reset_failed';
-      throw err;
+      // The task is already IN_PROGRESS after /next-role returns. Throwing here
+      // exits before runRoleOnce can post a terminal status, leaving the task to
+      // age into a heartbeat reap. Continue instead: prepareWorkspaceForRole
+      // retries the warm path and deterministically falls back to an empty-dir
+      // cold clone if the repository is missing or corrupt.
+      log(`resetForNextRole failed: ${resetMsg}; continuing with cold-start fallback`);
     }
   }
   deps.materializeClaimCredentialState(pollResult.secretManifest, 'reset_failed: warm-claim');
@@ -4111,7 +4143,15 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   // the idempotent claim replay. Replace that timer with the normal per-role
   // heartbeat before the handler begins so only one task heartbeat remains.
   stopHeartbeat();
-  startHeartbeat(taskId, () => buildHeartbeatStatus(statusRef, Date.now()));
+  startHeartbeat(
+    taskId,
+    () => buildHeartbeatStatus(statusRef, Date.now()),
+    () => (
+      statusRef.toolStartedAt !== undefined && statusRef.lastProgressAt !== undefined
+        ? new Date(statusRef.lastProgressAt).toISOString()
+        : undefined
+    ),
+  );
   scheduleProactiveTokenRefresh(AGENT_TOKEN);
   const ws = await connectLogStream(taskId);
   if (!ws) {
@@ -4289,8 +4329,10 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // runtime_unavailable is an infra decline (missing CLI binary), not a real
     // task failure. Convert to GracefulShutdownSignal so main() can exit with
     // code 42, signalling the runner to skip the failure-streak increment.
-    // eslint-disable-next-line @typescript-eslint/only-throw-error -- GracefulShutdownSignal is a typed control signal, not an Error
-    if (error instanceof RuntimeUnavailableError) throw new GracefulShutdownSignal('runtime_unavailable', 42);
+    if (error instanceof RuntimeUnavailableError) {
+      // eslint-disable-next-line @typescript-eslint/only-throw-error -- GracefulShutdownSignal is a typed control signal, not an Error
+      throw new GracefulShutdownSignal('runtime_unavailable', error.gracefulExitCode);
+    }
     // Re-throw so the role loop terminates — failures don't get warm
     // continuity; the orchestrator cold-provisions for the next role.
     throw error;

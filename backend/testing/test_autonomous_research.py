@@ -46,7 +46,13 @@ from app.autonomous_spawn_budget import (
     classify_autonomous_spawn_budget_category,
     compute_autonomous_spawn_budget_snapshot,
 )
-from app.research_completion import _handle_research_completion
+from app.research_completion import (
+    _handle_research_completion as _handle_research_completion_impl,
+)
+from app.findings_index import (
+    FINALIZED_RESEARCH_FINDINGS_KEY,
+    resolve_research_findings_for_surface,
+)
 from app.direction_outcomes import _update_direction_research_outcomes
 from app.direction_metrics import _compute_direction_quality_score
 from app.max_plan_pool import _max_plan_pools, _account_by_id
@@ -89,6 +95,33 @@ def _ensure_test_account_pool():
         a for a in _max_plan_pools.get(uid, []) if a["id"] != "test-acct"
     ]
     _account_by_id.pop("test-acct", None)
+
+
+def test_research_route_account_preflight_uses_unified_provider_model(mocker):
+    from app.autonomous_research import _research_route_has_available_account
+    from app.max_plan_pool import _account_available_for_model
+
+    account = {
+        "id": "zai-research-account",
+        "provider": "zai",
+        "auth_mode": "api_key",
+        "runtime_ready": True,
+        "enabled": True,
+        "provider_metadata": {"available_models": ["glm-5.2"]},
+    }
+    mocker.patch.dict(
+        _shared_state.runtime_config,
+        {
+            "task_type_models": {"research": "claude-opus-4-6"},
+            "task_type_routing": {
+                **(_shared_state.runtime_config.get("task_type_routing") or {}),
+                "research": {"providers": ["zai"], "effort": "max"},
+            },
+        },
+    )
+
+    assert _account_available_for_model(account, "claude-opus-4-6") is False
+    assert _research_route_has_available_account([account]) is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,7 +222,12 @@ def _active_direction(direction_id: str, text: str = "Test direction") -> dict:
 
 
 async def _make_research_task(
-    project: Project, direction: dict, db_session, depth: int = 0
+    project: Project,
+    direction: dict,
+    db_session,
+    depth: int = 0,
+    *,
+    status: TaskStatus = TaskStatus.IN_PROGRESS,
 ) -> Task:
     task = Task(
         project_id=project.id,
@@ -198,7 +236,7 @@ async def _make_research_task(
             {"type": "research", "directions": [direction], "base_branch": "main"}
         ],
         context={"research_depth": depth},
-        status=TaskStatus.IN_PROGRESS,
+        status=status,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
@@ -206,6 +244,22 @@ async def _make_research_task(
     await db_session.commit()
     await db_session.refresh(task)
     return task
+
+
+async def _handle_research_completion(task: Task, logs: str, db_session, **kwargs):
+    """Invoke the handler at its production post-dispatch status boundary.
+
+    The lifecycle commits COMPLETED before entering the research handler. Most
+    tests in this file intentionally reuse an IN_PROGRESS creation fixture, so
+    adapt only that state here; EVALUATING and terminal race fixtures retain
+    their exact status.
+    """
+
+    if task.status == TaskStatus.IN_PROGRESS:
+        task.status = TaskStatus.COMPLETED
+        db_session.add(task)
+        await db_session.commit()
+    return await _handle_research_completion_impl(task, logs, db_session, **kwargs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -337,6 +391,300 @@ async def test_research_payload_includes_compute_experiment_sweeps(
     assert "Experiment arm-b" in arm_titles
     # Bodies must not be included (index entries only)
     assert all("body" not in e for e in sweeps[sweep_id])
+
+
+@pytest.mark.asyncio
+async def test_research_payload_includes_work_headroom(db_session):
+    """Research carries a capacity ceiling and inherits direction priority."""
+    direction = _active_direction("d-wh-research")
+    direction["priority"] = "high"
+    direction["paths"] = [f"backend/app/path_{i}.py" + "x" * 400 for i in range(35)]
+    direction["notes"] = [
+        {
+            "text": f"Preserve diagnosis {i}: " + "n" * 700,
+            "added_at": "2026-08-10" + "z" * 100,
+        }
+        for i in range(7)
+    ]
+    direction["research_history"] = [
+        {
+            "tasks_created": 25,
+            "finding_titles": [f"Finding {i}: " + "t" * 250 for i in range(25)],
+        }
+    ]
+    non_selected = _active_direction("d-wh-non-selected")
+    non_selected["priority"] = "low"
+    non_selected["paths"] = ["backend/should-not-be-copied.py"]
+    non_selected["notes"] = [{"text": "Do not copy this unrelated note"}]
+    project = Project(
+        name="Work Headroom Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction, non_selected],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Keep the second direction visible in the parent portfolio context while
+    # making it ineligible for another concurrent root. This lets the assertion
+    # prove non-selected directions stay compact without spawning a second task.
+    blocker = Task(
+        project_id=project.id,
+        title="Research: already working the unrelated direction",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [non_selected],
+                "current_direction_id": non_selected["id"],
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(blocker)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "research" and t.id != blocker.id
+    ]
+    assert len(research) == 1
+    payload = research[0].first_payload
+    # With no findings deferred from prior cycles, the full ceiling is open.
+    assert payload.get("work_headroom") == 15
+    rendered_direction = next(
+        item for item in payload["directions"] if item["id"] == direction["id"]
+    )
+    assert rendered_direction["status"] == "active"
+    assert len(rendered_direction["paths"]) == 30
+    assert all(len(path) <= 300 for path in rendered_direction["paths"])
+    assert len(rendered_direction["notes"]) == 5
+    assert all(len(note["text"]) <= 500 for note in rendered_direction["notes"])
+    assert all(len(note["added_at"]) <= 80 for note in rendered_direction["notes"])
+    finding_titles = rendered_direction["research_history"][0]["finding_titles"]
+    assert len(finding_titles) == 20
+    assert all(len(title) <= 200 for title in finding_titles)
+    rendered_non_selected = next(
+        item for item in payload["directions"] if item["id"] == non_selected["id"]
+    )
+    assert "paths" not in rendered_non_selected
+    assert "notes" not in rendered_non_selected
+    assert research[0].priority == 100
+
+
+@pytest.mark.asyncio
+async def test_research_payload_work_headroom_reduced_by_prior_deferred(db_session):
+    """Recovered work consumes headroom without silently losing overflow."""
+    from app.time_utils import _utcnow
+
+    dir_id = "d-wh-deferred"
+    project = Project(
+        name="Deferred Headroom Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(dir_id)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A prior COMPLETED research cycle deferred more findings than one cycle can
+    # admit. The next cycle advertises zero new implementation headroom, but all
+    # recovered work must remain in the handoff: the producer is immutable and
+    # there is no consumed/overflow receipt that would make a truncated remainder
+    # reachable on a later cycle.
+    # The prior cycle is placed outside the directed-research cooldown window
+    # (refractory ~90min for a fresh direction) so the crash-guard in
+    # direction_lifecycle does not treat it as "just completed" and skip the
+    # direction — the re-injection path is exactly what this test exercises.
+    prior_completed_at = _utcnow() - timedelta(hours=3)
+    prior = Task(
+        project_id=project.id,
+        title="Research: prior deferred cycle",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [_active_direction(dir_id)],
+                "current_direction_id": dir_id,
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "deferred_findings": [
+                {
+                    "title": f"Deferred improvement {i}",
+                    "description": "A real improvement that did not fit last cycle.",
+                    "direction_id": dir_id,
+                    "finding_hash": f"deferred-hash-{i}",
+                    "deferred_count": i,
+                    "deferred_reason": "capacity",
+                    "originally_researched_at": prior_completed_at.isoformat(),
+                }
+                for i in range(20)
+            ]
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=prior_completed_at,
+        completed_at=prior_completed_at,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(prior)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    # The prior task itself is research; the newly spawned one is the target.
+    spawned = [t for t in research if t.id != prior.id]
+    assert len(spawned) == 1
+    payload = spawned[0].first_payload
+    assert payload.get("work_headroom") == 0
+    # The recovered deferred finding is also carried into the new cycle's context.
+    carried = (spawned[0].context or {}).get("prior_deferred_findings", [])
+    assert len(carried) == 20
+    assert [finding["deferred_count"] for finding in carried] == list(
+        range(19, -1, -1)
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonspawning_carried_metadata_does_not_consume_work_headroom(db_session):
+    """Deferred notes stay visible without suppressing genuinely fresh work."""
+    from app.research_completion import effective_research_finding_headroom
+    from app.time_utils import _utcnow
+
+    direction_id = "d-wh-metadata"
+    direction = _active_direction(direction_id, "Metadata carry headroom")
+    project = Project(
+        name="Metadata Carry Headroom",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_completed_at = _utcnow() - timedelta(hours=3)
+    prior = Task(
+        project_id=project.id,
+        title="Research: prior metadata cycle",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "current_direction_id": direction_id,
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "direction_id": direction_id,
+            "deferred_findings": [
+                {
+                    "type": "direction_note",
+                    "title": f"Deferred direction note {index}",
+                    "description": f"Preserve observation {index} for direction context.",
+                    "prompt": f"Record observation {index} without creating work.",
+                    "direction_id": direction_id,
+                    "originally_researched_at": prior_completed_at.isoformat(),
+                }
+                for index in range(20)
+            ],
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=prior_completed_at,
+        completed_at=prior_completed_at,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(prior)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != prior.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    spawned = result.scalars().all()
+    assert len(spawned) == 1
+    assert spawned[0].first_payload["work_headroom"] == (
+        effective_research_finding_headroom(0)
+    )
+    carried = (spawned[0].context or {}).get("prior_deferred_findings", [])
+    assert len(carried) == 20
+    assert all(item["type"] == "direction_note" for item in carried)
+
+
+@pytest.mark.asyncio
+async def test_autonomous_research_defers_model_and_effort_to_unified_routing(
+    db_session, monkeypatch
+):
+    """Legacy per-type pins cannot downgrade the canonical research=max route."""
+    from app.max_plan_pool import resolve_task_routing
+
+    monkeypatch.setitem(
+        _shared_state.runtime_config,
+        "task_type_models",
+        {"research": "legacy-low-tier-model"},
+    )
+    monkeypatch.setitem(
+        _shared_state.runtime_config,
+        "task_type_efforts",
+        {"research": "low"},
+    )
+    monkeypatch.setitem(
+        _shared_state.runtime_config,
+        "task_type_routing",
+        {"research": {"effort": "max"}},
+    )
+    project = Project(
+        name="Unified Research Route",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-unified-route")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    research = [task for task in tasks if task.first_payload.get("type") == "research"]
+    assert len(research) == 1
+    payload = research[0].first_payload
+    assert "model" not in payload
+    assert "effort" not in payload
+    assert resolve_task_routing(research[0], _shared_state.runtime_config)[
+        "effort"
+    ] == "max"
 
 
 @pytest.mark.asyncio
@@ -1068,6 +1416,266 @@ async def test_strategic_spawn_skipped_when_advisory_lock_held(db_session, mocke
     assert not design_doc_mock.called and not strategic_review_mock.called, (
         "strategic spawn must be skipped while a peer holds the research-spawn lock"
     )
+
+
+@pytest.mark.asyncio
+async def test_strategic_cadence_uses_monotonic_accepted_cycle_receipt(
+    db_session, mocker
+):
+    """Period six fires at 6/12/18, never at the legacy off-by-one count 11.
+
+    Exercise the production autonomous scheduler rather than only the cadence
+    predicate.  A successful Strategic spawn must stamp a durable last-fired
+    receipt under the Project vision lock without incrementing the accepted
+    research-cycle counter itself; replaying the same accepted count is a no-op.
+    """
+    from app.research_cycle_cadence import (
+        STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY,
+    )
+
+    strategic_review = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    design_doc_update = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    # Keep the repeated scheduler calls cadence-only and prevent their tactical
+    # fall-through from creating a research task that would make the direction
+    # busy on the next assertion.
+    mocker.patch("app.autonomous_research.project_parallelism_cap", return_value=0)
+    mocker.patch.dict(
+        _shared_state.runtime_config,
+        {
+            "strategic_research_frequency": 6,
+            "strategic_max_interval_minutes": 0,
+            "strategic_spawn_cooldown_minutes": 0,
+            "directed_research_cooldown_minutes": 0,
+            "architecture_review_frequency": 100,
+        },
+    )
+
+    project = Project(
+        name="Monotonic Strategic Cadence",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-cadence-receipt", "Cadence direction")],
+        vision={"purpose": "test", "_research_spawn_count": 5},
+        # Avoid the first-cycle empty-architecture override so every fire uses
+        # the same mocked Strategic-review path.
+        design_doc={"systems/api": {"id": "api", "status": "working"}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    async def _run_at_accepted_count(accepted_count: int) -> None:
+        await db_session.refresh(project)
+        project.vision = {
+            **(project.vision or {}),
+            "_research_spawn_count": accepted_count,
+        }
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await _spawn_research_task(project, db_session)
+        await db_session.refresh(project)
+        assert project.vision["_research_spawn_count"] == accepted_count, (
+            "Strategic scheduling must not manufacture an accepted research cycle"
+        )
+
+    await _run_at_accepted_count(5)
+    assert strategic_review.await_count == 0
+    assert STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY not in project.vision
+
+    await _run_at_accepted_count(6)
+    assert strategic_review.await_count == 1
+    assert project.vision[STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY] == 6
+
+    await _run_at_accepted_count(6)  # replay of the same scheduler boundary
+    assert strategic_review.await_count == 1
+
+    await _run_at_accepted_count(11)
+    assert strategic_review.await_count == 1, (
+        "A Strategic spawn must not shorten the next six-cycle period to five"
+    )
+
+    await _run_at_accepted_count(12)
+    assert strategic_review.await_count == 2
+    assert project.vision[STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY] == 12
+
+    await _run_at_accepted_count(18)
+    assert strategic_review.await_count == 3
+    assert project.vision[STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY] == 18
+    assert design_doc_update.await_count == 0
+
+
+def test_strategic_cadence_receipt_does_not_consume_concurrent_completion():
+    """A completion arriving during spawn remains owed to the next cadence."""
+    from app.research_cycle_cadence import (
+        STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY,
+        record_strategic_cadence_fire,
+        strategic_cadence_due,
+    )
+
+    vision = {
+        "_research_spawn_count": 7,
+        STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY: 0,
+    }
+    assert record_strategic_cadence_fire(vision, accepted_count=6) == 6
+    assert vision["_research_spawn_count"] == 7
+    assert not strategic_cadence_due(11, 6, 6)
+    assert strategic_cadence_due(12, 6, 6)
+
+
+@pytest.mark.asyncio
+async def test_strategic_cadence_receipt_survives_outer_commit_failure(
+    db_session, mocker
+):
+    """A durable Strategic spawn and its cadence receipt share one commit.
+
+    Fault the autonomous loop's follow-up bookkeeping commit after the real
+    guarded Strategic INSERT/cycle tail has committed. Replay at the same
+    accepted count must observe the spawner-owned receipt and create nothing.
+    """
+    import app.autonomous_research as autonomous_research
+    from app.research_cycle_cadence import (
+        STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY,
+        STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY,
+    )
+    from app.strategic_spawning import _finalize_strategic_review_spawn
+
+    project = Project(
+        name="Atomic Strategic Cadence Receipt",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-cadence-atomic", "Atomic cadence")],
+        vision={"purpose": "test", "_research_spawn_count": 6},
+        design_doc={"systems/api": {"id": "api", "status": "working"}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawn_calls = 0
+
+    async def _durable_strategic_spawn(
+        spawned_project,
+        session,
+        *,
+        cadence_accepted_count=None,
+        expected_legacy_generation=None,
+        **_kwargs,
+    ):
+        nonlocal spawn_calls
+        spawn_calls += 1
+        return await _finalize_strategic_review_spawn(
+            session,
+            project_id=spawned_project.id,
+            project_name=spawned_project.name,
+            payload={"type": "strategic_review", "base_branch": "main"},
+            cycle_id=str(uuid.uuid4()),
+            strategy_only=True,
+            base_vision=dict(spawned_project.vision or {}),
+            base_problem_model=dict(spawned_project.problem_model or {}),
+            base_running_update=spawned_project.running_update or "",
+            local_runner_intent={},
+            preferred_runner_target_id=None,
+            extra_context=None,
+            operator_steered=False,
+            steering_excerpt=None,
+            expected_legacy_generation=expected_legacy_generation,
+            cadence_accepted_count=cadence_accepted_count,
+        )
+
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=_durable_strategic_spawn,
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(side_effect=AssertionError("architecture path not expected")),
+    )
+    mocker.patch(
+        "app.strategic_events.emit_strategic_cycle_started",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch("app.autonomous_research.project_parallelism_cap", return_value=0)
+    mocker.patch.dict(
+        _shared_state.runtime_config,
+        {
+            "strategic_research_frequency": 6,
+            "strategic_max_interval_minutes": 0,
+            "strategic_spawn_cooldown_minutes": 0,
+            "directed_research_cooldown_minutes": 0,
+            "architecture_review_frequency": 100,
+        },
+    )
+
+    real_outer_commit = autonomous_research.commit_legacy_authorized
+    failed_outer_commit = False
+
+    async def _fault_first_outer_commit(session, project_id, generation):
+        nonlocal failed_outer_commit
+        if not failed_outer_commit:
+            failed_outer_commit = True
+            raise RuntimeError("fault after durable Strategic spawn")
+        return await real_outer_commit(session, project_id, generation)
+
+    mocker.patch.object(
+        autonomous_research,
+        "commit_legacy_authorized",
+        new=_fault_first_outer_commit,
+    )
+
+    with pytest.raises(RuntimeError, match="after durable Strategic spawn"):
+        await _spawn_research_task(project, db_session)
+    # The injected helper raises before SQLAlchemy's real commit transition.
+    # Reset the synthetic outer transaction just as the production commit
+    # helper does on failure.  Whether SQLAlchemy emits an internal transaction
+    # warning here is version/state dependent and is not part of this receipt
+    # durability contract.
+    await db_session.rollback()
+
+    await db_session.refresh(project)
+    strategic_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.payloads[0]["type"].as_string() == "strategic_review",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(strategic_tasks) == 1
+    assert strategic_tasks[0].context[
+        STRATEGIC_CADENCE_ACCEPTED_COUNT_CONTEXT_KEY
+    ] == 6
+    assert project.vision[STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY] == 6
+    assert project.vision["_research_spawn_count"] == 6
+
+    strategic_tasks[0].status = TaskStatus.COMPLETED
+    strategic_tasks[0].completed_at = _utcnow()
+    db_session.add(strategic_tasks[0])
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    assert spawn_calls == 1
+    strategic_task_count = (
+        await db_session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.payloads[0]["type"].as_string() == "strategic_review",
+            )
+        )
+    ).scalars().all()
+    assert len(strategic_task_count) == 1
 
 
 @pytest.mark.asyncio
@@ -2092,8 +2700,15 @@ async def test_research_admission_counts_evaluating_parent_without_active_childr
 
 
 def test_project_parallelism_cap_override_resolution():
-    """A positive-int build_config override wins; bool/zero/str/absent fall back to the global."""
+    """A positive-int build_config override wins; bool/zero/str/absent fall back to the global.
+
+    Also verifies the fleet-headroom composition used by the spawn path: the
+    effective per-project admission is ``min(parallelism cap, headroom budget)``,
+    so scarce headroom throttles even a project whose override would allow more,
+    while abundant headroom never inflates the override.
+    """
     from app.autonomous_research import project_parallelism_cap
+    from app.fleet_utilization import compute_headroom_spawn_budget
     from app.shared_state import runtime_config as _runtime_config
 
     old_val = _runtime_config.get("max_parallel_research_per_project", 2)
@@ -2119,6 +2734,29 @@ def test_project_parallelism_cap_override_resolution():
             assert _cap() == 4
         project.build_config = None
         assert _cap() == 4
+
+        # Fleet-headroom composition (the spawn path caps by both):
+        # min(project override, headroom budget).
+        project.build_config = {"max_parallel_research": 2}
+        assert _cap() == 2
+        abundant = compute_headroom_spawn_budget(
+            {"vm_slots_available": 8, "vm_cap": 10, "active_task_vms": 2},
+            min_free_slots=2,
+            cap=6,
+        )
+        assert abundant["budget"] == 6
+        assert min(_cap(), abundant["budget"]) == 2, (
+            "abundant headroom must not inflate the per-project parallel cap"
+        )
+        scarce = compute_headroom_spawn_budget(
+            {"vm_slots_available": 1, "vm_cap": 10, "active_task_vms": 9},
+            min_free_slots=2,
+            cap=6,
+        )
+        assert scarce["budget"] == 0
+        assert min(_cap(), scarce["budget"]) == 0, (
+            "headroom below the floor must admit nothing even under a project override"
+        )
     finally:
         _runtime_config["max_parallel_research_per_project"] = old_val
 
@@ -3780,10 +4418,14 @@ async def test_depth_limit_prevents_child_tasks(db_session, mocker):
 
     # depth=3 is at the limit — no children should be spawned
     task = await _make_research_task(project, direction, db_session, depth=3)
+    # Production invokes the post-completion handler after the agent has moved
+    # the task terminal; keep the direct unit invocation faithful to that seam.
+    task.status = TaskStatus.COMPLETED
 
-    mocker.patch(
+    finding = _make_finding(direction_id=direction["id"])
+    parser = mocker.patch(
         "app.research_completion._parse_research_findings",
-        return_value=[_make_finding(direction_id=direction["id"])],
+        return_value=[finding],
     )
 
     await _handle_research_completion(task, "", db_session)
@@ -3793,6 +4435,112 @@ async def test_depth_limit_prevents_child_tasks(db_session, mocker):
     )
     assert len(result.scalars().all()) == 0, "No children at max depth"
     assert "depth limit" in (task.latest_status_message or "").lower()
+    assert task.plan_output == []
+    assert [item["title"] for item in task.context["deferred_findings"]] == [
+        finding["title"]
+    ]
+    assert task.context[FINALIZED_RESEARCH_FINDINGS_KEY] is True
+    assert task.context["research_surviving_findings"] == 0
+    assert resolve_research_findings_for_surface(task) is None
+
+    # The marker is also the replay receipt: once preservation commits, a
+    # malformed/stale artifact must neither reprocess the deferred handoff nor
+    # promote it into the authoritative findings surface.
+    first_plan_output = list(task.plan_output)
+    parser.side_effect = AssertionError("finalized replay must not parse logs")
+    await _handle_research_completion(task, "malformed replay", db_session)
+    assert task.plan_output == first_plan_output
+    assert task.context[FINALIZED_RESEARCH_FINDINGS_KEY] is True
+
+
+@pytest.mark.asyncio
+async def test_depth_limit_cancellation_cannot_stamp_marker_or_consume_carry(
+    db_session, mocker
+):
+    """A peer cancellation in the pre-final-lock gap wins the depth boundary."""
+    import contextlib
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.orm import sessionmaker
+
+    import app.research_completion as research_completion
+    from app.research_deferred_carry import (
+        DEFERRED_FINDING_CONSUMPTION_ACKS_KEY,
+        unacknowledged_deferred_findings,
+    )
+
+    direction = _active_direction("d-depth-cancel", "Cancelled deep research")
+    project = Project(
+        name="Depth cancellation",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.flush()
+    carried = _make_finding("Preserve producer carry", direction["id"])
+    producer = Task(
+        project_id=project.id,
+        title="Carry producer",
+        payloads=[{"type": "research", "base_branch": "main"}],
+        context={"deferred_findings": [carried]},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(producer)
+    await db_session.flush()
+    task = await _make_research_task(project, direction, db_session, depth=3)
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": unacknowledged_deferred_findings(producer),
+    }
+    db_session.add(task)
+    await db_session.commit()
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[]
+    )
+
+    session_factory = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    real_boundary = research_completion.lock_accepted_research_boundary
+    cancelled = False
+
+    @contextlib.asynccontextmanager
+    async def _cancel_before_depth_boundary(session, stale_task):
+        nonlocal cancelled
+        if not cancelled:
+            async with session_factory() as peer_session:
+                peer_task = await peer_session.get(Task, stale_task.id)
+                assert peer_task is not None
+                peer_task.status = TaskStatus.CANCELLED
+                await peer_session.commit()
+                cancelled = True
+        async with real_boundary(session, stale_task) as pair:
+            yield pair
+
+    mocker.patch.object(
+        research_completion,
+        "lock_accepted_research_boundary",
+        new=_cancel_before_depth_boundary,
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    assert cancelled is True
+    async with session_factory() as verify_session:
+        persisted_task = await verify_session.get(Task, task.id)
+        persisted_producer = await verify_session.get(Task, producer.id)
+        assert persisted_task is not None and persisted_producer is not None
+        assert persisted_task.status == TaskStatus.CANCELLED
+        assert (
+            persisted_task.context or {}
+        ).get(FINALIZED_RESEARCH_FINDINGS_KEY) is not True
+        assert persisted_producer.context["deferred_findings"] != []
+        assert DEFERRED_FINDING_CONSUMPTION_ACKS_KEY not in (
+            persisted_producer.context or {}
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4174,9 +4922,15 @@ async def test_retry_with_preexisting_children_stays_evaluating_not_completed(
         parent_task_id=task.id,
         title=dup_title,
         payloads=[{"type": "create", "prompt": "refactor it", "base_branch": "main"}],
-        context={"finding_hash": fhash, "direction_id": direction["id"]},
+        context={
+            "research_task_id": str(task.id),
+            "parent_research_task_id": str(task.id),
+            "finding_hash": fhash,
+            "direction_id": direction["id"],
+        },
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_RESEARCH,
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
     db_session.add(existing_child)
@@ -4973,8 +5727,19 @@ async def test_child_task_carries_research_depth_plus_one(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_finding_type_research_spawns_research_subtask(db_session, mocker):
-    """A finding with type='research' spawns a child research task."""
-    direction = _active_direction("d-typeres1", "Type research")
+    """A direction-owned research finding freezes scope onto its child payload."""
+    direction = {
+        **_active_direction("d-typeres1", "Type research"),
+        "category": "reliability",
+        "completion_criteria": "The successor prompt remains direction-scoped.",
+        "research_context": "Determine which query bottleneck this direction should fix.",
+        "context": {
+            "success_evidence": "The child names the owning direction.",
+            "retirement_condition": "The scoped successor path is regression-tested.",
+        },
+        "notes": ["mutable operator note must not enter the task payload"],
+        "research_history": [{"tasks_created": 99}],
+    }
     project = Project(
         name="Sub-Research Test",
         user_id="test-user-123",
@@ -5008,7 +5773,23 @@ async def test_finding_type_research_spawns_research_subtask(db_session, mocker)
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 1
-    assert child_tasks[0].payloads[0]["type"] == "research"
+    child_payload = child_tasks[0].payloads[0]
+    assert child_payload["type"] == "research"
+    assert child_payload["current_direction_id"] == direction["id"]
+    assert child_payload["directions"] == [
+        {
+            "id": direction["id"],
+            "text": direction["text"],
+            "category": direction["category"],
+            "priority": direction["priority"],
+            "completion_criteria": direction["completion_criteria"],
+                "research_context": direction["research_context"],
+                "context": direction["context"],
+                "paths": direction["paths"],
+            }
+        ]
+    assert "notes" not in child_payload["directions"][0]
+    assert "research_history" not in child_payload["directions"][0]
 
 
 @pytest.mark.asyncio
@@ -8558,7 +9339,57 @@ async def test_all_saturated_directions_triggers_force_strategic(db_session):
 
 @pytest.mark.asyncio
 async def test_partially_saturated_directions_no_force_strategic(db_session):
-    """When only some active directions are saturated, force_strategic does NOT fire."""
+    """When only some active directions are saturated, force_strategic does NOT fire.
+
+    Also verifies that a cycle zeroed by a NON-dedup filter cause (adversarial
+    gate, low-actionability gate, degradation gate, or batch cap) is NOT genuine
+    exhaustion: those cycles must not count toward saturation the way a cycle
+    where the agent genuinely found nothing does, otherwise the direction is
+    wrongly marked possibly_saturated and its refractory window doubled.
+    """
+    from app.research_completion import _compute_saturation
+
+    # Each of the last 3 cycles produced zero tasks, but a non-dedup spawn gate
+    # deferred the findings — the agent found content the pipeline rejected, so
+    # the direction is NOT genuinely exhausted and must NOT be saturated.
+    filter_zeroed_history = [
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "degradation_gate": 2,
+                "batch_cap": 1,
+            },
+        },
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "adversarial_gate": 1,
+                "low_actionability": 2,
+            },
+        },
+        {
+            "tasks_created": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "batch_cap": 3,
+            },
+        },
+    ]
+    assert _compute_saturation(filter_zeroed_history) is False, (
+        "Gate-zeroed cycles (adversarial / low-actionability / degradation / "
+        "batch-cap) must NOT count as genuine exhaustion toward saturation"
+    )
+
+    # Sanity contrast: 3 zero-task cycles with no filter cause ARE genuine
+    # exhaustion and do saturate.
+    genuine_history = [{"tasks_created": 0} for _ in range(3)]
+    assert _compute_saturation(genuine_history) is True
+
     project = Project(
         name="Partial Saturated Test Project",
         user_id="test-user-123",
@@ -9859,6 +10690,81 @@ async def test_repeatedly_deferred_low_confidence_findings_are_decayed(
 
 
 @pytest.mark.asyncio
+async def test_directed_cycle_recovers_legacy_parent_scoped_deferred_finding(
+    db_session,
+):
+    """A legacy blank finding inherits only its matching producer direction."""
+    direction_id = "d-legacy-carry01"
+    other_direction_id = "d-legacy-other01"
+    direction = _active_direction(direction_id, "Legacy directed carry")
+    project = Project(
+        name="Legacy Directed Carry",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    legacy_parent_scoped = _make_finding(
+        "Legacy parent-scoped deferred finding", direction_id
+    )
+    legacy_parent_scoped.pop("direction_id")
+    explicit_other = _make_finding(
+        "Explicit other-direction finding", other_direction_id
+    )
+    prior_completed_at = _utcnow() - timedelta(hours=3)
+    producer = Task(
+        project_id=project.id,
+        title="Research: legacy directed producer",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "current_direction_id": direction_id,
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "direction_id": direction_id,
+            "deferred_findings": [legacy_parent_scoped, explicit_other],
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=prior_completed_at,
+        completed_at=prior_completed_at,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(producer)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    spawned = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.id != producer.id,
+                    Task.payloads[0]["type"].as_string() == "research",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(spawned) == 1
+    assert spawned[0].first_payload["current_direction_id"] == direction_id
+    carried = (spawned[0].context or {}).get("prior_deferred_findings", [])
+    assert [finding["title"] for finding in carried] == [
+        legacy_parent_scoped["title"]
+    ]
+    assert carried[0]["direction_id"] == direction_id
+
+
+@pytest.mark.asyncio
 async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, mocker):
     """Undirected research cycles must recover deferred findings without a direction_id.
 
@@ -9875,6 +10781,7 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
             "purpose": "test",
             "_research_spawn_count": 12,
             "_strategic_frequency_override": 5,
+            "_strategic_last_accepted_research_count": 10,
         },
     )
     db_session.add(project)
@@ -9886,6 +10793,7 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
     directed_finding = _make_finding(
         "Directed deferred finding", direction_id=direction["id"]
     )
+    prior_completed_at = _utcnow() - timedelta(hours=3)
     prev_completed = Task(
         project_id=project.id,
         title="Research: prior undirected cycle",
@@ -9903,6 +10811,35 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
     db_session.add(prev_completed)
+    # A second legacy producer owns a blank finding at the task boundary. The
+    # undirected scan may inspect this row, but the server-owned fallback must
+    # keep it directed so an undirected successor cannot duplicate/steal it.
+    parent_scoped = _make_finding(
+        "Legacy parent-scoped directed finding", direction_id=direction["id"]
+    )
+    parent_scoped.pop("direction_id")
+    directed_producer = Task(
+        project_id=project.id,
+        title="Research: prior directed legacy cycle",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction["id"],
+            }
+        ],
+        context={
+            "direction_id": direction["id"],
+            "deferred_findings": [parent_scoped],
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=prior_completed_at,
+        completed_at=prior_completed_at,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(directed_producer)
     await db_session.commit()
 
     await _spawn_research_task(project, db_session)
@@ -9910,7 +10847,7 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
     result = await db_session.execute(
         select(Task).where(
             Task.project_id == project.id,
-            Task.id != prev_completed.id,
+            Task.id.notin_([prev_completed.id, directed_producer.id]),
             Task.created_by == "ORCHESTRATOR",
         )
     )
@@ -9929,6 +10866,10 @@ async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, 
     )
     assert "Directed deferred finding" not in titles, (
         f"Undirected cycle must NOT steal directed-cycle leftovers, got: {titles}"
+    )
+    assert "Legacy parent-scoped directed finding" not in titles, (
+        "Undirected recovery must not duplicate a blank legacy finding whose "
+        f"producer owns direction {direction['id']}, got: {titles}"
     )
 
 
@@ -10011,6 +10952,94 @@ async def test_collection_expires_stale_deferred_findings(db_session):
         )
         assert "Stale TTL finding" not in titles, (
             f"Stale deferred finding older than TTL must be excluded, got: {titles}"
+        )
+    finally:
+        _ss.runtime_config.pop("completed_research_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_collection_records_retired_disposition_on_producer(db_session):
+    """A TTL-expired deferred finding is not silently dropped at the spawn-side
+    recovery scan: the producing COMPLETED task's context carries a durable
+    retired disposition under finding_retired_dispositions, while a fresh copy
+    with the same canonical body remains recoverable."""
+    import app.shared_state as _ss
+
+    from app.research_deferred_carry import canonical_deferred_finding_hash
+
+    _ss.runtime_config["completed_research_cooldown_minutes"] = 0
+    try:
+        direction_id = "d-ttl-retired01"
+        direction = _active_direction(direction_id, "TTL retired disposition direction")
+        project = Project(
+            name="TTL Retired Disposition Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+            vision={"purpose": "test"},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        stale_ts = (_utcnow() - timedelta(days=8)).isoformat()
+        stale_finding = _make_finding("Stale retired finding", direction_id)
+        stale_finding["originally_researched_at"] = stale_ts
+        stale_finding["deferred_reason"] = "degradation_gate"
+        stale_finding["deferred_count"] = 2
+        stale_finding["finding_hash"] = "agent-forged-retirement-alias"
+        fresh_duplicate = dict(stale_finding)
+        fresh_duplicate["originally_researched_at"] = (
+            _utcnow() - timedelta(days=1)
+        ).isoformat()
+        fresh_duplicate["finding_hash"] = "untrusted-fresh-lineage"
+
+        prev_completed = Task(
+            project_id=project.id,
+            title="Research: prior cycle",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [direction],
+                    "base_branch": "main",
+                    "current_direction_id": direction_id,
+                }
+            ],
+            context={"deferred_findings": [stale_finding, fresh_duplicate]},
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(prev_completed)
+        await db_session.commit()
+        await db_session.refresh(prev_completed)
+
+        await _spawn_research_task(project, db_session)
+
+        await db_session.refresh(prev_completed)
+        records = (prev_completed.context or {}).get("finding_retired_dispositions")
+        assert records is not None, (
+            "TTL-expired deferred findings must be recorded as retired dispositions "
+            "on the producing task"
+        )
+        assert isinstance(records, list)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["title"] == "Stale retired finding"
+        assert rec["direction_id"] == direction_id
+        assert rec["deferred_reason"] == "degradation_gate"
+        assert rec["deferred_count"] == 2
+        assert rec["retired_by"] == "ttl"
+        assert rec["disposition"] == "retired"
+        assert "retired_at" in rec
+        assert rec["finding_hash"] == canonical_deferred_finding_hash(stale_finding)
+        remaining = prev_completed.context["deferred_findings"]
+        assert len(remaining) == 1, (
+            "retirement must prune only the expired transport identity, not a fresh "
+            "copy with the same title/body"
+        )
+        assert remaining[0]["originally_researched_at"] == (
+            fresh_duplicate["originally_researched_at"]
         )
     finally:
         _ss.runtime_config.pop("completed_research_cooldown_minutes", None)
@@ -15278,6 +16307,475 @@ async def test_post_merge_research_skips_paused_project(db_session, mocker):
     spawned_ids = {call.args[0].id for call in spawn_spy.call_args_list}
     assert active.id in spawned_ids, "Non-paused project should spawn research"
     assert paused.id not in spawned_ids, "Paused project must be skipped"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fleet-headroom-scaled research admission
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _headroom_snapshot(*, available, vm_cap=10, active=2):
+    return {
+        "vm_slots_available": available,
+        "vm_cap": vm_cap,
+        "active_task_vms": active,
+        "managed_vm_count": max(active, vm_cap - available),
+        "idle_pool_vms": 0,
+        "orphaned_leased_vms": 0,
+        "vm_saturation": "healthy",
+    }
+
+
+@pytest.mark.asyncio
+async def test_idle_research_admits_by_headroom_budget(db_session, mocker):
+    """`_check_idle_research` scales admission to measured fleet headroom: a
+    budget of 0 (fleet below the min-free-slots floor) admits nothing, while
+    headroom above the floor hands the computed budget to the spawner."""
+    from app.autonomous_research import _check_idle_research
+    from conftest import TestingSessionLocal
+
+    mocker.patch("app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock)
+    mocker.patch(
+        "app.autonomous_research._spawn_residual_fingerprint_remediation",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.anomaly_detection._expire_stale_proposals", new_callable=AsyncMock
+    )
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", TestingSessionLocal)
+
+    project = Project(
+        name="Idle Headroom",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-hdrm01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawn_spy = mocker.patch(
+        "app.autonomous_research._spawn_research_task",
+        new_callable=AsyncMock,
+        return_value=1,
+    )
+
+    # Abundant headroom → budget = min(available, cap) = 6.
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=8)),
+    )
+    _shared_state.last_idle_check = None
+    try:
+        await _check_idle_research()
+    finally:
+        _shared_state.last_idle_check = None
+    assert spawn_spy.called, "headroom above floor must admit research"
+    assert spawn_spy.call_args.kwargs["headroom_budget"] == 6
+
+    # Below the floor → no admission at all.
+    spawn_spy.reset_mock()
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=1, active=9)),
+    )
+    _shared_state.last_idle_check = None
+    try:
+        await _check_idle_research()
+    finally:
+        _shared_state.last_idle_check = None
+    assert not spawn_spy.called, "headroom below floor must admit nothing"
+
+
+@pytest.mark.asyncio
+async def test_periodic_lane_not_starved_by_research_budget(db_session, mocker):
+    """Regression: the fleet-headroom budget scales RESEARCH admission only.
+
+    The budget is decremented per project across the sweep, so if the periodic
+    lane (security_audit / qa / deps) were gated on the *remaining* budget,
+    projects later in the iteration order would silently lose their security
+    audits once earlier projects consumed it — making iteration order decide
+    whether security audits run. Every project in a sweep that started with
+    fleet capacity must get its periodic spawns, even after research admission
+    is exhausted.
+    """
+    from app.autonomous_research import _check_idle_research
+    from conftest import TestingSessionLocal
+
+    mocker.patch(
+        "app.autonomous_research._spawn_residual_fingerprint_remediation",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.autonomous_research._spawn_viewport_regression_remediation",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.anomaly_detection._expire_stale_proposals", new_callable=AsyncMock
+    )
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", TestingSessionLocal)
+
+    projects = []
+    for n in range(3):
+        p = Project(
+            name=f"Budget Sweep {n}",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction(f"d-sweep{n}")],
+        )
+        db_session.add(p)
+        projects.append(p)
+    await db_session.commit()
+    for p in projects:
+        await db_session.refresh(p)
+
+    periodic_spy = mocker.patch(
+        "app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock
+    )
+    # The first project to reach the spawner consumes the entire budget (6),
+    # leaving 0 remaining for every project after it.
+    spawn_spy = mocker.patch(
+        "app.autonomous_research._spawn_research_task",
+        new_callable=AsyncMock,
+        return_value=6,
+    )
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=8)),
+    )
+
+    _shared_state.last_idle_check = None
+    try:
+        await _check_idle_research()
+    finally:
+        _shared_state.last_idle_check = None
+
+    # Research admission stops once the shared budget is exhausted: only the
+    # first project reached the spawner.
+    assert spawn_spy.call_count == 1, (
+        "research admission must stop once the shared budget is exhausted"
+    )
+
+    # ...but every project still got its full periodic lane.
+    swept = {p.id for p in projects}
+    for task_type in ("security_audit", "qa", "deps"):
+        got = {
+            c.args[0].id
+            for c in periodic_spy.call_args_list
+            if c.args[1] == task_type
+        }
+        assert swept <= got, (
+            f"every project in the sweep must get its periodic {task_type} spawn "
+            f"regardless of iteration order / remaining research budget; "
+            f"missing {swept - got}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_periodic_lane_skipped_when_fleet_below_floor(db_session, mocker):
+    """The periodic lane is still fleet-gated: a sweep that starts below the
+    min-free-slots floor spawns no research and no periodic work (the
+    pre-headroom all-or-none semantics), so decoupling it from the budget did
+    not make it unbounded.
+
+    The residual-fingerprint and viewport-regression remediation lanes are NOT
+    fleet-gated and must still run at zero headroom — a busy fleet is exactly
+    when recurring-failure remediation matters most.
+    """
+    from app.autonomous_research import _check_idle_research
+    from conftest import TestingSessionLocal
+
+    residual_spy = mocker.patch(
+        "app.autonomous_research._spawn_residual_fingerprint_remediation",
+        new_callable=AsyncMock,
+    )
+    viewport_spy = mocker.patch(
+        "app.autonomous_research._spawn_viewport_regression_remediation",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.anomaly_detection._expire_stale_proposals", new_callable=AsyncMock
+    )
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", TestingSessionLocal)
+
+    project = Project(
+        name="Below Floor Periodic",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-floor01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    periodic_spy = mocker.patch(
+        "app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.autonomous_research._spawn_research_task",
+        new_callable=AsyncMock,
+        return_value=0,
+    )
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=1, active=9)),
+    )
+
+    _shared_state.last_idle_check = None
+    try:
+        await _check_idle_research()
+    finally:
+        _shared_state.last_idle_check = None
+
+    assert not periodic_spy.called, (
+        "a sweep starting below the min-free-slots floor must not spawn periodic work"
+    )
+    assert residual_spy.called, (
+        "the residual-fingerprint remediation lane is not fleet-budget-scaled and "
+        "must still run when headroom is below the floor"
+    )
+    assert viewport_spy.called, (
+        "the viewport-regression remediation lane is not fleet-budget-scaled and "
+        "must still run when headroom is below the floor"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_merge_research_respects_headroom(db_session, mocker):
+    """The post-merge hook (`_check_autonomous_research`) shares the same
+    scaled-admission semantics: below-floor headroom skips the whole sweep,
+    and above-floor headroom threads the budget into each spawn."""
+    from app.autonomous_research import _check_autonomous_research
+    from conftest import TestingSessionLocal
+
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", TestingSessionLocal)
+    spawn_spy = mocker.patch(
+        "app.autonomous_research._spawn_research_task",
+        new_callable=AsyncMock,
+        return_value=1,
+    )
+
+    owner, repo = "acme", "widgets"
+    project = Project(
+        name="Merge Headroom",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        github_owner=owner,
+        github_repo=repo,
+        directions=[_active_direction("d-mh01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=8)),
+    )
+    await _check_autonomous_research(owner, repo)
+    assert spawn_spy.called, "headroom above floor must admit post-merge research"
+    assert spawn_spy.call_args.kwargs["headroom_budget"] == 6
+
+    spawn_spy.reset_mock()
+    mocker.patch(
+        "app.fleet_utilization.get_fleet_utilization_snapshot",
+        new=AsyncMock(return_value=_headroom_snapshot(available=1, active=9)),
+    )
+    await _check_autonomous_research(owner, repo)
+    assert not spawn_spy.called, "headroom below floor must admit nothing post-merge"
+
+
+@pytest.mark.asyncio
+async def test_spawn_research_task_headroom_budget_caps_spawn_count(db_session):
+    """The fleet-headroom budget is enforced inside the spawn path: with two
+    active directions and a per-project parallel cap of 2, a headroom budget of
+    1 admits exactly one task and a budget of 0 admits none."""
+    project = Project(
+        name="Headroom Caps Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            _active_direction("d-hcap-a1"),
+            _active_direction("d-hcap-b2"),
+        ],
+        vision={"purpose": "test"},
+        build_config={"max_parallel_research": 2},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_research_task(project, db_session, headroom_budget=1)
+    assert spawned == 1, "headroom budget 1 must cap the spawn at one task"
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 1, "exactly one research task may be spawned"
+
+    # A zero budget admits nothing (headroom below the floor).
+    project2 = Project(
+        name="Headroom Zero Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            _active_direction("d-hzero-a1"),
+            _active_direction("d-hzero-b2"),
+        ],
+        vision={"purpose": "test"},
+        build_config={"max_parallel_research": 2},
+    )
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    spawned = await _spawn_research_task(project2, db_session, headroom_budget=0)
+    assert spawned == 0, "headroom budget 0 must admit nothing"
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project2.id)
+    )
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 0, "no research task may be spawned with budget 0"
+
+
+@pytest.mark.asyncio
+async def test_idle_research_relaxes_evaluating_total_on_headroom(db_session):
+    """With the headroom relaxation on (the default) AND the fleet above the
+    min-free-slots floor, an EVALUATING parent stops counting against the
+    per-project total cap. With the operator escape hatch set to false — or
+    headroom below the floor — the parent still blocks (the relaxation is gated
+    on both)."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    old_flag = _runtime_config.get("research_headroom_ignores_evaluating", True)
+    _runtime_config["research_headroom_ignores_evaluating"] = True
+    try:
+        project = Project(
+            name="Eval Relax Headroom",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction("d-evalrelax1")],
+            vision={"purpose": "test"},
+            build_config={"max_total_research": 1},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # EVALUATING parent on a DIFFERENT direction: counts toward the total cap
+        # (type == "research") but does not block the active direction.
+        parent = Task(
+            project_id=project.id,
+            title="Research: evaluating parent",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [],
+                    "base_branch": "main",
+                    "current_direction_id": "d-elsewhere",
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(parent)
+        await db_session.commit()
+
+        # Flag on + headroom above floor → EVALUATING excluded → spawn proceeds.
+        spawned = await _spawn_research_task(project, db_session, headroom_budget=6)
+        assert spawned == 1, (
+            "EVALUATING parent must not block when the headroom relaxation is on"
+        )
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        research = [
+            t
+            for t in result.scalars().all()
+            if (t.payloads or [{}])[0].get("type") == "research"
+        ]
+        assert len(research) == 2, "parent + one newly spawned research task"
+
+        # Flag on but headroom below floor → EVALUATING counts again → blocked.
+        project3 = Project(
+            name="Eval Relax No Headroom",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction("d-evalrelax3")],
+            vision={"purpose": "test"},
+            build_config={"max_total_research": 1},
+        )
+        db_session.add(project3)
+        await db_session.commit()
+        await db_session.refresh(project3)
+        parent3 = Task(
+            project_id=project3.id,
+            title="Research: evaluating parent",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [],
+                    "base_branch": "main",
+                    "current_direction_id": "d-elsewhere3",
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(parent3)
+        await db_session.commit()
+
+        spawned = await _spawn_research_task(project3, db_session, headroom_budget=0)
+        assert not spawned, (
+            "headroom below the floor must keep the EVALUATING total cap in force"
+        )
+
+        # Flag off + headroom above floor → EVALUATING still counts → blocked.
+        _runtime_config["research_headroom_ignores_evaluating"] = False
+        project2 = Project(
+            name="Eval Relax Flag Off",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction("d-evalrelax2")],
+            vision={"purpose": "test"},
+            build_config={"max_total_research": 1},
+        )
+        db_session.add(project2)
+        await db_session.commit()
+        await db_session.refresh(project2)
+        parent2 = Task(
+            project_id=project2.id,
+            title="Research: evaluating parent",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [],
+                    "base_branch": "main",
+                    "current_direction_id": "d-elsewhere2",
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(parent2)
+        await db_session.commit()
+
+        spawned = await _spawn_research_task(project2, db_session, headroom_budget=6)
+        assert not spawned, (
+            "EVALUATING parent must still count when the relaxation flag is off"
+        )
+    finally:
+        _runtime_config["research_headroom_ignores_evaluating"] = old_flag
 
 
 # ─────────────────────────────────────────────────────────────────────────────

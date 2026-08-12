@@ -46,6 +46,7 @@ from app.research_context import (
     build_recent_findings_evidence,
     extract_diagnosis_from_context,
 )
+from app.research_execution_authority import authenticated_research_children
 from app.shared_state import DEFAULT_TASK_SCOPE
 from app.task_evaluators import (
     CHALLENGE_AGREES,
@@ -177,21 +178,28 @@ def _append_archived_diagnosis(doc: dict, direction: dict, direction_id: str) ->
 def _compute_saturation(history: list) -> bool:
     """Return True if last 3 *genuine* cycles all produced 0 or 1 tasks.
 
-    A cycle is dedup-zeroed (not genuine) when tasks_created==0 and dedup
-    filters (hash_dedup or word_overlap_dedup) account for the zero — meaning
-    the agent found real content but it was rejected as already-known. Those
-    cycles do not prove the direction is exhausted, so they are skipped when
-    building the saturation window.
+    A cycle is filter-zeroed (not genuine) when tasks_created==0 and a filter
+    cause accounts for the zero — the agent found real content but the pipeline
+    rejected it as already-known (hash_dedup / word_overlap_dedup) or as
+    non-actionable for this cycle (adversarial_gate, low_actionability,
+    degradation_gate, batch_cap). Those cycles do not prove the direction is
+    exhausted, so they are skipped when building the saturation window. Only a
+    cycle with zero tasks AND no filter cause is treated as genuine exhaustion.
     """
     genuine = []
     for entry in reversed(history):
         if entry.get("tasks_created", 0) == 0:
             fb = entry.get("filter_breakdown") or {}
-            dedup_count = (fb.get("hash_dedup") or 0) + (
-                fb.get("word_overlap_dedup") or 0
+            filter_count = (
+                (fb.get("hash_dedup") or 0)
+                + (fb.get("word_overlap_dedup") or 0)
+                + (fb.get("adversarial_gate") or 0)
+                + (fb.get("low_actionability") or 0)
+                + (fb.get("degradation_gate") or 0)
+                + (fb.get("batch_cap") or 0)
             )
-            if dedup_count > 0:
-                # Dedup-zeroed cycle — skip, not genuine exhaustion
+            if filter_count > 0:
+                # Filter-zeroed cycle — skip, not genuine exhaustion
                 continue
         genuine.append(entry)
         if len(genuine) == 3:
@@ -395,6 +403,10 @@ async def apply_post_spawn_state(
     filtered_findings: List[Dict[str, Any]] | None = None,
     type_filtered_by_dir: dict | None = None,
     salvage_count: int = 0,
+    adversarial_gate_deferred: List[Dict[str, Any]] | None = None,
+    low_actionability_deferred: List[Dict[str, Any]] | None = None,
+    degradation_gate_deferred: List[Dict[str, Any]] | None = None,
+    batch_cap_deferred: List[Dict[str, Any]] | None = None,
 ) -> None:
     """Apply all direction-state updates after research child tasks have been spawned.
 
@@ -526,6 +538,39 @@ async def apply_post_spawn_state(
                     evidence_overlap_by_dir[did] = (
                         evidence_overlap_by_dir.get(did, 0) + 1
                     )
+
+            # Tally findings deferred by the non-dedup spawn gates (adversarial,
+            # low-actionability, degradation, batch-cap) per direction so each
+            # direction's filter_breakdown records WHY its cycle produced zero
+            # tasks. Without these, a cycle zeroed by a gate was recorded
+            # identically to a cycle where the agent genuinely found nothing —
+            # counting toward saturation and doubling the refractory window.
+            adversarial_gate_by_dir: dict = {}
+            low_actionability_by_dir: dict = {}
+            degradation_gate_by_dir: dict = {}
+            batch_cap_by_dir: dict = {}
+            for _rec in adversarial_gate_deferred or []:
+                _did = _rec.get("direction_id") or current_direction_id
+                if _did:
+                    adversarial_gate_by_dir[_did] = (
+                        adversarial_gate_by_dir.get(_did, 0) + 1
+                    )
+            for _rec in low_actionability_deferred or []:
+                _did = _rec.get("direction_id") or current_direction_id
+                if _did:
+                    low_actionability_by_dir[_did] = (
+                        low_actionability_by_dir.get(_did, 0) + 1
+                    )
+            for _rec in degradation_gate_deferred or []:
+                _did = _rec.get("direction_id") or current_direction_id
+                if _did:
+                    degradation_gate_by_dir[_did] = (
+                        degradation_gate_by_dir.get(_did, 0) + 1
+                    )
+            for _rec in batch_cap_deferred or []:
+                _did = _rec.get("direction_id") or current_direction_id
+                if _did:
+                    batch_cap_by_dir[_did] = batch_cap_by_dir.get(_did, 0) + 1
 
             # Count raw actionable findings per direction so each direction's
             # history entry records only its own findings_produced instead of
@@ -701,6 +746,10 @@ async def apply_post_spawn_state(
                             "type_filtered": (type_filtered_by_dir or {}).get(did, 0),
                             "empty_prompt": empty_prompt_count,
                             "salvage_count": salvage_count,
+                            "adversarial_gate": adversarial_gate_by_dir.get(did, 0),
+                            "low_actionability": low_actionability_by_dir.get(did, 0),
+                            "degradation_gate": degradation_gate_by_dir.get(did, 0),
+                            "batch_cap": batch_cap_by_dir.get(did, 0),
                         },
                     }
                     # If the parent research task spawned a salvage-bundle subtask,
@@ -1247,7 +1296,7 @@ async def apply_post_spawn_state(
             STRATEGIC_RATIONALE_MAX,
         )
 
-        _notes_to_apply: list[tuple[str, dict]] = []
+        _notes_to_apply: list[tuple[str, dict, dict]] = []
         for note_finding in direction_notes:
             target_id = note_finding.get("direction_id")
             raw_note = (
@@ -1268,16 +1317,18 @@ async def apply_post_spawn_state(
                         "added_at": _utcnow().isoformat(),
                         "added_by_task": str(task.id),
                     },
+                    note_finding,
                 )
             )
 
+        _applied_note_findings: list[dict] = []
         if _notes_to_apply:
             _note_project = await session.get(Project, task.project_id)
             if _note_project:
                 session.expire(_note_project, ["directions"])
 
                 def _apply_notes(dirs: list) -> None:
-                    for _target_id, _note_entry in _notes_to_apply:
+                    for _target_id, _note_entry, _source_finding in _notes_to_apply:
                         for _d in dirs:
                             if _d.get("id") == _target_id:
                                 _notes = list(_d.get("notes") or [])
@@ -1289,6 +1340,7 @@ async def apply_post_spawn_state(
                                     for n in _notes
                                 ):
                                     _notes.append(_note_entry)
+                                    _applied_note_findings.append(_source_finding)
                                 if len(_notes) > STRATEGIC_NOTES_HISTORY_MAX:
                                     logger.warning(
                                         f"[RESEARCH] Task {task.id}: dropping {len(_notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {_target_id}"
@@ -1298,6 +1350,10 @@ async def apply_post_spawn_state(
 
                 await with_directions_locked(session, task.project_id, _apply_notes)
                 await session.commit()
+        # Keep only records that actually appended durable state. The caller
+        # uses this same list for completion-outcome and cycle-productivity
+        # bookkeeping, so duplicates/missing targets must not look productive.
+        direction_notes[:] = _applied_note_findings
 
     # Process direction proposals — add to Project.directions with status='proposed'
     proposals_created = 0
@@ -1318,6 +1374,7 @@ async def apply_post_spawn_state(
             max_proposals = 10
             now_iso = _utcnow().isoformat()
             _new_proposals: list[dict] = []
+            _new_proposal_sources: dict[str, dict] = {}
             for proposal in direction_proposals[:5]:  # max 5 per research call
                 if pending_count >= max_proposals:
                     logger.info(
@@ -1351,23 +1408,36 @@ async def apply_post_spawn_state(
                     "proposed_at": now_iso,
                 }
                 _new_proposals.append(new_direction)
+                _new_proposal_sources[new_direction["id"]] = proposal
                 proj_directions_snap.append(new_direction)
                 pending_count += 1
-                proposals_created += 1
-            if proposals_created:
+            if _new_proposals:
                 session.expire(proposal_project, ["directions"])
+                _applied_proposal_ids: list[str] = []
 
                 def _apply_proposals(dirs: list) -> None:
                     existing_ids = {d.get("id") for d in dirs}
-                    dirs.extend(
-                        _np for _np in _new_proposals if _np["id"] not in existing_ids
-                    )
+                    for _np in _new_proposals:
+                        if _np["id"] in existing_ids:
+                            continue
+                        dirs.append(_np)
+                        existing_ids.add(_np["id"])
+                        _applied_proposal_ids.append(_np["id"])
 
                 await with_directions_locked(session, task.project_id, _apply_proposals)
                 await session.commit()
+                direction_proposals[:] = [
+                    _new_proposal_sources[proposal_id]
+                    for proposal_id in _applied_proposal_ids
+                ]
+                proposals_created = len(direction_proposals)
                 logger.info(
                     f"[RESEARCH] Created {proposals_created} direction proposals from task {task.id}"
                 )
+            else:
+                direction_proposals.clear()
+        else:
+            direction_proposals.clear()
 
     # Store a human-readable research summary artifact
     if child_tasks:
@@ -1535,13 +1605,7 @@ async def _apply_terminal_transition(
     has_existing_children = False
     if not child_tasks:
         has_existing_children = bool(
-            (
-                await session.execute(
-                    select(Task.id).where(Task.parent_task_id == task.id).limit(1)
-                )
-            )
-            .scalars()
-            .first()
+            await authenticated_research_children(session, task)
         )
     if not child_tasks and not has_existing_children:
         # findings_documented: research produced only metadata findings (direction_notes,

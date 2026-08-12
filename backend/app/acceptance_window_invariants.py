@@ -8,6 +8,8 @@ by metrics-integrity checks without growing the chronic gate module.
 
 from __future__ import annotations
 
+_MODULE_SIZE_GOVERNANCE_CAP: int = 96
+
 #: The five keys emitted by the acceptance-window aggregate and merged into
 #: ``last_qualification["sub_scores"]``.  The helper is fail-safe: it returns
 #: ``[]`` when none of these keys are present (legacy verdicts).

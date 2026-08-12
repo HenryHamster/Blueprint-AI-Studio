@@ -14,15 +14,17 @@ lever).
 """
 from __future__ import annotations
 
+
 import hashlib
 from typing import Any
-
 from app.release_scoring import (
     _extract_audit_findings,
     _extract_excluded_audit_findings,
     _finding_matches_candidate_surface,
     _score_audit,
 )
+
+_MODULE_SIZE_GOVERNANCE_CAP: int = 526
 
 # Conclusive qualification verdicts — when a candidate commit receives one of
 # these verdicts, the outcome is settled and idempotent (relying on lucky

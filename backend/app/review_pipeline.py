@@ -128,6 +128,9 @@ from app.review_loop_convergence import (
     _is_pipeline_task_stale,
     _task_is_actively_ci_waiting,
     _set_review_loop_terminal_outcome,
+    build_cross_episode_abandon_candidate,
+    CROSS_EPISODE_ABANDON_THRESHOLD,
+    REVIEW_LOOP_ABANDON_CANDIDATE_KEY,
     review_loop_parked_for_operator,  # noqa: F401 — re-exported for lifecycle/rollup callers
 )
 
@@ -698,6 +701,9 @@ SPAWN_REASON_LANE_RECOVERY = "lane_checkpoint_recovery"
 # resolving the merge conflict that further attempts are unlikely to succeed.
 # Escalated to the operator before the lane sub-cap fires.
 SPAWN_REASON_PERSISTENT_CONFLICT = "persistent_conflict"
+# The PR-level history threshold fired: auto-spawning is stopped and the PR is
+# surfaced for an explicit abandon/continue decision.
+SPAWN_REASON_ABANDON_CANDIDATE = "abandon_candidate"
 
 # Grace window for the mid-retry defer: when a same-PR fix is FAILED/CANCELLED
 # with an infra failure_category and the failure is younger than this many minutes,
@@ -772,6 +778,78 @@ def _set_spawn_reason(task: Task, reason: str) -> None:
     ctx = dict(task.context or {})
     ctx[SPAWN_REASON_KEY] = reason
     task.context = ctx
+
+
+async def _halt_for_cross_episode_abandon_candidate(
+    source_task: Task,
+    original_task: Task | None,
+    *,
+    pr_number: int,
+    candidate: dict[str, object],
+    session: AsyncSession,
+) -> None:
+    """Persist and surface the PR-level stop signal before any new spawn.
+
+    This is deliberately independent of the ordinary iteration-cap and approval
+    feature settings.  The signal is a durable task-context record plus a
+    broadcast Alert; a human may decide whether to abandon or explicitly resume
+    the PR later, but the autonomous fix loop cannot silently continue.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    target = original_task or source_task
+    marker = {
+        **candidate,
+        "pr_number": pr_number,
+        "recorded_at": _utcnow().isoformat(),
+    }
+    target_ctx = dict(target.context or {})
+    target_ctx[REVIEW_LOOP_ABANDON_CANDIDATE_KEY] = marker
+    target.context = target_ctx
+    target.requires_approval = True
+    target.latest_status_message = (
+        f"PR #{pr_number} is an abandon candidate after {candidate['attempts']} "
+        f"review/fix attempts across {candidate['cycles']} cycle(s); "
+        "automatic fix spawning stopped."
+    )
+    flag_modified(target, "context")
+    session.add(target)
+
+    if source_task.id != target.id:
+        source_ctx = dict(source_task.context or {})
+        source_ctx[REVIEW_LOOP_ABANDON_CANDIDATE_KEY] = marker
+        source_task.context = source_ctx
+        source_task.latest_status_message = target.latest_status_message
+        flag_modified(source_task, "context")
+    _set_spawn_reason(source_task, SPAWN_REASON_ABANDON_CANDIDATE)
+    session.add(source_task)
+
+    try:
+        from app.alert_dispatch import _maybe_create_escalation_alert
+
+        await _maybe_create_escalation_alert(
+            target,
+            session,
+            pr_number=pr_number,
+            reason="abandon-candidate",
+            iteration=int(candidate["burden"]),
+            detail=(
+                f"Cumulative burden: {candidate['attempts']} attempt(s), "
+                f"{candidate['cycles']} cycle(s), "
+                f"{candidate['cancelled_attempts']} cancelled."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The context marker and spawn stop remain durable even if the alert
+        # backend is temporarily unavailable; the next re-entry retries the
+        # deduplicated alert while still refusing the spawn.
+        logger.warning(
+            "[PIPELINE] Failed to create abandon-candidate alert for PR #%s: %s",
+            pr_number,
+            exc,
+            exc_info=True,
+        )
+    await session.commit()
 
 
 def _normalized_review_target(
@@ -2718,8 +2796,10 @@ async def _spawn_pipeline_task(
                 )
                 .where(
                     Task.project_id == source_task.project_id,
-                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-                    Task.archived.is_(False),
+                    # Keep every status for the separate cross-episode
+                    # abandon census below.  The ordinary cap/lane counts are
+                    # narrowed back to completed/failed immediately after the
+                    # query, preserving their existing semantics.
                     pr_number_match,
                     type_match,
                 )
@@ -2728,6 +2808,82 @@ async def _spawn_pipeline_task(
         .scalars()
         .all()
     )
+
+    historical_pipeline_tasks = [
+        task
+        for task in pr_pipeline_tasks
+        if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+    ]
+    consumed_cross_episode_tasks = [
+        task
+        for task in pr_pipeline_tasks
+        if task.status
+        not in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS)
+    ]
+
+    # The existing admin reset-iteration-cap endpoint is also the explicit
+    # resume path for an abandon candidate. Its iteration_reset_at timestamp
+    # starts a fresh episode without deleting the immutable historical census.
+    reset_at_values: list[datetime] = []
+    for reset_source in (orig_task, source_task):
+        reset_loop = (reset_source.context or {}).get("review_loop") or {}
+        reset_at = reset_loop.get("iteration_reset_at")
+        if not isinstance(reset_at, str):
+            continue
+        try:
+            parsed_reset_at = datetime.fromisoformat(reset_at)
+        except ValueError:
+            continue
+        if parsed_reset_at.tzinfo is None:
+            parsed_reset_at = parsed_reset_at.replace(tzinfo=_utcnow().tzinfo)
+        reset_at_values.append(parsed_reset_at)
+    if reset_at_values:
+        reset_at = max(reset_at_values)
+        historical_pipeline_tasks = [
+            task
+            for task in historical_pipeline_tasks
+            if task.created_at is not None
+            and (
+                task.created_at.replace(tzinfo=reset_at.tzinfo)
+                if task.created_at.tzinfo is None
+                else task.created_at
+            )
+            > reset_at
+        ]
+        consumed_cross_episode_tasks = [
+            task
+            for task in consumed_cross_episode_tasks
+            if task.created_at is not None
+            and (
+                task.created_at.replace(tzinfo=reset_at.tzinfo)
+                if task.created_at.tzinfo is None
+                else task.created_at
+            )
+            > reset_at
+        ]
+
+    # This census intentionally differs from the ordinary cap query: it is
+    # keyed only by project+PR and includes cancelled tasks from every episode,
+    # so supersede/retarget cannot reset the accumulated burden.  It must run
+    # before any new review/fix task is inserted.
+    abandon_candidate = build_cross_episode_abandon_candidate(
+        consumed_cross_episode_tasks,
+        threshold=CROSS_EPISODE_ABANDON_THRESHOLD,
+    )
+    if abandon_candidate is not None and task_type in ("review", "fix"):
+        await _halt_for_cross_episode_abandon_candidate(
+            source_task,
+            orig_task,
+            pr_number=pr_number,
+            candidate=abandon_candidate,
+            session=session,
+        )
+        return (None, False)
+
+    # The remaining guards use the pre-existing completed/failed population;
+    # cancelled tasks are evidence for abandonment but do not change the
+    # ordinary cap or lane budgets.
+    pr_pipeline_tasks = historical_pipeline_tasks
 
     # ── Repeat-fingerprint halt ─────────────────────────────────────────
     # If the last two same-type FAILED tasks in this chain share an identical

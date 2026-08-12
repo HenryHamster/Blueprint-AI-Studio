@@ -29,6 +29,9 @@ router = APIRouter(
 )
 
 _NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,64}$")
+_CREDENTIAL_OWNED_PRINCIPAL_SCOPES = frozenset(
+    {"coding-agent:read", "project-operator"}
+)
 
 
 # ── Request models ──────────────────────────────────────────────────────────
@@ -182,7 +185,30 @@ async def mint_service_credential(
                 detail=f"Project {membership.project_id} not found",
             )
 
-    principal_user_id = payload.principal_user_id or f"service:{payload.name}"
+    credential_owned_principal = bool(
+        _CREDENTIAL_OWNED_PRINCIPAL_SCOPES.intersection(payload.scopes)
+    )
+    if credential_owned_principal and payload.principal_user_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "coding-agent and project-operator credentials require a "
+                "credential-owned service "
+                "principal; principal_user_id must be omitted"
+            ),
+        )
+
+    # Credential-owned scoped profiles receive a fresh identity on every mint,
+    # including a re-mint of a revoked name. Reusing service:{name} would retain the old
+    # principal's ProjectMember rows and could silently preserve projects that
+    # the new grant did not name. Other existing service consumers retain the
+    # backward-compatible principal convention.
+    credential_id = uuid.uuid4()
+    principal_user_id = (
+        f"service:credential:{credential_id}"
+        if credential_owned_principal
+        else (payload.principal_user_id or f"service:{payload.name}")
+    )
 
     # A caller-supplied principal_user_id must never reference an existing
     # project owner: the credential authenticates AS that principal, so it
@@ -215,6 +241,7 @@ async def mint_service_credential(
 
     token = mint_service_token()
     cred = ServiceCredential(
+        id=credential_id,
         name=payload.name,
         description=payload.description,
         principal_user_id=principal_user_id,

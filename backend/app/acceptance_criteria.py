@@ -7,6 +7,7 @@ classifier and a version-level coverage summary query.
 
 from __future__ import annotations
 
+
 import enum
 import logging
 import re
@@ -29,6 +30,7 @@ from app.models import (
     VersionAcceptanceCriterion,
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 5223
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,6 +48,28 @@ _acceptance_window_recompute_state: dict[
 ] = {}
 
 CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
+
+
+def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:
+    """Return a supported closed machine-contract shape for qualification."""
+    from app.release_commit_authorship import normalize_authorship_evidence_contract
+    from app.release_prepromotion_rehearsal import (
+        normalize_rehearsal_evidence_contract,
+    )
+
+    return normalize_authorship_evidence_contract(
+        raw
+    ) or normalize_rehearsal_evidence_contract(raw)
+
+
+def is_owner_controlled_machine_contract(
+    criterion: VersionAcceptanceCriterion,
+) -> bool:
+    """Return whether an autonomous loop must preserve this machine policy."""
+    if normalize_evidence_contract(criterion.evidence_contract) is None:
+        return False
+    actor = str(criterion.evidence_contract_updated_by or "")
+    return not actor.startswith("strategist:")
 
 
 def criterion_release_version_id_from_context(
@@ -601,14 +625,15 @@ def _attestation_reference_timestamp(e: CriterionEvidence) -> datetime | None:
             )
         except (TypeError, ValueError):
             attested_at = None
-        if attested_at is not None:
+        if attested_at is not None and (
             # Reject a timestamp dated meaningfully in the future; it would
             # otherwise extend (or perpetuate) the window.  A small tolerance
             # absorbs benign client/server clock skew.
-            if (attested_at - _utcnow()) <= timedelta(
+            (attested_at - _utcnow()) <= timedelta(
                 seconds=ATTESTATION_FUTURE_SKEW_SECONDS
-            ):
-                return attested_at
+            )
+        ):
+            return attested_at
     if e.recorded_at is None:
         return None
     return _coerce_naive_utc(e.recorded_at)
@@ -862,17 +887,33 @@ async def create_criterion(
     release_version_id: uuid.UUID,
     text: str,
     created_by: str | None = None,
+    evidence_contract: dict[str, Any] | None = None,
+    audit_actor: str | None = None,
 ) -> VersionAcceptanceCriterion:
     """Create and persist a new acceptance criterion for a release version.
 
     Commits the session immediately — use :func:`stage_criterion` when calling
     from inside a larger transaction that must commit once at the end.
     """
+    normalized_contract = (
+        normalize_evidence_contract(evidence_contract)
+        if evidence_contract is not None
+        else None
+    )
+    if evidence_contract is not None and normalized_contract is None:
+        raise ValueError("unsupported or malformed evidence_contract")
     criterion = VersionAcceptanceCriterion(
         project_id=project_id,
         release_version_id=release_version_id,
         criterion_key=generate_criterion_key(),
         text=text,
+        evidence_contract=normalized_contract,
+        evidence_contract_updated_at=_utcnow() if normalized_contract is not None else None,
+        evidence_contract_updated_by=(
+            (audit_actor or created_by or "legacy:created_at")[:128]
+            if normalized_contract is not None
+            else None
+        ),
         created_by=created_by,
     )
     session.add(criterion)
@@ -887,6 +928,7 @@ async def stage_criterion(
     release_version_id: uuid.UUID,
     text: str,
     created_by: str | None = None,
+    evidence_contract: dict[str, Any] | None = None,
 ) -> VersionAcceptanceCriterion:
     """Stage a new acceptance criterion without committing the session.
 
@@ -896,14 +938,65 @@ async def stage_criterion(
     a mid-transaction ``session.commit()`` would break the surrounding
     atomicity guarantee and cause one commit per criterion.
     """
+    normalized_contract = (
+        normalize_evidence_contract(evidence_contract)
+        if evidence_contract is not None
+        else None
+    )
+    if evidence_contract is not None and normalized_contract is None:
+        raise ValueError("unsupported or malformed evidence_contract")
     criterion = VersionAcceptanceCriterion(
         project_id=project_id,
         release_version_id=release_version_id,
         criterion_key=generate_criterion_key(),
         text=text,
+        evidence_contract=normalized_contract,
+        evidence_contract_updated_at=_utcnow() if normalized_contract is not None else None,
+        evidence_contract_updated_by=(
+            (created_by or "legacy:created_at")[:128]
+            if normalized_contract is not None
+            else None
+        ),
         created_by=created_by,
     )
     session.add(criterion)
+    return criterion
+
+
+async def update_criterion_evidence_contract(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    criterion_key: str,
+    evidence_contract: dict[str, Any] | None,
+    updated_by: str,
+) -> VersionAcceptanceCriterion | None:
+    """Atomically replace an existing criterion's canonical contract."""
+    normalized_contract = (
+        normalize_evidence_contract(evidence_contract)
+        if evidence_contract is not None
+        else None
+    )
+    if evidence_contract is not None and normalized_contract is None:
+        raise ValueError("unsupported or malformed evidence_contract")
+    result = await session.execute(
+        select(VersionAcceptanceCriterion)
+        .where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == criterion_key,
+        )
+        .with_for_update()
+    )
+    criterion = result.scalar_one_or_none()
+    if criterion is None:
+        return None
+    criterion.evidence_contract = normalized_contract
+    criterion.evidence_contract_updated_at = _utcnow()
+    criterion.evidence_contract_updated_by = updated_by[:128]
+    session.add(criterion)
+    await session.flush()
     return criterion
 
 
@@ -920,6 +1013,25 @@ async def get_criterion_by_key(
         )
     )
     return result.scalars().first()
+
+
+async def get_criterion_by_key_for_update(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    criterion_key: str,
+) -> VersionAcceptanceCriterion | None:
+    """Lock and return the exact row used for lifecycle authorization."""
+    result = await session.execute(
+        select(VersionAcceptanceCriterion)
+        .where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == criterion_key,
+        )
+        .with_for_update()
+    )
+    return result.scalar_one_or_none()
 
 
 async def count_criteria_for_version(
@@ -991,7 +1103,15 @@ async def get_active_criteria_rubric(
         .order_by(VersionAcceptanceCriterion.created_at)
     )
     return [
-        {"criterion_key": c.criterion_key, "text": c.text}
+        {
+            "criterion_key": c.criterion_key,
+            "text": c.text,
+            **(
+                {"evidence_contract": c.evidence_contract}
+                if isinstance(c.evidence_contract, dict)
+                else {}
+            ),
+        }
         for c in result.scalars().all()
     ]
 
@@ -1002,15 +1122,27 @@ async def get_criterion_by_text(
     release_version_id: uuid.UUID,
     text: str,
 ) -> VersionAcceptanceCriterion | None:
-    """Return an existing criterion matching (project_id, release_version_id, text), or None."""
+    """Return the unique active same-text criterion, or ``None``.
+
+    Strategic retries must never revive or mutate an inactive row.  Duplicate
+    active rows are treated as ambiguous rather than selecting arbitrarily.
+    """
     result = await session.execute(
         select(VersionAcceptanceCriterion).where(
             VersionAcceptanceCriterion.project_id == project_id,
             VersionAcceptanceCriterion.release_version_id == release_version_id,
             VersionAcceptanceCriterion.text == text,
+            VersionAcceptanceCriterion.status == "active",
         )
+        .order_by(VersionAcceptanceCriterion.created_at, VersionAcceptanceCriterion.id)
     )
-    return result.scalar_one_or_none()
+    rows = list(result.scalars().all())
+    if len(rows) > 1:
+        raise ValueError(
+            "ambiguous active acceptance criteria share the same text; "
+            "operator resolution is required"
+        )
+    return rows[0] if rows else None
 
 
 async def record_evidence(
@@ -1439,8 +1571,8 @@ async def direction_owns_uncovered_criterion(
     criteria, or all owned active criteria are covered.
     """
     try:
-        from app.directions_repo import get_direction_row  # noqa: PLC0415
-        from app.release_version import current_open_version  # noqa: PLC0415
+        from app.directions_repo import get_direction_row
+        from app.release_version import current_open_version
 
         direction_row = await get_direction_row(session, project_id, direction_id)
         keys = list(getattr(direction_row, "criterion_keys", None) or [])
@@ -2420,19 +2552,28 @@ async def stamp_rollup_child_commit_range(
 
     ``review_target`` is written by the backend from the live PR before review
     or merge.  Comparing those immutable SHAs is exact child provenance even
-    though the child never owns the rollup parent's PR.  ``None`` from GitHub
-    means indeterminate and leaves the existing context untouched; an empty
-    list is authoritative proof of an empty child range and is therefore still
-    stamped.
+    though the child never owns the rollup parent's PR.  Indeterminate or
+    empty results remain fail-closed and are recorded on the task context.
     """
-    commit_range = _rollup_child_commit_range(task)
-    if commit_range is None:
-        return False
     from app.acceptance_gate import (
         PARENT_DERIVED_CHANGED_FILES_KEY,
         record_code_acceptance_verdict,
         stamp_commit_range_derived_changed_files_signal,
     )
+    from app.acceptance_provenance import (
+        ChangedFilesStampSkipReason,
+        PR_CHANGED_FILES_STAMP_SKIPPED_KEY,
+        stamp_changed_files_skip_reason,
+    )
+
+    context = dict(task.context or {})
+    commit_range = _rollup_child_commit_range(task)
+    if commit_range is None:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.child_pr_range_unavailable
+        )
+        task.context = context
+        return False
     from app.github_refs import get_files_changed_between_refs
 
     base_sha, head_sha = commit_range
@@ -2451,17 +2592,29 @@ async def stamp_rollup_child_commit_range(
             getattr(task, "id", None),
             exc_info=True,
         )
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.diff_fetch_failed
+        )
+        task.context = context
         return False
     if changed is None:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.no_diff_returned
+        )
+        task.context = context
         return False
 
-    context = dict(task.context or {})
     # ``dict.update`` cannot remove provenance from the previous stamp.  Clear
     # the legacy parent-derived sentinels on the task before applying the exact
     # child range, so the old union diff cannot continue to cap this verdict.
     context.pop(PARENT_DERIVED_CHANGED_FILES_KEY, None)
     context.pop("_pr_changed_files_truncated", None)
+    context.pop(PR_CHANGED_FILES_STAMP_SKIPPED_KEY, None)
     context.update(stamp_commit_range_derived_changed_files_signal(changed))
+    if not changed:
+        stamp_changed_files_skip_reason(
+            context, ChangedFilesStampSkipReason.empty_diff
+        )
     task.context = context
     record_code_acceptance_verdict(task)
     return True
@@ -2616,7 +2769,7 @@ async def backfill_rollup_child_changed_files(
             # Bulk-prime the SQLAlchemy identity map with the direct parent of
             # every qualifying child in this batch.  The walk inside
             # _github_verified_ancestor_changed calls session.get(Task, id),
-            # which hits the identity map on a cache hit, avoiding N×depth
+            # which hits the identity map on a cache hit, avoiding N x depth
             # individual point-queries.  We load only the immediate parents
             # here; deeper ancestors are loaded on demand (rare — most chains
             # are ≤1 hop deep) and are cached after the first walk.
@@ -3321,7 +3474,7 @@ async def record_named_test_execution_evidence(
                 detail=detail,
             )
             recorded += 1
-        except Exception:  # noqa: BLE001 — best-effort per-row
+        except Exception:
             logger.exception(
                 "record_named_test_execution_evidence: failed to record evidence "
                 "for criterion %s (version %s)",
@@ -3914,11 +4067,13 @@ async def delete_criterion(
     Returns True if the row was found and deleted, False if not found.
     """
     result = await session.execute(
-        select(VersionAcceptanceCriterion).where(
+        select(VersionAcceptanceCriterion)
+        .where(
             VersionAcceptanceCriterion.project_id == project_id,
             VersionAcceptanceCriterion.release_version_id == release_version_id,
             VersionAcceptanceCriterion.criterion_key == criterion_key,
         )
+        .with_for_update()
     )
     row = result.scalar_one_or_none()
     if row is None:
@@ -3962,8 +4117,14 @@ async def retract_criterion(
     row = result.scalar_one_or_none()
     if row is None:
         return None
-    if enforce_loop_authored and is_operator_authored_criterion(row.created_by):
-        raise OperatorAuthoredRetractionError(criterion_key, row.created_by)
+    if enforce_loop_authored and (
+        is_operator_authored_criterion(row.created_by)
+        or is_owner_controlled_machine_contract(row)
+    ):
+        raise OperatorAuthoredRetractionError(
+            criterion_key,
+            row.evidence_contract_updated_by or row.created_by,
+        )
     if row.status == "active":
         row.status = "superseded" if superseded_by_key else "retracted"
         row.retraction_reason = reason
@@ -4005,11 +4166,13 @@ async def reinstate_criterion(
     before calling this function.
     """
     result = await session.execute(
-        select(VersionAcceptanceCriterion).where(
+        select(VersionAcceptanceCriterion)
+        .where(
             VersionAcceptanceCriterion.project_id == project_id,
             VersionAcceptanceCriterion.release_version_id == release_version_id,
             VersionAcceptanceCriterion.criterion_key == criterion_key,
         )
+        .with_for_update()
     )
     row = result.scalar_one_or_none()
     if row is None:
@@ -4269,7 +4432,7 @@ async def get_version_coverage_summary(
                     counts[co] -= 1
                     counts["partial"] = counts.get("partial", 0) + 1
 
-    from app.release_models import ReleaseVersion  # noqa: PLC0415
+    from app.release_models import ReleaseVersion
 
     _rv = await session.get(ReleaseVersion, release_version_id)
 
@@ -4309,6 +4472,9 @@ async def get_version_coverage_summary(
             {
                 "criterion_key": criterion.criterion_key,
                 "text": criterion.text,
+                "evidence_contract": normalize_evidence_contract(
+                    criterion.evidence_contract
+                ),
                 "coverage": coverage,
                 "covered_by": covered_by,
                 "status": criterion.status,
@@ -4321,6 +4487,12 @@ async def get_version_coverage_summary(
                     if coverage == "attested"
                     else None
                 ),
+                "evidence_contract_updated_at": (
+                    criterion.evidence_contract_updated_at.isoformat()
+                    if criterion.evidence_contract_updated_at
+                    else None
+                ),
+                "evidence_contract_updated_by": criterion.evidence_contract_updated_by,
             }
         )
 
@@ -4345,8 +4517,8 @@ async def get_version_coverage_summary(
     }
     if _rv is not None and _rv.status == "open":
         try:
-            from app.models import Project  # noqa: PLC0415 — avoid import cycle
-            from app.release_version import current_open_version  # noqa: PLC0415
+            from app.models import Project
+            from app.release_version import current_open_version
 
             current_version = await current_open_version(session, _rv.project_id)
             if current_version is not None and current_version.id == _rv.id:
@@ -4368,7 +4540,7 @@ async def get_version_coverage_summary(
                 )
                 phantom_bookkeeping["referenced_keys"] = sorted(referenced_keys)
                 phantom_bookkeeping["registered_count"] = len(registered_keys)
-        except Exception:  # noqa: BLE001 — best-effort drift signal, never blocks
+        except Exception:
             logger.exception(
                 "phantom-bookkeeping drift guard failed for version %s",
                 release_version_id,
@@ -4436,7 +4608,7 @@ async def get_failed_corroboration_keys(
     ``corroboration_of`` (JSON null, number, object) is still ignored rather than
     coerced into a key.
     """
-    from app.models import Task, TaskStatus  # noqa: PLC0415
+    from app.models import Task, TaskStatus
 
     # The JSON element (typed) and its text form. The text form is only used for
     # the SQL existence predicate (``->> 'corroboration_of' IS NOT NULL``, which a
@@ -4519,7 +4691,7 @@ async def spawn_corroboration_task(
     attestation or backfill itself is never blocked by a spawn failure.
     """
     try:
-        from app.models import Task, TaskStatus  # noqa: PLC0415
+        from app.models import Task, TaskStatus
 
         # Dedup: skip spawning when a non-terminal corroboration task already
         # exists for this criterion.  The attest endpoint calls this on BOTH
@@ -4734,7 +4906,7 @@ async def enroll_criterion_named_test_trial(
                     criterion_key,
                 )
                 return None
-        except Exception:  # noqa: BLE001 — dedup failure is non-fatal; enroll anyway
+        except Exception:
             logger.warning(
                 "[CRITERION_TRIAL] dedup check failed for criterion %s — "
                 "proceeding with enroll",
@@ -4775,7 +4947,7 @@ async def enroll_criterion_named_test_trial(
             head_sha,
         )
         return task
-    except Exception:  # noqa: BLE001 — enrollment must degrade, never raise
+    except Exception:
         logger.warning(
             "[CRITERION_TRIAL] failed to enroll criterion_named_test_trial for criterion=%r",
             criterion_key,
@@ -4783,7 +4955,7 @@ async def enroll_criterion_named_test_trial(
         )
         try:
             await session.rollback()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug(
                 "[CRITERION_TRIAL] rollback after enroll failure also failed",
                 exc_info=True,

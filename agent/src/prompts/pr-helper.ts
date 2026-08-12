@@ -50,7 +50,7 @@ function loadScreenshotsSectionScriptB64(): string {
 export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   // Idempotent push + PR creation/update. Runs a bounded ./check gate first:
-  // deterministic failures block; timeout/tool unavailability is receipted.
+  // deterministic failures and the absolute hard timeout block publication.
   // Writes /tmp/pr_url_<task_id> on success so the wrapper + ./done can
   // pick up the URL without re-querying GitHub.
   const _SR_SECTION_SCRIPT_B64 = loadSrSectionScriptB64();
@@ -62,8 +62,8 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   const script = `#!/bin/bash
 # ./pr open --title "..." --body "..."  — ship the diff via PR
 #
-# Gates on bounded ./check. Deterministic failures block; timeout/tool
-# unavailability requires authoritative CI. Then commits and pushes
+# Gates on bounded ./check. Deterministic failures and the absolute hard
+# timeout block publication. Then commits and pushes
 # to ${cfg.workBranch}, and creates a PR (or pushes an update to an
 # existing PR for review-fix tasks).
 #
@@ -238,12 +238,26 @@ case "$GATE_TIMEOUT_SECONDS" in
   ''|*[!0-9]*|0) GATE_TIMEOUT_SECONDS=600 ;;
 esac
 if [ "$GATE_TIMEOUT_SECONDS" -gt 900 ]; then
-  echo "[pr] PR_GATE_TIMEOUT_SECONDS=$GATE_TIMEOUT_SECONDS exceeds the 900s safety ceiling; capping it." >&2
+  echo "[pr] PR_GATE_TIMEOUT_SECONDS=$GATE_TIMEOUT_SECONDS exceeds the 900s soft-deadline ceiling; capping it." >&2
   GATE_TIMEOUT_SECONDS=900
+fi
+GATE_HARD_TIMEOUT_SECONDS="\${PR_GATE_HARD_TIMEOUT_SECONDS:-1800}"
+case "$GATE_HARD_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*|0) GATE_HARD_TIMEOUT_SECONDS=1800 ;;
+esac
+if [ "$GATE_HARD_TIMEOUT_SECONDS" -gt 1800 ]; then
+  echo "[pr] PR_GATE_HARD_TIMEOUT_SECONDS=$GATE_HARD_TIMEOUT_SECONDS exceeds the 1800s absolute safety ceiling; capping it." >&2
+  GATE_HARD_TIMEOUT_SECONDS=1800
+fi
+if [ "$GATE_HARD_TIMEOUT_SECONDS" -lt "$GATE_TIMEOUT_SECONDS" ]; then
+  echo "[pr] PR_GATE_HARD_TIMEOUT_SECONDS=$GATE_HARD_TIMEOUT_SECONDS is below the soft deadline; raising it to \${GATE_TIMEOUT_SECONDS}s." >&2
+  GATE_HARD_TIMEOUT_SECONDS="$GATE_TIMEOUT_SECONDS"
 fi
 GATE_RECEIPT_FILE="/tmp/pr_gate_receipt_${cfg.taskId}.json"
 GATE_SECTION=""
 GATE_COMMAND="./check"
+GATE_ELAPSED_SECONDS=0
+GATE_DEADLINE_EXTENDED=false
 
 write_gate_receipt() {
   local status="$1"
@@ -251,21 +265,87 @@ write_gate_receipt() {
   local fallback="$3"
   local recorded_at
   recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  printf '{"status":"%s","command":"%s","timeout_seconds":%s,"exit_code":%s,"authoritative_ci_required":%s,"recorded_at":"%s"}\n' \
-    "$status" "$GATE_COMMAND" "$GATE_TIMEOUT_SECONDS" "$exit_code" "$fallback" "$recorded_at" > "$GATE_RECEIPT_FILE"
-  GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+  printf '{"status":"%s","command":"%s","timeout_seconds":%s,"hard_timeout_seconds":%s,"elapsed_seconds":%s,"deadline_extended":%s,"exit_code":%s,"authoritative_ci_required":%s,"recorded_at":"%s"}\n' \
+    "$status" "$GATE_COMMAND" "$GATE_TIMEOUT_SECONDS" "$GATE_HARD_TIMEOUT_SECONDS" "$GATE_ELAPSED_SECONDS" "$GATE_DEADLINE_EXTENDED" "$exit_code" "$fallback" "$recorded_at" > "$GATE_RECEIPT_FILE"
+  GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
     '<!-- blueprint:local-gate -->' \
     '### Local publication gate' \
     "- Status: $status" \
     "- Command: $GATE_COMMAND" \
-    "- Deadline: \${GATE_TIMEOUT_SECONDS}s (hard ceiling 900s)" \
+    "- Deadlines: soft \${GATE_TIMEOUT_SECONDS}s; hard \${GATE_HARD_TIMEOUT_SECONDS}s (absolute ceiling 1800s)" \
+    "- Elapsed: \${GATE_ELAPSED_SECONDS}s; soft deadline extended: $GATE_DEADLINE_EXTENDED" \
     "- Exit code: $exit_code; authoritative CI required: $fallback" \
     '<!-- /blueprint:local-gate -->')
+}
+
+# A blocked gate normally exits before any PR body exists, so the bounded
+# receipt would be lost if the VM later died. Persist it through the
+# authenticated HEARTBEAT endpoint, which records telemetry without any task
+# state transition.
+#
+# WHY NOT /api/agent/status: a failing ./check is RETRYABLE — the very next
+# lines tell the agent to fix the failures and re-run ./pr open. Posting
+# status=FAILED with failure_category=BLOCKED_PRECONDITION would take the
+# backend's BLOCKED_PRECONDITION branch (routers/agent_status.py), which
+# releases the LLM account slot, retires the LEASED warm-pool member, clears
+# vm_instance_id and deletes the VM the agent is still running on. The
+# heartbeat channel persists the same sanitized receipt into
+# task.context["publication_gate_receipt"] and leaves the task IN_PROGRESS.
+record_gate_receipt() {
+  local gate_status="$1"
+  local api="\${ORCHESTRATOR_URL:-}"
+  local receipt_json payload http
+  if [ -z "$api" ]; then
+    echo "[pr] Warning: cannot persist local-gate receipt — ORCHESTRATOR_URL is unset" >&2
+    return 1
+  fi
+  if ! _load_agent_token; then
+    echo "[pr] Warning: cannot persist local-gate receipt — no agent token" >&2
+    return 1
+  fi
+  receipt_json=$(cat "$GATE_RECEIPT_FILE" 2>/dev/null || true)
+  if [ -z "$receipt_json" ]; then
+    echo "[pr] Warning: cannot persist local-gate receipt — receipt file is empty" >&2
+    return 1
+  fi
+  payload=$(printf '{"task_id":%s,"status_message":%s,"publication_gate_receipt":%s}' \\
+    "$(_json_str "${cfg.taskId}")" \\
+    "$(_json_str "local publication gate blocked with status $gate_status")" \\
+    "$receipt_json")
+  for attempt in 1 2 3; do
+    http=$(printf '%s' "$payload" | curl -sS -o /tmp/pr_gate_receipt_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
+      -X POST "$api/api/agent/heartbeat" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-) || http="000"
+    if [ "$http" = "200" ]; then
+      rm -f /tmp/pr_gate_receipt_resp_${cfg.taskId}
+      echo "[pr] Persisted local-gate receipt on the task (HTTP=$http)"
+      return 0
+    fi
+    case "$http" in
+      # 409 = the task row is locked by a concurrent writer; the heartbeat
+      # contract is explicitly "retry next cycle", so it is retryable here too.
+      000|409|429|5[0-9][0-9])
+        if [ "$attempt" -lt 3 ]; then
+          sleep "$attempt"
+          continue
+        fi
+        ;;
+    esac
+    echo "[pr] Warning: local-gate receipt POST failed with HTTP=$http" >&2
+    cat /tmp/pr_gate_receipt_resp_${cfg.taskId} >&2 2>/dev/null || true
+    break
+  done
+  rm -f /tmp/pr_gate_receipt_resp_${cfg.taskId}
+  return 1
 }
 
 run_pr_gate() {
   GATE_COMMAND="./check"
   [ "$#" -gt 0 ] && GATE_COMMAND="./check $*"
+  local gate_started_at gate_finished_at
+  gate_started_at=$(date +%s)
+  GATE_ELAPSED_SECONDS=0
+  GATE_DEADLINE_EXTENDED=false
   if ! command -v timeout >/dev/null 2>&1; then
     # timeout not installed: run ./check directly without a deadline.
     # A missing verdict (check never ran) must not be treated as a pass;
@@ -274,20 +354,32 @@ run_pr_gate() {
     ./check "$@"
     GATE_STATUS=$?
   else
-    echo "[pr] Running bounded local gate: $GATE_COMMAND (deadline \${GATE_TIMEOUT_SECONDS}s)"
-    timeout --signal=TERM --kill-after=10s "\${GATE_TIMEOUT_SECONDS}s" ./check "$@"
+    echo "[pr] Running bounded local gate: $GATE_COMMAND (soft deadline \${GATE_TIMEOUT_SECONDS}s; hard deadline \${GATE_HARD_TIMEOUT_SECONDS}s)"
+    # The inner timeout makes the historical 600/900s deadline non-destructive:
+    # SIGCONT is harmless to a running check and --preserve-status returns the
+    # check's eventual real verdict. The outer timeout remains an absolute bound
+    # for a genuinely wedged gate and still escalates TERM to KILL after 10s.
+    timeout --signal=TERM --kill-after=10s "\${GATE_HARD_TIMEOUT_SECONDS}s" timeout --preserve-status --signal=CONT "\${GATE_TIMEOUT_SECONDS}s" ./check "$@"
     GATE_STATUS=$?
+  fi
+  gate_finished_at=$(date +%s)
+  GATE_ELAPSED_SECONDS=$((gate_finished_at - gate_started_at))
+  if [ "$GATE_ELAPSED_SECONDS" -ge "$GATE_TIMEOUT_SECONDS" ]; then
+    GATE_DEADLINE_EXTENDED=true
   fi
   case "$GATE_STATUS" in
     0)
       write_gate_receipt passed "$GATE_STATUS" false
+      if [ "$GATE_DEADLINE_EXTENDED" = "true" ]; then
+        echo "[pr] $GATE_COMMAND completed after the soft \${GATE_TIMEOUT_SECONDS}s deadline and within the hard \${GATE_HARD_TIMEOUT_SECONDS}s bound."
+      fi
       return 0
       ;;
     124|137)
       write_gate_receipt timed_out "$GATE_STATUS" false
-      echo "[pr] $GATE_COMMAND exceeded its bounded \${GATE_TIMEOUT_SECONDS}s local deadline and was terminated." >&2
-      echo "[pr] ./check did not complete within the time limit — no verdict was produced." >&2
-      echo "[pr] Increase PR_GATE_TIMEOUT_SECONDS, fix the underlying slowness, or resolve" >&2
+      echo "[pr] $GATE_COMMAND exceeded its bounded \${GATE_HARD_TIMEOUT_SECONDS}s hard deadline and was terminated." >&2
+      echo "[pr] ./check did not complete within the absolute time limit — no verdict was produced." >&2
+      echo "[pr] Increase PR_GATE_HARD_TIMEOUT_SECONDS (up to 1800), fix the underlying slowness, or resolve" >&2
       echo "[pr] the failures, then re-run ./pr open." >&2
       return "$GATE_STATUS"
       ;;
@@ -300,6 +392,7 @@ run_pr_gate() {
 
 if [ "$WITH_TESTS" = "1" ]; then
   if ! run_pr_gate test; then
+    record_gate_receipt "\${GATE_STATUS}" || true
     echo ""
     echo "[pr] ./check test failed — fix lint/build/tests then re-run ./pr open."
     exit 1
@@ -320,6 +413,7 @@ if [ "$WITH_TESTS" = "1" ]; then
   fi
 else
   if ! run_pr_gate; then
+    record_gate_receipt "\${GATE_STATUS}" || true
     echo ""
     echo "[pr] ./check failed — fix lint/build then re-run ./pr open."
     exit 1

@@ -14,6 +14,7 @@ re-export is acyclic.
 import asyncio
 import logging
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 
 from fastapi import HTTPException
@@ -30,6 +31,83 @@ from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+# Keep the PR-level census aligned with the canonical rollup review budget.
+# A smaller value preempts the rollup's 16-cycle cap and leaves no recovery
+# path for work that is still within the budget.
+CROSS_EPISODE_ABANDON_THRESHOLD = 16
+REVIEW_LOOP_ABANDON_CANDIDATE_KEY = "review_loop_abandon_candidate"
+
+
+def build_cross_episode_abandon_candidate(
+    tasks: Iterable[Task],
+    *,
+    threshold: int = CROSS_EPISODE_ABANDON_THRESHOLD,
+) -> dict[str, object] | None:
+    """Build the durable PR-level abandon signal from consumed pipeline tasks.
+
+    The caller supplies rows for one project+PR, without filtering by chain or
+    episode.  A cancelled review/fix is an attempt even though it never appears
+    in the ordinary cap query; archived rows remain evidence here too, so a
+    supersede/retarget or manual cap reset cannot launder the PR's history.
+    ``review_loop.iteration`` is the carried cycle number.  Rows without cycle
+    metadata remain part of the attempt/cancellation totals, but cannot alone
+    trigger this signal: those rows are commonly synthetic or infrastructure
+    failures and the ordinary cap remains their governing behavior.
+    """
+    if threshold < 1:
+        raise ValueError("abandon threshold must be positive")
+
+    attempts = [
+        task for task in tasks if task.first_payload.get("type") in ("review", "fix")
+    ]
+    if not attempts:
+        return None
+
+    cycles_by_episode: dict[str, int] = {}
+    for task in attempts:
+        loop = (task.context or {}).get("review_loop")
+        loop = loop if isinstance(loop, dict) else {}
+        episode_id = str(
+            loop.get("original_task_id")
+            or task.first_payload.get("original_task_id")
+            or task.id
+        )
+        iteration = loop.get("iteration")
+        if isinstance(iteration, int) and iteration > 0:
+            cycles_by_episode[episode_id] = max(
+                cycles_by_episode.get(episode_id, 0), iteration
+            )
+    # A retargeted episode may restart its local iteration number. Summing the
+    # per-episode maxima preserves that work instead of letting the reset hide
+    # cumulative cycles; rows from old fixtures without iteration still count
+    # through the attempt burden below.
+    cycles = sum(cycles_by_episode.values())
+    burden = max(len(attempts), cycles)
+    if cycles < threshold:
+        return None
+
+    episode_ids: set[str] = set()
+    for task in attempts:
+        loop = (task.context or {}).get("review_loop")
+        loop = loop if isinstance(loop, dict) else {}
+        episode_ids.add(
+            str(
+                loop.get("original_task_id")
+                or task.first_payload.get("original_task_id")
+                or task.id
+            )
+        )
+    cancelled = sum(1 for task in attempts if task.status == TaskStatus.CANCELLED)
+    return {
+        "status": "abandon_candidate",
+        "threshold": threshold,
+        "attempts": len(attempts),
+        "cycles": cycles,
+        "burden": burden,
+        "cancelled_attempts": cancelled,
+        "episodes": len(episode_ids),
+    }
 
 # Liveness backstop on the cap-exhaustion preservability GET — a bound on a
 # WEDGED coroutine, NOT a competitor to the GitHub client's own retry budget.

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "python_packages": {
+    "ruff": "0.12.9",
+    "mypy": "1.20.2",
+    "pytest": "7.4.4",
+    "pgserver-search": "0.1.6"
+  },
+  "postgres": {
+    "required_extensions": {
+      "pg_trgm": [
+        "backend/alembic/versions/0122_artifact_pr_url_trgm_index.py",
+        "backend/alembic/versions/0145_knowledge_documents.py",
+        "backend/alembic/versions/0529_add_task_search_trgm_indexes.py",
+        "backend/alembic/versions/0714_repair_strategic_conversation_correctness.py"
+      ]
+    }
+  }
+}

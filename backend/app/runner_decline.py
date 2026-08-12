@@ -33,6 +33,7 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
 from app.models import Alert, AlertSeverity, Task, _utcnow
@@ -75,15 +76,61 @@ DECLINE_ESCALATION_THRESHOLD = 3
 DECLINE_ALERT_TITLE = "Task repeatedly declined by runners"
 
 
+def record_runner_decline(
+    task: Task,
+    runner_id: str,
+    *,
+    reason: str,
+    hostname: str | None = None,
+    same_runner_retryable: bool = True,
+    now: datetime | None = None,
+) -> tuple[int, int]:
+    """Persist one runner decline and return ``(runner_count, total_count)``.
+
+    Both pre-claim runner declines and post-claim runtime incompatibilities must
+    write the exact same context shape.  ``same_runner_retryable`` distinguishes
+    a plausibly transient decline from a deterministic task/runner contract
+    mismatch: Strategic dispatch may waive a transient exclusion on a
+    single-runner fleet, but it must never waive a deterministic one.
+    """
+    ctx = dict(task.context or {})
+    raw_records = ctx.get(DECLINED_BY_CONTEXT_KEY)
+    records = dict(raw_records) if isinstance(raw_records, dict) else {}
+    runner_key = str(runner_id)
+    previous = records.get(runner_key)
+    try:
+        runner_count = int((previous or {}).get("count") or 0) + 1
+    except (AttributeError, TypeError, ValueError):
+        runner_count = 1
+
+    clean_reason = (reason or "").strip() or "unspecified"
+    records[runner_key] = {
+        "count": runner_count,
+        "at": (now or _utcnow()).isoformat(),
+        "reason": clean_reason[:500],
+        "hostname": hostname,
+        "same_runner_retryable": bool(same_runner_retryable),
+    }
+    ctx[DECLINED_BY_CONTEXT_KEY] = records
+    task.context = ctx
+    flag_modified(task, "context")
+    return runner_count, total_decline_count(task)
+
+
 def recently_declined_runner_ids(
     task: Any, now: datetime | None = None
 ) -> set[str]:
-    """Runner ids that declined ``task`` within :data:`DECLINE_EXCLUSION_SECONDS`.
+    """Runner ids currently fenced from ``task`` dispatch.
 
-    Returned as strings so callers can compare against ``str(runner.id)`` without
-    caring whether the context marker survived a JSON round-trip. Unparseable or
-    expired entries are ignored (fail-open: a bad marker must never make a task
-    undispatchable).
+    Transient declines expire after :data:`DECLINE_EXCLUSION_SECONDS`.
+    Deterministic task/runner incompatibilities (``same_runner_retryable=False``)
+    remain fenced for the task lifetime so a Strategic hold cannot outlive the
+    generic TTL and periodically retry the same incapable runner.
+
+    Returned ids are strings so callers can compare against ``str(runner.id)``
+    without caring whether the marker survived a JSON round-trip. Unparseable
+    transient entries are ignored (fail-open: a bad marker must never make a
+    task undispatchable).
     """
     ctx = getattr(task, "context", None) or {}
     records = ctx.get(DECLINED_BY_CONTEXT_KEY) or {}
@@ -93,6 +140,9 @@ def recently_declined_runner_ids(
     excluded: set[str] = set()
     for runner_id, rec in records.items():
         if not isinstance(rec, dict):
+            continue
+        if rec.get("same_runner_retryable") is False:
+            excluded.add(str(runner_id))
             continue
         at = rec.get("at")
         if not isinstance(at, str):
@@ -114,12 +164,12 @@ def recently_declined_runner_ids(
 def decline_record_for_runner(
     task: Any, runner_id: str, now: datetime | None = None
 ) -> dict | None:
-    """The live decline record for ``runner_id`` on ``task``, or None.
+    """The active decline fence for ``runner_id`` on ``task``, or None.
 
-    "Live" = within :data:`DECLINE_EXCLUSION_SECONDS`, i.e. exactly the records
-    that :func:`recently_declined_runner_ids` is excluding. Lets a caller report
-    WHY a runner was dropped instead of leaving an unexplained hole (the pin-hold
-    diagnostic would otherwise blame a generic ``not_eligible``).
+    This mirrors :func:`recently_declined_runner_ids`: transient records are
+    active within the TTL, while deterministic incompatibilities remain active
+    for the task lifetime. Lets a caller report WHY a runner was dropped instead
+    of leaving an unexplained hole.
     """
     ctx = getattr(task, "context", None) or {}
     records = ctx.get(DECLINED_BY_CONTEXT_KEY) or {}
@@ -128,6 +178,11 @@ def decline_record_for_runner(
     rec = records.get(str(runner_id))
     if not isinstance(rec, dict):
         return None
+    if rec.get("same_runner_retryable") is False:
+        active = dict(rec)
+        active["seconds_left"] = None
+        active["task_lifetime"] = True
+        return active
     at = rec.get("at")
     if not isinstance(at, str):
         return None
@@ -165,7 +220,8 @@ def decline_exclusion_is_advisory(task: Any, task_type: str) -> bool:
     """May the decline exclusion be WAIVED rather than empty the candidate set?
 
     True only for a Strategic task whose declines still look transient (fewer
-    than :data:`DECLINE_ESCALATION_THRESHOLD` in total).
+    than :data:`DECLINE_ESCALATION_THRESHOLD` in total, with no live decline
+    explicitly marking the same runner as deterministically incompatible).
 
     Why Strategic is special: for a normal task, emptying the candidate set is
     the CORRECT outcome — the task falls through to cloud dispatch and makes
@@ -190,6 +246,16 @@ def decline_exclusion_is_advisory(task: Any, task_type: str) -> bool:
 
     if task_type not in STRATEGIC_TASK_TYPES:
         return False
+    context = getattr(task, "context", None) or {}
+    records = context.get(DECLINED_BY_CONTEXT_KEY) or {}
+    if isinstance(records, dict):
+        for runner_id in recently_declined_runner_ids(task):
+            record = records.get(runner_id)
+            if (
+                isinstance(record, dict)
+                and record.get("same_runner_retryable") is False
+            ):
+                return False
     return total_decline_count(task) < DECLINE_ESCALATION_THRESHOLD
 
 

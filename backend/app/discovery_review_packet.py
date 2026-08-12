@@ -460,6 +460,7 @@ async def build_discovery_review_packet(
             await session.execute(
                 select(Task)
                 .where(
+                    Task.project_id == cycle.project_id,
                     Task.discovery_cycle_id == cycle.id,
                     Task.id != cycle.review_task_id
                     if cycle.review_task_id is not None

@@ -12,7 +12,7 @@ working unchanged. Behaviour is byte-identical to the pre-split code.
 import os
 import asyncio
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 from app.task_capabilities import (
     ALL_TASK_TYPES,
@@ -43,6 +43,16 @@ def resolve_capability_proof_gate_mode_default(default: str = "observe") -> str:
     return raw if raw in _GATE_MODES else default
 
 # --- Runtime Config (adjustable via admin API) ---
+_FRONTIER_RESEARCH_PROVIDERS = (
+    "zai",
+    "anthropic",
+    "deepseek",
+    "openai",
+    "gemini",
+)
+_FRONTIER_RESEARCH_EFFORT = "max"
+
+
 runtime_config: Dict = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "8")),
     # Fleet-wide hard spending boundary for NEW managed execution only.  This
@@ -313,12 +323,12 @@ runtime_config: Dict = {
     # reusable driver that disposes dormant mode-knobs with MEASURED evidence:
     # graduate off→observe→enforce on measured lift, emit a legible CUT
     # recommendation (with numbers) when the enforce branch would never bind, or
-    # HOLD below threshold. Gated by a single dedicated enabled flag, default OFF
-    # — mirrors capability_proof_gate_auto_graduation_enabled. Runs independently
+    # HOLD below threshold. Gated by a single dedicated enabled flag, now armed
+    # by default. Runs independently
     # of any single knob's own mode (it does NOT require the target knob — or the
     # metrics-integrity sweep — to already be enforcing).
     "mode_knob_graduation_enabled": os.getenv(
-        "MODE_KNOB_GRADUATION_ENABLED", "false"
+        "MODE_KNOB_GRADUATION_ENABLED", "true"
     ).lower()
     in ("1", "true", "yes"),
     # Per-knob thresholds for autonomous_spawn_budget_mode. The graduation SIGNAL
@@ -585,6 +595,36 @@ runtime_config: Dict = {
     "max_total_research_per_project": int(
         os.getenv("MAX_TOTAL_RESEARCH_PER_PROJECT", "5")
     ),
+    # Research admission is scaled to measured fleet headroom instead of a
+    # binary "any VM slot free?" gate. research_headroom_min_free_slots is the
+    # floor of free VM slots below which a sweep admits no research (a safety
+    # buffer so research does not fill the last slots); research_fleet_spawn_budget
+    # caps how many research tasks a single sweep may admit per project when
+    # headroom is available (min(available, budget), so abundant headroom admits
+    # up to the budget and scarce headroom admits proportionally less).
+    "research_headroom_min_free_slots": int(
+        os.getenv("RESEARCH_HEADROOM_MIN_FREE_SLOTS", "2")
+    ),
+    "research_fleet_spawn_budget": int(
+        os.getenv("RESEARCH_FLEET_SPAWN_BUDGET", "6")
+    ),
+    # When True AND the fleet has headroom above the min-free-slots floor,
+    # EVALUATING research parents no longer count against the per-project total
+    # cap. The total cap exists to bound pending-rollup pile-up (each EVALUATING
+    # parent has children merging into the same base); on an idle fleet the
+    # merge bottleneck is not VM slots, so the count can be relaxed.
+    # Defaults ON: this is the fix for the measured symptom (active directions
+    # carrying fresh findings with ZERO tasks in flight because the per-project
+    # total cap of 5 was consumed by EVALUATING rollup parents), so shipping it
+    # dark would leave that symptom in place. The relaxation is already
+    # double-gated on `headroom_budget > 0` — i.e. the fleet is above the
+    # min-free-slots floor — which is the safety property that bounds it; the
+    # env var remains as an operator escape hatch
+    # (RESEARCH_HEADROOM_IGNORES_EVALUATING=false).
+    "research_headroom_ignores_evaluating": (
+        os.getenv("RESEARCH_HEADROOM_IGNORES_EVALUATING", "true").lower()
+        in ("1", "true", "yes")
+    ),
     # Auto-remediation governors (residual CODE_ERROR fingerprint spawner).
     # Global cap on concurrent/queued auto-remediation tasks prevents queue
     # ballooning when many distinct fingerprints accumulate. Cooldown is
@@ -679,7 +719,18 @@ runtime_config: Dict = {
     # Sparse per-task-type routing overrides. Either field optional; the
     # other inherits from the task's category. Use for surgical cases like
     # "route debug tasks to openai at high effort regardless of category".
-    "task_type_routing": {},
+    "task_type_routing": {
+        # A research parent is the campaign's evidence collector, synthesizer,
+        # and work-graph author.  Running it at the same medium initiative tier
+        # as ordinary plan/build work made its output materially weaker than a
+        # Strategic review even though both make similarly consequential
+        # portfolio decisions.  Keep implementation children cost-balanced;
+        # spend frontier effort once at the parent where it has the most leverage.
+        "research": {
+            "providers": list(_FRONTIER_RESEARCH_PROVIDERS),
+            "effort": _FRONTIER_RESEARCH_EFFORT,
+        },
+    },
     # Optional per-task-type concrete model priority overrides. When present,
     # selection uses these ordered {provider, model} pairs before falling back
     # to provider preference + quality tier resolution.
@@ -1412,11 +1463,61 @@ _DORMANT_MODE_KNOBS = {
         "Capability proof gate not yet enforcing (off/observe)"
     ),
 }
-# Master feature flags that ship OFF still owe an enablement decision.
-_DORMANT_OFF_FLAGS: dict = {}
+# Master release mechanisms that are deliberately dormant still owe a named,
+# owned rollback declaration. This is the single registry for release paths
+# that are not currently enforcing; do not create a parallel inventory.
+_DORMANT_OFF_FLAGS: dict[str, dict[str, Any]] = {
+    "merge_grade_block_threshold": {
+        "title": "Merge-grade blocker remains unarmed",
+        "owner": "Release engineering",
+        "reason": "The trusted promotion policy keeps merge_grade_block_threshold at 0.0, so merge_grade_misses cannot block promotion.",
+        "rearm_condition": "Set backend/promotion_policy.yaml merge_grade_block_threshold above 0.0 and verify a targeted qualification reports merge_grade_misses as an armed blocker.",
+    },
+    "capability_proof_gate": {
+        "title": "Capability proof enforcement is in observe-only rollout",
+        "owner": "Capability-runtime owner",
+        "reason": "capability_proof_gate_mode defaults to observe and capability_proof_gate_auto_graduation_enabled defaults to false, so proof remains advisory.",
+        "rearm_condition": "Record fleet-wide working-capability proof coverage of at least 0.95, then set the mode to enforce and enable auto-graduation in the same settings change.",
+        "runtime_keys": (
+            "capability_proof_gate_mode",
+            "capability_proof_gate_auto_graduation_enabled",
+        ),
+    },
+    "prepromotion_rehearsal": {
+        "title": "Pre-promotion rehearsal is a branch-pinned rollback path",
+        "owner": "Release engineering",
+        "reason": "The workflow definition must remain on trusted main while this version cannot arm its own promotion-target workflow, so rehearsal dispatch is intentionally pending.",
+        "rearm_condition": "After main contains .github/workflows/prepromotion-rehearsal.yml, a qualification must dispatch it from main and persist a valid receipt for the exact candidate SHA.",
+        "always_dormant": True,
+        "runtime_keys": (),
+    },
+    "mode_knob_graduation_enabled": {
+        "title": "Mode-knob graduation harness is armed",
+        "owner": "Runtime-config owner",
+        "reason": "The existing measured graduation harness previously shipped disabled, leaving its registered knobs without an active disposition path.",
+        "rearm_condition": "Keep mode_knob_graduation_enabled true and require each graduation decision to carry measured evidence before any knob advances.",
+        "runtime_keys": ("mode_knob_graduation_enabled",),
+    },
+}
 
 
-def iter_dormant_knob_debts() -> list[dict]:
+def _dormant_off_declaration_is_active(
+    key: str, declaration: Mapping[str, Any], config: Mapping[str, Any]
+) -> bool:
+    """Return whether an existing dormant declaration currently applies."""
+    if declaration.get("always_dormant"):
+        return True
+    runtime_keys = tuple(declaration.get("runtime_keys", (key,)))
+    return all(
+        str(config.get(key, "")).lower() in _DORMANT_KNOB_VALUES
+        or not bool(config.get(key, False))
+        for key in runtime_keys
+    )
+
+
+def iter_dormant_knob_debts(
+    config: Mapping[str, Any] | None = None,
+) -> list[dict]:
     """Enumerate runtime-config knobs currently in a dormant/default-off/observe
     state as completion-debt seed rows.
 
@@ -1425,9 +1526,10 @@ def iter_dormant_knob_debts() -> list[dict]:
     ``dormant_knob`` kind, a human ``title``, and bounded ``detail`` capturing
     the knob's current value). Deployment-global — no ``project_id``.
     """
+    active_config = runtime_config if config is None else config
     debts: list[dict] = []
     for key, title in _DORMANT_MODE_KNOBS.items():
-        value = str(runtime_config.get(key, "")).lower()
+        value = str(active_config.get(key, "")).lower()
         if value in _DORMANT_KNOB_VALUES:
             debts.append(
                 {
@@ -1439,16 +1541,25 @@ def iter_dormant_knob_debts() -> list[dict]:
                     "detail": {"knob": key, "value": value},
                 }
             )
-    for key, title in _DORMANT_OFF_FLAGS.items():
-        if not runtime_config.get(key, False):
+    for key, declaration in _DORMANT_OFF_FLAGS.items():
+        if _dormant_off_declaration_is_active(key, declaration, active_config):
             debts.append(
                 {
                     "dedupe_key": f"dormant_knob:{key}",
                     "kind": "dormant_knob",
-                    "title": title,
+                    "title": declaration["title"],
                     "project_id": None,
                     "source": "runtime_config_state",
-                    "detail": {"knob": key, "value": bool(runtime_config.get(key))},
+                    "detail": {
+                        "knob": key,
+                        "value": {
+                            runtime_key: active_config.get(runtime_key)
+                            for runtime_key in declaration.get("runtime_keys", (key,))
+                        },
+                        "owner": declaration["owner"],
+                        "reason": declaration["reason"],
+                        "rearm_condition": declaration["rearm_condition"],
+                    },
                 }
             )
     return debts
@@ -1798,6 +1909,21 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
     if isinstance(category_routing, dict):
         for category in ("_default", "strategic", "initiative", "build", "review", "ops"):
             _ensure_route_defaults(category_routing, category)
+
+    task_type_routing = config.setdefault("task_type_routing", {})
+    if isinstance(task_type_routing, dict):
+        # Existing per-research routes are operator-owned. Missing means this
+        # deployment predates the frontier-parent policy, so seed it once just
+        # like the missing smoketest model preference above. Use the immutable
+        # release policy rather than the process-local runtime_config: on a
+        # multi-instance deployment that dict may already reflect a different
+        # sync/PATCH history, and a migration must converge from persisted state
+        # identically on every instance.
+        if "research" not in task_type_routing:
+            task_type_routing["research"] = {
+                "providers": list(_FRONTIER_RESEARCH_PROVIDERS),
+                "effort": _FRONTIER_RESEARCH_EFFORT,
+            }
 
     if config.get("provider_selection_mode") not in (
         "balanced",
@@ -2340,6 +2466,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "cochange_decomposition_enabled",
                         bool(config_json["cochange_decomposition_enabled"]),
+                    )
+                if "research_quality_grader_enabled" in config_json:
+                    _set(
+                        "research_quality_grader_enabled",
+                        bool(config_json["research_quality_grader_enabled"]),
                     )
                 if "adversarial_spawn_gate_enabled" in config_json:
                     _set(

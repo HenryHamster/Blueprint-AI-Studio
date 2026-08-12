@@ -1465,24 +1465,19 @@ async def spawn_forward_quality_grader(
     )
     session.add(grader)
 
-    # Park the source awaiting the verdict. Overrides the COMPLETED status the
-    # orchestrator set pre-handler — the source is NOT done until graded.
+    # Park the source awaiting this exact verdict. ``Task.id`` is generated when
+    # the model is constructed, so the sidecar row and its source-side UUID can
+    # land atomically. The former two-commit ``True`` -> UUID handshake left a
+    # durable crash window that neither exact-ID resolution nor recovery could
+    # safely attribute.
     source_task.status = TaskStatus.EVALUATING
     source_task.latest_status_message = _status_message[:500]
-    ctx[_awaiting_key] = True
+    ctx[_awaiting_key] = str(grader.id)
     source_task.context = ctx
     flag_modified(source_task, "context")
     session.add(source_task)
     await session.commit()
     await session.refresh(grader)
-
-    # Record the concrete grader id for observability now that it exists.
-    ctx2 = dict(source_task.context or {})
-    ctx2[_awaiting_key] = str(grader.id)
-    source_task.context = ctx2
-    flag_modified(source_task, "context")
-    session.add(source_task)
-    await session.commit()
 
     logger.info(
         "[EVAL] Spawned %s grader %s for %s task %s; source parked "
@@ -1777,27 +1772,20 @@ async def spawn_finding_challenge(
     )
     session.add(challenge)
 
-    # Park the source awaiting the second opinion. Overrides the COMPLETED status
-    # the orchestrator set pre-handler — the source is NOT done until challenged.
+    # Park the source awaiting this exact second opinion in the same transaction
+    # that inserts the sidecar. ``Task.id`` already exists before the flush, so
+    # no boolean placeholder or second commit is necessary.
     source_task.status = TaskStatus.EVALUATING
     source_task.latest_status_message = (
         f"Awaiting independent second opinion on a {boundary} verdict before "
         "dropping/dispatching the finding"
     )[:500]
-    ctx["awaiting_finding_challenge"] = True
+    ctx["awaiting_finding_challenge"] = str(challenge.id)
     source_task.context = ctx
     flag_modified(source_task, "context")
     session.add(source_task)
     await session.commit()
     await session.refresh(challenge)
-
-    # Record the concrete side-car id for observability now that it exists.
-    ctx2 = dict(source_task.context or {})
-    ctx2["awaiting_finding_challenge"] = str(challenge.id)
-    source_task.context = ctx2
-    flag_modified(source_task, "context")
-    session.add(source_task)
-    await session.commit()
 
     logger.info(
         "[CHALLENGE] Spawned %s challenge %s for research task %s; source parked "

@@ -5062,7 +5062,17 @@ async def test_force_promote_proceeds_when_verdict_finalized(db_session, mocker)
             return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
         ),
     )
-    mocker.patch("app.github.create_pull_request", new=AsyncMock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(
+            return_value={
+                "number": 77,
+                "html_url": "http://pr/77",
+                "empty_diff": True,
+                "merged": True,
+            }
+        ),
+    )
     mocker.patch.object(
         rq,
         "_resolve_ci_at_finalize",

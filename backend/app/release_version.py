@@ -54,6 +54,7 @@ Public API:
 
 from __future__ import annotations
 
+
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -71,6 +72,7 @@ from app.acceptance_gate import (
 from app.landed_signal import landed_signal_predicate
 from app.models import Artifact, ArtifactType, Project, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _coerce_naive_utc, _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1836
 
 logger = logging.getLogger(__name__)
 
@@ -728,8 +730,8 @@ def _audit_child_crashed(audit_child: dict[str, Any] | None) -> bool:
     """Return True when the audit child reached a terminal-failed state with no report.
 
     ``audit_child`` is the version-scoped audit-evidence envelope (the
-    ``latest_audit`` dict resolved by ``resolve_lifecycle_audit_evidence`` /
-    ``get_latest_release_audit_report``), carrying ``task_status`` and ``report``.
+    ``latest_audit`` dict resolved by ``resolve_lifecycle_audit_evidence``),
+    carrying ``task_status`` and ``report``.
     ``None`` (no current audit child resolved) → not a crash, so callers that
     pass no signal preserve the prior ``qualifying`` behavior. Pure/sync — no I/O.
     """

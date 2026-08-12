@@ -1424,7 +1424,15 @@ def reserve_slots_for_types(
     types_by_id = {
         t.id: ((t.first_payload or {}).get("type") or "") for t in candidate_tasks
     }
-    protected = set(reserved_config.keys())
+    reserved_types = set(reserved_config.keys())
+    # ``reorder_by_completion_priority`` returns a list subclass carrying the
+    # small set of EVALUATING delivery-owner dependencies that must not be
+    # displaced by a fresh reserved task.  Keeping the metadata on the ordered
+    # list makes the existing two-pass orchestrator call sequence atomic from a
+    # policy perspective without treating EVALUATING owners as active work.
+    completion_protected_ids = set(
+        getattr(eligible_ids, "reservation_protected_ids", ())
+    )
     initial = list(eligible_ids[:slots_available])
     waiting = list(eligible_ids[slots_available:])
     for rtype, rn in reserved_config.items():
@@ -1441,24 +1449,46 @@ def reserve_slots_for_types(
         promote = [tid for tid in waiting if types_by_id.get(tid) == rtype][:needed]
         if not promote:
             continue
-        displaced = 0
+        displacement_indexes: list[int] = []
         for i in range(len(initial) - 1, -1, -1):
-            if displaced >= len(promote):
+            if len(displacement_indexes) >= len(promote):
                 break
-            if types_by_id.get(initial[i]) not in protected:
-                initial.pop(i)
-                displaced += 1
-        if displaced == 0:
+            tid = initial[i]
+            if (
+                types_by_id.get(tid) not in reserved_types
+                and tid not in completion_protected_ids
+            ):
+                displacement_indexes.append(i)
+        if not displacement_indexes:
             continue
-        promote = promote[:displaced]
+        promote = promote[: len(displacement_indexes)]
+        displacement_index_set = set(displacement_indexes)
+        # Preserve every displaced ID and its relative order just beyond the
+        # dispatch window.  The old pop-only implementation silently dropped
+        # these tasks from the returned permutation for the rest of the cycle.
+        displaced_ids = [
+            tid for i, tid in enumerate(initial) if i in displacement_index_set
+        ]
+        initial = [
+            tid for i, tid in enumerate(initial) if i not in displacement_index_set
+        ]
         promoted_set = set(promote)
-        waiting = [tid for tid in waiting if tid not in promoted_set]
+        waiting = displaced_ids + [tid for tid in waiting if tid not in promoted_set]
         initial.extend(promote)
         logger.info(
             f"[ORCHESTRATOR] Slot reservation: promoted {len(promote)} '{rtype}' "
-            f"task(s) (reserved={rn}, displaced {displaced} non-reserved)"
+            f"task(s) (reserved={rn}, displaced {len(displaced_ids)} non-reserved)"
         )
-    return initial + waiting
+    result = initial + waiting
+    if Counter(result) != Counter(eligible_ids):
+        # Reservation is only an ordering policy.  Fail safe to the input order
+        # if a future edit ever violates the permutation invariant.
+        logger.error(
+            "[ORCHESTRATOR] Slot reservation violated permutation invariant; "
+            "preserving the pre-reservation order"
+        )
+        return list(eligible_ids)
+    return result
 
 
 def _project_fairness_weight(priority) -> int:
@@ -1563,8 +1593,27 @@ def apply_project_fairness(
 
 # Task types that are part of the review/fix pipeline (tree-finishing candidates).
 _PIPELINE_TASK_TYPES = frozenset({"review", "fix"})
+# Parent task types that continue to own delivery while they wait for spawned
+# children to finish.  EVALUATING owners are deliberately kept separate from
+# ``active_task_ids`` so ordering does not change concurrency accounting.
+_DELIVERY_OWNER_TASK_TYPES = frozenset({"research", "plan"})
+# Parentless grader/challenge sidecars point at the EVALUATING task whose
+# delivery they unblock through one of these server-owned context keys.
+_DELIVERY_OWNER_SOURCE_CONTEXT_KEYS = (
+    "quality_grader_for_task_id",
+    "finding_challenge_for_task_id",
+)
+_QUALITY_GRADER_SOURCE_CONTEXT_KEY = "quality_grader_for_task_id"
 # Task types that represent brand-new top-level work (lowest completion priority).
 _NEW_WORK_TASK_TYPES = frozenset({"research", "web_research"})
+
+
+class _CompletionPriorityOrder(list):
+    """Ordered candidates plus transient protection for the reservation pass."""
+
+    def __init__(self, values, reservation_protected_ids=()):
+        super().__init__(values)
+        self.reservation_protected_ids = frozenset(reservation_protected_ids)
 
 
 def apply_completion_priority(
@@ -1573,6 +1622,8 @@ def apply_completion_priority(
     parent_id_by_id: dict,
     active_task_ids: set,
     rollup_parent_ids: set,
+    evaluating_delivery_owner_ids: set | None = None,
+    delivery_owner_id_by_id: dict | None = None,
 ) -> list:
     """Reorder eligible tasks so tree-completing work outranks new work.
 
@@ -1582,7 +1633,8 @@ def apply_completion_priority(
       1. review/fix tasks whose parent plan already issued a rollup PR
          (``parent_id`` in ``rollup_parent_ids``) — these close whole plan trees.
       2. review/fix tasks on ordinary in-flight PRs (parent not a rollup).
-      3. Children of already-running plans (``parent_id`` in ``active_task_ids``).
+      3. Children of already-running plans (``parent_id`` in ``active_task_ids``)
+         or EVALUATING research/plan delivery owners.
       4. Brand-new top-level work: research, web_research, and unparented tasks.
 
     This is a pure permutation — no tasks are added or removed. The existing
@@ -1597,22 +1649,38 @@ def apply_completion_priority(
         active_task_ids: set of task IDs currently PROVISIONING/IN_PROGRESS.
         rollup_parent_ids: set of plan-task IDs whose context contains
             ``rollup_pr_number`` (indicating the tree has rolled up).
+        evaluating_delivery_owner_ids: EVALUATING research/plan parent IDs whose
+            spawned children are still part of the already-started delivery tree.
+            These IDs affect ordering only and are never counted as active work.
+        delivery_owner_id_by_id: optional semantic owner mapping for candidates
+            whose delivery edge is not ``parent_task_id`` (notably parentless
+            grader/challenge sidecars linked through their source-task context).
 
     Returns:
         The reordered ``eligible_ids`` (same length / membership, stable within tier).
     """
+    evaluating_delivery_owner_ids = evaluating_delivery_owner_ids or set()
+    delivery_owner_id_by_id = delivery_owner_id_by_id or parent_id_by_id
+    finish_priority_parent_ids = active_task_ids | evaluating_delivery_owner_ids
+
+    reservation_protected_ids = {
+        tid
+        for tid in eligible_ids
+        if delivery_owner_id_by_id.get(tid) in evaluating_delivery_owner_ids
+    }
     if len(eligible_ids) <= 1:
-        return eligible_ids
+        return _CompletionPriorityOrder(eligible_ids, reservation_protected_ids)
 
     def _tier(tid) -> int:
         task_type = types_by_id.get(tid) or ""
         parent_id = parent_id_by_id.get(tid)
+        delivery_owner_id = delivery_owner_id_by_id.get(tid)
         if task_type in _PIPELINE_TASK_TYPES:
             if parent_id and parent_id in rollup_parent_ids:
                 return 1  # rollup tree-completing review/fix — highest priority
             return 2  # ordinary review/fix on in-flight PR
-        if parent_id and parent_id in active_task_ids:
-            return 3  # child of already-running plan
+        if delivery_owner_id and delivery_owner_id in finish_priority_parent_ids:
+            return 3  # child of an already-started delivery owner
         return 4  # new research / new top-level work — lowest priority
 
     tiers = [(_tier(tid), i, tid) for i, tid in enumerate(eligible_ids)]
@@ -1626,9 +1694,10 @@ def apply_completion_priority(
             tier_counts[tier] = tier_counts.get(tier, 0) + 1
         logger.info(
             "[ORCHESTRATOR] Finish-before-start: tier distribution "
-            f"{tier_counts} (1=rollup-review, 2=review/fix, 3=plan-child, 4=new-work)"
+            f"{tier_counts} (1=rollup-review, 2=review/fix, "
+            "3=delivery-owner-child, 4=new-work)"
         )
-    return result
+    return _CompletionPriorityOrder(result, reservation_protected_ids)
 
 
 def apply_project_concurrency_cap(
@@ -1691,10 +1760,12 @@ async def reorder_by_completion_priority(
 ) -> list:
     """Step 2.97: reorder eligible tasks so tree-completing work wins scarce slots.
 
-    Fetches parent-task contexts for review/fix candidates in a single batched
-    query to identify rollup parents, then delegates to the pure
-    ``apply_completion_priority`` for the stable-sort reorder.  Only issues a
-    DB query when review/fix candidates with a parent_task_id are present.
+    Fetches owner metadata for child candidates and source-linked grader/challenge
+    sidecars in a single batched query to identify rollup parents and EVALUATING
+    research/plan delivery owners, then delegates to the pure
+    ``apply_completion_priority`` for the stable-sort reorder. EVALUATING owners
+    are passed through a distinct ordering-only set; they are not added to
+    ``active_task_ids`` or active concurrency counts.
     """
     if len(eligible_ids) <= 1:
         return eligible_ids
@@ -1702,27 +1773,136 @@ async def reorder_by_completion_priority(
     types_by_id = {
         t.id: ((t.first_payload or {}).get("type") or "") for t in candidate_tasks
     }
+    candidate_by_id = {t.id: t for t in candidate_tasks}
     parent_id_by_id = {t.id: t.parent_task_id for t in candidate_tasks}
+    delivery_owner_id_by_id = dict(parent_id_by_id)
+    # Semantic sidecar links are security-sensitive: unlike parent_task_id they
+    # arrive through JSON context.  Record only a *claim* here; it becomes an
+    # ordering edge below after the locked owner row proves the same project and
+    # the exact awaiting-sidecar id.  Agent-created or otherwise malformed
+    # investigate tasks never gain completion priority from these keys.
+    sidecar_claims: dict[object, tuple[uuid.UUID, str]] = {}
+    for task in candidate_tasks:
+        if task.id not in eligible_ids:
+            continue
+        context = (
+            task.context
+            if isinstance(getattr(task, "context", None), dict)
+            else {}
+        )
+        source_key = next(
+            (
+                key
+                for key in _DELIVERY_OWNER_SOURCE_CONTEXT_KEYS
+                if context.get(key)
+            ),
+            None,
+        )
+        if source_key is None:
+            continue
+        if (
+            types_by_id.get(task.id) != "investigate"
+            or getattr(task, "created_by", None) != "ORCHESTRATOR"
+            or getattr(task, "parent_task_id", None) is not None
+        ):
+            continue
+        try:
+            parsed_source_id = uuid.UUID(str(context.get(source_key)))
+        except (TypeError, ValueError, AttributeError):
+            # Malformed context must not broaden priority.
+            continue
+        awaiting_key = (
+            "awaiting_adversarial_grader"
+            if source_key == _QUALITY_GRADER_SOURCE_CONTEXT_KEY
+            and context.get("adversarial_grader") is True
+            else (
+                "awaiting_quality_grader"
+                if source_key == _QUALITY_GRADER_SOURCE_CONTEXT_KEY
+                else "awaiting_finding_challenge"
+            )
+        )
+        sidecar_claims[task.id] = (parsed_source_id, awaiting_key)
 
-    # Collect parent IDs for review/fix candidates — only these need rollup check.
+    # All parented candidates need an EVALUATING delivery-owner check; review/fix
+    # parents additionally use the same row for rollup detection.
     parent_ids_to_fetch = set()
     for tid in eligible_ids:
-        task_type = types_by_id.get(tid) or ""
-        parent_id = parent_id_by_id.get(tid)
-        if task_type in _PIPELINE_TASK_TYPES and parent_id:
-            parent_ids_to_fetch.add(parent_id)
+        delivery_owner_id = delivery_owner_id_by_id.get(tid)
+        if delivery_owner_id:
+            parent_ids_to_fetch.add(delivery_owner_id)
+        sidecar_claim = sidecar_claims.get(tid)
+        if sidecar_claim:
+            parent_ids_to_fetch.add(sidecar_claim[0])
 
-    # Query parent contexts in one batch to find rollup parents.
+    # Query parent metadata in one batch to find both ordering signals.
     rollup_parent_ids: set = set()
+    evaluating_delivery_owner_ids: set = set()
     if parent_ids_to_fetch:
         rows = (
             await session.execute(
-                select(Task.id, Task.context).where(Task.id.in_(parent_ids_to_fetch))
+                select(
+                    Task.id,
+                    Task.context,
+                    Task.status,
+                    Task.payloads,
+                    Task.project_id,
+                ).where(Task.id.in_(parent_ids_to_fetch))
             )
         ).all()
-        for row_id, row_context in rows:
+        owner_rows: dict[object, tuple[dict, object, object]] = {}
+        for row_id, row_context, row_status, row_payloads, row_project_id in rows:
             if row_context and row_context.get("rollup_pr_number"):
                 rollup_parent_ids.add(row_id)
+            first_payload = (
+                row_payloads[0]
+                if row_payloads
+                and isinstance(row_payloads, list)
+                and isinstance(row_payloads[0], dict)
+                else {}
+            )
+            if (
+                row_status == TaskStatus.EVALUATING
+                and first_payload.get("type") in _DELIVERY_OWNER_TASK_TYPES
+            ):
+                evaluating_delivery_owner_ids.add(row_id)
+            owner_rows[row_id] = (
+                row_context if isinstance(row_context, dict) else {},
+                row_status,
+                row_project_id,
+            )
+
+        # ``parent_task_id`` is a delivery/rollup authority edge. Historical or
+        # corrupted cross-project links must not borrow another project's
+        # EVALUATING-owner or rollup priority, even after mutation ingress is
+        # closed. Missing owners fail closed for the same reason.
+        for candidate_id in eligible_ids:
+            parent_id = parent_id_by_id.get(candidate_id)
+            if parent_id is None:
+                continue
+            candidate = candidate_by_id.get(candidate_id)
+            owner_row = owner_rows.get(parent_id)
+            if (
+                candidate is None
+                or owner_row is None
+                or owner_row[2] != getattr(candidate, "project_id", None)
+            ):
+                parent_id_by_id[candidate_id] = None
+                delivery_owner_id_by_id[candidate_id] = None
+
+        for sidecar_id, (source_id, awaiting_key) in sidecar_claims.items():
+            owner_row = owner_rows.get(source_id)
+            sidecar = candidate_by_id.get(sidecar_id)
+            if owner_row is None or sidecar is None:
+                continue
+            source_context, source_status, source_project_id = owner_row
+            if (
+                source_status != TaskStatus.EVALUATING
+                or source_id not in evaluating_delivery_owner_ids
+                or source_project_id != getattr(sidecar, "project_id", None)
+                or str(source_context.get(awaiting_key) or "") != str(sidecar_id)
+            ):
+                continue
+            delivery_owner_id_by_id[sidecar_id] = source_id
 
     return apply_completion_priority(
         eligible_ids,
@@ -1730,6 +1910,8 @@ async def reorder_by_completion_priority(
         parent_id_by_id,
         active_task_ids,
         rollup_parent_ids,
+        evaluating_delivery_owner_ids,
+        delivery_owner_id_by_id,
     )
 
 

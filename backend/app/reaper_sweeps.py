@@ -832,7 +832,7 @@ async def sweep_mode_knob_graduation(session, now=None) -> list | None:
     """Always-on shared mode-knob graduation harness — independent of sweep mode.
 
     Thin delegator to :func:`app.mode_knob_graduation.run_mode_knob_graduation`.
-    Gated ONLY by its own ``mode_knob_graduation_enabled`` flag (default False)
+    Gated ONLY by its own ``mode_knob_graduation_enabled`` flag (default True)
     inside the callee — deliberately NOT gated on ``metrics_integrity_sweep_mode``
     so the harness that disposes dormant knobs never itself depends on a dormant
     knob being enforced. Returns the per-knob decision list, or an empty list when
@@ -1580,6 +1580,15 @@ async def sweep_stuck_qualifications(session, *, session_factory) -> int:
     Returns the number of qualifications finalized.
     """
     from app import release_qualifier
+    from app.release_prepromotion_rehearsal import (
+        dispatch_pending_rehearsal_intents,
+    )
+
+    dispatched = await dispatch_pending_rehearsal_intents(
+        session_factory=session_factory
+    )
+    if dispatched:
+        logger.info("[REAPER] Processed %d prepromotion rehearsal intent(s)", dispatched)
 
     finalized = await release_qualifier.sweep_stuck_qualifications(
         session, session_factory=session_factory

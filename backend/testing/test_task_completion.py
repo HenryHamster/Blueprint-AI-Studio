@@ -107,6 +107,75 @@ async def test_phase2_spawn_exception_emits_negative_receipt_for_failed_cycle(
     assert "FAILED to spawn" in receipt["completion"]["status_message"]
 
 
+@pytest.mark.asyncio
+async def test_phase2_spawn_recovers_poisoned_session_before_failure_writes(
+    db_session, mocker
+):
+    """A failed spawn flush must not turn an already-completed Phase 1 FAILED."""
+    project = make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update", "prompt": "update"}],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    cycle = StrategicCycle(
+        id="cycle-phase2-poisoned-session",
+        project_id=project.id,
+        phase1_task_id=task_id,
+    )
+    task.strategic_cycle_id = cycle.id
+    db_session.add_all([cycle, task])
+    await db_session.commit()
+
+    async def _poison_session(_project, session, **_kwargs):
+        # A duplicate primary-key flush puts a real SQLAlchemy AsyncSession in
+        # PendingRollbackError state, matching the production CI-compliance
+        # flush failure rather than merely raising a synthetic RuntimeError.
+        session.expunge(task)
+        duplicate = make_task(project_id=project.id, id=task_id)
+        session.add(duplicate)
+        await session.flush()
+
+    async def _assert_clean_alert(_project_id, session, _message):
+        # This query would raise PendingRollbackError if the handler reused the
+        # poisoned transaction for its alert/marker recovery.
+        assert await session.get(Task, task_id) is not None
+
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=_poison_session,
+    )
+    mocker.patch(
+        "app.alert_dispatch._create_strategic_alert",
+        new=_assert_clean_alert,
+    )
+    mocker.patch(
+        "app.strategic_events.emit_strategic_cycle_completed",
+        new=AsyncMock(),
+    )
+
+    await _handle_design_doc_completion(task, "", db_session, project=project)
+
+    recovered_task = await db_session.get(Task, task_id)
+    await db_session.refresh(project)
+    await db_session.refresh(cycle)
+    assert recovered_task is not None
+    assert recovered_task.status == TaskStatus.COMPLETED
+    assert project.vision["_pending_strategic_review"]["design_doc_task_id"] == str(
+        task_id
+    )
+    assert cycle.outcome == "failed_phase2_spawn"
+
+
 # ── _compute_first_attempt_succeeded ────────────────────────────────────────
 
 
@@ -114,9 +183,20 @@ class TestComputeFirstAttemptSucceeded:
     def test_attempt_zero_completed(self):
         assert _compute_first_attempt_succeeded(0, TaskStatus.COMPLETED) is True
 
-    def test_attempt_one_completed(self):
-        """attempt_count=1 (reaper retried once) still counts as first-attempt bucket."""
-        assert _compute_first_attempt_succeeded(1, TaskStatus.COMPLETED) is True
+    def test_attempt_one_is_not_first(self):
+        """attempt_count=1 means one retry was consumed (UI Attempt 2)."""
+        assert _compute_first_attempt_succeeded(1, TaskStatus.COMPLETED) is False
+
+    def test_banked_attempt_is_not_first_after_counter_reset(self):
+        """A manual fresh retry epoch cannot turn lifetime Attempt 2 into Attempt 1."""
+        assert (
+            _compute_first_attempt_succeeded(
+                0,
+                TaskStatus.COMPLETED,
+                banked_attempt_count=1,
+            )
+            is False
+        )
 
     def test_attempt_two_is_not_first(self):
         assert _compute_first_attempt_succeeded(2, TaskStatus.COMPLETED) is False
@@ -135,6 +215,67 @@ class TestComputeFirstAttemptSucceeded:
 
     def test_queued_status_not_success(self):
         assert _compute_first_attempt_succeeded(0, TaskStatus.QUEUED) is False
+
+    def test_completed_strategic_review_is_unmeasured_without_an_adjudicator(self):
+        assert (
+            _compute_first_attempt_succeeded(
+                0,
+                TaskStatus.COMPLETED,
+                task_type="strategic_review",
+            )
+            is None
+        )
+
+    def test_retried_unadjudicated_strategic_review_stays_unmeasured(self):
+        assert (
+            _compute_first_attempt_succeeded(
+                2,
+                TaskStatus.COMPLETED,
+                task_type="strategic_review",
+            )
+            is None
+        )
+
+    def test_banked_retried_unadjudicated_strategic_review_stays_unmeasured(self):
+        """A reset retry counter must not turn unknown semantics into failure."""
+        assert (
+            _compute_first_attempt_succeeded(
+                0,
+                TaskStatus.COMPLETED,
+                banked_attempt_count=1,
+                task_type="strategic_review",
+            )
+            is None
+        )
+
+    def test_non_strategic_first_attempt_behavior_is_unchanged(self):
+        assert (
+            _compute_first_attempt_succeeded(
+                0,
+                TaskStatus.COMPLETED,
+                task_type="create",
+            )
+            is True
+        )
+
+
+def test_pending_rollback_handler_error_is_transient_by_type():
+    from sqlalchemy.exc import PendingRollbackError
+
+    from app.task_lifecycle_completion_dispatch import (
+        _is_transient_completion_handler_error,
+    )
+
+    exc = PendingRollbackError("rollback required")
+    assert _is_transient_completion_handler_error(exc) is True
+
+
+def test_logic_handler_error_is_not_transient():
+    from app.task_lifecycle_completion_dispatch import (
+        _is_transient_completion_handler_error,
+    )
+
+    assert _is_transient_completion_handler_error(RuntimeError("logic bug")) is False
 
 
 # ── _parse_plan_output ───────────────────────────────────────────────────────

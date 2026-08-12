@@ -807,6 +807,11 @@ class StrategicReviewPayload(_SystemPopulated):
     # Short-window claim-vs-shipped drift signals; complements lifetime
     # prediction calibration with a fast-reacting drift detector.
     drift_signals: dict[str, Any] | None = None
+    # Authoritative promotion rubric resolved from the same project-aware seam
+    # the release qualifier enforces. Kept separate from the launch-time attempt
+    # snapshot so a historical threshold cannot masquerade as current policy.
+    current_effective_policy: dict[str, Any] | None = None
+    active_or_last_attempt_policy: dict[str, Any] | None = None
     # Current LTS version/phase context. Keys: version_number, phase,
     # phase_changed_at, tasks_merged_this_version, last_qualification,
     # acceptance_aggregate (additive proven-vs-merged version-window aggregate,
@@ -1511,6 +1516,44 @@ def _serialized_size(v: Any) -> int:
     return len(json.dumps(v, default=str).encode())
 
 
+def _decision_value(entry: dict, value: Any, key: str) -> float:
+    """Resolve a schema-declared decision value for one payload section.
+
+    The packer owns the ordering decision; schemas only provide the value
+    signal. Invalid callbacks are deliberately non-fatal and fall back to zero
+    so a malformed advisory signal cannot prevent payload construction.
+    """
+    raw = entry.get("decision_value", 0)
+    try:
+        value = raw(value) if callable(raw) else raw
+        if isinstance(value, bool):
+            return float(value)
+        return float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        logger.warning(
+            "pack_under_budget: decision_value for key %r was invalid (%s) — using 0",
+            key,
+            exc,
+        )
+        return 0.0
+
+
+def _payload_currency_metadata(payload: dict) -> tuple[str, str]:
+    """Return an explicit currency verdict and reason for packer diagnostics."""
+    staleness = payload.get("payload_staleness")
+    if not isinstance(staleness, dict):
+        return "unknown", "payload_staleness absent from payload"
+    verdict = staleness.get("verdict")
+    if verdict in ("fresh", "stale"):
+        return verdict, f"verdict={verdict}"
+    if verdict in ("unknown", "api_unreachable"):
+        reason = staleness.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            return "unknown", f"verdict={verdict}; {reason.strip()}"
+        return "unknown", f"verdict={verdict}; no reason supplied"
+    return "unknown", f"invalid payload_staleness verdict: {verdict!r}"
+
+
 def pack_under_budget(
     payload: dict,
     schema: dict[str, dict],
@@ -1584,12 +1627,14 @@ def pack_under_budget(
                 "size": full_size,
                 "unserializable": unserializable,
                 "summarize": entry.get("summarize"),
+                "decision_value": _decision_value(entry, value, key),
             }
         )
 
     parts.sort(
         key=lambda p: (
             -_TIER_RANK[p["priority"]],
+            -p["decision_value"],
             p["size"] if p["size"] is not None else float("inf"),
         )
     )
@@ -1927,9 +1972,13 @@ def pack_under_budget(
         "budget_used": used,
         "trimmed": trimmed,
         "dropped": dropped,
+        "dropped_section_count": len(dropped),
         "shipped": shipped,
         "gap_memory_trimmed": gap_memory_trimmed,
     }
+    payload_currency, payload_currency_reason = _payload_currency_metadata(payload)
+    packed["_packer_meta"]["payload_currency"] = payload_currency
+    packed["_packer_meta"]["payload_currency_reason"] = payload_currency_reason
     return packed
 
 

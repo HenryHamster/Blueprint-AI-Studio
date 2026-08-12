@@ -27,6 +27,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
   const statusColor = taskStatusDotColor(task.status);
   const isRunning = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
   const heartbeat = isRunning && task.last_heartbeat ? getHeartbeatStatus(task.last_heartbeat) : null;
+  const attemptNumber = task.attempt_number ?? ((task.attempt_count ?? 0) + 1);
 
   const isActiveForDuration = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
@@ -125,9 +126,9 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
       )}
 
       {/* Retry badge */}
-      {task.attempt_count != null && task.attempt_count > 0 && (
-        <span className="border border-violet-500/20 bg-violet-500/10 px-1.5 py-0.5 text-ui-xs font-semibold whitespace-nowrap text-violet-300 rounded shrink-0" title={`Attempt ${task.attempt_count + 1}`}>
-          ↺{task.attempt_count + 1}
+      {attemptNumber > 1 && (
+        <span className="border border-violet-500/20 bg-violet-500/10 px-1.5 py-0.5 text-ui-xs font-semibold whitespace-nowrap text-violet-300 rounded shrink-0" title={`Attempt ${attemptNumber}`}>
+          ↺{attemptNumber}
         </span>
       )}
 

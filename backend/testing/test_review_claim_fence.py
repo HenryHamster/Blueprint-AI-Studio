@@ -246,12 +246,114 @@ async def test_claim_fence_rejects_head_drift_for_review_and_fix(
 
     assert decision.allowed is False
     assert decision.reason == (
-        "assigned review target is stale"
+        "assigned review head drift"
         if task_type == "review"
-        else "assigned fix target is stale"
+        else "assigned fix head drift"
     )
     await db_session.refresh(task)
     assert task.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_claim_fence_retargets_closed_rollup_fix_to_replacement(
+    db_session, mocker
+):
+    """A closed rollup PR can hand its active fix to the same-branch replacement."""
+
+    project = Project(
+        name="Claim fence replacement fix",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    old_pr = 4112
+    new_pr = 4113
+    task = Task(
+        project_id=project.id,
+        title="Retarget rollup fix",
+        payloads=[{"type": "fix", "pr_number": old_pr}],
+        context={
+            "rollup_pr_number": old_pr,
+            "review_loop": {
+                "pr_number": old_pr,
+                "branch": "rollup/replacement",
+                "base_branch": "automain",
+                "fix_target": _target(project, old_pr, head="old-head"),
+                "reviewed_head_sha": "old-head",
+                "review_history": [{"verdict": "REQUEST_CHANGES"}],
+                "iteration": 4,
+            },
+        },
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.review_claim_fence.get_github_token_for_task",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.review_claim_fence.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "closed",
+                "merged": False,
+                "head": {"sha": "old-head", "ref": "rollup/replacement"},
+                "base": {"sha": "old-base", "ref": "automain"},
+            }
+        ),
+    )
+    lookup = mocker.patch(
+        "app.review_claim_fence.get_open_pull_request_for_head_branch",
+        new=AsyncMock(
+            return_value={
+                "number": new_pr,
+                "state": "open",
+                "merged": False,
+                "head": {"sha": "new-head", "ref": "rollup/replacement"},
+                "base": {"sha": "new-base", "ref": "automain"},
+                "html_url": f"https://github.com/owner/repo/pull/{new_pr}",
+            }
+        ),
+    )
+
+    decision = await lock_pr_task_for_execution(
+        db_session,
+        task_id=task.id,
+        claimable_statuses=(TaskStatus.IN_PROGRESS,),
+    )
+    await db_session.commit()
+
+    assert decision.allowed is True
+    lookup.assert_awaited_once_with(
+        "token",
+        "owner",
+        "repo",
+        "rollup/replacement",
+        "automain",
+        project_id=str(project.id),
+    )
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.first_payload["pr_number"] == new_pr
+    loop = (task.context or {}).get("review_loop") or {}
+    assert loop["fix_target"] == {
+        "project_id": str(project.id),
+        "pr_number": new_pr,
+        "base_sha": "new-base",
+        "head_sha": "new-head",
+    }
+    assert loop["reviewed_head_sha"] == "new-head"
+    assert loop["review_history"] == [{"verdict": "REQUEST_CHANGES"}]
+    assert loop["iteration"] == 4
+    assert (task.context or {}).get("rollup_pr_number") == new_pr
+    assert "review history and iteration state preserved" in (
+        task.latest_status_message or ""
+    )
 
 
 @pytest.mark.asyncio

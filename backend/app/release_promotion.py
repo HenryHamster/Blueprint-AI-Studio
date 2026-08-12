@@ -28,6 +28,7 @@ unchanged.
 
 from __future__ import annotations
 
+
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -49,6 +50,7 @@ from app.shared_state import (
     get_project_promotion_target as _get_project_promotion_target,
 )
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2374
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +66,6 @@ logger = logging.getLogger(__name__)
 # time to boot and stabilize before the deadline, while a boot-crashed deploy
 # surfaces as a loud failure within an hour.
 _DEPLOY_CONFIRM_WINDOW_SECONDS = 60 * 60
-
-
 # ---------------------------------------------------------------------------
 # Branch-name helpers
 # ---------------------------------------------------------------------------
@@ -316,6 +316,18 @@ def _recover_confidence_from_ci_unresolved(
         and not isinstance(debt_pressure_raw, bool)
         else None
     )
+    prior_operator_authorship_gate = base_record.get(
+        "prior_operator_authorship_gate"
+    )
+    if not isinstance(prior_operator_authorship_gate, dict):
+        # Legacy pending records predate this gate. Recovery must not turn the
+        # missing persisted decision into a bootstrap pass.
+        prior_operator_authorship_gate = {
+            "status": "unresolved",
+            "passed": False,
+            "count": None,
+            "reason": "prior_operator_authorship_gate_record_missing",
+        }
 
     recovered = compute_composite(
         ci_green=True,
@@ -343,6 +355,7 @@ def _recover_confidence_from_ci_unresolved(
         env_preflight_ack_override=bool(
             base_record.get("env_preflight_ack_override", False)
         ),
+        prior_operator_authorship_gate=prior_operator_authorship_gate,
     )
 
     recovered_sub_scores = dict(sub_scores)

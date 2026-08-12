@@ -191,6 +191,7 @@ import {
   SessionStreamer, handleStrategicResident, refreshResidentGitReadToken,
   recloneResidentWorkspace, installResidentReplyKeyAtPath,
   readResidentStagedReplyAtPath, residentReplyRuntimePaths,
+  withPrivateWorkdayTurnFence,
   partitionTypedFastMessages, selectTypedFastClaimMessages,
 } from './strategic-resident.js';
 import {
@@ -1445,9 +1446,25 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await done;
   });
 
-  it('does not start an autonomous turn while a private Fast consultation owns Workday', async () => {
+  it('keeps the shared private Workday boundary replyless, silent, and serialized', async () => {
     vi.useFakeTimers();
     mockApiGet.mockResolvedValue({ messages: [], fast_message_ids: [], claim_required: true });
+
+    let privateReplyPaths: string[] = [];
+    let privateTurnMarkerPath = '';
+    vi.mocked(fs.existsSync).mockImplementation((candidate) => {
+      const candidatePath = String(candidate);
+      if (
+        !privateReplyPaths.includes(candidatePath)
+        && candidatePath !== privateTurnMarkerPath
+      ) return true;
+      try {
+        fs.lstatSync(candidatePath);
+        return true;
+      } catch {
+        return false;
+      }
+    });
 
     const canonicalEnvelope = {
       version: 2,
@@ -1511,13 +1528,38 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       resolvePrivate = resolve;
     });
     let alive = true;
+    let capabilityRevokedAtTurnStart = false;
+    let privateMarkerKindAtTurnStart = '';
+    let framesAtPrivateTurnStart = 0;
     const workday = makeSession(() => {
       if (workday.sendTurn.mock.calls.length > 1) {
         throw new Error('resident sendTurn called while a turn is already active');
       }
+      capabilityRevokedAtTurnStart = privateReplyPaths.length === 3
+        && privateReplyPaths.every((artifactPath) => !fs.existsSync(artifactPath));
+      privateMarkerKindAtTurnStart = JSON.parse(
+        fs.readFileSync(privateTurnMarkerPath, 'utf8'),
+      ).kind as string;
+      framesAtPrivateTurnStart = mockSendWsFrame.mock.calls.length;
+      workday._emit({ kind: 'text', text: 'PRIVATE_WORKDAY_TEXT_MUST_NOT_STREAM' });
+      workday._emit({ kind: 'tool', toolName: 'private_tool', text: 'PRIVATE_TOOL_MUST_NOT_STREAM' });
+      workday._emit({ kind: 'error', text: 'PRIVATE_ERROR_MUST_NOT_STREAM' });
       return privateTurn;
     }, () => alive);
-    mockStartSession.mockReturnValue(workday);
+    mockStartSession.mockImplementation((options: unknown) => {
+      const env = (options as { env?: Record<string, string> }).env ?? {};
+      privateReplyPaths = [
+        env.BLUEPRINT_RESIDENT_REPLY_KEY_PATH,
+        env.BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH,
+        env.BLUEPRINT_RESIDENT_STAGED_REPLY_PATH,
+      ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+      privateTurnMarkerPath = env.BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH ?? '';
+      for (const artifactPath of privateReplyPaths) {
+        fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+        fs.writeFileSync(artifactPath, 'stale-public-reply-capability');
+      }
+      return workday;
+    });
 
     const done = run('typed-fast-private-workday-serialization', {
       ...qualifiedPayload(),
@@ -1529,6 +1571,16 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await vi.advanceTimersByTimeAsync(5_000);
 
     expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(capabilityRevokedAtTurnStart).toBe(true);
+    expect(privateMarkerKindAtTurnStart).toBe('typed-consultation');
+    const framesDuringPrivateTurn = mockSendWsFrame.mock.calls
+      .slice(framesAtPrivateTurnStart)
+      .map((call) => call[1] as { payload?: { status?: string; text?: string } } | undefined)
+      .filter((frame): frame is { payload: { status?: string; text?: string } } => Boolean(frame?.payload));
+    expect(framesDuringPrivateTurn.some((frame) => (
+      frame.payload.text?.includes('PRIVATE_')
+      || ['responding', 'working', 'done'].includes(frame.payload.status ?? '')
+    ))).toBe(false);
     expect(mockSendLog).not.toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining('sendTurn called while a turn is already active'),
@@ -1538,6 +1590,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     resolvePrivate(turnResult({ resultText: 'Private investigation complete.' }));
     await vi.advanceTimersByTimeAsync(2_000);
     await done;
+    expect(() => fs.lstatSync(privateTurnMarkerPath)).toThrow();
   });
 
   const runOrdinaryWorkdayOverlapCase = async (renewalFails: boolean) => {
@@ -1760,6 +1813,8 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     mockSendWsFrame.mockReturnValue(true);
     mockWriteArtifactsHelper.mockClear();
     mockWriteArtifactsHelper.mockReturnValue(true);
+    mockWriteMessagesHelper.mockClear();
+    mockWriteStrategicHelpers.mockClear();
     // Workspace guard must NOT fire in general-purpose tests (WORKSPACE='' otherwise
     // always looks vanished). Recovery-specific tests override this spy.
     vi.spyOn(fs, 'existsSync').mockReturnValue(true);
@@ -1777,6 +1832,10 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       paths.runtimeDir,
       '.resident-reply-receipt.json',
     ));
+    expect(paths.privateTurnMarkerPath).toBe(path.join(
+      paths.runtimeDir,
+      '.resident-private-workday-turn',
+    ));
     const competing = residentReplyRuntimePaths(
       'task-runtime-boundary',
       '00000000-0000-0000-0000-000000000901',
@@ -1788,6 +1847,37 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(competing.runtimeDir).not.toBe(winner.runtimeDir);
     expect(competing.replyReceiptPath).not.toBe(winner.replyReceiptPath);
   });
+
+  it.each(['typed-consultation', 'active-call'] as const)(
+    'keeps the local message fence installed for the complete %s private turn',
+    async (kind) => {
+      const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'private-workday-fence-'));
+      const markerPath = path.join(runtimeDir, '.resident-private-workday-turn');
+      let release!: () => void;
+      const pending = withPrivateWorkdayTurnFence(
+        markerPath,
+        kind,
+        '00000000-0000-0000-0000-000000000951',
+        async () => {
+          const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as {
+            kind?: string; incarnation_id?: string;
+          };
+          expect(marker).toEqual({
+            kind,
+            incarnation_id: '00000000-0000-0000-0000-000000000951',
+          });
+          await new Promise<void>((resolve) => { release = resolve; });
+          expect(fs.lstatSync(markerPath).isFile()).toBe(true);
+        },
+      );
+
+      expect(fs.lstatSync(markerPath).isFile()).toBe(true);
+      release();
+      await pending;
+      expect(() => fs.lstatSync(markerPath)).toThrow();
+      fs.rmSync(runtimeDir, { recursive: true, force: true });
+    },
+  );
 
   it('removes stale reply artifacts before the session starts or autonomous work runs', async () => {
     const events: string[] = [];
@@ -2344,7 +2434,6 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       }
       return Promise.resolve(null);
     });
-    mockPrepareWorkspaceForRole.mockClear();
     mockApiPost.mockResolvedValue({ authority_held: true });
 
     let turnCount = 0;
@@ -3440,6 +3529,7 @@ describe('handleStrategicResident — operator-turn responsiveness', () => {
     mockSendLog.mockReset();
     mockSendWsFrame.mockReset();
     mockSendWsFrame.mockReturnValue(true);
+    mockPrepareWorkspaceForRole.mockClear();
     vi.spyOn(fs, 'existsSync').mockReturnValue(true);
   });
   afterEach(() => {

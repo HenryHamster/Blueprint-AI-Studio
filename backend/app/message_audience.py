@@ -197,6 +197,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "release.build_stalled": OPERATOR_FYI,
     "release.stabilize_stalled": OPERATOR_FYI,
     "release.approved_pr_stranded": OPERATOR_FYI,
+    "release.unshipped_checkpoint_stranded": OPERATOR_ACTION_NEEDED,
     "release.promotion_deploy_failed": OPERATOR_ACTION_NEEDED,
     "release.managed_check_wait_stalled": OPERATOR_FYI,
     "release.qualification_timeout": OPERATOR_ACTION_NEEDED,

@@ -880,15 +880,17 @@ class TestDependentWorkspaceContainsPrerequisiteMergedCode:
 
 
 class TestResearchSiblingFileOverlapSerialization:
-    """``_wire_research_sibling_edges`` (research_completion.py) must author real
-    ``depends_on`` edges between research-spawned siblings that share a
-    related_file — not just the ``file_overlap_warnings`` observability surface —
-    so two siblings touching the same file serialize instead of dispatching in
-    parallel and racing at merge. This is research-side parity with
-    ``plan_completion._inject_file_overlap_deps``, which already chains same-file
-    plan subtasks."""
+    """Substantial sibling overlap serializes; incidental overlap stays parallel."""
 
-    async def _scenario(self, db_session, *, first_cancelled=False, reverse_dep=False):
+    async def _scenario(
+        self,
+        db_session,
+        *,
+        first_cancelled=False,
+        reverse_dep=False,
+        incidental_overlap=False,
+        contained_overlap=False,
+    ):
         """A project plus two findings sharing a related_file and their children.
 
         ``reverse_dep`` pre-wires the earlier child to depend on the later one so
@@ -903,22 +905,29 @@ class TestResearchSiblingFileOverlapSerialization:
         await db_session.commit()
 
         shared_file = "backend/app/models.py"
+        first_files = [shared_file]
+        second_files = [shared_file]
+        if contained_overlap:
+            first_files.extend(["backend/app/auth.py", "backend/app/session.py"])
+        elif incidental_overlap:
+            first_files.extend(["backend/app/auth.py", "backend/app/session.py"])
+            second_files.extend(["backend/app/billing.py", "backend/app/usage.py"])
         findings = [
-            {"title": "a", "related_files": [shared_file]},
-            {"title": "b", "related_files": [shared_file]},
+            {"title": "a", "related_files": first_files},
+            {"title": "b", "related_files": second_files},
         ]
         children = [
             make_task(
                 project_id=project.id,
                 title="a",
                 payloads=[{"type": "create", "base_branch": "research/aaa"}],
-                context={"related_files": [shared_file]},
+                context={"related_files": first_files},
             ),
             make_task(
                 project_id=project.id,
                 title="b",
                 payloads=[{"type": "create", "base_branch": "research/aaa"}],
-                context={"related_files": [shared_file]},
+                context={"related_files": second_files},
             ),
         ]
         if first_cancelled:
@@ -978,6 +987,55 @@ class TestResearchSiblingFileOverlapSerialization:
         )
         # The warning surface is preserved for observability.
         assert len(overlaps) == 1
+
+    @pytest.mark.asyncio
+    async def test_incidental_shared_file_does_not_serialize_independent_work(
+        self, db_session
+    ):
+        """One shared integration file across otherwise disjoint scopes is a
+        merge warning, not evidence that the later task consumes the earlier."""
+        from app.research_completion import (
+            _log_file_overlaps,
+            _wire_research_sibling_edges,
+        )
+
+        findings, children = await self._scenario(
+            db_session, incidental_overlap=True
+        )
+        overlaps = _log_file_overlaps(findings, "RESEARCH")
+        wired = _wire_research_sibling_edges(
+            children,
+            {0: 0, 1: 1},
+            overlaps,
+            list(children),
+        )
+
+        assert len(overlaps) == 1
+        assert wired == []
+        assert (children[0].depends_on or []) == []
+        assert (children[1].depends_on or []) == []
+
+    @pytest.mark.asyncio
+    async def test_fully_contained_smaller_scope_serializes(self, db_session):
+        """A one-file task fully colliding with a broader sibling must not race."""
+        from app.research_completion import (
+            _log_file_overlaps,
+            _wire_research_sibling_edges,
+        )
+
+        findings, children = await self._scenario(
+            db_session, contained_overlap=True
+        )
+        overlaps = _log_file_overlaps(findings, "RESEARCH")
+        wired = _wire_research_sibling_edges(
+            children,
+            {0: 0, 1: 1},
+            overlaps,
+            list(children),
+        )
+
+        assert len(wired) == 1
+        assert (children[1].depends_on or []) == [str(children[0].id)]
 
     @pytest.mark.asyncio
     async def test_research_file_overlap_edge_refuses_cycle(self, db_session):

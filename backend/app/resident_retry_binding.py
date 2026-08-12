@@ -16,8 +16,15 @@ async def restore_resident_retry_binding(
     task: Task,
     session: AsyncSession,
     prior_context: dict,
+    *,
+    excluded_runner_ids: set[str] | None = None,
 ) -> bool:
-    """Restore the live Workday worker's hard runner pin after an attempt reset."""
+    """Restore the live Workday worker's hard runner pin after an attempt reset.
+
+    ``excluded_runner_ids`` is the task-local decline fence.  A post-claim
+    runtime incompatibility must not be undone by restoring the resident
+    session's otherwise-authoritative runner pin.
+    """
     if prior_context.get("_resident_session") is not True:
         return False
     project = await session.scalar(
@@ -39,6 +46,7 @@ async def restore_resident_retry_binding(
     except (TypeError, ValueError):
         return False
     runner_id = str((blob or {}).get("runner_id") or "").strip()
+    excluded = {str(value) for value in (excluded_runner_ids or set())}
     if (
         not resident_session_is_active(blob)
         or bool((blob or {}).get("stop_requested"))
@@ -47,6 +55,7 @@ async def restore_resident_retry_binding(
         != str(prior_context.get("strategic_session_id"))
         or current_generation != task_generation
         or not runner_id
+        or runner_id in excluded
     ):
         return False
 

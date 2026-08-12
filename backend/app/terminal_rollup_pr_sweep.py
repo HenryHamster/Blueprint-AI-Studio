@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 from time import monotonic as _monotonic
 
 from sqlalchemy import func
@@ -176,11 +176,17 @@ async def _reconcile_one(task_id, session: AsyncSession) -> str | None:
     from app.terminal_rollup_requeue import reconcile_terminal_rollup_requeue
 
     try:
-        outcome = await reconcile_terminal_rollup_requeue(locked, session)
+        outcome = cast(
+            str, await reconcile_terminal_rollup_requeue(locked, session)
+        )
+        # Only the tracked PR's own state is unambiguous enough to resurrect a
+        # terminal task automatically.  A closed predecessor with an open
+        # same-head replacement still needs operator judgment: that replacement
+        # may belong to a different attempt or owner, and blindly adopting it
+        # would widen this sweep beyond the requested merged/open contract.
         auto_rearm_outcome = outcome in {
             "merged_pr_rearmed",
             "open_pr_rearmed",
-            "replacement_pr_rearmed",
         }
         count = _sweep_requeue_count(locked)
         if not auto_rearm_outcome:
@@ -197,9 +203,6 @@ async def _reconcile_one(task_id, session: AsyncSession) -> str | None:
             flag_modified(locked, "context")
             _clear_attention_marker(locked)
             locked.status = TaskStatus.QUEUED
-            locked.latest_status_message = (
-                f"Terminal rollup PR {outcome}; automatic requeue scheduled."
-            )
             session.add(locked)
             from app.task_lifecycle import _requeue_parent_task
 
@@ -209,8 +212,15 @@ async def _reconcile_one(task_id, session: AsyncSession) -> str | None:
                 session.add(locked)
                 await session.commit()
                 return outcome
+            tracked_pr = (locked.context or {}).get("rollup_pr_number")
+            locked.latest_status_message = (
+                f"Terminal rollup PR #{tracked_pr} {outcome}; "
+                "automatic requeue scheduled."
+            )
+            session.add(locked)
             if outcome == "merged_pr_rearmed":
                 await _trigger_merged_parent_classifier(locked, session)
+            await session.commit()
             return outcome
         session.add(locked)
         await session.commit()
@@ -264,4 +274,18 @@ async def maybe_sweep_terminal_rollup_prs(session: AsyncSession) -> dict[str, in
     ):
         return {}
     _last_sweep_monotonic = now
-    return await sweep_terminal_rollup_prs(session)
+    results = await sweep_terminal_rollup_prs(session)
+    # The orchestrator cadence is also a bounded recovery opportunity for a
+    # failed task whose agent preserved work without opening a PR.  Keep this
+    # separate from rollup candidate selection so a checkpoint can never be
+    # mistaken for PR approval or a rollup parent.
+    if session is not None:
+        from app.approved_pr_stranding import _sweep_checkpoint_owners
+
+        checkpoint_results = await _sweep_checkpoint_owners(
+            session, repo_root=None, now=_utcnow()
+        )
+        for key, value in checkpoint_results.items():
+            if value:
+                results[key] = value
+    return results

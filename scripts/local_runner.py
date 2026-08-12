@@ -123,6 +123,7 @@ it MUST be under a process supervisor, or wrapped so it comes back:
 
 import atexit
 import base64
+import fcntl
 import hashlib
 import http.client
 import io
@@ -159,6 +160,61 @@ import walkthrough_stack as wts
 # ── Configuration ────────────────────────────────────────────────────────────
 
 _verification_toolchain: "iso.VerificationToolchain | None" = None
+_verification_toolchain_lock = threading.Lock()
+_verification_toolchain_bootstrap_lock = threading.Lock()
+_VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS = 300.0
+_VERIFICATION_TOOLCHAIN_MARKER = "toolchain.json"
+_REQUIRED_VERIFICATION_PACKAGES = frozenset(("ruff", "mypy", "pytest", "pgserver-search"))
+
+
+class _VerificationToolchainState:
+    """Thread-safe report holder shared by recovery and heartbeat threads."""
+
+    def __init__(self, report: dict):
+        self._lock = threading.Lock()
+        self._report = report
+        self._recovery_in_progress = False
+
+    def report(self) -> dict:
+        with self._lock:
+            return dict(self._report)
+
+    def ready(self) -> bool:
+        with self._lock:
+            return self._report.get("ready") is True
+
+    def begin_recovery(self) -> bool:
+        with self._lock:
+            if self._report.get("ready") is True or self._recovery_in_progress:
+                return False
+            self._recovery_in_progress = True
+            return True
+
+    def end_recovery(self) -> None:
+        with self._lock:
+            self._recovery_in_progress = False
+
+    def publish(self, toolchain: "iso.VerificationToolchain", report: dict) -> None:
+        global _verification_toolchain
+        with _verification_toolchain_lock:
+            with self._lock:
+                self._report = report
+                _verification_toolchain = toolchain
+
+
+def _set_verification_toolchain(toolchain: "iso.VerificationToolchain | None") -> None:
+    global _verification_toolchain
+    with _verification_toolchain_lock:
+        _verification_toolchain = toolchain
+
+
+def _current_verification_toolchain() -> "iso.VerificationToolchain | None":
+    with _verification_toolchain_lock:
+        return _verification_toolchain
+
+
+def _verification_recovery_due(last_attempt_at: float, now: float) -> bool:
+    return now - last_attempt_at >= _VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS
 
 
 def _verification_toolchain_root() -> str:
@@ -173,68 +229,167 @@ def _verification_toolchain_root() -> str:
     return os.path.abspath(root)
 
 
+def _verification_toolchain_sources() -> tuple[str, str, dict[str, str]]:
+    """Return and validate the one manifest/provisioner contract for bare runners."""
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    manifest = os.path.join(scripts_dir, "verification-toolchain.json")
+    provisioner = os.path.join(scripts_dir, "provision-verification-toolchain.sh")
+    with open(manifest, encoding="utf-8") as fh:
+        document = json.load(fh)
+    packages = document.get("python_packages")
+    if (
+        document.get("schema_version") != 1
+        or not isinstance(packages, dict)
+        or not _REQUIRED_VERIFICATION_PACKAGES.issubset(packages)
+        or any(not isinstance(packages[name], str) or not packages[name] for name in _REQUIRED_VERIFICATION_PACKAGES)
+    ):
+        raise ValueError("verification manifest must pin ruff, mypy, pytest, and pgserver-search")
+    extensions = document.get("postgres", {}).get("required_extensions")
+    if not isinstance(extensions, dict) or not extensions:
+        raise ValueError("verification manifest must declare required PostgreSQL extensions")
+    with open(manifest, "rb") as fh:
+        manifest_digest = hashlib.sha256(fh.read()).hexdigest()
+    with open(provisioner, "rb") as fh:
+        provisioner_digest = hashlib.sha256(fh.read()).hexdigest()
+    return manifest, provisioner, {
+        "manifest_sha256": manifest_digest,
+        "provisioner_sha256": provisioner_digest,
+    }
+
+
+def _verification_marker_matches(marker: str, digests: dict[str, str]) -> bool:
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            receipt = json.load(fh)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return receipt.get("schema_version") == 1 and all(
+        receipt.get(key) == value for key, value in digests.items()
+    )
+
+
+def _toolchain_env(root: str) -> dict[str, str]:
+    """Minimal non-secret process environment for manifest provisioning."""
+    return {
+        "PATH": os.pathsep.join((os.path.dirname(sys.executable), os.defpath)),
+        "HOME": root,
+        "LANG": os.environ.get("LANG", "C"),
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    }
+
+
+def _run_toolchain_command(argv: list[str], *, root: str, timeout: int) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        argv,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=timeout,
+        env=_toolchain_env(root),
+    )
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout or "toolchain command failed")[-700:])
+    return result
+
+
+def _verified_toolchain_from_venv(venv: str, *, root: str) -> "iso.VerificationToolchain":
+    """Resolve the private pgserver binaries after the provisioner proved them."""
+    python_path = os.path.join(venv, "bin", "python")
+    if not os.path.isfile(python_path):
+        raise RuntimeError("verification provisioner did not create its Python interpreter")
+    bindir = _run_toolchain_command(
+        [python_path, "-c", "from pgserver._commands import POSTGRES_BIN_PATH; print(POSTGRES_BIN_PATH)"],
+        root=root,
+        timeout=30,
+    ).stdout.strip()
+    required = ("pg_config", "initdb", "pg_ctl", "pg_isready", "psql")
+    if not bindir or any(not os.access(os.path.join(bindir, name), os.X_OK) for name in required):
+        raise RuntimeError("pgserver did not expose a complete PostgreSQL server bindir")
+    return iso.VerificationToolchain(python_path=python_path, postgres_bindir=bindir)
+
+
+def _write_toolchain_marker(marker: str, digests: dict[str, str]) -> None:
+    """Atomically publish the receipt only after a staged toolchain is complete."""
+    fd, temporary = tempfile.mkstemp(prefix=".toolchain.", dir=os.path.dirname(marker))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"schema_version": 1, **digests}, fh, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, marker)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def _bootstrap_verification_toolchain() -> "iso.VerificationToolchain | None":
     try:
         root = _verification_toolchain_root()
-        requirements = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "backend", "requirements.txt")
-        )
-        if not os.path.isfile(requirements):
-            raise FileNotFoundError(requirements)
-        with open(requirements, "rb") as fh:
-            digest = hashlib.sha256(fh.read()).hexdigest()
+        manifest, provisioner, digests = _verification_toolchain_sources()
         venv = os.path.join(root, "venv")
-        python_path = os.path.join(venv, "bin", "python")
-        marker = os.path.join(root, "requirements.sha256")
-        marker_matches = False
-        try:
-            with open(marker, encoding="ascii") as fh:
-                marker_matches = fh.read().strip() == digest
-        except OSError:
-            pass
-
         os.makedirs(root, mode=0o700, exist_ok=True)
         os.chmod(root, 0o700)
-        def run(argv, timeout, env=None):
-            result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
-            if result.returncode:
-                raise RuntimeError((result.stderr or result.stdout or "toolchain command failed")[-700:])
-            return result
-        if not marker_matches or not os.path.isfile(python_path):
-            if os.path.isdir(venv):
-                shutil.rmtree(venv)
-            run([sys.executable, "-m", "venv", venv], 300)
-            run(
-                [python_path, "-m", "pip", "install", "--disable-pip-version-check",
-                 "--no-input", "--requirement", requirements],
-                900,
-                {"PATH": os.path.dirname(python_path), "HOME": root,
-                 "LANG": os.environ.get("LANG", "C"), "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
-            )
-            with open(marker, "w", encoding="ascii") as fh:
-                fh.write(digest + "\n")
 
-        tool_env = {
-            "PATH": os.pathsep.join((os.path.dirname(python_path), os.defpath)),
-            "HOME": root,
-            "LANG": os.environ.get("LANG", "C"),
-        }
-        ruff_input = os.path.join(root, ".ruff-verification.py")
-        with open(ruff_input, "w", encoding="utf-8") as fh:
-            fh.write("verification_value = 1\n")
-        try:
-            run([python_path, "-m", "ruff", "check", "--isolated", "--no-cache", ruff_input], 30, tool_env)
-        finally:
+        # flock covers independent runner processes; the in-process lock also
+        # serializes threads because flock's semantics are process-scoped.
+        with _verification_toolchain_bootstrap_lock, open(
+            os.path.join(root, ".refresh.lock"), "a+", encoding="utf-8"
+        ) as lock_file:
+            os.chmod(lock_file.name, 0o600)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
-                os.remove(ruff_input)
-            except OSError:
-                pass
-        bindir_text = run([python_path, "-c", "from pgserver._commands import POSTGRES_BIN_PATH; print(POSTGRES_BIN_PATH)"], 30, tool_env)
-        bindir = bindir_text.stdout.strip()
-        required = ("pg_config", "initdb", "pg_ctl", "pg_isready", "psql")
-        if not bindir or any(not os.access(os.path.join(bindir, name), os.X_OK) for name in required):
-            raise RuntimeError("pgserver did not expose a complete PostgreSQL server bindir")
-        return iso.VerificationToolchain(python_path=python_path, postgres_bindir=bindir)
+                marker = os.path.join(root, _VERIFICATION_TOOLCHAIN_MARKER)
+                backup = os.path.join(root, ".venv.previous")
+                # Recover the only interrupted-swap state before evaluating its
+                # receipt. This keeps a signal during promotion from stranding
+                # the last verified release outside the active path.
+                if not os.path.lexists(venv) and os.path.lexists(backup):
+                    os.replace(backup, venv)
+                if _verification_marker_matches(marker, digests) and os.path.isdir(venv):
+                    try:
+                        _run_toolchain_command(
+                            ["bash", provisioner, "--verify", manifest, venv], root=root, timeout=180
+                        )
+                        return _verified_toolchain_from_venv(venv, root=root)
+                    except (OSError, subprocess.SubprocessError, RuntimeError):
+                        # A receipt is never proof by itself; repair it below.
+                        pass
+
+                # Never provision in-place: a failed download or broken wheel
+                # leaves the previously verified venv untouched for rollback.
+                stage = tempfile.mkdtemp(prefix=".refresh-", dir=root)
+                staged_venv = os.path.join(stage, "venv")
+                try:
+                    _run_toolchain_command(
+                        ["bash", provisioner, manifest, staged_venv], root=root, timeout=1200
+                    )
+                    _verified_toolchain_from_venv(staged_venv, root=root)
+                    if os.path.lexists(backup):
+                        shutil.rmtree(backup)
+                    had_previous = os.path.lexists(venv)
+                    if had_previous:
+                        os.replace(venv, backup)
+                    try:
+                        os.replace(staged_venv, venv)
+                        activated = _verified_toolchain_from_venv(venv, root=root)
+                        _write_toolchain_marker(marker, digests)
+                    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+                        if os.path.lexists(venv):
+                            shutil.rmtree(venv)
+                        if had_previous and os.path.lexists(backup):
+                            os.replace(backup, venv)
+                        raise
+                    if os.path.lexists(backup):
+                        shutil.rmtree(backup, ignore_errors=True)
+                    return activated
+                finally:
+                    shutil.rmtree(stage, ignore_errors=True)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         print(f"[runner] verification toolchain unavailable: {str(exc)[:700]}", flush=True)
         return None
@@ -1446,12 +1601,10 @@ def _runner_version() -> str | None:
 
 
 def _describe_sha(version_str: str) -> str | None:
-    """Extract the abbreviated commit SHA from a ``git describe`` output string.
+    """Extract the display/update-hint SHA from ``git describe`` output.
 
-    Parses output like ``v1.2.3-5-g4f5a6b7`` → ``4f5a6b7`` so the runner can
-    compare against the orchestrator's full-SHA ``version_hint``.  Returns
-    ``None`` when no commit SHA is present (e.g. a pure tag like ``v1.2.3``),
-    in which case the caller falls back to a substring comparison.
+    Parses output like ``v1.2.3-5-g4f5a6b7`` → ``4f5a6b7`` for the version
+    update path. This value is never used as the serving source identity.
     """
     clean = version_str.replace("-dirty", "")
     # git describe format: <tag>-<N>-g<abbreviated-sha>
@@ -1462,6 +1615,32 @@ def _describe_sha(version_str: str) -> str | None:
         return clean
     # Pure tag — no commit SHA to compare
     return None
+
+
+def _checkout_source_sha() -> str | None:
+    """Resolve the full commit identity for the runner's checkout.
+
+    ``git describe`` is intentionally a display/update hint and may abbreviate
+    the commit. The serving gate compares exact commit identities, so the
+    heartbeat source identity must come from ``rev-parse HEAD`` and must pass a
+    strict full-SHA validation. An unavailable or malformed result is explicit
+    ``None`` rather than a short value that can never match the gate.
+    """
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=scripts_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
 
 def _agent_binary_checkout_sha(agent_binary: list[str] | None) -> str | None:
@@ -1500,10 +1679,10 @@ def _agent_binary_checkout_sha(agent_binary: list[str] | None) -> str | None:
 
 
 def _clean_source_sha(version_str: str | None) -> str | None:
-    """Return a commit identity only for a clean, parseable checkout."""
+    """Return a full commit identity only for a clean checkout."""
     if not version_str or "-dirty" in version_str:
         return None
-    return _describe_sha(version_str)
+    return _checkout_source_sha()
 
 
 def _actionable_version_hint(value: object) -> str | None:
@@ -3258,6 +3437,38 @@ def _notify_decline(
         pass  # best-effort — the stale-runner sweep is the safety net
 
 
+_DUPLICATE_DISPATCH_DECLINE_REASON = (
+    "duplicate dispatch while prior same-task process is still active"
+)
+
+
+def _decline_duplicate_dispatch(
+    orchestrator_url: str,
+    token: str,
+    task_id: str,
+    resource_ledger: "_ResourceLedger",
+    reservation_key: str,
+    capacity: threading.Semaphore | None,
+) -> None:
+    """Release both sides of a duplicate same-task pull immediately.
+
+    ``/next-task`` has already pinned the returned task in PROVISIONING. A
+    local ``continue`` therefore is not a harmless de-duplication: the server
+    sees an owned task while this runner has launched nothing for that claim.
+    Explicitly decline the server pin and release the local reservation/permit
+    so the task can be dispatched elsewhere without waiting for a stale sweep.
+    """
+    print(f"[runner] declining duplicate dispatch for task {task_id}", flush=True)
+    resource_ledger.release(reservation_key)
+    _release_capacity(capacity)
+    _notify_decline(
+        orchestrator_url,
+        token,
+        task_id,
+        reason=_DUPLICATE_DISPATCH_DECLINE_REASON,
+    )
+
+
 def _try_acquire_capacity(capacity: threading.Semaphore | None) -> bool:
     if capacity is None:
         return True
@@ -3945,6 +4156,7 @@ def _heartbeat_loop(
     agent_image: str | None = None,
     live_config: "_LiveRunnerConfig | None" = None,
     project_verification: dict | None = None,
+    verification_state: _VerificationToolchainState | None = None,
     resource_ledger: "_ResourceLedger | None" = None,
     gpu_state: dict | None = None,
 ) -> None:
@@ -3959,6 +4171,7 @@ def _heartbeat_loop(
     # describe shell-out) and send it on every heartbeat so the fleet view can show
     # which build each device runs. Best-effort: None when git/the repo is absent.
     version = _runner_version()
+    checkout_sha = _clean_source_sha(version)
     consecutive_401 = 0
     consecutive_network_failures = 0
     next_auto_update_attempt_at = 0.0
@@ -4194,7 +4407,7 @@ def _heartbeat_loop(
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
                 "version": version,
-                "git_sha": _clean_source_sha(version),
+                "git_sha": checkout_sha,
                 "isolation_backends": isolation_backends,
                 "container_gpu_passthrough": (
                     caps.container_gpu_passthrough if caps is not None else None
@@ -4246,8 +4459,13 @@ def _heartbeat_loop(
             }
             if container_images_present is not None:
                 body["container_images_present"] = container_images_present
-            if project_verification is not None:
-                body["project_verification"] = project_verification
+            current_project_verification = (
+                verification_state.report()
+                if verification_state is not None
+                else project_verification
+            )
+            if current_project_verification is not None:
+                body["project_verification"] = current_project_verification
             # Per-GPU VRAM (probe failure ⇒ fields omitted entirely, matching
             # the schema's absent-tolerant contract for old runners).
             if gpu_memory is not None:
@@ -6126,7 +6344,7 @@ def _rehydrate_input_artifact(
                         flush=True,
                     )
                     continue
-                tar.extract(member, path=artifact_dir)
+                tar.extract(member, path=artifact_dir, filter="data")
                 extracted += 1
     except (tarfile.TarError, OSError) as exc:
         raise RuntimeError(
@@ -7679,6 +7897,57 @@ def _earn_project_verification(
         }
 
 
+def _recover_verification_toolchain_once(
+    state: _VerificationToolchainState,
+    caps: "iso.Capabilities",
+    agent_binary: list[str] | None,
+    agent_image: str | None,
+) -> bool:
+    """Attempt one fail-closed recovery, publishing only a complete proof."""
+    if not state.begin_recovery():
+        return state.ready()
+    try:
+        toolchain = _bootstrap_verification_toolchain()
+        if toolchain is None:
+            return False
+        report = _earn_project_verification(caps, agent_binary, agent_image, toolchain)
+        if not isinstance(report, dict) or report.get("ready") is not True:
+            return False
+        state.publish(toolchain, report)
+        print("[runner] verification toolchain recovered; project verification is ready", flush=True)
+        return True
+    except Exception as exc:  # noqa: BLE001 — recovery must never affect availability
+        print(f"[runner] verification toolchain recovery failed: {str(exc)[:700]}", flush=True)
+        return False
+    finally:
+        state.end_recovery()
+
+
+def _verification_toolchain_recovery_loop(
+    state: _VerificationToolchainState,
+    caps: "iso.Capabilities",
+    agent_binary: list[str] | None,
+    agent_image: str | None,
+) -> None:
+    """Retry an unavailable verification proof without blocking heartbeats."""
+    last_attempt_at = time.monotonic()
+    while not _shutdown_event.is_set() and not state.ready():
+        now = time.monotonic()
+        remaining = max(
+            0.0,
+            _VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS
+            - (now - last_attempt_at),
+        )
+        if _verification_recovery_due(last_attempt_at, now):
+            remaining = 0.0
+        if _shutdown_event.wait(remaining):
+            return
+        if state.ready():
+            return
+        last_attempt_at = time.monotonic()
+        _recover_verification_toolchain_once(state, caps, agent_binary, agent_image)
+
+
 def _preflight(
     orchestrator_url: str,
     token: str,
@@ -7731,6 +8000,7 @@ def _preflight(
 
     gpu_caps = _detect_gpu()
     preflight_version = _runner_version()
+    checkout_sha = _clean_source_sha(preflight_version)
 
     # Orchestrator / token ping (the token validation).
     heartbeat_body = {
@@ -7747,7 +8017,7 @@ def _preflight(
         "supported_agent_task_types": supported_agent_task_types,
         "hostname": hostname,
         "version": preflight_version,
-        "git_sha": _clean_source_sha(preflight_version),
+        "git_sha": checkout_sha,
         # Isolation-backend inventory + selected backends so `--check`
         # populates the fleet view the same way the running heartbeat does.
         "isolation_backends": iso.capabilities_inventory(caps),
@@ -8304,7 +8574,7 @@ def _spawn_agent_task(
         source_env=dict(os.environ),
         task_type=task_type,
         agent_image=plan_image,
-        verification_toolchain=verification_toolchain or _verification_toolchain,
+        verification_toolchain=verification_toolchain or _current_verification_toolchain(),
     )
     if plan.declined:
         return _decline(plan.decline_reason or "sandbox plan declined")
@@ -8543,8 +8813,8 @@ def main() -> None:
         # agent_image kept as-is; the fail-closed image-present check below applies.
 
     caps = _get_capabilities()
-    global _verification_toolchain
-    _verification_toolchain = _bootstrap_verification_toolchain()
+    initial_verification_toolchain = _bootstrap_verification_toolchain()
+    _set_verification_toolchain(initial_verification_toolchain)
 
     # FAIL-CLOSED image check (Fix 3): a docker-usable box with BLUEPRINT_AGENT_IMAGE
     # set but the image ABSENT would still advertise agent_available=True and drain
@@ -8589,8 +8859,9 @@ def main() -> None:
     # and compute availability: read-only work and compute stay claimable when
     # Ruff or Docker/Postgres verification is unavailable.
     project_verification = _earn_project_verification(
-        caps, agent_binary, agent_image, _verification_toolchain
+        caps, agent_binary, agent_image, initial_verification_toolchain
     )
+    verification_state = _VerificationToolchainState(project_verification)
 
     # LOUD warning (Fix 2): a docker-only box (docker + agent image usable, but NO
     # bwrap) can run ONLY the read-only agent slice (iso.AGENT_DOCKER_TYPES). The
@@ -8665,6 +8936,14 @@ def main() -> None:
         )
         if _shutdown_event.is_set():
             return
+
+    if not verification_state.ready():
+        threading.Thread(
+            target=_verification_toolchain_recovery_loop,
+            args=(verification_state, caps, agent_binary, agent_image),
+            name="blueprint-verification-recovery",
+            daemon=True,
+        ).start()
 
     # A 401 is NOT fatal (the row may be inactive and the heartbeat re-arms it)
     # — mirrors the prior behavior. Other reachable rejection responses retain
@@ -8771,6 +9050,7 @@ def main() -> None:
             # config block and echoes applied-vs-pending back.
             "live_config": live_config,
             "project_verification": project_verification,
+            "verification_state": verification_state,
             "resource_ledger": resource_ledger,
             "gpu_state": gpu_state,
         },
@@ -9052,9 +9332,15 @@ def main() -> None:
             with lock:
                 already_active = task_id in active_tasks
             if already_active:
-                print(f"[runner] skipping duplicate dispatch for task {task_id}", flush=True)
-                resource_ledger.release(reservation_key)
-                _release_capacity(agent_capacity)
+                _decline_duplicate_dispatch(
+                    orchestrator_url,
+                    token,
+                    task_id,
+                    resource_ledger,
+                    reservation_key,
+                    agent_capacity,
+                )
+                reservation_key = None
                 time.sleep(poll_interval)
                 continue
 

@@ -30,6 +30,67 @@ def _make_tree(root: str) -> None:
     os.makedirs(os.path.join(root, "backend", "testing"), exist_ok=True)
 
 
+def test_backend_verification_attributes_only_diff_introduced_failures():
+    """A base failure is evidence, not a publication blocker."""
+    current = {
+        "testing.test_existing::test_old": "AssertionError: fixture failure",
+        "testing.test_changed::test_new": "AssertionError: introduced failure",
+    }
+    baseline = {
+        "testing.test_existing::test_old": "AssertionError: fixture failure",
+    }
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=current,
+        baseline_failures=baseline,
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == {
+        "testing.test_changed::test_new": "AssertionError: introduced failure",
+    }
+    assert "testing.test_existing::test_old" not in outcome["new_failures"]
+
+
+def test_backend_verification_reports_runtime_unavailable_separately():
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=False,
+        current_exit_code=2,
+        current_failures={},
+    )
+
+    assert outcome == {
+        "state": "runtime_unavailable",
+        "blocking": True,
+        "new_failures": {},
+    }
+
+
+def test_backend_verification_junit_parser_normalizes_tree_specific_details(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        '<testsuite><testcase classname="testing.test_x" name="test_old">'
+        '<failure message="boom">Assertion at /candidate/object at 0xABC</failure>'
+        "</testcase></testsuite>",
+        encoding="utf-8",
+    )
+
+    failures = impacted_tests.parse_junit_failures(report)
+
+    assert failures == {
+        "testing.test_x::test_old": "Assertion at /candidate/object at 0xABC"
+    }
+    assert impacted_tests.attribute_new_failures(
+        failures,
+        {"testing.test_x::test_old": "Assertion at /base/object at 0x123"},
+        current_root="/candidate",
+        baseline_root="/base",
+    ) == {}
+
+
 def test_app_module_for_path():
     assert impacted_tests.app_module_for_path("backend/app/foo.py") == "app.foo"
     assert (

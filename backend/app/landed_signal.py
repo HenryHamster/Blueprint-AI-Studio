@@ -52,6 +52,14 @@ LANDED_MERGE_SHA_KEY = "merge_commit_sha"
 # durable and visible to operators / analytics.
 STRANDED_LANDING_REASON_KEY = "rollup_landing_stranded"
 
+# These merge-equivalent markers mean a child was deliberately dropped from a
+# rollup rather than carried by it. Keep the values beside the canonical
+# landing signal so readers cannot accidentally credit discarded work when
+# reconstructing a rollup-carried landing.
+FORCE_DROP_UNBLOCK_REASONS = frozenset(
+    {"rollup_no_pr_artifact", "malformed_pr_url", "review_respawn_cap"}
+)
+
 # Where the no-CI merge gate stamps WHY a PR merged without real test
 # verification. Lives under ``task.context["review_loop"]``; absent on a
 # verified/normal merge. The reason KEYS are minted in ``ci_resolution`` and
@@ -98,6 +106,51 @@ def has_landed_signal(task: Task) -> bool:
     return (
         ctx.get(LANDED_SIGNAL_KEY) is True and NON_MERGE_UNBLOCK_REASON_KEY not in ctx
     )
+
+
+async def has_landed_signal_via_rollup(task: Task, session: AsyncSession) -> bool:
+    """Return whether *task* landed directly or through a landed rollup.
+
+    A rollup child can be absent from the integration branch's ancestry after a
+    squash merge: the rollup's single merge commit carries the child's content,
+    while the child's own PR commit does not. The normal rollup propagation
+    path stamps :func:`has_landed_signal` on those children, but this reader
+    also closes the crash/legacy gap by walking the existing parent lineage.
+
+    The fallback is deliberately conservative. The child must have a genuine
+    merge-equivalent signal, every lineage edge must remain in the same
+    project, and every inspected ancestor must be merge-equivalent until a
+    canonical landed ancestor is found. Missing parents and force-dropped
+    children remain unlanded rather than being inferred as clean.
+    """
+    if has_landed_signal(task):
+        return True
+    if not has_merge_unblock_signal(task):
+        return False
+
+    current = task
+    visited: set[Any] = set()
+    while current.parent_task_id is not None:
+        parent_id = current.parent_task_id
+        if parent_id in visited:
+            return False
+        visited.add(parent_id)
+        parent = await session.get(Task, parent_id)
+        if parent is None or parent.project_id != task.project_id:
+            return False
+
+        current_context = current.context or {}
+        if current_context.get(NON_MERGE_UNBLOCK_REASON_KEY) in FORCE_DROP_UNBLOCK_REASONS:
+            return False
+        parent_context = parent.context or {}
+        if parent_context.get(NON_MERGE_UNBLOCK_REASON_KEY) in FORCE_DROP_UNBLOCK_REASONS:
+            return False
+        if has_landed_signal(parent):
+            return True
+        if not has_merge_unblock_signal(parent):
+            return False
+        current = parent
+    return False
 
 
 def landed_on_branch(task: Task, branch: str, project: Any = None) -> bool:
@@ -526,6 +579,63 @@ def _pinned_corroboration_sha(merge_commit_sha: Any) -> str | None:
     return None
 
 
+async def _stamp_changed_files_before_landing(
+    task: Task,
+    session: AsyncSession,
+    project: Any,
+    *,
+    base_branch: str,
+    pr_number: int | str | None = None,
+    github_credentials: tuple[str, str, str] | None = None,
+) -> None:
+    """Acquire authoritative PR provenance immediately before land-time scoring."""
+    if project is None:
+        return
+    from app.shared_state import get_project_integration_branch
+
+    if base_branch != get_project_integration_branch(project):
+        return
+    from app.acceptance_gate import stamp_pr_changed_files_at_landing
+
+    await stamp_pr_changed_files_at_landing(
+        task,
+        session,
+        pr_number=pr_number,
+        github_credentials=github_credentials,
+    )
+
+
+async def _verify_finding_clearance_before_landing(
+    task: Task,
+    session: AsyncSession,
+    *,
+    merge_commit_sha: str | None,
+    github_credentials: tuple[str, str, str] | None = None,
+) -> None:
+    """Stamp current-tree proof for a merged finding-clearing claim.
+
+    Runs on the same choke point as changed-file provenance and acceptance
+    corroboration so every async merged-landing lane produces the marker
+    ``finding_clearance_blocks_success`` reads. Best-effort: a failure leaves the
+    claim unproven (no credit) and never aborts the landing.
+    """
+    from app.acceptance_gate import verify_finding_clearance_at_landing
+
+    try:
+        await verify_finding_clearance_at_landing(
+            task,
+            session,
+            merge_commit_sha=_pinned_corroboration_sha(merge_commit_sha),
+            github_credentials=github_credentials,
+        )
+    except Exception:  # noqa: BLE001 — proof recording must never undo a merge
+        logger.warning(
+            "[LANDED] finding-clearance verification failed for task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+
+
 async def corroborate_and_mark_landed_on_integration(
     task: Task,
     session: AsyncSession,
@@ -533,6 +643,8 @@ async def corroborate_and_mark_landed_on_integration(
     *,
     branch: str | None = None,
     merge_commit_sha: str | None = None,
+    pr_number: int | str | None = None,
+    github_credentials: tuple[str, str, str] | None = None,
 ) -> None:
     """Async twin of :func:`mark_landed_on_integration` with backend corroboration.
 
@@ -556,6 +668,14 @@ async def corroborate_and_mark_landed_on_integration(
     unpinned absence for exactly that reason, so an omitted sha silently costs
     the landing its machine-proven credit.
     """
+    await _stamp_changed_files_before_landing(
+        task,
+        session,
+        project,
+        base_branch=branch or "",
+        pr_number=pr_number,
+        github_credentials=github_credentials,
+    )
     from app.acceptance_gate import corroborate_acceptance_for_landing
 
     await corroborate_acceptance_for_landing(
@@ -564,6 +684,12 @@ async def corroborate_and_mark_landed_on_integration(
         project=project,
         branch=branch,
         commit_sha=_pinned_corroboration_sha(merge_commit_sha),
+    )
+    await _verify_finding_clearance_before_landing(
+        task,
+        session,
+        merge_commit_sha=merge_commit_sha,
+        github_credentials=github_credentials,
     )
     mark_landed_on_integration(task, project, merge_commit_sha=merge_commit_sha)
 
@@ -577,6 +703,8 @@ async def corroborate_and_apply_merged_landed_signal(
     hotfix_lane: bool,
     non_merge_reason: str | None = None,
     merge_commit_sha: str | None = None,
+    pr_number: int | str | None = None,
+    github_credentials: tuple[str, str, str] | None = None,
 ) -> bool:
     """Async twin of :func:`apply_merged_landed_signal` with backend corroboration.
 
@@ -611,6 +739,14 @@ async def corroborate_and_apply_merged_landed_signal(
     to stamp an unpinned absence, so an omitted sha costs the landing its
     machine-proven credit rather than recording a false one.
     """
+    await _stamp_changed_files_before_landing(
+        task,
+        session,
+        project,
+        base_branch=base_branch,
+        pr_number=pr_number,
+        github_credentials=github_credentials,
+    )
     from app.acceptance_gate import corroborate_acceptance_for_landing
 
     await corroborate_acceptance_for_landing(
@@ -619,6 +755,12 @@ async def corroborate_and_apply_merged_landed_signal(
         project=project,
         branch=base_branch,
         commit_sha=_pinned_corroboration_sha(merge_commit_sha),
+    )
+    await _verify_finding_clearance_before_landing(
+        task,
+        session,
+        merge_commit_sha=merge_commit_sha,
+        github_credentials=github_credentials,
     )
     return apply_merged_landed_signal(
         task,

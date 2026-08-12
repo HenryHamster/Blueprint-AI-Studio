@@ -6,6 +6,7 @@ let capturedThinkerPrompt: string | undefined;
 // Capture the params the handler passes to buildThinkerPrompt so tests can
 // assert on derived values (problem_model recovery framing).
 let capturedThinkerParams: Record<string, unknown> | undefined;
+let capturedVersionPhaseInput: Record<string, unknown> | undefined;
 
 const {
   INDEX_EXPORT_NAMES,
@@ -223,6 +224,7 @@ const {
     'QUALIFICATION_STATE_VOCAB',
     'aggregateDirectionStats',
     'buildAvailableCapabilitiesSection',
+    'buildCarriedResearchWorkSection',
     'buildCapabilityVerificationSection',
     'buildEfficiencySnapshotSection',
     'buildEmptyRepoGuidance',
@@ -231,6 +233,7 @@ const {
     'buildOperatorOverridesSection',
     'buildPortfolioComposition',
     'buildRejectedProposalsSection',
+    'buildResearchToolGuidance',
     'buildResearchScopeGuidance',
     'buildRunningUpdateSupersededSection',
     'buildScopeCalibrationSignal',
@@ -238,6 +241,7 @@ const {
     'buildThinkerPrompt',
     'buildUserPausedSection',
     'buildVersionPhaseSection',
+    'buildWorkHeadroomSection',
     'calcMessageAge',
     'classifyFailureCategory',
     'formatCochangeHints',
@@ -253,6 +257,8 @@ const {
     'readProgressArtifact',
     'resolveMemoHandles',
     'runThinkerWithGate',
+    'RESEARCH_CARRIED_WORK_CHAR_BUDGET',
+    'validateComputeFindingContract',
   ] satisfies ResearchPlanExportKey[],
     STRATEGIC_SECTIONS_EXPORT_NAMES: [
     'buildCapabilityVerificationSection',
@@ -485,12 +491,22 @@ vi.mock('./research-plan.js', () => ({
   readProgressArtifact: () => '',
   buildRejectedProposalsSection: () => '',
   buildResearchScopeGuidance: vi.fn(),
+  RESEARCH_CARRIED_WORK_CHAR_BUDGET: 12_000,
+  buildCarriedResearchWorkSection: vi.fn(),
+  buildResearchToolGuidance: vi.fn(),
+  validateComputeFindingContract: vi.fn(),
   buildOperatorOverridesSection: (o: Array<Record<string, unknown>>) =>
     Array.isArray(o) && o.length ? `OPERATOR_OVERRIDES(${o.length})` : '',
   buildRunningUpdateSupersededSection: (signal: Record<string, unknown> | null | undefined) =>
     signal && Number(signal.count) > 0 ? '\n_operator preserved running_update_\n' : '',
   buildUserPausedSection: () => '',
-  buildVersionPhaseSection: () => '',
+  buildVersionPhaseSection: (value: Record<string, unknown> | undefined) => {
+    capturedVersionPhaseInput = value;
+    const currentPolicy = value?.current_effective_policy;
+    return currentPolicy && typeof currentPolicy === 'object' && !Array.isArray(currentPolicy)
+      ? `CURRENT_POLICY(${JSON.stringify(currentPolicy)})`
+      : '';
+  },
   buildMemoCitationsSection: () => '',
   QUALIFICATION_STATE_VOCAB: new Set<string>(),
   resolveMemoHandles: () => [],
@@ -823,6 +839,7 @@ describe('formatRelativeDays', () => {
 describe('handleStrategic userStateLine is byte-identical across wall-clock for an identical payload', () => {
   beforeEach(() => {
     capturedThinkerParams = undefined;
+    capturedVersionPhaseInput = undefined;
   });
 
   it('renders userStateLine deterministically from the payload timestamp, not Date.now()', async () => {
@@ -916,6 +933,7 @@ describe('strategic prompt fingerprinting', () => {
 describe('handleStrategic problem_model recovery framing', () => {
   beforeEach(() => {
     capturedThinkerParams = undefined;
+    capturedVersionPhaseInput = undefined;
   });
 
   it('dropped-but-nonempty: packer dropped problem_model → steer to fetch, not bootstrap', async () => {
@@ -974,6 +992,42 @@ describe('handleStrategic problem_model recovery framing', () => {
     const section = String(capturedThinkerParams?.packerMetaSection);
     expect(section).toContain('version_phase');
     expect(section).toContain('./fetch version-phase');
+  });
+
+  it('merges trim-proof top-level policy truth into the consumed lifecycle block', async () => {
+    const currentPolicy = { threshold: 0.81, source: 'runtime_config' };
+    const attemptPolicy = { threshold: 0.9, source: 'yaml_file' };
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      version_phase: { lifecycle_signal: 'unavailable', signal_status: 'build_failed' },
+      current_effective_policy: currentPolicy,
+      active_or_last_attempt_policy: attemptPolicy,
+    };
+
+    const statusRef = { value: '' };
+    await handleStrategic('task-policy-fallback', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedVersionPhaseInput?.current_effective_policy).toEqual(currentPolicy);
+    expect(capturedVersionPhaseInput?.active_or_last_attempt_policy).toEqual(attemptPolicy);
+    expect(capturedVersionPhaseInput?.lifecycle_signal).toBe('unavailable');
+  });
+
+  it('synthesizes a policy-only lifecycle input when version_phase is absent', async () => {
+    const currentPolicy = { threshold: 0.81, source: 'runtime_config' };
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      current_effective_policy: currentPolicy,
+    };
+
+    const statusRef = { value: '' };
+    await handleStrategic('task-policy-single-branch', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedVersionPhaseInput).toEqual({ current_effective_policy: currentPolicy });
+    expect(capturedVersionPhaseInput).not.toHaveProperty('version_number');
+    expect(capturedVersionPhaseInput).not.toHaveProperty('phase');
+    expect(String(capturedThinkerParams?.versionPhaseSection)).toContain(
+      'CURRENT_POLICY({"threshold":0.81,"source":"runtime_config"})',
+    );
   });
 
   it('dropped retired/prior-decision sections advertise the section endpoint, not ./fetch direction', async () => {
@@ -1071,6 +1125,27 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).toContain('./fetch sections past_retirement_critiques');
     // Stale direction-verb entries are gone from previously incorrect mappings
     expect(section).not.toContain('./fetch direction');
+  });
+
+  it('renders payload currency and dropped-section count diagnostics', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        dropped: [{ key: 'generic_summary', reason: 'decision value lost the budget race', bytes: 512 }],
+        trimmed: [],
+        dropped_section_count: 1,
+        payload_currency: 'unknown',
+        payload_currency_reason: 'verdict=unknown; no_candidate_sha',
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-packer-diagnostics', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    expect(section).toContain('payload currency unknown (verdict=unknown; no_candidate_sha)');
+    expect(section).toContain('dropped sections 1');
+    expect(section).toContain('generic_summary');
+    expect(section).toContain('decision value lost the budget race');
   });
 
   it('true-empty: no packer drop/trim and empty model → bootstrap framing (first cycle)', async () => {

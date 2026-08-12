@@ -141,7 +141,7 @@ _RESUME_EXTRACTOR_PY = (
     ' and ".." not in m.name.split("/")'
     ' and not m.name.startswith("/")'
     ' and not(m.isreg() and m.name.split("/")[-1] in STALE)];'
-    "[tf.extract(m,d) for m in safe];"
+    "[tf.extract(m,d,filter=\"data\") for m in safe];"
     "fc=sum(1 for m in safe if m.isreg());"
     "tf.close();"
     "sys.exit(0 if fc>0 else 1)"
@@ -5266,5 +5266,4 @@ def resolve_compute_image_registry_repo() -> str:
     region = os.environ.get("COMPUTE_IMAGE_REGION", "us").strip() or "us"
     project = storage.GCP_PROJECT_ID
     return f"{region}-docker.pkg.dev/{project}/compute-images"
-
 

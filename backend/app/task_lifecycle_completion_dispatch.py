@@ -32,6 +32,14 @@ import logging
 import uuid
 from typing import Awaitable, Callable
 
+from sqlalchemy.exc import (
+    DisconnectionError,
+    InterfaceError,
+    InternalError,
+    OperationalError,
+    PendingRollbackError,
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import _sanitize_log
@@ -43,6 +51,39 @@ from app.task_blocked import reset_task_for_fresh_attempt
 from app.task_capabilities import get_task_capability
 
 logger = logging.getLogger(__name__)
+
+
+def _is_transient_completion_handler_error(exc: BaseException) -> bool:
+    """Classify retryable completion failures without relying on message text."""
+    if isinstance(
+        exc,
+        (
+            PendingRollbackError,
+            InterfaceError,
+            InternalError,
+            OperationalError,
+            DisconnectionError,
+            SQLAlchemyTimeoutError,
+        ),
+    ) or bool(getattr(exc, "connection_invalidated", False)):
+        return True
+
+    err_str = str(exc).lower()
+    return any(
+        kw in err_str
+        for kw in [
+            "api.github.com",
+            "502",
+            "503",
+            "connection",
+            "timeout",
+            "rate limit",
+            "ssl",
+            "name resolution",
+            "connection refused",
+            "greenlet",  # post-rollback expired-attr lazy-load; retryable
+        ]
+    )
 
 
 async def run_completion_dispatch(
@@ -134,9 +175,8 @@ async def run_completion_dispatch(
         if _handler_name:
             _handler = _completion_handlers[_handler_name]
             _handler_logs = payload.logs or task.latest_status_message or ""
-            # Round 3 C3 + C4: the strategic completion handlers
-            # (design_doc_update, strategic_review) require the
-            # canonically pre-locked Project. ``locked_project`` was
+            # Project-mutating completion handlers require the canonically
+            # pre-locked Project. ``locked_project`` was
             # acquired in Project → Task order at the top of
             # _process_post_commit via ``lock_project_then_task`` (see
             # docs/concurrency.md); passing it lets the handler skip its
@@ -149,6 +189,10 @@ async def run_completion_dispatch(
                     session,
                     project=locked_project,
                     message_sequences=preallocated_strategic_message_sequences,
+                )
+            elif _handler_name == "research":
+                await _handler(
+                    task, _handler_logs, session, project=locked_project
                 )
             elif _capability.completion_needs_locked_project:
                 await _handler(
@@ -249,29 +293,22 @@ async def run_completion_dispatch(
             # handler error so that loop can record this exact claim's
             # failure without re-running the agent or failing early.
             raise
-        # Detect transient errors (GitHub API, DB, network) and requeue instead of FAILED
-        err_str = str(handler_exc).lower()
-        is_transient = any(
-            kw in err_str
-            for kw in [
-                "api.github.com",
-                "502",
-                "503",
-                "connection",
-                "timeout",
-                "rate limit",
-                "ssl",
-                "name resolution",
-                "connection refused",
-                "greenlet",  # post-rollback expired-attr lazy-load; retryable
-            ]
-        )
-        # Research task interrupted mid-spawn: findings are already committed
-        # to task.plan_output and _research_spawn_pending is durable in context.
+        # Detect transient errors (GitHub API, DB, network) and requeue instead
+        # of FAILED.
+        # SQLAlchemy's transaction-state and driver wrappers must be matched by
+        # type: PendingRollbackError deliberately omits the original DB error
+        # from its short message, and asyncpg InternalClientError is surfaced as
+        # InternalError.  String-only matching turned the successful d8ae77b0
+        # design-doc task into terminal FAILED after a transient disconnect.
+        is_transient = _is_transient_completion_handler_error(handler_exc)
+        # Research task interrupted after durable routing began:
+        # _research_spawn_pending remains set until the authoritative final
+        # receipt commits, including for carried-only batches whose pre-gate
+        # plan_output is legitimately empty.
         # Requeuing the agent would discard those findings and start a new
         # research cycle. Instead raise PostCommitFinalCommitFailed — which
         # preserves the post_commit_pending marker so the sweep retries just
-        # the spawn from stored plan_output without re-running the agent.
+        # the durable routing/finalization state without re-running the agent.
         #
         # This recovery is NOT gated on the error being keyword-transient.
         # The previous version only preserved the marker for errors whose
@@ -285,35 +322,31 @@ async def run_completion_dispatch(
         # ~28%-of-zero-child class (cause B). Resuming the spawn is always
         # safe regardless of the original error: the resume path
         # (_handle_research_completion, _research_spawn_pending branch)
-        # never re-runs the agent — it replays the spawn from the durable
-        # plan_output — and the duplicate-spawn guard makes a re-run that
-        # actually did land children a no-op. So whenever findings are
-        # durable and the spawn was in flight, prefer sweep-retry over a
-        # terminal FAILED that buries the work.
+        # never re-runs the agent — it replays fresh plan_output and/or the
+        # durable carried-finding envelope — and the duplicate-spawn guard
+        # makes a re-run that actually did land children a no-op. So whenever
+        # routing/finalization was in flight, prefer sweep-retry over a terminal
+        # FAILED that buries the work.
         _spawn_pending = bool((task.context or {}).get("_research_spawn_pending"))
-        _has_durable_findings = bool(
-            isinstance(task.plan_output, list) and task.plan_output
-        )
-        if (
-            task_type == "research"
-            and _spawn_pending
-            and _has_durable_findings
-        ):
+        if task_type == "research" and _spawn_pending:
+            _stored_count = len(task.plan_output or []) + len(
+                (task.context or {}).get("prior_deferred_findings") or []
+            )
             logger.warning(
-                "[HANDLER] Research task %s: error mid-spawn with %d durable "
-                "finding(s) in plan_output (transient=%s); preserving "
-                "post_commit_pending for sweep to retry spawn from stored "
-                "findings rather than stranding them on a terminal FAILED "
+                "[HANDLER] Research task %s: error before final receipt with %d "
+                "durable routing input(s) (transient=%s); preserving "
+                "post_commit_pending for sweep retry rather than stranding "
+                "them on a terminal FAILED "
                 "(handler_exc=%r)",
                 task_id,
-                len(task.plan_output),
+                _stored_count,
                 is_transient,
                 handler_exc,
             )
             raise PostCommitFinalCommitFailed(
-                f"research mid-spawn error for {task_id}; "
-                f"sweep retries spawn from {len(task.plan_output)} stored "
-                f"finding(s): {handler_exc!r}"
+                f"research completion before final receipt failed for {task_id}; "
+                f"sweep retries {_stored_count} durable routing input(s): "
+                f"{handler_exc!r}"
             ) from handler_exc
         if is_transient and task.attempt_count < _runtime_config["max_retries"]:
             reset_task_for_fresh_attempt(task)

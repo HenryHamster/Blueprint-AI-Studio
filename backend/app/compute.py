@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import re
 import signal
 import subprocess
 import tempfile
@@ -65,6 +66,14 @@ from app.provision_error_scope import (
 )
 
 logger = logging.getLogger(__name__)
+
+_FULL_SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _full_source_sha(value: object) -> str | None:
+    """Return *value* only when it is a canonical full commit SHA."""
+    text = str(value) if value else ""
+    return text if _FULL_SOURCE_SHA_RE.fullmatch(text) else None
 
 # --- Mode Selection ---
 LOCAL_MODE = os.getenv("LOCAL_MODE", "false").lower() == "true"
@@ -1148,6 +1157,7 @@ async def fleet_serving_source_sha(
         from sqlalchemy import select
 
         from app.models import LocalRunner, PoolVm, Task, TaskStatus
+        from app.runner_project_binding import runner_allowed_for_project
         from app.runner_health_monitors import _get_liveness_seconds
         from app.time_utils import _utcnow
         from app.warm_pool import LIVE_POOL_STATES
@@ -1159,7 +1169,11 @@ async def fleet_serving_source_sha(
         if project_id is not None:
             stmt = stmt.where(PoolVm.project_id == project_id)
         rows = (await session.execute(stmt)).all()
-        observed_shas.update(str(row[0]) for row in rows if row[0])
+        observed_shas.update(
+            source_sha
+            for row in rows
+            if (source_sha := _full_source_sha(row[0])) is not None
+        )
 
         # Self-hosted checkout runners (LocalRunner) are a first-class fleet
         # member class. Their durable agent_source_sha is written by
@@ -1174,9 +1188,13 @@ async def fleet_serving_source_sha(
             LocalRunner.last_seen_at >= stale_cutoff,
         )
         if project_id is not None:
-            runner_stmt = runner_stmt.where(LocalRunner.project_id == project_id)
+            runner_stmt = runner_stmt.where(runner_allowed_for_project(project_id))
         runner_rows = (await session.execute(runner_stmt)).all()
-        observed_shas.update(str(row[0]) for row in runner_rows if row[0])
+        observed_shas.update(
+            source_sha
+            for row in runner_rows
+            if (source_sha := _full_source_sha(row[0])) is not None
+        )
         if promoted_sha in observed_shas:
             return True
 
@@ -1190,9 +1208,13 @@ async def fleet_serving_source_sha(
             LocalRunner.last_seen_at.is_not(None),
         )
         if project_id is not None:
-            runner_stmt = runner_stmt.where(LocalRunner.project_id == project_id)
+            runner_stmt = runner_stmt.where(runner_allowed_for_project(project_id))
         runner_rows = (await session.execute(runner_stmt)).all()
-        observed_shas.update(str(row[0]) for row in runner_rows if row[0])
+        observed_shas.update(
+            source_sha
+            for row in runner_rows
+            if (source_sha := _full_source_sha(row[0])) is not None
+        )
         if promoted_sha in observed_shas:
             return True
     except Exception as e:
@@ -1202,7 +1224,11 @@ async def fleet_serving_source_sha(
     # project-scoped serving check only accept cache entries tied to a currently
     # active task for that project. Durable warm-pool members are covered by the
     # PoolVm query above.
-    cached_sources = {vm_id: sha for vm_id, sha in _vm_source_shas.items() if sha}
+    cached_sources = {
+        vm_id: source_sha
+        for vm_id, sha in _vm_source_shas.items()
+        if (source_sha := _full_source_sha(sha)) is not None
+    }
     if project_id is None:
         observed_shas.update(cached_sources.values())
     elif cached_sources:
@@ -1260,8 +1286,9 @@ async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
     Durable ``LocalRunner`` rows cover self-hosted checkout runners (keyed by
     their ``runner:<id>`` vm identity, ``kind="runner"``). The in-memory
     heartbeat caches add short-lived task VMs that have no pool registry row.
-    Missing ``agent_source_sha`` is preserved as an explicit unknown bucket so
-    older/pre-marker images do not look healthy by omission.
+    Missing ``agent_source_sha`` falls back to the runner's durable
+    ``source_sha`` identity; runners with neither identity remain an explicit
+    unknown bucket so older/pre-marker images do not look healthy by omission.
     """
     observations: dict[str, dict] = {}
     try:
@@ -1316,6 +1343,7 @@ async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
         # runner:<id> vm identity. Liveness matches the fleet panel's runner
         # definition (status + last_seen_at recency), same as fleet_serving_source_sha.
         from app.models import LocalRunner
+        from app.runner_project_binding import runner_allowed_for_project
         from app.runner_health_monitors import _get_liveness_seconds
         from app.time_utils import _utcnow
 
@@ -1326,7 +1354,7 @@ async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
             LocalRunner.last_seen_at >= stale_cutoff,
         )
         if project_id is not None:
-            runner_stmt = runner_stmt.where(LocalRunner.project_id == project_id)
+            runner_stmt = runner_stmt.where(runner_allowed_for_project(project_id))
         runners = (await session.execute(runner_stmt)).scalars().all()
         for runner in runners:
             rid = f"runner:{runner.id}"
@@ -1334,7 +1362,7 @@ async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
                 continue
             observations[rid] = {
                 "vm_id": rid,
-                "source_sha": runner.agent_source_sha,
+                "source_sha": runner.agent_source_sha or runner.source_sha,
                 "image_name": None,
                 "build_ts": None,
                 "last_heartbeat_at": runner.last_seen_at.isoformat()

@@ -55,6 +55,11 @@ from app.project_message_projection import (
 )
 from app.qualification_state_resolver import apply_verdict_substitution
 from app.release_scoring import blocker_execution_site as _blocker_execution_site
+from app.release_commit_authorship import (
+    serving_authorship_range,
+    unresolved_authorship_receipt,
+    validate_authorship_receipt,
+)
 from app.routers.agent import verify_agent_token
 from app.schemas import serialize_compute_job_response_safe
 from app.shared_state import limiter
@@ -673,6 +678,7 @@ def _compose_serving_block(
         "failure_reason": aggregate.get("reason_code")
         if aggregate_status == "deploy_failed"
         else None,
+        "fleet_freshness": aggregate.get("fleet_freshness"),
         "artifacts": artifacts,
     }
 
@@ -1637,14 +1643,18 @@ async def agent_fetch_qualification(
 
     Payload includes: candidate_sha, finalized_at, status, confidence,
     sub_scores, findings, excluded_findings, challenger_refuted_findings, and
-    serving_sha (the git SHA of the deployed code producing this response).
+    serving_sha (the git SHA of the deployed code producing this response), and
+    the persisted operator_authored_commits release evidence.
     """
     from app.deployed_sha import get_serving_sha  # noqa: PLC0415
     from app.release_qualifier import (  # noqa: PLC0415
+        current_effective_policy_projection,
         get_latest_qualification_audit_findings,
+        qualification_attempt_policy_projection,
     )
 
-    await _resolve_agent_project(project_id, token, session)
+    project = await _resolve_agent_project(project_id, token, session)
+    current_effective_policy = current_effective_policy_projection(project)
     serving_sha = get_serving_sha()
 
     open_row = (
@@ -1666,6 +1676,8 @@ async def agent_fetch_qualification(
         return {
             "source": "no_open_version",
             "serving_sha": serving_sha,
+            "current_effective_policy": current_effective_policy,
+            "active_or_last_attempt_policy": None,
             "qualification_trigger_state": {
                 "trigger_state": "blocked",
                 "open_version_id": None,
@@ -1673,6 +1685,59 @@ async def agent_fetch_qualification(
                 "summary": "no open release version — nothing to qualify",
             },
         }
+
+    # This is release evidence, not a property of the currently open version
+    # or this backend process.  Reading only the latest closed promoted record
+    # prevents a vN+1 open from changing vN's immutable authorship range and
+    # keeps this polled endpoint free of GitHub/network work.
+    latest_promoted_version = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "promoted",
+                )
+                .order_by(ReleaseVersion.version_number.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    latest_promoted_qualification = (
+        latest_promoted_version.last_qualification
+        if latest_promoted_version is not None
+        else None
+    )
+    persisted_authorship = (
+        latest_promoted_qualification.get("operator_authored_commits")
+        if isinstance(latest_promoted_qualification, dict)
+        else None
+    )
+    authorship_base_sha, authorship_head_sha = serving_authorship_range(
+        latest_promoted_version
+    )
+    validated_authorship = (
+        validate_authorship_receipt(
+            persisted_authorship,
+            authorship_base_sha,
+            authorship_head_sha,
+        )
+        if latest_promoted_version is not None
+        and latest_promoted_version.serving_status == "serving_confirmed"
+        else None
+    )
+    operator_authored_commits = validated_authorship or unresolved_authorship_receipt(
+        authorship_base_sha,
+        authorship_head_sha,
+        "stored_authorship_receipt_invalid"
+        if persisted_authorship is not None
+        else "promotion_authorship_not_persisted",
+    )
+    active_or_last_attempt_policy = qualification_attempt_policy_projection(
+        open_row.last_qualification
+    )
 
     # Re-qualification readiness signal + per-finding resolution view (ADDITIVE).
     # The fix-first triage workflow needs to know, from the same read it already
@@ -1688,6 +1753,13 @@ async def agent_fetch_qualification(
         "requalification_readiness_reason": None,
         "gating_total": None,
         "gating_resolved": None,
+        "finding_total": None,
+        "resolved_finding_total": None,
+        "projected_audit_score": None,
+        "required_audit_score": None,
+        "projected_confidence": None,
+        "promotion_confidence_threshold": None,
+        "projected_promotion_ready": None,
         "promotion_ci_green_gate": None,
     }
     try:
@@ -1707,6 +1779,15 @@ async def agent_fetch_qualification(
             "requalification_readiness_reason": readiness["reason"],
             "gating_total": readiness["gating_total"],
             "gating_resolved": readiness["gating_resolved"],
+            "finding_total": readiness["finding_total"],
+            "resolved_finding_total": readiness["resolved_finding_total"],
+            "projected_audit_score": readiness["projected_audit_score"],
+            "required_audit_score": readiness["required_audit_score"],
+            "projected_confidence": readiness["projected_confidence"],
+            "promotion_confidence_threshold": readiness[
+                "promotion_confidence_threshold"
+            ],
+            "projected_promotion_ready": readiness["projected_promotion_ready"],
             # Populated by the CI-green-gate block below; keep the key present so
             # the response shape is stable whether or not that compute succeeds.
             "promotion_ci_green_gate": None,
@@ -1946,6 +2027,9 @@ async def agent_fetch_qualification(
             "qualification_provenance": qualification_provenance,
             "dimension_states": qualification_dimension_states,
             "serving_sha": serving_sha,
+            "operator_authored_commits": operator_authored_commits,
+            "current_effective_policy": current_effective_policy,
+            "active_or_last_attempt_policy": active_or_last_attempt_policy,
             **requalification_extra,
         }
 
@@ -2003,6 +2087,9 @@ async def agent_fetch_qualification(
         "qualification_provenance": qualification_provenance,
         "dimension_states": qualification_dimension_states,
         "serving_sha": serving_sha,
+        "operator_authored_commits": operator_authored_commits,
+        "current_effective_policy": current_effective_policy,
+        "active_or_last_attempt_policy": active_or_last_attempt_policy,
         **requalification_extra,
     }
 
@@ -2052,6 +2139,12 @@ async def agent_fetch_version_phase(
     use ``./fetch qualification`` explicitly.
     """
     project = await _resolve_agent_project(project_id, token, session)
+    from app.release_qualifier import (  # noqa: PLC0415
+        current_effective_policy_projection,
+        qualification_attempt_policy_projection,
+    )
+
+    current_effective_policy = current_effective_policy_projection(project)
 
     open_row = (
         (
@@ -2160,6 +2253,13 @@ async def agent_fetch_version_phase(
     )
     if _current_version_data is not None and version_phase_criterion_coverage is not None:
         _current_version_data["criterion_coverage"] = version_phase_criterion_coverage
+    active_or_last_attempt_policy = qualification_attempt_policy_projection(
+        open_row.last_qualification if open_row is not None else None
+    )
+    if _current_version_data is not None:
+        _current_version_data["active_or_last_attempt_policy"] = (
+            active_or_last_attempt_policy
+        )
 
     # Candidate-currency signal for the fetch/recovery path — same HEAD-vs-candidate
     # comparison the spawn payload provides in payload_staleness.  Best-effort:
@@ -2210,6 +2310,8 @@ async def agent_fetch_version_phase(
         "data": {
             "source": "open_version" if open_row is not None else "no_open_version",
             "current_version": _current_version_data,
+            "current_effective_policy": current_effective_policy,
+            "active_or_last_attempt_policy": active_or_last_attempt_policy,
             "recent_versions": [
                 _compact_version_lifecycle(row, project) for row in recent_closed_rows
             ],
@@ -2530,6 +2632,8 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "effective_purpose": None, "direction_counts": None,
     "max_active_directions": None,
     "open_message_count": None,
+    "current_effective_policy": None,
+    "active_or_last_attempt_policy": None,
     # Server-owned Fast activation contract — task payload configuration with
     # no independent fetch path. These critical scalars are carried verbatim.
     "typed_fast_enabled": None, "typed_fast_models": None,

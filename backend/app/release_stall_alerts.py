@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import logging
 from datetime import datetime
 
@@ -14,6 +15,7 @@ from app import pause_clock, release_version
 from app.models import Alert, AlertSeverity, DeploymentState
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 715
 
 logger = logging.getLogger(__name__)
 
@@ -431,7 +433,12 @@ async def _alert_promotion_deploy_failed(
         "rolled_back": "the deploy was ROLLED BACK after the promotion",
         "halted": "the deploy was HALTED after the promotion",
         "sha_mismatch": ("the live serving SHA does not match the promoted SHA"),
-    }.get(reason, reason)
+    }.get(reason, "the deploy failure reason is unclassified")
+    _resolution_text = "Investigate the deploy / roll forward a fix."
+    _outcome_text = (
+        "The promotion did NOT ship — the version is flagged deploy_failed "
+        "and must not be treated as live."
+    )
     _artifact_gap = summarize_required_artifact_gap(artifact_evidence)
     _artifact_text = f" Aggregate evidence: {_artifact_gap}." if _artifact_gap else ""
 
@@ -445,9 +452,8 @@ async def _alert_promotion_deploy_failed(
                 f"Release v{version.version_number} merged to the promotion "
                 f"target (promoted_sha={(version.promoted_sha or '')[:12] or '?'}) "
                 f"but its deploy is NOT serving: {_reason_text} "
-                f"(reason={reason}). The promotion did NOT ship — the version is "
-                f"flagged deploy_failed and must not be treated as live. "
-                f"Investigate the deploy / roll forward a fix.{_artifact_text}"
+                f"(reason={reason}). {_outcome_text} {_resolution_text}"
+                f"{_artifact_text}"
             ),
         )
     )
@@ -460,8 +466,8 @@ async def _alert_promotion_deploy_failed(
             "promotion_deploy_failed",
             (
                 f"v{version.version_number} promoted to the production branch but "
-                f"its deploy never confirmed serving ({_reason_text}). This "
-                f"promotion did NOT ship; the version is flagged deploy_failed."
+                f"its deploy never confirmed serving ({_reason_text}). "
+                f"{_outcome_text} {_resolution_text}"
                 + (f" {_artifact_gap}." if _artifact_gap else "")
             ),
             extra={

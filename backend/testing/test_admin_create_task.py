@@ -15,7 +15,7 @@ with an HTTP 400.
 import pytest
 from httpx import AsyncClient
 
-from app.models import Project, ProjectMember, ProjectStatus
+from app.models import Project, ProjectMember, ProjectStatus, Task, TaskStatus
 
 # Code-producing tasks now require an acceptance_evidence declaration at
 # validation (validate_task_payload). These tests exercise the operator
@@ -341,8 +341,88 @@ async def test_user_launchable_type_still_accepted(client: AsyncClient, db_sessi
     task_id = resp.json()["id"]
     get_resp = await client.get(f"/api/admin/tasks/{task_id}")
     assert get_resp.status_code == 200
-    assert get_resp.json()["payloads"][0]["type"] == "research"
+    stored_payload = get_resp.json()["payloads"][0]
+    assert stored_payload["type"] == "research"
+    assert stored_payload["base_branch"] == "main"
     assert await _count_tasks(db_session, project.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_research_gets_canonical_root_envelope(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """Omitted research fields use the same root contract as autonomous/direct work."""
+    from app import admin
+    from app.research_completion import effective_research_finding_headroom
+
+    project = Project(
+        name="acme/research-envelope",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+        github_owner="acme",
+        github_repo="research-envelope",
+        integration_branch="automain",
+        promotion_target="main",
+        directions=[
+            {
+                "id": "direction-1",
+                "text": "Improve research throughput",
+                "status": "active",
+                "category": "research",
+                "priority": "high",
+                "system_id": "research-runtime",
+                "completion_criteria": "A bounded end-to-end proof exists",
+                "research_context": {"decision_question": "Does the parent carry work?"},
+                "paths": ["backend/app/research_completion.py"],
+            }
+        ],
+        problem_model={
+            "capabilities": [{"name": "Repository Mapping", "status": "working"}]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    await db_session.commit()
+    monkeypatch.setitem(
+        admin._runtime_config,
+        "agent_prompt_suffixes",
+        {"research": "Inspect the exact causal path."},
+    )
+
+    response = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/research-envelope",
+            "title": "Research the parent",
+            "prompt": "Find the remaining parent-quality gaps",
+            "task_type": "research",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    stored = (
+        await client.get(f"/api/admin/tasks/{response.json()['id']}")
+    ).json()["payloads"][0]
+    assert stored["base_branch"] == "automain"
+    assert stored["work_headroom"] == effective_research_finding_headroom(0)
+    assert stored["prompt_suffix"] == "Inspect the exact causal path."
+    assert stored["available_capabilities"][0]["name"] == "repository-mapping"
+    assert stored["directions"] == [
+        {
+            "id": "direction-1",
+            "text": "Improve research throughput",
+            "category": "research",
+            "priority": "high",
+            "system_id": "research-runtime",
+            "completion_criteria": "A bounded end-to-end proof exists",
+            "research_context": {"decision_question": "Does the parent carry work?"},
+            "paths": ["backend/app/research_completion.py"],
+        }
+    ]
 
 
 # --- Idempotency tests -------------------------------------------------------
@@ -397,6 +477,113 @@ async def test_idempotency_key_dedupes_duplicate_submit(
     assert task_id_1 == task_id_2
     # Second response marked as duplicate
     assert resp2.json()["is_duplicate"] is True
+    assert resp2.json()["task_type"] == "create"
+
+
+@pytest.mark.asyncio
+async def test_idempotent_retry_succeeds_after_active_task_cap(
+    client: AsyncClient, db_session
+):
+    """A replay returns its original task even after the project reaches 200 active tasks."""
+    project = await _make_project_with_member(db_session, "acme/widget")
+    key = "retry-at-active-cap"
+    body = {
+        "github_repo": "acme/widget",
+        "project_id": str(project.id),
+        "title": "Already accepted",
+        "prompt": "do something",
+        "task_type": "create",
+        "acceptance_evidence": _CODE_EVIDENCE,
+        "idempotency_key": key,
+    }
+    first = await client.post("/api/admin/tasks", json=body)
+    assert first.status_code == 200, first.text
+
+    db_session.add_all([
+        Task(
+            project_id=project.id,
+            title=f"filler {index}",
+            description="fill the active queue",
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "plan", "prompt": "fill", "base_branch": "main"}],
+            vm_instance_id=f"filler-vm-{index}",
+        )
+        for index in range(199)
+    ])
+    await db_session.commit()
+
+    replay = await client.post("/api/admin/tasks", json=body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    assert replay.json()["is_duplicate"] is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_project_id_targets_exact_duplicate_repo_project(
+    client: AsyncClient, db_session
+):
+    project_a = await _make_project_with_member(db_session, "acme/widget")
+    project_b = await _make_project_with_member(db_session, "acme/widget")
+
+    response = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "project_id": str(project_b.id),
+            "title": "Target B",
+            "prompt": "enqueue on the explicitly selected project",
+            "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["project_id"] == str(project_b.id)
+    assert await _count_tasks(db_session, project_a.id) == 0
+    assert await _count_tasks(db_session, project_b.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_project_id_rejects_repo_mismatch(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_with_member(db_session, "acme/gadget")
+    response = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "project_id": str(project.id),
+            "title": "Mismatched identity",
+            "prompt": "must not enqueue",
+            "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert "not acme/widget" in response.json()["error"]["message"]
+    assert await _count_tasks(db_session, project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_explicit_project_id_enforces_member_role(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_with_member(
+        db_session, "acme/widget", role="viewer"
+    )
+    response = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "project_id": str(project.id),
+            "title": "Viewer cannot enqueue",
+            "prompt": "must not enqueue",
+            "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
+        },
+    )
+    assert response.status_code == 403, response.text
+    assert await _count_tasks(db_session, project.id) == 0
 
 
 @pytest.mark.asyncio

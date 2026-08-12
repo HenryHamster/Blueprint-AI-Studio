@@ -7,6 +7,7 @@ it only normalizes legacy rows and persists bounded waiter observations.
 
 from __future__ import annotations
 
+
 import logging
 import uuid
 from datetime import datetime
@@ -17,6 +18,7 @@ from sqlmodel import select
 from app import release_version
 from app.ci_resolution import _CI_RED
 from app.time_utils import _coerce_naive_utc, _utcnow
+_MODULE_SIZE_GOVERNANCE_CAP: int = 369
 
 logger = logging.getLogger(__name__)
 

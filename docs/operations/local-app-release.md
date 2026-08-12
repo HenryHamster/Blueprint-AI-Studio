@@ -1,5 +1,27 @@
 # Hamsterwheel application release
 
+<!-- RELEASE_RUNBOOK_CONTRACT:START -->
+```json
+{
+  "entrypoints": {
+    "bootstrap": {
+      "flags": ["--image", "--rehearse", "--revision"],
+      "script": "scripts/bootstrap_local_app_release.py"
+    },
+    "release": {
+      "flags": ["--expected-revision", "--image", "--rehearse"],
+      "script": "scripts/local_app_release.py"
+    }
+  },
+  "preconditions": [
+    "live systemd privilege boundary",
+    "worker secret and static migration inputs",
+    "candidate migration reachability from live schema"
+  ]
+}
+```
+<!-- RELEASE_RUNBOOK_CONTRACT:END -->
+
 Hamsterwheel is the production API, worker, database, and edge host. A normal
 push to `main` builds and publishes a combined backend plus admin-UI image, but
 does not automatically wake the recovery-only Cloud Run service or run the
@@ -49,6 +71,36 @@ Accepted or ambiguous socket handoffs are fenced and never replayed. Exhaustion
 is reported and persisted as `phase=failed` with the attempt count and
 `root_release.failure_reason`; it is not converted into a serving-confirmation
 timeout.
+
+## Qualification and integrated pre-stop checks
+
+The operator does not run a standalone pre-stop command. In particular, do not
+invoke either release entrypoint with `--rehearse`. Prequalification candidate
+execution on Hamsterwheel is disabled: those compatibility flags are fail-closed
+sentinels and exit with `host rehearsal disabled` before image pull, migration
+inspection, or service mutation. They are not an operator release step.
+
+Before promotion, any criterion that requires candidate build/smoke evidence
+is satisfied only by the candidate-bound, secrets-free trusted-main GitHub
+workflow. That workflow does not claim to prove Hamsterwheel's live systemd,
+secret-file, database, or activation state.
+
+The ordinary release command below performs the live pre-stop checks itself,
+inside the root-owned activation transaction and immediately before the first
+service mutation. This integrated phase is the only operator-facing pre-stop
+check and verifies:
+
+- the live systemd-reported privilege boundary: the non-root deploy agent has
+  `User=henry_hamster` and `NoNewPrivileges=yes`, while the root release
+  executor has `User=root` and `NoNewPrivileges=no`;
+- the candidate frontend/revision binding and image inspection;
+- worker-secret and other static migration inputs; and
+- that the candidate schema is forward-reachable from the live database head.
+
+A precondition failure is recorded in the root release receipt while the
+managed units remain running. Fix the reported input or select a corrected
+candidate, then submit a new ordinary activation. Never bypass the integrated
+check and never run candidate code on the production host before promotion.
 
 ## Release
 
@@ -110,7 +162,12 @@ downtime window begins, a failure leaves the app units stopped and requires a
 fix-forward release; it never rolls prior code back across a possibly advanced
 schema. Other failed activations roll back only their touched services using
 the same identity and readiness checks. Root-only receipts are written below
-`/var/lib/blueprint/local-app-releases/`.
+`/var/lib/blueprint/local-app-releases/`. If the run fails after its integrated
+pre-stop checks pass, abort and use that receipt to identify the failed phase;
+do not blindly retry. Before migration downtime begins, the tool restores its
+touched files and services. After downtime begins, leave the units stopped as
+directed by the failure evidence, do not restore the prior image across an
+advanced schema, and fix forward with a corrected candidate.
 
 Cloud Run remains a manually activated recovery target. Firebase Hosting
 remains a separately deployed rollback UI, and its origin must remain present

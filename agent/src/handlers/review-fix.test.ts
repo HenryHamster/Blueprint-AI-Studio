@@ -139,6 +139,7 @@ import {
   handleReview, handleFix,
   detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying,
   buildBlueprintPrFooter, formatLaneResumeSection,
+  REVIEW_VERDICT_JSON_MAX_LENGTH, serializeBoundedReviewVerdict,
 } from './review-fix.js';
 import { computeReviewPromptFingerprint } from '../prompts/review-prompt.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -210,6 +211,90 @@ beforeEach(() => {
 });
 
 // ── Authoritative blocker prompt ────────────────────────────────────────────
+describe('serializeBoundedReviewVerdict', () => {
+  it('preserves an exact-boundary verdict byte-for-byte', () => {
+    const verdict = { verdict: 'APPROVE', feedback: '' };
+    const envelopeLength = JSON.stringify(verdict).length;
+    verdict.feedback = 'x'.repeat(REVIEW_VERDICT_JSON_MAX_LENGTH - envelopeLength);
+    const original = JSON.stringify(verdict);
+
+    expect(original).toHaveLength(REVIEW_VERDICT_JSON_MAX_LENGTH);
+    expect(serializeBoundedReviewVerdict(verdict)).toBe(original);
+  });
+
+  it('returns valid bounded JSON and preserves routing fields one character over the boundary', () => {
+    const verdict = { verdict: 'REQUEST_CHANGES', feedback: '' };
+    const envelopeLength = JSON.stringify(verdict).length;
+    verdict.feedback = 'x'.repeat(REVIEW_VERDICT_JSON_MAX_LENGTH - envelopeLength + 1);
+
+    const serialized = serializeBoundedReviewVerdict(verdict);
+    const parsed = JSON.parse(serialized) as Record<string, unknown>;
+
+    expect(serialized.length).toBeLessThanOrEqual(REVIEW_VERDICT_JSON_MAX_LENGTH);
+    expect(parsed.verdict).toBe('REQUEST_CHANGES');
+    expect(parsed.verdict_json_truncated).toBe(true);
+    expect(String(parsed.feedback)).toMatch(/…$/);
+  });
+
+  it('keeps issue identity, locations, and reviewed-SHA provenance while compacting verbose text', () => {
+    const serialized = serializeBoundedReviewVerdict({
+      verdict: 'REQUEST_CHANGES',
+      feedback: 'f'.repeat(20_000),
+      issues: [{
+        issue_id: 'BP-123',
+        severity: 'major',
+        description: 'd'.repeat(20_000),
+        file: 'agent/src/handlers/review-fix.ts',
+        line: 960,
+      }],
+      reviewed_head_sha: 'a'.repeat(40),
+      reviewed_base_sha: 'b'.repeat(40),
+    });
+    const parsed = JSON.parse(serialized) as {
+      verdict: string;
+      issues: Array<Record<string, unknown>>;
+      reviewed_head_sha: string;
+      reviewed_base_sha: string;
+      verdict_json_truncated: boolean;
+    };
+
+    expect(serialized.length).toBeLessThanOrEqual(REVIEW_VERDICT_JSON_MAX_LENGTH);
+    expect(parsed.verdict).toBe('REQUEST_CHANGES');
+    expect(parsed.issues[0]).toMatchObject({
+      issue_id: 'BP-123',
+      severity: 'major',
+      file: 'agent/src/handlers/review-fix.ts',
+      line: 960,
+    });
+    expect(parsed.reviewed_head_sha).toBe('a'.repeat(40));
+    expect(parsed.reviewed_base_sha).toBe('b'.repeat(40));
+    expect(parsed.verdict_json_truncated).toBe(true);
+  });
+
+  it('bounds pathological issue arrays without emitting truncated JSON', () => {
+    const serialized = serializeBoundedReviewVerdict({
+      verdict: 'REQUEST_CHANGES',
+      feedback: 'large review',
+      issues: Array.from({ length: 500 }, (_, index) => ({
+        issue_id: `BP-${index}`,
+        severity: 'major',
+        description: `finding ${index} ${'x'.repeat(400)}`,
+        file: `agent/src/file-${index}.ts`,
+        line: index + 1,
+      })),
+    });
+    const parsed = JSON.parse(serialized) as {
+      issues: Array<Record<string, unknown>>;
+      verdict_json_truncated: boolean;
+    };
+
+    expect(serialized.length).toBeLessThanOrEqual(REVIEW_VERDICT_JSON_MAX_LENGTH);
+    expect(parsed.issues.length).toBeGreaterThan(0);
+    expect(parsed.issues.length).toBeLessThanOrEqual(50);
+    expect(parsed.verdict_json_truncated).toBe(true);
+  });
+});
+
 describe('authoritative blocker prompt', () => {
   const histWithStructured = [{
     iteration: 1,
@@ -1157,6 +1242,53 @@ describe('handleReview — verdict file parsing', () => {
       'admin-ui/src/components/DirectionCard.tsx',
       'admin-ui/src/components/DirectionCard.test.tsx',
     ]);
+  });
+
+  it('bounds an oversized augmented verdict before posting agent status', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'REQUEST_CHANGES',
+      feedback: 'f'.repeat(20_000),
+      issues: [{
+        issue_id: 'BP-oversized',
+        severity: 'major',
+        description: 'd'.repeat(20_000),
+        file: 'agent/src/handlers/review-fix.ts',
+        line: 960,
+      }],
+    }));
+    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: '',
+    });
+    vi.mocked(indexMod.extractInvestigatedFiles).mockReturnValueOnce([
+      'agent/src/handlers/review-fix.ts',
+    ]);
+
+    await handleReview(
+      'task-oversized', basePayload, { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
+    const serialized = String(status.verdict_json);
+    const verdictJson = JSON.parse(serialized) as {
+      verdict: string;
+      issues: Array<Record<string, unknown>>;
+      investigated_files: string[];
+      verdict_json_truncated: boolean;
+    };
+    expect(serialized.length).toBeLessThanOrEqual(REVIEW_VERDICT_JSON_MAX_LENGTH);
+    expect(verdictJson.verdict).toBe('REQUEST_CHANGES');
+    expect(verdictJson.issues[0]).toMatchObject({
+      issue_id: 'BP-oversized',
+      severity: 'major',
+      file: 'agent/src/handlers/review-fix.ts',
+      line: 960,
+    });
+    expect(verdictJson.investigated_files).toEqual([
+      'agent/src/handlers/review-fix.ts',
+    ]);
+    expect(verdictJson.verdict_json_truncated).toBe(true);
   });
 
   it('repairs a clean-exit review verdict when the temp file is malformed and preserves augmentation', async () => {

@@ -55,7 +55,7 @@ import {
   decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict, admitDecisionEntry,
   serializeDecisionsReg, restoreDecisionsReg, parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
-  resolveResidentPurposeText,
+  formatCurrentEffectivePolicyJson, resolveResidentPurposeText,
   type ConversationClaimResponse, type MessagesPollResponse,
   type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
@@ -88,7 +88,8 @@ import {
   typedFastAbandonDispositionWithConfirmation, typedFastFailureBackoffMs,
 } from './typed-fast-resident.js';
 import {
-  buildFastResidentContextFrame, verifyStrategicContextEnvelope,
+  buildFastResidentContextFrame, buildPrivateWorkdayContextFrame,
+  verifyStrategicContextEnvelope,
   type StrategicContextEnvelopeTransport,
 } from './strategic-context-envelope.js';
 import { CallMediaSession } from '../media/livekit-call-media.js';
@@ -137,6 +138,7 @@ export interface ResidentReplyRuntimePaths {
   replyKeyPath: string;
   replyReceiptPath: string;
   stagedReplyPath: string;
+  privateTurnMarkerPath: string;
 }
 
 /**
@@ -167,6 +169,7 @@ export function residentReplyRuntimePaths(
     replyKeyPath: path.join(runtimeDir, '.resident-reply-idempotency-key'),
     replyReceiptPath: path.join(runtimeDir, '.resident-reply-receipt.json'),
     stagedReplyPath: path.join(runtimeDir, '.resident-reply-staged-message.json'),
+    privateTurnMarkerPath: path.join(runtimeDir, '.resident-private-workday-turn'),
   };
 }
 
@@ -344,6 +347,32 @@ export function removeResidentReplyKeyAtPath(replyKeyPath: string): void {
     fs.unlinkSync(replyKeyPath);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+  }
+}
+
+export type PrivateWorkdayTurnKind = 'active-call' | 'typed-consultation';
+
+/**
+ * Fence the generated message CLIs for exactly one private Workday turn.
+ * Server-side call/consultation leases remain the authority for direct API
+ * writes; this local marker prevents the normal shell helpers from attempting
+ * egress, including while an ended call's private turn is still unwinding.
+ */
+export async function withPrivateWorkdayTurnFence<T>(
+  markerPath: string,
+  kind: PrivateWorkdayTurnKind,
+  incarnationId: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  fs.writeFileSync(
+    markerPath,
+    JSON.stringify({ kind, incarnation_id: incarnationId }),
+    { encoding: 'utf8', flag: 'wx', mode: 0o600 },
+  );
+  try {
+    return await run();
+  } finally {
+    removeResidentReplyKeyAtPath(markerPath);
   }
 }
 
@@ -695,6 +724,7 @@ export async function handleStrategicResident(
     replyKeyPath: RESIDENT_REPLY_KEY_PATH,
     replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
     stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+    privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
   } = replyRuntime;
   fs.mkdirSync(replyRuntime.runtimeDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(replyRuntime.runtimeDir, 0o700);
@@ -866,6 +896,7 @@ export async function handleStrategicResident(
     replyKeyPath: RESIDENT_REPLY_KEY_PATH,
     replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
     stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+    privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
   });
   const artifactsHelperAvailable = writeArtifactsHelper(WORKSPACE);
   writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
@@ -877,6 +908,7 @@ export async function handleStrategicResident(
     replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
     stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
     residentIncarnationId: residentProcessIncarnation,
+    privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
   });
   provisionAmbientHelpers(taskId, WORKSPACE);
 
@@ -893,6 +925,7 @@ export async function handleStrategicResident(
   const problemModel = payload.problem_model as Record<string, unknown> | undefined;
   const problemModelJson = problemModel && Object.keys(problemModel).length > 0
     ? JSON.stringify(problemModel, null, 2) : '';
+  const currentEffectivePolicyJson = formatCurrentEffectivePolicyJson(payload);
   const directionsSummary = Array.isArray(payload.directions_summary)
     ? payload.directions_summary as Array<Record<string, unknown>> : [];
   const directionCounts = payload.direction_counts && typeof payload.direction_counts === 'object'
@@ -994,6 +1027,7 @@ export async function handleStrategicResident(
     contextPrefix,
     projectName: strVal(payload.project_name, 'this project'),
     problemModelJson,
+    currentEffectivePolicyJson,
     runningUpdate: typeof payload.running_update === 'string' ? payload.running_update : '',
     directionsText: buildDirSummaryText(directionsSummary, authoritativeActive),
     stagedDirectionsText,
@@ -1294,6 +1328,7 @@ export async function handleStrategicResident(
         purposeText,
         strategicMemoryNotesText,
         runningUpdate: strVal(payload.running_update),
+        currentEffectivePolicyJson,
         openMessagesText: buildOpenMessagesText(openMessages),
         recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
       },
@@ -1312,6 +1347,9 @@ export async function handleStrategicResident(
         : buildDirSummaryText(directionsSummary, authoritativeActive) || undefined,
       runningUpdate: grounding.runningUpdate,
       decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
+      // Backend-resolved policy snapshot. Its rendered section directs the
+      // resumed Resident to prefer a newer fetch if the live policy changes.
+      currentEffectivePolicyJson: grounding.currentEffectivePolicyJson,
       // Static session-start grounding — same snapshot forward every checkpoint
       // (no refetch): retired/staged/prior-decision context the bootstrap shows.
       retiredDirectionsText: retiredDirectionsText || undefined,
@@ -1444,6 +1482,7 @@ export async function handleStrategicResident(
       BLUEPRINT_RESIDENT_REPLY_KEY_PATH: RESIDENT_REPLY_KEY_PATH,
       BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH: RESIDENT_REPLY_RECEIPT_PATH,
       BLUEPRINT_RESIDENT_STAGED_REPLY_PATH: RESIDENT_STAGED_REPLY_PATH,
+      BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH: RESIDENT_PRIVATE_TURN_MARKER_PATH,
     },
     turnTimeoutMs: sessionBaseStallTimeoutMs,
     appendSystemPrompt: STRATEGIC_RESIDENT_SYSTEM_PROMPT,
@@ -1659,6 +1698,42 @@ export async function handleStrategicResident(
     } finally {
       if (slowResponseTimer) clearTimeout(slowResponseTimer);
     }
+  };
+
+  const revokeNativeReplyForPrivateConsultation = (): void => {
+    // The normal Workday subprocess has the reply MCP server configured, but
+    // the receipt file is the actual capability. Remove every reply artifact
+    // before a private run and fail closed if it remains reachable; prompt text
+    // alone is never relied upon for this boundary. The call-packet MCP receipt
+    // is separate and remains available to active-call investigations.
+    removeResidentReplyArtifactsAtPaths(
+      RESIDENT_REPLY_KEY_PATH,
+      RESIDENT_REPLY_RECEIPT_PATH,
+    );
+    removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
+    if (
+      fs.existsSync(RESIDENT_REPLY_KEY_PATH)
+      || fs.existsSync(RESIDENT_REPLY_RECEIPT_PATH)
+      || fs.existsSync(RESIDENT_STAGED_REPLY_PATH)
+    ) {
+      throw new Error('native reply capability could not be revoked for private Workday');
+    }
+  };
+
+  const runPrivateWorkdayTurn = (
+    privateTurnKind: PrivateWorkdayTurnKind,
+    content: string | ContentBlock[],
+  ): Promise<ResidentTurnResult> => {
+    revokeNativeReplyForPrivateConsultation();
+    privateTurnStreamSuppressionDepth += 1;
+    return withPrivateWorkdayTurnFence(
+      RESIDENT_PRIVATE_TURN_MARKER_PATH,
+      privateTurnKind,
+      residentProcessIncarnation,
+      () => runTurn(content, false, undefined, undefined, true),
+    ).finally(() => {
+      privateTurnStreamSuppressionDepth = Math.max(0, privateTurnStreamSuppressionDepth - 1);
+    });
   };
 
   // Evaluate a completed turn for a wedged/stalled session. Returns true when the
@@ -3061,14 +3136,14 @@ export async function handleStrategicResident(
     if (!callCoordinator.completionIsCurrent(request.receipt)) return [];
     const lease = callCoordinator.currentLease();
     if (!lease) return [];
-    const turn = await runTurn([
+    const turn = await runPrivateWorkdayTurn('active-call', [
       { type: 'text', text: [
         'This is private Call Workday reasoning. You MUST NOT reply to the operator or use the native Workday reply tool.',
         'Use only mcp__call__emit_call_packet to return a schema-valid progress/final/blocked packet to Fast Resident.',
         `Call ${lease.callId} generation ${lease.generation}, input revision ${lease.inputRevision}, request ${request.request_id}.`,
         `Private request:\n${request.prompt}`,
       ].join('\n\n') },
-    ], false);
+    ]);
     if (turn.processGone) sendLog(ws, '[resident] Workday exited during private call request; preserving call state\n');
     return readWorkdayPackets();
   };
@@ -3193,25 +3268,6 @@ export async function handleStrategicResident(
     }
   };
 
-  const revokeNativeReplyForPrivateConsultation = (): void => {
-    // The normal Workday subprocess has the reply MCP server configured, but
-    // the receipt file is the actual capability.  Remove every reply artifact
-    // before a private run and fail closed if it remains reachable; prompt text
-    // alone is never relied upon for this boundary.
-    removeResidentReplyArtifactsAtPaths(
-      RESIDENT_REPLY_KEY_PATH,
-      RESIDENT_REPLY_RECEIPT_PATH,
-    );
-    removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
-    if (
-      fs.existsSync(RESIDENT_REPLY_KEY_PATH)
-      || fs.existsSync(RESIDENT_REPLY_RECEIPT_PATH)
-      || fs.existsSync(RESIDENT_STAGED_REPLY_PATH)
-    ) {
-      throw new Error('native reply capability could not be revoked for private Workday');
-    }
-  };
-
   const scheduleTypedConsultation = (packet: ClaimedTypedConsultation): void => {
     pendingPrivateWorkdayJobs += 1;
     privateWorkdayChain = privateWorkdayChain
@@ -3220,15 +3276,12 @@ export async function handleStrategicResident(
         let outcome: 'completed' | 'abandoned' = 'abandoned';
         let resultSummary: string | undefined;
         try {
-          revokeNativeReplyForPrivateConsultation();
           const verified = verifyStrategicContextEnvelope(packet.envelope, {
             contextAuthorityGeneration: packet.envelope.context_authority_generation,
             privacyGeneration: packet.envelope.privacy_generation,
             minimumTranscriptSequence: packet.envelope.transcript_sequence,
           });
-          privateTurnStreamSuppressionDepth += 1;
-          try {
-          const workdayTurn = runTurn([{
+          const workdayTurn = runPrivateWorkdayTurn('typed-consultation', [{
             type: 'text',
             text: [
               'This is a private, durable typed-Fast consultation.',
@@ -3241,11 +3294,11 @@ export async function handleStrategicResident(
               `Delivery key: ${packet.delivery_key}`,
               `Continuation: ${packet.continuation_key}`,
               '',
-              buildFastResidentContextFrame(verified),
+              buildPrivateWorkdayContextFrame(verified),
               '',
               `## Private question\n${packet.question}`,
             ].join('\n'),
-          }], false, undefined, undefined, true);
+          }]);
           const { result, leaseHeld } = await awaitTypedConsultationTurn(packet, workdayTurn);
           resultSummary = result.resultText.trim().slice(0, 20_000) || undefined;
           outcome = (
@@ -3256,9 +3309,6 @@ export async function handleStrategicResident(
             || result.hardTimedOut
             || result.sentOperatorMessage
           ) ? 'abandoned' : 'completed';
-          } finally {
-            privateTurnStreamSuppressionDepth = Math.max(0, privateTurnStreamSuppressionDepth - 1);
-          }
         } catch (error) {
           sendLog(
             ws,
@@ -4623,6 +4673,7 @@ export async function handleStrategicResident(
             replyKeyPath: RESIDENT_REPLY_KEY_PATH,
             replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
             stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+            privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
           });
           writeArtifactsHelper(WORKSPACE);
           writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
@@ -4632,6 +4683,7 @@ export async function handleStrategicResident(
             replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
             stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
             residentIncarnationId: residentProcessIncarnation,
+            privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
           });
           provisionAmbientHelpers(taskId, WORKSPACE);
           residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
@@ -5249,6 +5301,7 @@ export async function handleStrategicResident(
         RESIDENT_REPLY_RECEIPT_PATH,
       );
       removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
+      removeResidentReplyKeyAtPath(RESIDENT_PRIVATE_TURN_MARKER_PATH);
       fs.rmdirSync(replyRuntime.runtimeDir);
     } catch (e) {
       sendLog(ws, `[resident] reply runtime cleanup incomplete (non-fatal): ${String(e)}\n`);

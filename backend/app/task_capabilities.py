@@ -1247,6 +1247,9 @@ def _capability_to_contract(capability: TaskCapability) -> dict[str, object]:
         "default_category": capability.default_category,
         "description": capability.description,
         "user_launchable": capability.user_launchable,
+        "requires_acceptance_evidence": (
+            capability.id.value in CODE_PRODUCING_TASK_TYPES
+        ),
         "operator_contract_launchable": capability.operator_contract_launchable,
         "provider_configurable": capability.provider_configurable,
         "allowed_providers": (

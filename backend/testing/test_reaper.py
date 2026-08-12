@@ -67,6 +67,7 @@ from app.reaper import (
     _ORPHAN_PRIORITY_DEFAULT,
     _normalize_reaper_retry_failure_class,
     _build_active_scan_stmt,
+    _startup_orphan_grace_remaining,
 )
 from app.reaper_orphan_classify import (
     _RUNNER_REPORT_CLAIM_GRACE_SECONDS,
@@ -402,6 +403,12 @@ class _StopLoop(Exception):
 @pytest_asyncio.fixture()
 async def reaper_db(mocker):
     """Isolated in-memory DB bound into app.reaper.AsyncSessionLocal."""
+    original_startup_grace = _runtime_config.get(
+        "reaper_startup_orphan_grace_seconds"
+    )
+    # Existing service tests intentionally exercise orphan handling immediately.
+    # Individual reconnect-grace tests opt back in explicitly.
+    _runtime_config["reaper_startup_orphan_grace_seconds"] = 0
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -421,12 +428,19 @@ async def reaper_db(mocker):
     mocker.patch("app.reaper_halt.AsyncSessionLocal", Session)
     mocker.patch("app.reaper_post_orphan_sweep.AsyncSessionLocal", Session)
 
-    async with Session() as s:
-        yield s
-
-    async with engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.drop_all)
-    await engine.dispose()
+    try:
+        async with Session() as s:
+            yield s
+    finally:
+        if original_startup_grace is None:
+            _runtime_config.pop("reaper_startup_orphan_grace_seconds", None)
+        else:
+            _runtime_config["reaper_startup_orphan_grace_seconds"] = (
+                original_startup_grace
+            )
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.drop_all)
+        await engine.dispose()
 
 
 @pytest.fixture()
@@ -9210,6 +9224,44 @@ async def test_reaper_service_spares_task_the_runner_still_reports_active(
         "suppression — its agent is alive, its heartbeat write was lock-starved"
     )
     assert t.attempt_count == 0
+
+
+@pytest.mark.asyncio
+async def test_reaper_startup_grace_defers_false_reap_until_runner_reconnect_window(
+    reaper_db,
+    stop_after_one_cycle,
+    reaper_side_effects,
+    monkeypatch,
+):
+    """A worker restart cannot charge its own downtime to an in-flight task."""
+    import app.reaper as reaper_module
+
+    now = _utcnow()
+    task, _vm_id = await _runner_zombie_e2e_fixture(
+        reaper_db,
+        now=now,
+        reported_task_ids=lambda _task: [str(_uuid_mod.uuid4())],
+    )
+    _runtime_config["reaper_startup_orphan_grace_seconds"] = 120
+    monkeypatch.setattr(reaper_module, "_REAPER_PROCESS_STARTED_AT", now)
+
+    assert _startup_orphan_grace_remaining(now + timedelta(seconds=6)) == 114
+    await _run_reaper_once()
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.attempt_count == 0
+
+    # Once the reconnect window has elapsed, the unchanged stale task follows
+    # the normal classifier and retry path.
+    monkeypatch.setattr(
+        reaper_module,
+        "_REAPER_PROCESS_STARTED_AT",
+        now - timedelta(seconds=121),
+    )
+    await _run_reaper_once()
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1
 
 
 # ── RELOCK stage reads the TASK-scoped contact row on multiplexed runners ────

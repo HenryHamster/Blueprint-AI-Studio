@@ -125,30 +125,196 @@ class TestGpuPassthroughRetry(unittest.TestCase):
 
 
 class TestVerificationToolchain(unittest.TestCase):
-    def test_bootstrap_failure_is_not_a_verification_claim(self):
-        with patch.object(local_runner, "_verification_toolchain_root", return_value=tempfile.mkdtemp()), \
-             patch.object(local_runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "pip failed")):
-            self.assertIsNone(local_runner._bootstrap_verification_toolchain())
+    @staticmethod
+    def _sources(root, *, packages=None):
+        packages = packages or {
+            "ruff": "1", "mypy": "1", "pytest": "1", "pgserver-search": "1",
+        }
+        manifest = Path(root, "verification-toolchain.json")
+        provisioner = Path(root, "provision-verification-toolchain.sh")
+        manifest.write_text(json.dumps({
+            "schema_version": 1,
+            "python_packages": packages,
+            "postgres": {"required_extensions": {"pg_trgm": ["migration.py"]}},
+        }))
+        provisioner.write_text("#!/usr/bin/env bash\n")
+        return (
+            str(manifest), str(provisioner), {
+                "manifest_sha256": "manifest-digest",
+                "provisioner_sha256": "provisioner-digest",
+            },
+        )
 
-    def test_bootstrap_success_returns_exact_private_paths(self):
+    @staticmethod
+    def _successful_provisioner(argv, **_kwargs):
+        if argv[0] == "bash":
+            if "--verify" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "verification stale")
+            venv = Path(argv[-1])
+            (venv / "bin").mkdir(parents=True)
+            (venv / "bin" / "python").touch()
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if len(argv) > 2 and argv[1] == "-c":
+            venv = Path(argv[0]).parent.parent
+            bindir = venv / "lib" / "pgserver" / "bin"
+            bindir.mkdir(parents=True, exist_ok=True)
+            for name in ("pg_config", "initdb", "pg_ctl", "pg_isready", "psql"):
+                executable = bindir / name
+                executable.touch()
+                executable.chmod(0o755)
+            return subprocess.CompletedProcess(argv, 0, str(bindir) + "\n", "")
+        raise AssertionError(f"unexpected toolchain command: {argv}")
+
+    def test_manifest_requires_pgserver_search_before_provisioning(self):
         with tempfile.TemporaryDirectory() as root:
-            def fake_run(argv, **_kwargs):
-                if argv[1:3] == ["-m", "venv"]:
-                    os.makedirs(os.path.join(root, "venv", "bin"))
-                    Path(root, "venv", "bin", "python").touch()
-                if len(argv) > 2 and argv[1] == "-c":
-                    bindir = Path(root, "venv", "lib", "pgserver", "bin")
-                    bindir.mkdir(parents=True, exist_ok=True)
-                    for name in ("pg_config", "initdb", "pg_ctl", "pg_isready", "psql"):
-                        path = bindir / name
-                        path.touch()
-                        path.chmod(0o755)
-                    return subprocess.CompletedProcess(argv, 0, str(bindir) + "\n", "")
-                return subprocess.CompletedProcess(argv, 0, "", "")
-            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_VERIFICATION_TOOLCHAIN": root}), \
-                 patch.object(local_runner.subprocess, "run", side_effect=fake_run):
+            self._sources(root, packages={"ruff": "1", "mypy": "1", "pytest": "1"})
+            with patch.object(local_runner, "__file__", str(Path(root, "local_runner.py"))), \
+                 patch.object(local_runner, "_verification_toolchain_root", return_value=root), \
+                 patch.object(local_runner.subprocess, "run") as run:
+                self.assertIsNone(local_runner._bootstrap_verification_toolchain())
+            run.assert_not_called()
+
+    def test_stale_backend_only_venv_is_repaired_from_manifest_provisioner(self):
+        with tempfile.TemporaryDirectory() as root:
+            sources = self._sources(root)
+            stale_python = Path(root, "venv", "bin", "python")
+            stale_python.parent.mkdir(parents=True)
+            stale_python.touch()
+            Path(root, "requirements.sha256").write_text("backend-only\n")
+            with patch.object(local_runner, "_verification_toolchain_root", return_value=root), \
+                 patch.object(local_runner, "_verification_toolchain_sources", return_value=sources), \
+                 patch.object(local_runner.subprocess, "run", side_effect=self._successful_provisioner) as run:
                 toolchain = local_runner._bootstrap_verification_toolchain()
+
             self.assertEqual(toolchain.python_path, os.path.join(root, "venv", "bin", "python"))
+            provision_calls = [call.args[0] for call in run.call_args_list if call.args[0][0] == "bash"]
+            self.assertEqual(len(provision_calls), 1)
+            self.assertNotEqual(provision_calls[0][-1], os.path.join(root, "venv"))
+            receipt = json.loads(Path(root, "toolchain.json").read_text())
+            self.assertEqual(receipt["manifest_sha256"], "manifest-digest")
+            self.assertEqual(receipt["provisioner_sha256"], "provisioner-digest")
+
+    def test_matching_manifest_and_provisioner_receipt_is_verified_without_reinstall(self):
+        with tempfile.TemporaryDirectory() as root:
+            sources = self._sources(root)
+            python_path = Path(root, "venv", "bin", "python")
+            python_path.parent.mkdir(parents=True)
+            python_path.touch()
+            Path(root, "toolchain.json").write_text(json.dumps({
+                "schema_version": 1,
+                "manifest_sha256": "manifest-digest",
+                "provisioner_sha256": "provisioner-digest",
+            }))
+
+            def verified_run(argv, **kwargs):
+                if argv[0] == "bash" and "--verify" in argv:
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return self._successful_provisioner(argv, **kwargs)
+
+            with patch.object(local_runner, "_verification_toolchain_root", return_value=root), \
+                 patch.object(local_runner, "_verification_toolchain_sources", return_value=sources), \
+                 patch.object(local_runner.subprocess, "run", side_effect=verified_run) as run:
+                toolchain = local_runner._bootstrap_verification_toolchain()
+
+            self.assertEqual(toolchain.python_path, str(python_path))
+            provision_calls = [call.args[0] for call in run.call_args_list if call.args[0][0] == "bash"]
+            self.assertEqual(
+                provision_calls,
+                [["bash", sources[1], "--verify", sources[0], str(python_path.parent.parent)]],
+            )
+
+    def test_failed_staged_refresh_preserves_existing_verified_venv(self):
+        with tempfile.TemporaryDirectory() as root:
+            sources = self._sources(root)
+            sentinel = Path(root, "venv", "known-good")
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text("preserve me")
+            Path(root, "toolchain.json").write_text(json.dumps({
+                "schema_version": 1,
+                "manifest_sha256": "previous-manifest",
+                "provisioner_sha256": "previous-provisioner",
+            }))
+            with patch.object(local_runner, "_verification_toolchain_root", return_value=root), \
+                 patch.object(local_runner, "_verification_toolchain_sources", return_value=sources), \
+                 patch.object(
+                     local_runner.subprocess, "run",
+                     return_value=subprocess.CompletedProcess([], 1, "", "download failed"),
+                 ):
+                self.assertIsNone(local_runner._bootstrap_verification_toolchain())
+            self.assertEqual(sentinel.read_text(), "preserve me")
+
+
+class TestVerificationToolchainRecovery(unittest.TestCase):
+    def setUp(self):
+        self._old_toolchain = local_runner._verification_toolchain
+        local_runner._verification_toolchain = None
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._verification_toolchain = self._old_toolchain
+        local_runner._shutdown_event.clear()
+
+    @staticmethod
+    def _report(*, ready, reason):
+        return {
+            "version": 1,
+            "boundary": {"class": "agent", "backend": "bwrap"},
+            "ready": ready,
+            "reason": reason,
+            "probes": {},
+        }
+
+    def test_recovery_is_due_only_after_bounded_cadence(self):
+        cadence = local_runner._VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS
+        self.assertFalse(local_runner._verification_recovery_due(10.0, 10.0 + cadence - 0.01))
+        self.assertTrue(local_runner._verification_recovery_due(10.0, 10.0 + cadence))
+
+    def test_transient_failure_then_success_publishes_report_and_spawn_toolchain(self):
+        state = local_runner._VerificationToolchainState(
+            self._report(ready=False, reason="bootstrap failed")
+        )
+        toolchain = iso.VerificationToolchain("/runner/venv/bin/python", "/runner/pg/bin")
+        ready_report = self._report(ready=True, reason=None)
+        with patch.object(local_runner, "_bootstrap_verification_toolchain", side_effect=[None, toolchain]), \
+             patch.object(local_runner, "_earn_project_verification", return_value=ready_report):
+            self.assertFalse(local_runner._recover_verification_toolchain_once(
+                state, _bwrap_caps(), ["node", "/agent/dist/index.js"], None
+            ))
+            self.assertTrue(local_runner._recover_verification_toolchain_once(
+                state, _bwrap_caps(), ["node", "/agent/dist/index.js"], None
+            ))
+
+        self.assertEqual(state.report(), ready_report)
+        self.assertIs(local_runner._current_verification_toolchain(), toolchain)
+
+    def test_failed_recovery_preserves_fail_closed_report_and_availability_state(self):
+        report = self._report(ready=False, reason="temporary network failure")
+        state = local_runner._VerificationToolchainState(report)
+        with patch.object(local_runner, "_bootstrap_verification_toolchain", return_value=None):
+            self.assertFalse(local_runner._recover_verification_toolchain_once(
+                state, _bwrap_caps(), ["node", "/agent/dist/index.js"], None
+            ))
+        self.assertEqual(state.report(), report)
+        self.assertIsNone(local_runner._current_verification_toolchain())
+
+    def test_recovered_toolchain_is_used_by_later_spawn(self):
+        state = local_runner._VerificationToolchainState(self._report(ready=True, reason=None))
+        toolchain = iso.VerificationToolchain("/runner/venv/bin/python", "/runner/pg/bin")
+        state.publish(toolchain, state.report())
+        plan = iso.ExecutionPlan(backend=iso.BACKEND_BWRAP, argv=["bwrap"])
+        process = MagicMock(pid=123, stdout=io.BytesIO(b""))
+        with patch.object(local_runner.iso, "decide_agent_backend", return_value=iso.BACKEND_BWRAP), \
+             patch.object(local_runner.iso, "plan_agent_execution", return_value=plan) as planner, \
+             patch.object(local_runner.subprocess, "Popen", return_value=process):
+            self.assertTrue(local_runner._spawn_agent_task(
+                task_id="recovered-task", task_type="fix", agent_token="token",
+                vm_instance_id="runner", orchestrator_url="https://api",
+                workspace="/tmp/ws", caps=_bwrap_caps(),
+                agent_binary=["node", "/agent/dist/index.js"], agent_image=None,
+                active_tasks={}, agent_started_at={}, agent_teardown={},
+                lock=threading.Lock(),
+            ))
+        self.assertIs(planner.call_args.kwargs["verification_toolchain"], toolchain)
 
 
 def _healthy_llm_clis():
@@ -4022,6 +4188,32 @@ class TestGpuDetection(unittest.TestCase):
         self.assertEqual(body["agent_backend"], iso.BACKEND_BWRAP)
         self.assertEqual(body["compute_backend"], iso.BACKEND_BWRAP)
 
+    def test_heartbeat_reports_full_checkout_sha(self):
+        posted_bodies = []
+        checkout_sha = "b" * 40
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v22-abc"), \
+                 patch.object(local_runner, "_checkout_source_sha", return_value=checkout_sha):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    {},
+                    threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(posted_bodies[0]["git_sha"], checkout_sha)
+
     def test_isolation_fields_none_when_caps_absent(self):
         """caps=None (an old caller) → the three isolation fields serialize as
         None so the heartbeat is non-breaking and the backend tolerates them."""
@@ -4092,7 +4284,7 @@ class TestGpuDetection(unittest.TestCase):
                     threading.Lock(),
                     {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
                     caps=_bwrap_caps(),
-                    project_verification=verification,
+                    verification_state=local_runner._VerificationToolchainState(verification),
                 )
         finally:
             local_runner._shutdown_event.clear()
@@ -5237,6 +5429,39 @@ class TestFunctionalProbes(unittest.TestCase):
         with patch("subprocess.run", return_value=fake):
             self.assertIsNone(local_runner._runner_version())
 
+    def test_checkout_source_sha_returns_full_head_sha(self):
+        sha = "a" * 40
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = sha + "\n"
+        with patch("subprocess.run", return_value=fake) as run:
+            self.assertEqual(
+                local_runner._clean_source_sha("v22-15-gabc1234"), sha
+            )
+        self.assertEqual(run.call_args.args[0], ["git", "rev-parse", "HEAD"])
+
+    def test_checkout_source_sha_rejects_dirty_checkout(self):
+        with patch("subprocess.run") as run:
+            self.assertIsNone(
+                local_runner._clean_source_sha("v22-15-gabc1234-dirty")
+            )
+        run.assert_not_called()
+
+    def test_checkout_source_sha_rejects_unavailable_checkout(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertIsNone(
+                local_runner._clean_source_sha("v22-15-gabc1234")
+            )
+
+    def test_checkout_source_sha_rejects_short_head_sha(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "abc1234\n"
+        with patch("subprocess.run", return_value=fake):
+            self.assertIsNone(
+                local_runner._clean_source_sha("v22-15-gabc1234")
+            )
+
     def test_agent_binary_checkout_sha_returns_full_sha_from_entry_directory(self):
         sha = "9" * 40
         fake = MagicMock()
@@ -5771,6 +5996,30 @@ class TestDescribeSha(_LocalRunnerTestCase):
     def test_empty_string_returns_none(self):
         """``""`` → ``None`` (empty input)."""
         self.assertIsNone(local_runner._describe_sha(""))
+
+
+class TestCleanSourceSha(_LocalRunnerTestCase):
+    """Source identity is resolved from git, not abbreviated display text."""
+
+    def test_clean_source_sha_resolves_full_head_for_abbreviated_describe(self):
+        full_sha = "a" * 40
+        git_result = MagicMock(returncode=0, stdout=f"{full_sha}\n")
+        with patch("subprocess.run", return_value=git_result) as run:
+            self.assertEqual(
+                local_runner._clean_source_sha("v1.2.3-5-g4f5a6b7"),
+                full_sha,
+            )
+
+        self.assertEqual(run.call_args.args[0], ["git", "rev-parse", "HEAD"])
+        self.assertEqual(
+            run.call_args.kwargs["cwd"],
+            str(Path(local_runner.__file__).resolve().parent),
+        )
+
+    def test_clean_source_sha_reports_unknown_for_non_full_head(self):
+        git_result = MagicMock(returncode=0, stdout="4f5a6b7\n")
+        with patch("subprocess.run", return_value=git_result):
+            self.assertIsNone(local_runner._clean_source_sha("v1.2.3-5-g4f5a6b7"))
 
 
 class TestHeartbeatVersionHintWarning(unittest.TestCase):
@@ -6872,6 +7121,33 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
             {"task_id": "task-abc", "reason": "no bwrap: fail-closed"},
         )
 
+    def test_duplicate_dispatch_declines_server_pin_and_releases_local_capacity(self):
+        """A duplicate pull is already PROVISIONING server-side, so merely
+        skipping it strands the task. Release the local permit and explicitly
+        decline the server claim in the same branch."""
+        from unittest.mock import patch
+
+        ledger = MagicMock()
+        capacity = MagicMock()
+        with patch.object(local_runner, "_notify_decline") as notify_decline:
+            local_runner._decline_duplicate_dispatch(
+                "https://api.example.com",
+                "tok-123",
+                "task-duplicate",
+                ledger,
+                "agent-poll:7",
+                capacity,
+            )
+
+        ledger.release.assert_called_once_with("agent-poll:7")
+        capacity.release.assert_called_once_with()
+        notify_decline.assert_called_once_with(
+            "https://api.example.com",
+            "tok-123",
+            "task-duplicate",
+            reason=local_runner._DUPLICATE_DISPATCH_DECLINE_REASON,
+        )
+
     def test_spawn_agent_task_reports_decline_reason(self):
         """_spawn_agent_task hands the fail-closed reason back to the caller
         (which forwards it to /decline-task) instead of only printing it."""
@@ -7741,8 +8017,10 @@ class TestConcurrencyPresetMismatch(_LocalRunnerTestCase):
             captured["body"] = body
             return 200, {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}
 
+        checkout_sha = "c" * 40
         with patch.object(local_runner, "_post", side_effect=fake_post), \
-             patch.object(local_runner, "_workspace_writable", return_value=True):
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(local_runner, "_checkout_source_sha", return_value=checkout_sha):
             local_runner._preflight(
                 "https://api.example.com", "tok", None,
                 _bwrap_caps(), _gpu_state(()), 2, 2,
@@ -7751,6 +8029,7 @@ class TestConcurrencyPresetMismatch(_LocalRunnerTestCase):
         self.assertIn("body", captured)
         self.assertFalse(captured["body"]["active_work_report"])
         self.assertEqual(captured["body"]["active_task_ids"], [])
+        self.assertEqual(captured["body"]["git_sha"], checkout_sha)
 
     def test_no_warn_only_mismatch_path(self):
         """main() no longer emits the warn-only "disagrees" advisory when the env
@@ -9550,14 +9829,27 @@ class DownloadInputArtifactTests(_LocalRunnerTestCase):
 
     def test_corrupt_extract_never_publishes_staged_predecessor_files(self):
         """A tar failure after a member write leaves the durable dir empty."""
-        class _PartiallyFailingTar:
-            def getmembers(self):
-                return []
+        class _PartiallyFailingSource:
+            def __init__(self):
+                self._first_read = True
 
-            def extractall(self, destination, members):
-                with open(os.path.join(destination, "checkpoint.pt"), "wb") as fh:
-                    fh.write(b"partial predecessor")
+            def read(self, _size=-1):
+                if self._first_read:
+                    self._first_read = False
+                    return b"partial predecessor"
                 raise tarfile.ReadError("corrupt after first member")
+
+            def close(self):
+                pass
+
+        class _PartiallyFailingTar:
+            def __iter__(self):
+                member = tarfile.TarInfo("checkpoint.pt")
+                member.size = len(b"partial predecessor") + 1
+                return iter((member,))
+
+            def extractfile(self, _member):
+                return _PartiallyFailingSource()
 
             def __enter__(self):
                 return self

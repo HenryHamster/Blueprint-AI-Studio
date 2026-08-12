@@ -3,7 +3,8 @@
 A strategic cycle assembles and re-sends the full strategic context (~137 KB
 across ~17 turns) whether or not anything changed since the previous cycle.
 For a quiet project that costs the full price for no new information — the
-strategist is 92% of all LLM spend, and every cadence cycle pays for the
+strategist is approximately 47% of all LLM spend (measured baseline: see
+docs/strategic-cycle-cost-baseline.md), and every cadence cycle pays for the
 assembly regardless of delta.
 
 This module implements the cheap pre-check that runs on the cadence path

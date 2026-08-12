@@ -898,73 +898,16 @@ async def get_autonomy_debug(
             }
         )
 
-    # Guard 4b: total_research_active — mirrors _spawn_research_task_inner's
-    # second cap (autonomous_research.py:2091-2132): total non-terminal research
-    # (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING), excluding EVALUATING parents
-    # that still have active (non-terminal) children — those are productive
-    # in-flight work, not stuck parents piling up merge complexity.
-    max_total_research = project_parallelism_cap(
-        project, "max_total_research", "max_total_research_per_project", 5
-    )
     # Dialect-aware research-type predicate: the `.as_string()` form
     # JSON_QUOTE-double-quotes on SQLite and never matches, so build the
-    # json_extract form there (see ci_merge_helpers.py:31-43). Shared with the
-    # rate-limit guard below.
+    # json_extract form there (see ci_merge_helpers.py:31-43). Used by the
+    # rate-limit guard below and by Guard 4b, which lives after the
+    # fleet-headroom probe it depends on.
     dialect_name = resolve_dialect_name(session)
     if dialect_name == "sqlite":
         type_is_research = func.json_extract(Task.payloads, "$[0].type") == "research"
     else:
         type_is_research = Task.payloads[0]["type"].as_string() == "research"
-    total_research_result = await session.execute(
-        select(Task.id, Task.status)
-        .where(
-            Task.project_id == project_id,
-            Task.status.in_(
-                [
-                    TaskStatus.QUEUED,
-                    TaskStatus.PROVISIONING,
-                    TaskStatus.IN_PROGRESS,
-                    TaskStatus.EVALUATING,
-                ]
-            ),
-            type_is_research,
-        )
-    )
-    total_research_rows = total_research_result.all()
-    total_research_count = len(total_research_rows)
-    evaluating_research_ids = [
-        row[0] for row in total_research_rows if row[1] == TaskStatus.EVALUATING
-    ]
-    if evaluating_research_ids:
-        productive_evaluating_result = await session.execute(
-            select(func.count(func.distinct(Task.parent_task_id))).where(
-                Task.parent_task_id.in_(evaluating_research_ids),
-                Task.status.in_(
-                    [
-                        TaskStatus.QUEUED,
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.EVALUATING,
-                        TaskStatus.BLOCKED,
-                    ]
-                ),
-            )
-        )
-        productive_evaluating = productive_evaluating_result.scalar() or 0
-        total_research_count = max(0, total_research_count - productive_evaluating)
-    if total_research_count >= max_total_research:
-        blocking_guards.append(
-            {
-                "guard": "total_research_active",
-                "reason": (
-                    f"Total research ({total_research_count}) >= max_total_research "
-                    f"({max_total_research}) (excluding EVALUATING parents with "
-                    "active children)"
-                ),
-                "total_research_count": total_research_count,
-                "max_total_research": max_total_research,
-            }
-        )
 
     # Guard 5: rate_limit_exceeded
     one_hour_ago = now - timedelta(hours=1)
@@ -1028,25 +971,124 @@ async def get_autonomy_debug(
             }
         )
 
-    # Guard 6b: vm_slots_full — _check_idle_research only spawns when VMs are available.
-    # This is the most common silent-return path when max_concurrent_vms is small.
-    vm_consuming = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(
-                Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
-            )
+    # Guard 6b: vm_slots_full — the idle-research sweep scales admission to
+    # measured fleet headroom (compute_headroom_spawn_budget): a budget of 0
+    # means the fleet is below the min-free-slots floor, so no research spawns.
+    # Mirroring enforcement keeps "why no spawn" reporting in sync with the gate.
+    from app.fleet_utilization import (
+        compute_headroom_spawn_budget,
+        get_fleet_utilization_snapshot,
+    )
+
+    headroom = None
+    headroom_budget = 0
+    try:
+        snapshot = await get_fleet_utilization_snapshot(session)
+        headroom = compute_headroom_spawn_budget(
+            snapshot,
+            min_free_slots=_runtime_config.get(
+                "research_headroom_min_free_slots", 2
+            ),
+            cap=_runtime_config.get("research_fleet_spawn_budget", 6),
         )
-    ).scalar() or 0
-    max_concurrent_vms = _runtime_config.get("max_concurrent_vms", 5)
-    if vm_consuming >= max_concurrent_vms:
+        headroom_budget = headroom["budget"]
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[AUTONOMY-DEBUG] fleet headroom snapshot failed for project %s",
+            project_id,
+            exc_info=True,
+        )
+        headroom_budget = _runtime_config.get("research_fleet_spawn_budget", 6)
+    if headroom_budget <= 0:
         blocking_guards.append(
             {
                 "guard": "vm_slots_full",
-                "reason": f"VM slots full ({vm_consuming}/{max_concurrent_vms}) — waiting for a task to finish",
-                "vm_consuming": vm_consuming,
-                "max_concurrent_vms": max_concurrent_vms,
+                "reason": (
+                    f"Fleet headroom below floor (available "
+                    f"{headroom['available'] if headroom else '?'} < min_free_slots "
+                    f"{headroom['min_free_slots'] if headroom else '?'}) — "
+                    f"no research admission this sweep"
+                ),
+                "headroom_budget": headroom_budget,
+                "vm_slots_available": headroom["available"] if headroom else None,
+                "min_free_slots": headroom["min_free_slots"] if headroom else None,
+                "reason_code": headroom["reason"] if headroom else "headroom_unmeasured",
+            }
+        )
+
+    # Guard 4b: total_research_active — mirrors `_spawn_research_task_inner`'s
+    # second cap exactly. Pending EVALUATING rollups pile up merge complexity
+    # on the same base, so they normally count against the total — minus
+    # EVALUATING parents that still have active (non-terminal) children
+    # (productive in-flight work, not stuck backlog) — unless the operator
+    # headroom relaxation is on AND the fleet has headroom above the admission
+    # floor, in which case EVALUATING is excluded entirely (same condition the
+    # spawn path checks).
+    max_total_research = project_parallelism_cap(
+        project, "max_total_research", "max_total_research_per_project", 5
+    )
+    _headroom_above_floor = headroom_budget > 0
+    _excludes_evaluating = (
+        _runtime_config.get("research_headroom_ignores_evaluating", True)
+        and _headroom_above_floor
+    )
+    if _excludes_evaluating:
+        total_research_count = active_research_count
+    else:
+        total_research_rows = (
+            await session.execute(
+                select(Task.id, Task.status).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                        ]
+                    ),
+                    type_is_research,
+                )
+            )
+        ).all()
+        total_research_count = len(total_research_rows)
+        evaluating_research_ids = [
+            row[0] for row in total_research_rows if row[1] == TaskStatus.EVALUATING
+        ]
+        if evaluating_research_ids:
+            productive_evaluating = (
+                await session.execute(
+                    select(func.count(func.distinct(Task.parent_task_id))).where(
+                        Task.parent_task_id.in_(evaluating_research_ids),
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                                TaskStatus.BLOCKED,
+                            ]
+                        ),
+                    )
+                )
+            ).scalar() or 0
+            total_research_count = max(0, total_research_count - productive_evaluating)
+    if total_research_count >= max_total_research:
+        blocking_guards.append(
+            {
+                "guard": "total_research_active",
+                "reason": (
+                    f"Total research ({total_research_count}) >= max_total "
+                    f"({max_total_research}) "
+                    + (
+                        "(excluding EVALUATING — headroom relaxation)"
+                        if _excludes_evaluating
+                        else "(including EVALUATING, excluding parents with "
+                        "active children)"
+                    )
+                ),
+                "total_research_count": total_research_count,
+                "max_total_research": max_total_research,
             }
         )
 
@@ -1095,6 +1137,7 @@ async def get_autonomy_debug(
         else None,
         "directions": directions_info,
         "next_check_at": next_check_at,
+        "headroom": headroom,
         "strategic_cycle_history": await _get_cycle_history_for_debug(
             session, project_id
         ),

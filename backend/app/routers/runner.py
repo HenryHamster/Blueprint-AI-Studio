@@ -75,8 +75,8 @@ from app.execution_principal import resolve_project_execution_principal
 from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobFile, ComputeJobStatus, LocalRunner, Project, RunnerHeartbeatSnapshot, Task, TaskStatus, _utcnow
 from app.runner_decline import (
     DECLINE_ESCALATION_THRESHOLD as _DECLINE_ESCALATION_THRESHOLD,
-    DECLINED_BY_CONTEXT_KEY,
     maybe_create_decline_alert as _maybe_create_decline_alert,
+    record_runner_decline,
 )
 from app.task_capabilities import agent_capability_slice
 from app.workbench_events import (
@@ -1640,22 +1640,15 @@ async def decline_task(
     ):
         new_ctx.pop(key, None)
 
-    # ── Record the decline so the dispatcher can stop re-picking this runner ──
-    declined_by = dict(new_ctx.get(DECLINED_BY_CONTEXT_KEY) or {})
-    prev = declined_by.get(str(runner.id)) or {}
-    count = int(prev.get("count") or 0) + 1
-    declined_by[str(runner.id)] = {
-        "count": count,
-        "at": _utcnow().isoformat(),
-        "reason": reason[:500],
-        "hostname": runner.hostname,
-    }
-    new_ctx[DECLINED_BY_CONTEXT_KEY] = declined_by
-    total_declines = sum(
-        int((rec or {}).get("count") or 0) for rec in declined_by.values()
-    )
     task.context = new_ctx
     flag_modified(task, "context")
+    # ── Record the decline so the dispatcher can stop re-picking this runner ──
+    count, total_declines = record_runner_decline(
+        task,
+        str(runner.id),
+        reason=reason,
+        hostname=runner.hostname,
+    )
     task.latest_status_message = (
         f"Declined by runner {runner.hostname or runner.id} "
         f"(decline #{total_declines}): {reason}"

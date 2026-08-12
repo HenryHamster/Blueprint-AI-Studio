@@ -46,7 +46,6 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # slice and star-imports the same helper hub, so it needs the identical F405
 # exemption as the __<domain>.py buckets.
 "testing/test_release_qualifier__*.py" = ["F405"]
-"testing/test_release_qualifier.py" = ["F405"]
 "testing/_release_qualifier_testhelpers.py" = ["F401"]
 # main.py has many intentional except Exception blocks for background-task error handling
 # B904: FastAPI pattern — raise HTTPException in except block is intentional HTTP conversion

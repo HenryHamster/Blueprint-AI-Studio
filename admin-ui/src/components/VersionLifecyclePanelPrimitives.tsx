@@ -1006,10 +1006,6 @@ export function PromotedAwaitingActivationCallout({
   optimisticApproval?: { activation_requested_at: string; activation_requested_by: string } | null;
 }) {
   const servingStatus = version.serving?.status ?? version.serving_status;
-  // Only the "promoted, still unconfirmed" state is awaiting the operator's
-  // single activation approval — serving_confirmed and deploy_failed have their
-  // own surfaces, and an un-armed promotion reads as NULL/NA, not pending.
-  if (version.status !== 'promoted' || servingStatus !== 'unconfirmed') return null;
   const promotedAt = version.promoted_at ?? version.serving?.confirmed_at ?? version.served_at;
   const deadline = version.deploy_confirm_deadline;
   const deadlineText = deadline
@@ -1018,6 +1014,32 @@ export function PromotedAwaitingActivationCallout({
   const activationRequestedAt = version.activation_requested_at ?? optimisticApproval?.activation_requested_at;
   const activationRequestedBy = version.activation_requested_by ?? optimisticApproval?.activation_requested_by;
   const approved = !!activationRequestedAt;
+  const approvalDeadlineMs = deadline ? Date.parse(deadline) : Number.NaN;
+  const [nowMs, setNowMs] = useState(Date.now);
+  useEffect(() => {
+    if (!approved || !Number.isFinite(approvalDeadlineMs) || approvalDeadlineMs <= nowMs) {
+      return undefined;
+    }
+    const timer = window.setTimeout(
+      () => setNowMs(Date.now()),
+      approvalDeadlineMs - nowMs,
+    );
+    return () => window.clearTimeout(timer);
+  }, [approvalDeadlineMs, approved, nowMs]);
+  // Only a promoted version awaiting activation is shown here. The backend
+  // deliberately keeps confirmation_timed_out retryable, while
+  // serving_confirmed and deploy_failed have their own surfaces and an
+  // un-armed promotion reads as NULL/NA, not pending.
+  if (
+    version.status !== 'promoted'
+    || (servingStatus !== 'unconfirmed' && servingStatus !== 'confirmation_timed_out')
+  ) return null;
+  // A request that survived the confirmation window is deliberately retryable:
+  // the backend treats a new approval as a fresh attempt for
+  // confirmation_timed_out, while an in-window request stays at-most-once.
+  const approvalExpired = servingStatus === 'confirmation_timed_out'
+    || (approved && Number.isFinite(approvalDeadlineMs) && approvalDeadlineMs <= nowMs);
+  const approvalActionLabel = approvalExpired ? 'Retry activation approval' : 'Approve activation';
   return (
     <div
       data-testid="promoted-awaiting-activation"
@@ -1025,7 +1047,9 @@ export function PromotedAwaitingActivationCallout({
     >
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="text-ui-sm font-semibold text-amber-400">
-          {approved ? 'approved — awaiting activation' : 'promoted, awaiting activation'}
+          {approved && !approvalExpired
+            ? 'approved — awaiting activation'
+            : 'promoted, awaiting activation'}
         </span>
         <span className="text-ui-sm font-mono text-amber-300">v{version.version_number}</span>
         {promotedAt && (
@@ -1033,11 +1057,11 @@ export function PromotedAwaitingActivationCallout({
         )}
       </div>
       <p className="text-ui-sm text-amber-300/80">
-        {approved
+        {approved && !approvalExpired
           ? <>Approved by {activationRequestedBy || 'an administrator'}; the installed control-plane deploy agent will validate the bound manifest, invoke the root release service, and post a serving receipt after activation{deadlineText}.</>
-          : <>Approval records the request; it does not deploy immediately. The installed control-plane deploy agent polls for this approval, invokes the root release service for the bound release, and posts the serving receipt after activation. If the agent is not installed and running, use <span className="font-mono">blueprint deploy</span> manually{deadlineText}.</>}
+          : <>{approvalExpired ? 'The previous approval did not receive a serving receipt before its confirmation window closed. ' : 'Approval records the request; it does not deploy immediately. '}The installed control-plane deploy agent polls for this approval, invokes the root release service for the bound release, and posts the serving receipt after activation. If the agent is not installed and running, use <span className="font-mono">blueprint deploy</span> manually{deadlineText}.</>}
       </p>
-      {canApprove && !approved && onApprove && (
+      {canApprove && (!approved || approvalExpired) && onApprove && (
         <button
           type="button"
           data-testid="approve-activation"
@@ -1045,7 +1069,7 @@ export function PromotedAwaitingActivationCallout({
           disabled={approving}
           className="self-start text-ui-sm px-2 py-1 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-300 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
         >
-          {approving ? 'Approving…' : 'Approve activation'}
+          {approving ? 'Approving…' : approvalActionLabel}
         </button>
       )}
       {approvalError && (

@@ -188,6 +188,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "reserved_slots_for_types",
         "residual_audit_defer_escalation_threshold",
         "residual_remediation_cooldown_hours",
+        "research_quality_grader_enabled",
         "rollup_merge_queue_enabled",
         "env_preflight_enabled",
         "smoketest_enabled",
@@ -825,6 +826,9 @@ async def get_settings(
         ),
         "cochange_decomposition_enabled": bool(
             _runtime_config.get("cochange_decomposition_enabled", False)
+        ),
+        "research_quality_grader_enabled": bool(
+            _runtime_config.get("research_quality_grader_enabled", False)
         ),
         "park_and_retarget_enabled": bool(
             _runtime_config.get("park_and_retarget_enabled", False)
@@ -1870,6 +1874,14 @@ async def _apply_settings(
                 detail="cochange_decomposition_enabled must be a boolean",
             )
         _runtime_config["cochange_decomposition_enabled"] = val
+    if "research_quality_grader_enabled" in payload:
+        val = payload["research_quality_grader_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="research_quality_grader_enabled must be a boolean",
+            )
+        _runtime_config["research_quality_grader_enabled"] = val
     if "park_and_retarget_enabled" in payload:
         val = payload["park_and_retarget_enabled"]
         if not isinstance(val, bool):
@@ -3621,6 +3633,9 @@ async def _apply_settings(
                     ),
                     "cochange_decomposition_enabled": bool(
                         _runtime_config.get("cochange_decomposition_enabled", False)
+                    ),
+                    "research_quality_grader_enabled": bool(
+                        _runtime_config.get("research_quality_grader_enabled", False)
                     ),
                     "park_and_retarget_enabled": bool(
                         _runtime_config.get("park_and_retarget_enabled", False)

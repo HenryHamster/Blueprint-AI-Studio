@@ -1557,6 +1557,82 @@ async def _make_project_with_version(db_session, *, vm="agent-vm-qual"):
 
 
 @pytest.mark.asyncio
+async def test_operator_authorship_receipt_uses_promoted_serving_range(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """A read validates the immutable promoted-to-served receipt range only."""
+    from unittest.mock import AsyncMock
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.release_commit_authorship import (
+        AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        AUTHORSHIP_RECEIPT_SOURCE,
+    )
+
+    project, task, _ = await _make_project_with_version(
+        db_session, vm="agent-vm-authorship-range"
+    )
+    promoted = ReleaseVersion(
+        project_id=project.id,
+        version_number=9,
+        status="promoted",
+        base_sha="a" * 40,
+        promoted_sha="b" * 40,
+        served_sha="c" * 40,
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        serving_status="serving_confirmed",
+        last_qualification={
+            "status": "promoted",
+            "operator_authored_commits": {
+                "source": AUTHORSHIP_RECEIPT_SOURCE,
+                "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+                "state": "resolved",
+                "count": 0,
+                "offenders": [],
+                "range": {"base_sha": "b" * 40, "head_sha": "c" * 40},
+                "measured_at": "2026-01-01T00:00:00+00:00",
+                "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+            },
+        },
+    )
+    db_session.add(promoted)
+    await db_session.commit()
+
+    monkeypatch.setattr("app.deployed_sha.get_serving_sha", lambda: "d" * 40)
+    count = AsyncMock(side_effect=AssertionError("read path recomputed authorship"))
+    monkeypatch.setattr("app.release_commit_authorship.count_non_bot_authored_commits", count)
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": create_agent_token(str(task.id), task.vm_instance_id)},
+    )
+
+    assert response.status_code == 200, response.text
+    report = response.json()["operator_authored_commits"]
+    assert report["state"] == "resolved"
+    assert report["count"] == 0
+    assert report["range"] == {"base_sha": "b" * 40, "head_sha": "c" * 40}
+    count.assert_not_awaited()
+
+    tampered_qualification = dict(promoted.last_qualification)
+    tampered_report = dict(tampered_qualification["operator_authored_commits"])
+    tampered_report["range"] = {"base_sha": "b" * 40, "head_sha": "d" * 40}
+    tampered_qualification["operator_authored_commits"] = tampered_report
+    promoted.last_qualification = tampered_qualification
+    flag_modified(promoted, "last_qualification")
+    db_session.add(promoted)
+    await db_session.commit()
+
+    tampered = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": create_agent_token(str(task.id), task.vm_instance_id)},
+    )
+    tampered_report = tampered.json()["operator_authored_commits"]
+    assert tampered_report["state"] == "unresolved"
+    assert tampered_report["reason"] == "stored_authorship_receipt_invalid"
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_qualification_returns_latest_verdict_findings(
     client: AsyncClient, db_session
 ):
@@ -1630,6 +1706,13 @@ async def test_agent_fetch_qualification_returns_latest_verdict_findings(
     # carry no resolution-ledger rows, so the gating (HIGH+MEDIUM) findings read as
     # unresolved and the trigger is not met.
     assert body["requalification_ready"] is False
+    assert body["finding_total"] == 2
+    assert body["resolved_finding_total"] == 0
+    assert body["projected_audit_score"] == pytest.approx(1.0)
+    assert body["projected_confidence"] == pytest.approx(0.95)
+    assert body["projected_promotion_ready"] is True
+    assert body["projected_confidence"] >= body["promotion_confidence_threshold"]
+    assert body["required_audit_score"] == pytest.approx(0.9079)
     assert "finding_resolution" in body
     states = {f["state"] for f in body["finding_resolution"]}
     assert states == {"unresolved"}
@@ -1834,6 +1917,9 @@ async def test_agent_fetch_qualification_surfaces_finding_resolution_states(
     assert res2.status_code == 200, res2.text
     body2 = res2.json()
     assert body2["requalification_ready"] is True
+    assert body2["resolved_finding_total"] == 2
+    assert body2["projected_audit_score"] == pytest.approx(1.0)
+    assert body2["projected_confidence"] >= body2["promotion_confidence_threshold"]
     states2 = {f["key"]: f["state"] for f in body2["finding_resolution"]}
     assert states2[high["key"]] == "resolved"
     assert states2[medium["key"]] == "stale"
@@ -1882,6 +1968,85 @@ async def test_agent_fetch_qualification_falls_back_to_last_qualification(
     # Additive re-qualification signal present on the fallback path too.
     assert body["requalification_ready"] is False
     assert [f["state"] for f in body["finding_resolution"]] == ["unresolved"]
+
+
+@pytest.mark.asyncio
+async def test_policy_truth_separates_live_081_from_last_attempt_090(
+    client: AsyncClient, db_session, mocker
+):
+    """Fetch surfaces must not present an old attempt threshold as live policy."""
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app import release_qualifier as rq
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-policy-truth"
+    )
+    mocker.patch.dict(
+        rq._runtime_config,
+        {
+            "promotion_threshold": 0.81,
+            "promotion_weights": {
+                "audit": 4 / 7,
+                "test_erosion": 3 / 7,
+            },
+            "completion_debt_weight_mode": "observe",
+        },
+        clear=False,
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "a" * 40,
+        "confidence": 0.79,
+        "threshold": 0.90,
+        "promotion_policy_snapshot": {
+            "threshold": 0.90,
+            "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
+        },
+        "promotion_policy_source": "yaml_file",
+        "promotion_policy_fallback_error": None,
+        "finalized_at": "2026-06-03T10:00:00",
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    headers = {"x-agent-token": token}
+    qualification_response = await client.get(
+        f"/api/agent/projects/{project.id}/qualification", headers=headers
+    )
+    version_response = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase", headers=headers
+    )
+
+    assert qualification_response.status_code == 200, qualification_response.text
+    qualification = qualification_response.json()
+    assert qualification["current_effective_policy"]["threshold"] == pytest.approx(
+        0.81
+    )
+    assert qualification["current_effective_policy"]["source"] == "runtime_config"
+    assert qualification["active_or_last_attempt_policy"]["threshold"] == pytest.approx(
+        0.90
+    )
+    assert qualification["active_or_last_attempt_policy"]["source"] == "yaml_file"
+    assert (
+        qualification["current_effective_policy"]["policy_hash"]
+        != qualification["active_or_last_attempt_policy"]["policy_hash"]
+    )
+
+    assert version_response.status_code == 200, version_response.text
+    version_phase = version_response.json()["data"]
+    assert version_phase["current_effective_policy"] == qualification[
+        "current_effective_policy"
+    ]
+    assert version_phase["active_or_last_attempt_policy"] == qualification[
+        "active_or_last_attempt_policy"
+    ]
+    assert version_phase["current_version"]["active_or_last_attempt_policy"] == (
+        qualification["active_or_last_attempt_policy"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2359,11 +2524,13 @@ async def test_agent_fetch_qualification_stamps_serving_sha_on_verdict_path(
 
     # Mock the serving SHA to a known test value
     test_serving_sha = "f" * 40
+    version.base_sha = "b" * 40
+    db_session.add(version)
+    await db_session.commit()
     monkeypatch.setattr(
         "app.deployed_sha.get_serving_sha",
         lambda: test_serving_sha,
     )
-
     token = create_agent_token(str(task.id), task.vm_instance_id)
     res = await client.get(
         f"/api/agent/projects/{project.id}/qualification",
@@ -2374,6 +2541,8 @@ async def test_agent_fetch_qualification_stamps_serving_sha_on_verdict_path(
 
     assert body["source"] == "qualification_verdict"
     assert body["serving_sha"] == test_serving_sha
+    assert body["operator_authored_commits"]["state"] == "unresolved"
+    assert body["operator_authored_commits"]["count"] is None
 
 
 @pytest.mark.asyncio

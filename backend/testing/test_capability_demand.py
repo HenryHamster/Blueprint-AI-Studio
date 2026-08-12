@@ -758,7 +758,10 @@ class TestComputeUnprovenDemandedCapabilities:
                     "task_id": f"proof:{name}",
                     "proof_kind": "named_test",
                     "proof_ref": f"testing/test_{name}.py::test_{name}",
-                    "proved_at": "2026-07-16T00:00:00Z",
+                    # consumer_gate_proof_status defaults now→_utcnow() and applies
+                    # the 30d freshness TTL; anchor proved_at to real now so the
+                    # "proven capability excluded" assertions can't rot over time.
+                    "proved_at": (_utcnow() - timedelta(days=1)).isoformat(),
                     "commit_sha": "a" * 40,
                 }
             ]

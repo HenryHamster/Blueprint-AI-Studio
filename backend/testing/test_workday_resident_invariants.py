@@ -302,6 +302,28 @@ async def test_resident_fresh_attempt_restores_actual_runner_columns(db_session)
 
 
 @pytest.mark.asyncio
+async def test_resident_retry_does_not_restore_task_declined_runner(db_session):
+    _, task, runner_id = await _make_resident_record(
+        db_session, task_status=TaskStatus.FAILED
+    )
+    prior_context = dict(task.context or {})
+    reset_task_for_fresh_attempt(task)
+    task.status = TaskStatus.QUEUED
+
+    restored = await _restore_resident_retry_binding(
+        task,
+        db_session,
+        prior_context,
+        excluded_runner_ids={runner_id},
+    )
+
+    assert restored is False
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id is None
+    assert "runner_target_id" not in (task.context or {})
+
+
+@pytest.mark.asyncio
 async def test_retry_wait_projection_failure_keeps_durable_retry(
     db_session, monkeypatch
 ):
@@ -384,7 +406,7 @@ def test_all_three_fresh_attempt_paths_reapply_resident_binding():
         "_prior_retry_ctx",
     )
     for evidence, post_reset in zip(expected_path_evidence, segments[1:]):
-        window = post_reset[:6000]
+        window = post_reset[:12000]
         assert evidence in window
         assert "await _restore_resident_retry_binding(" in window
     assert source.count(

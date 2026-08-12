@@ -115,15 +115,15 @@ fi
 # without an explicit --testmon* arg, so a leftover .testmondata on disk
 # has no effect on the run and is preserved for the next opt-in.
 
-# --- Cleanup: combined trap for CLAUDE.md copy + Postgres sidecar ---
+# --- Cleanup: combined trap for Postgres sidecar and temporary outputs ---
 PG_CONTAINER=""
 PG_NETWORK=""
 PG_DATA=""
 PG_SOCKET=""
 PG_BIN=""
 VERIFICATION_OUTPUT_DIR=""
+VERIFICATION_OUTPUT_DIR_OWNED=0
 cleanup() {
-  rm -f CLAUDE.md
   [ -n "$PG_CONTAINER" ] && docker rm -f "$PG_CONTAINER" &>/dev/null || true
   [ -n "$PG_NETWORK" ] && docker network rm "$PG_NETWORK" &>/dev/null || true
   if [ -n "$PG_BIN" ] && [ -n "$PG_DATA" ] && [ -d "$PG_DATA" ]; then
@@ -131,17 +131,14 @@ cleanup() {
   fi
   [ -n "$PG_DATA" ] && rm -rf "$PG_DATA" || true
   [ -n "$PG_SOCKET" ] && rm -rf "$PG_SOCKET" || true
-  [ -n "$VERIFICATION_OUTPUT_DIR" ] && rm -rf "$VERIFICATION_OUTPUT_DIR" || true
+  [ "$VERIFICATION_OUTPUT_DIR_OWNED" = "1" ] && [ -n "$VERIFICATION_OUTPUT_DIR" ] && rm -rf "$VERIFICATION_OUTPUT_DIR" || true
 }
 trap cleanup EXIT
 
-# Copy root CLAUDE.md into the Docker build context so test_claude_md_* in
-# test_invariants.py finds it at /app/CLAUDE.md inside the image — mirrors
-# CI (.github/workflows/ci.yml already does this same cp before its own
-# docker build). backend/CLAUDE.md is in .gitignore as a safety net.
-if [ -f ../CLAUDE.md ]; then
-  cp ../CLAUDE.md CLAUDE.md
-fi
+# Do not stage CLAUDE.md into backend/.  The harness can run from a read-only
+# checkout (including the /repo bind mount used by CI).  In Docker, the repo
+# root is mounted at /repo; outside Docker, test_invariants.py resolves the
+# checkout root directly.  Neither path requires mutating the backend tree.
 
 # --- Select the execution boundary. The authoring-verification path uses a
 # private PostgreSQL process plus a baked read-only venv inside bwrap, never the
@@ -386,6 +383,8 @@ elif [ "$USE_POSTGRES" = "1" ]; then
   ENV_ARGS="--network $PG_NETWORK \
     -e DATABASE_URL=$PG_DSN \
     -e USE_TEST_POSTGRES=true \
+    -e GCE_METADATA_IP=127.0.0.1 \
+    -e GCE_METADATA_HOST=127.0.0.1:9 \
     -e GCP_PROJECT_ID=test-project \
     -e LOCAL_MODE=true \
     -e GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
@@ -393,6 +392,8 @@ elif [ "$USE_POSTGRES" = "1" ]; then
     -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 else
   ENV_ARGS="-e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
+    -e GCE_METADATA_IP=127.0.0.1 \
+    -e GCE_METADATA_HOST=127.0.0.1:9 \
     -e GCP_PROJECT_ID=test-project \
     -e LOCAL_MODE=true \
     -e GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
@@ -429,8 +430,31 @@ if [ "$USE_DOCKER" = "1" ] && [ -d .. ]; then
   ENV_ARGS="$ENV_ARGS -v ${REPO_HOST_PATH}:/repo:ro"
 fi
 
+# The static release guard supplies a host-side temporary JUnit path. Docker
+# containers cannot write to that path unless its directory is mounted, and
+# the container also needs the remapped path in its environment. Keep the
+# caller's filename so the host can parse the report after `docker run` exits.
+if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
+  STATIC_GUARD_OUTPUT_DIR="$(dirname -- "$BLUEPRINT_STATIC_GUARD_JUNIT")"
+  STATIC_GUARD_OUTPUT_NAME="$(basename -- "$BLUEPRINT_STATIC_GUARD_JUNIT")"
+  [ -d "$STATIC_GUARD_OUTPUT_DIR" ] || {
+    echo "ERROR: static guard JUnit output directory is unavailable: $STATIC_GUARD_OUTPUT_DIR" >&2
+    exit 2
+  }
+  if [ "$USE_DOCKER" = "1" ]; then
+    ENV_ARGS="$ENV_ARGS -v ${STATIC_GUARD_OUTPUT_DIR}:/static-guard-output"
+    BLUEPRINT_STATIC_GUARD_JUNIT="/static-guard-output/${STATIC_GUARD_OUTPUT_NAME}"
+    ENV_ARGS="$ENV_ARGS -e BLUEPRINT_STATIC_GUARD_JUNIT=$BLUEPRINT_STATIC_GUARD_JUNIT"
+  fi
+fi
+if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ] && [ "$USE_DOCKER" = "1" ]; then
+  ENV_ARGS="$ENV_ARGS -e BLUEPRINT_STATIC_GUARD_SELECTORS=$BLUEPRINT_STATIC_GUARD_SELECTORS"
+fi
+
 ENV_VARS="DATABASE_URL=${PG_DSN:-postgresql+asyncpg://x:x@localhost/x} \
   USE_TEST_POSTGRES=$([ "$USE_POSTGRES" = "1" ] && echo true || echo false) \
+  GCE_METADATA_IP=127.0.0.1 \
+  GCE_METADATA_HOST=127.0.0.1:9 \
   GCP_PROJECT_ID=test-project \
   LOCAL_MODE=true \
   GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
@@ -464,12 +488,83 @@ _run() {
   fi
 }
 
+# These are all roots containing test_*.py modules that the backend test gates
+# must inspect for silent zero-test stubs. Keep this derived from the repository
+# layout rather than maintaining a second per-file coverage roster.
+CI_TEST_MODULE_ROOTS=(
+  scripts
+  backend/testing
+)
+
+# Discover the scripts test corpus at runtime. This is intentionally a glob,
+# not a second per-file roster: a newly added scripts/test_*.py is picked up by
+# the standalone lane and by backend/testing/test_scripts_test_lane.py without
+# an unrelated list edit.
+CI_SCRIPT_TEST_DISCOVERY_GLOB="test_*.py"
+
+# Entries in this list need a capability that the Docker-less standalone lane
+# does not provide. They remain in the CI collection and are collected when the
+# Docker capability is present; the reason makes a local omission reviewable.
+CI_SCRIPT_TEST_EXEMPTIONS=(
+  "test_blueprint_cli.py|requires Blueprint operator API configuration and control-plane network"
+  "test_blueprint_node.py|requires a root-owned system Python and systemd deployment host"
+  "test_local_postgres_cutover_integration.py|requires a Docker daemon and two real PostgreSQL containers"
+  "test_local_runner.py|requires an enrolled local runner and its host services"
+)
+
+STANDALONE_SCRIPT_TEST_ARGS=()
 STANDALONE_RELEASE_TEST_ARGS=()
 if [ "$USE_DOCKER" = "1" ]; then
-  STANDALONE_RELEASE_TEST_ARGS+=(/repo/scripts/test_bootstrap_local_app_release.py)
-elif [ -f ../scripts/test_bootstrap_local_app_release.py ]; then
+  SCRIPT_TEST_ROOT=/repo/scripts
+else
   # Docker-less local runs are rooted at the checkout, not the /repo bind mount.
-  STANDALONE_RELEASE_TEST_ARGS+=(../scripts/test_bootstrap_local_app_release.py)
+  SCRIPT_TEST_ROOT=../scripts
+fi
+# Expand the discovered script corpus by capability. Every discovered entry is collected in
+# the standalone lane unless its written exemption names a capability absent
+# from this invocation. CI is deliberately not part of this decision: a
+# Docker-less CI-marked run has the same capabilities as any other Docker-less
+# run, and the discovery tripwire below makes omissions fail closed.
+for script_path in "$SCRIPT_TEST_ROOT"/$CI_SCRIPT_TEST_DISCOVERY_GLOB; do
+  [ -f "$script_path" ] || continue
+  script_test="${script_path##*/}"
+  script_test_exempt=0
+  for exemption in "${CI_SCRIPT_TEST_EXEMPTIONS[@]}"; do
+    [ "${exemption%%|*}" = "$script_test" ] || continue
+    script_test_exempt=1
+    break
+  done
+  if [ "$script_test_exempt" = "1" ] && [ "$USE_DOCKER" != "1" ]; then
+    continue
+  fi
+  [ "$script_test" = "test_bootstrap_local_app_release.py" ] && continue
+  STANDALONE_SCRIPT_TEST_ARGS+=("$SCRIPT_TEST_ROOT/$script_test")
+done
+if [ "$USE_DOCKER" = "1" ]; then
+  STANDALONE_RELEASE_TEST_ARGS+=("$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py")
+elif [ -f "$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py" ]; then
+  STANDALONE_RELEASE_TEST_ARGS+=("$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py")
+fi
+
+STATIC_GUARD_SELECTORS_ARGS=()
+if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ]; then
+  while IFS= read -r selector; do
+    [ -n "$selector" ] || continue
+    case "$selector" in
+      scripts/*)
+        if [ "$USE_DOCKER" = "1" ]; then
+          selector="/repo/$selector"
+        else
+          selector="../$selector"
+        fi
+        ;;
+    esac
+    STATIC_GUARD_SELECTORS_ARGS+=("$selector")
+  done < <(printf '%s\n' "$BLUEPRINT_STATIC_GUARD_SELECTORS" | base64 --decode)
+  [ "${#STATIC_GUARD_SELECTORS_ARGS[@]}" -gt 0 ] || {
+    echo "ERROR: static guard selector list is empty or invalid" >&2
+    exit 2
+  }
 fi
 
 if [ "$USE_DOCKER" = "1" ]; then
@@ -521,7 +616,10 @@ _run python3 -c "from app.main import app; print(f'OK: {len(app.routes)} routes'
 
 if [ "${1:-}" = "--standalone" ]; then
   echo "=== Standalone tests (no DB) ==="
-  STANDALONE_ARGS=(
+  if [ "${#STATIC_GUARD_SELECTORS_ARGS[@]}" -gt 0 ]; then
+    STANDALONE_ARGS=("${STATIC_GUARD_SELECTORS_ARGS[@]}")
+  else
+    STANDALONE_ARGS=(
     testing/test_security.py
     testing/test_pipeline.py
     testing/test_invariants.py
@@ -534,23 +632,29 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters
     testing/test_monthly_budget_alerts.py
     testing/test_migration_chain.py
+    testing/test_message_audience.py
+    testing/test_event_type_invariants.py
     testing/test_salvage_bundle_standalone.py
     testing/test_test_durations_freshness.py
     testing/test_shard_balance.py
     testing/test_conversational_workday_protection.py
     testing/test_vitest_durations_freshness.py
-  )
-  # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
-  [ -f /repo/scripts/test_blueprint_cli.py ] && STANDALONE_ARGS+=(/repo/scripts/test_blueprint_cli.py)
-  # The runner-isolation suite covers the GPU probe's arch gate, probe/real
-  # container-name isolation, and the pre-probe image pull. It lives under
-  # scripts/ (which ships standalone to runner hosts), so the `pytest testing/`
-  # shards never collect it — without this line the whole gate is untested in CI.
-  [ -f /repo/scripts/test_runner_isolation.py ] && STANDALONE_ARGS+=(/repo/scripts/test_runner_isolation.py)
-  # This exit-proof release suite covers durable handoff, serving confirmation,
-  # and receipt retry behavior that pytest's backend shards do not collect.
-  STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
-  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest
+    )
+    # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
+    # The scripts roster is explicitly maintained above and checked by
+    # backend/testing/test_ci_compliance_gate.py. It runs from the /repo mount in
+    # CI and from ../scripts on Docker-less checkouts.
+    STANDALONE_ARGS+=("${STANDALONE_SCRIPT_TEST_ARGS[@]}")
+    # This exit-proof release suite covers durable handoff, serving confirmation,
+    # and receipt retry behavior that pytest's backend shards do not collect.
+    STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
+  fi
+  STANDALONE_JUNIT_ARGS=()
+  if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
+    STANDALONE_JUNIT_ARGS+=("--junitxml=${BLUEPRINT_STATIC_GUARD_JUNIT}")
+  fi
+  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest \
+    --timeout=30 --timeout-method=signal "${STANDALONE_JUNIT_ARGS[@]}"
   exit 0
 fi
 
@@ -588,25 +692,62 @@ if [ $# -gt 0 ]; then
       exit 2
     }
     rm -f "$BLUEPRINT_VERIFICATION_RESULT_FILE"
-    VERIFICATION_OUTPUT_DIR=$(mktemp -d /tmp/blueprint-backend-verification.XXXXXX)
+    if [ -n "${BLUEPRINT_VERIFICATION_JUNIT:-}" ]; then
+      VERIFICATION_OUTPUT_DIR="$(dirname -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+      VERIFICATION_JUNIT_NAME="$(basename -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+      [ -d "$VERIFICATION_OUTPUT_DIR" ] || {
+        echo "ERROR: verification JUnit output directory is unavailable: $VERIFICATION_OUTPUT_DIR" >&2
+        exit 2
+      }
+    else
+      VERIFICATION_OUTPUT_DIR=$(mktemp -d /tmp/blueprint-backend-verification.XXXXXX)
+      VERIFICATION_OUTPUT_DIR_OWNED=1
+      VERIFICATION_JUNIT_NAME=""
+    fi
     if [ "$USE_DOCKER" = "1" ]; then
       ENV_ARGS="$ENV_ARGS -v ${VERIFICATION_OUTPUT_DIR}:/verification-output"
-      verification_junit=/verification-output/junit.xml
+      if [ -n "$VERIFICATION_JUNIT_NAME" ]; then
+        verification_junit="/verification-output/${VERIFICATION_JUNIT_NAME}"
+        ENV_ARGS="$ENV_ARGS -e BLUEPRINT_VERIFICATION_JUNIT=$verification_junit"
+      else
+        verification_junit=/verification-output/junit.xml
+      fi
     else
-      verification_junit="$VERIFICATION_OUTPUT_DIR/junit.xml"
+      if [ -n "$VERIFICATION_JUNIT_NAME" ]; then
+        verification_junit="$VERIFICATION_OUTPUT_DIR/$VERIFICATION_JUNIT_NAME"
+      else
+        verification_junit="$VERIFICATION_OUTPUT_DIR/junit.xml"
+      fi
     fi
-    _run python3 -m pytest "$@" --junitxml="$verification_junit"
+  _run python3 -m pytest "$@" --junitxml="$verification_junit"
     verification_tmp="${BLUEPRINT_VERIFICATION_RESULT_FILE}.$$"
     python3 -c 'import datetime,json,sys,xml.etree.ElementTree as ET; junit,out,*selectors=sys.argv[1:]; root=ET.parse(junit).getroot(); suites=[root] if root.tag.endswith("testsuite") else list(root); tests=sum(int(s.attrib.get("tests",0)) for s in suites); skipped=sum(int(s.attrib.get("skipped",0)) for s in suites); failures=sum(int(s.attrib.get("failures",0))+int(s.attrib.get("errors",0)) for s in suites); assert tests>0 and skipped<tests and failures==0, f"unacceptable pytest result tests={tests} skipped={skipped} failures={failures}"; payload={"version":1,"harness":"scripts/test-backend.sh","selectors":selectors,"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":tests,"skipped":skipped,"failures":failures,"exit_code":0,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$VERIFICATION_OUTPUT_DIR/junit.xml" "$verification_tmp" "$@"
     mv -f "$verification_tmp" "$BLUEPRINT_VERIFICATION_RESULT_FILE"
   else
-    _run python3 -m pytest "$@"
+    if [ -n "${BLUEPRINT_VERIFICATION_JUNIT:-}" ]; then
+      VERIFICATION_OUTPUT_DIR="$(dirname -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+      VERIFICATION_JUNIT_NAME="$(basename -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+      [ -d "$VERIFICATION_OUTPUT_DIR" ] || {
+        echo "ERROR: verification JUnit output directory is unavailable: $VERIFICATION_OUTPUT_DIR" >&2
+        exit 2
+      }
+      if [ "$USE_DOCKER" = "1" ]; then
+        ENV_ARGS="$ENV_ARGS -v ${VERIFICATION_OUTPUT_DIR}:/verification-output"
+        verification_junit="/verification-output/${VERIFICATION_JUNIT_NAME}"
+        ENV_ARGS="$ENV_ARGS -e BLUEPRINT_VERIFICATION_JUNIT=$verification_junit"
+      else
+        verification_junit="$BLUEPRINT_VERIFICATION_JUNIT"
+      fi
+      _run python3 -m pytest "$@" --junitxml="$verification_junit"
+    else
+      _run python3 -m pytest "$@"
+    fi
   fi
   exit 0
 fi
 
 echo "=== Standalone tests ==="
-_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_admin_auth_invariant.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py "${STANDALONE_RELEASE_TEST_ARGS[@]}" testing/test_test_durations_freshness.py testing/test_shard_balance.py testing/test_vitest_durations_freshness.py -v --noconftest
+_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_admin_auth_invariant.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py /repo/scripts/test_blueprint_mcp.py /repo/scripts/test_hermes_operator_cli.py "${STANDALONE_RELEASE_TEST_ARGS[@]}" testing/test_test_durations_freshness.py testing/test_shard_balance.py testing/test_vitest_durations_freshness.py -v --noconftest
 
 echo "=== Full test suite ==="
 if [ "${#TESTMON_ARGS[@]}" -gt 0 ]; then

@@ -126,6 +126,164 @@ def test_incremental_audit_base_refuses_dirty_ledger_hint():
         ) == rq._incremental_audit_base_sha(dirty, NEW)
 
 
+def test_finding_clearance_proof_is_pinned_to_the_landed_candidate():
+    """Audit remediation credit requires complete, exact current-tree proof."""
+    from app.acceptance_gate import (
+        FINDING_CLEARANCE_VERIFICATION_KEY,
+        finding_clearance_blocks_success,
+    )
+    from app.landed_signal import LANDED_MERGE_SHA_KEY
+
+    merge_sha = "a" * 40
+    claimed = {"resolving_finding_keys": ["finding-a", "finding-b"]}
+    assert finding_clearance_blocks_success(claimed) is True
+
+    verified = {
+        **claimed,
+        LANDED_MERGE_SHA_KEY: merge_sha,
+        FINDING_CLEARANCE_VERIFICATION_KEY: {
+            "state": "verified",
+            "finding_keys": ["finding-a", "finding-b"],
+            "verified_against_sha": merge_sha,
+        },
+    }
+    assert finding_clearance_blocks_success(verified) is False
+    verified[FINDING_CLEARANCE_VERIFICATION_KEY]["verified_against_sha"] = "b" * 40
+    assert finding_clearance_blocks_success(verified) is True
+
+
+async def _finding_clearance_setup(db_session, *, claimed: list[str]):
+    """A merged task claiming findings, plus the version that carries them."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "c" * 40,
+        "audit_findings": [
+            {
+                "key": "finding-a",
+                "severity": "high",
+                "file": "backend/app/foo.py",
+                "blob_sha": "old-blob-a",
+                "summary": "a",
+            },
+            {
+                "key": "finding-b",
+                "severity": "high",
+                "file": "backend/app/bar.py",
+                "blob_sha": "old-blob-b",
+                "summary": "b",
+            },
+        ],
+    }
+    db_session.add(version)
+    task = Task(
+        project_id=project.id,
+        title="clear findings",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="TEST",
+        payloads=[{"type": "fix", "prompt": "clear"}],
+        context={"resolving_finding_keys": claimed},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    return project, version, task
+
+
+@pytest.mark.asyncio
+async def test_finding_clearance_marker_is_produced_from_the_landed_tree(
+    db_session, mocker
+):
+    """The credit path has a real producer: the landed tree, not the claim.
+
+    Both claimed findings' cited blobs moved at the landed commit (one changed,
+    one deleted), so the marker is ``verified`` and pinned to that exact sha —
+    which is what ``finding_clearance_blocks_success`` requires for credit.
+    """
+    from app.acceptance_gate import (
+        FINDING_CLEARANCE_VERIFICATION_KEY,
+        finding_clearance_blocks_success,
+        verify_finding_clearance_at_landing,
+    )
+    from app.landed_signal import LANDED_MERGE_SHA_KEY
+
+    merge_sha = "d" * 40
+    _project, _version, task = await _finding_clearance_setup(
+        db_session, claimed=["finding-a", "finding-b"]
+    )
+    mocker.patch(
+        "app.github.get_file_blob_sha_at_ref",
+        new=AsyncMock(
+            side_effect=[(True, "new-blob-a"), (False, None)]
+        ),
+    )
+
+    marker = await verify_finding_clearance_at_landing(
+        task,
+        db_session,
+        merge_commit_sha=merge_sha,
+        github_credentials=("token", "acme", "widget"),
+    )
+
+    assert marker["state"] == "verified"
+    assert sorted(marker["finding_keys"]) == ["finding-a", "finding-b"]
+    assert marker["verified_against_sha"] == merge_sha
+    assert task.context[FINDING_CLEARANCE_VERIFICATION_KEY] == marker
+    task.context[LANDED_MERGE_SHA_KEY] = merge_sha
+    assert finding_clearance_blocks_success(task.context) is False
+
+
+@pytest.mark.asyncio
+async def test_finding_clearance_marker_fails_closed_on_unchanged_surface(
+    db_session, mocker
+):
+    """An unchanged cited blob, and an unreadable one, never earn credit."""
+    from app.acceptance_gate import (
+        finding_clearance_blocks_success,
+        verify_finding_clearance_at_landing,
+    )
+    from app.landed_signal import LANDED_MERGE_SHA_KEY
+
+    merge_sha = "e" * 40
+    _project, _version, task = await _finding_clearance_setup(
+        db_session, claimed=["finding-a", "finding-b"]
+    )
+    mocker.patch(
+        "app.github.get_file_blob_sha_at_ref",
+        new=AsyncMock(side_effect=[(True, "old-blob-a"), (None, None)]),
+    )
+
+    marker = await verify_finding_clearance_at_landing(
+        task,
+        db_session,
+        merge_commit_sha=merge_sha,
+        github_credentials=("token", "acme", "widget"),
+    )
+
+    assert marker["state"] == "unverified"
+    assert marker["finding_keys"] == []
+    task.context[LANDED_MERGE_SHA_KEY] = merge_sha
+    assert finding_clearance_blocks_success(task.context) is True
+
+
+@pytest.mark.asyncio
+async def test_finding_clearance_verification_skips_unclaimed_tasks(db_session):
+    """A task that claims no findings is untouched — no marker, no GitHub call."""
+    from app.acceptance_gate import (
+        FINDING_CLEARANCE_VERIFICATION_KEY,
+        verify_finding_clearance_at_landing,
+    )
+
+    _project, _version, task = await _finding_clearance_setup(db_session, claimed=[])
+
+    assert (
+        await verify_finding_clearance_at_landing(
+            task, db_session, merge_commit_sha="f" * 40
+        )
+        is None
+    )
+    assert FINDING_CLEARANCE_VERIFICATION_KEY not in task.context
+
+
 def test_release_qualifier_module_size_cap_is_governing():
     """release_qualifier.py's size cap is a governing value, not dead headroom.
 
@@ -645,6 +803,19 @@ async def test_qualification_reports_stranded_approved_prs(db_session, mocker):
         _approved_task(project.id, "duplicate review", 701),
         _approved_task(project.id, "already landed review", 702, merged=True),
     ])
+    reconciled_rollup_child = _approved_task(project.id, "reconciled rollup child", 703)
+    reconciled_rollup_child.context.update(
+        {
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            "approved_pr_stranding": {
+                "state": "landed",
+                "rollup_subsumed": True,
+            },
+        }
+    )
+    db_session.add(reconciled_rollup_child)
     await db_session.commit()
 
     snapshot = await rq.snapshot_stranded_approved_prs(db_session, project.id)
@@ -701,18 +872,119 @@ async def test_stranded_snapshot_filters_landed_rows_before_the_scan_cap(db_sess
     ``unavailable`` on any real project — the feature would ship dark.
     """
     project, _version = await _make_project_and_version(db_session)
+    direct_landed = [
+        _approved_task(project.id, f"landed {n}", 1000 + n, merged=True)
+        for n in range(10)
+    ]
+    reconciled_rollup_children = []
+    for n in range(rqa._STRANDED_APPROVED_PR_SCAN_LIMIT + 50):
+        child = _approved_task(project.id, f"reconciled child {n}", 2000 + n)
+        child.context.update(
+            {
+                "pr_merged": True,
+                "landed_on_integration": False,
+                "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+                "approved_pr_stranding": {
+                    "state": "landed",
+                    "rollup_subsumed": True,
+                },
+            }
+        )
+        reconciled_rollup_children.append(child)
     db_session.add_all(
-        [
-            _approved_task(project.id, f"landed {n}", 1000 + n, merged=True)
-            for n in range(rqa._STRANDED_APPROVED_PR_SCAN_LIMIT + 50)
-        ]
-        + [_approved_task(project.id, "stranded", 999)]
+        direct_landed + reconciled_rollup_children + [_approved_task(project.id, "stranded", 999)]
     )
     await db_session.commit()
 
     snapshot = await rq.snapshot_stranded_approved_prs(db_session, project.id)
     assert snapshot["status"] == "available"
     assert snapshot["pr_numbers"] == [999]
+
+
+@pytest.mark.asyncio
+async def test_stranded_snapshot_distinguishes_reland_and_superseded_records(db_session):
+    """The qualification readout stays truthful while bounded recovery runs."""
+    project, _version = await _make_project_and_version(db_session)
+    relanding = _approved_task(project.id, "relanding", 800)
+    relanding.status = TaskStatus.EVALUATING
+    relanding.context["approved_pr_reland"] = {
+        "state": "in_flight",
+        "identity": "review-target-800",
+        "attempt_count": 1,
+    }
+    relanding.context["review_loop"]["ci_waiting"] = True
+    relanding.context["review_loop"]["pr_number"] = 800
+    relanding.context = dict(relanding.context)
+    superseded = _approved_task(project.id, "superseded", 801)
+    superseded.context["approved_pr_reland"] = {
+        "state": "superseded",
+        "identity": "review-target-801",
+        "attempt_count": 1,
+        "reason": "immutable review target was replaced",
+    }
+    exhausted = _approved_task(project.id, "closed unmerged re-drive", 802)
+    exhausted.status = TaskStatus.FAILED
+    exhausted.context["approved_pr_reland"] = {
+        "state": "in_flight",
+        "identity": "review-target-802",
+        "attempt_count": 1,
+    }
+    exhausted.context = dict(exhausted.context)
+    db_session.add_all([relanding, superseded, exhausted])
+    await db_session.commit()
+
+    snapshot = await rq.snapshot_stranded_approved_prs(db_session, project.id)
+
+    assert snapshot["status"] == "available"
+    assert snapshot["count"] == 1
+    assert snapshot["pr_numbers"] == [802]
+    assert snapshot["unlanded_approved_pr_count"] == 2
+    assert snapshot["reland_inflight_count"] == 1
+    assert snapshot["superseded_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gate", "value"),
+    [
+        ("requires_approval", True),
+        ("conflict_fix_spawned", "still-running-conflict-fix"),
+        ("ci_fix_spawned", "still-running-ci-fix"),
+        ("merge_rule_blocked", True),
+        ("missing_pr_number", None),
+    ],
+)
+async def test_stranded_snapshot_surfaces_monitor_skipped_relands_as_actionable(
+    db_session, gate, value, monkeypatch
+):
+    """An in-flight receipt is live only while the canonical monitor can poll it."""
+    monkeypatch.setitem(rq._runtime_config, "require_approval_gates", True)
+    project, _version = await _make_project_and_version(db_session)
+    relanding = _approved_task(project.id, f"monitor-skipped {gate}", 803)
+    relanding.status = TaskStatus.EVALUATING
+    relanding.context["approved_pr_reland"] = {
+        "state": "in_flight",
+        "identity": "review-target-803",
+        "attempt_count": 1,
+    }
+    relanding.context["review_loop"]["ci_waiting"] = True
+    relanding.context["review_loop"]["pr_number"] = 803
+    if gate == "requires_approval":
+        relanding.requires_approval = value
+    elif gate != "missing_pr_number":
+        relanding.context["review_loop"][gate] = value
+    else:
+        relanding.context["review_loop"].pop("pr_number", None)
+    relanding.context = dict(relanding.context)
+    db_session.add(relanding)
+    await db_session.commit()
+
+    snapshot = await rq.snapshot_stranded_approved_prs(db_session, project.id)
+
+    assert snapshot["count"] == 1
+    assert snapshot["pr_numbers"] == [803]
+    assert snapshot["details"][0]["reland_state"] == "exhausted"
+    assert snapshot["reland_inflight_count"] == 0
 
 
 @pytest.mark.asyncio
