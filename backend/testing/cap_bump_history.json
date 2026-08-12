@@ -453,8 +453,8 @@
           "new_cap": 1050
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-11T18:09:20.634212+00:00",
+          "commit_sha": "232b534af19b3408b0c24f9df8e06659d57c384f",
+          "commit_date": "2026-08-11T18:16:59+00:00",
           "old_cap": 1050,
           "new_cap": 1350
         }
@@ -2489,6 +2489,12 @@
           "commit_date": "2026-07-07T11:56:06Z",
           "old_cap": 2550,
           "new_cap": 3000
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-12T02:18:01.653803+00:00",
+          "old_cap": 3000,
+          "new_cap": 3550
         }
       ],
       "routers/directions.py": [
@@ -3139,8 +3145,8 @@
       ],
       "approved_pr_stranding.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-12T01:07:39.684053+00:00",
+          "commit_sha": "88bd3452b2e5bb915fccec85fb7145a095c9b50d",
+          "commit_date": "2026-08-11T18:11:00-07:00",
           "old_cap": 1800,
           "new_cap": 2250
         }

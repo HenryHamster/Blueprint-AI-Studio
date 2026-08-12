@@ -1099,9 +1099,9 @@ async def areconcile_dormant_knob_debts(
     try:
         from app.models import CompletionDebtEntry
         from app.runtime_config_state import (
-            _DORMANT_KNOB_VALUES,
             _DORMANT_MODE_KNOBS,
             _DORMANT_OFF_FLAGS,
+            iter_dormant_knob_debts,
         )
 
         # Dedupe keys the knob registry owns. Stale resolution below must only
@@ -1113,35 +1113,10 @@ async def areconcile_dormant_knob_debts(
             for key in (*_DORMANT_MODE_KNOBS, *_DORMANT_OFF_FLAGS)
         }
 
-        if runtime_config is None:
-            from app.runtime_config_state import iter_dormant_knob_debts
-
-            dormant_by_key = {
-                item["dedupe_key"]: item for item in iter_dormant_knob_debts()
-            }
-        else:
-            dormant_by_key = {}
-            for key, title in _DORMANT_MODE_KNOBS.items():
-                value = str(runtime_config.get(key, "")).lower()
-                if value in _DORMANT_KNOB_VALUES:
-                    dormant_by_key[f"dormant_knob:{key}"] = {
-                        "dedupe_key": f"dormant_knob:{key}",
-                        "kind": KIND_DORMANT_KNOB,
-                        "title": title,
-                        "project_id": None,
-                        "source": "runtime_config_state",
-                        "detail": {"knob": key, "value": value},
-                    }
-            for key, title in _DORMANT_OFF_FLAGS.items():
-                if not runtime_config.get(key, False):
-                    dormant_by_key[f"dormant_knob:{key}"] = {
-                        "dedupe_key": f"dormant_knob:{key}",
-                        "kind": KIND_DORMANT_KNOB,
-                        "title": title,
-                        "project_id": None,
-                        "source": "runtime_config_state",
-                        "detail": {"knob": key, "value": bool(runtime_config.get(key))},
-                    }
+        dormant_by_key = {
+            item["dedupe_key"]: item
+            for item in iter_dormant_knob_debts(config=runtime_config)
+        }
 
         for item in dormant_by_key.values():
             if await arecord_completion_debt(session, **item):

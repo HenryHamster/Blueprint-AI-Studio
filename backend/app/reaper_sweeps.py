@@ -832,7 +832,7 @@ async def sweep_mode_knob_graduation(session, now=None) -> list | None:
     """Always-on shared mode-knob graduation harness — independent of sweep mode.
 
     Thin delegator to :func:`app.mode_knob_graduation.run_mode_knob_graduation`.
-    Gated ONLY by its own ``mode_knob_graduation_enabled`` flag (default False)
+    Gated ONLY by its own ``mode_knob_graduation_enabled`` flag (default True)
     inside the callee — deliberately NOT gated on ``metrics_integrity_sweep_mode``
     so the harness that disposes dormant knobs never itself depends on a dormant
     knob being enforced. Returns the per-knob decision list, or an empty list when

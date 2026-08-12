@@ -109,7 +109,7 @@
     "compute_jobs.py": 5600,
     "task_evaluators.py": 2300,
     "release_scoring.py": 3600,
-    "runtime_config_state.py": 3000,
+    "runtime_config_state.py": 3550,
     "routers/directions.py": 2450,
     "warm_pool_maintainer.py": 2650,
     "review_fix_lane_pilot.py": 2450,

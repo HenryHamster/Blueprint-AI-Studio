@@ -12,7 +12,7 @@ working unchanged. Behaviour is byte-identical to the pre-split code.
 import os
 import asyncio
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 from app.task_capabilities import (
     ALL_TASK_TYPES,
@@ -323,12 +323,12 @@ runtime_config: Dict = {
     # reusable driver that disposes dormant mode-knobs with MEASURED evidence:
     # graduate off→observe→enforce on measured lift, emit a legible CUT
     # recommendation (with numbers) when the enforce branch would never bind, or
-    # HOLD below threshold. Gated by a single dedicated enabled flag, default OFF
-    # — mirrors capability_proof_gate_auto_graduation_enabled. Runs independently
+    # HOLD below threshold. Gated by a single dedicated enabled flag, now armed
+    # by default. Runs independently
     # of any single knob's own mode (it does NOT require the target knob — or the
     # metrics-integrity sweep — to already be enforcing).
     "mode_knob_graduation_enabled": os.getenv(
-        "MODE_KNOB_GRADUATION_ENABLED", "false"
+        "MODE_KNOB_GRADUATION_ENABLED", "true"
     ).lower()
     in ("1", "true", "yes"),
     # Per-knob thresholds for autonomous_spawn_budget_mode. The graduation SIGNAL
@@ -1463,11 +1463,61 @@ _DORMANT_MODE_KNOBS = {
         "Capability proof gate not yet enforcing (off/observe)"
     ),
 }
-# Master feature flags that ship OFF still owe an enablement decision.
-_DORMANT_OFF_FLAGS: dict = {}
+# Master release mechanisms that are deliberately dormant still owe a named,
+# owned rollback declaration. This is the single registry for release paths
+# that are not currently enforcing; do not create a parallel inventory.
+_DORMANT_OFF_FLAGS: dict[str, dict[str, Any]] = {
+    "merge_grade_block_threshold": {
+        "title": "Merge-grade blocker remains unarmed",
+        "owner": "Release engineering",
+        "reason": "The trusted promotion policy keeps merge_grade_block_threshold at 0.0, so merge_grade_misses cannot block promotion.",
+        "rearm_condition": "Set backend/promotion_policy.yaml merge_grade_block_threshold above 0.0 and verify a targeted qualification reports merge_grade_misses as an armed blocker.",
+    },
+    "capability_proof_gate": {
+        "title": "Capability proof enforcement is in observe-only rollout",
+        "owner": "Capability-runtime owner",
+        "reason": "capability_proof_gate_mode defaults to observe and capability_proof_gate_auto_graduation_enabled defaults to false, so proof remains advisory.",
+        "rearm_condition": "Record fleet-wide working-capability proof coverage of at least 0.95, then set the mode to enforce and enable auto-graduation in the same settings change.",
+        "runtime_keys": (
+            "capability_proof_gate_mode",
+            "capability_proof_gate_auto_graduation_enabled",
+        ),
+    },
+    "prepromotion_rehearsal": {
+        "title": "Pre-promotion rehearsal is a branch-pinned rollback path",
+        "owner": "Release engineering",
+        "reason": "The workflow definition must remain on trusted main while this version cannot arm its own promotion-target workflow, so rehearsal dispatch is intentionally pending.",
+        "rearm_condition": "After main contains .github/workflows/prepromotion-rehearsal.yml, a qualification must dispatch it from main and persist a valid receipt for the exact candidate SHA.",
+        "always_dormant": True,
+        "runtime_keys": (),
+    },
+    "mode_knob_graduation_enabled": {
+        "title": "Mode-knob graduation harness is armed",
+        "owner": "Runtime-config owner",
+        "reason": "The existing measured graduation harness previously shipped disabled, leaving its registered knobs without an active disposition path.",
+        "rearm_condition": "Keep mode_knob_graduation_enabled true and require each graduation decision to carry measured evidence before any knob advances.",
+        "runtime_keys": ("mode_knob_graduation_enabled",),
+    },
+}
 
 
-def iter_dormant_knob_debts() -> list[dict]:
+def _dormant_off_declaration_is_active(
+    key: str, declaration: Mapping[str, Any], config: Mapping[str, Any]
+) -> bool:
+    """Return whether an existing dormant declaration currently applies."""
+    if declaration.get("always_dormant"):
+        return True
+    runtime_keys = tuple(declaration.get("runtime_keys", (key,)))
+    return all(
+        str(config.get(key, "")).lower() in _DORMANT_KNOB_VALUES
+        or not bool(config.get(key, False))
+        for key in runtime_keys
+    )
+
+
+def iter_dormant_knob_debts(
+    config: Mapping[str, Any] | None = None,
+) -> list[dict]:
     """Enumerate runtime-config knobs currently in a dormant/default-off/observe
     state as completion-debt seed rows.
 
@@ -1476,9 +1526,10 @@ def iter_dormant_knob_debts() -> list[dict]:
     ``dormant_knob`` kind, a human ``title``, and bounded ``detail`` capturing
     the knob's current value). Deployment-global — no ``project_id``.
     """
+    active_config = runtime_config if config is None else config
     debts: list[dict] = []
     for key, title in _DORMANT_MODE_KNOBS.items():
-        value = str(runtime_config.get(key, "")).lower()
+        value = str(active_config.get(key, "")).lower()
         if value in _DORMANT_KNOB_VALUES:
             debts.append(
                 {
@@ -1490,16 +1541,25 @@ def iter_dormant_knob_debts() -> list[dict]:
                     "detail": {"knob": key, "value": value},
                 }
             )
-    for key, title in _DORMANT_OFF_FLAGS.items():
-        if not runtime_config.get(key, False):
+    for key, declaration in _DORMANT_OFF_FLAGS.items():
+        if _dormant_off_declaration_is_active(key, declaration, active_config):
             debts.append(
                 {
                     "dedupe_key": f"dormant_knob:{key}",
                     "kind": "dormant_knob",
-                    "title": title,
+                    "title": declaration["title"],
                     "project_id": None,
                     "source": "runtime_config_state",
-                    "detail": {"knob": key, "value": bool(runtime_config.get(key))},
+                    "detail": {
+                        "knob": key,
+                        "value": {
+                            runtime_key: active_config.get(runtime_key)
+                            for runtime_key in declaration.get("runtime_keys", (key,))
+                        },
+                        "owner": declaration["owner"],
+                        "reason": declaration["reason"],
+                        "rearm_condition": declaration["rearm_condition"],
+                    },
                 }
             )
     return debts
