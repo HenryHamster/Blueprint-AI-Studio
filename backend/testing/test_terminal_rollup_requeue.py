@@ -4,8 +4,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import HTTPException
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 from sqlmodel import select
 
 from app.admin_task_mutations import modify_task_apply
@@ -481,7 +480,7 @@ async def test_terminal_requeue_merged_pr_immediately_runs_rollup_classifier(
 async def test_terminal_requeue_atomic_manual_rebind_sanitizes_effective_context(
     db_session, mocker
 ):
-    """A combined context+status PATCH cannot restore its stale proof later."""
+    """A combined context+status PATCH is rejected before stale proof is read."""
 
     parent = await _rollup_parent(
         db_session,
@@ -533,9 +532,17 @@ async def test_terminal_requeue_atomic_manual_rebind_sanitizes_effective_context
             BackgroundTasks(),
             db_session,
         )
-    assert exc_info.value.status_code == 400
-    assert "Apply status separately" in str(exc_info.value.detail)
+    assert exc_info.value.detail == (
+        "Apply status separately from generic payload, context, or topology mutation"
+    )
     get_pr.assert_not_awaited()
+
+    await db_session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    ctx = parent.context or {}
+    loop = ctx["review_loop"]
+    assert ctx["rollup_pr_number"] == 15488
+    assert loop == _stale_loop(15488)
 
 
 def test_attempt_reset_preserves_chain_metadata_only():

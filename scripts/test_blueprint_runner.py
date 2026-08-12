@@ -1025,6 +1025,7 @@ class UninstallTests(unittest.TestCase):
         Path(self.unit_path).write_text("[Unit]\n")
         with patch.object(br, "_user_unit_path", return_value=self.unit_path), \
              patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br, "_systemctl"), \
              patch("os.remove", side_effect=OSError("permission denied")):
             rc = br.do_uninstall(
                 system=False,

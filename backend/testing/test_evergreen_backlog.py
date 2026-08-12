@@ -32,7 +32,12 @@ from app.evergreen_backlog import (
     _reset_observability_for_tests,
     get_fill_observability,
 )
-from app.models import EvergreenBacklogItem, EvergreenFillDecisionLog, Project, Task
+from app.models import (
+    EvergreenBacklogItem,
+    EvergreenFillDecisionLog,
+    Project,
+    Task,
+)
 
 
 # --------------------------------------------------------------------------- #
