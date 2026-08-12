@@ -4942,7 +4942,6 @@ async def test_ci_build_smoke_contract_finalizes_without_grader_category(
         PREPROMOTION_REHEARSAL_CHECKS,
         PREPROMOTION_REHEARSAL_DEFERRED,
         PREPROMOTION_REHEARSAL_KIND,
-        PREPROMOTION_REHEARSAL_WORKFLOW_REF,
     )
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -4975,7 +4974,7 @@ async def test_ci_build_smoke_contract_finalizes_without_grader_category(
             "candidate_sha": "feed" * 10,
             "repository": f"{project.github_owner}/{project.github_repo}",
             "workflow_file": "prepromotion-rehearsal.yml",
-            "workflow_ref": PREPROMOTION_REHEARSAL_WORKFLOW_REF,
+            "workflow_ref": "main",
             "workflow_head_sha": "b" * 40,
             "run_id": 42,
             "run_attempt": 1,
@@ -4990,7 +4989,7 @@ async def test_ci_build_smoke_contract_finalizes_without_grader_category(
                 release_version_id=version.id,
                 project_id=project.id,
                 candidate_sha="feed" * 10,
-                workflow_ref=PREPROMOTION_REHEARSAL_WORKFLOW_REF,
+                workflow_ref="main",
                 status="observed",
                 workflow_run_id=42,
             )

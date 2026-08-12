@@ -28,10 +28,11 @@ PREPROMOTION_REHEARSAL_KIND = "blueprint.prepromotion_ci_build_smoke.v1"
 PREPROMOTION_REHEARSAL_SCHEMA_VERSION = 1
 PREPROMOTION_REHEARSAL_CONTRACT_TYPE = "prepromotion_ci_build_smoke"
 PREPROMOTION_REHEARSAL_WORKFLOW = "prepromotion-rehearsal.yml"
-# The rehearsal workflow must be resolved from the integration ref that owns
-# the candidate. Resolving it from the promotion target makes pre-promotion
-# evidence depend on the ref the rehearsal is meant to prove.
-PREPROMOTION_REHEARSAL_WORKFLOW_REF = "automain"
+# The workflow definition is loaded only from protected main.  The exact
+# automain candidate is supplied as immutable input and checked out as data by
+# that trusted workflow; resolving the workflow itself from automain would let
+# unqualified candidate code redefine the evidence producer.
+PREPROMOTION_REHEARSAL_WORKFLOW_REF = "main"
 PREPROMOTION_RECONCILE_GRACE_SECONDS = 120
 PREPROMOTION_RECONCILE_MAX_SECONDS = 20
 PREPROMOTION_RECONCILE_MAX_ATTEMPTS = 10

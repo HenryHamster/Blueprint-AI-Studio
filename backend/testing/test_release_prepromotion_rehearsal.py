@@ -107,7 +107,7 @@ async def test_permanent_dispatch_404_terminalizes_with_named_target(db_session,
     assert row.status == "rejected"
     assert row.last_error == (
         "permanent 404: dispatch target absent "
-        "acme/widget/actions/workflows/prepromotion-rehearsal.yml@automain"
+        "acme/widget/actions/workflows/prepromotion-rehearsal.yml@main"
     )
 
 
@@ -189,6 +189,7 @@ def test_missing_receipt_inserts_fail_closed_verdict_when_grader_omits_category(
     [
         (lambda value: value.update(extra="forged"),),
         (lambda value: value.update(checks=["candidate_checkout_exact_sha"]),),
+        (lambda value: value.update(workflow_ref="automain"),),
         (lambda value: value.update(workflow_ref="release-v32"),),
         (lambda value: value.update(run_id=True),),
         (lambda value: value.update(completed_at="not-a-timestamp"),),
@@ -259,7 +260,7 @@ def test_central_contract_normalizer_accepts_only_closed_ci_shape():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_uses_integration_workflow_and_exact_candidate(mocker):
+async def test_dispatch_uses_trusted_main_workflow_and_exact_candidate(mocker):
     dispatch = mocker.patch(
         "app.release_prepromotion_rehearsal.github.dispatch_workflow_run_outcome",
         new=AsyncMock(return_value="accepted"),
@@ -276,7 +277,7 @@ async def test_dispatch_uses_integration_workflow_and_exact_candidate(mocker):
         "owner",
         "repo",
         PREPROMOTION_REHEARSAL_WORKFLOW,
-        "automain",
+        PREPROMOTION_REHEARSAL_WORKFLOW_REF,
     )
     assert dispatch.await_args.kwargs["inputs"] == {
         "candidate_sha": _CANDIDATE,
