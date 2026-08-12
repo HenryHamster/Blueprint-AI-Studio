@@ -280,7 +280,6 @@ def _deploy_agent_unit(bundle: Path, install_user: str) -> bytes:
         "StateDirectoryMode=0700\n"
         f"Environment=GH_CONFIG_DIR={_GH_CONFIG_DIR}\n"
         "Environment=PYTHONUNBUFFERED=1\n"
-        f"ExecStartPre=/usr/bin/python3.12 {executable} deploy-agent --preflight\n"
         f"ExecStart=/usr/bin/python3.12 {executable} deploy-agent "
         "--poll-interval 30 "
         "--lock-path /run/blueprint-deploy-agent/deploy-agent.lock "

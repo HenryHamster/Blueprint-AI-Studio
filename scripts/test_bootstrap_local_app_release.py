@@ -287,11 +287,13 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         payload = bootstrap._deploy_agent_unit(
             PurePosixPath("/trusted/bundle"), "henry_hamster"
         ).decode()
-        self.assertIn(
-            "ExecStartPre=/usr/bin/python3.12 /trusted/bundle/blueprint.py "
-            "deploy-agent --preflight",
-            payload,
-        )
+        # The operational preflight requires the unit to already be active and
+        # to have written a successful-poll marker. Running it as ExecStartPre
+        # makes first installation impossible by construction. Bootstrap has
+        # dedicated fail-closed checks for GitHub auth and the privilege
+        # boundary before enabling the service, so startup must enter the poll
+        # loop directly.
+        self.assertNotIn("ExecStartPre=", payload)
         self.assertIn("StartLimitIntervalSec=60", payload)
         self.assertIn("StartLimitBurst=3", payload)
         self.assertLess(
