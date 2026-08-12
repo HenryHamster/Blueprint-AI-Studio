@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -60,6 +61,7 @@ _CHECKPOINT_SUBJECT_PREFIX = "blueprint-checkpoint: preserve unshipped task "
 _CHECKPOINT_VERSION = "1"
 _CHECKPOINT_BATCH_SIZE = 100
 _CHECKPOINT_HANDOFF_CAP = 1
+_INTEGRATION_HISTORY_LIMIT = 200
 # Durable "this row has been decided" marker.  The scan is a bounded, oldest-first
 # window over FAILED tasks, and a task with no checkpoint branch is never written
 # to — without this marker a wall of permanently-failed rows would pin the window
@@ -105,7 +107,9 @@ _RELAND_ELIGIBLE_TERMINAL_STATUSES = frozenset(
 
 EvidenceState = Literal["landed", "stranded", "unknown"]
 Mergeability = Literal["clean", "conflicted", "not_applicable", "unknown"]
-ReachabilitySignal = Literal["merge_sha", "head_sha", "neither"]
+ReachabilitySignal = Literal[
+    "merge_sha", "head_sha", "integration_history", "neither"
+]
 
 ROLLUP_SUBSUMED_REASON = "content carried by a landed rollup ancestor"
 
@@ -181,6 +185,7 @@ class _ApprovedPrCandidate:
     commit_sha: str | None
     target_valid: bool
     target_reason: str | None = None
+    is_rollup_review: bool = False
 
 
 def _git(args: list[str], *, repo_root: str) -> subprocess.CompletedProcess[str] | None:
@@ -807,11 +812,91 @@ def _resolve_integration_head(branch: str, *, repo_root: str) -> str | None:
     return None
 
 
+def _canonical_history_message_references_candidate(
+    message: str, *, pr_number: int | None, commit_shas: tuple[str | None, ...]
+) -> bool:
+    """Accept only canonical merge subjects or explicit full-SHA trailers.
+
+    An arbitrary mention such as ``revert #123`` or an abbreviated SHA is not
+    landing evidence.  GitHub squash merges end their subject with ``(#123)``;
+    merge commits start with ``Merge pull request #123``.  Rollup tooling may
+    instead preserve an immutable source identity in a named full-SHA trailer.
+    """
+    normalized = message.replace("\r\n", "\n")
+    lines = normalized.split("\n")
+    subject = lines[0].strip() if lines else ""
+    if pr_number is not None and (
+        re.search(rf"\(#{pr_number}\)\s*$", subject)
+        or re.match(rf"Merge pull request #{pr_number}(?:\s|$)", subject)
+    ):
+        return True
+
+    expected_shas = {
+        sha.lower()
+        for sha in commit_shas
+        if isinstance(sha, str)
+        and len(sha) in (40, 64)
+        and all(char in "0123456789abcdefABCDEF" for char in sha)
+    }
+    if not expected_shas:
+        return False
+    for line in lines[1:]:
+        key, separator, value = line.partition(":")
+        if not separator or key.strip().lower() not in {
+            "reviewed-sha",
+            "source-sha",
+            "blueprint-source-sha",
+        }:
+            continue
+        if value.strip().lower() in expected_shas:
+            return True
+    return False
+
+
+def _local_integration_history_match(
+    *,
+    integration_branch: str,
+    pr_number: int | None,
+    commit_shas: tuple[str | None, ...],
+    repo_root: str,
+) -> tuple[str, str] | None:
+    """Return ``(matching_commit, integration_head)`` from bounded history.
+
+    ``None`` means history could not be read.  An empty matching commit means
+    history was read successfully but contained no canonical landing record.
+    """
+    integration_head_sha = _resolve_integration_head(
+        integration_branch, repo_root=repo_root
+    )
+    if not integration_head_sha:
+        return None
+    history = _git(
+        [
+            "log",
+            "--first-parent",
+            f"--max-count={_INTEGRATION_HISTORY_LIMIT}",
+            "--format=%H%x1f%B%x1e",
+            integration_head_sha,
+        ],
+        repo_root=repo_root,
+    )
+    if history is None or history.returncode != 0:
+        return None
+    for record in history.stdout.split("\x1e"):
+        commit_sha, separator, message = record.strip().partition("\x1f")
+        if separator and _canonical_history_message_references_candidate(
+            message, pr_number=pr_number, commit_shas=commit_shas
+        ):
+            return commit_sha.strip(), integration_head_sha
+    return "", integration_head_sha
+
+
 def inspect_approved_pr(
     *,
     base_sha: str | None,
     head_sha: str | None,
     merge_commit_sha: str | None = None,
+    pr_number: int | None = None,
     integration_branch: str,
     repo_root: str,
 ) -> ApprovedPrEvidence:
@@ -876,6 +961,31 @@ def inspect_approved_pr(
             reason="; ".join(ancestry_errors) or "git ancestry check failed",
             checked_commit_sha=merge_commit_sha or head_sha,
             merge_commit_sha=merge_commit_sha,
+        )
+
+    history_match = _local_integration_history_match(
+        integration_branch=integration_branch,
+        pr_number=pr_number,
+        commit_shas=(head_sha, merge_commit_sha),
+        repo_root=repo_root,
+    )
+    if history_match is None:
+        return ApprovedPrEvidence(
+            "unknown",
+            "unknown",
+            integration_head_sha,
+            reason="git integration history unavailable",
+            checked_commit_sha=merge_commit_sha or head_sha,
+            merge_commit_sha=merge_commit_sha,
+        )
+    if history_match[0]:
+        return ApprovedPrEvidence(
+            "landed",
+            "not_applicable",
+            integration_head_sha=history_match[1],
+            reachability_signal="integration_history",
+            checked_commit_sha=history_match[0],
+            merge_commit_sha=history_match[0],
         )
 
     mergeability_sha = head_sha or merge_commit_sha
@@ -1018,10 +1128,12 @@ async def _inspect_approved_pr_with_github(
     # merge observer did not already stamp it on the task.
     mergeability: Mergeability = "unknown"
     observed_merge_commit_sha: str | None = None
+    pull_merged = False
     try:
         pull = await github.get_pull_request(
             token, owner, repo, candidate.pr_number, project_id=project_id
         )
+        pull_merged = pull.get("merged") is True
         if pull.get("mergeable") is True:
             mergeability = "clean"
         elif pull.get("mergeable") is False:
@@ -1085,6 +1197,48 @@ async def _inspect_approved_pr_with_github(
                 merge_commit_sha=observed_merge_commit_sha,
             )
     if ancestry_results and all(reachable is False for _, _, reachable in ancestry_results):
+        if pull_merged:
+            try:
+                history_messages = await github.list_recent_commit_messages(
+                    token,
+                    owner,
+                    repo,
+                    branch,
+                    limit=_INTEGRATION_HISTORY_LIMIT,
+                    project_id=project_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - evidence remains tri-state
+                logger.info(
+                    "[APPROVED_PR] integration history unavailable for PR #%s: %s",
+                    candidate.pr_number,
+                    exc,
+                )
+                history_messages = None
+            if history_messages is None:
+                return ApprovedPrEvidence(
+                    "unknown",
+                    "unknown",
+                    integration_head_sha=integration_head_sha,
+                    checked_commit_sha=ancestry_results[0][1],
+                    merge_commit_sha=observed_merge_commit_sha,
+                    reason="GitHub integration history unavailable",
+                )
+            if any(
+                _canonical_history_message_references_candidate(
+                    message,
+                    pr_number=candidate.pr_number,
+                    commit_shas=(candidate.head_sha, candidate.commit_sha),
+                )
+                for message in history_messages
+            ):
+                return ApprovedPrEvidence(
+                    "landed",
+                    "not_applicable",
+                    integration_head_sha=integration_head_sha,
+                    reachability_signal="integration_history",
+                    checked_commit_sha=observed_merge_commit_sha,
+                    merge_commit_sha=observed_merge_commit_sha,
+                )
         return ApprovedPrEvidence(
             "stranded",
             mergeability,
@@ -1107,6 +1261,7 @@ async def _inspect_approved_pr_with_github(
 def _candidate_from_task(task: Task, project: Project) -> _ApprovedPrCandidate | None:
     context = task.context or {}
     review_loop = context.get("review_loop") or {}
+    is_rollup_review = context.get("_is_rollup_review") is True
     merged_without_integration_landing = (
         context.get(LANDED_SIGNAL_KEY) is True
         and context.get(LANDED_ON_INTEGRATION_KEY) is False
@@ -1138,6 +1293,7 @@ def _candidate_from_task(task: Task, project: Project) -> _ApprovedPrCandidate |
             merge_commit_sha,
             False,
             "approved or merged review has no review_target",
+            is_rollup_review,
         )
     target = target if isinstance(target, dict) else {}
     pr_number = (
@@ -1172,6 +1328,7 @@ def _candidate_from_task(task: Task, project: Project) -> _ApprovedPrCandidate |
             commit_sha if isinstance(commit_sha, str) and commit_sha.strip() else None,
             False,
             "approved review target is incomplete or malformed",
+            is_rollup_review,
         )
     return _ApprovedPrCandidate(
         task,
@@ -1181,7 +1338,14 @@ def _candidate_from_task(task: Task, project: Project) -> _ApprovedPrCandidate |
         head_sha.strip() if isinstance(head_sha, str) and head_sha.strip() else None,
         commit_sha.strip(),
         True,
+        None,
+        is_rollup_review,
     )
+
+
+def _candidate_recency_key(candidate: _ApprovedPrCandidate) -> tuple[datetime, str]:
+    updated_at = _strip_tz_assume_utc(candidate.task.updated_at) or datetime.min
+    return updated_at, str(candidate.task.id)
 
 
 def _qualification_cycle_id(version: ReleaseVersion | None) -> str | None:
@@ -1589,12 +1753,21 @@ async def sweep_approved_pr_stranding(
         candidate = _candidate_from_task(task, project)
         if candidate is None:
             continue
-        candidate_key = (
-            project.id,
-            candidate.pr_number or 0,
-            candidate.commit_sha or str(task.id),
-        )
-        candidates.setdefault(candidate_key, candidate)
+        if candidate.is_rollup_review and candidate.commit_sha:
+            # Rollup children can leave several approved rows that resolve to
+            # one immutable review commit.  Keep one newest observation owner.
+            candidate_key = (project.id, -1, candidate.commit_sha)
+        else:
+            candidate_key = (
+                project.id,
+                candidate.pr_number or 0,
+                candidate.commit_sha or str(task.id),
+            )
+        previous = candidates.get(candidate_key)
+        if previous is None or _candidate_recency_key(
+            candidate
+        ) > _candidate_recency_key(previous):
+            candidates[candidate_key] = candidate
 
     observations: list[
         tuple[_ApprovedPrCandidate, dict[str, Any], dict[str, str | int] | None]
@@ -1641,6 +1814,7 @@ async def sweep_approved_pr_stranding(
                     if candidate.commit_sha and candidate.commit_sha != candidate.head_sha
                     else None
                 ),
+                pr_number=candidate.pr_number,
                 integration_branch=branch,
                 repo_root=repo_root,
             )

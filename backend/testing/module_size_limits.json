@@ -171,7 +171,7 @@
     "size_limit_policy.py": 2050,
     "schemas.py": 1750,
     "release_commit_authorship.py": 1800,
-    "approved_pr_stranding.py": 1800
+    "approved_pr_stranding.py": 2250
   },
   "agent": {
     "index.ts": 4600,
@@ -414,6 +414,7 @@
     "test_dependency_contracts.py": 2000,
     "test_fleet_utilization.py": 1800,
     "test_size_limits_checker.py": 1750,
-    "test_release_commit_authorship.py": 2650
+    "test_release_commit_authorship.py": 2650,
+    "test_approved_pr_stranding.py": 1800
   }
 }

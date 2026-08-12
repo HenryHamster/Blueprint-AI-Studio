@@ -85,6 +85,31 @@ def _squash_merge_fixture(tmp_path: Path) -> tuple[Path, str, str, str]:
     return repo, base_sha, head_sha, merge_commit_sha
 
 
+def _phantom_stranding_fixture(
+    tmp_path: Path,
+) -> tuple[Path, str, str, str, list[int]]:
+    """Model eight canonical squash landings and one genuinely open target."""
+    repo, base_sha, head_sha, _integration_sha = _git_fixture(tmp_path)
+    merged_prs = [16896, 17223, 17224, 17243, 17247, 17253, 17255, 17279]
+    _run("git", "checkout", "main", cwd=repo)
+    for pr_number in merged_prs:
+        _run(
+            "git",
+            "commit",
+            "--allow-empty",
+            "-m",
+            f"land approved work (#{pr_number})",
+            cwd=repo,
+        )
+    _run("git", "checkout", "-b", "genuinely-stranded", base_sha, cwd=repo)
+    (repo / "unmerged.txt").write_text("still unmerged\n", encoding="utf-8")
+    _run("git", "add", ".", cwd=repo)
+    _run("git", "commit", "-m", "genuinely stranded work", cwd=repo)
+    stranded_head_sha = _run("git", "rev-parse", "HEAD", cwd=repo)
+    _run("git", "checkout", "main", cwd=repo)
+    return repo, base_sha, head_sha, stranded_head_sha, merged_prs
+
+
 def _checkpoint_fixture(
     tmp_path: Path, task_id: uuid.UUID, *, valid: bool = True
 ) -> tuple[Path, str, str]:
@@ -185,6 +210,87 @@ def test_inspect_unknown_never_becomes_clean(tmp_path: Path):
     )
     assert evidence.state == "unknown"
     assert evidence.mergeability == "unknown"
+
+
+def test_history_match_rejects_incidental_pr_and_abbreviated_sha_mentions():
+    full_sha = "a" * 40
+    assert not stranding._canonical_history_message_references_candidate(
+        f"Revert behavior from #17048\n\nNotes: {full_sha[:8]}",
+        pr_number=17048,
+        commit_shas=(full_sha,),
+    )
+    assert stranding._canonical_history_message_references_candidate(
+        "fix release detector (#17048)",
+        pr_number=17048,
+        commit_shas=(full_sha,),
+    )
+    assert stranding._canonical_history_message_references_candidate(
+        f"rollup release\n\nReviewed-SHA: {full_sha}",
+        pr_number=17048,
+        commit_shas=(full_sha,),
+    )
+
+
+@pytest.mark.asyncio
+async def test_stranding_report_excludes_merged_and_subsumed_rollup_prs(
+    db_session, tmp_path: Path
+):
+    """The incident-shaped report retains only genuinely unmerged PR 17048."""
+    repo, base_sha, head_sha, stranded_head_sha, merged_prs = _phantom_stranding_fixture(
+        tmp_path
+    )
+    project = Project(
+        name="Phantom stranding project",
+        user_id="test-user",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    pr_numbers = [*merged_prs, 17048]
+    tasks = []
+    for index, pr_number in enumerate(pr_numbers):
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title=f"approved PR #{pr_number}",
+                status=TaskStatus.COMPLETED,
+                requires_approval=True,
+                created_by="TEST",
+                updated_at=datetime(2026, 8, 12, 0, index, tzinfo=timezone.utc),
+                context={
+                    "_is_rollup_review": pr_number in {17247, 17253, 17255},
+                    "review_loop": {
+                        "review_approved": True,
+                        "review_target": {
+                            "project_id": str(project.id),
+                            "pr_number": pr_number,
+                            "base_sha": base_sha,
+                            "head_sha": (
+                                stranded_head_sha if pr_number == 17048 else head_sha
+                            ),
+                        },
+                    },
+                },
+            )
+        )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert result["stranded"] == 1
+    assert result["scanned"] == 7
+    assert tasks[-1].context["approved_pr_stranding"]["state"] == "stranded"
+    assert tasks[-1].context["approved_pr_stranding"]["pr_number"] == 17048
+    for index in (0, 1, 2, 3, 6, 7):
+        assert tasks[index].context["approved_pr_stranding"]["state"] == "landed"
+        assert (
+            tasks[index].context["approved_pr_stranding"]["reachability_signal"]
+            == "integration_history"
+        )
+    assert "approved_pr_stranding" not in tasks[4].context
+    assert "approved_pr_stranding" not in tasks[5].context
 
 
 @pytest.mark.asyncio
@@ -1138,7 +1244,7 @@ async def test_stranded_verdict_without_local_checkout(db_session, monkeypatch):
     )
     monkeypatch.setattr(
         "app.github.get_pull_request",
-        AsyncMock(return_value={"mergeable": True}),
+        AsyncMock(return_value={"mergeable": True, "merged": False}),
     )
     monkeypatch.setattr(
         "app.github.get_branch_sha",
@@ -1148,6 +1254,8 @@ async def test_stranded_verdict_without_local_checkout(db_session, monkeypatch):
         "app.github.is_ancestor_of",
         AsyncMock(return_value=False),
     )
+    history = AsyncMock(return_value=["incidental mention (#17160)"])
+    monkeypatch.setattr("app.github.list_recent_commit_messages", history)
 
     project = Project(
         name="Deployed detector project",
@@ -1210,6 +1318,68 @@ async def test_stranded_verdict_without_local_checkout(db_session, monkeypatch):
     assert alert.task_id == task.id
     assert "PR #17160" in alert.message
     assert "integration-head" in alert.message
+    history.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_can_use_canonical_integration_history(db_session, monkeypatch):
+    """A merged PR may use canonical squash history when old SHAs are absent."""
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "acme", "widget")),
+    )
+    monkeypatch.setattr(
+        "app.github.get_pull_request",
+        AsyncMock(
+            return_value={
+                "merged": True,
+                "mergeable": True,
+                "merge_commit_sha": "b" * 40,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "app.github.get_branch_sha", AsyncMock(return_value="integration-head")
+    )
+    monkeypatch.setattr("app.github.is_ancestor_of", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        "app.github.list_recent_commit_messages",
+        AsyncMock(return_value=["fix detector (#17161)"]),
+    )
+
+    project = Project(
+        name="Merged history project",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="merged approved work",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+    )
+    candidate = stranding._ApprovedPrCandidate(
+        task=task,
+        project=project,
+        pr_number=17161,
+        base_sha="a" * 40,
+        head_sha="c" * 40,
+        commit_sha="c" * 40,
+        target_valid=True,
+    )
+
+    evidence = await stranding._inspect_approved_pr_with_github(
+        session=db_session,
+        project=project,
+        candidate=candidate,
+    )
+
+    assert evidence.state == "landed"
+    assert evidence.reachability_signal == "integration_history"
 
 
 @pytest.mark.asyncio
