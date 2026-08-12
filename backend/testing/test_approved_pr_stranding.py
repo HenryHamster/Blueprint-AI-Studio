@@ -1383,6 +1383,74 @@ async def test_merged_pr_can_use_canonical_integration_history(db_session, monke
 
 
 @pytest.mark.asyncio
+async def test_ephemeral_test_merge_sha_is_not_treated_as_landed(
+    db_session, monkeypatch
+):
+    """An open PR's synthetic test-merge SHA never becomes landed identity."""
+    ephemeral_sha = "b" * 40
+    reviewed_head = "c" * 40
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "acme", "widget")),
+    )
+    monkeypatch.setattr(
+        "app.github.get_pull_request",
+        AsyncMock(
+            return_value={
+                "merged": False,
+                "mergeable": True,
+                "merge_commit_sha": ephemeral_sha,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "app.github.get_branch_sha", AsyncMock(return_value="integration-head")
+    )
+    ancestry = AsyncMock(return_value=False)
+    monkeypatch.setattr("app.github.is_ancestor_of", ancestry)
+    history = AsyncMock(return_value=[f"unrelated mention {ephemeral_sha}"])
+    monkeypatch.setattr("app.github.list_recent_commit_messages", history)
+
+    project = Project(
+        name="Open test-merge project",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="open approved work",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+    )
+    candidate = stranding._ApprovedPrCandidate(
+        task=task,
+        project=project,
+        pr_number=17162,
+        base_sha="a" * 40,
+        head_sha=reviewed_head,
+        commit_sha=reviewed_head,
+        target_valid=True,
+    )
+
+    evidence = await stranding._inspect_approved_pr_with_github(
+        session=db_session,
+        project=project,
+        candidate=candidate,
+    )
+
+    assert evidence.state == "stranded"
+    assert evidence.checked_commit_sha == reviewed_head
+    assert evidence.merge_commit_sha is None
+    assert ancestry.await_count == 1
+    assert ancestry.await_args.args[3] == reviewed_head
+    history.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_sweep_normalizes_aware_cadence_timestamp(db_session):
     stranding._last_stranding_scan = datetime(2026, 8, 9, tzinfo=timezone.utc)
 

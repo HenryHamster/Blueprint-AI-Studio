@@ -1139,7 +1139,14 @@ async def _inspect_approved_pr_with_github(
         elif pull.get("mergeable") is False:
             mergeability = "conflicted"
         api_merge_commit_sha = pull.get("merge_commit_sha")
-        if isinstance(api_merge_commit_sha, str) and api_merge_commit_sha.strip():
+        # GitHub also populates merge_commit_sha for an OPEN PR with a
+        # synthetic test-merge commit.  That SHA is ephemeral and is not proof
+        # that anything landed.  Only a merged PR may contribute this identity.
+        if (
+            pull_merged
+            and isinstance(api_merge_commit_sha, str)
+            and api_merge_commit_sha.strip()
+        ):
             observed_merge_commit_sha = api_merge_commit_sha.strip()[:64]
     except Exception as exc:  # noqa: BLE001
         logger.info(
