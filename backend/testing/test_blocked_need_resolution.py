@@ -3786,7 +3786,7 @@ async def _proof_project_and_task(
             {"type": "research", "directions": [direction], "base_branch": "main"}
         ],
         context={"research_depth": 0},
-        status=TaskStatus.IN_PROGRESS,
+        status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{_uuid.uuid4().hex[:16]}",
     )

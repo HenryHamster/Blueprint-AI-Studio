@@ -8777,7 +8777,7 @@ async def test_corroboration_child_inherits_criterion_ids_and_upgrades_attested_
         payloads=[{"type": "research", "base_branch": "main"}],
         context={"research_depth": 0},
         criterion_ids=[criterion_key],
-        status=TaskStatus.IN_PROGRESS,
+        status=TaskStatus.COMPLETED,
         created_by="SYSTEM_AUTO_REVIEW",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )

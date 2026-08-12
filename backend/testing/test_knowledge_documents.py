@@ -1954,7 +1954,10 @@ async def test_grader_resume_reconstructs_document_from_stash_body_intact(
         payloads=[{"type": "investigate", "base_branch": "main"}],
         context={QUALITY_GRADER_SOURCE_KEY: str(source.id)},
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_by="ORCHESTRATOR",
     )
+    source.context = {**(source.context or {}), "awaiting_quality_grader": str(grader.id)}
+    db_session.add(source)
     db_session.add(grader)
     await db_session.commit()
     await db_session.refresh(grader)

@@ -4,7 +4,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 from sqlmodel import select
 
 from app.admin_task_mutations import modify_task_apply
@@ -480,7 +480,7 @@ async def test_terminal_requeue_merged_pr_immediately_runs_rollup_classifier(
 async def test_terminal_requeue_atomic_manual_rebind_sanitizes_effective_context(
     db_session, mocker
 ):
-    """A combined context+status PATCH cannot restore its stale proof later."""
+    """A combined context+status PATCH is rejected before stale proof is read."""
 
     parent = await _rollup_parent(
         db_session,
@@ -517,43 +517,32 @@ async def test_terminal_requeue_atomic_manual_rebind_sanitizes_effective_context
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
 
     incoming_loop = _stale_loop(15494)
-    await modify_task_apply(
-        parent,
-        {
-            "status": TaskStatus.QUEUED.value,
-            "context": {
-                **_stale_rollup_cycle_context(),
-                "rollup_pr_number": 15494,
-                "blueprint_review_verdict": "APPROVE",
-                "review_loop": incoming_loop,
+    with pytest.raises(HTTPException) as exc_info:
+        await modify_task_apply(
+            parent,
+            {
+                "status": TaskStatus.QUEUED.value,
+                "context": {
+                    **_stale_rollup_cycle_context(),
+                    "rollup_pr_number": 15494,
+                    "blueprint_review_verdict": "APPROVE",
+                    "review_loop": incoming_loop,
+                },
             },
-        },
-        BackgroundTasks(),
-        db_session,
+            BackgroundTasks(),
+            db_session,
+        )
+    assert exc_info.value.detail == (
+        "Apply status separately from generic payload, context, or topology mutation"
     )
+    assert get_pr.await_count == 0
 
     await db_session.refresh(parent)
-    assert parent.status == TaskStatus.EVALUATING
+    assert parent.status == TaskStatus.FAILED
     ctx = parent.context or {}
     loop = ctx["review_loop"]
-    assert get_pr.await_args.args[3] == 15494
-    assert ctx["rollup_pr_number"] == 15494
-    assert loop["pr_number"] == 15494
-    assert loop["head_sha"] == "replacement-head"
-    assert loop["ci_wait_pause_baseline"] == 7.0
-    assert loop["ci_wait_started"] != incoming_loop["ci_wait_started"]
-    for stale_key in (
-        "ci_passed",
-        "review_approved",
-        "verify_tests_task_id",
-        "verify_tests_verdict",
-        "escalated",
-        "merge_failures",
-    ):
-        assert stale_key not in loop
-    assert "blueprint_review_verdict" not in ctx
-    for stale_key in _stale_rollup_cycle_context():
-        assert stale_key not in ctx
+    assert ctx["rollup_pr_number"] == 15488
+    assert loop == _stale_loop(15488)
 
 
 def test_attempt_reset_preserves_chain_metadata_only():

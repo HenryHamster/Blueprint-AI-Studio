@@ -140,7 +140,6 @@ async def test_phase2_spawn_recovers_poisoned_session_before_failure_writes(
         # A duplicate primary-key flush puts a real SQLAlchemy AsyncSession in
         # PendingRollbackError state, matching the production CI-compliance
         # flush failure rather than merely raising a synthetic RuntimeError.
-        session.expunge(task)
         duplicate = make_task(project_id=project.id, id=task_id)
         session.add(duplicate)
         await session.flush()

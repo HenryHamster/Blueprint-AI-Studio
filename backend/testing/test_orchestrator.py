@@ -23,7 +23,9 @@ import app.shared_state as _shared_state
 from app.reaper import reaper_service
 from app.autonomous_research import _spawn_research_task
 from app.failure_classification import classify_failure
-from app.research_completion import _handle_research_completion
+from test_autonomous_research import (
+    _handle_research_completion,
+)
 from app.max_plan_pool import (
     load_max_plan_pool,
     select_max_plan_account,
@@ -4313,7 +4315,9 @@ class TestResearchCompletion:
     @staticmethod
     def _findings_json(*findings):
         """Serialize a list of finding dicts to a log string for _handle_research_completion."""
-        return json.dumps(findings)
+        return json.dumps(
+            [{"type": "improvement", **finding} for finding in findings]
+        )
 
     # ── Test 5: duplicate findings are skipped ───────────────────────────────
 

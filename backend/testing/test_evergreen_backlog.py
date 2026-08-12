@@ -32,7 +32,13 @@ from app.evergreen_backlog import (
     _reset_observability_for_tests,
     get_fill_observability,
 )
-from app.models import EvergreenBacklogItem, EvergreenFillDecisionLog, Project, Task
+from app.models import (
+    EvergreenBacklogItem,
+    EvergreenFillDecisionLog,
+    Project,
+    Task,
+    TaskStatus,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -740,7 +746,9 @@ async def test_deferred_memo_enrollment_flag_gated(db_session, mocker):
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
-        task = await _make_research_task(project, direction, db_session)
+        task = await _make_research_task(
+            project, direction, db_session, status=TaskStatus.COMPLETED
+        )
         return project, direction, task
 
     def _low_finding(dir_suffix=""):

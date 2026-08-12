@@ -1025,6 +1025,7 @@ class UninstallTests(unittest.TestCase):
         Path(self.unit_path).write_text("[Unit]\n")
         with patch.object(br, "_user_unit_path", return_value=self.unit_path), \
              patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br, "_systemctl"), \
              patch("os.remove", side_effect=OSError("permission denied")):
             rc = br.do_uninstall(system=False)
         self.assertEqual(rc, 1)
@@ -1740,11 +1741,10 @@ class StatusCommandTests(unittest.TestCase):
             status_path = os.path.join(tmpdir, "status.json")
             with open(status_path, "w") as f:
                 f.write("{}")
-            # Make file unreadable
-            os.chmod(status_path, 0o000)
             with patch.object(br, "_credential_dir", return_value=tmpdir):
                 fake_stderr = io.StringIO()
-                with patch.object(br.sys, "stderr", fake_stderr):
+                with patch.object(br.sys, "stderr", fake_stderr), \
+                     patch("builtins.open", side_effect=PermissionError("permission denied")):
                     rc = br.do_status()
             self.assertEqual(rc, 1)
             self.assertIn("could not read", fake_stderr.getvalue())

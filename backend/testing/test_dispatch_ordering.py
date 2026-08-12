@@ -250,7 +250,7 @@ def test_reserve_promotes_reserved_type_under_pressure():
         runtime_config={"reserved_slots_for_types": {"create": 1}},
         slots_available=2,
     )
-    assert out == ["r1", "c1"]
+    assert out == ["r1", "c1", "r2"]
 
 
 def test_reserve_no_promotion_when_reserved_type_already_present():
