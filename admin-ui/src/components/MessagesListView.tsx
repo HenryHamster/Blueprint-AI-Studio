@@ -1,5 +1,5 @@
 /* eslint-disable react-hooks/refs */
-import { type Dispatch, type SetStateAction, type RefObject, type ReactNode, useMemo, useEffect, useRef, useCallback, useImperativeHandle } from 'react';
+import { type Dispatch, type SetStateAction, type RefObject, useMemo, useEffect, useRef, useCallback, useImperativeHandle } from 'react';
 import { MessageSquare, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, ChevronUp, MoreVertical } from 'lucide-react';
 import { List, useDynamicRowHeight, useListRef, type RowComponentProps, type ListImperativeAPI } from 'react-window';
 import { ROUTINE_EVENT_LABELS } from './eventPrefs';
@@ -731,15 +731,6 @@ export function buildTriageItems(p: BuildParams): { items: TriageItem[]; section
 
 export interface MessagesListViewProps {
   presentation?: 'triage' | 'conversation';
-  /**
-   * Live strategic-session streaming preview, rendered at the tail of the
-   * conversation transcript (conversation presentation only). Reconciled away by
-   * the caller once the durable strategic ProjectMessage lands, so it never
-   * duplicates a persisted message.
-   */
-  streamingBubble?: ReactNode;
-  /** Calm operation status rendered at the conversation tail; details stay in Activity. */
-  operationItem?: ReactNode;
   hasOlderConversationMessages?: boolean;
   loadingOlderConversationMessages?: boolean;
   onLoadOlderConversationMessages?: () => void | Promise<void>;
@@ -809,8 +800,6 @@ export interface MessagesListViewProps {
 export function MessagesListView(props: MessagesListViewProps) {
   const {
     presentation = 'triage',
-    streamingBubble,
-    operationItem,
     hasOlderConversationMessages,
     loadingOlderConversationMessages,
     onLoadOlderConversationMessages,
@@ -822,8 +811,6 @@ export function MessagesListView(props: MessagesListViewProps) {
     return (
       <ConversationVirtualList
         {...triageProps}
-        streamingBubble={streamingBubble}
-        operationItem={operationItem}
         hasOlderConversationMessages={hasOlderConversationMessages}
         loadingOlderConversationMessages={loadingOlderConversationMessages}
         onLoadOlderConversationMessages={onLoadOlderConversationMessages}
@@ -845,8 +832,7 @@ type ConversationRow =
   | { kind: 'loading' }
   | { kind: 'empty' }
   | { kind: 'divider'; label: string }
-  | { kind: 'message'; message: ProjectMessage }
-  | { kind: 'node'; key: 'streaming' | 'operation'; node: ReactNode };
+  | { kind: 'message'; message: ProjectMessage };
 
 interface ConversationRowData {
   rows: ConversationRow[];
@@ -895,14 +881,13 @@ function ConversationRowView({
         {row.kind === 'message' && (
           <MessageBubble
             msg={row.message}
-            faded={row.message.status === 'resolved'}
+            faded={false}
             replyTarget={replyTargetFor(row.message, messagesById)}
             presentation="chat"
             highlighted={row.message.id === highlightedMessageId}
             {...bubbleProps}
           />
         )}
-        {row.kind === 'node' && row.node}
       </div>
     </div>
   );
@@ -916,8 +901,6 @@ function ConversationVirtualList({
   highlightedMessageId,
   showScrollDown,
   scrollToBottom,
-  streamingBubble,
-  operationItem,
   hasOlderConversationMessages,
   loadingOlderConversationMessages,
   onLoadOlderConversationMessages,
@@ -945,17 +928,15 @@ function ConversationVirtualList({
     const next: ConversationRow[] = [];
     if (hasOlderConversationMessages) next.push({ kind: 'load_older' });
     if (loading) next.push({ kind: 'loading' });
-    else if (messages.length === 0 && !streamingBubble && !operationItem) next.push({ kind: 'empty' });
+    else if (messages.length === 0) next.push({ kind: 'empty' });
     else {
       for (const item of insertTimeDividers(messages)) {
         if (item.kind === 'divider') next.push({ kind: 'divider', label: item.label });
         else next.push({ kind: 'message', message: item.msg });
       }
-      if (streamingBubble) next.push({ kind: 'node', key: 'streaming', node: streamingBubble });
-      if (operationItem) next.push({ kind: 'node', key: 'operation', node: operationItem });
     }
     return next;
-  }, [hasOlderConversationMessages, loading, messages, operationItem, streamingBubble]);
+  }, [hasOlderConversationMessages, loading, messages]);
 
   useImperativeHandle(conversationListRef, () => ({
     scrollToMessage: (messageId: string) => {
@@ -1160,7 +1141,7 @@ function ConversationVirtualList({
 
 // ─── Triage virtual list ──────────────────────────────────────────────────────
 
-type TriageVirtualListProps = Omit<MessagesListViewProps, 'presentation' | 'streamingBubble' | 'operationItem'>;
+type TriageVirtualListProps = Omit<MessagesListViewProps, 'presentation'>;
 
 function TriageVirtualList(props: TriageVirtualListProps) {
   const {

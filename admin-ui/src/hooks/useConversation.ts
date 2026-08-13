@@ -10,6 +10,39 @@ import { messageHasClientIdentity } from '../utils/conversationMessageIdentity';
 /** Enough recent context for either layout without fetching an entire transcript. */
 export const CONVERSATION_INITIAL_WINDOW = 30;
 
+const INTERNAL_CONVERSATION_AUDIENCES = new Set(['strategist-internal', 'pipeline-log']);
+const NON_CONVERSATION_EVENT_TYPES = new Set(['strategic_check_in', 'mode_knob_cut_recommended']);
+
+function isDispositionedNonConversationRealtimeEvent(message: ProjectMessage): boolean {
+  return message.surface === 'conversation'
+    && typeof message.context?.event_type === 'string'
+    && NON_CONVERSATION_EVENT_TYPES.has(message.context.event_type);
+}
+
+/** Structural eligibility shared by rows returned from the canonical endpoint. */
+export function isCanonicalConversationEnvelope(message: ProjectMessage): boolean {
+  // Null surface is retained only for legacy rows returned by the trusted
+  // canonical endpoint. Realtime direct merge below still requires an explicit
+  // conversation surface.
+  if (message.surface != null && message.surface !== 'conversation') return false;
+  if (typeof message.context?.event_type === 'string'
+    && NON_CONVERSATION_EVENT_TYPES.has(message.context.event_type)) return false;
+  return true;
+}
+
+/**
+ * Realtime frames are not relational proof. Internal-audience rows therefore
+ * must round-trip through the canonical endpoint even when their envelope names
+ * reply/covered ids; only the server can verify those ids are operator inputs
+ * on the conversation surface.
+ */
+export function canDirectlyMergeRealtimeConversationMessage(message: ProjectMessage): boolean {
+  if (message.surface !== 'conversation') return false;
+  if (!isCanonicalConversationEnvelope(message)) return false;
+  const audience = message.context?.audience;
+  return typeof audience !== 'string' || !INTERNAL_CONVERSATION_AUDIENCES.has(audience);
+}
+
 export function compareConversationMessages(a: ProjectMessage, b: ProjectMessage): number {
   if (a.sequence != null || b.sequence != null) {
     if (a.sequence == null) return -1;
@@ -130,7 +163,6 @@ export function useConversation({
   const gapContinuationRef = useRef<() => void>(() => {});
   const refreshAbortRef = useRef<AbortController | null>(null);
   const olderAbortRef = useRef<AbortController | null>(null);
-  const ackedRealtimeMessageIdsRef = useRef<Set<string>>(new Set());
   const initialFetchScopeRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -146,14 +178,6 @@ export function useConversation({
     setNextBeforeSequence(null);
     setLoadingOlder(false);
   }, [actorUserId, projectId, includeMessageId, normalizedSearch]);
-
-  // Delivery acknowledgements belong to the actor/project connection scope,
-  // not to local navigation or search state. Resetting this set when a target
-  // message or search changes causes the same realtime frame to be acked
-  // repeatedly as the operator moves around the conversation.
-  useEffect(() => {
-    ackedRealtimeMessageIdsRef.current = new Set();
-  }, [actorUserId, projectId]);
 
   const refresh = useCallback(async (fillSequenceGap = false, explicitForwardFrom?: number | null) => {
     if (!enabled || !projectId || !actorUserId) return;
@@ -171,7 +195,9 @@ export function useConversation({
     const requestedTargetId = targetKey && fetchedTargetKeyRef.current !== targetKey
       ? includeMessageId
       : null;
-    const existing = getMessages().filter(message => message.project_id === projectId);
+    const existing = getMessages().filter(message => (
+      message.project_id === projectId && isCanonicalConversationEnvelope(message)
+    ));
     const priorSequences = existing
       .filter(message => message.sequence != null)
       .map(message => message.sequence as number);
@@ -199,7 +225,7 @@ export function useConversation({
         onTargetFetched?.(requestedTargetId);
       }
       etagRef.current = result.etag ?? null;
-      let page = result.conversation.items ?? [];
+      let page = (result.conversation.items ?? []).filter(isCanonicalConversationEnvelope);
       let cursor = result.conversation.next_before_sequence ?? null;
       let pageHasMore = Boolean(result.conversation.has_more);
       let gapPages = 0;
@@ -220,7 +246,7 @@ export function useConversation({
         }, controller.signal);
         if (!isCurrentRequest()) return;
         if (isStrategicConversationNotModified(gapResult)) break;
-        const gapItems = gapResult.conversation.items ?? [];
+        const gapItems = (gapResult.conversation.items ?? []).filter(isCanonicalConversationEnvelope);
         page = mergeConversationPages(page, gapItems);
         cursor = gapResult.conversation.next_before_sequence ?? null;
         pageHasMore = Boolean(gapResult.conversation.has_more);
@@ -281,7 +307,10 @@ export function useConversation({
         limit: 30,
       }, controller.signal);
       if (isStrategicConversationNotModified(result) || !isCurrentRequest()) return;
-      setMessages(previous => mergeConversationPages(previous, result.conversation.items ?? []));
+      setMessages(previous => mergeConversationPages(
+        previous.filter(isCanonicalConversationEnvelope),
+        (result.conversation.items ?? []).filter(isCanonicalConversationEnvelope),
+      ));
       setHasMore(Boolean(result.conversation.has_more));
       setNextBeforeSequence(result.conversation.next_before_sequence ?? null);
     } catch (error) {
@@ -294,8 +323,8 @@ export function useConversation({
     }
   }, [actorUserId, enabled, hasMore, loadingOlder, nextBeforeSequence, normalizedSearch, onError, projectId, setMessages]);
 
-  const refetchCanonicalMessage = useCallback(async (messageId: string) => {
-    if (!enabled || !projectId || !actorUserId) return;
+  const refetchCanonicalMessage = useCallback(async (messageId: string): Promise<boolean> => {
+    if (!enabled || !projectId || !actorUserId) return false;
     refreshAbortRef.current?.abort();
     const controller = new AbortController();
     refreshAbortRef.current = controller;
@@ -312,11 +341,18 @@ export function useConversation({
         { includeMessageId: messageId, limit: 1 },
         controller.signal,
       );
-      if (isStrategicConversationNotModified(result) || !isCurrentRequest()) return;
-      const canonical = (result.conversation.items ?? []).find(message => message.id === messageId);
+      if (isStrategicConversationNotModified(result) || !isCurrentRequest()) return false;
+      const canonical = (result.conversation.items ?? [])
+        .filter(isCanonicalConversationEnvelope)
+        .find(message => message.id === messageId);
       if (canonical) {
-        setMessages(previous => mergeConversationPages(previous, [canonical]));
+        setMessages(previous => mergeConversationPages(
+          previous.filter(isCanonicalConversationEnvelope),
+          [canonical],
+        ));
+        return true;
       }
+      return false;
     } catch (error) {
       if (isCurrentRequest() && !(error instanceof DOMException && error.name === 'AbortError')) {
         onError('Failed to reconcile a realtime message');
@@ -324,6 +360,7 @@ export function useConversation({
     } finally {
       if (refreshAbortRef.current === controller) refreshAbortRef.current = null;
     }
+    return false;
   }, [actorUserId, enabled, normalizedSearch, onError, projectId, setMessages]);
 
   const previousSearchRef = useRef(normalizedSearch);
@@ -335,26 +372,57 @@ export function useConversation({
   }, [enabled, normalizedSearch, refresh]);
 
   useEffect(() => {
-    if (!enabled || !projectId || !realtimeMessage || realtimeMessage.project_id !== projectId || realtimeMessage.surface !== 'conversation') return;
-    if (sendAck && !ackedRealtimeMessageIdsRef.current.has(realtimeMessage.id)) {
-      ackedRealtimeMessageIdsRef.current.add(realtimeMessage.id);
-      sendAck(realtimeMessage.id);
-    }
-    if (normalizedSearch) {
-      const timer = window.setTimeout(() => { void refresh(false); }, 100);
-      return () => window.clearTimeout(timer);
+    if (!enabled || !projectId || !realtimeMessage || realtimeMessage.project_id !== projectId) return;
+    if (realtimeMessage.surface !== 'conversation' || !isCanonicalConversationEnvelope(realtimeMessage)) {
+      // Purge a stale projection too: the same non-canonical row may have been
+      // merged by an older realtime handler before this hook mounted.
+      setMessages(previous => previous.some(message => message.id === realtimeMessage.id)
+        ? previous.filter(message => message.id !== realtimeMessage.id)
+        : previous);
+      // These two event types have an explicit final disposition: they belong
+      // outside Chat. Acknowledge their otherwise-valid conversation delivery
+      // so the backend does not replay the intentionally discarded row after
+      // every reconnect. Ambiguous surfaces and unproven internal rows remain
+      // unacknowledged and follow their existing reconciliation paths.
+      if (isDispositionedNonConversationRealtimeEvent(realtimeMessage) && sendAck) {
+        sendAck(realtimeMessage.id);
+      }
+      return;
     }
     const existing = getMessages().filter(message => message.project_id === projectId);
     const sequences = existing.flatMap(message => message.sequence == null ? [] : [message.sequence]);
     const priorMax = sequences.length ? Math.max(...sequences) : null;
-    if (realtimeMessageRequiresCanonicalRefetch) {
+    if (!canDirectlyMergeRealtimeConversationMessage(realtimeMessage)) {
+      // An internal row may be a valid legacy reply, but only the canonical
+      // endpoint can prove its reply target belongs to this conversation.
+      setMessages(previous => previous.some(message => message.id === realtimeMessage.id)
+        ? previous.filter(message => message.id !== realtimeMessage.id)
+        : previous);
       const timer = window.setTimeout(() => {
-        void refetchCanonicalMessage(realtimeMessage.id)
-          .then(() => refresh(priorMax != null, priorMax));
+        void refetchCanonicalMessage(realtimeMessage.id).then(canonicalFound => {
+          if (canonicalFound && sendAck) sendAck(realtimeMessage.id);
+        });
       }, 0);
       return () => window.clearTimeout(timer);
     }
-    setMessages(previous => mergeConversationPages(previous, [realtimeMessage]));
+    if (realtimeMessageRequiresCanonicalRefetch) {
+      const timer = window.setTimeout(() => {
+        void refetchCanonicalMessage(realtimeMessage.id).then(canonicalFound => {
+          if (canonicalFound && sendAck) sendAck(realtimeMessage.id);
+          return refresh(priorMax != null, priorMax);
+        });
+      }, 0);
+      return () => window.clearTimeout(timer);
+    }
+    if (sendAck) sendAck(realtimeMessage.id);
+    if (normalizedSearch) {
+      const timer = window.setTimeout(() => { void refresh(false); }, 100);
+      return () => window.clearTimeout(timer);
+    }
+    setMessages(previous => mergeConversationPages(
+      previous.filter(isCanonicalConversationEnvelope),
+      [realtimeMessage],
+    ));
     const timer = window.setTimeout(() => { void refresh(priorMax != null, priorMax); }, 0);
     return () => window.clearTimeout(timer);
   }, [enabled, getMessages, normalizedSearch, projectId, realtimeMessage, realtimeMessageRequiresCanonicalRefetch, refetchCanonicalMessage, refresh, sendAck, setMessages]);

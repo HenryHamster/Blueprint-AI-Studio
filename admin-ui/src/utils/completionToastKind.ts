@@ -21,3 +21,23 @@ export function resolveCompletionToastMessage(kind: CompletionToastKind): string
   if (kind === 'info') return 'Strategic cycle cancelled';
   return 'Strategic cycle complete';
 }
+
+const INTENTIONAL_RESIDENT_STOP_SOURCE = /(?:["']?source["']?)\s*(?:=|:)\s*["']?resident_operator_stop\b/i;
+
+/**
+ * Intentional operator stops remain part of the durable cycle lifecycle, but
+ * are not exceptional enough to interrupt the operator with a sticky toast.
+ * Fail closed: only a cancelled status plus the exact durable source marker is
+ * suppressed; every unmarked cancellation and every failure remains visible.
+ */
+export function shouldSuppressCompletionToast(
+  status: string | undefined,
+  failureReason?: string,
+  statusMessage?: string,
+): boolean {
+  const normalizedStatus = status?.toLowerCase();
+  if (normalizedStatus !== 'cancelled' && normalizedStatus !== 'canceled') return false;
+  return [failureReason, statusMessage].some(
+    detail => typeof detail === 'string' && INTENTIONAL_RESIDENT_STOP_SOURCE.test(detail),
+  );
+}

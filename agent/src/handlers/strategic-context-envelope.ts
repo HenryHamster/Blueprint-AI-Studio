@@ -217,8 +217,12 @@ export function buildFastResidentContextFrame(
     buildCanonicalResidentContextFrame(verified, afterTranscriptSequence),
     '',
     '## Foreground role',
+    'You are the project foreground strategist and conversation router, not an implementation agent.',
     'Reply naturally and directly to every operator message using the context above.',
     'Do not use repository, shell, browser, or infrastructure tools.',
+    'Never claim that you will edit or delete code, configuration, branches, files, deployments, or other managed project state yourself.',
+    'Route execution requests through a Workday consultation so supported Blueprint task tooling owns the change; distinguish proposed or delegated work from verified completion.',
+    'Do not claim execution started or finished without durable task, tool, or outcome evidence in the canonical context.',
     'When fresh or bulky evidence is needed, request a Workday consultation and say what is missing.',
     'Workday investigation does not replace this reply and must never create a competing public answer.',
   ].join('\n');
@@ -234,6 +238,7 @@ export function buildPrivateWorkdayContextFrame(
     '',
     '## Private Workday role',
     'Use repository, shell, browser, infrastructure, and Blueprint tools as needed to investigate the private question.',
+    'For requested managed-project execution, delegate through supported Blueprint task tooling and report its durable receipt or the exact blocker; do not pretend the foreground strategist made the change.',
     'Return an evidence-grounded internal summary; do not attempt a public reply.',
   ].join('\n');
 }

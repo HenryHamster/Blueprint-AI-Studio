@@ -366,13 +366,13 @@
         "publishes a ready waiting state before entering the conversational loop",
         "acquires the fenced slot before readiness and releases it on normal shutdown",
         "closes a lease-lost Fast controller without giving its next tagged message to Workday",
-        "completes a pure Fast message without starting idle Workday",
+        "does not acknowledge or answer an Activity remainder in the same Fast turn",
         "preserves the operator message without broad Workday fallback when Fast capacity is denied",
         "continues polling and heartbeating while the Fast readiness probe is pending",
         "ignores a stale heartbeat response sent before the Fast lease was acquired",
         "revokes Fast when the exact active lease heartbeat returns typed_fast null",
         "releases a dead ready Fast child before replacing it and admitting the message",
-        "recovers an expired claimed turn before sequentially answering newer input",
+        "reconciles a lost Fast completion response and then picks up newer input",
         "paces a transient Fast claim conflict and retries the same client identity",
         "renews and restores the ordinary Workday claim while Fast replies",
         "releases the exact lease after a failed readiness probe without starting a Fast turn",
@@ -381,6 +381,7 @@
         "waits for authoritative stale claim membership instead of claiming a partial page",
         "recovers an authoritative complete stale claim group exactly",
         "sends only the backend-marked canonical user subset to Fast",
+        "gives activated Fast sole public ownership of mixed broad-poll pages",
         "stops both lanes when the displaced Workday claim cannot be renewed",
         "uses the retained M1 input while its stable claim is leased",
         "keeps the local message fence installed for the complete %s private turn",
@@ -434,10 +435,11 @@
     },
     {
       "path": "admin-ui/src/hooks/useConversation.test.tsx",
-      "reason": "Protects realtime acknowledgement deduplication across callback changes and targeted conversation navigation.",
+      "reason": "Protects canonical realtime acknowledgement after admission and repeat acknowledgement on recovery frames and conversation navigation.",
       "test_ids": [
-        "acknowledges the same realtime message only once when callback identity changes",
-        "keeps acknowledgement dedup across include-target and search navigation"
+        "calls sendAck with the realtime message id when a conversation message is merged",
+        "can acknowledge the same canonical message again on a recovery frame",
+        "re-acknowledges an admitted replay after conversation navigation"
       ]
     },
     {
@@ -738,24 +740,6 @@
         "renders the backend-resolved effective policy with explicit source precedence",
         "ignores absent or non-record effective policy payloads",
         "buildCompactionCheckpoint preserves effective policy authority and freshness rules"
-      ]
-    },
-    {
-      "path": "admin-ui/src/components/StrategicLiveTurn.test.tsx",
-      "reason": "Covers StrategicResidentActivityWidget — the live-turn UI component that displays the elapsed timer, executing/idle/dead states, and streaming reply for the conversational Workday session. Guards timer truthfulness: the counter ticks only while a command is genuinely executing and freezes on idle or dead state, fixing the defect where the timer ticked forever after session death.",
-      "test_ids": [
-        "executing state advances the elapsed timer each second",
-        "dead state renders no ticking timer and stays constant as time advances",
-        "idle state renders waiting copy and no ticking timer",
-        "durable waiting state renders one compact activity and idle line"
-      ]
-    },
-    {
-      "path": "admin-ui/src/components/StrategicLiveTurn.viewport.test.tsx",
-      "reason": "Viewport regression tests for StrategicLiveTurn components (StrategicStreamingBubble, StrategicActivityStrip, StrategicResidentActivityWidget) at 375px mobile width. Guards that streaming reply/reasoning content and live activity strips remain contained within the viewport without overflow — a critical UI contract for the conversational Workday session display on mobile.",
-      "test_ids": [
-        "streaming reply and reasoning remain contained at 375px",
-        "live activity and resident status remain contained at 375px"
       ]
     },
     {

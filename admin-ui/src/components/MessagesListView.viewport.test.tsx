@@ -185,6 +185,34 @@ describe('MessagesListView — viewport regression', () => {
     });
   });
 
+  test('renders a resolved Fast reply at normal emphasis with proven Workday provenance', async () => {
+    const reply = makeMsg({
+      id: 'fast-workday-reply',
+      sequence: 1,
+      from_type: 'strategic',
+      surface: 'conversation',
+      status: 'resolved',
+      content: 'Durable answer from Fast.',
+      context: {
+        audience: 'operator-fyi',
+        event_type: 'question_answer',
+        _conversation_public_reply_owner: 'fast',
+        message_role: 'workday_consultation_continuation',
+        _workday_result_packet_id: 'packet-1',
+      },
+    });
+
+    await renderView(baseProps({ presentation: 'conversation', messages: [reply] }));
+    await vi.waitFor(() => {
+      expect(host?.querySelector('[data-message-id="fast-workday-reply"]')).not.toBeNull();
+    });
+    const bubble = host?.querySelector('[data-message-id="fast-workday-reply"]');
+    expect(bubble?.className).not.toContain('opacity-75');
+    expect(bubble?.textContent).toContain('Strategic');
+    expect(bubble?.textContent).toContain('Workday consulted');
+    expect(bubble?.textContent).toContain('Durable answer from Fast.');
+  });
+
   test('imperative conversation navigation renders an offscreen target before resolving', async () => {
     const messages = Array.from({ length: 200 }, (_, index) => makeMsg({
       id: `target-history-${index + 1}`,

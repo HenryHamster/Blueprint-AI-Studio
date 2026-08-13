@@ -337,7 +337,7 @@ describe('MessagesPanel confirmation chip actionability', () => {
         selectedProjectId="proj-1"
         addToast={() => {}}
         onMessageCountChange={() => {}}
-        filterChrome="minimal"
+        filterChrome="compact"
         strategicState={makeConfirmationStrategicState()}
       />,
     );
@@ -374,7 +374,7 @@ describe('MessagesPanel confirmation chip actionability', () => {
         selectedProjectId="proj-1"
         addToast={() => {}}
         onMessageCountChange={() => {}}
-        filterChrome="minimal"
+        filterChrome="compact"
         strategicState={makeConfirmationStrategicState('confirm-42', 'proj-1')}
         onStrategicStateRefresh={onStrategicStateRefresh}
       />,
@@ -415,7 +415,7 @@ describe('MessagesPanel confirmation chip actionability', () => {
         selectedProjectId="proj-1"
         addToast={() => {}}
         onMessageCountChange={() => {}}
-        filterChrome="minimal"
+        filterChrome="compact"
         strategicState={makeConfirmationStrategicState('confirm-99', 'proj-1')}
       />,
     );
@@ -452,7 +452,7 @@ describe('MessagesPanel confirmation chip actionability', () => {
         selectedProjectId="proj-1"
         addToast={addToast}
         onMessageCountChange={() => {}}
-        filterChrome="minimal"
+        filterChrome="compact"
         strategicState={makeConfirmationStrategicState('confirm-err', 'proj-1')}
       />,
     );
@@ -473,6 +473,25 @@ describe('MessagesPanel confirmation chip actionability', () => {
     // Chip must still be visible — it was not removed on failure
     const chipAfter = [...(container.querySelector('[data-testid="needs-action-strip"]')?.querySelectorAll('button') ?? [])].find(b => b.textContent?.includes('Confirm deployment plan'));
     expect(chipAfter).toBeTruthy();
+  });
+
+  test('minimal Chat omits needs-action controls even when attention is present', async () => {
+    setupConvMock();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        strategicState={makeConfirmationStrategicState()}
+      />,
+    );
+
+    await waitFor(() => expect(container.querySelector('[aria-label="Search strategist conversation"]')).toBeTruthy());
+    expect(container.querySelector('[data-testid="needs-action-strip"]')).toBeNull();
+    expect(container.textContent).not.toContain('Needs your action');
+    expect(container.textContent).not.toContain('Confirm deployment plan');
   });
 
   test('message chip in non-conversation mode is not disabled and triggers scroll', async () => {
@@ -1706,7 +1725,7 @@ describe('MessagesPanel attention model lifecycle field consumption', () => {
         selectedProjectId="proj-1"
         addToast={() => {}}
         onMessageCountChange={() => {}}
-        filterChrome="minimal"
+        filterChrome="compact"
         strategicState={state}
       />,
     );
@@ -1756,7 +1775,7 @@ describe('MessagesPanel attention model lifecycle field consumption', () => {
         selectedProjectId="proj-1"
         addToast={() => {}}
         onMessageCountChange={() => {}}
-        filterChrome="minimal"
+        filterChrome="compact"
         strategicState={state}
       />,
     );
@@ -1818,7 +1837,7 @@ describe('MessagesPanel attention model lifecycle field consumption', () => {
         selectedProjectId="proj-1"
         addToast={() => {}}
         onMessageCountChange={() => {}}
-        filterChrome="minimal"
+        filterChrome="compact"
         strategicState={state}
       />,
     );

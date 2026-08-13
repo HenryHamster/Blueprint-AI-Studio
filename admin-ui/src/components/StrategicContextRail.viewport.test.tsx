@@ -424,8 +424,8 @@ describe('StrategicContextRail — viewport regression', () => {
 
   test('needs-your-action confirmation list renders without overflow at 1280px — acceptance evidence', async () => {
     await expectNoOverflowAt(1280, async () => { await mountConfirmations(1280); });
-    expect(host?.querySelector('[data-testid="rail-needs-action"]')).toBeTruthy();
-    expect(host?.querySelector('[data-testid="rail-needs-action"]')?.textContent).toContain('Needs your action');
+    expect(host?.querySelector('[data-testid="rail-pending-confirmations"]')).toBeTruthy();
+    expect(host?.querySelector('[data-testid="rail-pending-confirmations"]')?.textContent).toContain('Pending confirmations');
   });
 
   test('needs-your-action confirmation list keeps touch targets and no overflow at 375px', async () => {

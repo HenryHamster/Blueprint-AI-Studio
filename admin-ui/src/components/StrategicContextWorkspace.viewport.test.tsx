@@ -1,4 +1,4 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { StrategicContextWorkspace } from './StrategicContextWorkspace';
@@ -22,7 +22,14 @@ const STATE = {
       blocked_tasks: 1,
       parked_tasks: 0,
     },
-    items: [],
+    items: [{
+      id: 'confirmation:viewport-credential',
+      kind: 'confirmation',
+      label: 'Provide a deployment credential',
+      detail: 'Provide a deployment credential before the next release can continue.',
+      confirmation_type: 'credentials_needed',
+      ref: { id: 'pending-viewport-credential', project_id: 'proj-viewport' },
+    }],
   },
   context_package: {
     id: 'strategic-context:proj-viewport',
@@ -217,6 +224,9 @@ describe('StrategicContextWorkspace — viewport regression', () => {
         <StrategicContextWorkspace
           open
           state={STATE}
+          projectId="proj-viewport"
+          canOperateProject
+          showAttention={false}
           onClose={vi.fn()}
           onOpenTarget={vi.fn()}
           onUpdateSessionRefs={vi.fn()}
@@ -231,5 +241,14 @@ describe('StrategicContextWorkspace — viewport regression', () => {
 
   test('drawer controls meet touch target at 375px', async () => {
     await expectMinTouchTargetAt(375, mount);
+  });
+
+  test('mobile drawer exposes neutral pending confirmation actions at 375px', async () => {
+    await expectNoOverflowAt(375, mount);
+    const section = host?.querySelector('[data-testid="strategic-context-workspace-pending-confirmations"]');
+    expect(section?.textContent).toContain('Pending confirmations');
+    expect(section?.querySelector('[title="Mark provided"]')).toBeTruthy();
+    expect(section?.querySelector('[title="Mark as resolved without action"]')).toBeTruthy();
+    expect(host?.textContent).not.toContain('Attention');
   });
 });

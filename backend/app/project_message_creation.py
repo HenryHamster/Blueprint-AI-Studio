@@ -86,7 +86,6 @@ CONVERSATION_EVENT_TYPES = frozenset(
         "capability_proof_gate_graduated_enforce",
         "mode_knob_graduated_observe",
         "mode_knob_graduated_enforce",
-        "mode_knob_cut_recommended",
         "criterion_retracted",
         "criterion_superseded",
         "artifact_handoff_failed",

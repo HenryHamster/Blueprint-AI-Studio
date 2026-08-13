@@ -218,7 +218,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
   const {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,
     handleViewLogs, closeLogViewer,
-    wsRef, wsConnected,
+    wsRef, wsConnected, acknowledgeMessageDelivery,
     pipelineThrottle,
     ceilingDeferredProjectIds,
     gatedTaskTypes,
@@ -734,7 +734,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     // Projects
     projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous, fetchProjects, projectsLoaded,
     // Log viewer
-    logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer, strategicSessionTranscript,
+    logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer, strategicSessionTranscript, acknowledgeMessageDelivery,
     // Research browser
     showResearchBrowser, setShowResearchBrowser,
     showKnowledgeBrowser, setShowKnowledgeBrowser,

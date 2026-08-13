@@ -20,6 +20,24 @@ const MAX_TYPED_REPLY_CHARS = 20_000;
 export const MAX_TYPED_WORKDAY_REQUESTS_PER_TURN = 1;
 const MAX_TYPED_WORKDAY_DELIVERY_KEY_CHARS = 128;
 const MAX_TYPED_WORKDAY_QUESTION_CHARS = 20_000;
+// Fast is deliberately unprivileged. Reject a staged public answer that
+// impersonates an execution agent even if the model ignored its role prompt.
+// Delegation language (for example, "I'll route a task to remove it") is valid
+// only when the same typed turn stages the Workday request that makes the
+// promise true; see FAST_WORKDAY_DELEGATION_COMMITMENT below.
+const FAST_DIRECT_EXECUTION_CLAIM = /\b(?:i(?:'ll| will|'m| am going to)|let me)\s+(?:now\s+|directly\s+)?(?:edit|delete|remove|modify|patch|rewrite|commit|push|merge|deploy|revert|reset|rename|fast[-\s]?forward)\b(?=[^.!?\n]{0,100}\b(?:code|configuration|config|setting|knob|entr(?:y|ies)|file|branch|commit|pull request|pr|deployment|service|database|schema|migration|repository|repo|main|default\s+branch)\b)/i;
+
+// A public first-person promise to create or route a Blueprint/Workday task is
+// not merely prose: without a staged request, Coordinator completion would mark
+// the operator input handled while launching no private Workday packet. Keep
+// this intentionally narrower than proposals such as "we can change the mode":
+// it requires both a first-person commitment and explicit task/Workday routing.
+const FAST_WORKDAY_DELEGATION_COMMITMENT = /\b(?:i(?:'ll| will|'m going to| am going to)|let me)\s+(?:now\s+)?(?:(?:route|create|open|launch|start|spawn|queue|have|get|spin\s+up)\s+(?:(?:a|an|the|this|that|your)\s+)?(?:blueprint\s+task|workday\s+(?:task|request))\b|(?:route|send|delegate|hand(?:\s+(?:it|this|that))?(?:\s+off)?)\b[^.!?\n]{0,100}\b(?:to|through|via)\s+(?:workday|blueprint(?:\s+task)?)\b|(?:ask|have)\s+(?:workday|blueprint)\s+to\b)/i;
+
+// Also fence generic task promises when the same sentence makes their
+// managed-state purpose explicit. This catches "I'll create a task to deploy
+// the service" without treating an ordinary task-list discussion as a launch.
+const FAST_MANAGED_TASK_DELEGATION_COMMITMENT = /\b(?:i(?:'ll| will|'m going to| am going to)|let me)\s+(?:now\s+)?(?:route|create|open|launch|start|spawn|queue)\s+(?:(?:a|an|the|this|that|your)\s+)?(?:task|job|request)\b(?=[^.!?\n]{0,140}\b(?:edit|delete|remove|modify|patch|rewrite|commit|push|merge|deploy|revert|reset|rename|change|configure|update|fix|implement|fast[-\s]?forward)\b[^.!?\n]{0,100}\b(?:code|configuration|config|setting|knob|entr(?:y|ies)|file|branch|commit|pull request|pr|deployment|service|database|schema|migration|repository|repo|main|default\s+branch)\b)/i;
 
 export interface TypedConversationTurnReceipt {
   claim_id: string;
@@ -117,6 +135,19 @@ function parseWorkdayRequest(value: unknown): TypedWorkdayRequest {
   };
 }
 
+function assertFastStrategistCompletion(completion: TypedFastCompletion): void {
+  if (FAST_DIRECT_EXECUTION_CLAIM.test(completion.content)) {
+    throw new Error(
+      'Fast Resident claimed direct managed-project execution; delegate through Workday task tooling',
+    );
+  }
+}
+
+function claimsWorkdayDelegation(content: string): boolean {
+  return FAST_WORKDAY_DELEGATION_COMMITMENT.test(content)
+    || FAST_MANAGED_TASK_DELEGATION_COMMITMENT.test(content);
+}
+
 function validateStagedTypedIntents(
   completions: TypedFastCompletion[],
   requests: TypedWorkdayRequest[],
@@ -124,6 +155,7 @@ function validateStagedTypedIntents(
   if (completions.length > 1) {
     throw new Error('Fast Resident staged multiple public completions for one receipt');
   }
+  if (completions[0]) assertFastStrategistCompletion(completions[0]);
   const uniqueRequests = new Map<string, TypedWorkdayRequest>();
   for (const request of requests) {
     const existing = uniqueRequests.get(request.delivery_key);
@@ -134,6 +166,9 @@ function validateStagedTypedIntents(
   }
   if (uniqueRequests.size > MAX_TYPED_WORKDAY_REQUESTS_PER_TURN) {
     throw new Error('Fast Resident staged too many Workday requests for one turn');
+  }
+  if (completions[0] && claimsWorkdayDelegation(completions[0].content) && uniqueRequests.size === 0) {
+    throw new Error('Fast Resident promised Workday delegation without staging a Workday request');
   }
   return { completion: completions[0] ?? null, workdayRequests: [...uniqueRequests.values()] };
 }
@@ -213,6 +248,9 @@ export class ForegroundTypedController {
         readinessTimeout,
       ]);
     } finally {
+      // The Promise executor above assigns this synchronously; retain the null
+      // guard for defensive cleanup if that construction ever changes.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       if (watchdog !== null) clearTimeout(watchdog);
     }
     if (
@@ -264,7 +302,10 @@ export class ForegroundTypedController {
     const session = this.session;
     if (!session) throw new Error('Fast Resident failed to start');
     const result = await session.sendTurn(prompt);
-    if (result.interrupted || result.timedOut) {
+    if (
+      result.interrupted || result.timedOut || result.hardTimedOut
+      || result.processGone || result.providerFailed
+    ) {
       if (this.session === session) this.closeSessionOnly();
       return { receipt, result, completion: null, workdayRequests: [] };
     }
@@ -328,5 +369,6 @@ export function typedFastAbandonDispositionWithConfirmation(
 }
 
 export const _typedFastInternals = {
-  receiptFrom, sameReceipt, parseCompletion, parseWorkdayRequest, validateStagedTypedIntents,
+  receiptFrom, sameReceipt, parseCompletion, parseWorkdayRequest,
+  assertFastStrategistCompletion, claimsWorkdayDelegation, validateStagedTypedIntents,
 };

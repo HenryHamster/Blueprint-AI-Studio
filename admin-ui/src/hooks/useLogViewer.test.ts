@@ -233,7 +233,7 @@ describe('useLogViewer strategist events', () => {
     expect(failingTaskTypesFetchCount).toBe(0);
   });
 
-  it('reconciles a canonical message projection immediately instead of waiting for the debounce', async () => {
+  it('projects conversation messages without ACKing until Chat admits them', async () => {
     const { result } = setup({ selectedProjectId: 'proj-live' });
     await act(async () => {
       await Promise.resolve();
@@ -255,7 +255,36 @@ describe('useLogViewer strategist events', () => {
 
     expect(refreshMessages).toHaveBeenCalledTimes(1);
     expect(refreshMessages).toHaveBeenCalledWith(canonical, false);
+    expect(ws.send).not.toHaveBeenCalledWith(JSON.stringify({ type: 'message_ack', message_id: 'msg-2' }));
+
+    act(() => { result.current.lv.acknowledgeMessageDelivery('msg-2'); });
     expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'message_ack', message_id: 'msg-2' }));
+  });
+
+  it('continues to ACK non-conversation message delivery immediately', async () => {
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+    refreshMessages.mockClear();
+    const activity = {
+      id: 'msg-activity', project_id: 'proj-live', message_type: 'NOTE', from_type: 'system',
+      from_task_id: null, content: 'operational activity', context: {}, status: 'open',
+      resolution: null, resolved_at: null, created_at: '2026-07-18T00:00:00Z',
+      sequence: 3, surface: 'activity',
+    };
+
+    act(() => { ws.emit({ event: 'message_created', data: { project_id: 'proj-live', message: activity } }); });
+
+    expect(refreshMessages).not.toHaveBeenCalled();
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'message_ack', message_id: 'msg-activity' }));
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(refreshMessages).toHaveBeenCalledOnce();
   });
 
   it('marks a truncated realtime message projection for canonical refetch', async () => {
@@ -1212,6 +1241,29 @@ describe('useLogViewer strategist events', () => {
     expect(result.current.lv.lastCycleCompletion).not.toMatchObject({
       status: 'deferred',
       created_count: 3,
+    });
+  });
+
+  it('preserves durable cancelled reason markers for App toast disposition', async () => {
+    const strategicReadModelRef = {
+      current: makeStrategicState(null, makeCycle({
+        outcome: 'failed_phase1',
+        terminal_disposition: 'cancelled',
+        has_active_task: false,
+        summary_text: 'Cycle stopped',
+        failure_reason: 'terminal_task_reconciliation source=resident_operator_stop',
+      })),
+    };
+    const { result } = setup({ selectedProjectId: 'proj1', strategicReadModelRef });
+
+    await connect(result);
+
+    expect(result.current.lv.strategistActive).toBe(false);
+    expect(result.current.lv.lastCycleCompletion).toMatchObject({
+      cycle_id: 'cycle-reconnect',
+      status: 'CANCELLED',
+      status_message: 'Cycle stopped',
+      failure_reason: 'terminal_task_reconciliation source=resident_operator_stop',
     });
   });
 

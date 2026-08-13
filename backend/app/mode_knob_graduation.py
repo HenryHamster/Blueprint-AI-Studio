@@ -68,6 +68,21 @@ HOLD = "hold"
 ERROR = "error"
 
 
+def _cut_notification_idempotency_key(
+    *,
+    config_key: str,
+    current_mode: str,
+) -> str:
+    """Return the durable identity of one operator-visible CUT recommendation.
+
+    The graduation driver runs on every reaper cycle.  A recommendation is a
+    state transition, not a heartbeat: changing counters inside a still-CUT
+    evidence window must not create a fresh operator message.  A real mode
+    transition gets a new key and remains operator-visible.
+    """
+    return f"mode-knob-cut:{config_key}:{current_mode}"
+
+
 @dataclass(frozen=True)
 class KnobEvidence:
     """The measured counterfactual a knob's evidence provider returns.
@@ -988,6 +1003,10 @@ async def _cut(
         "measurements": measurements,
         "recommended_at": _utcnow().isoformat(),
     }
+    notification_idempotency_key = _cut_notification_idempotency_key(
+        config_key=config_key,
+        current_mode=current_mode,
+    )
 
     stamped = False
     try:
@@ -1021,6 +1040,7 @@ async def _cut(
                 config_key=config_key,
                 signal=signal,
                 measurements=measurements,
+                idempotency_key=notification_idempotency_key,
             )
         if project_ids:
             await session.commit()

@@ -24,6 +24,11 @@ from app.workbench_events import (
 
 DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
     "event_type",
+    # Required by the realtime Chat admission guard. The websocket frame cannot
+    # reproduce the server's relational conversation predicate, but it must at
+    # least preserve the bounded audience classification so internal rows are
+    # forced through the canonical refetch path instead of merged directly.
+    "audience",
     "direction_id",
     "task_id",
     "source_task_id",

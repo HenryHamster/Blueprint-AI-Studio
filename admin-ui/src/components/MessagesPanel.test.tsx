@@ -998,21 +998,16 @@ describe('MessagesPanel chrome modes', () => {
     expect(strip).toBeNull();
   });
 
-  test('minimal chat chrome can render the Strategic work session strip from read model state', async () => {
+  test('minimal chat chrome keeps Strategic work-session and attention status out of Chat', async () => {
     const el = await renderPanel({
       filterChrome: 'minimal',
       strategicState: makeStrategicState(),
     });
 
     const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
-    expect(strip?.textContent).toContain('Strategic');
-    expect(strip?.textContent).toContain('Check-in');
-    expect(strip?.textContent).toContain('1 needs attention');
-    expect(strip?.textContent).not.toContain('Workbench context');
-    expect(strip?.textContent).not.toContain('ready');
-    expect(strip?.textContent).not.toContain('18 items');
-    expect(strip?.textContent).not.toContain('Question waiting');
-    expect(strip?.textContent).not.toContain('3 running / 5 queued');
+    expect(strip).toBeNull();
+    expect(el.textContent).not.toContain('needs attention');
+    expect(el.textContent).not.toContain('Question waiting');
   });
 
   test('minimal chat composer shows live Strategic context and opens the sideboard', async () => {
@@ -1320,7 +1315,7 @@ describe('MessagesPanel chrome modes', () => {
     expect(el.querySelector('button[title="Delete"]')).not.toBeNull();
   });
 
-  test('minimal chat renders durable cycle completion receipt without count chrome', async () => {
+  test('minimal chat hides operational cycle completion receipts', async () => {
     const el = await renderPanel({
       filterChrome: 'minimal',
       lastCycleCompletion: {
@@ -1332,39 +1327,35 @@ describe('MessagesPanel chrome modes', () => {
     });
 
     const text = el.textContent ?? '';
-    expect(text).toContain('Cycle complete');
+    expect(text).not.toContain('Cycle complete');
     expect(text).not.toContain('+2 directions');
     expect(text).not.toContain('1 task spawned');
     expect(text).not.toContain('running update written');
   });
 
-  test('minimal chat renders durable cancellation and failure receipts', async () => {
+  test('minimal chat hides operational cancellation and failure receipts', async () => {
     const cancelled = await renderPanel({
       filterChrome: 'minimal',
       lastCycleCompletion: { status: 'cancelled', failure_reason: 'Operator stopped the cycle' },
     });
-    expect(cancelled.textContent).toContain('Cycle cancelled');
-    expect(cancelled.textContent).toContain('Operator stopped the cycle');
+    expect(cancelled.textContent).not.toContain('Cycle cancelled');
+    expect(cancelled.textContent).not.toContain('Operator stopped the cycle');
 
     const failed = await renderPanel({
       filterChrome: 'minimal',
       lastCycleCompletion: { status: 'failed', failure_reason: 'Execution site unavailable' },
     });
-    expect(failed.textContent).toContain('Cycle failed');
-    expect(failed.textContent).toContain('Execution site unavailable');
+    expect(failed.textContent).not.toContain('Cycle failed');
+    expect(failed.textContent).not.toContain('Execution site unavailable');
   });
 
-  test('terminal failure reason renders in both minimal chat and full message chrome', async () => {
-    // The failure-reason span is mode-independent — the completion receipt keeps
-    // it visible in conversation (minimal) and non-conversation chrome alike. The
-    // minimal variant is covered above; this proves the non-conversation render
-    // stays byte-equivalent after the collapsed single branch.
+  test('terminal failure reason stays in operational message chrome only', async () => {
     const conversation = await renderPanel({
       filterChrome: 'minimal',
       lastCycleCompletion: { status: 'failed', failure_reason: 'Execution site unavailable' },
     });
-    expect(conversation.textContent).toContain('Cycle failed');
-    expect(conversation.textContent).toContain('Execution site unavailable');
+    expect(conversation.textContent).not.toContain('Cycle failed');
+    expect(conversation.textContent).not.toContain('Execution site unavailable');
 
     await act(async () => { root?.unmount(); });
     root = null;
@@ -1662,7 +1653,7 @@ describe('MessagesPanel chrome modes', () => {
     });
   });
 
-  test('minimal chat chrome keeps queued and working state in the compact strip only', async () => {
+  test('minimal chat chrome hides queued and working activity state', async () => {
     const base = makeStrategicState();
     const queuedState = makeStrategicState({
       strategic: {
@@ -1685,7 +1676,7 @@ describe('MessagesPanel chrome modes', () => {
     });
 
     const queuedStrip = queuedEl.querySelector('[data-testid="strategic-context-package-strip"]');
-    expect(queuedStrip?.textContent).toContain('Steer queued');
+    expect(queuedStrip).toBeNull();
     expect(queuedEl.textContent).not.toContain('Strategic steer queued');
     expect(queuedEl.textContent).not.toContain('Cancel');
 
@@ -1701,12 +1692,12 @@ describe('MessagesPanel chrome modes', () => {
       cycleProgress: { task_id: 't1', phase_label: 'Reviewing context' },
     });
     const workingStrip = workingEl.querySelector('[data-testid="strategic-context-package-strip"]');
-    expect(workingStrip?.textContent).toContain('Reviewing context');
+    expect(workingStrip).toBeNull();
     expect(workingEl.textContent).not.toContain('Strategist: Reviewing context');
     expect(workingEl.textContent).not.toContain('Strategic is working');
   });
 
-  test('minimal chat chrome shows recent steer receipt in the compact strip', async () => {
+  test('minimal chat chrome hides recent steer receipts', async () => {
     const base = makeStrategicState();
     const state = makeStrategicState({
       strategic: {
@@ -1725,7 +1716,7 @@ describe('MessagesPanel chrome modes', () => {
     });
 
     const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
-    expect(strip?.textContent).toContain('Steer picked up');
+    expect(strip).toBeNull();
     expect(el.textContent).not.toContain('strategic cycle ran');
   });
 

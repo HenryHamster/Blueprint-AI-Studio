@@ -75,7 +75,11 @@ import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
 import { STATUS_OPTIONS } from './constants';
 import { resolveAccess } from './accessControl';
 import { reportUiLoadTiming } from './uiLoadTiming';
-import { resolveCompletionToastKind, resolveCompletionToastMessage } from './utils/completionToastKind';
+import {
+  resolveCompletionToastKind,
+  resolveCompletionToastMessage,
+  shouldSuppressCompletionToast,
+} from './utils/completionToastKind';
 import { shouldResumeNewProjectAfterGitHubOAuth } from './utils/newProjectOAuthResume';
 
 type PipelineDirectionOption = { id: string; text: string };
@@ -185,6 +189,11 @@ export default function App() {
     if (!cycleCompletion) return;
     if (cycleCompletion === lastCycleCompletionToastRef.current) return;
     lastCycleCompletionToastRef.current = cycleCompletion;
+    if (shouldSuppressCompletionToast(
+      cycleCompletion.status,
+      cycleCompletion.failure_reason,
+      cycleCompletion.status_message,
+    )) return;
     const toastKind = resolveCompletionToastKind(cycleCompletion.status);
     const terminalDetail = cycleCompletion.failure_reason ?? cycleCompletion.status_message;
     const message = toastKind !== 'success' && terminalDetail
@@ -238,12 +247,8 @@ export default function App() {
   );
   const filterTaskTypeIds = resolvedTaskCapabilities.filterIds;
   useEffect(() => {
-    if (openMessageCount > 0) {
-      document.title = `(${openMessageCount}) Blueprint AI Studio`;
-    } else {
-      document.title = 'Blueprint AI Studio';
-    }
-  }, [openMessageCount]);
+    document.title = 'Blueprint AI Studio';
+  }, []);
   const selectedProjectId = s.selectedProjectId;
   const rawActiveTab = s.activeTab;
   const activeTab: PrimaryTab = normalizePrimaryTab(rawActiveTab);
@@ -1229,6 +1234,10 @@ export default function App() {
         open={strategicContextWorkspaceOpen}
         state={strategicReadModel.data ?? null}
         projectId={selectedProjectId}
+        canOperateProject={s.selectedProjectAccess.canOperateProject}
+        showAttention={false}
+        onConfirmationResolved={() => { void strategicReadModel.refresh(); }}
+        addToast={s.addToast}
         onClose={closeStrategicContextWorkspace}
         onOpenTarget={openStrategicContextWorkspaceTarget}
         onOpenMessageTarget={strategicMessageTarget.open}
@@ -1346,11 +1355,11 @@ export default function App() {
                 realtimeRefreshSignal={messageRealtimeRefreshSignal}
                 realtimeCanonicalMessage={realtimeCanonicalProjection?.message ?? null}
                 realtimeCanonicalRefetchRequired={realtimeCanonicalProjection?.canonicalRefetchRequired ?? false}
+                onAcknowledgeRealtimeMessage={s.acknowledgeMessageDelivery}
                 strategicPollEpoch={strategicPollEpoch}
                 targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
                 strategicState={strategicReadModel.data ?? null}
                 strategicWorkbenchState={strategicWorkbenchState}
-                strategicSessionTranscript={s.strategicSessionTranscript}
                 onStrategicInteraction={() => { persistStrategicWorkbench({ active_surface: 'strategic' }); }}
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
                 onOpenCommandPalette={openCommandPalette}
@@ -1374,6 +1383,7 @@ export default function App() {
               <StrategicContextRail
                 projectId={s.selectedProjectId}
                 canOperateProject={s.selectedProjectAccess.canOperateProject}
+                showAttention={false}
                 state={strategicReadModel.data ?? null}
                 loading={strategicReadModel.loading}
                 error={strategicReadModel.error}

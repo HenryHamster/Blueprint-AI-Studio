@@ -995,15 +995,17 @@ async def post_mode_knob_cut_recommendation_message(
     signal: float,
     measurements: dict[str, Any],
     task_id: Optional[uuid.UUID] = None,
+    idempotency_key: str | None = None,
 ) -> Optional[ProjectMessage]:
-    """Post a HIGH-SIGNAL system NOTE recommending a dormant mode-knob be CUT.
+    """Post an activity NOTE recommending a dormant mode-knob be CUT.
 
     Fired by the shared mode-knob graduation harness when a knob's measured
     counterfactual shows its enforce branch would never bind (no lift) over a
     representative window — the default-off PRINCIPLE's "cut, with numbers"
     disposition. Carries the measured signal so the operator can act (remove the
     knob) rather than let it age as completion debt indefinitely. FYI-class: it
-    changes nothing on its own.
+    changes nothing on its own. The completion-debt ledger is the durable
+    operator surface; this event is explicitly not part of Strategic Chat.
     """
     would_have_blocked = measurements.get("would_have_blocked")
     summary = (
@@ -1023,6 +1025,7 @@ async def post_mode_knob_cut_recommendation_message(
             "measurements": measurements,
         },
         task_id=task_id,
+        idempotency_key=idempotency_key,
     )
 
 

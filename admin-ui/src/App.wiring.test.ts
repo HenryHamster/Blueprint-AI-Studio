@@ -30,6 +30,7 @@ describe('App workbench wiring', () => {
   test('wires the real Strategic MessagesPanel to the context workspace opener', () => {
     expect(appSource).toContain('const openStrategicContextWorkspace = useCallback(');
     expect(appSource).toMatch(/<MessagesPanel[\s\S]*onOpenCommandPalette=\{openCommandPalette\}[\s\S]*onOpenStrategicContextWorkspace=\{openStrategicContextWorkspace\}/);
+    expect(appSource).toMatch(/<MessagesPanel[\s\S]*onAcknowledgeRealtimeMessage=\{s\.acknowledgeMessageDelivery\}/);
   });
 
   test('routes command-palette Strategic targets through overlay-safe wrappers', () => {

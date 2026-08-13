@@ -497,6 +497,7 @@ def test_operator_visible_undotted_event_types_not_conversational_must_be_explic
         "pilot_auto_disabled",
         "operator_command",
         "strategic_check_in",
+        "mode_knob_cut_recommended",
         "agent_annotation",
         "MONTHLY_BUDGET_ALERT",
         "DAILY_BUDGET_ALERT",

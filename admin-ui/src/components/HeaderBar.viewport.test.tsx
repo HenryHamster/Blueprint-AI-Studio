@@ -431,7 +431,7 @@ describe('HeaderBar — viewport regression', () => {
     expect(onOpenNewTaskModal).not.toHaveBeenCalled();
   });
 
-  test('mobile primary nav switches modes and shows badges', async () => {
+  test('mobile primary nav switches modes without an attention-derived Chat badge', async () => {
     const onTabChange = vi.fn();
     host = document.createElement('div');
     document.body.appendChild(host);
@@ -451,7 +451,7 @@ describe('HeaderBar — viewport regression', () => {
 
     const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>('button'));
     expect(buttons.map(button => button.textContent?.trim())).toEqual([
-      'Chat3',
+      'Chat',
       'Pipeline5',
       'Project',
       'Runtime',

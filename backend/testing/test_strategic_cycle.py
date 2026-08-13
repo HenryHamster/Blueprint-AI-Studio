@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
@@ -42,6 +43,34 @@ async def _make_project(session, name: str = "W2 Test Project") -> Project:
 
 
 # --- strategic_cycle helper ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_without_completion_still_broadcasts(monkeypatch):
+    """Quiet operator stops still close the client's live cycle indicator."""
+    emit = AsyncMock()
+    monkeypatch.setattr(
+        "app.strategic_events.emit_strategic_cycle_completed",
+        emit,
+    )
+    event = {
+        "project_id": "project-1",
+        "task_id": "task-1",
+        "phase": 2,
+        "cycle_id": "cycle-1",
+        "phase_state": "failed_phase2",
+    }
+
+    await strategic_cycle.emit_terminal_completion_events([event])
+
+    emit.assert_awaited_once_with(
+        "project-1",
+        "task-1",
+        2,
+        cycle_id="cycle-1",
+        phase_state="failed_phase2",
+        completion=None,
+    )
 
 
 @pytest.mark.asyncio

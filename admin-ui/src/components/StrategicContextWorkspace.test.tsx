@@ -2,11 +2,20 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import type { ComponentProps } from 'react';
 import { StrategicContextWorkspace } from './StrategicContextWorkspace';
+import { acceptPendingConfirmation, dismissPendingConfirmation } from '../api';
 import type {
   StrategicStateResponse,
   StrategicWorkbenchState,
   StrategicWorkSessionEvent,
 } from '../strategicStateApi';
+
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    acceptPendingConfirmation: vi.fn(async () => ({ status: 'accepted', type: 'credentials_needed' })),
+    dismissPendingConfirmation: vi.fn(async () => {}),
+  });
+});
 
 type SessionRefs = StrategicWorkbenchState['selected_refs'];
 
@@ -311,9 +320,73 @@ describe('StrategicContextWorkspace', () => {
     };
   }
 
+  function stateWithPendingConfirmation(): StrategicStateResponse {
+    return {
+      ...STATE,
+      attention: {
+        ...STATE.attention!,
+        items: [{
+          id: 'confirmation:mobile-credential',
+          kind: 'confirmation',
+          severity: 'needs_operator',
+          reason: 'credentials_needed',
+          label: 'Provide the deployment credential',
+          detail: 'Provide the deployment credential before the next release.',
+          confirmation_type: 'credentials_needed',
+          ref: { kind: 'confirmation', id: 'pending-mobile-credential', project_id: 'proj-1' },
+        }],
+      },
+    };
+  }
+
   test('does not render while closed', () => {
     const { host } = mount({ open: false });
     expect(host.textContent).toBe('');
+  });
+
+  test('keeps pending confirmation actions reachable without attention chrome', async () => {
+    vi.mocked(acceptPendingConfirmation).mockClear();
+    vi.mocked(dismissPendingConfirmation).mockClear();
+    const onConfirmationResolved = vi.fn();
+    const { host } = mount({
+      state: stateWithPendingConfirmation(),
+      projectId: 'proj-1',
+      canOperateProject: true,
+      showAttention: false,
+      onConfirmationResolved,
+    });
+
+    const section = host.querySelector('[data-testid="strategic-context-workspace-pending-confirmations"]');
+    expect(section?.textContent).toContain('Pending confirmations');
+    expect(host.textContent).not.toContain('Attention');
+    expect(host.textContent).not.toContain('needs operator');
+    expect(host.textContent).not.toContain('Reply to operator question');
+    const acceptButton = Array.from(section!.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.title === 'Mark provided');
+    expect(acceptButton).toBeTruthy();
+
+    await act(async () => { acceptButton!.click(); });
+
+    expect(acceptPendingConfirmation).toHaveBeenCalledWith(
+      'proj-1',
+      'pending-mobile-credential',
+      undefined,
+    );
+    expect(onConfirmationResolved).toHaveBeenCalledOnce();
+  });
+
+  test('pending confirmations fail closed without operate permission', () => {
+    const { host } = mount({
+      state: stateWithPendingConfirmation(),
+      projectId: 'proj-1',
+      canOperateProject: false,
+      showAttention: false,
+    });
+
+    const section = host.querySelector('[data-testid="strategic-context-workspace-pending-confirmations"]');
+    expect(section?.textContent).toContain('Pending confirmations');
+    expect(section?.querySelector('[title="Mark provided"]')).toBeNull();
+    expect(section?.querySelector('[title="Mark as resolved without action"]')).toBeNull();
   });
 
   test('shows a neutral empty state when no context package is loaded', () => {

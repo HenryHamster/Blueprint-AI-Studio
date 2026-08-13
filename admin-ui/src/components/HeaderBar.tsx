@@ -23,7 +23,8 @@ export interface HeaderBarProps {
   showKnowledgeBrowser: boolean;
   onToggleKnowledgeBrowser: () => void;
   onOpenActivityFeed?: () => void;
-  openMessageCount: number;
+  /** Legacy count input retained for callers; Chat no longer displays attention counts. */
+  openMessageCount?: number;
   newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
   activeAlerts?: number;
@@ -83,8 +84,6 @@ function tabLabel(tab: PrimaryTab): string {
 export const PrimaryTabNav = memo(function PrimaryTabNav({
   activeTab,
   onTabChange,
-  openMessageCount = 0,
-  newSinceLastVisitCount = 0,
   needsAttentionCount = 0,
   activeAlerts = 0,
   className = '',
@@ -105,11 +104,7 @@ export const PrimaryTabNav = memo(function PrimaryTabNav({
     >
       {(['chat', 'pipeline', 'project', 'runtime', 'fleet'] as const).map(tab => {
         const isActive = activeTab === tab;
-        const chatBadgeCount = tab === 'chat'
-          ? Math.max(openMessageCount, newSinceLastVisitCount)
-          : 0;
-        const pipelineBadgeCount = tab === 'pipeline' ? needsAttentionCount : 0;
-        const badgeCount = Math.max(chatBadgeCount, pipelineBadgeCount);
+        const badgeCount = tab === 'pipeline' ? needsAttentionCount : 0;
         const label = tabLabel(tab);
         return (
           <button
@@ -130,7 +125,7 @@ export const PrimaryTabNav = memo(function PrimaryTabNav({
                 {badgeCount > 99 ? '99+' : badgeCount}
               </span>
             )}
-            {activeAlerts > 0 && (
+            {tab === 'pipeline' && activeAlerts > 0 && (
               <span
                 className="ml-1 inline-flex h-2 w-2 shrink-0 rounded-full bg-red-500"
                 title={`${activeAlerts} active alert${activeAlerts !== 1 ? 's' : ''}`}
@@ -158,8 +153,6 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
     onToggleKnowledgeBrowser,
     onOpenActivityFeed,
     onOpenSettings,
-    openMessageCount,
-    newSinceLastVisitCount,
     activeAlerts,
     wsRef,
     apiHealthy,
@@ -292,8 +285,6 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
           <PrimaryTabNav
             activeTab={props.activeTab}
             onTabChange={props.onTabChange}
-            openMessageCount={openMessageCount}
-            newSinceLastVisitCount={newSinceLastVisitCount}
             needsAttentionCount={props.needsAttentionCount}
             activeAlerts={activeAlerts}
           />

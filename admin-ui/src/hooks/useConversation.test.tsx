@@ -3,6 +3,8 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { ProjectMessage } from '../types/messages';
 import {
   CONVERSATION_INITIAL_WINDOW,
+  canDirectlyMergeRealtimeConversationMessage,
+  isCanonicalConversationEnvelope,
   mergeConversationPages,
   useConversation,
 } from './useConversation';
@@ -26,7 +28,7 @@ function message(sequence: number): ProjectMessage {
 }
 
 describe('conversation pagination', () => {
-  afterEach(() => { cleanup(); vi.clearAllMocks(); });
+  afterEach(() => { cleanup(); vi.clearAllMocks(); vi.useRealTimers(); });
 
   test('merges overlapping pages by canonical id while preserving sequence order', () => {
     const merged = mergeConversationPages(
@@ -49,6 +51,171 @@ describe('conversation pagination', () => {
     const canonical = { ...message(2), id: 'canonical-1', client_idempotency_key: 'send-1' };
     const merged = mergeConversationPages([optimistic], [canonical]);
     expect(merged).toEqual([canonical]);
+  });
+
+  test('directly admits durable Fast replies but requires server proof for internal realtime envelopes', () => {
+    const fastReply = {
+      ...message(1445),
+      status: 'resolved',
+      context: {
+        audience: 'operator-fyi',
+        event_type: 'question_answer',
+        _conversation_public_reply_owner: 'fast',
+      },
+    };
+    const legacyResidentReply = {
+      ...message(1446),
+      reply_to_message_id: 'activity-input-that-client-cannot-verify',
+      context: {
+        audience: 'strategist-internal',
+        event_type: 'strategic_message',
+        _resident_reply_covered_message_ids: ['another-unverified-input'],
+      },
+    };
+    const checkIn = {
+      ...message(1447),
+      context: { audience: 'operator-fyi', event_type: 'strategic_check_in' },
+    };
+    const retiredModeKnobCut = {
+      ...message(1448),
+      context: { audience: 'operator-fyi', event_type: 'mode_knob_cut_recommended' },
+    };
+
+    expect(isCanonicalConversationEnvelope(fastReply)).toBe(true);
+    expect(canDirectlyMergeRealtimeConversationMessage(fastReply)).toBe(true);
+    expect(isCanonicalConversationEnvelope(legacyResidentReply)).toBe(true);
+    expect(canDirectlyMergeRealtimeConversationMessage(legacyResidentReply)).toBe(false);
+    expect(isCanonicalConversationEnvelope(checkIn)).toBe(false);
+    expect(canDirectlyMergeRealtimeConversationMessage(checkIn)).toBe(false);
+    expect(isCanonicalConversationEnvelope(retiredModeKnobCut)).toBe(false);
+    expect(canDirectlyMergeRealtimeConversationMessage(retiredModeKnobCut)).toBe(false);
+  });
+
+  test('drops and acknowledges explicitly dispositioned non-conversation events from realtime', () => {
+    let messages = [message(1445)];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const sendAck = vi.fn();
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        realtimeMessage,
+        sendAck,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+
+    const retiredModeKnobCut = {
+      ...message(1448),
+      context: { audience: 'operator-fyi', event_type: 'mode_knob_cut_recommended' },
+    };
+    const strategicCheckIn = {
+      ...message(1449),
+      context: { audience: 'operator-fyi', event_type: 'strategic_check_in' },
+    };
+
+    rerender({ realtimeMessage: retiredModeKnobCut });
+    rerender({ realtimeMessage: strategicCheckIn });
+
+    expect(messages.map(item => item.sequence)).toEqual([1445]);
+    expect(sendAck).toHaveBeenCalledTimes(2);
+    expect(sendAck).toHaveBeenNthCalledWith(1, retiredModeKnobCut.id);
+    expect(sendAck).toHaveBeenNthCalledWith(2, strategicCheckIn.id);
+  });
+
+  test('does not flash or acknowledge an internal realtime row when canonical refetch omits it', async () => {
+    vi.useFakeTimers();
+    let messages = [message(1445)];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const sendAck = vi.fn();
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 1, has_more: false, next_before_sequence: null, items: [] },
+    });
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        realtimeMessage,
+        sendAck,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+
+    rerender({ realtimeMessage: {
+      ...message(1446),
+      reply_to_message_id: 'activity-input-that-client-cannot-verify',
+      context: {
+        audience: 'strategist-internal',
+        event_type: 'strategic_message',
+        _resident_reply_covered_message_ids: ['another-unverified-input'],
+      },
+    } });
+
+    expect(messages.map(item => item.sequence)).toEqual([1445]);
+    expect(sendAck).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(fetchStrategicConversation).toHaveBeenCalledWith(
+      'project-1',
+      { includeMessageId: 'message-1446', limit: 1 },
+      expect.any(AbortSignal),
+    );
+    expect(messages.map(item => item.sequence)).toEqual([1445]);
+    expect(sendAck).not.toHaveBeenCalled();
+  });
+
+  test('restores an internal realtime row only when canonical refetch proves it', async () => {
+    vi.useFakeTimers();
+    let messages = [message(1445)];
+    const canonicalLegacyReply = {
+      ...message(1446),
+      reply_to_message_id: 'canonical-conversation-input',
+      context: { audience: 'strategist-internal', event_type: 'strategic_message' },
+    };
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const sendAck = vi.fn();
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 1, has_more: false, next_before_sequence: null, items: [canonicalLegacyReply] },
+    });
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        realtimeMessage,
+        sendAck,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+
+    rerender({ realtimeMessage: canonicalLegacyReply });
+    expect(messages.map(item => item.sequence)).toEqual([1445]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(messages.map(item => item.sequence)).toEqual([1445, 1446]);
+    expect(sendAck).toHaveBeenCalledOnce();
+    expect(sendAck).toHaveBeenCalledWith('message-1446');
   });
 
   test('renders a canonical realtime projection immediately, then fills from the prior sequence', async () => {
@@ -97,6 +264,7 @@ describe('conversation pagination', () => {
     const setMessages = vi.fn(update => {
       messages = typeof update === 'function' ? update(messages) : update;
     });
+    const sendAck = vi.fn();
     const { rerender } = renderHook(
       ({ realtimeMessage, requiresRefetch }) => useConversation({
         enabled: true,
@@ -105,6 +273,7 @@ describe('conversation pagination', () => {
         includeMessageId: null,
         realtimeMessage,
         realtimeMessageRequiresCanonicalRefetch: requiresRefetch,
+        sendAck,
         getMessages: () => messages,
         setMessages,
         onLoadingChange: vi.fn(),
@@ -118,6 +287,7 @@ describe('conversation pagination', () => {
       requiresRefetch: true,
     });
     expect(messages.find(item => item.sequence === 50)?.content).toBe('full durable content');
+    expect(sendAck).not.toHaveBeenCalled();
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(fetchStrategicConversation.mock.calls[0][1]).toMatchObject({
       includeMessageId: 'message-50',
@@ -125,6 +295,8 @@ describe('conversation pagination', () => {
     });
     expect(fetchStrategicConversation.mock.calls[1][1]).toMatchObject({ afterSequence: 100 });
     expect(messages.find(item => item.sequence === 50)?.content).toBe('canonical updated content');
+    expect(sendAck).toHaveBeenCalledOnce();
+    expect(sendAck).toHaveBeenCalledWith('message-50');
     vi.useRealTimers();
   });
 
@@ -599,7 +771,7 @@ describe('sendAck callback', () => {
     expect(sendAck).toHaveBeenCalledWith(msg.id);
   });
 
-  test('acknowledges the same realtime message only once when callback identity changes', () => {
+  test('can acknowledge the same canonical message again on a recovery frame', () => {
     let messages: ProjectMessage[] = [];
     const setMessages = vi.fn(update => {
       messages = typeof update === 'function' ? update(messages) : update;
@@ -627,9 +799,10 @@ describe('sendAck callback', () => {
     rerender({ realtimeMessage: msg, sendAck: replacementSendAck });
 
     expect(firstSendAck).toHaveBeenCalledOnce();
-    expect(replacementSendAck).not.toHaveBeenCalled();
+    expect(replacementSendAck).toHaveBeenCalledOnce();
+    expect(replacementSendAck).toHaveBeenCalledWith(msg.id);
   });
-  test('keeps acknowledgement dedup across include-target and search navigation', () => {
+  test('re-acknowledges an admitted replay after conversation navigation', () => {
     let messages: ProjectMessage[] = [];
     const setMessages = vi.fn(update => {
       messages = typeof update === 'function' ? update(messages) : update;
@@ -661,8 +834,8 @@ describe('sendAck callback', () => {
     rerender({ realtimeMessage: msg, includeMessageId: msg.id, searchQuery: '' });
     rerender({ realtimeMessage: msg, includeMessageId: msg.id, searchQuery: 'needle' });
 
-    expect(sendAck).toHaveBeenCalledOnce();
-    expect(sendAck).toHaveBeenCalledWith(msg.id);
+    expect(sendAck.mock.calls.length).toBeGreaterThan(1);
+    expect(sendAck).toHaveBeenLastCalledWith(msg.id);
   });
 
   test('does not call sendAck for non-conversation surface messages', () => {

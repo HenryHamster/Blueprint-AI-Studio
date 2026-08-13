@@ -26,6 +26,7 @@ import {
 import { StrategicContextMap } from './StrategicContextMap';
 import { ArtifactViewablePreviews, StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
+import { PendingConfirmationsSection } from './PendingConfirmationsSection';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['canvas']>;
@@ -37,6 +38,12 @@ interface StrategicContextWorkspaceProps {
   workbenchState?: StrategicWorkbenchState | null;
   savingSessionRefs?: boolean;
   projectId?: string | null;
+  /** Whether the current operator may resolve project confirmations. */
+  canOperateProject?: boolean;
+  /** Attention summaries can be hidden without hiding durable confirmations. */
+  showAttention?: boolean;
+  onConfirmationResolved?: () => void;
+  addToast?: (message: string, type: 'success' | 'error' | 'info') => void;
   onClose: () => void;
   onOpenTarget: (target?: StrategicContextTarget | null) => void;
   onOpenMessageTarget?: (target?: StrategicMessageTarget) => void;
@@ -566,6 +573,10 @@ export function StrategicContextWorkspace({
   workbenchState,
   savingSessionRefs = false,
   projectId,
+  canOperateProject = false,
+  showAttention = true,
+  onConfirmationResolved,
+  addToast,
   onClose,
   onOpenTarget,
   onOpenMessageTarget,
@@ -681,8 +692,12 @@ export function StrategicContextWorkspace({
     () => rankStrategicWorkSessionMetrics(workSession?.curated_metrics ?? [], 6),
     [workSession?.curated_metrics],
   );
+  const confirmationItems = useMemo(
+    () => state?.attention?.items.filter(item => item.kind === 'confirmation') ?? [],
+    [state?.attention?.items],
+  );
   const attentionPills = useMemo(
-    () => (attentionCounts
+    () => (showAttention && attentionCounts
       ? [
           { label: 'needs', value: attentionCounts.needs_operator },
           { label: 'watch', value: attentionCounts.watch },
@@ -693,7 +708,7 @@ export function StrategicContextWorkspace({
           { label: 'failed', value: attentionCounts.failed_tasks },
         ].filter(item => item.value > 0).slice(0, 6)
       : []),
-    [attentionCounts],
+    [attentionCounts, showAttention],
   );
 
   // Early return when panel is closed
@@ -808,6 +823,16 @@ export function StrategicContextWorkspace({
 
         <div className="min-h-0 flex-1 overflow-auto p-3 custom-scrollbar md:p-4">
           <div className="grid min-w-0 max-w-full grid-cols-1 gap-3">
+            {confirmationItems.length > 0 && (
+              <PendingConfirmationsSection
+                items={confirmationItems}
+                projectId={projectId ?? state?.project_id}
+                canOperateProject={canOperateProject}
+                onResolved={onConfirmationResolved}
+                addToast={addToast}
+                testId="strategic-context-workspace-pending-confirmations"
+              />
+            )}
             <Section
               title="Session"
               meta={sessionModeLabel(sessionMode)}
@@ -837,7 +862,7 @@ export function StrategicContextWorkspace({
                       onOpenTarget={handleOpenTarget}
                     />
                   )}
-                  {state?.attention && (
+                  {showAttention && state?.attention && (
                     <SessionSummaryButton
                       icon={<CircleAlert className="h-4 w-4" aria-hidden="true" />}
                       label="Attention"
@@ -877,7 +902,7 @@ export function StrategicContextWorkspace({
                   </div>
                 )}
 
-                {workSessionActions.length > 0 && (
+                {showAttention && workSessionActions.length > 0 && (
                   <div className="grid gap-2 lg:grid-cols-2" data-testid="strategic-session-actions">
                     {workSessionActions.map(action => (
                       <WorkSessionActionRow key={action.id} action={action} onOpenTarget={handleOpenTarget} />

@@ -192,7 +192,8 @@ import {
   recloneResidentWorkspace, installResidentReplyKeyAtPath,
   readResidentStagedReplyAtPath, residentReplyRuntimePaths,
   withPrivateWorkdayTurnFence,
-  partitionTypedFastMessages, selectTypedFastClaimMessages,
+  partitionTypedFastMessages, partitionResidentPublicReplyMessages,
+  selectTypedFastClaimMessages,
 } from './strategic-resident.js';
 import {
   apiGet, apiPost, persistAndPostStatus,
@@ -235,6 +236,23 @@ describe('partitionTypedFastMessages', () => {
     expect(partition.workday.map(message => message.id)).toEqual([
       'ordinary-user',
       'tagged-system',
+    ]);
+  });
+
+  it('gives activated Fast sole public ownership of mixed broad-poll pages', () => {
+    const messages = [
+      { id: 'canonical-user', from_type: 'user', context: { _typed_fast_eligible: true } },
+      { id: 'activity-row', from_type: 'system', context: { surface: 'activity' } },
+    ] as never;
+
+    const activated = partitionResidentPublicReplyMessages(messages, true);
+    expect(activated.fast.map(message => message.id)).toEqual(['canonical-user']);
+    expect(activated.workday.map(message => message.id)).toEqual(['activity-row']);
+
+    const legacy = partitionResidentPublicReplyMessages(messages, false);
+    expect(legacy.fast).toEqual([]);
+    expect(legacy.workday.map(message => message.id)).toEqual([
+      'canonical-user', 'activity-row',
     ]);
   });
 });
@@ -1035,7 +1053,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
   });
 
-  it('recovers an expired claimed turn before sequentially answering newer input', async () => {
+  it('reconciles a lost Fast completion response and then picks up newer input', async () => {
     const staleM1 = {
       id: 'typed-fast-stale-m1', content: 'hi',
       created_at: '2026-07-31T08:25:25.598Z', from_type: 'user',
@@ -1047,6 +1065,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       context: { _server_artifact_delivery_deferred: true },
     };
     let completed = 0;
+    let completionAttempts = 0;
     const claimBodies: Array<Record<string, unknown> | undefined> = [];
     mockApiGet.mockImplementation((url: string) => {
       if (!url.includes('/messages?')) return Promise.resolve(null);
@@ -1111,8 +1130,21 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         });
       }
       if (url.endsWith('/conversation/turns/complete')) {
+        completionAttempts += 1;
         completed += 1;
+        if (completionAttempts === 1) {
+          // Coordinator committed the reply, but its response was lost. The
+          // handler must use one bounded write attempt, reconcile the stable
+          // claim, and resume polling rather than blocking for general retries.
+          return Promise.reject(new Error('POST completion response lost after commit'));
+        }
         return Promise.resolve({ status: 'completed' });
+      }
+      if (url.endsWith('/conversation/turns/abandon')) {
+        return Promise.resolve({
+          status: 'already_completed',
+          legacy_fallback_admissible: false,
+        });
       }
       if (url.endsWith('/typed-fast-lease/release')) {
         return Promise.resolve({ released: true });
@@ -1139,6 +1171,11 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       [newerM2.id],
     ]);
     expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(2);
+    const completionCalls = mockApiPost.mock.calls.filter(([url]) =>
+      url.endsWith('/conversation/turns/complete'));
+    expect(completionCalls).toHaveLength(2);
+    expect(completionCalls[0]?.[2]).toBe(1);
+    expect(completionCalls[0]?.[3]).toBe(5_000);
     const recoveredPrompt = typedFastMocks.dispatch.mock.calls[0]?.[1];
     const recoveredPromptText = typeof recoveredPrompt === 'string'
       ? recoveredPrompt
@@ -1333,7 +1370,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(releaseCalls).toEqual([]);
   });
 
-  it('completes a pure Fast message without starting idle Workday', async () => {
+  it('does not acknowledge or answer an Activity remainder in the same Fast turn', async () => {
     vi.useFakeTimers();
     const operatorMessage = {
       id: 'typed-fast-parallel-message',
@@ -1341,13 +1378,20 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       created_at: new Date().toISOString(),
       from_type: 'user',
     };
+    const activityRow = {
+      id: 'workday-start-activity',
+      content: 'Workday started examining project state.',
+      created_at: new Date().toISOString(),
+      from_type: 'system',
+      context: { surface: 'activity' },
+    };
     let messagePolls = 0;
     mockApiGet.mockImplementation((url: string) => {
       if (url.includes('/messages?')) {
         messagePolls += 1;
         return Promise.resolve(messagePolls === 2
           ? {
-              messages: [operatorMessage],
+              messages: [operatorMessage, activityRow],
               fast_message_ids: [operatorMessage.id],
               claim_required: true,
             }
@@ -1380,9 +1424,11 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       expires_at: '2035-01-01T00:00:00.000Z',
     };
     let heartbeatCount = 0;
-    mockApiPost.mockImplementation((url: string) => {
+    const heartbeatBodies: Array<Record<string, unknown> | undefined> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('/strategic-session/heartbeat')) {
         heartbeatCount += 1;
+        heartbeatBodies.push(body);
         return Promise.resolve({
           authority_held: true,
           stop_requested: heartbeatCount > 1,
@@ -1441,6 +1487,10 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       url.endsWith('/conversation/turns/complete'))).toBe(true);
     expect(workday.interrupt).not.toHaveBeenCalled();
     expect(workday.sendTurn).not.toHaveBeenCalled();
+    expect(heartbeatBodies.some(body => (
+      Array.isArray(body?.handled_message_ids)
+      && body.handled_message_ids.includes(activityRow.id)
+    ))).toBe(false);
 
     await vi.advanceTimersByTimeAsync(2_000);
     await done;

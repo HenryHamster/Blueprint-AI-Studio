@@ -285,13 +285,9 @@ describe('MessagesPanel — viewport regression', () => {
     });
 
     const strip = host!.querySelector('[data-testid="strategic-context-package-strip"]');
-    expect(strip).not.toBeNull();
-    expect(strip!.textContent).toContain('Strategic');
-    expect(strip!.textContent).toContain('Workday');
-    expect(strip!.textContent).toContain('2 needs attention');
-    expect(strip!.textContent).not.toContain('42 items');
-    expect(strip!.textContent).not.toContain('2 needs / 5 watch');
-    expect(strip!.textContent).not.toContain('canvas nodes');
+    expect(strip).toBeNull();
+    expect(host!.textContent).not.toContain('needs attention');
+    expect(host!.textContent).not.toContain('Question waiting about a very long local workday session');
   });
 
   test('minimal chat composer aligns to the conversation column at desktop widths', async () => {

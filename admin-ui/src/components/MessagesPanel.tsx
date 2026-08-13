@@ -5,15 +5,13 @@ import { useChatChrome } from '../hooks/useChatChrome';
 import { auth } from '../firebase';
 import { currentUiSurface, reportUiLoadTiming } from '../uiLoadTiming';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker, acceptPendingConfirmation, dismissPendingConfirmation } from '../api';
-import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from '../hooks/useLogViewer';
-import { parseTimestamp, timeAgo } from '../utils/time';
+import type { StrategicCycleProgress, StrategicCycleCompletion } from '../hooks/useLogViewer';
+import { parseTimestamp } from '../utils/time';
 import { type EventPref, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
 import { type TemporaryMutes } from './temporaryMutes';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { saveServerNoisePrefs } from './serverSync';
 import type { MessageAttachment, ProjectMessage } from '../types/messages';
-import { computeStrategicStreamingTurn } from '../utils/strategicSessionLive';
-import { StrategicStreamingBubble } from './StrategicLiveTurn';
 import { AlertsBanner } from './AlertsBanner';
 import type { Alert } from '../types/alert';
 import { SaveViewDialog } from './SaveViewDialog';
@@ -29,7 +27,7 @@ import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useConversationSend } from '../hooks/useConversationSend';
-import { compareConversationMessages, useConversation } from '../hooks/useConversation';
+import { compareConversationMessages, isCanonicalConversationEnvelope, useConversation } from '../hooks/useConversation';
 import { useStrategicCall } from '../hooks/useStrategicCall';
 import { StrategicCallLauncher, StrategicCallMode } from './StrategicCallMode';
 import { useStrategistStatus } from '../hooks/useStrategistStatus';
@@ -154,22 +152,6 @@ function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 
   parts.push(`sort: ${sort}`);
   parts.push(showResolved ? 'resolved shown' : 'resolved hidden');
   return parts.join(' · ');
-}
-function contextPackageTextTone(status?: string | null): string {
-  if (status === 'building') return 'text-cyan-300';
-  if (status === 'stale') return 'text-amber-300';
-  return 'text-emerald-300';
-}
-function workbenchModeLabel(mode?: string | null): string {
-  if (mode === 'check_in') return 'Check-in';
-  if (mode === 'monitor') return 'Monitor';
-  if (mode === 'continuous') return 'Workday';
-  return 'Chat';
-}
-function attentionTextTone(level?: string | null): string {
-  if (level === 'needs_operator') return 'text-amber-300';
-  if (level === 'watch') return 'text-neutral-300';
-  return 'text-emerald-300';
 }
 /** Human-readable short label for an attention item's lifecycle.operator_action. */
 function lifecycleOperatorActionLabel(operatorAction?: string | null): string {
@@ -404,6 +386,8 @@ export interface MessagesPanelProps {
   realtimeCanonicalMessage?: ProjectMessage | null;
   /** The realtime projection was transport-truncated and must be fetched by canonical message id. */
   realtimeCanonicalRefetchRequired?: boolean;
+  /** Acknowledge delivery only after this Chat surface admits the realtime row. */
+  onAcknowledgeRealtimeMessage?: (messageId: string) => void;
   /** Increments when the strategic-state poll completes with new data.
    *  When set, the conversation refresh piggybacks on the strategic-state
    *  poll cadence instead of running its own independent timer. */
@@ -432,8 +416,6 @@ export interface MessagesPanelProps {
   onOpenStrategicContextCommands?: () => void;
   /** Legacy refresh callback kept for callers that still wire the old prop name. */
   onStrategicRefresh?: () => void;
-  /** Ephemeral Workday transcript deltas for the in-flight Strategic reply. */
-  strategicSessionTranscript?: StrategicSessionDelta[];
   /** Active alerts surfaced inline at the top of the panel, replacing the separate AlertsPopover. */
   alerts?: Alert[];
   onDismissAlert?: (id: string) => void;
@@ -503,7 +485,7 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, strategicPollEpoch, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -516,8 +498,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
   const currentActorUserId = auth.currentUser?.uid ?? auth.currentUser?.email ?? null;
   const currentStrategicState = strategicState?.project_id === selectedProjectId ? strategicState : null;
   const usesStrategicReadModel = currentStrategicState != null;
-  const effectiveContextPackage = contextPackage ?? currentStrategicState?.context_package ?? null;
-  const workbenchState = strategicWorkbenchState ?? currentStrategicState?.workbench ?? null;
   const strategicAttention = currentStrategicState?.attention ?? null;
   const strategicAttentionRef = useRef(strategicAttention);
   // eslint-disable-next-line react-hooks/refs
@@ -1099,6 +1079,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     realtimeRefreshSignal,
     realtimeMessage: realtimeCanonicalMessage,
     realtimeMessageRequiresCanonicalRefetch: realtimeCanonicalRefetchRequired,
+    sendAck: onAcknowledgeRealtimeMessage,
     strategicPollEpoch,
     getMessages: getCurrentMessages,
     setMessages,
@@ -1264,17 +1245,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
   const conversationMessages = useMemo(() => {
     return messages
       .filter(msg => msg.surface != null
-        ? msg.surface === 'conversation'
+        ? isCanonicalConversationEnvelope(msg)
         : isConversationMessage(msg, eventPrefs, tempMutes))
       .slice()
       .sort(compareConversationMessages);
   }, [messages, eventPrefs, tempMutes]);
-  const streamingTurn = useMemo(
-    () => conversationMode
-      ? computeStrategicStreamingTurn(strategicSessionTranscript, conversationMessages)
-      : null,
-    [conversationMode, strategicSessionTranscript, conversationMessages],
-  );
   // Render the operator's optimistic bubble until the durable copy lands. Client
   // identity, never message content, is the reconciliation key: identical text
   // sent intentionally must remain two distinct turns.
@@ -1471,12 +1446,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       });
     return () => { cancelled = true; if (!settled) recoveryKeys.delete(recoveryKey); };
   }, [canOperateProject, clearSubmittedComposerDraft, conversationMode, currentActorUserId, optimisticSend, resetComposerIntent, selectedProjectId]);
-  const showStrategicStatusStrip = conversationMode && Boolean(
-    strategistActive
-      || strategicRefresh
-      || (effectiveContextPackage?.status && effectiveContextPackage.status !== 'ready')
-      || (strategicAttention?.level === 'needs_operator' && attentionNeeds > 0),
-  );
   const strategicComposerContext = useMemo(
     () => conversationMode
       ? buildStrategicContextDescriptor(currentStrategicState, strategicWorkbenchState)
@@ -2918,12 +2887,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         <ConversationUtilityBar
           expanded={chatChromeExpanded} onExpand={() => persistChatChrome(true)} onCollapse={() => persistChatChrome(false)}
           searchQuery={searchQuery} onSearchChange={setSearchQuery}
-          needsActionCount={usesStrategicReadModel ? visibleAttentionNeedsActionItems.length : 0} alertCount={alerts?.length ?? 0}
         />
       )}
 
-      {/* Inline alerts — collapsed into the utility bar above by default in conversation mode. */}
-      {(!conversationMode || chatChromeExpanded) && alerts && alerts.length > 0 && (
+      {/* Alerts remain operational triage, not conversation transcript chrome. */}
+      {!conversationMode && alerts && alerts.length > 0 && (
         <div className="shrink-0 border-b border-workbench-border px-3 py-2 md:px-4" data-testid="alerts-inline-banner">
           <AlertsBanner
             alerts={alerts}
@@ -2933,41 +2901,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
             projectId={selectedProjectId ?? undefined}
             canMutate={canOperateProject}
           />
-        </div>
-      )}
-
-      {showStrategicStatusStrip && (
-        <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4" data-testid="strategic-context-package-strip">
-          <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500" aria-label="Strategic chat status">
-            <span className="shrink-0 font-semibold text-neutral-200">Strategic</span>
-            <span className="shrink-0 text-neutral-400">{workbenchModeLabel(workbenchState?.interaction_mode)}</span>
-            {strategistActive && (
-              <span className="text-cyan-300">{cycleProgress?.phase_label ?? 'Working'}</span>
-            )}
-            {!strategistActive && strategicRefresh?.requested_at && (
-              <span className="text-amber-300">Steer queued</span>
-            )}
-            {!strategistActive && !strategicRefresh?.requested_at && strategicRefresh?.last_fired_at && (
-              <span className="text-emerald-300">Steer picked up · {timeAgo(strategicRefresh.last_fired_at)}</span>
-            )}
-            {effectiveContextPackage?.status && effectiveContextPackage.status !== 'ready' && (
-              <span className={contextPackageTextTone(effectiveContextPackage.status)}>
-                Context {effectiveContextPackage.status}
-              </span>
-            )}
-            {effectiveContextPackage?.status === 'stale' && currentStrategicState?.sha_freshness?.verdict === 'stale' && (() => {
-              const cSha = currentStrategicState.sha_freshness?.active_candidate_sha?.slice(0, 7);
-              const iSha = currentStrategicState.sha_freshness?.integration_head_sha?.slice(0, 7);
-              if (cSha && iSha) return <span className="text-amber-500/70">sha diverged: @{cSha} vs @{iSha}</span>;
-              if (cSha || iSha) return <span className="text-amber-500/70">sha diverged</span>;
-              return null;
-            })()}
-            {strategicAttention?.level === 'needs_operator' && attentionNeeds > 0 && (
-              <span className={attentionTextTone(strategicAttention.level)}>
-                {attentionNeeds} needs attention
-              </span>
-            )}
-          </div>
         </div>
       )}
 
@@ -2991,11 +2924,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         </div>
       )}
 
-      {/* Cycle completion receipt — shown after a cycle finishes until the next one begins.
-          Summarises what changed: direction counts, running-update, problem-model. In
-          conversation (minimal) chat the rich count chrome is suppressed but the label and
-          terminal failure reason stay visible so the operator can verify the outcome inline. */}
-      {lastCycleCompletion && !strategistActive && (
+      {/* Cycle receipts belong to operational triage. Chat contains only durable turns. */}
+      {!conversationMode && lastCycleCompletion && !strategistActive && (
         <div className={`px-4 md:px-6 py-2 border-b border-neutral-800 flex items-start gap-2 shrink-0 ${completionReceiptTone?.banner ?? 'bg-emerald-950/30'}`} role="status" aria-live="polite">
           <span className={`w-2 h-2 rounded-full mt-0.5 shrink-0 ${completionReceiptTone?.dot ?? 'bg-emerald-400'}`} aria-hidden="true" />
           <span className={`text-xs min-w-0 ${completionReceiptTone?.text ?? 'text-emerald-300'}`}>
@@ -3005,31 +2935,31 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
             {lastCycleCompletion.failure_reason && (
               <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'}`}>{lastCycleCompletion.failure_reason.slice(0, 80)}</span>
             )}
-            {!conversationMode && (lastCycleCompletion.created_count ?? 0) > 0 && (
+            {(lastCycleCompletion.created_count ?? 0) > 0 && (
               <span className="ml-1.5">· +{lastCycleCompletion.created_count} direction{lastCycleCompletion.created_count !== 1 ? 's' : ''}</span>
             )}
-            {!conversationMode && (lastCycleCompletion.retired_count ?? 0) > 0 && (
+            {(lastCycleCompletion.retired_count ?? 0) > 0 && (
               <span className="ml-1.5">· −{lastCycleCompletion.retired_count} retired</span>
             )}
-            {!conversationMode && (lastCycleCompletion.staged_count ?? 0) > 0 && (
+            {(lastCycleCompletion.staged_count ?? 0) > 0 && (
               <span className="ml-1.5">· {lastCycleCompletion.staged_count} direction{lastCycleCompletion.staged_count !== 1 ? 's' : ''} staged</span>
             )}
-            {!conversationMode && (lastCycleCompletion.updated_count ?? 0) > 0 && (
+            {(lastCycleCompletion.updated_count ?? 0) > 0 && (
               <span className="ml-1.5">· {lastCycleCompletion.updated_count} updated</span>
             )}
-            {!conversationMode && (lastCycleCompletion.tasks_spawned ?? 0) > 0 && (
+            {(lastCycleCompletion.tasks_spawned ?? 0) > 0 && (
               <span className="ml-1.5">· {lastCycleCompletion.tasks_spawned} task{lastCycleCompletion.tasks_spawned !== 1 ? 's' : ''} spawned</span>
             )}
-            {!conversationMode && lastCycleCompletion.running_update_changed && (
+            {lastCycleCompletion.running_update_changed && (
               <span className="ml-1.5">· running update written</span>
             )}
-            {!conversationMode && lastCycleCompletion.problem_model_changed && (
+            {lastCycleCompletion.problem_model_changed && (
               <span className="ml-1.5">· problem model updated</span>
             )}
-            {!conversationMode && lastCycleCompletion.status_message && (
+            {lastCycleCompletion.status_message && (
               <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'} italic`}>{lastCycleCompletion.status_message.slice(0, 80)}</span>
             )}
-            {!conversationMode && lastCycleCompletion.strategic_judgment_challenge && (
+            {lastCycleCompletion.strategic_judgment_challenge && (
               <span className="ml-1.5 align-middle">
                 <StrategicChallengeChip summary={lastCycleCompletion.strategic_judgment_challenge} />
               </span>
@@ -3041,7 +2971,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       {/* Needs-action strip — derived from the canonical attention model when the
           strategic read model is available. Shows needs_operator items at the top
           with lifecycle.clears_when so the operator sees they will self-clear. */}
-      {(!conversationMode || chatChromeExpanded) && usesStrategicReadModel && visibleAttentionNeedsActionItems.length > 0 && (
+      {!conversationMode && usesStrategicReadModel && visibleAttentionNeedsActionItems.length > 0 && (
         <div className="shrink-0 border-b border-workbench-border bg-amber-950/20 px-3 py-2 md:px-4" data-testid="needs-action-strip">
           <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-col gap-1.5">
             <div className="flex items-center gap-2">
@@ -3227,7 +3157,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         loadingOlderTriageMessages={loadingOlderTriageMessages}
         onLoadOlderTriageMessages={loadOlderTriageMessages}
         conversationListRef={conversationListRef}
-        streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} segments={streamingTurn.segments} /> : null}
         scrollRef={scrollRef}
         dividerDismissedRef={dividerDismissedRef}
         messages={conversationMode ? renderedConversationMessages : messages}
@@ -3354,7 +3283,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         editingLocked={sendState === 'sending' || sendState === 'needs_retry'}
         replyTo={replyTo}
         lastArming={lastArming}
-        strategistBusy={strategistActive}
+        strategistBusy={conversationMode ? false : strategistActive}
         disabledReason={selectedProjectId ? null : 'Select a project to message Strategic'}
         pendingAttachments={pendingAttachments}
         retainedAttachmentCount={sendState === 'needs_retry'
