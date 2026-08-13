@@ -42,6 +42,10 @@ const DEFAULT_RESIDENT_TURN_TIMEOUT_MS = 120_000;   // per-active-turn stall bud
 const DEFAULT_RESIDENT_IDLE_CEILING_MS = 30 * 60_000; // warm-but-orphaned backstop
 const RESIDENT_INTERRUPT_SIGINT_GRACE_MS = 4_000;   // control_request → SIGINT fallback
 const RESIDENT_TURN_FORCE_SETTLE_MS = 20_000;       // stall+interrupt → force-settle
+// Callers also interrupt proactively (operator pickup, claim loss, continuation
+// preemption). A provider that ignores SIGINT must not keep that caller, its
+// message poll, and the public "Responding" state blocked indefinitely.
+const RESIDENT_COOPERATIVE_INTERRUPT_SETTLE_MS = 10_000;
 // ABSOLUTE per-turn ceiling, measured from turn dispatch and NEVER reset by
 // output. The stall watchdog above resets on every stdout chunk, so a wedged
 // child that keeps emitting keepalive / partial-message noise but never returns
@@ -179,7 +183,7 @@ export interface ResidentSession {
     stallTimeoutMs?: number;
     hardTimeoutMs?: number;
   }): Promise<ResidentTurnResult>;
-  /** Cooperatively pre-empt the in-flight turn with SIGINT. */
+  /** Pre-empt with SIGINT, force-settling if the provider ignores it. */
   interrupt(): void;
   /** Subscribe to parsed stream events (text deltas, tool_use, errors). */
   onEvent(cb: (ev: ResidentSessionEvent) => void): void;
@@ -514,7 +518,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       if (activeTurn !== t) return;
       log(`[resident] turn stall — no output for >${t.stallTimeoutMs / 1000}s; interrupting`);
       t.timedOut = true;
-      interrupt();
+      signalInterrupt(t);
       // If the interrupt does not produce a terminal result, force-settle so the
       // handler loop never blocks forever on a wedged turn. The child stays alive
       // and will still emit this turn's real `result` later — mark it stale so it
@@ -544,7 +548,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       log(`[resident] turn hard-timeout — no terminal result within ${Math.round(t.hardTimeoutMs / 1000)}s; force-killing session`);
       t.timedOut = true;
       t.hardTimedOut = true;
-      try { interrupt(); } catch { /* fall through to the kill below */ }
+      try { signalInterrupt(t); } catch { /* fall through to the kill below */ }
       setTimeout(() => {
         // Still the same active turn after the interrupt grace ⇒ genuinely wedged.
         // close() kills the group and settles this turn with processGone=true.
@@ -862,14 +866,31 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     if (opts.onExit) { try { opts.onExit(exitCodeVal); } catch { /* ignore */ } }
   });
 
-  function interrupt(): void {
+  function signalInterrupt(t: ActiveTurn | null): void {
     if (!alive || closed) return;
-    const t = activeTurn;
     if (t) t.interrupted = true;
     // Claude's stream-json input accepts only user frames. Sending a synthetic
     // control_request makes the CLI exit instead of cancelling the active
     // turn, so always use the process-level cooperative interrupt.
     try { if (typeof pid === 'number') process.kill(pid, 'SIGINT'); } catch { /* ignore */ }
+  }
+
+  function interrupt(): void {
+    if (!alive || closed) return;
+    const t = activeTurn;
+    signalInterrupt(t);
+    if (t && !t.interruptTimer) {
+      t.interruptTimer = setTimeout(() => {
+        if (activeTurn !== t) return;
+        log('[resident] cooperative interrupt did not settle; closing the wedged session');
+        // A cooperative interrupt deadline is also the process-reuse fence. If
+        // the provider ignored SIGINT, resolving while it remained alive would
+        // let an outer deadline race observe a settled turn and reuse the same
+        // wedged child. Tear down the process group and report processGone so
+        // every caller takes its existing restart/terminal path.
+        close();
+      }, RESIDENT_COOPERATIVE_INTERRUPT_SETTLE_MS);
+    }
   }
 
   function close(): void {

@@ -23,8 +23,6 @@ describe('ConversationUtilityBar — viewport regression', () => {
   async function renderBar(props: {
     expanded: boolean;
     searchQuery?: string;
-    needsActionCount?: number;
-    alertCount?: number;
   }) {
     host = document.createElement('div');
     host.style.width = '100%';
@@ -39,18 +37,12 @@ describe('ConversationUtilityBar — viewport regression', () => {
           onCollapse={() => {}}
           searchQuery={props.searchQuery ?? ''}
           onSearchChange={() => {}}
-          needsActionCount={props.needsActionCount ?? 0}
-          alertCount={props.alertCount ?? 0}
         />,
       );
     });
   }
 
-  test('collapsed with action + alert pills does not overflow at 375px', async () => {
-    await expectNoOverflowAt(375, () => renderBar({ expanded: false, needsActionCount: 8, alertCount: 5 }));
-  });
-
-  test('collapsed with no counts (search icon only) does not overflow at 375px', async () => {
+  test('collapsed search control does not overflow at 375px', async () => {
     await expectNoOverflowAt(375, () => renderBar({ expanded: false }));
   });
 
@@ -60,7 +52,7 @@ describe('ConversationUtilityBar — viewport regression', () => {
     );
   });
 
-  test('collapsed pills do not overflow at 1280px', async () => {
-    await expectNoOverflowAt(1280, () => renderBar({ expanded: false, needsActionCount: 12, alertCount: 9 }));
+  test('collapsed search control does not overflow at 1280px', async () => {
+    await expectNoOverflowAt(1280, () => renderBar({ expanded: false }));
   });
 });

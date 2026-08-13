@@ -242,6 +242,8 @@ async def reconcile_terminal_task(
 def terminal_completion_event(
     cycle: StrategicCycle,
     task: Task,
+    *,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Snapshot the canonical ``strategic_cycle_completed`` args for a cycle that
     :func:`reconcile_terminal_task` just terminalized.
@@ -258,7 +260,7 @@ def terminal_completion_event(
     :func:`emit_terminal_completion_events`.
     """
     phase = 1 if cycle.phase1_task_id == task.id else 2
-    return {
+    event: dict[str, Any] = {
         "project_id": str(cycle.project_id),
         "task_id": str(task.id),
         "phase": phase,
@@ -266,12 +268,22 @@ def terminal_completion_event(
         # The resulting terminal outcome (failed_phase1 / failed_phase2), not a
         # generic "failed" literal — the UI mirrors this into cycle state.
         "phase_state": cycle.outcome,
-        "completion": {
+    }
+    # An intentional Workday stop is already acknowledged by the session control
+    # the operator just used.  The lifecycle event must still close the live
+    # "Strategist working" state, but including ``completion`` makes the client
+    # surface a second, sticky "Strategic cycle cancelled" receipt.  Preserve the
+    # completion payload for every unexpected cancellation and every failure.
+    intentional_resident_stop = (
+        task.status == TaskStatus.CANCELLED and source == "resident_operator_stop"
+    )
+    if not intentional_resident_stop:
+        event["completion"] = {
             "status": getattr(task.status, "value", str(task.status)),
             "status_message": task.latest_status_message,
             "failure_reason": cycle.failure_reason,
-        },
-    }
+        }
+    return event
 
 
 async def emit_terminal_completion_events(events) -> None:
@@ -291,7 +303,7 @@ async def emit_terminal_completion_events(events) -> None:
                 event["phase"],
                 cycle_id=event["cycle_id"],
                 phase_state=event["phase_state"],
-                completion=event["completion"],
+                completion=event.get("completion"),
             )
         except Exception as exc:  # noqa: BLE001 - best-effort post-commit signal
             logger.warning(

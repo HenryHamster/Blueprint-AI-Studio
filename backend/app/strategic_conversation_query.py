@@ -23,6 +23,7 @@ from app.message_audience import PIPELINE_LOG, STRATEGIST_INTERNAL
 from app.models import MessageSurface, ProjectMessage
 
 _CHECK_IN_EVENT_TYPE = "strategic_check_in"
+_MODE_KNOB_CUT_EVENT_TYPE = "mode_knob_cut_recommended"
 _COVERED_MESSAGE_IDS_KEY = "_resident_reply_covered_message_ids"
 _CANONICAL_UUID_RE = (
     "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
@@ -125,12 +126,19 @@ def strategic_conversation_predicate() -> Any:
             _HasVerifiedCoveredInput(ProjectMessage.context),
         ),
     )
+    event_type = ProjectMessage.context["event_type"].as_string()
     return and_(
         ProjectMessage.surface == MessageSurface.CONVERSATION,
         or_(
-            ProjectMessage.context["event_type"].as_string().is_(None),
-            ProjectMessage.context["event_type"].as_string()
-            != _CHECK_IN_EVENT_TYPE,
+            event_type.is_(None),
+            event_type != _CHECK_IN_EVENT_TYPE,
+        ),
+        # CUT recommendations are completion-debt bookkeeping, not human
+        # conversation. Keep legacy rows out even though they were persisted on
+        # the conversation surface before that routing distinction was fixed.
+        or_(
+            event_type.is_(None),
+            event_type != _MODE_KNOB_CUT_EVENT_TYPE,
         ),
         or_(
             proven_operator_reply,

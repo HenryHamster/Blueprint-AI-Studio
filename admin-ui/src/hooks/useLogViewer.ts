@@ -173,6 +173,17 @@ function canonicalProjectMessage(value: unknown): ProjectMessage | null {
   return candidate as ProjectMessage;
 }
 
+function projectMessageDeliveryEnvelope(value: unknown): Pick<ProjectMessage, 'id' | 'project_id' | 'surface'> | null {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as Partial<ProjectMessage>;
+  if (
+    typeof candidate.id !== 'string'
+    || typeof candidate.project_id !== 'string'
+    || typeof candidate.surface !== 'string'
+  ) return null;
+  return { id: candidate.id, project_id: candidate.project_id, surface: candidate.surface };
+}
+
 const STRATEGIC_READ_MODEL_REFRESH_EVENTS = new Set([
   'task_updated',
   'artifact_created',
@@ -295,6 +306,10 @@ export function useLogViewer({
   const wsPingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastPongRef = useRef<number>(0);
   const wsPongTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const acknowledgeMessageDelivery = useCallback((messageId: string) => {
+    if (!messageId || wsRef.current?.readyState !== WebSocket.OPEN) return;
+    wsRef.current.send(JSON.stringify({ type: 'message_ack', message_id: messageId }));
+  }, []);
 
   // --- Task Tracking State ---
   const [trackedTaskIds, setTrackedTaskIds] = useState<Set<string>>(new Set());
@@ -641,19 +656,24 @@ export function useLogViewer({
         const canonicalMessage = (msg.event === 'message_created' || msg.event === 'message_updated')
           ? canonicalProjectMessage(msg.data?.message)
           : null;
+        const deliveryEnvelope = (msg.event === 'message_created' || msg.event === 'message_updated')
+          ? projectMessageDeliveryEnvelope(msg.data?.message)
+          : null;
         const canonicalRefetchRequired = msg.data?.canonical_refetch_required === true
           || msg.data?.message?.projection_truncated === true
           || msg.data?.message?.context?.projection_truncated === true;
+        // Activity/general messages are admitted by their own surfaces and
+        // retain immediate delivery acknowledgement. Conversation rows are
+        // deferred to useConversation, which can enforce canonical visibility
+        // (including server proof for legacy internal replies) before ACKing.
         if (canonicalMessage) {
           refreshMessagesRef?.current?.(canonicalMessage, canonicalRefetchRequired);
-          // Acknowledge delivery so the backend stamps delivered_at.
-          // Without this, the recovery-on-reconnect path re-sends every
-          // undelivered message from the last 10 minutes, and the liveness
-          // audit reports permanent false-positive undelivered gaps.
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({ type: 'message_ack', message_id: canonicalMessage.id }));
+        } else {
+          refreshMessages();
+          if (deliveryEnvelope && deliveryEnvelope.surface !== 'conversation') {
+            acknowledgeMessageDelivery(deliveryEnvelope.id);
           }
-        } else refreshMessages();
+        }
       }
       if (projectEventApplies && (
         msg.event === 'alert_created'
@@ -755,7 +775,7 @@ export function useLogViewer({
     } catch {
       // ignore parse errors
     }
-  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, refreshGatedTaskTypes, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshMessagesRef, refreshAlerts, refreshFleetRunnersRef]);
+  }, [acknowledgeMessageDelivery, appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, refreshGatedTaskTypes, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshMessagesRef, refreshAlerts, refreshFleetRunnersRef]);
 
   const connectWs = useCallback(async (projectId: string) => {
     if (!canViewProjectRef.current) return;
@@ -1071,7 +1091,7 @@ export function useLogViewer({
   return {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,
     handleViewLogs, closeLogViewer,
-    wsRef, wsConnected,
+    wsRef, wsConnected, acknowledgeMessageDelivery,
     pipelineThrottle,
     ceilingDeferredProjectIds,
     gatedTaskTypes,

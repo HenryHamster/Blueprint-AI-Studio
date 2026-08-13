@@ -55,7 +55,7 @@ describe('PrimaryTabNav — cross-tab alert indicator (PR #15230)', () => {
     return container;
   }
 
-  test('shows alert dot on all five tab buttons when activeAlerts > 0', () => {
+  test('shows the operational alert dot on Pipeline only', () => {
     const el = render(
       <PrimaryTabNav
         activeTab="chat"
@@ -67,14 +67,9 @@ describe('PrimaryTabNav — cross-tab alert indicator (PR #15230)', () => {
 
     const buttons = el.querySelectorAll<HTMLButtonElement>('button');
     expect(buttons.length).toBe(5);
-    // Every tab button should contain an alert-dot span regardless of which tab is active
-    let dotCount = 0;
-    for (const button of buttons) {
-      const dot = button.querySelector('[title*="active alert"]');
-      expect(dot).not.toBeNull();
-      dotCount++;
-    }
-    expect(dotCount).toBe(5);
+    expect(el.querySelectorAll('[title*="active alert"]')).toHaveLength(1);
+    const pipeline = Array.from(buttons).find(button => button.textContent?.includes('Pipeline'));
+    expect(pipeline?.querySelector('[title*="active alert"]')).not.toBeNull();
   });
 
   test('shows no alert dot when activeAlerts is 0', () => {
@@ -153,63 +148,13 @@ describe('PrimaryTabNav — cross-tab alert indicator (PR #15230)', () => {
     expect(pipelineDot).not.toBeNull();
   });
 
-  test('alert indicator is visible on project tab when active tab is chat (cross-tab)', () => {
+  test('attention counts and alert dots stay off Chat and non-Pipeline tabs', () => {
     const el = render(
       <PrimaryTabNav
         activeTab="chat"
-        onTabChange={() => {}}
-        activeAlerts={2}
-      />,
-    );
-    act(() => {});
-
-    const projectBtn = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
-      .find(b => b.textContent?.includes('Project'));
-    expect(projectBtn).toBeDefined();
-    const projectDot = projectBtn?.querySelector('[title*="active alert"]');
-    expect(projectDot).not.toBeNull();
-  });
-
-  test('alert indicator is visible on runtime tab when active tab is chat (cross-tab)', () => {
-    const el = render(
-      <PrimaryTabNav
-        activeTab="chat"
-        onTabChange={() => {}}
-        activeAlerts={2}
-      />,
-    );
-    act(() => {});
-
-    const runtimeBtn = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
-      .find(b => b.textContent?.includes('Runtime'));
-    expect(runtimeBtn).toBeDefined();
-    const runtimeDot = runtimeBtn?.querySelector('[title*="active alert"]');
-    expect(runtimeDot).not.toBeNull();
-  });
-
-  test('alert indicator is visible on chat tab when active tab is pipeline (cross-tab)', () => {
-    const el = render(
-      <PrimaryTabNav
-        activeTab="pipeline"
-        onTabChange={() => {}}
-        activeAlerts={1}
-      />,
-    );
-    act(() => {});
-
-    const chatBtn = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
-      .find(b => b.textContent?.includes('Chat'));
-    expect(chatBtn).toBeDefined();
-    const chatDot = chatBtn?.querySelector('[title*="active alert"]');
-    expect(chatDot).not.toBeNull();
-  });
-
-  test('alert dot coexists with chat badge count', () => {
-    const el = render(
-      <PrimaryTabNav
-        activeTab="pipeline"
         onTabChange={() => {}}
         openMessageCount={7}
+        newSinceLastVisitCount={9}
         activeAlerts={2}
       />,
     );
@@ -217,10 +162,14 @@ describe('PrimaryTabNav — cross-tab alert indicator (PR #15230)', () => {
 
     const chatBtn = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
       .find(b => b.textContent?.includes('Chat'));
-    expect(chatBtn?.textContent).toContain('7');
-    // Chat tab should also carry the alert dot even though it has a badge
-    const chatDot = chatBtn?.querySelector('[title*="active alert"]');
-    expect(chatDot).not.toBeNull();
+    expect(chatBtn?.textContent).toBe('Chat');
+    expect(chatBtn?.querySelector('[title*="active alert"]')).toBeNull();
+    const projectBtn = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(b => b.textContent?.includes('Project'));
+    const runtimeBtn = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(b => b.textContent?.includes('Runtime'));
+    expect(projectBtn?.querySelector('[title*="active alert"]')).toBeNull();
+    expect(runtimeBtn?.querySelector('[title*="active alert"]')).toBeNull();
   });
 
   test('alert dot coexists with pipeline attention badge count', () => {

@@ -272,6 +272,11 @@ export const MessageBubble = memo(function MessageBubble({
     : msg.context.event_type === 'feedback_acknowledgment'
       ? 'In reply to your feedback:'
       : null;
+  const workdayConsulted = chatMode
+    && !userMsg
+    && msg.context.message_role === 'workday_consultation_continuation'
+    && typeof msg.context._workday_result_packet_id === 'string'
+    && msg.context._workday_result_packet_id.trim().length > 0;
 
   return (
     <>
@@ -307,6 +312,17 @@ export const MessageBubble = memo(function MessageBubble({
                   title={`Task ${taskId}`}
                 >
                   {taskId.slice(0, 8)}
+                </span>
+              </>
+            )}
+            {workdayConsulted && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span
+                  className="text-neutral-600"
+                  title="This final reply incorporates a completed Workday consultation"
+                >
+                  Workday consulted
                 </span>
               </>
             )}

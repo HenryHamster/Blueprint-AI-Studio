@@ -42,6 +42,7 @@ vi.mock('./strategic-resident.js', () => ({
   withPrivateWorkdayTurnFence: vi.fn(),
   residentReplyRuntimePaths: vi.fn(),
   partitionTypedFastMessages: vi.fn(),
+  partitionResidentPublicReplyMessages: vi.fn(),
   selectTypedFastClaimMessages: vi.fn(),
 }));
 

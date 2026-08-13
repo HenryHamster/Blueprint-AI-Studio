@@ -648,6 +648,36 @@ describe('startResidentClaudeSession', () => {
     session.close();
   });
 
+  it('closes a provider that never returns after cooperative interrupt', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({
+      turnTimeoutMs: 60_000,
+      hardTurnTimeoutMs: 10 * 60_000,
+    });
+    const turn = session.sendTurn('provider wedge');
+    let settled = false;
+    void turn.then(() => { settled = true; });
+
+    session.interrupt();
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    const result = await turn;
+    expect(result.interrupted).toBe(true);
+    expect(result.timedOut).toBe(false);
+    expect(result.processGone).toBe(true);
+    expect(session.isAlive()).toBe(false);
+    // The deadline tears down the detached process group rather than leaving a
+    // wedged child eligible for reuse by the outer preemption coordinator.
+    // `process.kill` is mocked above; this assertion never calls the unbound
+    // host method.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(process.kill).toHaveBeenCalledWith(-4242, 'SIGTERM');
+    expect(settled).toBe(true);
+  });
+
   it('settles a pending turn as processGone when the child closes', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);

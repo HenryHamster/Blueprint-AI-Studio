@@ -25,7 +25,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 
 import app.mode_knob_graduation as mkg
 from app.completion_debt import KIND_DORMANT_KNOB
@@ -35,6 +35,7 @@ from app.models import (
     DeploymentState,
     EvergreenFillDecisionLog,
     Project,
+    ProjectMessage,
     Task,
     TaskStatus,
 )
@@ -187,6 +188,23 @@ async def _seed_dormant_debt(db, project) -> CompletionDebtEntry:
     return entry
 
 
+async def _cut_recommendation_messages(db, project: Project) -> list[ProjectMessage]:
+    rows = (
+        (
+            await db.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        row
+        for row in rows
+        if (row.context or {}).get("event_type") == "mode_knob_cut_recommended"
+    ]
+
+
 # --- Registry + enabled gate --------------------------------------------------
 
 
@@ -325,7 +343,8 @@ async def test_cut_recommendation_on_measured_no_lift(db):
         min_sample=3,
     )
 
-    decisions = await mkg.run_mode_knob_graduation(db, now=_utcnow())
+    measured_at = _utcnow()
+    decisions = await mkg.run_mode_knob_graduation(db, now=measured_at)
     cut = next(d for d in decisions if d.config_key == CONFIG_KEY)
     assert cut.action == mkg.CUT
     assert cut.signal == pytest.approx(0.0)
@@ -348,6 +367,37 @@ async def test_cut_recommendation_on_measured_no_lift(db):
     assert rec["verdict"] == "cut"
     assert rec["measurements"]["initiative_count"] == 0
     assert rec["measurements"]["would_have_blocked"] == 0
+
+    # Reaper retries against the identical evidence state coalesce onto the same
+    # durable ProjectMessage instead of reposting operator noise every cycle.
+    repeated = await mkg.run_mode_knob_graduation(db, now=measured_at)
+    repeated_cut = next(d for d in repeated if d.config_key == CONFIG_KEY)
+    assert repeated_cut.action == mkg.CUT
+    messages = await _cut_recommendation_messages(db, project)
+    assert len(messages) == 1
+    assert messages[0].surface == "activity"
+    first_message_id = messages[0].id
+
+    # Counter changes inside a still-CUT episode are not a new recommendation.
+    # This is particularly important for audit-backed knobs whose evaluation
+    # count and last-cycle timestamp naturally move on every reaper pass.
+    await _spawn_tasks(db, project, "review", 1)
+    changed = await mkg.run_mode_knob_graduation(db, now=_utcnow())
+    changed_cut = next(d for d in changed if d.config_key == CONFIG_KEY)
+    assert changed_cut.action == mkg.CUT
+    messages = await _cut_recommendation_messages(db, project)
+    assert [message.id for message in messages] == [first_message_id]
+
+    # A real knob-state transition is a new recommendation episode and remains
+    # visible even when the no-lift evidence itself is otherwise unchanged.
+    _rc[CONFIG_KEY] = "off"
+    new_mode = await mkg.run_mode_knob_graduation(db, now=_utcnow())
+    new_mode_cut = next(d for d in new_mode if d.config_key == CONFIG_KEY)
+    assert new_mode_cut.action == mkg.CUT
+    assert new_mode_cut.from_mode == "off"
+    messages = await _cut_recommendation_messages(db, project)
+    assert len(messages) == 2
+    assert len({message.idempotency_key for message in messages}) == 2
 
 
 # --- HOLD --------------------------------------------------------------------

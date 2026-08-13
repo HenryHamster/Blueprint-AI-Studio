@@ -749,6 +749,7 @@ describe('StrategicContextRail', () => {
       onOpenPipeline: vi.fn(),
       onOpenRuntimeHealth: vi.fn(),
       onOpenRuntimeDevices: vi.fn(),
+      canOperateProject: true,
       ...overrides,
     };
     act(() => {
@@ -831,6 +832,17 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('1 approval');
     expect(host.textContent).toContain('Run GPU benchmark');
     expect(host.textContent).toContain('parked');
+  });
+
+  test('can hide operator-attention prompts for the Chat embedding', () => {
+    const { host } = mount({ showAttention: false });
+
+    expect(host.textContent).toContain('Persistent Strategic interaction');
+    expect(host.textContent).toContain('Context package');
+    expect(host.textContent).not.toContain('Needs operator');
+    expect(host.textContent).not.toContain('Needs your action');
+    expect(host.textContent).not.toContain('Next actions');
+    expect(host.querySelector('[data-testid="rail-pending-confirmations"]')).toBeNull();
   });
 
   test('drills into existing workbench sections', () => {
@@ -1422,8 +1434,9 @@ describe('StrategicContextRail', () => {
     };
   }
 
-  test('renders every pending confirmation in a dedicated needs-your-action list, never truncated', () => {
+  test('keeps every pending confirmation reachable in calm Chat without attention summaries', () => {
     const { host } = mount({
+      showAttention: false,
       state: stateWithConfirmations([
         {
           id: 'message:msg-1',
@@ -1438,14 +1451,18 @@ describe('StrategicContextRail', () => {
       ]),
     });
 
-    const section = host.querySelector('[data-testid="rail-needs-action"]');
+    const section = host.querySelector('[data-testid="rail-pending-confirmations"]');
     expect(section).toBeTruthy();
+    expect(section?.textContent).toContain('Pending confirmations');
+    expect(host.textContent).not.toContain('Needs operator');
+    expect(host.textContent).not.toContain('Needs your action');
     // All three confirmations are reachable (cap is 3 with show-more beyond).
     expect(section?.textContent).toContain('Provide the Hugging Face token');
     expect(section?.textContent).toContain('Should the pipeline adopt the 30-day retention window?');
     expect(section?.textContent).toContain('Grant repo access for dependency scanning.');
     // Confirmations are not double-rendered in the generic attention preview.
-    expect(host.textContent).toContain('Question waiting');
+    expect(host.textContent).not.toContain('Question waiting');
+    expect(section?.querySelector('button')).not.toBeNull();
   });
 
   test('accepting a confirmation calls the accept API and refreshes strategic state', async () => {
@@ -1453,7 +1470,7 @@ describe('StrategicContextRail', () => {
     const onConfirmationResolved = vi.fn();
     const { host } = mount({ state: stateWithConfirmations(), onConfirmationResolved });
 
-    const section = host.querySelector('[data-testid="rail-needs-action"]')!;
+    const section = host.querySelector('[data-testid="rail-pending-confirmations"]')!;
     const acceptButton = Array.from(section.querySelectorAll<HTMLButtonElement>('button'))
       .find(button => button.getAttribute('title') === 'Mark provided');
     expect(acceptButton).toBeTruthy();
@@ -1463,7 +1480,7 @@ describe('StrategicContextRail', () => {
     expect(acceptPendingConfirmation).toHaveBeenCalledWith('proj-1', 'p-2e5edcbc', undefined);
     expect(onConfirmationResolved).toHaveBeenCalledTimes(1);
     // Resolved item is optimistically removed from the list.
-    expect(host.querySelector('[data-testid="rail-needs-action"]')?.textContent).not.toContain('Credentials needed');
+    expect(host.querySelector('[data-testid="rail-pending-confirmations"]')?.textContent).not.toContain('Credentials needed');
   });
 
   test('resolving a long-stale confirmation is one click and hits the dismiss API', async () => {
@@ -1471,7 +1488,7 @@ describe('StrategicContextRail', () => {
     const onConfirmationResolved = vi.fn();
     const { host } = mount({ state: stateWithConfirmations(), onConfirmationResolved });
 
-    const section = host.querySelector('[data-testid="rail-needs-action"]')!;
+    const section = host.querySelector('[data-testid="rail-pending-confirmations"]')!;
     const resolveButton = Array.from(section.querySelectorAll<HTMLButtonElement>('button'))
       .find(button => button.getAttribute('title') === 'Mark as resolved without action');
     expect(resolveButton).toBeTruthy();

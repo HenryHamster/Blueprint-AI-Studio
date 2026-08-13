@@ -186,7 +186,7 @@
     "handlers/research-plan.ts": 3000,
     "handlers/strategic.ts": 1900,
     "handlers/strategic-resident-lib.ts": 3550,
-    "handlers/strategic-resident.ts": 5350,
+    "handlers/strategic-resident.ts": 6200,
     "handlers/research-direction-context.ts": 250,
     "prompts/thinker.ts": 1400,
     "handlers/standard.ts": 1900,

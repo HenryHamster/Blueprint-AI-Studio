@@ -2491,8 +2491,8 @@
           "new_cap": 3000
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-12T02:18:01.653803+00:00",
+          "commit_sha": "bc52602e02c35e22a378d2ae142346efa0f6e0b0",
+          "commit_date": "2026-08-12T02:34:51Z",
           "old_cap": 3000,
           "new_cap": 3550
         }
@@ -3403,6 +3403,12 @@
           "commit_date": "2026-07-30T18:49:32-07:00",
           "old_cap": 3700,
           "new_cap": 5350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-12T23:50:39.472227+00:00",
+          "old_cap": 5350,
+          "new_cap": 6200
         }
       ],
       "prompts/thinker.ts": [

@@ -121,6 +121,13 @@ const MAX_CONSECUTIVE_GENERIC_PROVIDER_FAILURES = 2;
 const MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES = 2;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
 const OPERATOR_HARD_TIMEOUT_GRACE_MS = 30_000;
+// Public conversation coordination must stay substantially cheaper than a
+// provider turn.  These writes are idempotent; one bounded attempt followed by
+// an explicit disposition reconciliation is safer than apiPost's general
+// five-attempt transport loop, which can otherwise stop message polling for
+// minutes after the Coordinator has already committed a Fast reply.
+const TYPED_COORDINATOR_API_ATTEMPTS = 1;
+const TYPED_COORDINATOR_API_TIMEOUT_MS = 5_000;
 const RESIDENT_LIVENESS_HEARTBEAT_MAX_MS = 30_000;
 const RESIDENT_LEGACY_ADMISSION_MAX_MS = 180_000;
 const RESIDENT_LEGACY_ADMISSION_SKEW_MS = 30_000;
@@ -203,6 +210,29 @@ export function partitionTypedFastMessages(
     else workday.push(message);
   }
   return { fast, workday };
+}
+
+export interface ResidentPublicReplyPartition {
+  fast: ResidentInboundMessage[];
+  workday: ResidentInboundMessage[];
+}
+
+/**
+ * Select exactly one public-reply owner for an admitted message page.
+ *
+ * When typed Fast is active, the backend-marked canonical subset belongs to
+ * Fast. Other broad-poll rows retain their legacy Workday owner, but the
+ * handler serializes a mixed page so they cannot create an adjacent response
+ * in the same Fast turn. A Workday-only session owns the whole page.
+ */
+export function partitionResidentPublicReplyMessages(
+  messages: ResidentInboundMessage[],
+  typedFastActivated: boolean,
+): ResidentPublicReplyPartition {
+  if (!typedFastActivated) {
+    return { fast: [], workday: [...messages] };
+  }
+  return partitionTypedFastMessages(messages);
 }
 
 /**
@@ -1150,10 +1180,10 @@ export async function handleStrategicResident(
       : undefined,
   });
   // Once Fast owns the public conversation, Workday is an on-demand research
-  // lane rather than a second autonomous mind. It still handles explicit Fast
-  // consultations and the ordinary fallback path, but it must not burn turns
-  // merely because the project clock moved while nobody asked it to do
-  // anything. Workday-only sessions retain their autonomous behavior.
+  // and execution lane rather than a second public conversational mind. It
+  // handles explicit Fast consultations, but broad poll/activity rows never
+  // create a competing Workday reply. Workday-only sessions retain their
+  // legacy public and autonomous behavior.
   const workdayOnDemand = typedFastConfig.activated;
   // The backend stamps conversation rows fast-eligible from its one canonical
   // predicate, independent of whether THIS session can ever run the typed Fast
@@ -1163,10 +1193,9 @@ export async function handleStrategicResident(
   // child that can never exist.
   const partitionInboundMessages = (
     msgs: ResidentInboundMessage[],
-  ): { fast: ResidentInboundMessage[]; workday: ResidentInboundMessage[] } => (
-    typedFastConfig.activated
-      ? partitionTypedFastMessages(msgs)
-      : { fast: [], workday: [...msgs] }
+  ): ResidentPublicReplyPartition => partitionResidentPublicReplyMessages(
+    msgs,
+    typedFastConfig.activated,
   );
   let typedFastReady = typedFastConfig.activated;
   let typedFastProvisioning = false;
@@ -1680,10 +1709,6 @@ export async function handleStrategicResident(
         // fenced and replaced with the durable message still open.
         ...(operator ? { hardTimeoutMs: operatorHardTimeoutMs } : {}),
       });
-      if (!privateTurn) {
-        streamer.flush();
-        streamer.done();
-      }
       recordResidentTurnLatency({
         kind: operator ? 'operator' : 'autonomous',
         turnMs: r.turnMs,
@@ -1697,6 +1722,14 @@ export async function handleStrategicResident(
       return r;
     } finally {
       if (slowResponseTimer) clearTimeout(slowResponseTimer);
+      if (!privateTurn) {
+        // A completed or failed turn is no longer responding. Without this
+        // reset every later heartbeat can advertise the last Workday turn as
+        // active even while the loop is idle or Fast owns the foreground.
+        streamer.flush();
+        streamer.done();
+        statusRef.value = 'Resident ready — waiting for operator input';
+      }
     }
   };
 
@@ -3454,6 +3487,8 @@ export async function handleStrategicResident(
         content: turn.completion.content,
         idempotency_key: receipt.idempotency_key,
       },
+      TYPED_COORDINATOR_API_ATTEMPTS,
+      TYPED_COORDINATOR_API_TIMEOUT_MS,
     );
     typedFastTranscriptSequence = verified.envelope.transcript_sequence;
     return 'completed';
@@ -3888,6 +3923,8 @@ export async function handleStrategicResident(
         incarnation_id: residentProcessIncarnation,
         claim_id: claimId,
       },
+      TYPED_COORDINATOR_API_ATTEMPTS,
+      TYPED_COORDINATOR_API_TIMEOUT_MS,
     ) as TypedAbandonResponse;
     return response;
   };
@@ -4019,6 +4056,8 @@ export async function handleStrategicResident(
           client_claim_id: claimRequest.clientClaimId,
           idempotency_key: claimRequest.idempotencyKey,
         },
+        TYPED_COORDINATOR_API_ATTEMPTS,
+        TYPED_COORDINATOR_API_TIMEOUT_MS,
       ) as TypedClaimResponse;
       claimId = typeof claimed.claim_id === 'string' ? claimed.claim_id : '';
       if (claimId) unresolvedTypedFastClaimId = claimId;
@@ -4091,6 +4130,8 @@ export async function handleStrategicResident(
         '',
         'You MUST use mcp__call__complete_turn exactly once with the natural public reply.',
         'If fresh investigation is genuinely necessary, also use mcp__call__request_workday with a concise private request, but still complete this turn naturally (for example, say what you are checking). Do not emit a competing public answer in plain text.',
+        'If the operator requests code, configuration, branch, deployment, or other managed-state execution, request Workday to route it through supported Blueprint task tooling. Never promise that Fast will perform the mutation itself.',
+        'Any public promise to route, create, or hand off a Blueprint/Workday task MUST be paired with mcp__call__request_workday in this same turn. Otherwise answer without promising delegation.',
       ].join('\n');
       const promptBlocks: Array<Record<string, unknown>> = [
         { type: 'text', text: promptText },
@@ -4146,7 +4187,7 @@ export async function handleStrategicResident(
             question: workdayRequest.prompt,
           },
         } : {}),
-      });
+      }, TYPED_COORDINATOR_API_ATTEMPTS, TYPED_COORDINATOR_API_TIMEOUT_MS);
       typedFastTranscriptSequence = verified.envelope.transcript_sequence;
       typedFastFailureCount = 0;
       typedFastCircuitOpenUntil = 0;
@@ -4226,15 +4267,19 @@ export async function handleStrategicResident(
           setResidentActivity('waiting', 'Fast Resident completed an earlier message; picking up newer input');
           return 'continue';
         }
-        if (workdayMessages.length === 0) {
-          pendingOperatorAdmission = null;
+        if (workdayMessages.length > 0) {
+          // The exact mixed-page failure was Fast completion immediately
+          // followed by Workday answering the page remainder. Re-open admission
+          // instead: Coordinator has removed the canonical Fast input, so the
+          // next poll presents the still-open Activity/general input by itself
+          // to its legacy Workday owner. Nothing is acknowledged without a
+          // reply and the two inputs cannot share one public turn.
+          rollbackPendingOperatorAdmission();
+          setResidentActivity('waiting', 'Fast Resident replied; deferring separate Workday input');
           return 'continue';
         }
-        // The Fast subset is already durably handled. Retain just the
-        // noncanonical remainder for the legacy Workday claim/retry path.
-        if (pendingOperatorAdmission) {
-          pendingOperatorAdmission.messages = [...workdayMessages];
-        }
+        pendingOperatorAdmission = null;
+        return 'continue';
       } else {
         rollbackPendingOperatorAdmission();
         setResidentActivity('waiting', 'Fast Resident turn remains pending');
@@ -4257,7 +4302,7 @@ export async function handleStrategicResident(
         return 'continue';
       }
     }
-    if (typedOutcome === 'not_available' && fastMessages.length > 0) {
+    if (fastMessages.length > 0) {
       // Fast is the sole public owner for canonical conversation.  Falling
       // through to the broad Workday process here lets a greeting become a
       // project-tool/autonomy turn — exactly the split-brain behavior the
@@ -4565,8 +4610,9 @@ export async function handleStrategicResident(
 
   /**
    * Complete a pure typed-conversation page without interrupting Workday.
-   * Mixed/legacy pages still return false and take the existing serialized
-   * Workday path.  A failed or deferred Fast attempt also returns false so the
+   * Mixed broad-poll pages return false so the current Workday turn is first
+   * pre-empted; handleOperatorTurn completes Fast, then re-polls the untouched
+   * legacy input separately. A failed or deferred Fast attempt returns false so the
    * caller pre-empts Workday; handleOperatorTurn then retries fail-closed and
    * never hands canonical public input to the broad tool-capable process.
    */
@@ -4574,10 +4620,7 @@ export async function handleStrategicResident(
     messages: ResidentInboundMessage[],
   ): Promise<boolean> => {
     const partition = partitionInboundMessages(messages);
-    if (
-      partition.fast.length === 0
-      || partition.workday.length > 0
-    ) return false;
+    if (partition.fast.length === 0 || partition.workday.length > 0) return false;
     // A legacy Workday reply can already own a distinct durable input claim.
     // Fast temporarily uses the single heartbeat claim slot while it completes
     // the newer canonical row, then restores Workday's exact claim. If Fast

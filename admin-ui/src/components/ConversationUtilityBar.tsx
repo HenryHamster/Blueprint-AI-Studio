@@ -1,11 +1,8 @@
 import { Search, ChevronUp } from 'lucide-react';
 
 /**
- * Compact, collapsible utility bar shown above the strategist conversation. Collapsed by
- * default — a search icon plus optional "N need your action" / "N alerts" count pills —
- * so the conversation stays clean. Expanding reveals the full conversation-search input;
- * the caller renders the inline alerts banner and the needs-action strip below, gated on
- * the same `expanded` flag. Extracted from MessagesPanel to keep that file under its cap.
+ * Compact, collapsible search bar shown above the strategist conversation.
+ * Attention and operational alerts intentionally stay out of the Chat surface.
  */
 export function ConversationUtilityBar({
   expanded,
@@ -13,16 +10,12 @@ export function ConversationUtilityBar({
   onCollapse,
   searchQuery,
   onSearchChange,
-  needsActionCount,
-  alertCount,
 }: {
   expanded: boolean;
   onExpand: () => void;
   onCollapse: () => void;
   searchQuery: string;
   onSearchChange: (value: string) => void;
-  needsActionCount: number;
-  alertCount: number;
 }) {
   return (
     <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4">
@@ -48,35 +41,14 @@ export function ConversationUtilityBar({
               <Search className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
               <span className="hidden sm:inline">Search</span>
             </button>
-            {needsActionCount > 0 && (
-              <button
-                type="button"
-                onClick={onExpand}
-                title="Show items that need your action"
-                className="inline-flex min-h-[44px] md:min-h-9 shrink-0 items-center gap-1.5 rounded-md border border-amber-800/60 bg-amber-950/25 px-2 text-xs font-medium text-amber-200/90 transition-colors hover:bg-amber-900/35"
-              >
-                <span aria-hidden="true">⚠</span>
-                <span className="truncate">{needsActionCount} need{needsActionCount === 1 ? 's' : ''} your action</span>
-              </button>
-            )}
-            {alertCount > 0 && (
-              <button
-                type="button"
-                onClick={onExpand}
-                title="Show alerts"
-                className="inline-flex min-h-[44px] md:min-h-9 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2 text-xs font-medium text-neutral-300 transition-colors hover:border-neutral-700 hover:text-neutral-100"
-              >
-                {alertCount} alert{alertCount === 1 ? '' : 's'}
-              </button>
-            )}
           </>
         )}
         {expanded && (
           <button
             type="button"
             onClick={onCollapse}
-            title="Hide search, alerts and actions"
-            aria-label="Hide search, alerts and actions"
+            title="Hide search"
+            aria-label="Hide search"
             className="inline-flex min-h-[44px] md:min-h-9 shrink-0 items-center gap-1 rounded-md border border-neutral-800 bg-neutral-950/70 px-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200"
           >
             <ChevronUp className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />

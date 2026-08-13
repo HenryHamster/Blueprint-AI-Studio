@@ -392,6 +392,29 @@ def test_message_event_carries_canonical_projection_for_gap_reconciliation():
     assert payload["message"]["context"]["source_refs"][0]["revision"] == 2
 
 
+def test_message_event_preserves_bounded_audience_for_realtime_admission():
+    msg = _message(
+        surface=MessageSurface.CONVERSATION,
+        from_type="strategic",
+        context={
+            "event_type": "resident_internal_bookkeeping",
+            "audience": "strategist-internal",
+            "private_detail": "not transported",
+        },
+    )
+
+    preview = message_preview_dict(msg)
+    payload = message_event_payload(msg)
+
+    assert preview["context"]["audience"] == "strategist-internal"
+    assert payload["message"]["context"]["audience"] == "strategist-internal"
+    assert "private_detail" not in payload["message"]["context"]
+    assert (
+        len(json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8"))
+        <= MESSAGE_EVENT_MAX_BYTES
+    )
+
+
 def test_message_event_enforces_hard_serialized_budget():
     oversized_items = [
         {

@@ -29,6 +29,7 @@ from app.routers.agent_strategic_fetch import (
 )
 from app.strategic_conversation_query import (
     _HasVerifiedCoveredInput,
+    query_strategic_conversation,
     strategic_conversation_predicate,
 )
 
@@ -204,6 +205,44 @@ def test_covered_message_proof_executes_against_sqlite_guid_storage():
             {"reply_id": reply_id.hex},
         ).scalar_one_or_none()
     assert visible == reply_id.hex
+
+
+@pytest.mark.asyncio
+async def test_conversation_query_excludes_legacy_mode_knob_cut_rows(db_session):
+    project = Project(
+        name="CUT recommendation history filter",
+        user_id="conversation-query-user",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    cut_row = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="Mode-knob recommendation from an older deployment",
+        context={
+            "event_type": "mode_knob_cut_recommended",
+            "audience": "operator-fyi",
+        },
+    )
+    operator_row = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="Keep this actual conversation row",
+        context={},
+    )
+    db_session.add_all([cut_row, operator_row])
+    await db_session.commit()
+
+    page = await query_strategic_conversation(db_session, project.id, limit=20)
+
+    assert [row.id for row in page.rows] == [operator_row.id]
 
 
 @pytest.mark.asyncio

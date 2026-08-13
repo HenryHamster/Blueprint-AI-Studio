@@ -1,8 +1,5 @@
-import { memo, useMemo, useState, type ReactNode } from 'react';
+import { memo, useMemo, type ReactNode } from 'react';
 import { Activity, ArrowUpRight, CircleAlert, Cpu, CreditCard, GitBranch, Network, Radio, X } from 'lucide-react';
-import { acceptPendingConfirmation, dismissPendingConfirmation } from '../api';
-import type { PendingConfirmation, PendingConfirmationType } from '../types';
-import { PendingConfirmationList } from './ProblemModelAttention';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import {
   strategicCycleIsWorking,
@@ -37,6 +34,7 @@ import { WorkbenchPanel } from './WorkbenchLayout';
 import { RailMiniCanvas } from './RailMiniCanvas';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
 import { WhiteboardRailSection } from './WhiteboardRailSection';
+import { PendingConfirmationsSection } from './PendingConfirmationsSection';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
 type TaskFocusBucketKey = 'needs_judgment' | 'active' | 'friction' | 'queued' | 'recent_completed';
@@ -78,6 +76,8 @@ interface StrategicContextRailProps {
   projectId?: string | null;
   /** Whether the caller may mutate project-scoped tools. Unknown fails closed. */
   canOperateProject?: boolean;
+  /** Hide operator-attention prompts when the rail is embedded in calm Chat. */
+  showAttention?: boolean;
 }
 
 function formatCost(value: number | undefined): string {
@@ -472,96 +472,6 @@ function AttentionItem({
   );
 }
 
-const _PENDING_CONFIRMATION_TYPES: readonly PendingConfirmationType[] = [
-  'credentials_needed',
-  'access_needed',
-  'intent_change',
-  'major_decision',
-];
-
-/** Map a durable ``kind: 'confirmation'`` attention item onto the
- *  ``PendingConfirmation`` shape consumed by the shared PendingItemRow UI. */
-function attentionItemToPendingConfirmation(item: StrategicStateAttentionItem): PendingConfirmation {
-  const rawType = item.confirmation_type ?? '';
-  const type = (_PENDING_CONFIRMATION_TYPES as readonly string[]).includes(rawType)
-    ? (rawType as PendingConfirmationType)
-    : 'major_decision';
-  return {
-    id: item.ref?.id ?? item.id,
-    type,
-    proposal: item.detail ?? item.label,
-    created_at: item.created_at ?? undefined,
-  };
-}
-
-/** Fully-reachable, inline-actionable list of pending operator confirmations on
- *  the daily surface. Reuses the shared accept/dismiss row and the existing
- *  accept/dismiss API so this is the single place the operator acts on these
- *  items (the problem-model view now renders them read-only). */
-function RailPendingConfirmations({
-  items,
-  onResolved,
-  addToast,
-}: {
-  items: StrategicStateAttentionItem[];
-  onResolved?: () => void;
-  addToast?: (message: string, type: 'success' | 'error' | 'info') => void;
-}) {
-  const [resolvedIds, setResolvedIds] = useState<Set<string>>(() => new Set());
-  const projectByPendingId = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const item of items) {
-      const pendingId = item.ref?.id ?? item.id;
-      const projectId = item.ref?.project_id;
-      if (pendingId && projectId) map.set(pendingId, projectId);
-    }
-    return map;
-  }, [items]);
-  const pending = useMemo(
-    () =>
-      items
-        .filter(item => !resolvedIds.has(item.ref?.id ?? item.id))
-        .map(attentionItemToPendingConfirmation),
-    [items, resolvedIds],
-  );
-
-  if (pending.length === 0) return null;
-
-  const handleDismiss = async (id: string, note?: string) => {
-    const projectId = projectByPendingId.get(id);
-    if (!projectId) return;
-    try {
-      await dismissPendingConfirmation(projectId, id, note);
-      setResolvedIds(prev => new Set(prev).add(id));
-      onResolved?.();
-    } catch {
-      addToast?.('Failed to resolve — try again', 'error');
-    }
-  };
-
-  const handleAccept = async (id: string, answer?: string) => {
-    const projectId = projectByPendingId.get(id);
-    if (!projectId) return;
-    try {
-      await acceptPendingConfirmation(projectId, id, answer);
-      setResolvedIds(prev => new Set(prev).add(id));
-      onResolved?.();
-    } catch {
-      addToast?.('Failed to accept — try again', 'error');
-    }
-  };
-
-  return (
-    <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="rail-needs-action">
-      <div className="mb-1.5 flex min-w-0 items-center justify-between gap-2">
-        <span className="truncate text-xs font-semibold text-amber-200">Needs your action</span>
-        <span className="shrink-0 font-mono text-ui-sm text-neutral-600">{formatCompactNumber(pending.length)}</span>
-      </div>
-      <PendingConfirmationList pending={pending} onDismiss={handleDismiss} onAccept={handleAccept} />
-    </div>
-  );
-}
-
 function workSessionActionPriorityText(priority?: string | null): string {
   if (priority === 'critical') return 'text-rose-300';
   if (priority === 'high') return 'text-amber-300';
@@ -897,6 +807,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   addToast,
   projectId = null,
   canOperateProject = false,
+  showAttention = true,
 }: StrategicContextRailProps) {
   const activeCycle = state?.strategic.active_cycle ?? null;
   const localRunner = state?.runtime?.local_runner ?? null;
@@ -1223,13 +1134,17 @@ export const StrategicContextRail = memo(function StrategicContextRail({
           </div>
         )}
         {confirmationItems.length > 0 && (
-          <RailPendingConfirmations
+          <PendingConfirmationsSection
             items={confirmationItems}
+            projectId={projectId}
+            canOperateProject={canOperateProject}
             onResolved={onConfirmationResolved}
             addToast={addToast}
+            className="mt-3 border-t border-neutral-800 pt-3"
+            testId="rail-pending-confirmations"
           />
         )}
-        {attention && attention.level !== 'clear' && (
+        {showAttention && attention && attention.level !== 'clear' && (
           <div className="mt-3 border-t border-neutral-800 pt-3">
             <div className="flex min-w-0 gap-2">
               <CircleAlert
@@ -1256,7 +1171,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
             )}
           </div>
         )}
-        {visibleWorkSessionActions.length > 0 && (
+        {showAttention && visibleWorkSessionActions.length > 0 && (
           <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="strategic-next-actions">
             <div className="mb-1 flex min-w-0 items-center justify-between gap-2">
               <span className="truncate text-xs font-semibold text-neutral-100">Next actions</span>
@@ -1275,7 +1190,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
             </div>
           </div>
         )}
-        {showActionableSessionActivity && (
+        {showAttention && showActionableSessionActivity && (
           <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="strategic-session-activity">
             <div className="mb-1 flex min-w-0 items-center justify-between gap-2">
               <span className="truncate text-xs font-semibold text-neutral-100">Recent signal</span>

@@ -4,6 +4,7 @@ import path from 'node:path';
 import {
   resolveCompletionToastKind,
   resolveCompletionToastMessage,
+  shouldSuppressCompletionToast,
 } from './utils/completionToastKind';
 
 const appSource = readFileSync(path.join(process.cwd(), 'src', 'App.tsx'), 'utf8');
@@ -59,5 +60,24 @@ describe('App completion toast', () => {
     expect(appSource).toContain('cycleCompletion.failure_reason');
     // Failure/cancellation toasts persist until dismissed; success stays transient
     expect(appSource).toContain("addToast(message, toastKind, toastKind !== 'success')");
+  });
+
+  test('intentional resident operator stop stays durable but does not toast', () => {
+    expect(shouldSuppressCompletionToast(
+      'CANCELLED',
+      'terminal_task_reconciliation source=resident_operator_stop',
+    )).toBe(true);
+    expect(shouldSuppressCompletionToast(
+      'cancelled',
+      undefined,
+      '{"source":"resident_operator_stop","reason":"operator stop"}',
+    )).toBe(true);
+    expect(appSource).toContain('shouldSuppressCompletionToast(');
+  });
+
+  test('unexpected cancellations and every failure still toast', () => {
+    expect(shouldSuppressCompletionToast('CANCELLED', 'Runner disappeared')).toBe(false);
+    expect(shouldSuppressCompletionToast('FAILED', 'source=resident_operator_stop')).toBe(false);
+    expect(shouldSuppressCompletionToast('FAILED', 'Execution site unavailable')).toBe(false);
   });
 });

@@ -4095,7 +4095,11 @@ async def _reconcile_resident_terminal_task(
     )
     if reconciled is None:
         return None
-    return strategic_cycle.terminal_completion_event(reconciled, task)
+    return strategic_cycle.terminal_completion_event(
+        reconciled,
+        task,
+        source=source,
+    )
 
 
 async def stop_resident_session(

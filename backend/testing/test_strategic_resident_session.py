@@ -192,12 +192,21 @@ async def _link_phase2_cycle(db_session, project: Project, task: Task) -> Strate
     return cycle
 
 
-def _assert_resident_terminal_receipt(emit, cycle: StrategicCycle, source: str):
+def _assert_resident_terminal_receipt(
+    emit,
+    cycle: StrategicCycle,
+    source: str,
+    *,
+    expect_completion: bool = True,
+):
     emit.assert_awaited_once()
     event = emit.await_args.args[0][0]
     assert event["cycle_id"] == cycle.id
     assert event["phase"] == 2
     assert event["phase_state"] == "failed_phase2"
+    if not expect_completion:
+        assert "completion" not in event
+        return event
     assert event["completion"]["status"] == "CANCELLED"
     assert f"source={source}" in event["completion"]["failure_reason"]
     return event
@@ -1928,7 +1937,12 @@ async def test_stop_ends_task_releases_continuation_and_hands_off_messages(
     refreshed_cycle = await db_session.get(StrategicCycle, cycle.id)
     await db_session.refresh(refreshed_cycle)
     assert refreshed_cycle.outcome == "failed_phase2"
-    _assert_resident_terminal_receipt(emit, cycle, "resident_operator_stop")
+    _assert_resident_terminal_receipt(
+        emit,
+        cycle,
+        "resident_operator_stop",
+        expect_completion=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -1967,7 +1981,10 @@ async def test_stop_with_strategic_api_marker_preserves_cancelled_cycle_disposit
     await db_session.refresh(refreshed_cycle)
     assert refreshed_cycle.outcome == "failed_phase2"
     _assert_resident_terminal_receipt(
-        terminal_emit, cycle, "resident_operator_stop"
+        terminal_emit,
+        cycle,
+        "resident_operator_stop",
+        expect_completion=False,
     )
     completion_emit.assert_not_awaited()
 

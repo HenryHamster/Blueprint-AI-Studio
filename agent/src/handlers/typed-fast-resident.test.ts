@@ -118,4 +118,53 @@ describe('typed Fast local receipt fence', () => {
       [completion, { ...completion, content: 'Two.' }], [],
     )).toThrow(/multiple public completions/);
   });
+
+  it('rejects direct execution and couples delegation promises to a Workday request', () => {
+    const receipt = { claim_id: 'c', message_ids: ['m'], idempotency_key: 'k' };
+    const directClaims = [
+      "I'll remove the knob entries and delete the branches.",
+      'I will edit the configuration now.',
+      'Let me deploy the service change.',
+      "I'll fast-forward main now.",
+    ];
+    for (const content of directClaims) {
+      const completion = _typedFastInternals.parseCompletion({ receipt, content });
+      expect(() => _typedFastInternals.validateStagedTypedIntents(
+        [completion], [],
+      )).toThrow(/delegate through Workday task tooling/);
+    }
+
+    for (const content of [
+      'We can change the mode after checking the tradeoff.',
+      'A Blueprint task could make the change if you want.',
+      "I'll create a task list explaining the deployment options.",
+    ]) {
+      const proposal = _typedFastInternals.parseCompletion({ receipt, content });
+      expect(_typedFastInternals.validateStagedTypedIntents([proposal], [])).toMatchObject({
+        completion: proposal,
+        workdayRequests: [],
+      });
+    }
+
+    const request = _typedFastInternals.parseWorkdayRequest({
+      receipt,
+      delivery_key: 'managed-state-change',
+      prompt: 'Use supported Blueprint task tooling to make the requested change.',
+    });
+    for (const content of [
+      "I'll route a Blueprint task to change it and report the durable outcome.",
+      "I'll create a Blueprint task to change the configuration.",
+      "I'll create a task to deploy the service.",
+      "I'll hand this off to Workday to update the repository.",
+    ]) {
+      const delegated = _typedFastInternals.parseCompletion({ receipt, content });
+      expect(() => _typedFastInternals.validateStagedTypedIntents(
+        [delegated], [],
+      )).toThrow(/without staging a Workday request/);
+      expect(_typedFastInternals.validateStagedTypedIntents([delegated], [request])).toMatchObject({
+        completion: delegated,
+        workdayRequests: [request],
+      });
+    }
+  });
 });
