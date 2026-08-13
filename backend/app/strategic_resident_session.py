@@ -62,6 +62,7 @@ from app.voice_credentials import (
 from app.models import (
     ArtifactType,
     Direction,
+    MessageHandlingState,
     MessageSurface,
     MessageType,
     Project,
@@ -72,11 +73,18 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.resident_conversation_scope import (
+    RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY,
+    RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY,
+    resident_broad_message_scope,
+    resident_conversation_floor_sequence,
+)
 from app.schemas import AgentStatusPayload
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
 from app.strategic_payload_summaries import (
     _fetch_open_messages,
+    _fetch_open_operator_cursor_floor,
     _fetch_recent_handled_conversation,
 )
 from app.shared_state import limiter, runtime_config
@@ -170,6 +178,10 @@ _RESIDENT_ACTIVATION_PROMPT = (
     "otherwise ask what they want to work through. Do not describe startup "
     "mechanics, claim completed work, or use a canned greeting."
 )
+
+
+class _ResidentActivationSuppressed(Exception):
+    """Internal transaction signal: real current-session input already exists."""
 
 # Runtime-config: max wall-clock a resident session may run WITHOUT any operator
 # interaction before the heartbeat stops renewing the lease (so the legacy
@@ -1974,7 +1986,10 @@ async def clear_resident_worker_retry_wait(
     return changed
 
 
-def _session_scope_conditions(resident_session_id: str | None) -> list:
+def _session_scope_conditions(
+    resident_session_id: str | None,
+    conversation_floor_sequence: int | None = None,
+) -> list:
     """WHERE fragments scoping operator messages to a resident session.
 
     When ``resident_session_id`` is provided, only messages stamped for THAT
@@ -1988,9 +2003,9 @@ def _session_scope_conditions(resident_session_id: str | None) -> list:
     if resident_session_id is None:
         return []
     return [
-        or_(
-            ProjectMessage.resident_session_id == resident_session_id,
-            ProjectMessage.resident_session_id.is_(None),
+        resident_broad_message_scope(
+            resident_session_id,
+            conversation_floor_sequence=conversation_floor_sequence,
         )
     ]
 
@@ -2000,6 +2015,7 @@ async def _latest_operator_interaction_at(
     project_id: uuid.UUID,
     *,
     resident_session_id: str | None = None,
+    conversation_floor_sequence: int | None = None,
 ) -> datetime | None:
     """Return the newest operator-authored message time for the project (or None).
 
@@ -2014,7 +2030,10 @@ async def _latest_operator_interaction_at(
             select(func.max(ProjectMessage.created_at)).where(
                 ProjectMessage.project_id == project_id,
                 ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
-                *_session_scope_conditions(resident_session_id),
+                *_session_scope_conditions(
+                    resident_session_id,
+                    conversation_floor_sequence,
+                ),
             )
         )
     ).scalar_one_or_none()
@@ -2075,6 +2094,7 @@ async def _compute_resident_work_state(
     project_id: uuid.UUID,
     *,
     resident_session_id: str | None = None,
+    conversation_floor_sequence: int | None = None,
     resident_task_id: uuid.UUID | None = None,
 ) -> tuple[str | None, dict[str, int]]:
     """READ-ONLY snapshot of strategist-relevant world state for the heartbeat.
@@ -2207,7 +2227,10 @@ async def _compute_resident_work_state(
             select(func.max(ProjectMessage.created_at)).where(
                 ProjectMessage.project_id == project_id,
                 ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
-                *_session_scope_conditions(resident_session_id),
+                *_session_scope_conditions(
+                    resident_session_id,
+                    conversation_floor_sequence,
+                ),
             )
         )
     ).scalar_one_or_none()
@@ -2306,7 +2329,10 @@ async def _compute_resident_work_state(
                 ProjectMessage.project_id == project_id,
                 ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
                 ProjectMessage.status == "open",
-                *_session_scope_conditions(resident_session_id),
+                *_session_scope_conditions(
+                    resident_session_id,
+                    conversation_floor_sequence,
+                ),
             )
         )
     ).scalar() or 0
@@ -2330,9 +2356,10 @@ async def _release_start_claim(
     spawned_task_id: uuid.UUID | None,
     *,
     worker_generation: int,
+    failure_reason: str | None = None,
     session_factory=None,
 ) -> None:
-    """Compensate a failed start: drop our claim + cancel any task we spawned.
+    """Compensate a failed start: end our claim and cancel its exact task.
 
     Runs on a DEDICATED, fresh ``AsyncSession``/connection — NEVER the caller's
     session, which the original in-``try`` failure may have poisoned (a Cloud SQL
@@ -2358,6 +2385,10 @@ async def _release_start_claim(
     try:
         async with factory() as session:
             completion_events = []
+            released_claim: dict[str, Any] = {
+                "owned": False,
+                "task_id": None,
+            }
 
             def _clear(vision: dict[str, Any]) -> None:
                 current = read_resident_session(vision)
@@ -2366,14 +2397,60 @@ async def _release_start_claim(
                     and str(current.get("session_id")) == str(session_id)
                     and int(current.get("worker_generation") or 1) == worker_generation
                 ):
-                    vision.pop(RESIDENT_SESSION_KEY, None)
+                    released_claim["owned"] = True
+                    released_claim["task_id"] = current.get("task_id")
+                    ended_at = _utcnow().isoformat()
+                    ended = dict(current)
+                    ended.update(
+                        {
+                            "status": STATUS_ENDED,
+                            "stop_requested": False,
+                            "worker_state": "restart_failed",
+                            "ended_at": ended_at,
+                            "updated_at": ended_at,
+                        }
+                    )
+                    vision[RESIDENT_SESSION_KEY] = ended
+                    vision[RESIDENT_SESSION_REASON_KEY] = {
+                        "reason": (
+                            f"{RESIDENT_SESSION_REASON_START_FAILED_PREFIX}: "
+                            f"{failure_reason or 'resident start compensation'}"
+                        )[:200],
+                        "recorded_at": ended_at,
+                    }
 
             await with_vision_locked(session, project_id, _clear, skip_locked=False)
-            if spawned_task_id is not None:
+            if released_claim["owned"]:
+                # The provisional session may already own input rebound from its
+                # predecessor. Release those rows and stamp its exact identity
+                # before removing the failed authority, so the next start can
+                # carry them without reopening arbitrary NULL-session backlog.
+                from app.session_message_handoff import _apply_handoff_mutations
+
+                await _apply_handoff_mutations(session, project_id, session_id)
+            compensation_task_id = spawned_task_id
+            if compensation_task_id is None and released_claim["task_id"]:
+                # An adopted task is not assigned to ``spawned_task_id``. If its
+                # finalize commit had an unknown outcome, the identity-guarded
+                # session blob is the durable authority that names the exact
+                # task this failed generation stamped. Recover it while the
+                # Project lock remains held, then take Task second below.
+                try:
+                    compensation_task_id = uuid.UUID(
+                        str(released_claim["task_id"])
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    logger.warning(
+                        "[RESIDENT_SESSION] failed start session %s recorded "
+                        "invalid task id %r",
+                        session_id,
+                        released_claim["task_id"],
+                    )
+            if compensation_task_id is not None:
                 # The project lock remains held. Acquire the task second and
-                # cancel only the task born from THIS failed generation.
+                # cancel only the task stamped by THIS failed generation.
                 async with task_lock(
-                    session, spawned_task_id, skip_locked=False
+                    session, compensation_task_id, skip_locked=False
                 ) as task:
                     context = (task.context or {}) if task is not None else {}
                     if (
@@ -2597,6 +2674,7 @@ async def _spawn_resident_strategic_task(
     operator_user_id: str,
     session_id: str,
     worker_generation: int = 1,
+    conversation_floor_sequence: int | None = None,
     exam_ledger: str | None = None,
     message_cursor: str | None = None,
     session_summary: str | None = None,
@@ -2651,6 +2729,7 @@ async def _spawn_resident_strategic_task(
             runner_id,
             exam_ledger=exam_ledger,
             message_cursor=message_cursor,
+            conversation_floor_sequence=conversation_floor_sequence,
             worker_generation=worker_generation,
             session_summary=session_summary,
             decisions_register=decisions_register,
@@ -2865,6 +2944,7 @@ def _resident_born_context(
     runner_id: str | None,
     *,
     worker_generation: int = 1,
+    conversation_floor_sequence: int | None = None,
     exam_ledger: str | None = None,
     message_cursor: str | None = None,
     session_summary: str | None = None,
@@ -2892,6 +2972,10 @@ def _resident_born_context(
         "_resident_worker_generation": worker_generation,
         "provider_preference": list(_RESIDENT_PROVIDER_PREFERENCE),
     }
+    if conversation_floor_sequence is not None:
+        context[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY] = (
+            conversation_floor_sequence
+        )
     if runner_id:
         context["preferred_runner_target_id"] = str(runner_id)
         # Hard local-runner intent so dispatch pins the warm session to the
@@ -2934,6 +3018,9 @@ def _stamp_resident_context(
     session_id: str,
     runner_id: str | None,
     worker_generation: int = 1,
+    conversation_floor_sequence: int | None = None,
+    open_messages: list[dict[str, Any]] | None = None,
+    open_message_cursor_floor: str | None = None,
     exam_ledger: str | None = None,
     message_cursor: str | None = None,
     session_summary: str | None = None,
@@ -2976,12 +3063,25 @@ def _stamp_resident_context(
     if payloads:
         first_payload = dict(task.first_payload or {})
         first_payload.update(_resident_typed_fast_payload())
+        if open_messages is not None:
+            first_payload["open_messages"] = open_messages
+            first_payload["open_message_count"] = len(open_messages)
+        if open_message_cursor_floor:
+            first_payload[RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY] = (
+                open_message_cursor_floor
+            )
         task.payloads = [first_payload, *payloads[1:]]
         flag_modified(task, "payloads")
     context["_resident_session"] = True
     context["strategic_session_id"] = session_id
     context["_resident_worker_generation"] = worker_generation
     context["provider_preference"] = list(_RESIDENT_PROVIDER_PREFERENCE)
+    if conversation_floor_sequence is not None:
+        context[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY] = (
+            conversation_floor_sequence
+        )
+    if open_message_cursor_floor:
+        context[RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY] = open_message_cursor_floor
     # Carry the persisted exam ledger forward (adopt-path twin of the born-context
     # seed) so an adopted cadence task continues the examination rotation across a
     # restart. Absent leaves the merged context unchanged.
@@ -3167,6 +3267,207 @@ async def _repair_stale_message_handoffs_after_ensure(
         )
 
 
+async def _next_resident_conversation_floor_sequence(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> int:
+    """Return the first transcript sequence created after a new session claim."""
+
+    latest = await session.scalar(
+        select(func.max(ProjectMessage.sequence)).where(
+            ProjectMessage.project_id == project_id
+        )
+    )
+    return int(latest or 0) + 1
+
+
+async def _rebind_predecessor_conversation_handoff(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    predecessor: dict[str, Any] | None,
+    resident_session_id: str,
+) -> int:
+    """Bind only intentionally carried predecessor work to a new session.
+
+    Current code stamps an exact predecessor-session marker while releasing an
+    unanswered row. The second predicate is a rollout bridge for rows already
+    released by the previous revision: canonical open conversation rows created
+    during the immediate predecessor's lifetime belong to that just-ended chat.
+    Older project-wide NULL backlog predates the predecessor start and remains
+    below the new session floor. Private Workday packet/result rows use only the
+    exact handoff marker (never the rollout time bridge), because their server
+    provenance is session-bound and must not be inferred from timestamps.
+    """
+
+    if not isinstance(predecessor, dict):
+        return 0
+    predecessor_session_id = str(predecessor.get("session_id") or "").strip()
+    if not predecessor_session_id:
+        return 0
+
+    from app.session_message_handoff import (
+        RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
+        _apply_handoff_mutations,
+    )
+    from app.conversation_coordinator import (
+        reset_conversation_claim_for_session_handoff,
+    )
+
+    # Repair any still-stamped rows first. This classifies already-answered rows
+    # through the canonical handoff evidence check and stamps unanswered rows with
+    # the durable marker used below, all inside the caller's Project lock.
+    await _apply_handoff_mutations(
+        session,
+        project_id,
+        predecessor_session_id,
+    )
+    # Test and production session factories may disable autoflush. The exact
+    # rebind queries below intentionally target the just-released NULL-session
+    # rows, so make that staged handoff state visible inside this transaction.
+    await session.flush()
+
+    predecessor_started_at = _parse_iso_naive(predecessor.get("started_at"))
+    explicit_handoff = (
+        ProjectMessage.context[
+            RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY
+        ].as_string()
+        == predecessor_session_id
+    )
+    rollout_bridge: object
+    if predecessor_started_at is not None:
+        rollout_bridge = ProjectMessage.created_at >= predecessor_started_at
+    else:
+        # An unparseable predecessor lifetime cannot safely distinguish a
+        # pre-boundary conversation row from old project backlog.
+        rollout_bridge = and_(False)
+
+    rows = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.from_type == "user",
+                    ProjectMessage.surface == MessageSurface.CONVERSATION,
+                    ProjectMessage.status == "open",
+                    ProjectMessage.resident_session_id.is_(None),
+                    or_(explicit_handoff, rollout_bridge),
+                )
+                .order_by(
+                    ProjectMessage.sequence.asc().nulls_last(),
+                    ProjectMessage.created_at.asc(),
+                    ProjectMessage.id.asc(),
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    rebound = 0
+    now = _utcnow()
+    for row in rows:
+        if dict(row.context or {}).get(RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY) is True:
+            # A startup prompt is synthetic session-local input, not operator
+            # intent. It must never cross a replacement boundary: otherwise
+            # the replacement also creates its own activation and Fast sees two
+            # startup turns in one claim. Retire the predecessor prompt while
+            # preserving it as hidden audit history.
+            row.status = "resolved"
+            row.handling_state = MessageHandlingState.RESPONDED
+            row.resolution = row.resolution or "session_handoff_activation_retired"
+            row.resolved_at = row.resolved_at or now
+            reset_conversation_claim_for_session_handoff(row)
+            row.updated_at = now
+            session.add(row)
+            continue
+        if (
+            row.handling_state == MessageHandlingState.RESPONDED
+            or row.resolution
+        ):
+            continue
+        row.resident_session_id = resident_session_id
+        row.handling_state = MessageHandlingState.PENDING
+        row.handled_by_task_id = None
+        reset_conversation_claim_for_session_handoff(row)
+        row.updated_at = now
+        session.add(row)
+        rebound += 1
+
+    coordination_rows = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.from_type == "system",
+                    ProjectMessage.surface == MessageSurface.CONVERSATION,
+                    ProjectMessage.status == "open",
+                    ProjectMessage.resident_session_id.is_(None),
+                )
+                .order_by(
+                    ProjectMessage.sequence.asc().nulls_last(),
+                    ProjectMessage.created_at.asc(),
+                    ProjectMessage.id.asc(),
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    packet_claim_keys = (
+        "_workday_consultation_claim_id",
+        "_workday_consultation_claim_generation",
+        "_workday_consultation_claim_incarnation",
+        "_workday_consultation_claim_expires_at",
+        "_workday_consultation_claim_attempt",
+    )
+    continuation_claim_keys = (
+        "_workday_continuation_claim_id",
+        "_workday_continuation_claim_generation",
+        "_workday_continuation_claim_incarnation",
+        "_workday_continuation_claim_expires_at",
+        "_workday_continuation_claim_attempt",
+    )
+    for row in coordination_rows:
+        context = dict(row.context or {})
+        if (
+            context.get(RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY)
+            != predecessor_session_id
+        ):
+            continue
+        is_packet = bool(
+            context.get("_conversation_consultation_packet") is True
+            and context.get("audience") == "strategist-internal"
+            and context.get("message_role") == "workday_consultation"
+            and context.get("public_reply_owner") == "fast"
+            and isinstance(
+                context.get("_workday_consultation_atomic_reply_id"), str
+            )
+            and context.get("_workday_consultation_atomic_reply_id")
+        )
+        is_result = bool(
+            context.get("_workday_consultation_result") is True
+            and context.get("audience") == "strategist-internal"
+            and context.get("message_role") == "workday_consultation_result"
+            and context.get("public_reply_owner") == "fast"
+        )
+        if not is_packet and not is_result:
+            continue
+        for key in packet_claim_keys if is_packet else continuation_claim_keys:
+            context.pop(key, None)
+        row.context = context
+        row.resident_session_id = resident_session_id
+        row.handling_state = MessageHandlingState.PENDING
+        row.handled_by_task_id = None
+        row.updated_at = now
+        session.add(row)
+        rebound += 1
+    return rebound
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
@@ -3245,6 +3546,7 @@ async def start_resident_session(
     # the predecessor *attempt*.  It is populated only after that exact task is
     # re-read under the recovery lock, never from an arbitrary old session blob.
     carried_blacklisted_accounts: list[str] = []
+    conversation_floor_sequence: int | None = None
     if isinstance(existing, dict):
         _raw_ledger = existing.get("_exam_ledger")
         if (
@@ -3491,6 +3793,23 @@ async def start_resident_session(
         else:
             session_id = decision.get("session_id") or new_session_id()
             worker_generation = int(decision.get("worker_generation") or 1)
+            continuing_logical_session = bool(
+                isinstance(fresh, dict)
+                and str(fresh.get("session_id") or "") == session_id
+            )
+            persisted_conversation_floor = (
+                resident_conversation_floor_sequence(fresh)
+                if continuing_logical_session
+                else None
+            )
+            conversation_floor_sequence = persisted_conversation_floor
+            if conversation_floor_sequence is None:
+                conversation_floor_sequence = (
+                    await _next_resident_conversation_floor_sequence(
+                        session,
+                        project.id,
+                    )
+                )
             if (
                 stale_locked_task is not None
                 and stale_locked_task.status in _LIVE_TASK_STATUSES
@@ -3524,6 +3843,16 @@ async def start_resident_session(
                         session.add(orphan_task)
                         superseded_task_ids.append(orphan_task.id)
 
+            # Only after every live predecessor task has been terminalized under
+            # Project -> Task locks may we sever and narrow its durable Fast turn.
+            if not continuing_logical_session or persisted_conversation_floor is None:
+                await _rebind_predecessor_conversation_handoff(
+                    session,
+                    project.id,
+                    predecessor=fresh,
+                    resident_session_id=session_id,
+                )
+
             if (
                 adopt_task is not None
                 and stale_predecessor is not None
@@ -3552,6 +3881,9 @@ async def start_resident_session(
                 "ended_at": None,
                 "last_progress_at": None,
                 "last_operator_interaction_at": now_iso,
+                RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY: (
+                    conversation_floor_sequence
+                ),
                 "activity": {
                     "phase": "waiting",
                     "phase_started_at": now_iso,
@@ -3773,6 +4105,27 @@ async def start_resident_session(
                             session_id=session_id,
                             runner_id=effective_runner_id,
                             worker_generation=worker_generation,
+                            conversation_floor_sequence=(
+                                conversation_floor_sequence
+                            ),
+                            open_messages=await _fetch_open_messages(
+                                session,
+                                project.id,
+                                resident_session_id=session_id,
+                                conversation_floor_sequence=(
+                                    conversation_floor_sequence
+                                ),
+                            ),
+                            open_message_cursor_floor=(
+                                await _fetch_open_operator_cursor_floor(
+                                    session,
+                                    project.id,
+                                    resident_session_id=session_id,
+                                    conversation_floor_sequence=(
+                                        conversation_floor_sequence
+                                    ),
+                                )
+                            ),
                             exam_ledger=carried_exam_ledger,
                             message_cursor=carried_message_cursor,
                             session_summary=carried_session_summary,
@@ -3835,6 +4188,7 @@ async def start_resident_session(
                 operator_user_id=str(operator_user_id),
                 session_id=session_id,
                 worker_generation=worker_generation,
+                conversation_floor_sequence=conversation_floor_sequence,
                 exam_ledger=carried_exam_ledger,
                 message_cursor=carried_message_cursor,
                 session_summary=carried_session_summary,
@@ -3924,6 +4278,7 @@ async def start_resident_session(
             session_id,
             spawned_task_id,
             worker_generation=worker_generation,
+            failure_reason=_short_error(exc),
             session_factory=session_factory,
         )
         if isinstance(exc, _ResidentCycleInFlight):
@@ -4539,6 +4894,41 @@ async def _enqueue_resident_activation_turn(
         from app.project_message_creation import (  # noqa: PLC0415
             create_operator_project_message,
         )
+        from app.strategic_conversation_query import (  # noqa: PLC0415
+            strategic_conversation_predicate,
+        )
+
+        async def suppress_when_real_input_exists(
+            locked_session: AsyncSession,
+            _message_id: uuid.UUID,
+            message_context: dict[str, Any],
+        ) -> dict[str, Any]:
+            # create_operator_project_message invokes this after locking the
+            # Project row. Every operator-message creator takes that same lock,
+            # so checking and inserting the synthetic activation are atomic.
+            # A recovered predecessor turn is the actual reason the new
+            # session woke; Fast must claim it alone instead of co-batching a
+            # made-up startup request into the same public answer.
+            real_input_id = await locked_session.scalar(
+                select(ProjectMessage.id)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.resident_session_id == session_id,
+                    ProjectMessage.status == "open",
+                    ProjectMessage.from_type == "user",
+                    strategic_conversation_predicate(),
+                    func.coalesce(
+                        ProjectMessage.context[
+                            RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY
+                        ].as_boolean(),
+                        False,
+                    ).is_(False),
+                )
+                .limit(1)
+            )
+            if real_input_id is not None:
+                raise _ResidentActivationSuppressed
+            return message_context
 
         await create_operator_project_message(
             session,
@@ -4552,7 +4942,14 @@ async def _enqueue_resident_activation_turn(
             idempotency_key=f"resident-activation:{session_id}",
             surface=MessageSurface.CONVERSATION,
             include_strategic_session_snapshot=False,
+            precommit_validate=suppress_when_real_input_exists,
         )
+    except _ResidentActivationSuppressed:
+        # The precommit callback may run after harmless arming bookkeeping;
+        # roll the whole attempted synthetic message transaction back. The
+        # real current-session row remains durably bound and ready for Fast.
+        await session.rollback()
+        return
     except Exception:
         try:
             await session.rollback()
@@ -4855,6 +5252,7 @@ async def renew_resident_session_lease(
         session,
         project.id,
         resident_session_id=session_id,
+        conversation_floor_sequence=resident_conversation_floor_sequence(blob),
         resident_task_id=uuid.UUID(str(task_id)),
     )
     fired_watch_receipts: list[dict[str, Any]] = []
@@ -5323,6 +5721,11 @@ async def renew_resident_session_lease(
                 session,
                 project.id,
                 resident_session_id=session_id,
+                conversation_floor_sequence=(
+                    resident_conversation_floor_sequence(
+                        read_resident_session(locked_project.vision)
+                    )
+                ),
             )
             await with_vision_locked(
                 session,
@@ -5586,6 +5989,9 @@ async def renew_resident_session_lease(
             session,
             project.id,
             resident_session_id=session_id,
+            conversation_floor_sequence=resident_conversation_floor_sequence(
+                read_resident_session(project.vision)
+            ),
             resident_task_id=uuid.UUID(str(task_id)),
         )
         fired_barrier_receipts = await _resident_wake_barrier_receipts(
@@ -5783,7 +6189,21 @@ async def agent_fetch_checkpoint_state(
     (set-problem-model, set-memory, set-running-update).
     """
     project = await _resolve_agent_project(project_id, token, session)
-    open_messages = await _fetch_open_messages(session, project.id)
+    resident = read_resident_session(project.vision)
+    if not resident_session_is_active(resident):
+        raise HTTPException(status_code=409, detail="No active resident session for checkpoint")
+    token_task_id = str(token.get("sub") or "")
+    if not token_task_id or str(resident.get("task_id") or "") != token_task_id:
+        raise HTTPException(status_code=403, detail="Token is not the current resident task")
+    resident_session_id = str(resident.get("session_id") or "")
+    if not resident_session_id:
+        raise HTTPException(status_code=409, detail="Resident session identity is incomplete")
+    open_messages = await _fetch_open_messages(
+        session,
+        project.id,
+        resident_session_id=resident_session_id,
+        conversation_floor_sequence=resident_conversation_floor_sequence(resident),
+    )
     # Recently-answered operator conversation tail (status handled/resolved) so a
     # marker-less correction the operator just made survives the compaction
     # restart instead of vanishing with the open feed. Read-only, non-actionable.

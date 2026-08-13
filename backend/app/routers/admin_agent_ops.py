@@ -84,6 +84,7 @@ from app.message_audience import (
 from app.project_message_creation import (
     build_project_message,
     lock_project_and_next_message_sequence,
+    sanitize_untrusted_chat_context,
 )
 from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
@@ -3404,7 +3405,7 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail="Message context too large (max 50KB)"
             )
-        msg_ctx = dict(msg_ctx)
+        msg_ctx = sanitize_untrusted_chat_context(msg_ctx)
         # Idempotency guard: a network error can cause the caller to retry after
         # the server already committed. Accept an optional idempotency_key from
         # the agent and short-circuit if a matching row already exists.

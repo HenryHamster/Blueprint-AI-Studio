@@ -63,6 +63,8 @@ export interface MessagesPollResponse {
     artifacts_degraded?: boolean;
   }>;
   server_time?: string;
+  /** Authoritative MIN(created_at) across all in-scope open user rows. */
+  open_message_cursor_floor?: string | null;
   claim_required?: boolean;
 }
 
@@ -922,6 +924,62 @@ export const MAX_POLL_PAGES = 100;
  * the bootstrap prompt is insufficient in on-demand mode because Workday does
  * not run a turn until a message is admitted.
  */
+export function rewindCursorToOpenMessageFloor(
+  cursor: string,
+  rawFloor: unknown,
+): string {
+  const floor = str(rawFloor);
+  const cursorMs = Date.parse(cursor);
+  const floorMs = Date.parse(floor);
+  if (Number.isNaN(floorMs)) return cursor;
+  if (Number.isNaN(cursorMs) || floorMs < cursorMs) return floor;
+  return cursor;
+}
+
+export interface OpenMessageFloorTraversal {
+  cursor: string;
+  traversedFloor: string | null;
+  rewound: boolean;
+}
+
+/**
+ * Apply a live authoritative open-message floor without oscillating between
+ * that floor and the end of every full page. `traversedFloor` is local to one
+ * paginated poll traversal: once a request began at or before an advertised
+ * floor, later pages with that same (or a newer) floor are already covered.
+ * A newly advertised older floor still forces an immediate rewind.
+ */
+export function applyOpenMessageCursorFloor(
+  cursor: string,
+  rawFloor: unknown,
+  traversedFloor: string | null,
+): OpenMessageFloorTraversal {
+  const floor = str(rawFloor);
+  const floorMs = Date.parse(floor);
+  if (Number.isNaN(floorMs)) {
+    return { cursor, traversedFloor, rewound: false };
+  }
+
+  const traversedMs = traversedFloor === null
+    ? Number.NaN
+    : Date.parse(traversedFloor);
+  const alreadyTraversed = !Number.isNaN(traversedMs) && traversedMs <= floorMs;
+  const rewoundCursor = rewindCursorToOpenMessageFloor(cursor, floor);
+  if (rewoundCursor !== cursor && !alreadyTraversed) {
+    return { cursor: rewoundCursor, traversedFloor: floor, rewound: true };
+  }
+
+  // If this request started at/before the floor, it has traversed that floor
+  // even when no rewind was necessary (the bootstrap cursor commonly equals
+  // the floor exactly). Preserve the earliest floor covered in this traversal.
+  const cursorMs = Date.parse(cursor);
+  const requestCoveredFloor = !Number.isNaN(cursorMs) && cursorMs <= floorMs;
+  const nextTraversedFloor = requestCoveredFloor && !alreadyTraversed
+    ? floor
+    : traversedFloor;
+  return { cursor, traversedFloor: nextTraversedFloor, rewound: false };
+}
+
 export function initialCursor(
   task: Record<string, unknown>,
   payload: Record<string, unknown>,
@@ -936,6 +994,22 @@ export function initialCursor(
   let earliest = base;
   let earliestMs = Date.parse(base);
   if (Number.isNaN(earliestMs)) earliestMs = Infinity;
+  // The bounded open_messages bootstrap can omit an older ordinary row when a
+  // burst of higher-priority critical rows fills the pack. The backend ships an
+  // independent authoritative MIN(open operator created_at) in both task
+  // context and payload so mixed-version/recovery paths can still rewind far
+  // enough to retrieve that omitted row from the paginated poll endpoint.
+  const cursorFloors: unknown[] = [
+    str(ctx.open_message_cursor_floor),
+    str(payload.open_message_cursor_floor),
+  ];
+  for (const floor of cursorFloors) {
+    const rewound = rewindCursorToOpenMessageFloor(earliest, floor);
+    if (rewound !== earliest) {
+      earliest = rewound;
+      earliestMs = Date.parse(rewound);
+    }
+  }
   const openMessages = Array.isArray(payload.open_messages) ? payload.open_messages : [];
   for (const raw of openMessages) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;

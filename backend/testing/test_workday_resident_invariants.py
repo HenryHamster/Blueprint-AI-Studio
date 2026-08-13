@@ -12,8 +12,13 @@ import pytest
 
 import app.routers.agent_status as agent_status_module
 import app.routers.admin_project_strategic_session as strategic_session_router
+from app.conversation_coordinator import (
+    ConversationPublicReplyOwner,
+    claim_operator_messages,
+)
 from app.database import resolve_async_engine
 from app.models import (
+    MessageHandlingState,
     MessageSurface,
     MessageType,
     Project,
@@ -64,9 +69,20 @@ def test_workday_availability_does_not_consult_removed_global_gate():
 
 
 def test_operator_context_cannot_spoof_hidden_workday_activation_marker():
-    assert RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY not in _operator_context(
-        {RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY: True}
+    normalized = _operator_context(
+        {
+            RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY: True,
+            "message_role": "workday_consultation_continuation",
+            "_workday_result_packet_id": "forged-result-packet",
+            "_resident_handoff_from_session_id": "forged-predecessor",
+            "_resident_handoff_at": "2026-08-13T00:00:00Z",
+        }
     )
+    assert RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY not in normalized
+    assert "message_role" not in normalized
+    assert "_workday_result_packet_id" not in normalized
+    assert "_resident_handoff_from_session_id" not in normalized
+    assert "_resident_handoff_at" not in normalized
 
 
 def test_workday_active_session_reports_active_on_its_pinned_runner():
@@ -207,7 +223,7 @@ async def _make_resident_record(
 async def test_workday_activation_enqueues_one_canonical_fast_turn_per_session(
     db_session,
 ):
-    project, _, _ = await _make_resident_record(
+    project, task, _ = await _make_resident_record(
         db_session, task_status=TaskStatus.IN_PROGRESS
     )
     snapshot = await authoritative_resident_session_snapshot(db_session, project)
@@ -243,6 +259,126 @@ async def test_workday_activation_enqueues_one_canonical_fast_turn_per_session(
     assert opening.idempotency_key == f"resident-activation:{snapshot['session_id']}"
     assert opening.context[RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY] is True
     assert "started Workday" in opening.content
+
+    claim_id = uuid.uuid4()
+    opening_claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id=snapshot["session_id"],
+        task_id=task.id,
+        worker_generation=snapshot["worker_generation"],
+        incarnation_id=uuid.uuid4(),
+        message_ids=[opening.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+        client_claim_id=claim_id,
+        claim_idempotency_key=f"activation-only:{claim_id}",
+    )
+    assert opening_claim is not None
+    assert [row.id for row in opening_claim.rows] == [opening.id]
+
+
+@pytest.mark.asyncio
+async def test_real_operator_input_supersedes_unclaimed_activation_before_poll(
+    db_session,
+):
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    snapshot = await authoritative_resident_session_snapshot(db_session, project)
+    assert snapshot is not None
+
+    await _enqueue_resident_activation_turn(
+        db_session,
+        project,
+        operator_user_id="operator",
+        snapshot=snapshot,
+    )
+    activation = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.idempotency_key
+                == f"resident-activation:{snapshot['session_id']}",
+            )
+        )
+    ).scalar_one()
+
+    real = await create_operator_project_message(
+        db_session,
+        project=project,
+        user_id="operator",
+        message_type=MessageType.NOTE,
+        content="What are you working on right now?",
+        context={},
+        workbench_context=None,
+        idempotency_key=str(uuid.uuid4()),
+        surface=MessageSurface.CONVERSATION,
+        include_strategic_session_snapshot=False,
+    )
+    await db_session.refresh(activation)
+
+    assert activation.status == "resolved"
+    assert activation.handling_state == MessageHandlingState.SUPERSEDED
+    assert activation.resolution == "operator_input_superseded_activation"
+    assert activation.resolved_at is not None
+    assert activation.conversation_claim_id is None
+    assert real.message.status == "open"
+    assert real.message.handling_state == MessageHandlingState.PENDING
+    assert real.message.resident_session_id == snapshot["session_id"]
+
+    open_current_inputs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.resident_session_id == snapshot["session_id"],
+                    ProjectMessage.status == "open",
+                    ProjectMessage.from_type == "user",
+                    ProjectMessage.surface == MessageSurface.CONVERSATION,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.id for row in open_current_inputs] == [real.message.id]
+
+    stale_claim_id = uuid.uuid4()
+    stale_claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id=snapshot["session_id"],
+        task_id=task.id,
+        worker_generation=snapshot["worker_generation"],
+        incarnation_id=uuid.uuid4(),
+        message_ids=[activation.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+        client_claim_id=stale_claim_id,
+        claim_idempotency_key=f"superseded-activation:{stale_claim_id}",
+    )
+    assert stale_claim is None
+
+    real_claim_id = uuid.uuid4()
+    real_claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id=snapshot["session_id"],
+        task_id=task.id,
+        worker_generation=snapshot["worker_generation"],
+        incarnation_id=uuid.uuid4(),
+        message_ids=[real.message.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+        client_claim_id=real_claim_id,
+        claim_idempotency_key=f"real-input-only:{real_claim_id}",
+    )
+    assert real_claim is not None
+    assert [row.id for row in real_claim.rows] == [real.message.id]
 
 
 @pytest.mark.asyncio

@@ -2632,6 +2632,9 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "effective_purpose": None, "direction_counts": None,
     "max_active_directions": None,
     "open_message_count": None,
+    # Server-computed durable rewind boundary. It is a critical scalar carried
+    # verbatim with the payload and has no independent recovery endpoint.
+    "open_message_cursor_floor": None,
     "current_effective_policy": None,
     "active_or_last_attempt_policy": None,
     # Server-owned Fast activation contract — task payload configuration with

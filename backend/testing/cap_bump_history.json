@@ -3150,6 +3150,14 @@
           "old_cap": 1800,
           "new_cap": 2250
         }
+      ],
+      "project_message_creation.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-13T04:44:25.631925+00:00",
+          "old_cap": 950,
+          "new_cap": 1250
+        }
       ]
     },
     "agent": {
@@ -3405,8 +3413,8 @@
           "new_cap": 5350
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-12T23:50:39.472227+00:00",
+          "commit_sha": "84b563f1cdd342218611a87c551d2c97387b9a04",
+          "commit_date": "2026-08-12T17:45:11-07:00",
           "old_cap": 5350,
           "new_cap": 6200
         }
@@ -4333,6 +4341,12 @@
           "commit_date": "2026-08-08T22:21:52+00:00",
           "old_cap": 3550,
           "new_cap": 4500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-13T05:23:46.211369+00:00",
+          "old_cap": 4500,
+          "new_cap": 5500
         }
       ],
       "test_shard_balance.py": [
@@ -4377,6 +4391,12 @@
           "commit_date": "2026-08-07T20:58:05-07:00",
           "old_cap": 1950,
           "new_cap": 2250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-13T05:23:01.639418+00:00",
+          "old_cap": 2250,
+          "new_cap": 2950
         }
       ],
       "test_rollup_management.py": [

@@ -4,6 +4,13 @@
 
   "protect": [
     {
+      "path": "backend/testing/test_project_message_projection.py",
+      "reason": "Protects the bounded realtime/canonical preview fields that power the truthful non-interruptive Workday-consulted cue in Chat.",
+      "test_ids": [
+        "test_message_preview_preserves_bounded_workday_chat_provenance"
+      ]
+    },
+    {
       "path": "backend/testing/test_strategic_session_messages.py",
       "reason": "Covers the agent-side message-poll endpoint (GET /api/agent/projects/{id}/messages) — the inbound operator-to-agent channel for the conversational Workday session. Removing this leaves zero test coverage on the agent message delivery contract.",
       "test_ids": [
@@ -20,11 +27,17 @@
         "test_poll_since_is_inclusive_of_boundary",
         "test_poll_max_created_at_cursor_redelivers_boundary",
         "test_poll_session_id_scopes_to_session_plus_legacy_rows",
+        "test_resident_poll_applies_durable_session_floor_to_null_session_rows",
+        "test_resident_poll_floor_recovers_activity_released_after_start",
         "test_resident_poll_route_limit_supports_cadence_and_project_isolation",
         "test_resident_poll_uses_authenticated_session_scope",
         "test_resident_poll_returns_stale_fast_claim_group_atomically_across_page_cap",
         "test_resident_poll_leaves_expired_ordinary_claim_group_to_workday",
         "test_stale_fast_claim_group_degrades_artifacts_without_losing_membership",
+        "test_typed_fast_exact_completion_replay_rebroadcasts_canonical_message",
+        "test_workday_continuation_exact_replay_rebroadcasts_canonical_message",
+        "test_workday_claim_retires_stale_private_packet_and_delivers_next",
+        "test_fast_claim_retires_stale_private_result_and_delivers_next_continuation",
         "test_resident_final_fence_orders_equal_timestamps_deterministically",
         "test_resident_poll_rejects_query_identity_spoof",
         "test_stale_resident_poll_is_rejected_without_generation_query"
@@ -40,6 +53,7 @@
         "test_strategic_session_conversation_marks_more_history",
         "test_strategic_session_includes_requested_older_message_once",
         "test_strategic_session_conversation_filters_routine_before_limit",
+        "test_strategic_conversation_preserves_workday_ui_provenance",
         "test_strategic_session_conversation_resolves_message_selected_refs",
         "test_strategic_conversation_endpoint_returns_cursor_page",
         "test_strategic_conversation_cursor_is_sequence_stable_and_excludes_activity",
@@ -57,6 +71,13 @@
         "test_strategic_session_message_persists_workbench_snapshot_and_arms",
         "test_strategic_session_message_allows_attachment_only_content",
         "test_workbench_state_from_prefs_legacy_fallback_decays_stale_session_started_at"
+      ]
+    },
+    {
+      "path": "backend/testing/test_admin_routers__strategic_directions.py",
+      "reason": "Protects the generic Strategic create_message boundary from forging server-owned Chat hiding and Workday-consultation provenance fields.",
+      "test_ids": [
+        "test_strategic_create_message_strips_server_owned_chat_provenance"
       ]
     },
     {
@@ -195,6 +216,7 @@
       "test_ids": [
         "test_workday_availability_does_not_consult_removed_global_gate",
         "test_workday_activation_enqueues_one_canonical_fast_turn_per_session",
+        "test_real_operator_input_supersedes_unclaimed_activation_before_poll",
         "test_workday_activation_enqueue_failure_does_not_fail_started_session",
         "test_operator_context_cannot_spoof_hidden_workday_activation_marker",
         "test_workday_active_session_reports_active_on_its_pinned_runner",
@@ -259,7 +281,15 @@
         "test_resident_reaper_uses_own_heartbeat_window",
         "test_heartbeat_handled_ids_only_affect_own_session",
         "test_new_resident_start_repairs_stale_message_ownership_without_cadence",
-        "test_healthy_existing_resident_ensure_repairs_stale_message_ownership",
+          "test_fresh_session_rebinds_only_immediate_predecessor_turn_without_activation_cobatch",
+          "test_restart_retires_predecessor_activation_before_enqueuing_new_one",
+          "test_restart_rebinds_pending_workday_packet_with_fresh_lease",
+          "test_restart_rebinds_awaiting_workday_continuation_with_fresh_lease",
+          "test_restart_cursor_floor_survives_packed_open_message_eviction",
+          "test_fresh_session_does_not_rebind_marked_rows_from_older_sessions",
+          "test_fresh_session_severs_shared_predecessor_claim_before_narrow_rebind",
+          "test_failed_provisional_start_handoff_is_recovered_by_next_start",
+          "test_healthy_existing_resident_ensure_repairs_stale_message_ownership",
         "test_repair_excludes_db_authoritative_active_session",
         "test_repair_noop_candidate_releases_per_id_project_transaction",
         "test_repair_rechecks_active_session_between_stale_ids",
@@ -287,6 +317,23 @@
         "test_autonomous_turn_does_not_bypass_unattended_cap",
         "test_autonomous_turn_flag_does_not_rescue_operator_chat_idle_lapse",
         "test_autonomous_working_turn_renews_freshness_without_mutation"
+      ]
+    },
+    {
+      "path": "agent/src/handlers/typed-fast-resident.test.ts",
+      "reason": "Covers the fenced Typed Fast child used by conversational Workday: exact claim binding, private delegation, bounded staging, unique idempotency, readiness timeout, circuit fallback, and rejection of malformed or ambiguous public completions.",
+      "test_ids": [
+        "poisons the child when local staging validation rejects its completion",
+        "closes and rejects a readiness probe that never settles",
+        "binds a public completion to the exact claimed message set",
+        "does not accept malformed staged output as a consultation or reply",
+        "creates a unique server-idempotency key without trusting model output",
+        "falls back only after the server confirms that the Fast claim is released",
+        "uses a bounded exponential circuit delay",
+        "keeps the private Workday fan-out to one request per Fast turn",
+        "bounds the atomic completion Workday payload to the coordinator contract",
+        "rejects multiple public completions instead of choosing one arbitrarily",
+        "rejects direct execution and couples delegation promises to a Workday request"
       ]
     },
     {
@@ -372,9 +419,17 @@
         "ignores a stale heartbeat response sent before the Fast lease was acquired",
         "revokes Fast when the exact active lease heartbeat returns typed_fast null",
         "releases a dead ready Fast child before replacing it and admitting the message",
+        "recycles Fast once and completes the same claim when the first child omits completion",
+        "abandons once after the replacement also omits receipt-bound completion",
+        "replaces invalid Fast staging and completes the same exact claim",
+        "retires Fast and abandons once after two invalid staging attempts",
+        "reprovisions Fast after two continuation protocol failures and completes without new operator input",
+        "preempts a Workday continuation at message-poll cadence for new operator input",
+        "reconciles a lost Workday continuation completion response without retrying",
         "reconciles a lost Fast completion response and then picks up newer input",
         "paces a transient Fast claim conflict and retries the same client identity",
         "renews and restores the ordinary Workday claim while Fast replies",
+        "preserves a newer Workday status when concurrent Fast completes",
         "releases the exact lease after a failed readiness probe without starting a Fast turn",
         "retries only M1 when a later page contains M1 plus M2",
         "recovers an older claimed turn before newer unclaimed input after restart",
@@ -386,7 +441,8 @@
         "uses the retained M1 input while its stable claim is leased",
         "keeps the local message fence installed for the complete %s private turn",
         "keeps the shared private Workday boundary replyless, silent, and serialized",
-        "answers server fast-marked rows through the legacy Workday path when typed Fast is not activated"
+        "answers server fast-marked rows through the legacy Workday path when typed Fast is not activated",
+        "rewinds and immediately repolls when the server advertises an older open-message floor"
       ]
     },
     {
@@ -428,6 +484,7 @@
         "uses server total when guaranteed high-signal rows make the response longer than the requested page",
         "keeps a terminal expanded window terminal when the capped newest-window poll runs",
         "opens a durable tool handoff as an exact conversation draft",
+        "hides the Workday activation trigger but shows its model-generated reply",
         "sends a queued tool revision with operator intent and preserves exact identity across retry",
         "removing an unrelated artifact preserves the queued handoff operator intent",
         "drains only one queued handoff and immediately shows the next after chip removal"
@@ -472,7 +529,10 @@
         "never regresses below the current cursor",
         "orders numerically so mixed ISO precision cannot mis-advance",
         "rewinds a persisted cursor to include an explicitly shipped open message",
+        "rewinds to the authoritative open-message floor when packing omits the oldest row",
         "does not move a cursor forward for newer or malformed open-message timestamps",
+        "rewinds only for an older parseable authoritative floor",
+        "satisfies an unchanged floor once across more than twenty paginated responses",
         "drops ids already seen and records new ones",
         "does not mark or cursor-suppress unseen rows deferred by the atomic batch cap",
         "passes through messages with no id (cannot dedup) but dedups those with ids",

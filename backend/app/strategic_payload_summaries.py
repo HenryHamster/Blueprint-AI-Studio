@@ -14,15 +14,16 @@ resolving unchanged.
 
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import case
+from sqlalchemy import case, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import MessageType, ProjectMessage
 from app.project_message_projection import agent_thread_message_dict
+from app.resident_conversation_scope import resident_broad_message_scope
 from app.strategic_payload_compaction import (
     _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED,
     _bounded_text,
@@ -516,6 +517,8 @@ async def _fetch_open_messages(
     project_id: uuid.UUID,
     *,
     limit: int = _OPEN_MESSAGES_KEEP,
+    resident_session_id: str | None = None,
+    conversation_floor_sequence: int | None = None,
 ) -> list[dict]:
     """Authoritative open-message feed for a strategic spawn payload.
 
@@ -553,11 +556,22 @@ async def _fetch_open_messages(
         (ProjectMessage.message_type.in_(_CRITICAL_OPEN_MESSAGE_DB_TYPES), 0),
         else_=1,
     )
+    scope = (
+        [
+            resident_broad_message_scope(
+                resident_session_id,
+                conversation_floor_sequence=conversation_floor_sequence,
+            )
+        ]
+        if resident_session_id
+        else []
+    )
     result = await session.execute(
         select(ProjectMessage)
         .where(
             ProjectMessage.project_id == project_id,
             ProjectMessage.status == "open",
+            *scope,
         )
         .order_by(_critical_first, ProjectMessage.created_at.asc())
         .limit(_OPEN_MESSAGES_FETCH_LIMIT)
@@ -579,6 +593,56 @@ async def _fetch_open_messages(
     # size bound is handled independently by _bound_open_messages.
     messages.sort(key=lambda msg: msg.get("created_at") or "")
     return _bound_open_messages(messages, limit)
+
+
+async def _fetch_open_operator_cursor_floor(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    resident_session_id: str | None = None,
+    conversation_floor_sequence: int | None = None,
+) -> str | None:
+    """Return the authoritative oldest in-scope open operator timestamp.
+
+    This scalar is deliberately independent of the bounded ``open_messages``
+    payload. A critical-message burst can evict an older ordinary row from that
+    packed list, but the Resident poll cursor must still rewind far enough to
+    retrieve and claim it from the canonical paginated endpoint.
+    """
+
+    scope = (
+        [
+            resident_broad_message_scope(
+                resident_session_id,
+                conversation_floor_sequence=conversation_floor_sequence,
+            )
+        ]
+        if resident_session_id
+        else []
+    )
+    oldest = await session.scalar(
+        select(func.min(ProjectMessage.created_at)).where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status == "open",
+            # Match the Resident poll's exact inbound actor filter. Including
+            # a legacy ``operator`` row here would rewind a ``from_type=user``
+            # poll forever to a row that endpoint can never return.
+            ProjectMessage.from_type == "user",
+            *scope,
+        )
+    )
+    if oldest is None:
+        return None
+    # SQLite returns naive datetimes while PostgreSQL may return aware values.
+    # The message ``since`` parser treats a naive timestamp as UTC, but
+    # JavaScript's Date.parse treats it as runner-local time. Emit one explicit
+    # UTC wire representation so both sides rewind to the same instant.
+    oldest_utc = (
+        oldest.replace(tzinfo=timezone.utc)
+        if oldest.tzinfo is None
+        else oldest.astimezone(timezone.utc)
+    )
+    return oldest_utc.isoformat().replace("+00:00", "Z")
 
 
 # ── Recently-answered operator conversation tail ──────────────────────────────

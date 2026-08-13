@@ -38,6 +38,12 @@ DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
     "source_refs",
     "artifact_refs",
     "operator_intent",
+    # Canonical Chat provenance. The activation marker lets the UI suppress the
+    # server-authored Workday trigger without hiding real operator rows. The
+    # continuation fields drive the non-interruptive "Workday consulted" cue.
+    "message_role",
+    "_workday_result_packet_id",
+    "_resident_activation_prompt",
 )
 
 # Compact set of context keys rendered by the list UI (grouping, severity badges,
@@ -56,6 +62,9 @@ _LIST_CONTEXT_KEYS = frozenset({
     "source_refs",
     "artifact_refs",
     "operator_intent",
+    "message_role",
+    "_workday_result_packet_id",
+    "_resident_activation_prompt",
     "_convergence_link",
     "_provenance_warnings",
     "task_id",
@@ -588,6 +597,12 @@ def message_preview_dict(
     for key in context_keys:
         value = raw_context.get(key)
         if value is None:
+            continue
+        if key == "_resident_activation_prompt":
+            # This is a typed server marker, not display text. Stringifying it
+            # would defeat the UI's strict boolean suppression guard.
+            if isinstance(value, bool):
+                context_preview[key] = value
             continue
         if key in _STRUCTURED_CONTEXT_KEYS:
             sanitized = _sanitize_structured_context(key, value)

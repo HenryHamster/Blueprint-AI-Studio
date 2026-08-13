@@ -228,6 +228,7 @@ from app.strategic_payload_summaries import (  # noqa: F401 — re-exported for 
     _fetch_operator_context_refs,
     _open_message_citation_summary,
     _fetch_open_messages,
+    _fetch_open_operator_cursor_floor,
     _fetch_recent_handled_conversation,
     _RECENT_HANDLED_KEEP,
     _RECENT_HANDLED_FETCH_LIMIT,
@@ -2225,6 +2226,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # BEFORE packing. Critical tier (tiny scalar) so the agent sees the true inbox
     # depth even when ``open_messages`` itself is trimmed/dropped under byte budget.
     "open_message_count": {"priority": "critical"},
+    # Independent authoritative cursor rewind. Unlike the bounded inbox list,
+    # this tiny scalar cannot be evicted by a burst of higher-priority messages.
+    "open_message_cursor_floor": {"priority": "critical"},
     "prompt_suffix": {"priority": "high", "exempt": True},
     # Effective purpose — the single live intent field shipped to the agent
     # (the legacy vision body is no longer shipped). A compact resolved-purpose
@@ -5957,7 +5961,41 @@ async def _spawn_strategic_review(
                     "[STRATEGIC] criterion_link_conflicts fetch failed; continuing"
                 )
         _res_rejected_ops = _build_rejected_direction_ops(cycle_history, n=5)
-        _res_open_messages = await _fetch_open_messages(session, project.id)
+        _resident_session_id = str(
+            (extra_context or {}).get("strategic_session_id") or ""
+        ).strip()
+        _resident_conversation_floor = (
+            (extra_context or {}).get("conversation_floor_sequence")
+        )
+        _res_open_messages = await _fetch_open_messages(
+            session,
+            project.id,
+            resident_session_id=_resident_session_id or None,
+            conversation_floor_sequence=(
+                int(_resident_conversation_floor)
+                if isinstance(_resident_conversation_floor, int)
+                and not isinstance(_resident_conversation_floor, bool)
+                and _resident_conversation_floor > 0
+                else None
+            ),
+        )
+        _res_open_message_cursor_floor = await _fetch_open_operator_cursor_floor(
+            session,
+            project.id,
+            resident_session_id=_resident_session_id or None,
+            conversation_floor_sequence=(
+                int(_resident_conversation_floor)
+                if isinstance(_resident_conversation_floor, int)
+                and not isinstance(_resident_conversation_floor, bool)
+                and _resident_conversation_floor > 0
+                else None
+            ),
+        )
+        _res_task_context = dict(extra_context or {})
+        if _res_open_message_cursor_floor:
+            _res_task_context["open_message_cursor_floor"] = (
+                _res_open_message_cursor_floor
+            )
         # Recently-answered operator conversation tail — DB-only, bounded, and
         # explicitly non-actionable. Surfaces a correction the operator just made
         # (now marked handled/resolved, so gone from the open feed) so a restarted
@@ -6106,6 +6144,18 @@ async def _spawn_strategic_review(
                     # the same format as spawned agents.
                     "strategic_memory_notes": await build_strategic_memory_index(session, project.id),
                     **(extra_payload or {}),
+                    # Server-authoritative and intentionally AFTER extra_payload:
+                    # a caller-supplied payload must not advance the bootstrap
+                    # cursor past an older open operator row omitted by packing.
+                    **(
+                        {
+                            "open_message_cursor_floor": (
+                                _res_open_message_cursor_floor
+                            )
+                        }
+                        if _res_open_message_cursor_floor
+                        else {}
+                    ),
                     # Gaps whose history entries warrant compaction — surfaced
                     # directly in the payload so the strategist sees an automatic
                     # signal without manual inspection. Pure in-memory computation.
@@ -6131,7 +6181,7 @@ async def _spawn_strategic_review(
             base_running_update=_base_running_update,
             local_runner_intent=local_runner_intent,
             preferred_runner_target_id=preferred_runner_target_id,
-            extra_context=extra_context,
+            extra_context=_res_task_context or None,
             operator_steered=operator_steered,
             steering_excerpt=steering_excerpt,
             launched_by_user_id=launched_by_user_id,

@@ -25,7 +25,33 @@ const MAX_TYPED_WORKDAY_QUESTION_CHARS = 20_000;
 // Delegation language (for example, "I'll route a task to remove it") is valid
 // only when the same typed turn stages the Workday request that makes the
 // promise true; see FAST_WORKDAY_DELEGATION_COMMITMENT below.
-const FAST_DIRECT_EXECUTION_CLAIM = /\b(?:i(?:'ll| will|'m| am going to)|let me)\s+(?:now\s+|directly\s+)?(?:edit|delete|remove|modify|patch|rewrite|commit|push|merge|deploy|revert|reset|rename|fast[-\s]?forward)\b(?=[^.!?\n]{0,100}\b(?:code|configuration|config|setting|knob|entr(?:y|ies)|file|branch|commit|pull request|pr|deployment|service|database|schema|migration|repository|repo|main|default\s+branch)\b)/i;
+const FAST_DIRECT_EXECUTION_CLAIM = /\b(?:i(?:'ll| will|'m going to| am going to)|let me)\s+(?:(?:now|directly|quickly|just|immediately|first|actually|personally|then|go)\s+|go\s+ahead\s+and\s+)*(?:edit|delete|remove|modify|patch|rewrite|commit|push|merge|deploy|revert|reset|rename|fix|change|update|configure|implement|make|apply|open|run|handle|work|cherry[-\s]?pick|fast[-\s]?forward)(?:\s+and\s+(?:edit|delete|remove|modify|patch|rewrite|commit|push|merge|deploy|revert|reset|rename|fix|change|update|configure|implement|make|apply|open|run|handle|work|cherry[-\s]?pick|fast[-\s]?forward))*\s+/i;
+const FAST_FUTURE_PROGRESSIVE_EXECUTION_CLAIM = /\b(?:i(?:'ll| will|'m going to| am going to)|let me)\s+(?:(?:now|directly|quickly|just|immediately|first|actually|personally|then)\s+|go\s+ahead\s+and\s+)*(?:be\s+|take\s+care\s+of\s+)(?:editing|deleting|removing|modifying|patching|rewriting|committing|pushing|merging|deploying|reverting|resetting|renaming|fixing|changing|updating|configuring|implementing|making|applying|opening|running|handling|working\s+on|cherry[-\s]?picking|fast[-\s]?forwarding)\s+/i;
+const FAST_ACTIVE_EXECUTION_CLAIM = /\bi(?:'m| am)\s+(?:(?:already|now|directly|quickly|just|immediately|first|actually|personally|then)\s+|going\s+ahead\s+and\s+)*(?:editing|deleting|removing|modifying|patching|rewriting|committing|pushing|merging|deploying|reverting|resetting|renaming|fixing|changing|updating|configuring|implementing|making|applying|opening|running|handling|working|cherry[-\s]?picking|fast[-\s]?forwarding)(?:\s+and\s+(?:editing|deleting|removing|modifying|patching|rewriting|committing|pushing|merging|deploying|reverting|resetting|renaming|fixing|changing|updating|configuring|implementing|making|applying|opening|running|handling|working|cherry[-\s]?picking|fast[-\s]?forwarding))*\s+/i;
+const FAST_COMPLETED_EXECUTION_CLAIM = /\bi(?:'ve| have)\s+(?:(?:already|now|directly|quickly|just|immediately|actually|personally|then)\s+)*(?:edited|deleted|removed|modified|patched|rewritten|committed|pushed|merged|deployed|reverted|reset|renamed|fixed|changed|updated|configured|implemented|made|applied|opened|run|handled|worked|cherry[-\s]?picked|fast[-\s]?forwarded)(?:\s+and\s+(?:edited|deleted|removed|modified|patched|rewritten|committed|pushed|merged|deployed|reverted|reset|renamed|fixed|changed|updated|configured|implemented|made|applied|opened|run|handled|worked|cherry[-\s]?picked|fast[-\s]?forwarded))*\s+/i;
+const FAST_SIMPLE_PAST_EXECUTION_CLAIM = /\bi\s+(?:(?:just|already|quickly|immediately|actually|personally|then)\s+)*(?:edited|deleted|removed|modified|patched|rewritten|committed|pushed|merged|deployed|reverted|reset|renamed|fixed|changed|updated|configured|implemented|made|applied|opened|ran|handled|worked|cherry[-\s]?picked|fast[-\s]?forwarded)(?:\s+and\s+(?:edited|deleted|removed|modified|patched|rewritten|committed|pushed|merged|deployed|reverted|reset|renamed|fixed|changed|updated|configured|implemented|made|applied|opened|ran|handled|worked|cherry[-\s]?picked|fast[-\s]?forwarded))*\s+/i;
+// Repository/deployment verbs are intrinsically managed execution. A bare
+// pronoun is therefore enough to make the claim concrete ("I'll deploy it"),
+// unlike ambiguous verbs such as "update" or "rewrite", whose pronoun may
+// refer to an explanation or recommendation.
+const FAST_DIRECT_INTRINSIC_PRONOUN_CLAIM = /\b(?:i(?:'ll| will|'m going to| am going to)|let me)\s+(?:(?:now|directly|quickly|just|immediately|first|actually|personally|then)\s+|go\s+ahead\s+and\s+)*(?:commit|push|merge|deploy|revert|cherry[-\s]?pick|fast[-\s]?forward)(?:\s+and\s+(?:commit|push|merge|deploy|revert|cherry[-\s]?pick|fast[-\s]?forward))*\s+(?:it|this|that)\b/i;
+const FAST_ACTIVE_INTRINSIC_PRONOUN_CLAIM = /\bi(?:'m| am)\s+(?:(?:already|now|directly|quickly|just|immediately|first|actually|personally|then)\s+|going\s+ahead\s+and\s+)*(?:committing|pushing|merging|deploying|reverting|cherry[-\s]?picking|fast[-\s]?forwarding)(?:\s+and\s+(?:committing|pushing|merging|deploying|reverting|cherry[-\s]?picking|fast[-\s]?forwarding))*\s+(?:it|this|that)\b/i;
+const FAST_COMPLETED_INTRINSIC_PRONOUN_CLAIM = /\bi(?:'ve| have)\s+(?:(?:already|now|directly|quickly|just|immediately|actually|personally|then)\s+)*(?:committed|pushed|merged|deployed|reverted|cherry[-\s]?picked|fast[-\s]?forwarded)(?:\s+and\s+(?:committed|pushed|merged|deployed|reverted|cherry[-\s]?picked|fast[-\s]?forwarded))*\s+(?:it|this|that)\b/i;
+const FAST_SIMPLE_PAST_INTRINSIC_PRONOUN_CLAIM = /\bi\s+(?:(?:just|already|quickly|immediately|actually|personally|then)\s+)*(?:committed|pushed|merged|deployed|reverted|cherry[-\s]?picked|fast[-\s]?forwarded)(?:\s+and\s+(?:committed|pushed|merged|deployed|reverted|cherry[-\s]?picked|fast[-\s]?forwarded))*\s+(?:it|this|that)\b/i;
+const FAST_OBJECTLESS_EXECUTION_END = '(?=\\s*(?:(?:now|shortly|soon|already|just|immediately|today|tonight)\\b\\s*)?(?:[.!?,;:]|$))';
+const FAST_DIRECT_OBJECTLESS_INTRINSIC_CLAIM = new RegExp(`\\b(?:i(?:'ll| will|'m going to| am going to)|let me)\\s+(?:(?:now|directly|quickly|just|immediately|first|actually|personally|then|go)\\s+|go\\s+ahead\\s+and\\s+)*(?:commit|push|merge|deploy|revert|cherry[-\\s]?pick|fast[-\\s]?forward)(?:\\s+and\\s+(?:commit|push|merge|deploy|revert|cherry[-\\s]?pick|fast[-\\s]?forward))*${FAST_OBJECTLESS_EXECUTION_END}`, 'i');
+const FAST_ACTIVE_OBJECTLESS_INTRINSIC_CLAIM = new RegExp(`\\bi(?:'m| am)\\s+(?:(?:already|now|directly|quickly|just|immediately|first|actually|personally|then)\\s+|going\\s+ahead\\s+and\\s+)*(?:committing|pushing|merging|deploying|reverting|cherry[-\\s]?picking|fast[-\\s]?forwarding)(?:\\s+and\\s+(?:committing|pushing|merging|deploying|reverting|cherry[-\\s]?picking|fast[-\\s]?forwarding))*${FAST_OBJECTLESS_EXECUTION_END}`, 'i');
+const FAST_COMPLETED_OBJECTLESS_INTRINSIC_CLAIM = new RegExp(`\\bi(?:'ve| have)\\s+(?:(?:already|now|directly|quickly|just|immediately|actually|personally|then)\\s+)*(?:committed|pushed|merged|deployed|reverted|cherry[-\\s]?picked|fast[-\\s]?forwarded)(?:\\s+and\\s+(?:committed|pushed|merged|deployed|reverted|cherry[-\\s]?picked|fast[-\\s]?forwarded))*${FAST_OBJECTLESS_EXECUTION_END}`, 'i');
+const FAST_SIMPLE_PAST_OBJECTLESS_INTRINSIC_CLAIM = new RegExp(`\\bi\\s+(?:(?:just|already|quickly|immediately|actually|personally|then)\\s+)*(?:committed|pushed|merged|deployed|reverted|cherry[-\\s]?picked|fast[-\\s]?forwarded)(?:\\s+and\\s+(?:committed|pushed|merged|deployed|reverted|cherry[-\\s]?picked|fast[-\\s]?forwarded))*${FAST_OBJECTLESS_EXECUTION_END}`, 'i');
+// Managed execution needs a concrete object or destination. This catches direct,
+// prepositional, pronoun-bound, and compound claims while leaving strategist
+// prose such as "update you about the code" and "reset expectations around the
+// deployment" alone.
+const FAST_MANAGED_TARGET = '(?:(?:the|a|an|this|that|your|our)\\s+)?(?:(?:current|existing|requested|production|project|service|database|repository|repo|deployment|default|main)\\s+){0,2}(?:code|codebase|configuration|config|setting|knob|entr(?:y|ies)|file|branch|commit|change|changes|patch|pull request|pr|deployment|service|database|schema|migration|repository|repo|production|main|default\\s+branch|[a-z0-9_.-]+\\.(?:ts|tsx|js|jsx|mjs|cjs|py|json|ya?ml|toml|sql|sh|ps1|md))\\b(?!\\s+(?:recommendation|recommendations|plan|plans|example|examples|sample|samples|snippet|snippets|discussion|analysis|explanation|summary|options?|status|expectations?|proposal|direction)\\b)';
+const FAST_MANAGED_EXECUTION_COMPLEMENT = new RegExp(
+  `^(?:${FAST_MANAGED_TARGET}|(?:(?:it|this|that)\\s+)?(?:to|into|onto|from|in|on|against|through)\\s+${FAST_MANAGED_TARGET})`,
+  'i',
+);
 
 // A public first-person promise to create or route a Blueprint/Workday task is
 // not merely prose: without a staged request, Coordinator completion would mark
@@ -38,6 +64,19 @@ const FAST_WORKDAY_DELEGATION_COMMITMENT = /\b(?:i(?:'ll| will|'m going to| am g
 // managed-state purpose explicit. This catches "I'll create a task to deploy
 // the service" without treating an ordinary task-list discussion as a launch.
 const FAST_MANAGED_TASK_DELEGATION_COMMITMENT = /\b(?:i(?:'ll| will|'m going to| am going to)|let me)\s+(?:now\s+)?(?:route|create|open|launch|start|spawn|queue)\s+(?:(?:a|an|the|this|that|your)\s+)?(?:task|job|request)\b(?=[^.!?\n]{0,140}\b(?:edit|delete|remove|modify|patch|rewrite|commit|push|merge|deploy|revert|reset|rename|change|configure|update|fix|implement|fast[-\s]?forward)\b[^.!?\n]{0,100}\b(?:code|configuration|config|setting|knob|entr(?:y|ies)|file|branch|commit|pull request|pr|deployment|service|database|schema|migration|repository|repo|main|default\s+branch)\b)/i;
+
+// Present-perfect delegation claims are commitments too. In particular, a
+// reply such as "I've routed the removal as a task" tells the operator that a
+// durable handoff already exists; it must be backed by a request staged during
+// this exact receipt-bound turn, just like a future-tense promise.
+const FAST_PAST_WORKDAY_DELEGATION_COMMITMENT = /\b(?:i(?:['’]ve| have))\s+(?:already\s+)?(?:routed|created|opened|launched|started|spawned|queued|delegated|sent|handed(?:\s+(?:it|this|that))?\s+off)\b(?=[^.!?\n]{0,160}(?:\b(?:as|into)\s+(?:(?:a|an|the)\s+)?(?:(?:blueprint|workday)\s+)?(?:task|job|request)\b|\b(?:to|through|via)\s+(?:workday|blueprint(?:\s+task)?)\b))/i;
+// Consultation promises are receipt-coupled too. These phrases explicitly tell
+// the operator that Workday is being (or has been) consulted even when they do
+// not use the task-routing vocabulary above.
+const FAST_FUTURE_WORKDAY_CONSULTATION_COMMITMENT = /\b(?:i(?:'ll| will|'m going to| am going to)|let me)\s+(?:now\s+|quickly\s+|just\s+)?(?:have|get|ask)\s+workday\b(?:\s+to)?\s+(?:look\s+into|check|investigate|review|analy[sz]e|work\s+on)\b/i;
+const FAST_ACTIVE_WORKDAY_CONSULTATION_COMMITMENT = /\bi(?:'m| am)\s+(?:now\s+|already\s+|currently\s+)?(?:asking|routing|sending|delegating)\s+(?:this\s+|it\s+|that\s+)?(?:to\s+)?workday\b(?:\s+to)?\s+(?:look\s+into|check|investigate|review|analy[sz]e|work\s+on)?/i;
+const FAST_PAST_WORKDAY_CONSULTATION_COMMITMENT = /\bi(?:'ve| have)\s+(?:already\s+|just\s+)?(?:asked|had|got|routed|sent|delegated)\s+(?:this\s+|it\s+|that\s+)?(?:to\s+)?workday\b(?:\s+to)?\s+(?:look\s+into|check|investigate|review|analy[sz]e|work\s+on)?/i;
+const FAST_WORKDAY_ACTIVITY_CLAIM = /\bworkday\s+(?:(?:is|was)\s+(?:already\s+|currently\s+|now\s+)?(?:looking\s+into|checking|investigating|reviewing|analy[sz]ing|handling|working\s+on)|has\s+(?:already\s+|just\s+)?(?:looked\s+into|checked|investigated|reviewed|analy[sz]ed|handled|worked\s+on))\b/i;
 
 export interface TypedConversationTurnReceipt {
   claim_id: string;
@@ -135,8 +174,46 @@ function parseWorkdayRequest(value: unknown): TypedWorkdayRequest {
   };
 }
 
+function normalizeRoleClassifierText(content: string): string {
+  // Model prose commonly uses a typographic apostrophe. Keep every execution
+  // and delegation fence on one canonical spelling so "I’m"/"I’ve" cannot
+  // bypass the same role contract enforced for "I'm"/"I've".
+  return content.replace(/\u2019/g, "'");
+}
+
+function claimsManagedExecution(content: string): boolean {
+  if ([
+    FAST_DIRECT_INTRINSIC_PRONOUN_CLAIM,
+    FAST_ACTIVE_INTRINSIC_PRONOUN_CLAIM,
+    FAST_COMPLETED_INTRINSIC_PRONOUN_CLAIM,
+    FAST_SIMPLE_PAST_INTRINSIC_PRONOUN_CLAIM,
+    FAST_DIRECT_OBJECTLESS_INTRINSIC_CLAIM,
+    FAST_ACTIVE_OBJECTLESS_INTRINSIC_CLAIM,
+    FAST_COMPLETED_OBJECTLESS_INTRINSIC_CLAIM,
+    FAST_SIMPLE_PAST_OBJECTLESS_INTRINSIC_CLAIM,
+  ].some((pattern) => pattern.test(content))) {
+    return true;
+  }
+  for (const pattern of [
+    FAST_DIRECT_EXECUTION_CLAIM,
+    FAST_FUTURE_PROGRESSIVE_EXECUTION_CLAIM,
+    FAST_ACTIVE_EXECUTION_CLAIM,
+    FAST_COMPLETED_EXECUTION_CLAIM,
+    FAST_SIMPLE_PAST_EXECUTION_CLAIM,
+  ]) {
+    const scanner = new RegExp(pattern.source, `${pattern.flags}g`);
+    for (let match = scanner.exec(content); match; match = scanner.exec(content)) {
+      if (FAST_MANAGED_EXECUTION_COMPLEMENT.test(content.slice(match.index + match[0].length))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function assertFastStrategistCompletion(completion: TypedFastCompletion): void {
-  if (FAST_DIRECT_EXECUTION_CLAIM.test(completion.content)) {
+  const content = normalizeRoleClassifierText(completion.content);
+  if (claimsManagedExecution(content)) {
     throw new Error(
       'Fast Resident claimed direct managed-project execution; delegate through Workday task tooling',
     );
@@ -144,13 +221,19 @@ function assertFastStrategistCompletion(completion: TypedFastCompletion): void {
 }
 
 function claimsWorkdayDelegation(content: string): boolean {
-  return FAST_WORKDAY_DELEGATION_COMMITMENT.test(content)
-    || FAST_MANAGED_TASK_DELEGATION_COMMITMENT.test(content);
+  const normalized = normalizeRoleClassifierText(content);
+  return FAST_WORKDAY_DELEGATION_COMMITMENT.test(normalized)
+    || FAST_MANAGED_TASK_DELEGATION_COMMITMENT.test(normalized)
+    || FAST_PAST_WORKDAY_DELEGATION_COMMITMENT.test(normalized)
+    || FAST_FUTURE_WORKDAY_CONSULTATION_COMMITMENT.test(normalized)
+    || FAST_ACTIVE_WORKDAY_CONSULTATION_COMMITMENT.test(normalized)
+    || FAST_PAST_WORKDAY_CONSULTATION_COMMITMENT.test(normalized);
 }
 
 function validateStagedTypedIntents(
   completions: TypedFastCompletion[],
   requests: TypedWorkdayRequest[],
+  allowCompletedWorkdayAttribution = false,
 ): { completion: TypedFastCompletion | null; workdayRequests: TypedWorkdayRequest[] } {
   if (completions.length > 1) {
     throw new Error('Fast Resident staged multiple public completions for one receipt');
@@ -169,6 +252,16 @@ function validateStagedTypedIntents(
   }
   if (completions[0] && claimsWorkdayDelegation(completions[0].content) && uniqueRequests.size === 0) {
     throw new Error('Fast Resident promised Workday delegation without staging a Workday request');
+  }
+  if (
+    completions[0]
+    && FAST_WORKDAY_ACTIVITY_CLAIM.test(normalizeRoleClassifierText(completions[0].content))
+    && uniqueRequests.size === 0
+    && !allowCompletedWorkdayAttribution
+  ) {
+    throw new Error(
+      'Fast Resident claimed an active Workday consultation without staging a Workday request',
+    );
   }
   return { completion: completions[0] ?? null, workdayRequests: [...uniqueRequests.values()] };
 }
@@ -296,6 +389,7 @@ export class ForegroundTypedController {
   async dispatch(
     receipt: TypedConversationTurnReceipt,
     prompt: string | Array<Record<string, unknown>>,
+    options: { allowCompletedWorkdayAttribution?: boolean } = {},
   ): Promise<TypedFastTurn> {
     this.ensureStarted();
     this.writeReceipt(receipt);
@@ -311,7 +405,21 @@ export class ForegroundTypedController {
     }
     const completions = this.drain('complete-', parseCompletion, receipt);
     const requests = this.drain('request-', parseWorkdayRequest, receipt);
-    const accepted = validateStagedTypedIntents(completions, requests);
+    let accepted: ReturnType<typeof validateStagedTypedIntents>;
+    try {
+      accepted = validateStagedTypedIntents(
+        completions,
+        requests,
+        options.allowCompletedWorkdayAttribution === true,
+      );
+    } catch (error) {
+      // A child that staged a role-violating completion is protocol-poisoned,
+      // even though its provider process returned cleanly. Do not let the next
+      // claim reuse the same conversational state. The Resident handler may
+      // replace it once under the immutable claim/receipt before failing closed.
+      if (this.session === session) this.closeSessionOnly();
+      throw error;
+    }
     return {
       receipt,
       result,
