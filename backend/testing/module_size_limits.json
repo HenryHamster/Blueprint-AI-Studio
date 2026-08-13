@@ -131,7 +131,7 @@
     "direction_lifecycle.py": 2300,
     "routers/admin_notifications.py": 2150,
     "strategic_state_read_model.py": 1100,
-    "project_message_creation.py": 950,
+    "project_message_creation.py": 1250,
     "project_message_sequence_fence.py": 100,
     "max_plan_slot_accounting.py": 50,
     "work_session_check_in.py": 400,

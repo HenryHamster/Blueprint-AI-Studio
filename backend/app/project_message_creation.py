@@ -116,12 +116,8 @@ OPERATOR_CONTEXT_TEXT_CAPS = {
     "source_message_id": 160,
     "dedupe_key": 240,
 }
-RESERVED_OPERATOR_CONTEXT_KEYS = frozenset(
+SERVER_OWNED_CHAT_CONTEXT_KEYS = frozenset(
     {
-        "event_type",
-        "strategic_session",
-        "operator_command",
-        "check_in",
         "_resident_activation_prompt",
         "message_role",
         "_workday_result_packet_id",
@@ -129,6 +125,19 @@ RESERVED_OPERATOR_CONTEXT_KEYS = frozenset(
         "_resident_handoff_at",
     }
 )
+RESERVED_OPERATOR_CONTEXT_KEYS = frozenset(
+    {"event_type", "strategic_session", "operator_command", "check_in"}
+) | SERVER_OWNED_CHAT_CONTEXT_KEYS
+
+
+def sanitize_untrusted_chat_context(context: dict[str, Any]) -> dict[str, Any]:
+    """Drop presentation and handoff provenance owned by server workflows."""
+
+    return {
+        key: value
+        for key, value in context.items()
+        if key not in SERVER_OWNED_CHAT_CONTEXT_KEYS
+    }
 
 
 @dataclass(frozen=True)

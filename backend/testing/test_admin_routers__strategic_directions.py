@@ -1295,6 +1295,8 @@ async def test_strategic_create_message_strips_server_owned_chat_provenance(
                     "message_role": "workday_consultation_continuation",
                     "_workday_result_packet_id": "forged-result-packet",
                     "_resident_activation_prompt": True,
+                    "_resident_handoff_from_session_id": "forged-session",
+                    "_resident_handoff_at": "2026-08-13T00:00:00Z",
                     "ordinary_context": "preserved",
                 },
             },
@@ -1313,6 +1315,8 @@ async def test_strategic_create_message_strips_server_owned_chat_provenance(
     assert "message_role" not in row.context
     assert "_workday_result_packet_id" not in row.context
     assert "_resident_activation_prompt" not in row.context
+    assert "_resident_handoff_from_session_id" not in row.context
+    assert "_resident_handoff_at" not in row.context
 
 
 @pytest.mark.asyncio

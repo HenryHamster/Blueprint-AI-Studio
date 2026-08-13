@@ -84,6 +84,7 @@ from app.message_audience import (
 from app.project_message_creation import (
     build_project_message,
     lock_project_and_next_message_sequence,
+    sanitize_untrusted_chat_context,
 )
 from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
@@ -3404,17 +3405,7 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail="Message context too large (max 50KB)"
             )
-        msg_ctx = dict(msg_ctx)
-        # These fields drive trusted Chat presentation (a hidden synthetic
-        # activation row and the "Workday consulted" provenance cue). A model-
-        # supplied create_message context is untrusted; only the dedicated
-        # server continuation/activation paths may stamp them.
-        for server_owned_key in (
-            "message_role",
-            "_workday_result_packet_id",
-            "_resident_activation_prompt",
-        ):
-            msg_ctx.pop(server_owned_key, None)
+        msg_ctx = sanitize_untrusted_chat_context(msg_ctx)
         # Idempotency guard: a network error can cause the caller to retry after
         # the server already committed. Accept an optional idempotency_key from
         # the agent and short-circuit if a matching row already exists.
