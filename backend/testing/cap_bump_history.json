@@ -4341,6 +4341,12 @@
           "commit_date": "2026-08-08T22:21:52+00:00",
           "old_cap": 3550,
           "new_cap": 4500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-13T05:23:46.211369+00:00",
+          "old_cap": 4500,
+          "new_cap": 5500
         }
       ],
       "test_shard_balance.py": [
@@ -4385,6 +4391,12 @@
           "commit_date": "2026-08-07T20:58:05-07:00",
           "old_cap": 1950,
           "new_cap": 2250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-13T05:23:01.639418+00:00",
+          "old_cap": 2250,
+          "new_cap": 2950
         }
       ],
       "test_rollup_management.py": [

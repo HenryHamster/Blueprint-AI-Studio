@@ -1719,6 +1719,15 @@ async def test_fresh_session_severs_shared_predecessor_claim_before_narrow_rebin
     flag_modified(project, "vision")
     await db_session.commit()
 
+    await db_session.refresh(legacy_member)
+    await db_session.refresh(carried_member)
+    persisted_legacy_sequence = legacy_member.sequence
+    persisted_carried_sequence = carried_member.sequence
+    assert persisted_legacy_sequence is not None
+    assert persisted_carried_sequence is not None
+    assert persisted_legacy_sequence < persisted_carried_sequence
+    expected_floor = persisted_carried_sequence + 1
+
     started = await start_resident_session(
         db_session,
         project,
@@ -1732,7 +1741,7 @@ async def test_fresh_session_severs_shared_predecessor_claim_before_narrow_rebin
         RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY
     ]
 
-    assert floor == 1786
+    assert floor == expected_floor
     assert legacy_member.resident_session_id is None
     assert legacy_member.conversation_claim_id == shared_claim_id
     assert legacy_member.context["_conversation_public_reply_owner"] == "fast"
