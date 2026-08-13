@@ -1124,6 +1124,26 @@ async def test_fresh_session_rebinds_only_immediate_predecessor_turn_without_act
     flag_modified(project, "vision")
     await db_session.commit()
 
+    # PostgreSQL owns the canonical per-project sequence via its allocation
+    # trigger, so explicit fixture values may be replaced at INSERT time.
+    # Preserve the intended predecessor ordering while deriving the fresh
+    # session boundary from the sequences that were actually persisted.
+    await db_session.refresh(old_activity)
+    await db_session.refresh(legacy)
+    await db_session.refresh(carried)
+    persisted_old_activity_sequence = old_activity.sequence
+    persisted_legacy_sequence = legacy.sequence
+    persisted_carried_sequence = carried.sequence
+    assert persisted_old_activity_sequence is not None
+    assert persisted_legacy_sequence is not None
+    assert persisted_carried_sequence is not None
+    assert persisted_legacy_sequence < persisted_carried_sequence
+    expected_floor = max(
+        persisted_old_activity_sequence,
+        persisted_legacy_sequence,
+        persisted_carried_sequence,
+    ) + 1
+
     started = await start_resident_session(
         db_session,
         project,
@@ -1143,8 +1163,11 @@ async def test_fresh_session_rebinds_only_immediate_predecessor_turn_without_act
     resident = read_resident_session(project.vision)
     floor = resident[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY]
 
-    assert floor == 1786
-    assert task.context[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY] == 1786
+    assert floor == expected_floor
+    assert (
+        task.context[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY]
+        == expected_floor
+    )
     assert old_activity.resident_session_id is None
     assert legacy.resident_session_id is None
     assert carried.resident_session_id == started["session_id"]
@@ -1631,6 +1654,26 @@ async def test_fresh_session_does_not_rebind_marked_rows_from_older_sessions(
     flag_modified(project, "vision")
     await db_session.commit()
 
+    # PostgreSQL owns the canonical per-project sequence via its allocation
+    # trigger, so explicit fixture values may be replaced at INSERT time.
+    # Derive the new-session floor from the persisted immediate-predecessor row
+    # while retaining the ordering and old-session exclusion assertions below.
+    await db_session.refresh(older_one)
+    await db_session.refresh(older_two)
+    await db_session.refresh(immediate)
+    persisted_older_one_sequence = older_one.sequence
+    persisted_older_two_sequence = older_two.sequence
+    persisted_immediate_sequence = immediate.sequence
+    assert persisted_older_one_sequence is not None
+    assert persisted_older_two_sequence is not None
+    assert persisted_immediate_sequence is not None
+    assert (
+        persisted_older_one_sequence
+        < persisted_older_two_sequence
+        < persisted_immediate_sequence
+    )
+    expected_floor = persisted_immediate_sequence + 1
+
     started = await start_resident_session(
         db_session,
         project,
@@ -1644,7 +1687,7 @@ async def test_fresh_session_does_not_rebind_marked_rows_from_older_sessions(
 
     assert read_resident_session(project.vision)[
         RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY
-    ] == 203
+    ] == expected_floor
     assert older_one.resident_session_id is None
     assert older_two.resident_session_id is None
     assert immediate.resident_session_id == started["session_id"]

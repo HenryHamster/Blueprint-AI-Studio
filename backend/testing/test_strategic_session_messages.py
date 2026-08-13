@@ -728,6 +728,14 @@ async def test_resident_poll_applies_durable_session_floor_to_null_session_rows(
         conversation_claim_attempt=1,
         context=predecessor_claim_context,
     )
+    # PostgreSQL's rolling-compatibility INSERT trigger projects every user
+    # conversation row to pending. Restore the intended pre-existing claim with
+    # an UPDATE, which the gated trigger deliberately leaves untouched; SQLite
+    # already preserved the requested state, so this is idempotent there.
+    legacy_null.handling_state = MessageHandlingState.CLAIMED
+    db_session.add(legacy_null)
+    await db_session.commit()
+    await db_session.refresh(legacy_null)
     current_null_sequence = await lock_project_and_next_message_sequence(
         db_session, project.id
     )
