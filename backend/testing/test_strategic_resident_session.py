@@ -1776,6 +1776,7 @@ async def test_failed_provisional_start_handoff_is_recovered_by_next_start(
 
     project = await _make_project(db_session)
     runner = await _make_runner(db_session, project)
+    runner_id = str(runner.id)
     predecessor_started_at = _utcnow() - timedelta(minutes=10)
     project.vision = {
         RESIDENT_SESSION_KEY: {
@@ -1830,7 +1831,7 @@ async def test_failed_provisional_start_handoff_is_recovered_by_next_start(
             db_session,
             project,
             operator_user_id=TEST_USER_ID,
-            runner_id=str(runner.id),
+            runner_id=runner_id,
             session_factory=_test_session_factory(db_session),
         )
 
@@ -1862,7 +1863,7 @@ async def test_failed_provisional_start_handoff_is_recovered_by_next_start(
         db_session,
         project,
         operator_user_id=TEST_USER_ID,
-        runner_id=str(runner.id),
+        runner_id=runner_id,
         session_factory=_test_session_factory(db_session),
     )
     await db_session.refresh(stale)
