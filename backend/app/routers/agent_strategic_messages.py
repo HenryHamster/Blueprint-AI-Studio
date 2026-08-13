@@ -78,6 +78,12 @@ from app.project_message_creation import (
     lock_project_and_next_message_sequence,
     parse_operator_message_type,
 )
+from app.resident_conversation_scope import (
+    resident_broad_message_scope,
+    resident_conversation_floor_sequence,
+    resident_conversation_scope,
+)
+from app.strategic_payload_summaries import _fetch_open_operator_cursor_floor
 from app.time_utils import _utcnow
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
@@ -513,6 +519,58 @@ async def _resolve_message_context_envelope(
         reference=context.get("envelope"),
     )
     return row, envelope
+
+
+_PRIVATE_HANDOFF_RETIREMENT_CONTEXT_KEY = "_private_handoff_retirement"
+_PRIVATE_HANDOFF_RETIREMENT_REASON = "context_envelope_unavailable"
+# Each coordinator call scans the current private queue while holding Project
+# authority. Bound abnormal cleanup per HTTP request so a corrupt backlog cannot
+# turn one poll into an unbounded lock hold; the next normal poll resumes cleanup.
+_PRIVATE_HANDOFF_RETIREMENT_LIMIT = 8
+_PRIVATE_HANDOFF_CLAIM_CONTEXT_KEYS = (
+    "_workday_consultation_claim_id",
+    "_workday_consultation_claim_generation",
+    "_workday_consultation_claim_incarnation",
+    "_workday_consultation_claim_expires_at",
+    "_workday_consultation_claim_attempt",
+    "_workday_continuation_claim_id",
+    "_workday_continuation_claim_generation",
+    "_workday_continuation_claim_incarnation",
+    "_workday_continuation_claim_expires_at",
+    "_workday_continuation_claim_attempt",
+)
+
+
+async def _retire_unavailable_private_handoff(
+    session: AsyncSession,
+    *,
+    row: ProjectMessage,
+) -> None:
+    """Terminalize one private queue row whose fenced prompt no longer exists.
+
+    The claim-next routes hold Project/Task authority locks, and the coordinator
+    has already selected this exact row with ``FOR UPDATE``.  Keep the content
+    private, erase every transient lease identity, and retain only a bounded
+    server-authored audit marker before moving on to the next queue candidate.
+    """
+
+    now = _utcnow()
+    context = dict(row.context or {})
+    for key in _PRIVATE_HANDOFF_CLAIM_CONTEXT_KEYS:
+        context.pop(key, None)
+    context[_PRIVATE_HANDOFF_RETIREMENT_CONTEXT_KEY] = {
+        "reason": _PRIVATE_HANDOFF_RETIREMENT_REASON,
+        "retired_at": now.isoformat(),
+    }
+    row.context = context
+    row.status = "resolved"
+    row.handling_state = MessageHandlingState.SUPERSEDED
+    row.handled_by_task_id = None
+    row.resolution = "private_handoff_context_envelope_unavailable"
+    row.resolved_at = now
+    row.updated_at = now
+    session.add(row)
+    await session.flush()
 
 
 @router.post("/projects/{project_id}/strategic-call/finalized-transcript")
@@ -1051,6 +1109,9 @@ async def claim_public_conversation_turn(
         canonical_conversation_only=True,
         client_claim_id=payload.client_claim_id,
         claim_idempotency_key=payload.idempotency_key,
+        conversation_floor_sequence=resident_conversation_floor_sequence(
+            (project.vision or {}).get("_resident_strategic_session") or {}
+        ),
     )
     if claim is None:
         await session.rollback()
@@ -1185,10 +1246,14 @@ async def complete_public_conversation_turn(
         await session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from None
     await session.commit()
-    if not result.duplicate:
-        await broadcast_to_project(
-            str(project_id), "message_created", message_event_payload(result.message)
-        )
+    # Re-emit the canonical event for an exact replay too. A completion response
+    # and its post-commit websocket event can both be lost after the durable row
+    # was written; the foreground then retries this receipt specifically to
+    # reconcile that ambiguity. Project-message delivery is idempotent by row id,
+    # while suppressing this event leaves Chat waiting for its fallback poll.
+    await broadcast_to_project(
+        str(project_id), "message_created", message_event_payload(result.message)
+    )
     response: dict[str, Any] = {
         "id": str(result.message.id),
         "status": "duplicate" if result.duplicate else "created",
@@ -1436,22 +1501,51 @@ async def claim_next_workday_consultation(
     )
     from app.conversation_coordinator import claim_next_workday_consultation_packet
 
-    packet_claim = await claim_next_workday_consultation_packet(
-        session,
-        project_id=project_id,
-        task_id=task.id,
-        worker_generation=payload.worker_generation,
-        worker_incarnation=accepted_incarnation,
-        resident_session_id=payload.session_id,
-        lease_seconds=payload.lease_seconds,
-    )
+    packet_claim = None
     resolved_envelope = None
-    if packet_claim is not None:
-        _, resolved_envelope = await _resolve_message_context_envelope(
+    retired_handoffs = 0
+    while True:
+        packet_claim = await claim_next_workday_consultation_packet(
             session,
             project_id=project_id,
-            message_id=packet_claim.message.id,
+            task_id=task.id,
+            worker_generation=payload.worker_generation,
+            worker_incarnation=accepted_incarnation,
+            resident_session_id=payload.session_id,
+            lease_seconds=payload.lease_seconds,
         )
+        if packet_claim is None:
+            break
+        try:
+            _, resolved_envelope = await _resolve_message_context_envelope(
+                session,
+                project_id=project_id,
+                message_id=packet_claim.message.id,
+            )
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            await _retire_unavailable_private_handoff(
+                session,
+                row=packet_claim.message,
+            )
+            logger.warning(
+                "[STRATEGIC] Retired private Workday packet %s because its "
+                "context envelope is unavailable",
+                packet_claim.message.id,
+            )
+            retired_handoffs += 1
+            resolved_envelope = None
+            if retired_handoffs >= _PRIVATE_HANDOFF_RETIREMENT_LIMIT:
+                logger.warning(
+                    "[STRATEGIC] Paused private Workday packet retirement after "
+                    "%s rows; the next poll will resume",
+                    retired_handoffs,
+                )
+                packet_claim = None
+                break
+            continue
+        break
     await session.commit()
     if packet_claim is None:
         return {"status": "empty"}
@@ -1652,22 +1746,51 @@ async def claim_next_workday_continuation(
     )
     from app.conversation_coordinator import claim_next_workday_consultation_continuation
 
-    claim = await claim_next_workday_consultation_continuation(
-        session,
-        project_id=project_id,
-        task_id=task.id,
-        worker_generation=payload.worker_generation,
-        worker_incarnation=accepted_incarnation,
-        resident_session_id=payload.session_id,
-        lease_seconds=payload.lease_seconds,
-    )
+    claim = None
     resolved_envelope = None
-    if claim is not None:
-        _, resolved_envelope = await _resolve_message_context_envelope(
+    retired_handoffs = 0
+    while True:
+        claim = await claim_next_workday_consultation_continuation(
             session,
             project_id=project_id,
-            message_id=claim.message.id,
+            task_id=task.id,
+            worker_generation=payload.worker_generation,
+            worker_incarnation=accepted_incarnation,
+            resident_session_id=payload.session_id,
+            lease_seconds=payload.lease_seconds,
         )
+        if claim is None:
+            break
+        try:
+            _, resolved_envelope = await _resolve_message_context_envelope(
+                session,
+                project_id=project_id,
+                message_id=claim.message.id,
+            )
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            await _retire_unavailable_private_handoff(
+                session,
+                row=claim.message,
+            )
+            logger.warning(
+                "[STRATEGIC] Retired private Workday continuation %s because "
+                "its context envelope is unavailable",
+                claim.message.id,
+            )
+            retired_handoffs += 1
+            resolved_envelope = None
+            if retired_handoffs >= _PRIVATE_HANDOFF_RETIREMENT_LIMIT:
+                logger.warning(
+                    "[STRATEGIC] Paused private Workday continuation retirement "
+                    "after %s rows; the next poll will resume",
+                    retired_handoffs,
+                )
+                claim = None
+                break
+            continue
+        break
     await session.commit()
     if claim is None:
         return {"status": "empty"}
@@ -1750,6 +1873,16 @@ async def complete_workday_continuation(
                 status_code=409,
                 detail="idempotency_key already belongs to a different continuation",
             )
+        # Release the Project/Task locks before realtime delivery. The strict
+        # identity comparison above proves this is the canonical committed
+        # continuation, so replaying its row-id event is safe and closes the
+        # commit-succeeded/event-lost window without creating any new output.
+        await session.commit()
+        await broadcast_to_project(
+            str(project_id),
+            "message_created",
+            message_event_payload(existing_completion),
+        )
         return {"id": str(existing_completion.id), "status": "duplicate"}
     await _resolve_message_context_envelope(
         session,
@@ -1775,10 +1908,9 @@ async def complete_workday_continuation(
         await session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from None
     await session.commit()
-    if not result.duplicate:
-        await broadcast_to_project(
-            str(project_id), "message_created", message_event_payload(result.message)
-        )
+    await broadcast_to_project(
+        str(project_id), "message_created", message_event_payload(result.message)
+    )
     return {"id": str(result.message.id), "status": "duplicate" if result.duplicate else "created"}
 
 
@@ -2593,6 +2725,9 @@ async def claim_resident_messages(
         ),
         message_ids=payload.message_ids,
         lease_seconds=payload.lease_seconds,
+        conversation_floor_sequence=resident_conversation_floor_sequence(
+            resident_blob
+        ),
     )
     if claim is None:
         await session.rollback()
@@ -2659,6 +2794,8 @@ async def agent_poll_messages(
         authenticated_task.context if authenticated_task is not None else {}
     )
     resident_poll = bool(task_context and task_context.get("_resident_session") is True)
+    conversation_floor_sequence: int | None = None
+    open_message_cursor_floor: str | None = None
     if resident_poll:
         # Resident replacement takes the Project row exclusively. Hold a fresh
         # shared lock through this poll so validation and message selection are
@@ -2696,6 +2833,9 @@ async def agent_poll_messages(
         resident_blob = (
             (project.vision or {}).get("_resident_strategic_session") or {}
         )
+        conversation_floor_sequence = resident_conversation_floor_sequence(
+            resident_blob
+        )
         current_generation = _parse_persisted_worker_generation(
             resident_blob.get("worker_generation")
         )
@@ -2725,11 +2865,18 @@ async def agent_poll_messages(
             and str((active_call or {}).get("worker_task_id"))
             == str(authenticated_task_id)
         ):
+            open_message_cursor_floor = await _fetch_open_operator_cursor_floor(
+                session,
+                project.id,
+                resident_session_id=authenticated_session_id,
+                conversation_floor_sequence=conversation_floor_sequence,
+            )
             await session.commit()
             return {
                 "messages": [],
                 "server_time": datetime.now(timezone.utc).isoformat(),
                 "call_active": True,
+                "open_message_cursor_floor": open_message_cursor_floor,
             }
         # Caller-supplied scope is advisory only; authenticated task authority
         # always selects the current Resident conversation.
@@ -2753,12 +2900,10 @@ async def agent_poll_messages(
         # skip a strict > would open (see module docstring).
         conditions.append(ProjectMessage.created_at >= since_dt)
     if session_id:
-        # Include legacy NULL-session backlog, but never leak a different
-        # Workday session into this resident's conversation.
         conditions.append(
-            or_(
-                ProjectMessage.resident_session_id == session_id,
-                ProjectMessage.resident_session_id.is_(None),
+            resident_broad_message_scope(
+                session_id,
+                conversation_floor_sequence=conversation_floor_sequence,
             )
         )
 
@@ -2814,9 +2959,9 @@ async def agent_poll_messages(
             ]
             if session_id:
                 claim_group_conditions.append(
-                    or_(
-                        ProjectMessage.resident_session_id == session_id,
-                        ProjectMessage.resident_session_id.is_(None),
+                    resident_conversation_scope(
+                        session_id,
+                        conversation_floor_sequence=conversation_floor_sequence,
                     )
                 )
             exact_claim_rows = (
@@ -2997,9 +3142,9 @@ async def agent_poll_messages(
             ]
             if session_id:
                 final_conditions.append(
-                    or_(
-                        ProjectMessage.resident_session_id == session_id,
-                        ProjectMessage.resident_session_id.is_(None),
+                    resident_conversation_scope(
+                        session_id,
+                        conversation_floor_sequence=conversation_floor_sequence,
                     )
                 )
             fresh_query = select(ProjectMessage).where(*final_conditions)
@@ -3029,6 +3174,19 @@ async def agent_poll_messages(
                 headers={"Retry-After": "1"},
             )
         remaining_rows = fresh_prefix
+        # Independent of the cursor-bounded page: generic repair can release an
+        # older non-conversation Activity row after session bootstrap. Holding
+        # current Project authority while computing this MIN makes the additive
+        # floor a truthful control signal for the Agent to rewind and repoll.
+        conversation_floor_sequence = resident_conversation_floor_sequence(
+            resident_blob
+        )
+        open_message_cursor_floor = await _fetch_open_operator_cursor_floor(
+            session,
+            project.id,
+            resident_session_id=current_session_id,
+            conversation_floor_sequence=conversation_floor_sequence,
+        )
 
     projected_messages: list[dict[str, Any]] = []
     for row in remaining_rows:
@@ -3112,6 +3270,7 @@ async def agent_poll_messages(
     return {
         "messages": projected_messages,
         "server_time": server_time.isoformat(),
+        "open_message_cursor_floor": open_message_cursor_floor,
         # New agents must atomically claim the exact materialized batch before
         # giving it to a provider. Older agents ignore this additive field during
         # the rolling-deploy window; generation fencing still prevents overlap.

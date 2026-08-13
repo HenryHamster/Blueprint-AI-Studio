@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ResidentSession } from '../providers/resident-session.js';
+import fs from 'fs';
+import type { ResidentSession, ResidentTurnResult } from '../providers/resident-session.js';
 import type { ForegroundResidentAdapter } from '../providers/foreground-resident.js';
 import {
   _typedFastInternals,
@@ -14,6 +15,70 @@ import {
 afterEach(() => { vi.useRealTimers(); });
 
 describe('typed Fast local receipt fence', () => {
+  it('poisons the child when local staging validation rejects its completion', async () => {
+    let alive = true;
+    const close = vi.fn(() => { alive = false; });
+    const cleanResult: ResidentTurnResult = {
+      resultText: '', accumulatedTurnText: '', interrupted: false,
+      timedOut: false, hardTimedOut: false, appliedStrategicOp: false,
+      sawToolUse: true, sentOperatorMessage: false, operatorReply: null,
+      processGone: false, ttftMs: null, turnMs: 1, toolCallCount: 1,
+      totalToolCallDurationMs: 1, meanInterTokenMs: null, inputTokens: 1,
+      providerFailed: false, failureCategory: null,
+    };
+    const adapter: ForegroundResidentAdapter = {
+      id: 'invalid-staging',
+      validation: 'qualified',
+      start: ({ mcpConfigPath }) => {
+        const config = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf8')) as {
+          mcpServers: { call: { env: {
+            CALL_LOCAL_STAGE_DIR: string;
+            CALL_TURN_RECEIPT_PATH: string;
+          } } };
+        };
+        const paths = config.mcpServers.call.env;
+        return {
+          sendTurn: () => {
+            const receipt: unknown = JSON.parse(
+              fs.readFileSync(paths.CALL_TURN_RECEIPT_PATH, 'utf8'),
+            );
+            fs.writeFileSync(
+              `${paths.CALL_LOCAL_STAGE_DIR}/complete-invalid.json`,
+              JSON.stringify({
+                receipt,
+                content: "I've routed the mode knob removal as a task instead.",
+              }),
+            );
+            return Promise.resolve(cleanResult);
+          },
+          interrupt: () => undefined,
+          onEvent: () => undefined,
+          touch: () => undefined,
+          waitForIdle: () => Promise.resolve(),
+          close,
+          sessionId: () => null,
+          isAlive: () => alive,
+          exitCode: () => null,
+        } satisfies ResidentSession;
+      },
+    };
+    const controller = new ForegroundTypedController({ adapter });
+    const receipt = {
+      claim_id: 'invalid-claim',
+      message_ids: ['invalid-message'],
+      idempotency_key: 'invalid-key',
+    };
+    try {
+      await expect(controller.dispatch(receipt, 'Answer the operator.')).rejects.toThrow(
+        /without staging a Workday request/,
+      );
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(controller.isAlive()).toBe(false);
+    } finally {
+      controller.close();
+    }
+  });
+
   it('closes and rejects a readiness probe that never settles', async () => {
     vi.useFakeTimers();
     const close = vi.fn();
@@ -124,8 +189,56 @@ describe('typed Fast local receipt fence', () => {
     const directClaims = [
       "I'll remove the knob entries and delete the branches.",
       'I will edit the configuration now.',
+      "I'm going to edit the configuration now.",
+      'I’m going to deploy the service now.',
+      "I'm editing the configuration now.",
+      'I’m deploying the service now.',
+      "I'll fix the code now.",
+      'Let me change the setting.',
+      'I’m updating the config now.',
+      "I'm configuring the service now.",
+      "I've edited the configuration already.",
+      'I’ve deployed the service already.',
+      "I've implemented the repository change.",
+      'I’ve fixed the code already.',
+      'I have pushed the commit already.',
+      'I just updated the config.',
+      'I will update you about the issue. I will fix the code now.',
+      "I'll deploy to production.",
+      "I'll push to main.",
+      "I'll merge into the default branch.",
+      "I'll deploy it to production.",
+      "I'll deploy it now.",
+      "I'll push it now.",
+      "I'll commit it.",
+      "I've deployed it already.",
+      "I'll deploy now.",
+      "I'm deploying now.",
+      "I've deployed already.",
+      "I'll push shortly.",
+      'I deployed it.',
+      'I pushed to main.',
+      'I committed the change.',
+      "I'll remove it from the config.",
+      "I'll commit and push the code.",
+      "I'll quickly edit the code.",
+      "I'll just deploy to production.",
+      "I'll go ahead and push to main.",
+      "I'll make the code change.",
+      "I'll apply the patch.",
+      "I'll open a pull request.",
+      "I'll run the migration.",
+      "I'll cherry-pick the commit.",
+      "I'll take care of editing the code.",
+      "I'll handle the code change.",
+      "I'll go update the code.",
+      "I'll be editing the code.",
+      "I'll work on the code.",
+      "I'll edit strategic-resident.ts.",
+      "I'll update the codebase.",
       'Let me deploy the service change.',
       "I'll fast-forward main now.",
+      'I’ll fast-forward main now.',
     ];
     for (const content of directClaims) {
       const completion = _typedFastInternals.parseCompletion({ receipt, content });
@@ -136,6 +249,22 @@ describe('typed Fast local receipt fence', () => {
 
     for (const content of [
       'We can change the mode after checking the tradeoff.',
+      'We are editing the direction together, not touching repository code.',
+      "I've reviewed the deployment options and can route a task if you want.",
+      'I will update you about the code.',
+      "I'm updating you on the deployment status.",
+      "I've changed my recommendation for the repository.",
+      "I'll edit my recommendation after reviewing the code.",
+      "I've rewritten this answer to explain the config.",
+      "I'm resetting expectations around the deployment.",
+      "I'll change the deployment recommendation.",
+      "I'll rewrite the deployment plan.",
+      "I'll edit the code example.",
+      "I'll push back on that recommendation.",
+      "I'll commit to explaining the tradeoff.",
+      "I'll merge these ideas in the summary.",
+      'I recommend pushing to main after the checks pass.',
+      "I'll explain why we should not deploy yet.",
       'A Blueprint task could make the change if you want.',
       "I'll create a task list explaining the deployment options.",
     ]) {
@@ -156,6 +285,16 @@ describe('typed Fast local receipt fence', () => {
       "I'll create a Blueprint task to change the configuration.",
       "I'll create a task to deploy the service.",
       "I'll hand this off to Workday to update the repository.",
+      "I've routed the mode knob removal as a task instead.",
+      'I’ve routed the mode knob removal as a Blueprint task.',
+      'I have already handed this off to Workday.',
+      "I'll have Workday look into it.",
+      "I'll get Workday to check it.",
+      "I'm asking Workday to investigate.",
+      "I've asked Workday to check it.",
+      'Workday is looking into this.',
+      'Workday is handling it.',
+      'Workday has reviewed it.',
     ]) {
       const delegated = _typedFastInternals.parseCompletion({ receipt, content });
       expect(() => _typedFastInternals.validateStagedTypedIntents(
@@ -166,5 +305,22 @@ describe('typed Fast local receipt fence', () => {
         workdayRequests: [request],
       });
     }
+
+    const completedConsultation = _typedFastInternals.parseCompletion({
+      receipt,
+      content: 'Workday has reviewed it; here is the bounded result.',
+    });
+    expect(_typedFastInternals.validateStagedTypedIntents(
+      [completedConsultation], [], true,
+    )).toMatchObject({ completion: completedConsultation, workdayRequests: [] });
+
+    const hypothetical = _typedFastInternals.parseCompletion({
+      receipt,
+      content: 'Workday could review this if a deeper pass would help.',
+    });
+    expect(_typedFastInternals.validateStagedTypedIntents([hypothetical], [])).toMatchObject({
+      completion: hypothetical,
+      workdayRequests: [],
+    });
   });
 });

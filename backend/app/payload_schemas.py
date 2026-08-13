@@ -781,6 +781,7 @@ class StrategicReviewPayload(_SystemPopulated):
     recent_interventions: dict[str, Any] | None = None
     previous_decision_outcomes: dict[str, Any] | None = None
     open_messages: list[dict[str, Any]] | None = None
+    open_message_cursor_floor: str | None = None
     conversation_thread: list[dict[str, Any]] | None = None
     project_name: str | None = None
     research_mode: str | None = None

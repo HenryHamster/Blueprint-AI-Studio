@@ -43,9 +43,15 @@ from app.routers.agent_strategic_messages import (
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.strategic_memory_envelope import (
+    context_envelope_reference,
     get_or_create_project_memory_state,
     purge_expired_context_envelope_snapshots,
 )
+from app.resident_conversation_scope import (
+    RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY,
+    RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY,
+)
+from app.session_message_handoff import handoff_session_messages
 from app.time_utils import _utcnow
 
 # The inbound-poll router is intentionally NOT wired into app.main here — that
@@ -649,6 +655,260 @@ async def _make_resident_poll_worker(
     return project, task
 
 
+@pytest.mark.asyncio
+async def test_resident_poll_applies_durable_session_floor_to_null_session_rows(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY] = 100
+    project.vision = {
+        **project.vision,
+        "_resident_strategic_session": resident,
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    predecessor_claim_id = uuid.uuid4()
+    predecessor_incarnation = uuid.uuid4()
+    predecessor_claim_context = {
+        "_conversation_public_reply_owner": "fast",
+        "_conversation_claim_idempotency_key": "predecessor-shared-turn",
+    }
+    legacy_activity = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.BUG_REPORT,
+        surface=MessageSurface.ACTIVITY,
+        content="legacy activity bug report remains visible",
+        sequence=97,
+        resident_session_id="resident-predecessor",
+        created_at=_BASE - timedelta(seconds=1),
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        conversation_claim_id=predecessor_claim_id,
+        conversation_claim_generation=1,
+        conversation_claim_incarnation=predecessor_incarnation,
+        conversation_claim_expires_at=_BASE + timedelta(minutes=10),
+        conversation_claim_attempt=1,
+        context=predecessor_claim_context,
+    )
+    own_pre_floor = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content="intentionally rebound predecessor input",
+        sequence=98,
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    legacy_null = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content="legacy null-session backlog",
+        sequence=99,
+        resident_session_id=None,
+        created_at=_BASE + timedelta(seconds=1),
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        conversation_claim_id=predecessor_claim_id,
+        conversation_claim_generation=1,
+        conversation_claim_incarnation=predecessor_incarnation,
+        conversation_claim_expires_at=_BASE + timedelta(minutes=10),
+        conversation_claim_attempt=1,
+        context=predecessor_claim_context,
+    )
+    current_null = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content="current-session null input",
+        sequence=100,
+        resident_session_id=None,
+        created_at=_BASE + timedelta(seconds=2),
+    )
+    new_activity = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.BUG_REPORT,
+        surface=MessageSurface.ACTIVITY,
+        content="new activity after resident restart",
+        sequence=101,
+        resident_session_id=None,
+        created_at=_BASE + timedelta(seconds=3),
+    )
+
+    changed = await handoff_session_messages(
+        db_session, project.id, "resident-predecessor"
+    )
+    assert changed == 1
+    await db_session.refresh(legacy_activity)
+    assert legacy_activity.resident_session_id is None
+    assert legacy_activity.handling_state == MessageHandlingState.PENDING
+    assert legacy_activity.conversation_claim_id is None
+    assert legacy_activity.conversation_claim_generation is None
+    assert legacy_activity.conversation_claim_incarnation is None
+    assert legacy_activity.conversation_claim_expires_at is None
+    assert "_conversation_public_reply_owner" not in legacy_activity.context
+    assert "_conversation_claim_idempotency_key" not in legacy_activity.context
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages?limit=20",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+
+    assert response.status_code == 200, response.text
+    visible_ids = [row["id"] for row in response.json()["messages"]]
+    assert visible_ids == [
+        str(legacy_activity.id),
+        str(own_pre_floor.id),
+        str(current_null.id),
+        str(new_activity.id),
+    ]
+    assert str(legacy_null.id) not in visible_ids
+
+    incarnation_id = "00000000-0000-0000-0000-000000000097"
+    claim_payload = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "incarnation_id": incarnation_id,
+        "lease_seconds": 45,
+    }
+    activity_claim = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **claim_payload,
+            "message_ids": [str(legacy_activity.id), str(new_activity.id)],
+        },
+    )
+    assert activity_claim.status_code == 200, activity_claim.text
+    assert activity_claim.json()["message_ids"] == [
+        str(legacy_activity.id),
+        str(new_activity.id),
+    ]
+
+    stale_chat_claim = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**claim_payload, "message_ids": [str(legacy_null.id)]},
+    )
+    assert stale_chat_claim.status_code == 409, stale_chat_claim.text
+
+    await db_session.refresh(legacy_activity)
+    await db_session.refresh(new_activity)
+    await db_session.refresh(legacy_null)
+    assert legacy_activity.handling_state == MessageHandlingState.CLAIMED
+    assert legacy_activity.conversation_claim_id is not None
+    assert legacy_activity.conversation_claim_id != predecessor_claim_id
+    assert new_activity.handling_state == MessageHandlingState.CLAIMED
+    assert new_activity.conversation_claim_id == legacy_activity.conversation_claim_id
+    assert legacy_null.handling_state == MessageHandlingState.CLAIMED
+    assert legacy_null.conversation_claim_id == predecessor_claim_id
+
+
+@pytest.mark.asyncio
+async def test_resident_poll_floor_recovers_activity_released_after_start(
+    client: AsyncClient, db_session
+):
+    """A live poll advertises an old row released after bootstrap packing."""
+
+    project, task = await _make_resident_poll_worker(db_session)
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY] = 100
+    project.vision = {
+        **project.vision,
+        "_resident_strategic_session": resident,
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    released_later = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.ACTIVITY,
+        content="old ordinary Activity released after Resident bootstrap",
+        sequence=7,
+        resident_session_id="ended-resident-after-bootstrap",
+        created_at=_BASE,
+        handling_state=MessageHandlingState.PENDING,
+    )
+    newer_cursor = (
+        (_BASE + timedelta(hours=1))
+        .replace(tzinfo=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    poll_url = f"/api/agent/projects/{project.id}/messages"
+    headers = _headers(task, vm="agent-vm-resident-poll")
+
+    before_release = await client.get(
+        poll_url,
+        params={"since": newer_cursor, "limit": 20},
+        headers=headers,
+    )
+    assert before_release.status_code == 200, before_release.text
+    assert before_release.json()["messages"] == []
+    assert (
+        before_release.json()[RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY]
+        is None
+    )
+
+    changed = await handoff_session_messages(
+        db_session,
+        project.id,
+        "ended-resident-after-bootstrap",
+        replacement_resident_active=True,
+    )
+    assert changed == 1
+    await db_session.refresh(released_later)
+    assert released_later.resident_session_id is None
+
+    control_poll = await client.get(
+        poll_url,
+        params={"since": newer_cursor, "limit": 20},
+        headers=headers,
+    )
+    assert control_poll.status_code == 200, control_poll.text
+    body = control_poll.json()
+    assert body["messages"] == []
+    expected_floor = (
+        released_later.created_at.replace(tzinfo=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    assert body[RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY] == expected_floor
+
+    rewound_poll = await client.get(
+        poll_url,
+        params={"since": expected_floor, "limit": 20},
+        headers=headers,
+    )
+    assert rewound_poll.status_code == 200, rewound_poll.text
+    assert [row["id"] for row in rewound_poll.json()["messages"]] == [
+        str(released_later.id)
+    ]
+
+
 async def _activate_typed_fast_worker(db_session, project, task) -> str:
     """Install one current typed-Fast process fence for route-level tests."""
     incarnation = str(uuid.uuid4())
@@ -884,6 +1144,143 @@ async def test_typed_fast_claim_replay_completion_fences_and_abandon(
 
 
 @pytest.mark.asyncio
+async def test_typed_fast_exact_completion_replay_rebroadcasts_canonical_message(
+    client: AsyncClient, db_session, mocker
+):
+    """A lost post-commit event is recovered without creating another reply."""
+
+    project, task = await _make_resident_poll_worker(db_session)
+    incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    claim_id = uuid.uuid4()
+    reply = await _add_message(
+        db_session,
+        project,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        from_task_id=task.id,
+        status="open",
+        handling_state=MessageHandlingState.RESPONDED,
+        content="Here is the durable immediate answer.",
+        resident_session_id="resident-session",
+        idempotency_key="typed-fast-rebroadcast-exact-replay",
+        context={
+            "message_role": "operator_reply",
+            "_conversation_claim_id": str(claim_id),
+            "_conversation_public_reply_owner": "fast",
+            "audience": "operator-fyi",
+        },
+    )
+    broadcast = mocker.patch(
+        "app.routers.agent_strategic_messages.broadcast_to_project",
+        new_callable=mocker.AsyncMock,
+    )
+    payload = {
+        "task_id": str(task.id),
+        "worker_generation": 2,
+        "incarnation_id": incarnation,
+        "claim_id": str(claim_id),
+        "owner": "fast",
+        "content": reply.content,
+        "idempotency_key": reply.idempotency_key,
+        # Exact durable replays deliberately do not dereference the expired
+        # prompt envelope again.
+        "envelope": {},
+    }
+
+    replay = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/complete",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == {"id": str(reply.id), "status": "duplicate"}
+    broadcast.assert_awaited_once()
+    assert broadcast.await_args.args[:2] == (str(project.id), "message_created")
+    assert broadcast.await_args.args[2]["message"]["id"] == str(reply.id)
+
+    conflict = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/complete",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**payload, "content": "Conflicting text must not be broadcast."},
+    )
+    assert conflict.status_code == 409
+    assert broadcast.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_workday_continuation_exact_replay_rebroadcasts_canonical_message(
+    client: AsyncClient, db_session, mocker
+):
+    """Continuation recovery re-emits the exact committed row-id event."""
+
+    project, task = await _make_resident_poll_worker(db_session)
+    incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    continuation_claim_id = uuid.uuid4()
+    result_packet_id = uuid.uuid4()
+    reply = await _add_message(
+        db_session,
+        project,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        from_task_id=task.id,
+        status="open",
+        handling_state=MessageHandlingState.RESPONDED,
+        content="The checked result is now available.",
+        resident_session_id="resident-session",
+        idempotency_key="typed-workday-continuation-rebroadcast",
+        context={
+            "message_role": "workday_consultation_continuation",
+            "_workday_continuation_claim_id": str(continuation_claim_id),
+            "_workday_result_packet_id": str(result_packet_id),
+            "_conversation_public_reply_owner": "fast",
+            "audience": "operator-fyi",
+        },
+    )
+    broadcast = mocker.patch(
+        "app.routers.agent_strategic_messages.broadcast_to_project",
+        new_callable=mocker.AsyncMock,
+    )
+    payload = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "incarnation_id": incarnation,
+        "continuation_claim_id": str(continuation_claim_id),
+        "content": reply.content,
+        "idempotency_key": reply.idempotency_key,
+    }
+    path = (
+        f"/api/agent/projects/{project.id}/workday-consultations/"
+        f"continuations/{result_packet_id}/complete"
+    )
+
+    replay = await client.post(
+        path,
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == {"id": str(reply.id), "status": "duplicate"}
+    broadcast.assert_awaited_once()
+    assert broadcast.await_args.args[:2] == (str(project.id), "message_created")
+    assert broadcast.await_args.args[2]["message"]["id"] == str(reply.id)
+
+    conflict = await client.post(
+        path,
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**payload, "content": "Conflicting continuation text."},
+    )
+    assert conflict.status_code == 409
+    assert broadcast.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_post_ledger_fast_claim_and_workday_consultation_use_live_envelope_revision(
     client: AsyncClient, db_session
 ):
@@ -921,6 +1318,176 @@ async def test_post_ledger_fast_claim_and_workday_consultation_use_live_envelope
     )
     assert consultation.status_code == 200, consultation.text
     assert consultation.json()["envelope"]["ledger_revision"] == 7
+
+
+@pytest.mark.asyncio
+async def test_workday_claim_retires_stale_private_packet_and_delivers_next(
+    client: AsyncClient, db_session
+):
+    """A purged private prompt cannot poison the FIFO Workday packet queue."""
+
+    project, task = await _make_resident_poll_worker(db_session)
+    incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    inbound = await _add_typed_fast_input(db_session, project)
+    claim = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=_typed_fast_claim_payload(
+            task, incarnation, inbound.id, client_claim_id=str(uuid.uuid4())
+        ),
+    )
+    assert claim.status_code == 200, claim.text
+    live_reference = context_envelope_reference(claim.json()["envelope"])
+    stale_reference = {**live_reference, "snapshot_id": str(uuid.uuid4())}
+    common_context = {
+        "_conversation_consultation_packet": True,
+        "audience": "strategist-internal",
+        "message_role": "workday_consultation",
+        "public_reply_owner": "fast",
+        "_workday_consultation_atomic_reply_id": str(uuid.uuid4()),
+    }
+    stale = await _add_message(
+        db_session,
+        project,
+        sequence=10,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        content="stale private question must never be surfaced",
+        resident_session_id="resident-session",
+        context={
+            **common_context,
+            "delivery_key": "stale",
+            "envelope": stale_reference,
+        },
+    )
+    valid = await _add_message(
+        db_session,
+        project,
+        sequence=11,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        content="valid private question",
+        resident_session_id="resident-session",
+        context={**common_context, "delivery_key": "valid", "envelope": live_reference},
+    )
+
+    response = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "incarnation_id": incarnation,
+            "lease_seconds": 45,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "claimed"
+    assert response.json()["packet"]["packet_id"] == str(valid.id)
+    assert response.json()["packet"]["question"] == "valid private question"
+    await db_session.refresh(stale)
+    retired = stale
+    assert retired.status == "resolved"
+    assert retired.handling_state == MessageHandlingState.SUPERSEDED
+    assert retired.handled_by_task_id is None
+    assert retired.resolution == "private_handoff_context_envelope_unavailable"
+    assert retired.context["_private_handoff_retirement"]["reason"] == (
+        "context_envelope_unavailable"
+    )
+    assert "_workday_consultation_claim_id" not in retired.context
+
+
+@pytest.mark.asyncio
+async def test_fast_claim_retires_stale_private_result_and_delivers_next_continuation(
+    client: AsyncClient, db_session
+):
+    """A revoked result prompt cannot poison later Fast continuations."""
+
+    project, task = await _make_resident_poll_worker(db_session)
+    incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    inbound = await _add_typed_fast_input(db_session, project)
+    claim = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=_typed_fast_claim_payload(
+            task, incarnation, inbound.id, client_claim_id=str(uuid.uuid4())
+        ),
+    )
+    assert claim.status_code == 200, claim.text
+    live_reference = context_envelope_reference(claim.json()["envelope"])
+    stale_reference = {**live_reference, "snapshot_id": str(uuid.uuid4())}
+    common_context = {
+        "_workday_consultation_result": True,
+        "audience": "strategist-internal",
+        "message_role": "workday_consultation_result",
+        "public_reply_owner": "fast",
+    }
+    stale = await _add_message(
+        db_session,
+        project,
+        sequence=20,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        content="stale result must never be surfaced",
+        resident_session_id="resident-session",
+        context={
+            **common_context,
+            "delivery_key": "stale",
+            "envelope": stale_reference,
+        },
+    )
+    valid = await _add_message(
+        db_session,
+        project,
+        sequence=21,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        content="valid checked result",
+        resident_session_id="resident-session",
+        context={**common_context, "delivery_key": "valid", "envelope": live_reference},
+    )
+
+    response = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/"
+        "continuations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "incarnation_id": incarnation,
+            "lease_seconds": 45,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "claimed"
+    assert response.json()["continuation"]["result_packet_id"] == str(valid.id)
+    assert response.json()["continuation"]["result_summary"] == "valid checked result"
+    await db_session.refresh(stale)
+    retired = stale
+    assert retired.status == "resolved"
+    assert retired.handling_state == MessageHandlingState.SUPERSEDED
+    assert retired.handled_by_task_id is None
+    assert retired.resolution == "private_handoff_context_envelope_unavailable"
+    assert retired.context["_private_handoff_retirement"]["reason"] == (
+        "context_envelope_unavailable"
+    )
+    assert "_workday_continuation_claim_id" not in retired.context
 
 
 @pytest.mark.asyncio

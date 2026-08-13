@@ -8,7 +8,7 @@ handoff, and reaper contracts directly.
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from inspect import unwrap
 import uuid
 from unittest.mock import AsyncMock
@@ -21,9 +21,17 @@ from sqlalchemy.orm.attributes import flag_modified
 
 import app.strategic_resident_session as resident_session_module
 from app.database import resolve_async_engine
+from app.conversation_coordinator import (
+    ConversationPublicReplyOwner,
+    claim_next_workday_consultation_continuation,
+    claim_next_workday_consultation_packet,
+    claim_operator_messages,
+    complete_claimed_public_turn,
+)
 from app.models import (
     LocalRunner,
     MessageHandlingState,
+    MessageSurface,
     MessageType,
     Project,
     ProjectMember,
@@ -39,7 +47,12 @@ from app.routers.admin_project_strategic_session import (
     start_project_strategic_resident_session,
 )
 from app.reaper_orphan_classify import _classify_resident_session
+from app.resident_conversation_scope import (
+    RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY,
+    RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY,
+)
 from app.session_message_handoff import (
+    RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
     handoff_session_messages,
     repair_stale_session_message_handoffs,
 )
@@ -1043,6 +1056,825 @@ async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_sessi
     )
     assert liveness["authority_held"] is True
     assert liveness["leased_until"] == lease
+
+
+@pytest.mark.asyncio
+async def test_fresh_session_rebinds_only_immediate_predecessor_turn_without_activation_cobatch(
+    db_session,
+):
+    """Seq 1785 is Fast's sole chat input; seq 1784/startup stay excluded."""
+
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    predecessor_session_id = "resident-predecessor-cancelled"
+    predecessor_started_at = _utcnow() - timedelta(minutes=10)
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": predecessor_session_id,
+            "task_id": str(uuid.uuid4()),
+            "worker_generation": 1,
+            "status": "ended",
+            "stop_requested": True,
+            "started_at": predecessor_started_at.isoformat(),
+            "ended_at": (_utcnow() - timedelta(minutes=1)).isoformat(),
+        }
+    }
+    old_activity = ProjectMessage(
+        project_id=project.id,
+        sequence=1783,
+        message_type=MessageType.BUG_REPORT,
+        surface=MessageSurface.ACTIVITY,
+        from_type="user",
+        content="old unresolved activity must remain in the broad Resident inbox",
+        status="open",
+        resident_session_id=None,
+        created_at=predecessor_started_at - timedelta(minutes=2),
+    )
+    legacy = ProjectMessage(
+        project_id=project.id,
+        sequence=1784,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="legacy NULL-session backlog must stay outside the new chat",
+        status="open",
+        resident_session_id=None,
+        created_at=predecessor_started_at - timedelta(minutes=1),
+    )
+    carried = ProjectMessage(
+        project_id=project.id,
+        sequence=1785,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="what are you working on rn; can you consult smart strategic?",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=None,
+        created_at=predecessor_started_at + timedelta(minutes=1),
+        conversation_claim_id=None,
+        conversation_claim_generation=None,
+        conversation_claim_incarnation=None,
+        conversation_claim_expires_at=None,
+        conversation_claim_attempt=11,
+        context={},
+    )
+    db_session.add_all([project, old_activity, legacy, carried])
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+    )
+    await resident_session_module._enqueue_resident_activation_turn(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        snapshot=started,
+    )
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+    await db_session.refresh(old_activity)
+    await db_session.refresh(legacy)
+    await db_session.refresh(carried)
+    resident = read_resident_session(project.vision)
+    floor = resident[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY]
+
+    assert floor == 1786
+    assert task.context[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY] == 1786
+    assert old_activity.resident_session_id is None
+    assert legacy.resident_session_id is None
+    assert carried.resident_session_id == started["session_id"]
+    current_chat_inputs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.resident_session_id == started["session_id"],
+                    ProjectMessage.status == "open",
+                    ProjectMessage.from_type == "user",
+                    ProjectMessage.surface == MessageSurface.CONVERSATION,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.id for row in current_chat_inputs] == [carried.id]
+    assert not any(
+        row.context.get("_resident_activation_prompt") is True
+        for row in current_chat_inputs
+    )
+    assert [row["id"] for row in task.first_payload["open_messages"]] == [
+        str(old_activity.id),
+        str(carried.id)
+    ]
+
+    _, work_state = await resident_session_module._compute_resident_work_state(
+        db_session,
+        project.id,
+        resident_session_id=started["session_id"],
+        conversation_floor_sequence=floor,
+        resident_task_id=task.id,
+    )
+    # The pre-floor Activity row and carried current input are actionable; the
+    # stale pre-floor conversation row is the only one hidden by the boundary.
+    assert work_state["new_operator_messages"] == 2
+
+    incarnation = uuid.uuid4()
+    stale_claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id=started["session_id"],
+        task_id=task.id,
+        worker_generation=started["worker_generation"],
+        incarnation_id=incarnation,
+        message_ids=[legacy.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+        client_claim_id=uuid.uuid4(),
+        claim_idempotency_key="must-not-claim-legacy-null",
+        conversation_floor_sequence=floor,
+    )
+    assert stale_claim is None
+
+    client_claim_id = uuid.uuid4()
+    claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id=started["session_id"],
+        task_id=task.id,
+        worker_generation=started["worker_generation"],
+        incarnation_id=incarnation,
+        message_ids=[carried.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+        client_claim_id=client_claim_id,
+        claim_idempotency_key=f"recovered-fast-turn:{client_claim_id}",
+        conversation_floor_sequence=floor,
+    )
+    assert claim is not None
+    reply = await complete_claimed_public_turn(
+        db_session,
+        project_id=project.id,
+        claim_id=claim.claim_id,
+        task_id=task.id,
+        worker_generation=started["worker_generation"],
+        incarnation_id=incarnation,
+        owner=ConversationPublicReplyOwner.FAST,
+        content="I am setting direction with you now; Workday consultation is available.",
+        idempotency_key="recovered-predecessor-turn-answer",
+        resident_session_id=started["session_id"],
+    )
+    await db_session.commit()
+    await db_session.refresh(carried)
+
+    assert carried.status == "handled"
+    assert carried.handling_state == MessageHandlingState.RESPONDED
+    assert reply.message.context["_resident_reply_covered_message_ids"] == [
+        str(carried.id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restart_retires_predecessor_activation_before_enqueuing_new_one(
+    db_session,
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    predecessor_session_id = "resident-with-unanswered-activation"
+    predecessor_started_at = _utcnow() - timedelta(minutes=10)
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": predecessor_session_id,
+            "task_id": str(uuid.uuid4()),
+            "worker_generation": 1,
+            "status": "ended",
+            "stop_requested": True,
+            "started_at": predecessor_started_at.isoformat(),
+            "ended_at": (_utcnow() - timedelta(minutes=1)).isoformat(),
+        }
+    }
+    old_activation = ProjectMessage(
+        project_id=project.id,
+        sequence=500,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="synthetic predecessor startup prompt",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=predecessor_session_id,
+        created_at=predecessor_started_at + timedelta(seconds=1),
+        context={"_resident_activation_prompt": True},
+    )
+    db_session.add_all([project, old_activation])
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+    )
+    await resident_session_module._enqueue_resident_activation_turn(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        snapshot=started,
+    )
+    await db_session.refresh(old_activation)
+
+    current_inputs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.resident_session_id == started["session_id"],
+                    ProjectMessage.status == "open",
+                    ProjectMessage.from_type == "user",
+                    ProjectMessage.surface == MessageSurface.CONVERSATION,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(current_inputs) == 1
+    assert current_inputs[0].context["_resident_activation_prompt"] is True
+    assert current_inputs[0].idempotency_key == (
+        f"resident-activation:{started['session_id']}"
+    )
+    assert old_activation.resident_session_id is None
+    assert old_activation.status == "resolved"
+    assert old_activation.handling_state == MessageHandlingState.RESPONDED
+    assert old_activation.resolution == "session_handoff_activation_retired"
+
+
+async def _restart_with_claimed_predecessor_coordination_row(
+    db_session,
+    *,
+    context: dict,
+) -> tuple[Project, Task, ProjectMessage, dict, str]:
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    predecessor_session_id = f"resident-private-predecessor-{uuid.uuid4()}"
+    predecessor_started_at = _utcnow() - timedelta(minutes=10)
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": predecessor_session_id,
+            "task_id": str(uuid.uuid4()),
+            "worker_generation": 7,
+            "status": "ended",
+            "stop_requested": True,
+            "started_at": predecessor_started_at.isoformat(),
+            "ended_at": (_utcnow() - timedelta(minutes=1)).isoformat(),
+        }
+    }
+    row = ProjectMessage(
+        project_id=project.id,
+        sequence=700,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="system",
+        content="private Workday coordination survives Resident replacement",
+        status="open",
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        resident_session_id=predecessor_session_id,
+        created_at=predecessor_started_at + timedelta(minutes=1),
+        context=context,
+    )
+    db_session.add_all([project, row])
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+    )
+    await db_session.refresh(task)
+    await db_session.refresh(row)
+    return project, task, row, started, predecessor_session_id
+
+
+@pytest.mark.asyncio
+async def test_restart_rebinds_pending_workday_packet_with_fresh_lease(db_session):
+    old_claim_id = uuid.uuid4()
+    project, task, packet, started, predecessor_session_id = (
+        await _restart_with_claimed_predecessor_coordination_row(
+            db_session,
+            context={
+                "_conversation_consultation_packet": True,
+                "audience": "strategist-internal",
+                "message_role": "workday_consultation",
+                "public_reply_owner": "fast",
+                "_workday_consultation_atomic_reply_id": str(uuid.uuid4()),
+                "_workday_consultation_claim_id": str(old_claim_id),
+                "_workday_consultation_claim_generation": 7,
+                "_workday_consultation_claim_incarnation": str(uuid.uuid4()),
+                "_workday_consultation_claim_expires_at": (
+                    _utcnow() + timedelta(minutes=5)
+                ).isoformat(),
+                "_workday_consultation_claim_attempt": 4,
+            },
+        )
+    )
+
+    assert packet.resident_session_id == started["session_id"]
+    assert packet.handling_state == MessageHandlingState.PENDING
+    assert packet.handled_by_task_id is None
+    assert packet.context[RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY] == (
+        predecessor_session_id
+    )
+    for key in (
+        "_workday_consultation_claim_id",
+        "_workday_consultation_claim_generation",
+        "_workday_consultation_claim_incarnation",
+        "_workday_consultation_claim_expires_at",
+        "_workday_consultation_claim_attempt",
+    ):
+        assert key not in packet.context
+
+    new_claim = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=started["worker_generation"],
+        worker_incarnation=uuid.uuid4(),
+        resident_session_id=started["session_id"],
+    )
+    assert new_claim is not None
+    assert new_claim.message.id == packet.id
+    assert new_claim.workday_claim_id != old_claim_id
+    assert new_claim.attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_rebinds_awaiting_workday_continuation_with_fresh_lease(
+    db_session,
+):
+    old_claim_id = uuid.uuid4()
+    project, task, result, started, predecessor_session_id = (
+        await _restart_with_claimed_predecessor_coordination_row(
+            db_session,
+            context={
+                "_workday_consultation_result": True,
+                "audience": "strategist-internal",
+                "message_role": "workday_consultation_result",
+                "public_reply_owner": "fast",
+                "_workday_continuation_claim_id": str(old_claim_id),
+                "_workday_continuation_claim_generation": 7,
+                "_workday_continuation_claim_incarnation": str(uuid.uuid4()),
+                "_workday_continuation_claim_expires_at": (
+                    _utcnow() + timedelta(minutes=5)
+                ).isoformat(),
+                "_workday_continuation_claim_attempt": 3,
+            },
+        )
+    )
+
+    assert result.resident_session_id == started["session_id"]
+    assert result.handling_state == MessageHandlingState.PENDING
+    assert result.handled_by_task_id is None
+    assert result.context[RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY] == (
+        predecessor_session_id
+    )
+    for key in (
+        "_workday_continuation_claim_id",
+        "_workday_continuation_claim_generation",
+        "_workday_continuation_claim_incarnation",
+        "_workday_continuation_claim_expires_at",
+        "_workday_continuation_claim_attempt",
+    ):
+        assert key not in result.context
+
+    new_claim = await claim_next_workday_consultation_continuation(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=started["worker_generation"],
+        worker_incarnation=uuid.uuid4(),
+        resident_session_id=started["session_id"],
+    )
+    assert new_claim is not None
+    assert new_claim.message.id == result.id
+    assert new_claim.continuation_claim_id != old_claim_id
+    assert new_claim.attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_cursor_floor_survives_packed_open_message_eviction(
+    db_session,
+):
+    """An omitted ordinary predecessor row remains reachable by initial poll."""
+
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    predecessor_session_id = "resident-before-cursor-floor"
+    predecessor_started_at = _utcnow() - timedelta(minutes=10)
+    carried_cursor_dt = predecessor_started_at + timedelta(minutes=9)
+    carried_cursor = (
+        carried_cursor_dt.replace(tzinfo=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": predecessor_session_id,
+            "task_id": str(uuid.uuid4()),
+            "worker_generation": 2,
+            "status": "ended",
+            "stop_requested": True,
+            "started_at": predecessor_started_at.isoformat(),
+            "ended_at": (_utcnow() - timedelta(seconds=30)).isoformat(),
+            "_message_cursor": carried_cursor,
+        }
+    }
+    old_ordinary = ProjectMessage(
+        project_id=project.id,
+        sequence=3000,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.ACTIVITY,
+        from_type="user",
+        content="old ordinary predecessor input omitted behind critical rows",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=predecessor_session_id,
+        created_at=predecessor_started_at + timedelta(minutes=1),
+    )
+    newer_criticals = [
+        ProjectMessage(
+            project_id=project.id,
+            sequence=3100 + index,
+            message_type=MessageType.BUG_REPORT,
+            surface=MessageSurface.ACTIVITY,
+            from_type="user",
+            content=f"newer critical inbox row {index}",
+            status="open",
+            handling_state=MessageHandlingState.PENDING,
+            resident_session_id=None,
+            created_at=(
+                predecessor_started_at
+                + timedelta(minutes=2, seconds=index)
+            ),
+        )
+        for index in range(41)
+    ]
+    db_session.add_all([project, old_ordinary, *newer_criticals])
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+    )
+    await db_session.refresh(task)
+    await db_session.refresh(old_ordinary)
+
+    oldest_utc = (
+        old_ordinary.created_at.replace(tzinfo=timezone.utc)
+        if old_ordinary.created_at.tzinfo is None
+        else old_ordinary.created_at.astimezone(timezone.utc)
+    )
+    expected_floor = oldest_utc.isoformat().replace("+00:00", "Z")
+    packed_ids = {row["id"] for row in task.first_payload["open_messages"]}
+
+    assert old_ordinary.resident_session_id is None
+    assert task.context["strategic_session_id"] == started["session_id"]
+    assert task.context["message_cursor"] == carried_cursor
+    assert task.context[RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY] == expected_floor
+    assert (
+        task.first_payload[RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY]
+        == expected_floor
+    )
+    assert expected_floor.endswith("Z")
+    assert len(task.first_payload["open_messages"]) == 40
+    assert str(old_ordinary.id) not in packed_ids
+    assert packed_ids.issubset({str(row.id) for row in newer_criticals})
+
+
+@pytest.mark.asyncio
+async def test_fresh_session_does_not_rebind_marked_rows_from_older_sessions(
+    db_session,
+):
+    """Only the immediate predecessor marker crosses the new session boundary."""
+
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    predecessor_session_id = "resident-immediate-predecessor"
+    predecessor_started_at = _utcnow() - timedelta(minutes=10)
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": predecessor_session_id,
+            "task_id": str(uuid.uuid4()),
+            "worker_generation": 3,
+            "status": "ended",
+            "stop_requested": True,
+            "started_at": predecessor_started_at.isoformat(),
+            "ended_at": (_utcnow() - timedelta(minutes=1)).isoformat(),
+        }
+    }
+    older_one = ProjectMessage(
+        project_id=project.id,
+        sequence=200,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="marked carry from an older, unrelated session",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=None,
+        created_at=predecessor_started_at - timedelta(hours=2),
+        context={RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY: "resident-old-one"},
+    )
+    older_two = ProjectMessage(
+        project_id=project.id,
+        sequence=201,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="marked carry from another old session",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=None,
+        created_at=predecessor_started_at - timedelta(hours=1),
+        context={RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY: "resident-old-two"},
+    )
+    immediate = ProjectMessage(
+        project_id=project.id,
+        sequence=202,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="explicit carry from the immediate predecessor",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=None,
+        created_at=predecessor_started_at + timedelta(minutes=1),
+        context={
+            RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY: predecessor_session_id
+        },
+    )
+    db_session.add_all([project, older_one, older_two, immediate])
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+    )
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+    await db_session.refresh(older_one)
+    await db_session.refresh(older_two)
+    await db_session.refresh(immediate)
+
+    assert read_resident_session(project.vision)[
+        RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY
+    ] == 203
+    assert older_one.resident_session_id is None
+    assert older_two.resident_session_id is None
+    assert immediate.resident_session_id == started["session_id"]
+    assert [row["id"] for row in task.first_payload["open_messages"]] == [
+        str(immediate.id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fresh_session_severs_shared_predecessor_claim_before_narrow_rebind(
+    db_session,
+):
+    """A stale below-floor claim member cannot strand the carried current row."""
+
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    predecessor_started_at = _utcnow() - timedelta(minutes=10)
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": "resident-predecessor-shared-turn",
+            "task_id": str(uuid.uuid4()),
+            "worker_generation": 1,
+            "status": "ended",
+            "stop_requested": True,
+            "started_at": predecessor_started_at.isoformat(),
+            "ended_at": (_utcnow() - timedelta(minutes=1)).isoformat(),
+        }
+    }
+    shared_claim_id = uuid.uuid4()
+    shared_context = {
+        "_conversation_public_reply_owner": "fast",
+        "_conversation_claim_idempotency_key": "old-broad-fast-turn",
+    }
+    legacy_member = ProjectMessage(
+        project_id=project.id,
+        sequence=1784,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="stale pre-session member of the broad old claim",
+        status="open",
+        handling_state=MessageHandlingState.CLAIMED,
+        resident_session_id=None,
+        created_at=predecessor_started_at - timedelta(minutes=1),
+        conversation_claim_id=shared_claim_id,
+        conversation_claim_generation=1,
+        conversation_claim_incarnation=uuid.uuid4(),
+        conversation_claim_expires_at=_utcnow() - timedelta(minutes=1),
+        conversation_claim_attempt=1,
+        context=dict(shared_context),
+    )
+    carried_member = ProjectMessage(
+        project_id=project.id,
+        sequence=1785,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="current predecessor input that must form a fresh exact turn",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=None,
+        created_at=predecessor_started_at + timedelta(minutes=1),
+        conversation_claim_id=shared_claim_id,
+        conversation_claim_generation=1,
+        conversation_claim_incarnation=uuid.uuid4(),
+        conversation_claim_expires_at=_utcnow() - timedelta(minutes=1),
+        conversation_claim_attempt=1,
+        context=dict(shared_context),
+    )
+    db_session.add_all([project, legacy_member, carried_member])
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+    )
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+    await db_session.refresh(legacy_member)
+    await db_session.refresh(carried_member)
+    floor = read_resident_session(project.vision)[
+        RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY
+    ]
+
+    assert floor == 1786
+    assert legacy_member.resident_session_id is None
+    assert legacy_member.conversation_claim_id == shared_claim_id
+    assert legacy_member.context["_conversation_public_reply_owner"] == "fast"
+    assert carried_member.resident_session_id == started["session_id"]
+    assert carried_member.conversation_claim_id is None
+    assert carried_member.conversation_claim_generation is None
+    assert carried_member.conversation_claim_incarnation is None
+    assert carried_member.conversation_claim_expires_at is None
+    assert "_conversation_public_reply_owner" not in carried_member.context
+    assert "_conversation_claim_idempotency_key" not in carried_member.context
+
+    incarnation = uuid.uuid4()
+    fresh_claim_id = uuid.uuid4()
+    fresh_claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id=started["session_id"],
+        task_id=task.id,
+        worker_generation=started["worker_generation"],
+        incarnation_id=incarnation,
+        message_ids=[carried_member.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+        client_claim_id=fresh_claim_id,
+        claim_idempotency_key=f"fresh-narrow-turn:{fresh_claim_id}",
+        conversation_floor_sequence=floor,
+    )
+
+    assert fresh_claim is not None
+    assert fresh_claim.claim_id == fresh_claim_id
+    assert [row.id for row in fresh_claim.rows] == [carried_member.id]
+
+
+@pytest.mark.asyncio
+async def test_failed_provisional_start_handoff_is_recovered_by_next_start(
+    db_session,
+    monkeypatch,
+):
+    """A start failure cannot strand input already rebound to its claim."""
+
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    predecessor_started_at = _utcnow() - timedelta(minutes=10)
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": "resident-before-failed-start",
+            "task_id": str(uuid.uuid4()),
+            "worker_generation": 1,
+            "status": "ended",
+            "stop_requested": True,
+            "started_at": predecessor_started_at.isoformat(),
+            "ended_at": (_utcnow() - timedelta(minutes=1)).isoformat(),
+        }
+    }
+    stale = ProjectMessage(
+        project_id=project.id,
+        sequence=400,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="old stale chat must remain excluded after retry",
+        status="open",
+        resident_session_id=None,
+        created_at=predecessor_started_at - timedelta(minutes=1),
+    )
+    pending = ProjectMessage(
+        project_id=project.id,
+        sequence=401,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="immediate predecessor input must survive failed start",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=None,
+        created_at=predecessor_started_at + timedelta(minutes=1),
+    )
+    db_session.add_all([project, stale, pending])
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    original_spawn = resident_session_module._spawn_resident_strategic_task
+
+    async def _fail_before_task(*args, **kwargs):
+        raise RuntimeError("forced provisional spawn failure")
+
+    monkeypatch.setattr(
+        resident_session_module,
+        "_spawn_resident_strategic_task",
+        _fail_before_task,
+    )
+    with pytest.raises(RuntimeError, match="forced provisional spawn failure"):
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            runner_id=str(runner.id),
+            session_factory=_test_session_factory(db_session),
+        )
+
+    await db_session.refresh(project)
+    await db_session.refresh(stale)
+    await db_session.refresh(pending)
+    failed = read_resident_session(project.vision)
+    failed_session_id = failed["session_id"]
+    assert failed["status"] == "ended"
+    assert failed["worker_state"] == "restart_failed"
+    assert failed["ended_at"]
+    assert project.vision[resident_session_module.RESIDENT_SESSION_REASON_KEY][
+        "reason"
+    ].startswith("start_failed: forced provisional spawn failure")
+    assert stale.resident_session_id is None
+    assert pending.resident_session_id is None
+    assert pending.context[RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY] == (
+        failed_session_id
+    )
+
+    monkeypatch.setattr(
+        resident_session_module,
+        "_spawn_resident_strategic_task",
+        original_spawn,
+    )
+    task = await _make_task(db_session, project)
+    project = await db_session.get(Project, project.id)
+    recovered = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(runner.id),
+        session_factory=_test_session_factory(db_session),
+    )
+    await db_session.refresh(stale)
+    await db_session.refresh(pending)
+    await db_session.refresh(task)
+
+    assert recovered["session_id"] != failed_session_id
+    assert stale.resident_session_id is None
+    assert pending.resident_session_id == recovered["session_id"]
+    assert [row["id"] for row in task.first_payload["open_messages"]] == [
+        str(pending.id)
+    ]
 
 
 @pytest.mark.asyncio
@@ -2080,7 +2912,11 @@ async def test_failed_start_compensation_reconciles_cycle_and_emits_receipt(
     await resident_session_module._release_start_claim(
         project.id,
         session_id,
-        task.id,
+        # Adopted tasks are finalized into the session blob but never assigned
+        # to start_resident_session's spawned_task_id local. Model an unknown
+        # finalize-commit outcome: compensation must recover this exact task
+        # from the identity-guarded blob and leave no live old-generation task.
+        None,
         worker_generation=1,
         session_factory=_test_session_factory(db_session),
     )
@@ -2093,7 +2929,15 @@ async def test_failed_start_compensation_reconciles_cycle_and_emits_receipt(
     await db_session.refresh(refreshed_project)
     assert refreshed_task.status == TaskStatus.CANCELLED
     assert refreshed_cycle.outcome == "failed_phase2"
-    assert RESIDENT_SESSION_KEY not in (refreshed_project.vision or {})
+    failed_session = read_resident_session(refreshed_project.vision)
+    assert failed_session["session_id"] == session_id
+    assert failed_session["worker_generation"] == 1
+    assert failed_session["status"] == "ended"
+    assert failed_session["worker_state"] == "restart_failed"
+    assert failed_session["ended_at"]
+    assert refreshed_project.vision[
+        resident_session_module.RESIDENT_SESSION_REASON_KEY
+    ]["reason"].startswith("start_failed:")
     _assert_resident_terminal_receipt(
         emit, cycle, "resident_start_compensation"
     )
@@ -2812,8 +3656,10 @@ async def test_handoff_releases_unanswered_and_resolves_answered(
     assert unanswered.resident_session_id is None
     assert unanswered.handling_state == MessageHandlingState.PENDING
     assert unanswered.handled_by_task_id is None
-    assert unanswered.conversation_claim_id == durable_claim_id
-    assert unanswered.conversation_claim_expires_at <= _utcnow()
+    assert unanswered.conversation_claim_id is None
+    assert unanswered.conversation_claim_generation is None
+    assert unanswered.conversation_claim_incarnation is None
+    assert unanswered.conversation_claim_expires_at is None
     await db_session.refresh(answered)
     assert answered.status == "resolved"
     assert answered.handling_state == MessageHandlingState.RESPONDED

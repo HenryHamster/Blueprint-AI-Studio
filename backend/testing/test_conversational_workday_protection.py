@@ -792,6 +792,45 @@ def test_strategic_resident_agent_handler_is_protected_with_all_tests():
     )
 
 
+def test_typed_fast_resident_handler_is_protected_with_all_tests():
+    """The Typed Fast Resident suite must be protected in both directions."""
+    manifest = _load_manifest()
+    target_path = "agent/src/handlers/typed-fast-resident.test.ts"
+
+    entries = [e for e in manifest["protect"] if e["path"] == target_path]
+    assert entries, (
+        f"{target_path} is not in the protect section of the manifest. "
+        "Add it with all test_ids so deletion of the fenced Fast child suite "
+        "cannot silently weaken conversational Workday."
+    )
+    entry = entries[0]
+
+    full_path = REPO_ROOT / target_path
+    if not full_path.exists():
+        pytest.skip(
+            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
+        )
+
+    source = full_path.read_text(encoding="utf-8")
+    actual_labels: set[str] = _extract_ts_it_labels(source)
+    actual_labels |= _extract_ts_it_each_labels(source)
+    actual_labels |= _extract_ts_test_labels(source)
+    listed_labels = set(entry["test_ids"])
+
+    missing_from_manifest = sorted(actual_labels - listed_labels)
+    extra_in_manifest = sorted(listed_labels - actual_labels)
+    assert not missing_from_manifest, (
+        "These test labels exist in typed-fast-resident.test.ts but are NOT "
+        "listed in the protect manifest:\n"
+        + "\n".join(f"  - {t}" for t in missing_from_manifest)
+    )
+    assert not extra_in_manifest, (
+        "These test_ids are in the protect manifest but no longer exist in "
+        "typed-fast-resident.test.ts:\n"
+        + "\n".join(f"  - {t}" for t in extra_in_manifest)
+    )
+
+
 def test_strategic_resident_lib_is_protected_with_all_tests():
     """The strategic-resident-lib agent test suite must appear in the manifest with all tests.
 

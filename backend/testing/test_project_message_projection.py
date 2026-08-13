@@ -153,6 +153,31 @@ def test_message_preview_compacts_content_and_context_subset():
     assert "huge" not in data["context"]
 
 
+def test_message_preview_preserves_bounded_workday_chat_provenance():
+    result_packet_id = "packet-" + ("a" * 200)
+    msg = _message(
+        from_type="strategic",
+        surface=MessageSurface.CONVERSATION,
+        context={
+            "event_type": "question_answer",
+            "message_role": "workday_consultation_continuation",
+            "_workday_result_packet_id": result_packet_id,
+            "_resident_activation_prompt": True,
+            "_conversation_public_reply_owner": "fast",
+        },
+    )
+
+    data = message_preview_dict(msg)
+    event = message_event_payload(msg)
+
+    assert data["context"]["message_role"] == "workday_consultation_continuation"
+    assert data["context"]["_workday_result_packet_id"].endswith("…")
+    assert len(data["context"]["_workday_result_packet_id"]) <= 120
+    assert data["context"]["_resident_activation_prompt"] is True
+    assert "_conversation_public_reply_owner" not in data["context"]
+    assert event["message"]["context"] == data["context"]
+
+
 def test_message_preview_preserves_bounded_strategic_session_snapshot():
     msg = _message(
         context={

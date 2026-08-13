@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -28,6 +27,10 @@ from app.models import (
 from app.project_message_creation import (
     build_project_message,
     lock_project_and_next_message_sequence,
+)
+from app.resident_conversation_scope import (
+    resident_broad_message_scope,
+    resident_conversation_scope,
 )
 from app.strategic_conversation_query import strategic_conversation_predicate
 from app.time_utils import _utcnow
@@ -169,11 +172,43 @@ def legacy_conversation_claim_incarnation(
     )
 
 
-def _session_scope(session_id: str) -> object:
-    return or_(
-        ProjectMessage.resident_session_id == session_id,
-        ProjectMessage.resident_session_id.is_(None),
+def _session_scope(
+    session_id: str,
+    *,
+    conversation_floor_sequence: int | None,
+    canonical_conversation_only: bool,
+) -> object:
+    scope = (
+        resident_conversation_scope
+        if canonical_conversation_only
+        else resident_broad_message_scope
     )
+    return scope(
+        session_id,
+        conversation_floor_sequence=conversation_floor_sequence,
+    )
+
+
+def reset_conversation_claim_for_session_handoff(row: ProjectMessage) -> None:
+    """Sever a terminal predecessor's turn identity before narrowing membership.
+
+    A pre-boundary Fast claim may span both legacy backlog and a current operator
+    row. Once the durable session floor excludes the legacy member, preserving
+    that shared claim id would make the current row permanently unclaimable: the
+    coordinator correctly rejects a subset of immutable membership. The ended or
+    superseded predecessor can no longer complete, so the intentionally rebound
+    row starts a fresh exact turn while excluded members retain their old claim
+    evidence for diagnosis.
+    """
+
+    row.conversation_claim_id = None
+    row.conversation_claim_generation = None
+    row.conversation_claim_incarnation = None
+    row.conversation_claim_expires_at = None
+    context = dict(row.context or {})
+    context.pop(_PUBLIC_REPLY_OWNER_CONTEXT_KEY, None)
+    context.pop(_CONVERSATION_CLAIM_IDEMPOTENCY_CONTEXT_KEY, None)
+    row.context = context
 
 
 def _message_ordering() -> tuple[object, ...]:
@@ -198,6 +233,7 @@ async def claim_operator_messages(
     canonical_conversation_only: bool = False,
     client_claim_id: uuid.UUID | None = None,
     claim_idempotency_key: str | None = None,
+    conversation_floor_sequence: int | None = None,
 ) -> ConversationClaim | None:
     """Claim exactly one canonical operator batch under the caller's Project lock.
 
@@ -226,7 +262,11 @@ async def claim_operator_messages(
         ProjectMessage.id.in_(requested),
         ProjectMessage.from_type == "user",
         ProjectMessage.status == "open",
-        _session_scope(session_id),
+        _session_scope(
+            session_id,
+            conversation_floor_sequence=conversation_floor_sequence,
+            canonical_conversation_only=canonical_conversation_only,
+        ),
     ]
     if canonical_conversation_only:
         row_conditions.append(strategic_conversation_predicate())
@@ -319,7 +359,8 @@ async def claim_operator_messages(
         for row in claimed_rows
     )
     lease_expired = bool(claimed_rows) and all(
-        row.handling_state == MessageHandlingState.CLAIMED
+        row.handling_state
+        in (MessageHandlingState.PENDING, MessageHandlingState.CLAIMED)
         and row.conversation_claim_expires_at is not None
         and row.conversation_claim_expires_at <= now
         for row in claimed_rows

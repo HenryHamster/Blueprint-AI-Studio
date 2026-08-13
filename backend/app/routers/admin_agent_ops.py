@@ -3405,6 +3405,16 @@ async def strategic_operation(
                 status_code=400, detail="Message context too large (max 50KB)"
             )
         msg_ctx = dict(msg_ctx)
+        # These fields drive trusted Chat presentation (a hidden synthetic
+        # activation row and the "Workday consulted" provenance cue). A model-
+        # supplied create_message context is untrusted; only the dedicated
+        # server continuation/activation paths may stamp them.
+        for server_owned_key in (
+            "message_role",
+            "_workday_result_packet_id",
+            "_resident_activation_prompt",
+        ):
+            msg_ctx.pop(server_owned_key, None)
         # Idempotency guard: a network error can cause the caller to retry after
         # the server already committed. Accept an optional idempotency_key from
         # the agent and short-circuit if a matching row already exists.

@@ -2497,6 +2497,68 @@ async def test_strategic_session_conversation_filters_routine_before_limit(
 
 
 @pytest.mark.asyncio
+async def test_strategic_conversation_preserves_workday_ui_provenance(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    activation = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="Internal Workday activation instruction",
+        context={"_resident_activation_prompt": True},
+    )
+    continuation = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="Here is the answer after consulting Workday.",
+        context={
+            "event_type": "question_answer",
+            "audience": "operator-fyi",
+            "message_role": "workday_consultation_continuation",
+            "_workday_result_packet_id": "packet-1",
+            "_conversation_public_reply_owner": "fast",
+        },
+    )
+    operator_message = ProjectMessage(
+        project_id=project.id,
+        sequence=3,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="This real operator turn must remain visible.",
+        context={},
+    )
+    db_session.add_all([activation, continuation, operator_message])
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+    )
+
+    assert resp.status_code == 200, resp.text
+    by_id = {item["id"]: item for item in resp.json()["items"]}
+    assert by_id[str(activation.id)]["context"][
+        "_resident_activation_prompt"
+    ] is True
+    assert by_id[str(continuation.id)]["context"] == {
+        "event_type": "question_answer",
+        "audience": "operator-fyi",
+        "message_role": "workday_consultation_continuation",
+        "_workday_result_packet_id": "packet-1",
+    }
+    assert by_id[str(operator_message.id)]["content"] == (
+        "This real operator turn must remain visible."
+    )
+    assert by_id[str(operator_message.id)]["context"] == {}
+
+
+@pytest.mark.asyncio
 async def test_strategic_session_conversation_resolves_message_selected_refs(
     client: AsyncClient, db_session
 ):
@@ -9571,11 +9633,58 @@ async def test_checkpoint_state_returns_knowledge_index(db_session, mocker):
         task_type="strategic_review",
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"command": "review", "vision": {"revision": 1}}],
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "checkpoint-current",
+            "_resident_worker_generation": 2,
+        },
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
     task_id = str(task.id)
+    project.vision = {
+        "_resident_strategic_session": {
+            "session_id": "checkpoint-current",
+            "task_id": task_id,
+            "worker_generation": 2,
+            "status": "active",
+            "stop_requested": False,
+            "conversation_floor_sequence": 100,
+        }
+    }
+    stale_chat = ProjectMessage(
+        project_id=project.id,
+        sequence=98,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="stale pre-floor chat must not survive compaction",
+        status="open",
+        resident_session_id=None,
+    )
+    old_activity = ProjectMessage(
+        project_id=project.id,
+        sequence=97,
+        surface=MessageSurface.ACTIVITY,
+        message_type=MessageType.BUG_REPORT,
+        from_type="user",
+        content="old Activity remains durable grounding",
+        status="open",
+        resident_session_id=None,
+    )
+    rebound_current = ProjectMessage(
+        project_id=project.id,
+        sequence=96,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="explicitly rebound current-session input",
+        status="open",
+        resident_session_id="checkpoint-current",
+    )
+    db_session.add_all([project, stale_chat, old_activity, rebound_current])
+    await db_session.commit()
 
     mem_doc = KnowledgeDocument(
         project_id=project.id,
@@ -9616,6 +9725,10 @@ async def test_checkpoint_state_returns_knowledge_index(db_session, mocker):
         data = resp.json()
         assert data["current_effective_policy"]["threshold"] == pytest.approx(0.81)
         assert data["current_effective_policy"]["source"] == "runtime_config"
+        open_ids = {row["id"] for row in data["open_messages"]}
+        assert str(stale_chat.id) not in open_ids
+        assert str(old_activity.id) in open_ids
+        assert str(rebound_current.id) in open_ids
         notes = data["strategic_memory_notes"]
         assert isinstance(notes, list)
         # Must contain the KnowledgeDocument entry.
