@@ -35,7 +35,8 @@ import {
   formatRecentHandledConversation,
 } from './strategic-sections.js';
 import {
-  residentConfig, initialCursor, advanceCursorFromMessages,
+  residentConfig, initialCursor, applyOpenMessageCursorFloor,
+  advanceCursorFromMessages,
   BoundedSeenSet, admitMessageBatchPage, combineOperatorMessages,
   materializeContentBlocks, rollbackMessageBatchAdmission,
   isRetryableArtifactAttachmentError,
@@ -1165,6 +1166,8 @@ export async function handleStrategicResident(
   type TypedFastLeaseIdentity = { leaseId: string; generation: number };
   let typedFastLease: TypedFastLeaseIdentity | null = null;
   let typedFastDispatching = false;
+  let typedFastPreviousStatus: string | null = null;
+  const typedFastRespondingStatus = 'Responding to operator...';
   const typedFastConfig = typedFastRuntimeConfig({
     enabled: payload.typed_fast_enabled === true,
     models: (
@@ -2055,6 +2058,7 @@ export async function handleStrategicResident(
     const collected: ResidentInboundMessage[] = [];
     let collectedRequiredImages = 0;
     let claimRequired = false;
+    let traversedOpenMessageFloor: string | null = null;
     const cursorBefore = cursor;
     try {
       for (let page = 0; page < MAX_POLL_PAGES; page++) {
@@ -2065,6 +2069,19 @@ export async function handleStrategicResident(
         const sessionScope = sessionId ? `&session_id=${encodeURIComponent(sessionId)}&worker_generation=${workerGeneration}` : '';
         const q = `since=${encodeURIComponent(cursor)}&from_type=user&status=open&limit=${MESSAGE_POLL_LIMIT}${sessionScope}`;
         const resp = await apiGet(`/api/agent/projects/${projectId}/messages?${q}`) as MessagesPollResponse;
+        const floorTraversal = applyOpenMessageCursorFloor(
+          cursor,
+          resp.open_message_cursor_floor,
+          traversedOpenMessageFloor,
+        );
+        traversedOpenMessageFloor = floorTraversal.traversedFloor;
+        if (floorTraversal.rewound) {
+          // A row can become visible after bootstrap when stale-session repair
+          // releases it. Discard this newer page, rewind, and immediately
+          // repoll so advancing across the page cannot skip the older row.
+          cursor = floorTraversal.cursor;
+          continue;
+        }
         claimRequired = claimRequired || resp.claim_required === true;
         const fastIds = new Set(
           (Array.isArray(resp.fast_message_ids) ? resp.fast_message_ids : [])
@@ -2578,6 +2595,13 @@ export async function handleStrategicResident(
     if (!lease) return;
     typedFastLease = null;
     await releaseExactTypedFastLease(lease, reason);
+  };
+
+  const retireTypedFastController = async (reason: string): Promise<void> => {
+    typedFastReady = false;
+    foregroundTyped?.close();
+    foregroundTyped = null;
+    await releaseTypedFastLease(reason);
   };
 
   /**
@@ -3400,6 +3424,7 @@ export async function handleStrategicResident(
     continuation: ClaimedTypedContinuation,
   ): Promise<'completed' | 'preempted' | 'lost'> => {
     if (!foregroundTyped) throw new Error('Fast Resident is not warmed for Workday continuation');
+    const typedController = foregroundTyped;
     const verified = verifyStrategicContextEnvelope(continuation.envelope, {
       contextAuthorityGeneration: continuation.envelope.context_authority_generation,
       privacyGeneration: continuation.envelope.privacy_generation,
@@ -3422,58 +3447,104 @@ export async function handleStrategicResident(
       'Use mcp__call__complete_turn exactly once with the concise, useful researched follow-up for the operator.',
       'Do not request another Workday consultation from a continuation turn.',
     ].join('\n');
-    const turnPromise = foregroundTyped.dispatch(receipt, prompt);
-    const watchContinuation = async (): Promise<'done' | 'preempted' | 'lost'> => {
-      const done = turnPromise.then(() => 'done' as const);
-      for (;;) {
-        const raced = await Promise.race([
-          done,
-          sleep(CONVERSATION_CLAIM_RENEW_MS).then(() => 'renew' as const),
-        ]);
-        if (raced === 'done') return 'done';
-        // Poll at the renewal cadence while the continuation has the Fast
-        // child. A new operator input wins immediately over a delayed follow-up.
-        const incoming = await pollMessages();
-        if (incoming.length > 0) {
-          preemptedTypedContinuationMessages = incoming;
-          foregroundTyped?.interrupt();
+    const dispatchContinuation = async () => {
+      const turnPromise = typedController.dispatch(receipt, prompt, {
+        // Only this server-created receipt proves that Workday already produced
+        // a durable result, so completed-consultation attribution is truthful.
+        allowCompletedWorkdayAttribution: true,
+      }).then(
+        value => ({ status: 'fulfilled' as const, value }),
+        (reason: unknown) => ({ status: 'rejected' as const, reason }),
+      );
+      const watchContinuation = async (): Promise<'done' | 'preempted' | 'lost'> => {
+        const done = turnPromise.then(() => 'done' as const);
+        let nextRenewAt = Date.now() + CONVERSATION_CLAIM_RENEW_MS;
+        for (;;) {
+          const waitMs = Math.max(
+            1,
+            Math.min(cfg.messagePollMs, nextRenewAt - Date.now()),
+          );
+          const raced = await Promise.race([
+            done,
+            sleep(waitMs).then(() => 'tick' as const),
+          ]);
+          if (raced === 'done') return 'done';
+          // Operator input is higher priority than a delayed Workday follow-up,
+          // so poll at the normal message cadence. Keep the heavier durable
+          // lease renewal on its independent 15-second cadence.
+          const incoming = await pollMessages();
+          if (incoming.length > 0) {
+            preemptedTypedContinuationMessages = incoming;
+            typedController.interrupt();
+            await turnPromise;
+            return 'preempted';
+          }
+          if (Date.now() < nextRenewAt) continue;
+          try {
+            const renewed = await apiPost(
+              `/api/agent/projects/${projectId}/workday-consultations/continuations/${continuation.result_packet_id}/renew`,
+              {
+                task_id: taskId,
+                session_id: sessionId,
+                worker_generation: workerGeneration,
+                incarnation_id: residentProcessIncarnation,
+                continuation_claim_id: continuation.continuation_claim_id,
+                lease_seconds: 120,
+              },
+              TYPED_COORDINATOR_API_ATTEMPTS,
+              TYPED_COORDINATOR_API_TIMEOUT_MS,
+            ) as { continuation_claim_id?: string; lease_expires_at?: string };
+            if (
+              renewed.continuation_claim_id === continuation.continuation_claim_id
+              && typeof renewed.lease_expires_at === 'string'
+            ) {
+              nextRenewAt = Date.now() + CONVERSATION_CLAIM_RENEW_MS;
+              continue;
+            }
+          } catch (error) {
+            sendLog(ws, `[resident] typed continuation renewal deferred: ${sanitize(String(error))}\n`);
+          }
+          typedController.interrupt();
           await turnPromise;
-          return 'preempted';
+          return 'lost';
         }
-        try {
-          const renewed = await apiPost(
-            `/api/agent/projects/${projectId}/workday-consultations/continuations/${continuation.result_packet_id}/renew`,
-            {
-              task_id: taskId,
-              session_id: sessionId,
-              worker_generation: workerGeneration,
-              incarnation_id: residentProcessIncarnation,
-              continuation_claim_id: continuation.continuation_claim_id,
-              lease_seconds: 120,
-            },
-          ) as { continuation_claim_id?: string; lease_expires_at?: string };
-          if (
-            renewed.continuation_claim_id === continuation.continuation_claim_id
-            && typeof renewed.lease_expires_at === 'string'
-          ) continue;
-        } catch (error) {
-          sendLog(ws, `[resident] typed continuation renewal deferred: ${sanitize(String(error))}\n`);
-        }
-        foregroundTyped?.interrupt();
-        await turnPromise;
-        return 'lost';
-      }
+      };
+      const watch = await watchContinuation();
+      if (watch !== 'done') return { outcome: watch, attempt: null } as const;
+      return { outcome: 'done', attempt: await turnPromise } as const;
     };
-    const watch = await watchContinuation();
-    if (watch !== 'done') return watch;
-    const turn = await turnPromise;
-    if (turn.result.processGone || turn.result.timedOut || turn.result.hardTimedOut) {
-      throw new Error('Fast Resident failed while preparing Workday continuation');
+    let attempt = await dispatchContinuation();
+    if (attempt.outcome !== 'done') return attempt.outcome;
+    let dispatchAttempt = attempt.attempt;
+    if (
+      dispatchAttempt.status === 'rejected'
+      || dispatchAttempt.value.result.processGone
+      || dispatchAttempt.value.result.timedOut
+      || dispatchAttempt.value.result.hardTimedOut
+      || dispatchAttempt.value.completion === null
+    ) {
+      typedController.replaceAfterCrash();
+      typedFastTranscriptSequence = 0;
+      attempt = await dispatchContinuation();
+      if (attempt.outcome !== 'done') return attempt.outcome;
+      dispatchAttempt = attempt.attempt;
     }
+    if (dispatchAttempt.status === 'rejected') {
+      await retireTypedFastController('continuation_protocol_failure');
+      throw new Error(
+        `Fast Resident rejected Workday continuation staging: ${sanitize(String(dispatchAttempt.reason))}`,
+      );
+    }
+    const turn = dispatchAttempt.value;
     if (turn.workdayRequests.length > 0) {
+      await retireTypedFastController('continuation_protocol_failure');
       throw new Error('Fast Resident attempted nested Workday work from a continuation');
     }
-    if (!turn.completion) {
+    if (
+      turn.result.processGone || turn.result.timedOut || turn.result.hardTimedOut
+      || !turn.completion
+    ) {
+      await retireTypedFastController('continuation_protocol_failure');
       throw new Error('Fast Resident did not stage Workday continuation completion');
     }
     await apiPost(
@@ -3496,8 +3567,8 @@ export async function handleStrategicResident(
 
   const releaseTypedConsultationContinuation = async (
     continuation: ClaimedTypedContinuation,
-  ): Promise<void> => {
-    await apiPost(
+  ): Promise<'released' | 'already_released' | 'already_completed'> => {
+    const response = await apiPost(
       `/api/agent/projects/${projectId}/workday-consultations/continuations/${continuation.result_packet_id}/release`,
       {
         task_id: taskId,
@@ -3506,16 +3577,40 @@ export async function handleStrategicResident(
         incarnation_id: residentProcessIncarnation,
         continuation_claim_id: continuation.continuation_claim_id,
       },
-    );
+      TYPED_COORDINATOR_API_ATTEMPTS,
+      TYPED_COORDINATOR_API_TIMEOUT_MS,
+    ) as { status?: 'released' | 'already_released' | 'already_completed' };
+    if (
+      response.status !== 'released'
+      && response.status !== 'already_released'
+      && response.status !== 'already_completed'
+    ) {
+      throw new Error('Workday continuation release returned an invalid status');
+    }
+    return response.status;
   };
 
   const maybeClaimTypedContinuation = async (): Promise<boolean> => {
     if (
       typedFastDispatching
-      || !typedFastReady
       || Date.now() < typedFastCircuitOpenUntil
       || callCoordinator.suppressOrdinaryWorkday()
     ) return false;
+    if (
+      !typedFastReady
+      || foregroundTyped === null
+      || typedFastLease === null
+      || !foregroundTyped.isAlive()
+    ) {
+      // A continuation protocol failure retires the poisoned Fast child and
+      // releases its capacity lease.  There may be no newer operator message to
+      // re-enter tryHandleTypedFastTurn, so the continuation-only idle loop must
+      // provision the replacement itself once the existing circuit and
+      // provisioning retry gates permit it.  The released result packet remains
+      // durable and will be reclaimed on a later loop by the fresh controller.
+      if (Date.now() >= typedFastProvisionRetryAt) kickTypedFastProvisioning();
+      return false;
+    }
     try {
       const response = await apiPost(
         `/api/agent/projects/${projectId}/workday-consultations/continuations/claim-next`,
@@ -3540,13 +3635,26 @@ export async function handleStrategicResident(
         typedFastFailureCount = 0;
         typedFastCircuitOpenUntil = 0;
       } catch (error) {
+        let releaseStatus: 'released' | 'already_released' | 'already_completed' | null = null;
         try {
-          await releaseTypedConsultationContinuation(response.continuation);
+          releaseStatus = await releaseTypedConsultationContinuation(response.continuation);
         } catch (releaseError) {
           sendLog(
             ws,
             `[resident] typed continuation release deferred: ${sanitize(String(releaseError))}\n`,
           );
+        }
+        if (releaseStatus === 'already_completed') {
+          // The completion POST may commit and then lose its HTTP response. The
+          // release endpoint is the durable reconciliation read: never reopen,
+          // retry, or penalize a continuation the server already completed.
+          typedFastTranscriptSequence = Math.max(
+            typedFastTranscriptSequence,
+            response.continuation.envelope.transcript_sequence,
+          );
+          typedFastFailureCount = 0;
+          typedFastCircuitOpenUntil = 0;
+          return true;
         }
         typedFastFailureCount += 1;
         typedFastCircuitOpenUntil = Date.now()
@@ -3840,12 +3948,21 @@ export async function handleStrategicResident(
     | 'not_available'
     | 'displaced_workday_claim_lost';
 
-  const clearTypedConversationClaim = (): void => {
+  const clearTypedConversationClaim = (restoreStatus = true): void => {
     activeConversationClaimId = null;
     activeConversationClaimMessageIds = [];
     activeConversationClaimIncarnation = null;
     unresolvedTypedFastClaimId = null;
     pendingTypedFastClaimRequest = null;
+    if (restoreStatus && typedFastPreviousStatus !== null) {
+      // A legacy Workday turn can finish while Fast is concurrently answering
+      // a newer pure-Fast message. Restore the snapshot only if Fast still owns
+      // the visible status; never clobber a newer authoritative Workday write.
+      if (statusRef.value === typedFastRespondingStatus) {
+        statusRef.value = typedFastPreviousStatus;
+      }
+      typedFastPreviousStatus = null;
+    }
   };
 
   const markTypedFastCompleted = (messageIds: string[]): void => {
@@ -3954,7 +4071,7 @@ export async function handleStrategicResident(
         return 'completed';
       }
       if (disposition === 'fallback') {
-        clearTypedConversationClaim();
+        clearTypedConversationClaim(false);
         return 'released';
       }
     } catch (error) {
@@ -3980,7 +4097,6 @@ export async function handleStrategicResident(
     // Preserve a stable pending request without re-hitting claim/abandon while
     // its retry circuit is open.  This check must precede unresolved-claim
     // reconciliation because that path uses the same coordinator budget.
-    if (Date.now() < typedFastCircuitOpenUntil) return 'not_available';
     const unresolved = await reconcileUnresolvedTypedFastClaim();
     if (unresolved === 'completed') return 'completed';
     if (unresolved === 'pending') {
@@ -3998,6 +4114,21 @@ export async function handleStrategicResident(
       .map((message) => typeof message.id === 'string' ? message.id.trim() : '')
       .filter(Boolean);
     if (pageMessageIds.length !== msgs.length || pageMessageIds.length === 0) return 'deferred';
+    // A canonical Fast-owned input is pending as soon as it passes admission,
+    // not only after the restricted child is warm and its server claim lands.
+    // Keep liveness truthful through provisioning/backoff/retry. During an
+    // overlapping legacy Workday turn, that turn's newer status remains the
+    // authoritative one and the existing CAS restore fence still applies.
+    if (displacedWorkdayClaim === null) {
+      if (typedFastPreviousStatus === null) typedFastPreviousStatus = statusRef.value;
+      if (
+        statusRef.value === typedFastPreviousStatus
+        || statusRef.value === typedFastRespondingStatus
+      ) {
+        statusRef.value = typedFastRespondingStatus;
+      }
+    }
+    if (Date.now() < typedFastCircuitOpenUntil) return 'not_available';
     const pendingClaimRequest = pendingTypedFastClaimRequest;
     // A claim POST can time out after the coordinator commits M1, while a
     // later poll contains M1 + M2. Retry *only* M1 with its stable client
@@ -4084,7 +4215,7 @@ export async function handleStrategicResident(
           return 'completed';
         }
         if (disposition === 'fallback') {
-          clearTypedConversationClaim();
+          clearTypedConversationClaim(false);
           return 'not_available';
         }
         return 'deferred';
@@ -4101,10 +4232,13 @@ export async function handleStrategicResident(
       if (foregroundTyped === null) {
         throw new Error('typed Fast is not lease-provisioned');
       }
+      const typedController = foregroundTyped;
       activeConversationClaimId = claimId;
       activeConversationClaimMessageIds = [...messageIds];
       activeConversationClaimIncarnation = residentProcessIncarnation;
       unresolvedTypedFastClaimId = claimId;
+      if (typedFastPreviousStatus === null) typedFastPreviousStatus = statusRef.value;
+      statusRef.value = typedFastRespondingStatus;
 
       // The current message text is already the terminal row in the verified
       // canonical envelope. Only carry attachment blocks separately, avoiding a
@@ -4142,35 +4276,55 @@ export async function handleStrategicResident(
       const prompt: string | Array<Record<string, unknown>> = attachmentBlocks.length === 0
         ? promptText
         : promptBlocks;
-      let turnPromise = foregroundTyped.dispatch(receipt, prompt);
-      let watch = await watchTypedFastTurn(turnPromise, displacedWorkdayClaim);
-      if (watch !== 'done') {
-        foregroundTyped.interrupt();
-        await turnPromise;
-        throw new Error(
-          watch === 'displaced_lost'
-            ? 'DISPLACED_WORKDAY_CLAIM_LOST'
-            : 'Fast Resident lost its exact conversation claim',
+      const dispatchExactFastTurn = async () => {
+        const turnPromise = typedController.dispatch(receipt, prompt).then(
+          value => ({ status: 'fulfilled' as const, value }),
+          (reason: unknown) => ({ status: 'rejected' as const, reason }),
         );
-      }
-      let turn = await turnPromise;
-      if (turn.result.processGone) {
-        foregroundTyped.replaceAfterCrash();
-        typedFastTranscriptSequence = 0;
-        turnPromise = foregroundTyped.dispatch(receipt, prompt);
-        watch = await watchTypedFastTurn(turnPromise, displacedWorkdayClaim);
+        const watch = await watchTypedFastTurn(turnPromise, displacedWorkdayClaim);
         if (watch !== 'done') {
-          foregroundTyped.interrupt();
+          typedController.interrupt();
           await turnPromise;
           throw new Error(
             watch === 'displaced_lost'
               ? 'DISPLACED_WORKDAY_CLAIM_LOST'
-              : 'Fast Resident lost its exact conversation claim during replacement',
+              : 'Fast Resident lost its exact conversation claim',
           );
         }
-        turn = await turnPromise;
+        return await turnPromise;
+      };
+      let dispatchAttempt = await dispatchExactFastTurn();
+      if (
+        dispatchAttempt.status === 'rejected'
+        || dispatchAttempt.value.result.processGone
+        || dispatchAttempt.value.completion === null
+      ) {
+        if (dispatchAttempt.status === 'rejected') {
+          sendLog(
+            ws,
+            `[resident] typed Fast rejected local staging; replacing child and retrying exact claim once: ${sanitize(String(dispatchAttempt.reason))}\n`,
+          );
+        } else if (dispatchAttempt.value.completion === null) {
+          sendLog(
+            ws,
+            '[resident] typed Fast omitted receipt-bound completion; replacing child and retrying exact claim once\n',
+          );
+        }
+        typedController.replaceAfterCrash();
+        typedFastTranscriptSequence = 0;
+        dispatchAttempt = await dispatchExactFastTurn();
       }
-      if (turn.completion === null) throw new Error('Fast Resident did not stage a receipt-bound completion');
+      if (dispatchAttempt.status === 'rejected') {
+        await retireTypedFastController('receipt_protocol_failure');
+        throw new Error(
+          `Fast Resident rejected receipt-bound staging: ${sanitize(String(dispatchAttempt.reason))}`,
+        );
+      }
+      const turn = dispatchAttempt.value;
+      if (turn.result.processGone || turn.completion === null) {
+        await retireTypedFastController('receipt_protocol_failure');
+        throw new Error('Fast Resident did not stage a receipt-bound completion');
+      }
       const workdayRequest = turn.workdayRequests[0];
       await apiPost(`/api/agent/projects/${projectId}/conversation/turns/complete`, {
         task_id: taskId,
@@ -4220,7 +4374,7 @@ export async function handleStrategicResident(
         }
       }
       if (claimReleased) {
-        clearTypedConversationClaim();
+        clearTypedConversationClaim(false);
         return displacedWorkdayClaimLost
           ? 'displaced_workday_claim_lost'
           : 'not_available';

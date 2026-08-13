@@ -33,6 +33,9 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
+RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY = "_resident_handoff_from_session_id"
+RESIDENT_HANDOFF_AT_CONTEXT_KEY = "_resident_handoff_at"
+
 
 def _utcnow_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -139,6 +142,12 @@ async def _apply_handoff_mutations(
     answered_count = 0
     released_count = 0
     rearm_candidates: list[ProjectMessage] = []
+    # Local import keeps this low-level handoff module independent at import
+    # time while reusing the coordinator's exact claim-identity reset contract.
+    from app.conversation_coordinator import (
+        reset_conversation_claim_for_session_handoff,
+    )
+
     for message in messages:
         answered = (
             _handling_value(message) == MessageHandlingState.RESPONDED.value
@@ -153,14 +162,20 @@ async def _apply_handoff_mutations(
             message.resolved_at = message.resolved_at or now
             answered_count += 1
         else:
+            message.context = {
+                **dict(message.context or {}),
+                RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY: resident_session_id,
+                RESIDENT_HANDOFF_AT_CONTEXT_KEY: now.isoformat(),
+            }
             message.resident_session_id = None
             message.handling_state = MessageHandlingState.PENDING
             message.handled_by_task_id = None
-            # Preserve the durable claim id as the logical-turn identity, but
-            # expire its ownership immediately so a replacement Resident can
-            # reclaim the same turn without waiting for the old lease.
-            if message.conversation_claim_id is not None:
-                message.conversation_claim_expires_at = now
+            # Terminal authority can no longer complete this claim. Retaining
+            # its immutable membership would poison a replacement Resident's
+            # broad Activity claim whenever the old group also contained an
+            # excluded row, so every unanswered released row starts a fresh
+            # exact claim under the replacement generation.
+            reset_conversation_claim_for_session_handoff(message)
             message.resolution = None
             message.resolved_at = None
             released_count += 1
@@ -401,4 +416,5 @@ async def repair_stale_session_message_handoffs(
                 project_id,
                 exc_info=True,
             )
+    await session.commit()
     return repaired

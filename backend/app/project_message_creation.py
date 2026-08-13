@@ -116,15 +116,28 @@ OPERATOR_CONTEXT_TEXT_CAPS = {
     "source_message_id": 160,
     "dedupe_key": 240,
 }
-RESERVED_OPERATOR_CONTEXT_KEYS = frozenset(
+SERVER_OWNED_CHAT_CONTEXT_KEYS = frozenset(
     {
-        "event_type",
-        "strategic_session",
-        "operator_command",
-        "check_in",
         "_resident_activation_prompt",
+        "message_role",
+        "_workday_result_packet_id",
+        "_resident_handoff_from_session_id",
+        "_resident_handoff_at",
     }
 )
+RESERVED_OPERATOR_CONTEXT_KEYS = frozenset(
+    {"event_type", "strategic_session", "operator_command", "check_in"}
+) | SERVER_OWNED_CHAT_CONTEXT_KEYS
+
+
+def sanitize_untrusted_chat_context(context: dict[str, Any]) -> dict[str, Any]:
+    """Drop presentation and handoff provenance owned by server workflows."""
+
+    return {
+        key: value
+        for key, value in context.items()
+        if key not in SERVER_OWNED_CHAT_CONTEXT_KEYS
+    }
 
 
 @dataclass(frozen=True)
@@ -542,6 +555,53 @@ def _operator_request_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+async def _retire_unclaimed_resident_activation(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    resident_session_id: str,
+    activation_context_key: str,
+) -> None:
+    """Retire a synthetic opening that real operator intent supersedes.
+
+    The caller already holds the Project row lock shared by every canonical
+    operator-message writer.  Lock the activation row as well so a concurrent
+    Fast claim either wins first (and is left alone) or observes the terminal
+    activation after this real message commits.  Both mutations remain in the
+    same transaction: a rejected real message cannot consume the opening.
+    """
+
+    activation = (
+        await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.resident_session_id == resident_session_id,
+                ProjectMessage.idempotency_key
+                == f"resident-activation:{resident_session_id}",
+                ProjectMessage.from_type == "user",
+                ProjectMessage.surface == MessageSurface.CONVERSATION,
+                ProjectMessage.status == "open",
+                ProjectMessage.handling_state == MessageHandlingState.PENDING,
+                ProjectMessage.conversation_claim_id.is_(None),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if activation is None or (
+        dict(activation.context or {}).get(activation_context_key) is not True
+    ):
+        return
+
+    now = _utcnow()
+    activation.status = "resolved"
+    activation.handling_state = MessageHandlingState.SUPERSEDED
+    activation.resolution = "operator_input_superseded_activation"
+    activation.resolved_at = now
+    activation.updated_at = now
+    session.add(activation)
+
+
 async def create_operator_project_message(
     session: AsyncSession,
     *,
@@ -682,7 +742,10 @@ async def create_operator_project_message(
     # Keep the low-level message creation module importable without pulling in
     # the resident runtime (and, through it, the admin/release router graph).
     # This import is intentionally local to the Workday-only association path.
-    from app.strategic_resident_session import resident_session_snapshot  # noqa: PLC0415
+    from app.strategic_resident_session import (  # noqa: PLC0415
+        RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY,
+        resident_session_snapshot,
+    )
 
     locked_project = await session.scalar(
         select(Project)
@@ -745,6 +808,18 @@ async def create_operator_project_message(
         refresh_was_pending = strategic_refresh_pending(locked_vision)
         if resident_active:
             arming = ARMING_RESIDENT_SESSION
+
+    if (
+        resident_session_id
+        and surface == MessageSurface.CONVERSATION
+        and message_context.get(RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY) is not True
+    ):
+        await _retire_unclaimed_resident_activation(
+            session,
+            project_id=project_id,
+            resident_session_id=resident_session_id,
+            activation_context_key=RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY,
+        )
 
     if idem_key:
         # Same-identity retries serialize before reply/source/attachment

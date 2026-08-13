@@ -1,7 +1,9 @@
 import { createHash } from 'crypto';
 import { describe, it, expect, vi } from 'vitest';
 import {
-  residentConfig, initialCursor, advanceCursorFromMessages,
+  residentConfig, initialCursor, rewindCursorToOpenMessageFloor,
+  applyOpenMessageCursorFloor,
+  advanceCursorFromMessages,
   BoundedSeenSet, dedupNewMessages, admitMessageBatchPage, extractMessageTurn, combineOperatorMessages,
   materializeContentBlocks, isAllowedAttachmentDownloadUrl,
   rollbackMessageBatchAdmission, RetryableArtifactAttachmentError,
@@ -151,6 +153,22 @@ describe('initialCursor', () => {
     expect(cur).toBe('2026-06-01T10:00:00Z');
   });
 
+  it('rewinds to the authoritative open-message floor when packing omits the oldest row', () => {
+    const cur = initialCursor(
+      {
+        context: {
+          message_cursor: '2026-06-01T12:00:00Z',
+          open_message_cursor_floor: '2026-06-01T10:00:00Z',
+        },
+      },
+      {
+        open_message_cursor_floor: '2026-06-01T09:00:00Z',
+        open_messages: [{ id: 'packed-critical', created_at: '2026-06-01T11:00:00Z' }],
+      },
+    );
+    expect(cur).toBe('2026-06-01T09:00:00Z');
+  });
+
   it('does not move a cursor forward for newer or malformed open-message timestamps', () => {
     const cur = initialCursor(
       { context: { message_cursor: '2026-06-01T12:00:00Z' } },
@@ -160,6 +178,56 @@ describe('initialCursor', () => {
       ] },
     );
     expect(cur).toBe('2026-06-01T12:00:00Z');
+  });
+});
+
+describe('rewindCursorToOpenMessageFloor', () => {
+  it('rewinds only for an older parseable authoritative floor', () => {
+    const cursor = '2026-06-01T12:00:00Z';
+    expect(rewindCursorToOpenMessageFloor(cursor, '2026-06-01T09:00:00Z'))
+      .toBe('2026-06-01T09:00:00Z');
+    expect(rewindCursorToOpenMessageFloor(cursor, '2026-06-01T13:00:00Z'))
+      .toBe(cursor);
+    expect(rewindCursorToOpenMessageFloor(cursor, 'not-a-date')).toBe(cursor);
+    expect(rewindCursorToOpenMessageFloor(cursor, null)).toBe(cursor);
+  });
+
+  it('satisfies an unchanged floor once across more than twenty paginated responses', () => {
+    const floor = '2026-06-01T09:00:00Z';
+    let traversal = applyOpenMessageCursorFloor(
+      '2026-06-01T12:00:00Z',
+      floor,
+      null,
+    );
+    expect(traversal).toEqual({
+      cursor: floor,
+      traversedFloor: floor,
+      rewound: true,
+    });
+
+    for (let page = 1; page <= 25; page += 1) {
+      const pageCursor = new Date(
+        Date.parse(floor) + page * 60 * 60 * 1_000,
+      ).toISOString();
+      traversal = applyOpenMessageCursorFloor(
+        pageCursor,
+        floor,
+        traversal.traversedFloor,
+      );
+      expect(traversal.cursor).toBe(pageCursor);
+      expect(traversal.rewound).toBe(false);
+    }
+
+    const olderFloor = '2026-06-01T08:00:00Z';
+    expect(applyOpenMessageCursorFloor(
+      traversal.cursor,
+      olderFloor,
+      traversal.traversedFloor,
+    )).toEqual({
+      cursor: olderFloor,
+      traversedFloor: olderFloor,
+      rewound: true,
+    });
   });
 });
 
