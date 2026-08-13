@@ -51,6 +51,7 @@ from app.resident_conversation_scope import (
     RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY,
     RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY,
 )
+from app.project_message_creation import lock_project_and_next_message_sequence
 from app.session_message_handoff import handoff_session_messages
 from app.time_utils import _utcnow
 
@@ -660,21 +661,15 @@ async def test_resident_poll_applies_durable_session_floor_to_null_session_rows(
     client: AsyncClient, db_session
 ):
     project, task = await _make_resident_poll_worker(db_session)
-    resident = dict(project.vision["_resident_strategic_session"])
-    resident[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY] = 100
-    project.vision = {
-        **project.vision,
-        "_resident_strategic_session": resident,
-    }
-    flag_modified(project, "vision")
-    db_session.add(project)
-    await db_session.commit()
     predecessor_claim_id = uuid.uuid4()
     predecessor_incarnation = uuid.uuid4()
     predecessor_claim_context = {
         "_conversation_public_reply_owner": "fast",
         "_conversation_claim_idempotency_key": "predecessor-shared-turn",
     }
+    legacy_activity_sequence = await lock_project_and_next_message_sequence(
+        db_session, project.id
+    )
     legacy_activity = await _add_message(
         db_session,
         project,
@@ -683,7 +678,7 @@ async def test_resident_poll_applies_durable_session_floor_to_null_session_rows(
         message_type=MessageType.BUG_REPORT,
         surface=MessageSurface.ACTIVITY,
         content="legacy activity bug report remains visible",
-        sequence=97,
+        sequence=legacy_activity_sequence,
         resident_session_id="resident-predecessor",
         created_at=_BASE - timedelta(seconds=1),
         handling_state=MessageHandlingState.CLAIMED,
@@ -695,6 +690,9 @@ async def test_resident_poll_applies_durable_session_floor_to_null_session_rows(
         conversation_claim_attempt=1,
         context=predecessor_claim_context,
     )
+    own_pre_floor_sequence = await lock_project_and_next_message_sequence(
+        db_session, project.id
+    )
     own_pre_floor = await _add_message(
         db_session,
         project,
@@ -703,9 +701,12 @@ async def test_resident_poll_applies_durable_session_floor_to_null_session_rows(
         message_type=MessageType.NOTE,
         surface=MessageSurface.CONVERSATION,
         content="intentionally rebound predecessor input",
-        sequence=98,
+        sequence=own_pre_floor_sequence,
         resident_session_id="resident-session",
         created_at=_BASE,
+    )
+    legacy_null_sequence = await lock_project_and_next_message_sequence(
+        db_session, project.id
     )
     legacy_null = await _add_message(
         db_session,
@@ -715,7 +716,7 @@ async def test_resident_poll_applies_durable_session_floor_to_null_session_rows(
         message_type=MessageType.NOTE,
         surface=MessageSurface.CONVERSATION,
         content="legacy null-session backlog",
-        sequence=99,
+        sequence=legacy_null_sequence,
         resident_session_id=None,
         created_at=_BASE + timedelta(seconds=1),
         handling_state=MessageHandlingState.CLAIMED,
@@ -727,6 +728,9 @@ async def test_resident_poll_applies_durable_session_floor_to_null_session_rows(
         conversation_claim_attempt=1,
         context=predecessor_claim_context,
     )
+    current_null_sequence = await lock_project_and_next_message_sequence(
+        db_session, project.id
+    )
     current_null = await _add_message(
         db_session,
         project,
@@ -735,9 +739,12 @@ async def test_resident_poll_applies_durable_session_floor_to_null_session_rows(
         message_type=MessageType.NOTE,
         surface=MessageSurface.CONVERSATION,
         content="current-session null input",
-        sequence=100,
+        sequence=current_null_sequence,
         resident_session_id=None,
         created_at=_BASE + timedelta(seconds=2),
+    )
+    new_activity_sequence = await lock_project_and_next_message_sequence(
+        db_session, project.id
     )
     new_activity = await _add_message(
         db_session,
@@ -747,10 +754,30 @@ async def test_resident_poll_applies_durable_session_floor_to_null_session_rows(
         message_type=MessageType.BUG_REPORT,
         surface=MessageSurface.ACTIVITY,
         content="new activity after resident restart",
-        sequence=101,
+        sequence=new_activity_sequence,
         resident_session_id=None,
         created_at=_BASE + timedelta(seconds=3),
     )
+
+    # Use the production allocator so PostgreSQL's compatibility trigger and
+    # SQLite preserve the same ordering. Anchor the floor to the canonical row
+    # actually stored to exercise both pre-floor and inclusive-boundary paths.
+    assert legacy_activity.sequence is not None
+    assert own_pre_floor.sequence is not None
+    assert legacy_null.sequence is not None
+    assert current_null.sequence is not None
+    assert legacy_activity.sequence < current_null.sequence
+    assert own_pre_floor.sequence < current_null.sequence
+    assert legacy_null.sequence < current_null.sequence
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident[RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY] = current_null.sequence
+    project.vision = {
+        **project.vision,
+        "_resident_strategic_session": resident,
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
 
     changed = await handoff_session_messages(
         db_session, project.id, "resident-predecessor"
