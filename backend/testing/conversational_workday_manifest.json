@@ -181,7 +181,24 @@
       "test_ids": [
         "appends --input-format stream-json and keeps stdin piped",
         "sendTurn writes a user NDJSON line and resolves on the top-level result",
-        "classifies provider rate limits from bounded stderr evidence"
+        "classifies provider rate limits from bounded stderr evidence",
+        "allows foreground Fast without append support while identity-bound Workday stays fail-closed"
+      ]
+    },
+    {
+      "path": "scripts/test_runner_isolation.py",
+      "reason": "Protects the exact bwrap provider-CLI boundary used by conversational Workday. Host CLI evidence must not admit a runner whose sandbox PATH resolves a shadow Claude without the required Resident identity flags.",
+      "test_ids": [
+        "test_host_selected_provider_cli_precedes_legacy_node_directory",
+        "test_agent_plan_probe_uses_exact_bwrap_boundary",
+        "test_agent_plan_probe_reports_sandbox_missing_resident_flag"
+      ]
+    },
+    {
+      "path": "scripts/test_local_runner.py",
+      "reason": "Protects heartbeat admission proof through the exact bwrap Agent plan before a conversational Workday session is assigned to a runner.",
+      "test_ids": [
+        "test_bwrap_backend_probes_the_exact_agent_plan_when_available"
       ]
     },
     {
@@ -419,6 +436,8 @@
         "revalidates an existing claim before retrying the provider turn",
         "waits through retryable legacy grace without publishing loser helpers",
         "publishes a ready waiting state before entering the conversational loop",
+        "completes a preserved Fast turn after resolved workspace prep before Workday identity launch fails",
+        "does not start a Fast foreground child for a resolved workspace with no Fast message",
         "completes Fast with autonomous authority lapsed while workspace preparation is unresolved",
         "finishes a claimed cold Fast response when clone becomes ready during slow prompt materialization",
         "does not start cold Fast while an active call survives an omitted heartbeat projection",

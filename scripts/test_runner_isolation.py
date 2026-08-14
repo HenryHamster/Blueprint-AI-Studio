@@ -1015,6 +1015,44 @@ class TestAgentPlan(unittest.TestCase):
         self.assertIn(verification_toolchain.root, plan.argv)
         self.assertNotIn(iso.PROJECT_VERIFICATION_VENV, plan.argv)
 
+    def test_host_selected_provider_cli_precedes_legacy_node_directory(self):
+        verification_toolchain = iso.VerificationToolchain(
+            python_path="/opt/provisioned-venv/bin/python",
+            postgres_bindir="/opt/provisioned-postgres/bin",
+        )
+        selected = {
+            "claude": "/managed/bin/claude",
+            "node": "/legacy-node/bin/node",
+            "git": "/usr/bin/git",
+            "bash": "/usr/bin/bash",
+            "sh": "/usr/bin/sh",
+        }
+        source_path = os.pathsep.join(("/managed/bin", "/legacy-node/bin", "/usr/bin"))
+        with mock.patch.object(
+            iso.shutil,
+            "which",
+            side_effect=lambda name, path=None: selected.get(name),
+        ):
+            plan = iso.plan_agent_execution(
+                caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+                agent_binary=["node", "/opt/agent/dist/index.js"],
+                workspace_host="/tmp/ws/provider-precedence",
+                injected_env={"TASK_ID": "provider-precedence"},
+                source_env={"PATH": source_path},
+                verification_toolchain=verification_toolchain,
+            )
+
+        path_dirs = plan.env["PATH"].split(":")
+        self.assertLess(
+            path_dirs.index(os.path.dirname(verification_toolchain.python_path)),
+            path_dirs.index("/managed/bin"),
+        )
+        self.assertLess(
+            path_dirs.index(verification_toolchain.postgres_bindir),
+            path_dirs.index("/managed/bin"),
+        )
+        self.assertLess(path_dirs.index("/managed/bin"), path_dirs.index("/legacy-node/bin"))
+
     def test_decline_without_bwrap(self):
         plan = iso.plan_agent_execution(
             caps=_caps(docker_usable=True),
@@ -1881,6 +1919,63 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertTrue(result["claude"]["resident_ready"])
         self.assertIn("0.144.1", result["codex"]["version"])
         self.assertIn("0.2.0", result["gemini"]["version"])
+
+    def test_agent_plan_probe_uses_exact_bwrap_boundary(self):
+        plan = iso.ExecutionPlan(
+            backend=iso.BACKEND_BWRAP,
+            argv=["/usr/bin/bwrap", "--tmpfs", "/home", "--", "node", "/agent/index.js"],
+            env={"PATH": "/sandbox/bin", "HOME": "/home"},
+        )
+
+        def fake_run(args, **kwargs):
+            if args[-2:] == ["-c", "command -v claude"]:
+                output = "/sandbox/bin/claude\n"
+            elif args[-2:] == ["-c", "command -v codex"]:
+                output = "/sandbox/bin/codex\n"
+            elif args[-2:] == ["-c", "command -v gemini"]:
+                output = "/sandbox/bin/gemini\n"
+            elif args[-1] == "--help":
+                output = "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
+            elif args[-2].endswith("codex"):
+                output = "codex-cli 0.144.1\n"
+            else:
+                output = "cli 1.0.0\n"
+            return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run) as run:
+            result = iso.probe_agent_plan_llm_clis(plan)
+
+        self.assertTrue(result["claude"]["resident_ready"])
+        self.assertEqual(result["claude"]["boundary"], "agent_bwrap")
+        self.assertEqual(result["claude"]["executable"], "/sandbox/bin/claude")
+        self.assertEqual(run.call_count, 7)
+        for call in run.call_args_list:
+            self.assertEqual(call.args[0][:4], plan.argv[:4])
+            self.assertEqual(call.kwargs["env"], plan.env)
+
+    def test_agent_plan_probe_reports_sandbox_missing_resident_flag(self):
+        plan = iso.ExecutionPlan(
+            backend=iso.BACKEND_BWRAP,
+            argv=["bwrap", "--", "node", "/agent/index.js"],
+            env={"PATH": "/sandbox/bin", "HOME": "/home"},
+        )
+
+        def fake_run(args, **_kwargs):
+            if args[-2:] == ["-c", "command -v claude"]:
+                return subprocess.CompletedProcess(args, 0, "/sandbox/bin/claude\n", "")
+            if args[-2:] == ["-c", "command -v codex"] or args[-2:] == ["-c", "command -v gemini"]:
+                return subprocess.CompletedProcess(args, 1, "", "")
+            if args[-1] == "--help":
+                return subprocess.CompletedProcess(args, 0, "--input-format --mcp-config --strict-mcp-config --allowedTools", "")
+            return subprocess.CompletedProcess(args, 0, "claude 2.1.232\n", "")
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            result = iso.probe_agent_plan_llm_clis(plan)
+
+        self.assertTrue(result["claude"]["healthy"])
+        self.assertFalse(result["claude"]["resident_ready"])
+        self.assertEqual(result["claude"]["missing_resident_flags"], ["--append-system-prompt"])
+        self.assertFalse(result["codex"]["present"])
 
     def test_explicit_probe_environment_is_used_for_every_version_process(self):
         safe_env = {"PATH": "/safe/bin", "HOME": "/safe/home"}
