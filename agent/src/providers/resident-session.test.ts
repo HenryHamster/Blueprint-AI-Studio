@@ -247,6 +247,34 @@ describe('startResidentClaudeSession', () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  it('allows foreground Fast without append support while identity-bound Workday stays fail-closed', () => {
+    vi.mocked(probeClaudeCapabilities).mockReturnValue(
+      new Set(['--input-format']),
+    );
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const fast = startResidentClaudeSession({
+      foregroundLaunch: {
+        command: 'claude',
+        args: [
+          '-p', '--output-format', 'stream-json', '--verbose',
+          '--input-format', 'stream-json',
+        ],
+        env: { PATH: '/foreground/bin', HOME: '/foreground/home' },
+        cwd: '/foreground',
+      },
+    });
+    const [, fastArgs] = vi.mocked(spawn).mock.calls[0] as unknown as [string, string[]];
+    expect(fastArgs).toContain('--input-format');
+    expect(fastArgs).not.toContain('--append-system-prompt');
+    fast.close();
+
+    expect(() => startResidentClaudeSession({
+      appendSystemPrompt: 'canonical resident identity',
+    })).toThrow(/--append-system-prompt/);
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
   it('refuses a known Claude CLI without streaming input support', () => {
     vi.mocked(probeClaudeCapabilities).mockReturnValueOnce(new Set(['--effort']));
     expect(() => startResidentClaudeSession({})).toThrow(/--input-format/);

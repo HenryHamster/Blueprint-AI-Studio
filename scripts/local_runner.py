@@ -3976,6 +3976,11 @@ def _agent_image_identity(agent_image: str) -> str | None:
 def _probe_llm_clis_for_agent_backend(
     agent_backend: str | None,
     agent_image: str | None,
+    *,
+    caps: "iso.Capabilities | None" = None,
+    agent_binary: list[str] | None = None,
+    workspace_root: str | None = None,
+    verification_toolchain: "iso.VerificationToolchain | None" = None,
 ) -> tuple[str, dict[str, dict]]:
     """Probe the CLI environment that the advertised agent backend will use."""
     if agent_backend == iso.BACKEND_DOCKER and agent_image:
@@ -4008,6 +4013,33 @@ def _probe_llm_clis_for_agent_backend(
                 {name: dict(info) for name, info in probed.items()},
             )
         return source, probed
+    if agent_backend == iso.BACKEND_BWRAP and caps is not None and agent_binary:
+        checkout_sha = _agent_binary_checkout_sha(agent_binary) or "unknown"
+        source = f"bwrap:{agent_binary[-1]}@{checkout_sha}"
+        try:
+            probe_parent = (
+                workspace_root
+                if workspace_root and os.path.isdir(workspace_root)
+                else None
+            )
+            with tempfile.TemporaryDirectory(
+                prefix="blueprint-cli-boundary-", dir=probe_parent
+            ) as workspace:
+                plan = iso.plan_agent_execution(
+                    caps=caps,
+                    agent_binary=agent_binary,
+                    workspace_host=workspace,
+                    injected_env={"TASK_ID": "runner-cli-capability-probe"},
+                    source_env=_cli_subprocess_env(),
+                    task_type="strategic_review",
+                    agent_image=None,
+                    verification_toolchain=verification_toolchain,
+                )
+                return source, iso.probe_agent_plan_llm_clis(plan)
+        except Exception:  # noqa: BLE001 -- heartbeat evidence fails closed
+            return source, iso.probe_agent_plan_llm_clis(
+                iso.ExecutionPlan.decline("agent_boundary_probe_setup_failed")
+            )
     return "host", iso.probe_llm_clis(env=_cli_subprocess_env())
 
 
@@ -4159,6 +4191,7 @@ def _heartbeat_loop(
     verification_state: _VerificationToolchainState | None = None,
     resource_ledger: "_ResourceLedger | None" = None,
     gpu_state: dict | None = None,
+    agent_binary: list[str] | None = None,
 ) -> None:
     url = f"{orchestrator_url}/api/runner/heartbeat"
     has_gpu = bool(gpu_capabilities.get("has_gpu"))
@@ -4323,7 +4356,12 @@ def _heartbeat_loop(
                 backend_inventories: dict[str, dict[str, dict]] = {}
                 for label, backend in probe_targets:
                     _cli_source, probed_clis = _probe_llm_clis_for_agent_backend(
-                        backend, agent_image
+                        backend,
+                        agent_image,
+                        caps=caps if backend == iso.BACKEND_BWRAP else None,
+                        agent_binary=agent_binary,
+                        workspace_root=workspace_root,
+                        verification_toolchain=_current_verification_toolchain(),
                     )
                     backend_inventories[label] = _stabilize_llm_cli_probe(
                         _cli_source,
@@ -9053,6 +9091,7 @@ def main() -> None:
             "verification_state": verification_state,
             "resource_ledger": resource_ledger,
             "gpu_state": gpu_state,
+            "agent_binary": agent_binary,
         },
         daemon=True,
     )

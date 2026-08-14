@@ -594,6 +594,128 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(statusAtLoopEntry).toBe('Resident ready — waiting for operator input');
   });
 
+  it('completes a preserved Fast turn after resolved workspace prep before Workday identity launch fails', async () => {
+    const operatorMessage = {
+      id: 'settled-workspace-preserved-fast',
+      content: 'Answer this preserved message before trying to start Workday.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    mockPrepareWorkspaceForRole.mockImplementationOnce(async () => {
+      await Promise.resolve();
+    });
+    let messageOpen = true;
+    const lifecycle: string[] = [];
+    mockApiGet.mockImplementation((url: string) => Promise.resolve(
+      url.includes('/messages?') && messageOpen
+        ? { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] }
+        : { messages: [], fast_message_ids: [] },
+    ));
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true,
+          lease: { lease_id: 'settled-workspace-fast-lease', generation: 11 },
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        return Promise.resolve({
+          claim_id: 'settled-workspace-fast-claim',
+          owner: 'fast',
+          message_ids: [operatorMessage.id],
+          envelope: typedEnvelope(operatorMessage.content, 311),
+        });
+      }
+      if (url.endsWith('/conversation/turns/complete')) {
+        lifecycle.push('fast-complete');
+        messageOpen = false;
+        return Promise.resolve({ status: 'completed' });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) {
+        return Promise.resolve({ released: true });
+      }
+      return Promise.resolve({});
+    });
+    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
+      receipt,
+      result: turnResult(),
+      completion: { receipt, content: 'The preserved Fast response is complete.' },
+      workdayRequests: [],
+    }));
+    const identityFailure = new Error(
+      'resident identity requires Claude --append-system-prompt support',
+    );
+    mockStartSession.mockImplementation(() => {
+      lifecycle.push('workday-start');
+      throw identityFailure;
+    });
+
+    const failure = await run('settled-workspace-preserved-fast', {
+      ...qualifiedPayload(),
+      // The message arrived after task payload construction; the live poll,
+      // not this stale spawn-time count, is authoritative.
+      open_message_count: 0,
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBe(identityFailure);
+    expect(lifecycle).toEqual(['fast-complete', 'workday-start']);
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
+    expect(mockApiPost.mock.calls.filter(([url]) =>
+      url.endsWith('/conversation/turns/complete'))).toHaveLength(1);
+    expect(mockApiPost.mock.calls.filter(([url]) =>
+      url.endsWith('/conversation/turns/abandon'))).toHaveLength(0);
+  });
+
+  it('does not start a Fast foreground child for a resolved workspace with no Fast message', async () => {
+    mockPrepareWorkspaceForRole.mockImplementationOnce(async () => {
+      await Promise.resolve();
+    });
+    let settledFastPolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) settledFastPolls += 1;
+      return Promise.resolve({ messages: [], fast_message_ids: [] });
+    });
+    let leaseAcquireCount = 0;
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) leaseAcquireCount += 1;
+      return Promise.resolve({});
+    });
+    const identityFailure = new Error(
+      'resident identity requires Claude --append-system-prompt support',
+    );
+    mockStartSession.mockImplementation(() => { throw identityFailure; });
+
+    const failure = await run('settled-workspace-no-fast-message', {
+      ...qualifiedPayload(),
+      open_message_count: 0,
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBe(identityFailure);
+    expect(settledFastPolls).toBe(1);
+    expect(leaseAcquireCount).toBe(0);
+    expect(typedFastMocks.construct).not.toHaveBeenCalled();
+    expect(typedFastMocks.ensureReady).not.toHaveBeenCalled();
+    expect(mockStartSession).toHaveBeenCalledTimes(1);
+  });
+
   it('completes Fast with autonomous authority lapsed while workspace preparation is unresolved', async () => {
     const operatorMessage = {
       id: 'cold-fast-before-clone',
@@ -1426,6 +1548,9 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     mockApiGet.mockImplementation((url: string) => {
       if (url.includes('/messages?')) {
         messagePolls += 1;
+        if (messagePolls === 1) {
+          return Promise.resolve({ messages: [], fast_message_ids: [] });
+        }
         return Promise.resolve({ messages: [operatorMessage], fast_message_ids: [operatorMessage.id] });
       }
       return Promise.resolve({ messages: [] });
@@ -1655,6 +1780,9 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     mockApiGet.mockImplementation((url: string) => {
       if (url.includes('/messages?')) {
         messagePolls += 1;
+        if (messagePolls === 1) {
+          return Promise.resolve({ messages: [], fast_message_ids: [] });
+        }
         return Promise.resolve({ messages: [operatorMessage], fast_message_ids: [operatorMessage.id] });
       }
       return Promise.resolve({ messages: [] });
@@ -2170,11 +2298,14 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       get value() { return currentStatus; },
       set value(value: string) { currentStatus = value; statusChanges.push(value); },
     };
-    mockApiGet.mockImplementation((url: string) => Promise.resolve(
-      url.includes('/messages?') && !abandoned
-        ? { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] }
-        : { messages: [] },
-    ));
+    let messagePolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?') || abandoned) return Promise.resolve({ messages: [] });
+      messagePolls += 1;
+      return Promise.resolve(messagePolls === 1
+        ? { messages: [], fast_message_ids: [] }
+        : { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] });
+    });
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('/strategic-session/heartbeat')) return Promise.resolve({ authority_held: true });
       if (url.endsWith('/typed-fast-lease/acquire')) {
@@ -2308,11 +2439,14 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     let workdayAlive = true;
     let claimCount = 0;
     const releaseReasons: unknown[] = [];
-    mockApiGet.mockImplementation((url: string) => Promise.resolve(
-      url.includes('/messages?') && !abandoned
-        ? { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] }
-        : { messages: [] },
-    ));
+    let messagePolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?') || abandoned) return Promise.resolve({ messages: [] });
+      messagePolls += 1;
+      return Promise.resolve(messagePolls === 1
+        ? { messages: [], fast_message_ids: [] }
+        : { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] });
+    });
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('/strategic-session/heartbeat')) return Promise.resolve({ authority_held: true });
       if (url.endsWith('/typed-fast-lease/acquire')) {
@@ -2826,11 +2960,14 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     let completed = false;
     const claimBodies: Array<Record<string, unknown> | undefined> = [];
     const claimTimes: number[] = [];
-    mockApiGet.mockImplementation((url: string) => Promise.resolve(
-      url.includes('/messages?') && !completed
-        ? { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] }
-        : { messages: [] },
-    ));
+    let messagePolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?') || completed) return Promise.resolve({ messages: [] });
+      messagePolls += 1;
+      return Promise.resolve(messagePolls === 1
+        ? { messages: [], fast_message_ids: [] }
+        : { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] });
+    });
     const canonicalEnvelope = {
       version: 2,
       project_id: '11111111-1111-4111-8111-111111111111',
@@ -3285,12 +3422,15 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         })),
       },
     };
-    let fastDelivered = false;
+    let messagePolls = 0;
     let publishWorkdayAdvancing = () => undefined;
     mockApiGet.mockImplementation((url: string) => {
       if (!url.includes('/messages?')) return Promise.resolve(null);
-      if (!fastDelivered) {
-        fastDelivered = true;
+      messagePolls += 1;
+      if (messagePolls === 1) {
+        return Promise.resolve({ messages: [], fast_message_ids: [], claim_required: true });
+      }
+      if (messagePolls === 2) {
         publishWorkdayAdvancing();
         return Promise.resolve({
           messages: [fastMessage],
@@ -3576,12 +3716,19 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       messagePolls += 1;
       if (messagePolls === 1) {
         return Promise.resolve({
-          messages: [legacyMessage],
+          messages: [],
           fast_message_ids: [],
           claim_required: true,
         });
       }
       if (messagePolls === 2) {
+        return Promise.resolve({
+          messages: [legacyMessage],
+          fast_message_ids: [],
+          claim_required: true,
+        });
+      }
+      if (messagePolls === 3) {
         return Promise.resolve({
           messages: [fastMessage],
           fast_message_ids: [fastMessage.id],
