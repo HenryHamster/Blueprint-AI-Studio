@@ -1504,6 +1504,36 @@ def tool_dirs_for(paths: list[str]) -> list[str]:
     return dirs
 
 
+def selected_tool_dirs_for(
+    names: tuple[str, ...], source_env: dict[str, str]
+) -> list[str]:
+    """Return host-selected tool directories in original PATH precedence.
+
+    ``resolve_tools`` is ordered by requested tool name and records real paths
+    before shims. That is correct for read-only binds, but wrong for PATH: a
+    directory selected for ``node`` can contain an older ``claude`` and shadow
+    the managed Claude shim that ``shutil.which`` chose on the host. Preserve
+    the source PATH order for the provider CLI directories, then append their
+    real-entry directories only as a fallback.
+    """
+    source_path = source_env.get("PATH") or ""
+    found: list[str] = []
+    for name in names:
+        selected = shutil.which(name, path=source_path)
+        if selected and selected not in found:
+            found.append(selected)
+    selected_dirs = {os.path.dirname(path) for path in found if os.path.dirname(path)}
+    ordered: list[str] = []
+    for directory in source_path.split(os.pathsep):
+        if directory in selected_dirs and directory not in ordered:
+            ordered.append(directory)
+    for path in found:
+        for directory in (os.path.dirname(path), os.path.dirname(os.path.realpath(path))):
+            if directory and directory not in ordered:
+                ordered.append(directory)
+    return ordered
+
+
 def npm_tool_roots(paths: list[str]) -> list[str]:
     """Package roots needed by npm-managed CLIs inside bwrap.
 
@@ -1889,6 +1919,110 @@ class ExecutionPlan:
         return cls(backend=DECLINE, declined=True, decline_reason=reason)
 
 
+def probe_agent_plan_llm_clis(plan: ExecutionPlan) -> dict[str, dict]:
+    """Probe provider CLIs inside the exact planned bwrap agent boundary.
+
+    Host ``PATH``/``HOME`` evidence is not sufficient for a bwrap runner: the
+    task receives a rebuilt PATH, a tmpfs HOME, and only explicitly bound tool
+    roots. Reuse the immutable bwrap prefix and environment from the real agent
+    plan, replacing only its terminal command, so heartbeat eligibility matches
+    the boundary that will consume it.
+    """
+    unavailable_reason = plan.decline_reason or "agent_boundary_unavailable"
+    if plan.declined or plan.backend != BACKEND_BWRAP:
+        return {
+            name: (
+                _with_claude_resident_capabilities(
+                    _unavailable_llm_cli(unavailable_reason),
+                    None,
+                    failure_reason=unavailable_reason,
+                )
+                if name == "claude"
+                else _unavailable_llm_cli(unavailable_reason)
+            )
+            for name in _LLM_CLI_NAMES
+        }
+    try:
+        separator = len(plan.argv) - 1 - list(reversed(plan.argv)).index("--")
+    except ValueError:
+        return probe_agent_plan_llm_clis(
+            ExecutionPlan.decline("unexpected_agent_boundary")
+        )
+
+    prefix = list(plan.argv[: separator + 1])
+    result: dict[str, dict] = {}
+    for name in _LLM_CLI_NAMES:
+        try:
+            located = subprocess.run(
+                [*prefix, "/bin/sh", "-c", f"command -v {name}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=plan.env,
+            )
+            located_lines = (located.stdout or "").strip().splitlines()
+            executable = located_lines[0] if located_lines else ""
+            if located.returncode != 0 or not executable:
+                result[name] = _unavailable_llm_cli("not_found")
+                if name == "claude":
+                    result[name] = _with_claude_resident_capabilities(
+                        result[name], None, failure_reason="not_found"
+                    )
+                continue
+            version = subprocess.run(
+                [*prefix, executable, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=plan.env,
+            )
+            result[name] = _llm_cli_result(name, version)
+            result[name]["boundary"] = "agent_bwrap"
+            result[name]["executable"] = executable
+            if name == "claude":
+                if result[name].get("healthy") is not True:
+                    result[name] = _with_claude_resident_capabilities(
+                        result[name], None, failure_reason=result[name].get("reason")
+                    )
+                else:
+                    try:
+                        help_result = subprocess.run(
+                            [*prefix, executable, "--help"],
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                            env=plan.env,
+                        )
+                        result[name] = _with_claude_resident_capabilities(
+                            result[name], help_result
+                        )
+                    except subprocess.TimeoutExpired:
+                        result[name] = _with_claude_resident_capabilities(
+                            result[name], None, failure_reason="help_probe_timeout"
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        result[name] = _with_claude_resident_capabilities(
+                            result[name], None, failure_reason="help_probe_error"
+                        )
+        except subprocess.TimeoutExpired:
+            result[name] = _unavailable_llm_cli(
+                "version_probe_timeout", executable_found=True
+            )
+            if name == "claude":
+                result[name] = _with_claude_resident_capabilities(
+                    result[name], None, failure_reason="version_probe_timeout"
+                )
+        except (OSError, subprocess.SubprocessError):
+            result[name] = _unavailable_llm_cli(
+                "version_probe_error", executable_found=True
+            )
+            if name == "claude":
+                result[name] = _with_claude_resident_capabilities(
+                    result[name], None, failure_reason="version_probe_error"
+                )
+    return result
+
+
 # ── Plan orchestrators (pure given resolved host paths) ──────────────────────
 
 # Tools an agent task needs resolvable inside the sandbox (provider CLIs + git).
@@ -2048,6 +2182,7 @@ def plan_agent_execution(
         verification_root,
         *npm_tool_roots(tools),
     ]
+    provider_tool_dirs = selected_tool_dirs_for(_LLM_CLI_NAMES, source_env)
     tool_dirs = [
         os.path.dirname(verification_toolchain.python_path)
         if verification_toolchain is not None
@@ -2058,6 +2193,7 @@ def plan_agent_execution(
         tool_dirs += [verification_toolchain.postgres_bindir]
         verification_injected = {"BLUEPRINT_SANDBOX_PYTHON": verification_toolchain.python_path,
                                  "BLUEPRINT_SANDBOX_PG_BINDIR": verification_toolchain.postgres_bindir}
+    tool_dirs += provider_tool_dirs
     tool_dirs += tool_dirs_for(tools)
 
     env = build_agent_env(

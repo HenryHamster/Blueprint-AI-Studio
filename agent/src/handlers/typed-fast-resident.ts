@@ -65,6 +65,12 @@ const FAST_WORKDAY_DELEGATION_COMMITMENT = /\b(?:i(?:'ll| will|'m going to| am g
 // the service" without treating an ordinary task-list discussion as a launch.
 const FAST_MANAGED_TASK_DELEGATION_COMMITMENT = /\b(?:i(?:'ll| will|'m going to| am going to)|let me)\s+(?:now\s+)?(?:route|create|open|launch|start|spawn|queue)\s+(?:(?:a|an|the|this|that|your)\s+)?(?:task|job|request)\b(?=[^.!?\n]{0,140}\b(?:edit|delete|remove|modify|patch|rewrite|commit|push|merge|deploy|revert|reset|rename|change|configure|update|fix|implement|fast[-\s]?forward)\b[^.!?\n]{0,100}\b(?:code|configuration|config|setting|knob|entr(?:y|ies)|file|branch|commit|pull request|pr|deployment|service|database|schema|migration|repository|repo|main|default\s+branch)\b)/i;
 
+// A direct task/job/request object is itself evidence that the claimed handoff
+// already happened. Require the object to end there (or continue with a
+// purpose clause) so compound prose such as "task list" and "job description"
+// remains ordinary strategist language.
+const FAST_PAST_DIRECT_OBJECT_DELEGATION_COMMITMENT = /\b(?:i(?:['’]ve| have)|i)\s+(?:(?:already|just)\s+)?(?:routed|created|opened|launched|started|spawned|queued(?:\s+up)?)\s+(?:(?:a|an|the|this|that|another|my|your|our)\s+)?(?:(?:new|follow-up|separate|dedicated)\s+)?(?:(?:blueprint|workday)\s+)?(?:(?:task|job)\b(?=\s*(?:(?:to|for)\b|[.!?,;:]|$))|request\b(?=\s*(?:to\b|for\b(?!\s+(?:(?:your|my|our|the|some|more)\s+)?(?:clarification|feedback|input|comments?|details)\b)|[.!?,;:]|$)))/i;
+
 // Present-perfect delegation claims are commitments too. In particular, a
 // reply such as "I've routed the removal as a task" tells the operator that a
 // durable handoff already exists; it must be backed by a request staged during
@@ -224,6 +230,7 @@ function claimsWorkdayDelegation(content: string): boolean {
   const normalized = normalizeRoleClassifierText(content);
   return FAST_WORKDAY_DELEGATION_COMMITMENT.test(normalized)
     || FAST_MANAGED_TASK_DELEGATION_COMMITMENT.test(normalized)
+    || FAST_PAST_DIRECT_OBJECT_DELEGATION_COMMITMENT.test(normalized)
     || FAST_PAST_WORKDAY_DELEGATION_COMMITMENT.test(normalized)
     || FAST_FUTURE_WORKDAY_CONSULTATION_COMMITMENT.test(normalized)
     || FAST_ACTIVE_WORKDAY_CONSULTATION_COMMITMENT.test(normalized)

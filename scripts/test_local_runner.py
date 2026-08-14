@@ -405,6 +405,39 @@ class TestLlmCliBackendProbe(unittest.TestCase):
         )
         container_probe.assert_not_called()
 
+    def test_bwrap_backend_probes_the_exact_agent_plan_when_available(self):
+        caps = iso.Capabilities(bwrap_path="/usr/bin/bwrap", userns_ok=True)
+        binary = ["node", "/agent/dist/index.js"]
+        planned = iso.ExecutionPlan(
+            backend=iso.BACKEND_BWRAP,
+            argv=["bwrap", "--", *binary],
+            env={"PATH": "/sandbox/bin", "HOME": "/home"},
+        )
+        boundary_health = _healthy_llm_clis()
+        with tempfile.TemporaryDirectory() as workspace_root, patch.object(
+            local_runner, "_agent_binary_checkout_sha", return_value="a" * 40
+        ), patch.object(
+            iso, "plan_agent_execution", return_value=planned
+        ) as planner, patch.object(
+            iso, "probe_agent_plan_llm_clis", return_value=boundary_health
+        ) as boundary_probe, patch.object(
+            iso, "probe_llm_clis", return_value=_broken_codex_llm_clis()
+        ) as host_probe:
+            source, result = local_runner._probe_llm_clis_for_agent_backend(
+                iso.BACKEND_BWRAP,
+                "registry/agent:not-selected",
+                caps=caps,
+                agent_binary=binary,
+                workspace_root=workspace_root,
+            )
+
+        self.assertEqual(source, f"bwrap:/agent/dist/index.js@{'a' * 40}")
+        self.assertIs(result, boundary_health)
+        self.assertEqual(planner.call_args.kwargs["task_type"], "strategic_review")
+        self.assertEqual(planner.call_args.kwargs["agent_image"], None)
+        boundary_probe.assert_called_once_with(planned)
+        host_probe.assert_not_called()
+
     def _hybrid_heartbeat(self, *, host_health, image_health):
         posted = []
 

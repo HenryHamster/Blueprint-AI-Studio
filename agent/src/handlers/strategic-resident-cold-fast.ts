@@ -239,9 +239,11 @@ function projectFastMessages(response: MessagesPollResponse): ResidentInboundMes
 }
 
 /**
- * Run the restricted typed lane while the repository clone is unresolved.
- * The function returns only after every known public claim has a server-
- * confirmed terminal disposition, so the later Workday process cannot race it.
+ * Run the restricted typed lane while the repository clone is unresolved, or
+ * drain one already-open Fast turn when preparation settled before this lane
+ * received control. The function returns only after every known public claim
+ * has a server-confirmed terminal disposition, so the later Workday process
+ * cannot race it.
  */
 export async function runCheckoutIndependentFastStartup(
   options: CheckoutIndependentFastStartupOptions,
@@ -270,10 +272,17 @@ export async function runCheckoutIndependentFastStartup(
     () => { workspaceResult = { status: 'ready' }; },
     (error: unknown) => { workspaceResult = { status: 'failed', error }; },
   );
-  // Preserve the normal path when preparation already settled.
+  // A failed preparation still fences all model work. Successful synchronous
+  // warm prep gets one bounded Fast poll below instead of skipping input that
+  // arrived after the task payload was created. The
+  // public workspace helper is an async wrapper around its implementation, so
+  // allow both its continuation and this observer to drain without waiting on
+  // genuinely asynchronous clone work.
+  await Promise.resolve();
   await Promise.resolve();
   const immediateWorkspace = currentWorkspaceResult();
-  if (immediateWorkspace !== null) {
+  const drainSettledReadyWorkspace = immediateWorkspace?.status === 'ready';
+  if (immediateWorkspace?.status === 'failed') {
     return {
       workspace: immediateWorkspace,
       stopRequested: false,
@@ -538,9 +547,13 @@ export async function runCheckoutIndependentFastStartup(
     return [...collected.values()];
   };
 
-  const monitorProvisioning = async (): Promise<void> => {
+  const monitorProvisioning = async (allowReadyWorkspace = false): Promise<void> => {
     if (!config.activated || Date.now() < nextProvisionAt) return;
     nextProvisionAt = Date.now() + TYPED_PROVISION_RETRY_MS;
+    const workspaceFencesProvisioning = (): boolean => {
+      const result = currentWorkspaceResult();
+      return result !== null && (!allowReadyWorkspace || result.status === 'failed');
+    };
     let settled = false;
     const provisioning = (async () => {
       try {
@@ -571,14 +584,14 @@ export async function runCheckoutIndependentFastStartup(
           leaseId: (rawLease as Record<string, unknown>).lease_id as string,
           generation: (rawLease as Record<string, unknown>).generation as number,
         };
-        if (currentWorkspaceResult() !== null || isStopRequested()) return;
+        if (workspaceFencesProvisioning() || isStopRequested()) return;
         controller = new ForegroundTypedController({
           adapter: config.adapter,
           model: config.model,
           effort: config.effort,
         });
         await controller.ensureReady();
-        if (currentWorkspaceResult() !== null || isStopRequested()) return;
+        if (workspaceFencesProvisioning() || isStopRequested()) return;
         ready = controller.isAlive();
         if (!ready) throw new Error('typed Fast readiness child exited');
         nextProvisionAt = 0;
@@ -601,10 +614,10 @@ export async function runCheckoutIndependentFastStartup(
     while (!provisioningSettled()) {
       await Promise.race([
         provisioning,
-        observedWorkspace,
+        ...(allowReadyWorkspace ? [] : [observedWorkspace]),
         new Promise<void>(resolve => setTimeout(resolve, CLAIM_RENEW_MS)),
       ]);
-      if (currentWorkspaceResult() !== null || isStopRequested()) {
+      if (workspaceFencesProvisioning() || isStopRequested()) {
         controller?.close();
         await provisioning;
         break;
@@ -903,7 +916,43 @@ export async function runCheckoutIndependentFastStartup(
     }
   };
 
-  while (currentWorkspaceResult() === null && !isStopRequested() && isHandoffSafe()) {
+  if (
+    drainSettledReadyWorkspace
+    && !isStopRequested()
+    && isHandoffSafe()
+    && !isCallActive()
+    && config.activated
+  ) {
+    let messages: ResidentInboundMessage[] = [];
+    try {
+      // Poll before provisioning so a quick workspace with no waiting Fast
+      // turn pays no foreground-process startup cost.
+      messages = await pollFastMessages();
+    } catch (error) {
+      sendLog(ws, `[resident] settled-workspace Fast poll failed: ${sanitize(String(error))}\n`);
+    }
+    if (messages.length > 0) {
+      await monitorProvisioning(true);
+      const exactController = currentController();
+      if (
+        isReady()
+        && exactController !== null
+        && currentLease() !== null
+        && exactController.isAlive()
+        && !isStopRequested()
+        && !isCallActive()
+      ) {
+        await dispatchClaim(messages);
+      }
+    }
+  }
+
+  while (
+    !drainSettledReadyWorkspace
+    && currentWorkspaceResult() === null
+    && !isStopRequested()
+    && isHandoffSafe()
+  ) {
     if (isCallActive()) {
       if (currentController() !== null || currentLease() !== null) {
         await closeController('cold_start_nested_call_active');
