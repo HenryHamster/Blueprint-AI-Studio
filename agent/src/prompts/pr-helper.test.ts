@@ -434,9 +434,13 @@ esac
   });
 
   it('retries PR creation on a 503 and honors Retry-After, then succeeds', async () => {
+    const taskId = `task-retry-${process.pid}`;
+    const workBranch = `blueprint/${taskId}`;
+    const attemptsPath = `/tmp/pr_attempts_${taskId}`;
+    const urlPath = `/tmp/pr_url_${taskId}`;
     const script = writeScript({
-      taskId: 'task-retry-1',
-      workBranch: 'blueprint/task-retry-1',
+      taskId,
+      workBranch,
       baseBranch: 'main',
       owner: 'acme',
       repo: 'repo',
@@ -446,10 +450,11 @@ esac
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     // Cross-process handoff files live at absolute /tmp paths (survive the temp
     // dir cleanup). Start clean so the attempt counter is authoritative.
-    realFs.rmSync('/tmp/pr_attempts_task-retry-1', { force: true });
-    realFs.rmSync('/tmp/pr_url_task-retry-1', { force: true });
+    realFs.rmSync(attemptsPath, { force: true });
+    realFs.rmSync(urlPath, { force: true });
 
-    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+    try {
+      const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
       const bin = `${dir}/bin`;
       rfs.mkdirSync(bin, { recursive: true });
       rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
@@ -463,7 +468,7 @@ case "$*" in
   *"status --porcelain"*) printf '%s\\n' '?? src/normal.txt'; exit 0 ;;
   *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
   *"remote set-url origin"*) exit 0 ;;
-  *"push --force-with-lease origin blueprint/task-retry-1"*) exit 0 ;;
+  *"push --force-with-lease origin ${workBranch}"*) exit 0 ;;
   *) exit 0 ;;
 esac
 `, { mode: 0o755 });
@@ -482,10 +487,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$ARGS" in
-  *"/api/agent/github/token?task_id=task-retry-1"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
   *"/api/agent/github/pull-requests"*)
-    N=$(cat /tmp/pr_attempts_task-retry-1 2>/dev/null || echo 0)
-    N=$((N + 1)); echo "$N" > /tmp/pr_attempts_task-retry-1
+    N=$(cat ${attemptsPath} 2>/dev/null || echo 0)
+    N=$((N + 1)); echo "$N" > ${attemptsPath}
     if [ "$N" -lt 2 ]; then
       [ -n "$DUMP" ] && printf 'HTTP/1.1 503 Service Unavailable\\r\\nRetry-After: 1\\r\\n\\r\\n' > "$DUMP"
       [ -n "$OUT" ] && printf '{"error":{"code":503}}' > "$OUT"
@@ -500,12 +505,14 @@ esac
       rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/7\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
     });
 
-    expect(result.status).toBe(0);
-    // Exactly two POSTs: the 503 (retried) and the 201 (success).
-    expect(realFs.readFileSync('/tmp/pr_attempts_task-retry-1', 'utf8').trim()).toBe('2');
-    expect(realFs.readFileSync('/tmp/pr_url_task-retry-1', 'utf8').trim()).toBe('https://github.com/acme/repo/pull/7');
-    realFs.rmSync('/tmp/pr_attempts_task-retry-1', { force: true });
-    realFs.rmSync('/tmp/pr_url_task-retry-1', { force: true });
+      expect(result.status).toBe(0);
+      // Exactly two POSTs: the 503 (retried) and the 201 (success).
+      expect(realFs.readFileSync(attemptsPath, 'utf8').trim()).toBe('2');
+      expect(realFs.readFileSync(urlPath, 'utf8').trim()).toBe('https://github.com/acme/repo/pull/7');
+    } finally {
+      realFs.rmSync(attemptsPath, { force: true });
+      realFs.rmSync(urlPath, { force: true });
+    }
   });
 
   // ── jq-free integration: the generated script must work WITHOUT jq on PATH ──
