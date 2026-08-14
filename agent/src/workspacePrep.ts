@@ -109,6 +109,10 @@ export interface PrepareWorkspaceOptions {
    * present. Shallow (depth > 0) requests never trigger the unshallow.
    */
   depth?: number;
+  /** Cold-path opt-in; restrict the clone to `branch`. Warm reuse is unchanged. */
+  singleBranch?: boolean;
+  /** Cold-path opt-in; retain history while fetching file blobs lazily. */
+  filter?: 'blob:none';
   /**
    * Review-fix lane pilot, gate-integrity guard. Lane warm-resume
    * (hard-reset to BLUEPRINT_LANE_CHECKPOINT_SHA) lane-izes ONLY the FIX
@@ -442,6 +446,8 @@ async function _prepareWorkspaceForRoleImpl(opts: PrepareWorkspaceOptions): Prom
   } else {
     cloneArgs.push('clone', '--branch', branch);
   }
+  if (opts.singleBranch === true) cloneArgs.push('--single-branch');
+  if (opts.filter) cloneArgs.push(`--filter=${opts.filter}`);
   const referenceRepo = resolveReferenceRepo(cleanRepoUrl);
   if (referenceRepo) {
     cloneArgs.push('--reference-if-able', referenceRepo);

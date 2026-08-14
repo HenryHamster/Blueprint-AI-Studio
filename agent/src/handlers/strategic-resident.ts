@@ -89,6 +89,12 @@ import {
   typedFastAbandonDispositionWithConfirmation, typedFastFailureBackoffMs,
 } from './typed-fast-resident.js';
 import {
+  buildTypedFastDispatchPrompt,
+  runCheckoutIndependentFastStartup,
+  selectTypedFastClaimMessages,
+} from './strategic-resident-cold-fast.js';
+import { monitorClaimBoundWork } from './strategic-resident-claim-monitor.js';
+import {
   buildFastResidentContextFrame, buildPrivateWorkdayContextFrame,
   verifyStrategicContextEnvelope,
   type StrategicContextEnvelopeTransport,
@@ -148,6 +154,8 @@ export interface ResidentReplyRuntimePaths {
   stagedReplyPath: string;
   privateTurnMarkerPath: string;
 }
+
+export { selectTypedFastClaimMessages } from './strategic-resident-cold-fast.js';
 
 /**
  * Keep the native reply capability outside the mutable Git checkout.
@@ -234,67 +242,6 @@ export function partitionResidentPublicReplyMessages(
     return { fast: [], workday: [...messages] };
   }
   return partitionTypedFastMessages(messages);
-}
-
-/**
- * Preserve an unknown-outcome Fast claim's exact M1 input when a later poll
- * adds M2 (or omits M1 because it is presently leased). The returned subset is
- * the only input that may reuse the stable client claim identifiers.
- */
-export function selectTypedFastClaimMessages(
-  messages: ResidentInboundMessage[],
-  pending?: {
-    messageIds: string[];
-    messages: ResidentInboundMessage[];
-  } | null,
-): ResidentInboundMessage[] | null {
-  if (!pending) {
-    // A previous Resident incarnation can leave an expired, exact Fast claim
-    // in front of newer unclaimed input.  The coordinator intentionally
-    // forbids appending the newer rows to that immutable logical turn.  Polls
-    // retain the claim idempotency marker in the internal message context, so
-    // recover the oldest marked turn by itself; the newer rows remain open and
-    // are picked up immediately after its atomic completion.
-    const oldestClaimKey = messages.find(message => (
-      typeof message.context?._conversation_claim_idempotency_key === 'string'
-      && message.context._conversation_claim_idempotency_key.trim().length > 0
-    ))?.context?._conversation_claim_idempotency_key;
-    if (typeof oldestClaimKey === 'string') {
-      const claimedMessages = messages.filter(message => (
-        message.context?._conversation_claim_idempotency_key === oldestClaimKey
-      ));
-      const groupContext = claimedMessages[0]?.context;
-      const expectedCount = groupContext?._conversation_claim_member_count;
-      const expectedIds = groupContext?._conversation_claim_message_ids;
-      if (groupContext?._conversation_claim_group_complete === false) return null;
-      if (
-        typeof expectedCount === 'number'
-        && (!Number.isInteger(expectedCount) || expectedCount !== claimedMessages.length)
-      ) return null;
-      if (Array.isArray(expectedIds)) {
-        const visibleIds = new Set(claimedMessages.map(message => message.id));
-        if (
-          expectedIds.length !== claimedMessages.length
-          || expectedIds.some(id => typeof id !== 'string' || !visibleIds.has(id))
-        ) return null;
-      }
-      return claimedMessages;
-    }
-    return messages;
-  }
-  const pageById = new Map(messages.map(message => [
-    typeof message.id === 'string' ? message.id.trim() : '',
-    message,
-  ]));
-  const selected = pending.messageIds.map(messageId => (
-    pageById.get(messageId)
-    ?? pending.messages.find(message => (
-      typeof message.id === 'string' && message.id.trim() === messageId
-    ))
-  ));
-  return selected.every((message): message is ResidentInboundMessage => message !== undefined)
-    ? selected
-    : null;
 }
 
 /** Read and authenticate the native reply tool's staged intent against this immutable turn receipt. */
@@ -732,6 +679,7 @@ export async function recloneResidentWorkspace(
     repoUrl: `https://x-access-token:${token}@github.com/${owner}/${repo}.git`,
     githubToken: token,
     branch: baseBranch, baseBranch, depth: 0,
+    singleBranch: true, filter: 'blob:none',
   });
   // Restore the refreshable credential: plain HTTPS remote + helper reading the
   // token file. Without this the re-cloned workspace keeps a token-embedded remote
@@ -886,11 +834,52 @@ export async function handleStrategicResident(
   sendLog(ws, 'Resident strategic session starting...\n');
 
   // ── Workspace + tool provisioning (mirror handleStrategic's setup) ──────────
+  // The restricted typed child has no checkout or Blueprint token. Start it
+  // immediately after exact process-incarnation admission and let it own
+  // canonical typed claims while the repository clone is still unresolved.
+  // Workday construction below remains fenced until every such claim is
+  // server-confirmed completed or abandoned.
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  await prepareWorkspaceForRole({
+  const workspacePreparation = Promise.resolve(prepareWorkspaceForRole({
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: 0,
+    singleBranch: true, filter: 'blob:none',
+  }));
+  const coldFast = await runCheckoutIndependentFastStartup({
+    taskId,
+    payload,
+    task,
+    projectId,
+    sessionId,
+    workerGeneration,
+    residentIncarnationId: residentProcessIncarnation,
+    workspacePreparation,
+    initialAdmission: initialAuthorityAdmission,
+    initialAdmissionAt: initialAuthorityAdmissionAt,
+    ws,
+    statusRef,
   });
+  initialAuthorityAdmission = coldFast.latestAdmission;
+  initialAuthorityAdmissionAt = coldFast.latestAdmissionAt;
+  if (coldFast.stopRequested) {
+    cleanupUnadmittedRuntime();
+    return;
+  }
+  if (!coldFast.handoffSafe) {
+    cleanupUnadmittedRuntime();
+    throw new Error(
+      'checkout-independent Fast claim did not reach a server-confirmed terminal disposition',
+    );
+  }
+  const workspaceResult = coldFast.workspace;
+  if (workspaceResult === null) {
+    cleanupUnadmittedRuntime();
+    throw new Error('checkout-independent Fast startup returned before workspace settlement');
+  }
+  if (workspaceResult.status === 'failed') {
+    cleanupUnadmittedRuntime();
+    throw workspaceResult.error;
+  }
 
   // A hard process/VM exit bypasses the operator turn's finally block. Clear
   // any reply key it left behind before starting a new model process; otherwise
@@ -1167,6 +1156,7 @@ export async function handleStrategicResident(
   let typedFastLease: TypedFastLeaseIdentity | null = null;
   let typedFastDispatching = false;
   let typedFastPreviousStatus: string | null = null;
+  const typedFastPendingStatus = 'Operator message received — preparing response';
   const typedFastRespondingStatus = 'Responding to operator...';
   const typedFastConfig = typedFastRuntimeConfig({
     enabled: payload.typed_fast_enabled === true,
@@ -3942,6 +3932,10 @@ export async function handleStrategicResident(
     messageIds: string[];
     incarnation: string | null;
   };
+  type TypedFastClaimSnapshot = {
+    controller: ForegroundTypedController;
+    lease: TypedFastLeaseIdentity;
+  };
   type TypedFastTurnOutcome =
     | 'completed'
     | 'deferred'
@@ -3958,7 +3952,10 @@ export async function handleStrategicResident(
       // A legacy Workday turn can finish while Fast is concurrently answering
       // a newer pure-Fast message. Restore the snapshot only if Fast still owns
       // the visible status; never clobber a newer authoritative Workday write.
-      if (statusRef.value === typedFastRespondingStatus) {
+      if (
+        statusRef.value === typedFastPendingStatus
+        || statusRef.value === typedFastRespondingStatus
+      ) {
         statusRef.value = typedFastPreviousStatus;
       }
       typedFastPreviousStatus = null;
@@ -4007,27 +4004,52 @@ export async function handleStrategicResident(
 
   const watchTypedFastTurn = async <T>(
     turnPromise: Promise<T>,
+    fastClaim: TypedFastClaimSnapshot,
     displacedWorkdayClaim: ConversationClaimSnapshot | null = null,
+    onFence?: () => void,
   ): Promise<'done' | 'fast_lost' | 'displaced_lost'> => {
-    const done = turnPromise.then(() => 'done' as const);
-    for (;;) {
-      const raced = await Promise.race([
-        done,
-        sleep(CONVERSATION_CLAIM_RENEW_MS).then(() => 'renew' as const),
-      ]);
-      if (raced === 'done') return 'done';
-      const hb = await heartbeat(false);
-      if (
-        hb?.conversation_claim_held === false
-        || hb?.stop_requested
-        || !authorityHeld
-        || !residentIncarnationHeld
-      ) return 'fast_lost';
-      if (
-        displacedWorkdayClaim !== null
-        && !await renewConversationClaimSnapshot(displacedWorkdayClaim)
-      ) return 'displaced_lost';
+    const observedLoss: { value: 'fast_lost' | 'displaced_lost' | null } = {
+      value: null,
+    };
+    const fastClaimIsCurrent = (): boolean => {
+      try {
+        return foregroundTyped === fastClaim.controller
+          && typedFastLease !== null
+          && typedFastLease.leaseId === fastClaim.lease.leaseId
+          && typedFastLease.generation === fastClaim.lease.generation
+          && !callCoordinator.suppressOrdinaryWorkday();
+      } catch {
+        return false;
+      }
+    };
+    const monitored = await monitorClaimBoundWork({
+      work: turnPromise,
+      renewEveryMs: CONVERSATION_CLAIM_RENEW_MS,
+      renew: async () => {
+        const hb = await heartbeat(false);
+        if (
+          observedLoss.value === null
+          && (
+            hb?.conversation_claim_held === false
+            || hb?.stop_requested
+            || !residentIncarnationHeld
+            || !fastClaimIsCurrent()
+          )
+        ) observedLoss.value = 'fast_lost';
+        if (
+          displacedWorkdayClaim !== null
+          && !await renewConversationClaimSnapshot(displacedWorkdayClaim)
+        ) observedLoss.value = 'displaced_lost';
+        return observedLoss.value === null;
+      },
+      onFence,
+    });
+    if (observedLoss.value === null && !fastClaimIsCurrent()) {
+      observedLoss.value = 'fast_lost';
     }
+    return monitored.fenced || observedLoss.value !== null
+      ? (observedLoss.value ?? 'fast_lost')
+      : 'done';
   };
 
   const abandonTypedFastClaim = async (claimId: string): Promise<TypedAbandonResponse> => {
@@ -4114,18 +4136,18 @@ export async function handleStrategicResident(
       .map((message) => typeof message.id === 'string' ? message.id.trim() : '')
       .filter(Boolean);
     if (pageMessageIds.length !== msgs.length || pageMessageIds.length === 0) return 'deferred';
-    // A canonical Fast-owned input is pending as soon as it passes admission,
-    // not only after the restricted child is warm and its server claim lands.
-    // Keep liveness truthful through provisioning/backoff/retry. During an
-    // overlapping legacy Workday turn, that turn's newer status remains the
-    // authoritative one and the existing CAS restore fence still applies.
+    // A canonical operator input is pending even when capacity/readiness is
+    // still warming. Keep this distinct from Responding: that stronger status
+    // begins only at provider dispatch. The CAS-style write/restore protects a
+    // newer overlapping Workday status from being clobbered.
     if (displacedWorkdayClaim === null) {
       if (typedFastPreviousStatus === null) typedFastPreviousStatus = statusRef.value;
       if (
         statusRef.value === typedFastPreviousStatus
+        || statusRef.value === typedFastPendingStatus
         || statusRef.value === typedFastRespondingStatus
       ) {
-        statusRef.value = typedFastRespondingStatus;
+        statusRef.value = typedFastPendingStatus;
       }
     }
     if (Date.now() < typedFastCircuitOpenUntil) return 'not_available';
@@ -4206,7 +4228,14 @@ export async function handleStrategicResident(
       // accepted the claim. Reconcile first, then release it explicitly before
       // allowing legacy Workday to answer; never fall through on an unknown
       // claim outcome.
-      if (!typedFastReady || Date.now() < typedFastCircuitOpenUntil) {
+      if (
+        !typedFastReady
+        || foregroundTyped === null
+        || typedFastLease === null
+        || !foregroundTyped.isAlive()
+        || callCoordinator.suppressOrdinaryWorkday()
+        || Date.now() < typedFastCircuitOpenUntil
+      ) {
         const disposition = typedFastAbandonDispositionFromResponse(
           await abandonTypedFastClaim(claimId),
         );
@@ -4229,62 +4258,45 @@ export async function handleStrategicResident(
         minimumTranscriptSequence: claimed.envelope.transcript_sequence,
       });
       const receipt = newTypedConversationReceipt(claimId, messageIds);
-      if (foregroundTyped === null) {
-        throw new Error('typed Fast is not lease-provisioned');
-      }
       const typedController = foregroundTyped;
+      const fastClaim: TypedFastClaimSnapshot = {
+        controller: typedController,
+        lease: { ...typedFastLease },
+      };
       activeConversationClaimId = claimId;
       activeConversationClaimMessageIds = [...messageIds];
       activeConversationClaimIncarnation = residentProcessIncarnation;
       unresolvedTypedFastClaimId = claimId;
-      if (typedFastPreviousStatus === null) typedFastPreviousStatus = statusRef.value;
-      statusRef.value = typedFastRespondingStatus;
-
-      // The current message text is already the terminal row in the verified
-      // canonical envelope. Only carry attachment blocks separately, avoiding a
-      // duplicate textual copy while preserving images/whiteboard artifacts.
-      const attachmentOnlyMessages = selectedMessages.map(message => ({ ...message, content: '' }));
-      const attachmentBlocks = await materializeContentBlocks(
-        combineOperatorMessages(attachmentOnlyMessages),
+      const promptPromise = buildTypedFastDispatchPrompt(
+        verified,
+        selectedMessages,
+        typedFastTranscriptSequence,
       );
-      const artifactDeliveryDeferred = selectedMessages.some(message => (
-        message.context?._server_artifact_delivery_deferred === true
-      ));
-      const promptText = [
-        buildFastResidentContextFrame(verified, typedFastTranscriptSequence),
-        '',
-        '## Active operator turn',
-        `The canonical context ends at the active operator input (sequence ${verified.envelope.transcript_sequence}).`,
-        attachmentBlocks.length > 0
-          ? 'The model input following this text contains the active turn attachments.'
-          : 'There are no separate attachment blocks for this turn.',
-        ...(artifactDeliveryDeferred ? [
-          'Recovery notice: attachments from this interrupted turn exceeded the safe delivery limit and were not included. Ask the operator to resend the relevant artifact if it is needed to answer accurately.',
-        ] : []),
-        '',
-        'You MUST use mcp__call__complete_turn exactly once with the natural public reply.',
-        'If fresh investigation is genuinely necessary, also use mcp__call__request_workday with a concise private request, but still complete this turn naturally (for example, say what you are checking). Do not emit a competing public answer in plain text.',
-        'If the operator requests code, configuration, branch, deployment, or other managed-state execution, request Workday to route it through supported Blueprint task tooling. Never promise that Fast will perform the mutation itself.',
-        'Any public promise to route, create, or hand off a Blueprint/Workday task MUST be paired with mcp__call__request_workday in this same turn. Otherwise answer without promising delegation.',
-      ].join('\n');
-      const promptBlocks: Array<Record<string, unknown>> = [
-        { type: 'text', text: promptText },
-        ...attachmentBlocks.map(
-          block => block as unknown as Record<string, unknown>,
-        ),
-      ];
-      const prompt: string | Array<Record<string, unknown>> = attachmentBlocks.length === 0
-        ? promptText
-        : promptBlocks;
+      const promptWatch = await watchTypedFastTurn(
+        promptPromise,
+        fastClaim,
+        displacedWorkdayClaim,
+      );
+      if (promptWatch !== 'done') {
+        throw new Error(
+          promptWatch === 'displaced_lost'
+            ? 'DISPLACED_WORKDAY_CLAIM_LOST'
+            : 'Fast Resident lost its exact conversation claim during prompt materialization',
+        );
+      }
+      const prompt = await promptPromise;
       const dispatchExactFastTurn = async () => {
         const turnPromise = typedController.dispatch(receipt, prompt).then(
           value => ({ status: 'fulfilled' as const, value }),
           (reason: unknown) => ({ status: 'rejected' as const, reason }),
         );
-        const watch = await watchTypedFastTurn(turnPromise, displacedWorkdayClaim);
+        const watch = await watchTypedFastTurn(
+          turnPromise,
+          fastClaim,
+          displacedWorkdayClaim,
+          () => { typedController.interrupt(); },
+        );
         if (watch !== 'done') {
-          typedController.interrupt();
-          await turnPromise;
           throw new Error(
             watch === 'displaced_lost'
               ? 'DISPLACED_WORKDAY_CLAIM_LOST'
@@ -4293,6 +4305,14 @@ export async function handleStrategicResident(
         }
         return await turnPromise;
       };
+      if (
+        statusRef.value !== typedFastPendingStatus
+        || typedFastPreviousStatus === null
+      ) typedFastPreviousStatus = statusRef.value;
+      // Truthful liveness: readiness, polling, attachment materialization, and
+      // coordinator claim are not a provider response. Publish Responding only
+      // at the exact dispatch boundary.
+      statusRef.value = typedFastRespondingStatus;
       let dispatchAttempt = await dispatchExactFastTurn();
       if (
         dispatchAttempt.status === 'rejected'
