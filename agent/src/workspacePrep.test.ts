@@ -425,6 +425,30 @@ describe('prepareWorkspaceForRole', () => {
     ]);
   });
 
+  it('cold path: opt-in full-history single-branch blobless clone passes exact args to retry wrapper', async () => {
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'automain',
+      depth: 0,
+      singleBranch: true,
+      filter: 'blob:none',
+    });
+
+    // cloneWithRetry owns auth/network recovery. Passing the complete immutable
+    // argv here means every retry retains the single-branch partial-clone
+    // contract. No --depth keeps the selected branch's full commit history.
+    expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
+    expect(cloneWithRetryMock).toHaveBeenCalledWith([
+      '-c', `credential.https://github.com.helper=${MOCK_HELPER_PATH}`,
+      'clone', '--branch', 'automain', '--single-branch', '--filter=blob:none',
+      'https://github.com/o/r.git', '/ws',
+    ]);
+    const cloneArgs = cloneWithRetryMock.mock.calls[0][0] as string[];
+    expect(cloneArgs).not.toContain('--depth');
+  });
+
   // ── Cold path: empty-in-place semantics ────────────────────────────────────
   it('cold path: workspace has children → each child removed via fs.rmSync, mountpoint kept', async () => {
     fsMocks.readdirSync.mockReturnValue(['file.txt', 'subdir']);
@@ -1011,6 +1035,38 @@ describe('prepareWorkspaceForRole', () => {
         'https://github.com/o/r.git', '/ws',
       ]);
       // The warm-path failure was logged.
+      const logged = logMock.mock.calls.map(c => String(c[0])).join('\n');
+      expect(logged).toMatch(/warm path failed/i);
+    });
+
+    it('optimized full-history warm failure → cold recovery preserves single-branch blobless args', async () => {
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      setExistsSync({ gitDir: true, shallow: true });
+      execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === 'git' && args.includes('--unshallow')) {
+          throw new Error('fatal: unable to access remote: network unreachable');
+        }
+        return '';
+      });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'automain',
+        baseBranch: 'automain',
+        depth: 0,
+        singleBranch: true,
+        filter: 'blob:none',
+      });
+
+      expect(fsMocks.readdirSync).toHaveBeenCalledWith('/ws');
+      expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
+      expect(cloneWithRetryMock).toHaveBeenCalledWith([
+        '-c', `credential.https://github.com.helper=${MOCK_HELPER_PATH}`,
+        'clone', '--branch', 'automain', '--single-branch', '--filter=blob:none',
+        'https://github.com/o/r.git', '/ws',
+      ]);
       const logged = logMock.mock.calls.map(c => String(c[0])).join('\n');
       expect(logged).toMatch(/warm path failed/i);
     });

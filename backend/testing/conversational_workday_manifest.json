@@ -320,6 +320,14 @@
       ]
     },
     {
+      "path": "agent/src/workspacePrep.test.ts",
+      "reason": "Protects the Resident cold-clone optimization: selected-branch full history with blobless transfer, including the warm-failure recovery path, without changing other workspace callers.",
+      "test_ids": [
+        "cold path: opt-in full-history single-branch blobless clone passes exact args to retry wrapper",
+        "optimized full-history warm failure → cold recovery preserves single-branch blobless args"
+      ]
+    },
+    {
       "path": "agent/src/handlers/typed-fast-resident.test.ts",
       "reason": "Covers the fenced Typed Fast child used by conversational Workday: exact claim binding, private delegation, bounded staging, unique idempotency, readiness timeout, circuit fallback, and rejection of malformed or ambiguous public completions.",
       "test_ids": [
@@ -411,8 +419,18 @@
         "revalidates an existing claim before retrying the provider turn",
         "waits through retryable legacy grace without publishing loser helpers",
         "publishes a ready waiting state before entering the conversational loop",
+        "completes Fast with autonomous authority lapsed while workspace preparation is unresolved",
+        "finishes a claimed cold Fast response when clone becomes ready during slow prompt materialization",
+        "does not start cold Fast while an active call survives an omitted heartbeat projection",
+        "interrupts and abandons once when workspace preparation fails during a cold Fast turn",
+        "abandons an exact cold Fast claim when required attachment materialization fails before dispatch",
+        "renews a cold Fast claim during slow materialization and abandons on cancellation without dispatch",
+        "paces every released cold Fast claim before retrying the still-open message",
+        "interrupts and abandons once when cold-start cancellation arrives during dispatch",
+        "fails the attempt after clone settlement when a cold Fast claim disposition stays unknown",
         "acquires the fenced slot before readiness and releases it on normal shutdown",
         "closes a lease-lost Fast controller without giving its next tagged message to Workday",
+        "waits for a standard Fast prompt to settle after %s fences its exact owner",
         "does not acknowledge or answer an Activity remainder in the same Fast turn",
         "preserves the operator message without broad Workday fallback when Fast capacity is denied",
         "continues polling and heartbeating while the Fast readiness probe is pending",
@@ -420,6 +438,7 @@
         "revokes Fast when the exact active lease heartbeat returns typed_fast null",
         "releases a dead ready Fast child before replacing it and admitting the message",
         "recycles Fast once and completes the same claim when the first child omits completion",
+        "retries the same Fast claim when the first dispatch settles processGone with a dead child",
         "abandons once after the replacement also omits receipt-bound completion",
         "replaces invalid Fast staging and completes the same exact claim",
         "retires Fast and abandons once after two invalid staging attempts",
@@ -430,6 +449,7 @@
         "paces a transient Fast claim conflict and retries the same client identity",
         "renews and restores the ordinary Workday claim while Fast replies",
         "preserves a newer Workday status when concurrent Fast completes",
+        "preserves autonomous Ready when Workday settles after Fast pending but before dispatch",
         "releases the exact lease after a failed readiness probe without starting a Fast turn",
         "retries only M1 when a later page contains M1 plus M2",
         "recovers an older claimed turn before newer unclaimed input after restart",
