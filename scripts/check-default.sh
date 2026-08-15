@@ -327,7 +327,17 @@ if touches "backend/"; then
 
   if [ -n "$(printf '%s\n' "$CHANGED" | while IFS= read -r f; do case "$f" in backend/*.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]; then
     # required backend-authoring verification. No skip can mint this receipt.
-    source scripts/backend-test-route.sh
+    _VERIFICATION_ROUTE_HELPER_OK=0
+    unset -f select_backend_test_route 2>/dev/null || true
+    if [ -r scripts/backend-test-route.sh ] \
+      && bash -n scripts/backend-test-route.sh >/dev/null 2>&1 \
+      && source scripts/backend-test-route.sh \
+      && declare -F select_backend_test_route >/dev/null 2>&1; then
+      _VERIFICATION_ROUTE_HELPER_OK=1
+    else
+      echo "[check] required backend verification FAILED — route helper unavailable or invalid"
+      FAILED+=("backend verification route helper")
+    fi
     _VERIFICATION_DIR='backend'
     _VERIFICATION_HARNESS='scripts/test-backend.sh'
     _VERIFICATION_CHANGED=$(mktemp /tmp/check_verification_changed.XXXXXX)
@@ -405,66 +415,70 @@ if touches "backend/"; then
       fi
       mapfile -t _verification_selector_args < <(printf '%s\n' "$_VERIFICATION_SELECTORS" | head -n 8)
       _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
+      _verification_postgres_flag=""
       if [ -z "$_VERIFICATION_HARNESS" ] || [ ! -f "$_VERIFICATION_HARNESS" ]; then
         echo "[check] required backend verification FAILED — sanctioned harness missing: $_VERIFICATION_HARNESS"
         FAILED+=("$_VERIFICATION_DIR verification: harness missing")
-      else
-        _verification_postgres_flag=""
+      elif [ "$_VERIFICATION_ROUTE_HELPER_OK" = "1" ]; then
         if _verification_postgres_flag="$(select_backend_test_route)"; then
           :
         else
           echo "[check] required backend verification state=runtime_unavailable — PostgreSQL runtime unavailable"
+          _verification_capability_tmp="${_VERIFY_CAPABILITY_RECEIPT}.$$"
+          if ( umask 077; printf 'backend_verification:runtime_unavailable:v1:%s\n' \
+            "$_VERIFY_TASK_ID" >"$_verification_capability_tmp" ) \
+            && mv -f "$_verification_capability_tmp" "$_VERIFY_CAPABILITY_RECEIPT"; then
+            echo "[check] execution capability receipt: $_VERIFY_CAPABILITY_RECEIPT"
+          else
+            echo "[check] unable to record backend verification capability receipt" >&2
+            rm -f "$_verification_capability_tmp" "$_VERIFY_CAPABILITY_RECEIPT"
+            FAILED+=("$_VERIFICATION_DIR verification: capability receipt")
+          fi
           FAILED+=("$_VERIFICATION_DIR verification: runtime_unavailable")
         fi
       fi
       if [ -n "${_verification_postgres_flag:-}" ]; then
         echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest..."
         _verification_harness_receipt="$_VERIFY_HARNESS_RECEIPT"
-        rm -f "$_verification_harness_receipt"
-        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_verification_harness_receipt" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ) \
-          && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d.get("exit_code")==0 and d.get("targeted") is True and d.get("use_test_postgres") is True and d.get("postgres_sidecar") is True and int(d.get("tests",0))>int(d.get("skipped",0)) and d.get("selectors")' "$_verification_harness_receipt"; then
+        _verification_attribution_dir=$(mktemp -d /tmp/check_verification_attribution.XXXXXX)
+        _verification_current_junit="$_verification_attribution_dir/current.xml"
+        rm -f "$_verification_harness_receipt" "$_verification_current_junit"
+        _verification_exit=0
+        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_verification_harness_receipt" BLUEPRINT_VERIFICATION_JUNIT="$_verification_current_junit" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ); then
+          :
+        else
+          _verification_exit=$?
+        fi
+        if [ -s "$_verification_current_junit" ]; then
+          _verification_attribution=$(python3 scripts/backend_verification_guard.py \
+            --base "$BASE" --repo-root "$PWD" --current-junit "$_verification_current_junit" \
+            --current-exit-code "$_verification_exit" --route="$_verification_postgres_flag" \
+            --harness "$_VERIFICATION_HARNESS" "${_verification_selector_args[@]}")
+        else
+          _verification_attribution='{"state":"execution_failure","blocking":true,"new_failures":{}}'
+        fi
+        echo "[check] backend verification attribution: $_verification_attribution"
+        _verification_state=$(printf '%s' "$_verification_attribution" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state","attribution_unavailable"))' 2>/dev/null || printf attribution_unavailable)
+        _verification_tests=$(python3 -c 'import sys,xml.etree.ElementTree as ET; print(sum(1 for _ in ET.parse(sys.argv[1]).getroot().iter("testcase")))' "$_verification_current_junit" 2>/dev/null || printf 0)
+        _verification_skipped=$(python3 -c 'import sys,xml.etree.ElementTree as ET; print(sum(1 for c in ET.parse(sys.argv[1]).getroot().iter("testcase") if c.find("skipped") is not None))' "$_verification_current_junit" 2>/dev/null || printf 0)
+        if [ "$_verification_tests" -gt 0 ] && [ "$_verification_skipped" -eq "$_verification_tests" ]; then
+          _verification_state=skipped_test
+        fi
+        if [ "$_verification_state" = "passed" ] || [ "$_verification_state" = "preexisting_test_failure" ]; then
+          echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest OK — state=$_verification_state"
           _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
-          _verification_tmp="${_VERIFY_RECEIPT}.$$"
-          if python3 -c 'import datetime,json,sys; out,task,directory,harness,selectors,harness_receipt,postgres_flag=sys.argv[1:]; runtime=json.load(open(harness_receipt,encoding="utf-8")); payload={"version":1,"task_id":task,"directory":directory,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"ruff":{"command":"python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>","exit_code":0},"pytest":{"command":"USE_TEST_POSTGRES=true bash "+harness+" "+postgres_flag+" <impacted-selectors>","harness":harness,"selectors":json.loads(selectors),"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":runtime["tests"],"skipped":runtime["skipped"],"exit_code":0}}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$_verification_tmp" "$_VERIFY_TASK_ID" "$_VERIFICATION_DIR" "$_VERIFICATION_HARNESS" "$_verification_selectors_json" "$_verification_harness_receipt" "$_verification_postgres_flag" \
-            && mv -f "$_verification_tmp" "$_VERIFY_RECEIPT"; then
-            echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest OK"
+          if python3 -c 'import datetime,json,sys,xml.etree.ElementTree as ET; out,task,directory,harness,selectors,attribution,junit=sys.argv[1:]; d=json.loads(attribution); root=ET.parse(junit).getroot(); cases=list(root.iter("testcase")); skipped=sum(1 for c in cases if c.find("skipped") is not None); failed=sum(1 for c in cases if c.find("failure") is not None or c.find("error") is not None); payload={"version":1,"task_id":task,"directory":directory,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"ruff":{"command":"python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>","exit_code":0},"pytest":{"command":"USE_TEST_POSTGRES=true bash "+harness+" <impacted-selectors>","harness":harness,"selectors":json.loads(selectors),"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"state":d["state"],"current_exit_code":int(d.get("current_exit_code",0)),"tests":len(cases),"skipped":skipped,"failures":failed,"new_failures":d.get("new_failures",{}),"suppressed_failures":d.get("suppressed_failures",{}),"disappeared_failures":d.get("disappeared_failures",{}),"skipped_failures":d.get("skipped_failures",{}),"exit_code":0}}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$_VERIFY_RECEIPT" "$_VERIFY_TASK_ID" "$_VERIFICATION_DIR" "$_VERIFICATION_HARNESS" "$_verification_selectors_json" "$_verification_attribution" "$_verification_current_junit"; then
             echo "[check] verification receipt: $_VERIFY_RECEIPT"
           else
-            echo "[check] required backend verification FAILED — could not write receipt"
-            rm -f "$_verification_tmp" "$_VERIFY_RECEIPT"
+            echo "[check] required backend verification FAILED — could not write attribution receipt"
             FAILED+=("$_VERIFICATION_DIR verification receipt")
           fi
         else
-          echo "[check] $_VERIFICATION_DIR targeted Postgres pytest failed; collecting JUnit attribution"
-          _verification_attribution_dir=$(mktemp -d /tmp/check_verification_attribution.XXXXXX)
-          _verification_current_junit="$_verification_attribution_dir/current.xml"
-          rm -f "$_verification_harness_receipt" "$_verification_current_junit"
-          if ( set -o pipefail; BLUEPRINT_VERIFICATION_JUNIT="$_verification_current_junit" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ); then
-            _verification_attribution='{"state":"execution_failure","blocking":true,"new_failures":{}}'
-          elif [ -s "$_verification_current_junit" ]; then
-            _verification_attribution=$(python3 scripts/backend_verification_guard.py \
-              --base "$BASE" --repo-root "$PWD" --current-junit "$_verification_current_junit" \
-              --route="$_verification_postgres_flag" --harness "$_VERIFICATION_HARNESS" \
-              "${_verification_selector_args[@]}" 2>/dev/null || true)
-          else
-            _verification_attribution='{"state":"execution_failure","blocking":true,"new_failures":{}}'
-          fi
-          _verification_state=$(printf '%s' "$_verification_attribution" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state","attribution_unavailable"))' 2>/dev/null || printf attribution_unavailable)
-          if [ "$_verification_state" = "preexisting_test_failure" ]; then
-            echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest OK — only pre-existing failures"
-            if python3 -c 'import datetime,json,sys; out,task,directory,harness,selectors,attribution=sys.argv[1:]; d=json.loads(attribution); payload={"version":1,"task_id":task,"directory":directory,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"ruff":{"command":"python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>","exit_code":0},"pytest":{"command":"USE_TEST_POSTGRES=true bash "+harness+" <impacted-selectors>","harness":harness,"selectors":json.loads(selectors),"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"state":d["state"],"current_exit_code":1,"new_failures":d["new_failures"],"exit_code":0}}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$_VERIFY_RECEIPT" "$_VERIFY_TASK_ID" "$_VERIFICATION_DIR" "$_VERIFICATION_HARNESS" "$_verification_selectors_json" "$_verification_attribution"; then
-              echo "[check] verification receipt: $_VERIFY_RECEIPT"
-            else
-              echo "[check] required backend verification FAILED — could not write attribution receipt"
-              FAILED+=("$_VERIFICATION_DIR verification receipt")
-            fi
-          else
-            echo "[check] required backend verification FAILED — state=$_verification_state"
-            rm -f "$_VERIFY_RECEIPT"
-            FAILED+=("$_VERIFICATION_DIR verification: $_verification_state")
-          fi
-          rm -rf "$_verification_attribution_dir"
+          echo "[check] required backend verification FAILED — state=$_verification_state"
+          rm -f "$_VERIFY_RECEIPT"
+          FAILED+=("$_VERIFICATION_DIR verification: $_verification_state")
         fi
+        rm -rf "$_verification_attribution_dir"
         rm -f "$_verification_harness_receipt"
       fi
     fi
