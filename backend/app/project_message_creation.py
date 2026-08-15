@@ -41,6 +41,7 @@ from app.strategic_trigger import (
 )
 from app.workbench_state import (
     build_message_strategic_session_snapshot,
+    get_strategic_workbench_state,
     persist_strategic_workbench_update,
     workbench_context_for_strategic_session_snapshot,
     workbench_state_exceeds_max_bytes,
@@ -121,6 +122,7 @@ SERVER_OWNED_CHAT_CONTEXT_KEYS = frozenset(
         "_resident_activation_prompt",
         "message_role",
         "_workday_result_packet_id",
+        "_workday_consultation_requested",
         "_resident_handoff_from_session_id",
         "_resident_handoff_at",
     }
@@ -625,6 +627,7 @@ async def create_operator_project_message(
         Awaitable[dict[str, Any] | None],
     ]
     | None = None,
+    precreate_ensure: Callable[[], Awaitable[Any]] | None = None,
 ) -> OperatorMessageCreateResult:
     """Create or idempotently return an operator-authored ProjectMessage."""
 
@@ -682,6 +685,18 @@ async def create_operator_project_message(
                 wakeup_state=stored_wakeup_state(existing),
             )
 
+    if precreate_ensure is not None:
+        # The fast idempotency adoption above must run first: an exact replay of
+        # an already-accepted message is not a new operator action and must not
+        # restart Workday. Release this request's read transaction before the
+        # isolated ensure so single-connection test pools and production pools
+        # cannot deadlock or pin two connections unnecessarily.
+        await session.rollback()
+        await precreate_ensure()
+        project = await session.get(Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
     _ensure_context_size(message_context, compact=compact_context_size)
 
     if message_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
@@ -696,6 +711,7 @@ async def create_operator_project_message(
             message_context = {**message_context, "_provenance_warnings": warning}
 
     workbench_context_for_snapshot = workbench_context
+    stored_workbench: dict[str, Any] | None = None
     should_persist_workbench = (
         workbench_context is not None or persist_empty_workbench_context
     )
@@ -721,6 +737,26 @@ async def create_operator_project_message(
                     workbench_context,
                 )
             )
+    elif surface == MessageSurface.CONVERSATION:
+        # Conversation ownership is selected by the persisted interaction
+        # mode, not by the Resident blob alone. A mode leave commits Chat
+        # before its best-effort stop, so the blob can still be active briefly
+        # while it is already forbidden from accepting another turn.
+        stored_workbench = await get_strategic_workbench_state(
+            session,
+            user_id,
+            project_id,
+            for_update=True,
+            populate_existing=True,
+        )
+
+    resident_mode_selected = bool(
+        surface != MessageSurface.CONVERSATION
+        or (
+            stored_workbench is not None
+            and stored_workbench.get("interaction_mode") == "continuous"
+        )
+    )
 
     if include_strategic_session_snapshot:
         strategic_session = await build_message_strategic_session_snapshot(
@@ -759,6 +795,7 @@ async def create_operator_project_message(
         resident_snapshot
         and resident_snapshot.get("status") == "active"
         and not resident_snapshot.get("stop_requested")
+        and resident_mode_selected
     )
     resident_session_id = (
         str(resident_snapshot.get("session_id"))
@@ -773,11 +810,17 @@ async def create_operator_project_message(
         message_content=trimmed_content,
         resident_session_active=resident_active,
     )
+    if resident_active and surface == MessageSurface.CONVERSATION:
+        # Every canonical conversation row belongs to the active Resident,
+        # including NOTE-shaped chat input. NOTE remains passive everywhere
+        # else, but storing a bound live-chat turn as ``paused`` would make an
+        # exact replay lie about whether Workday can consume it.
+        arming = ARMING_RESIDENT_SESSION
     if not session.in_transaction():
         # A failed wake releases every lock. Restore the canonical
         # prefs -> Project order before re-deriving the arming state.
         if should_persist_workbench:
-            await persist_strategic_workbench_update(
+            workbench_write = await persist_strategic_workbench_update(
                 session,
                 user_id,
                 project_id,
@@ -786,7 +829,23 @@ async def create_operator_project_message(
                 arm_interaction_mode=False,
                 commit=False,
             )
+            stored_workbench = workbench_write.state
             await session.flush()
+        elif surface == MessageSurface.CONVERSATION:
+            stored_workbench = await get_strategic_workbench_state(
+                session,
+                user_id,
+                project_id,
+                for_update=True,
+                populate_existing=True,
+            )
+        resident_mode_selected = bool(
+            surface != MessageSurface.CONVERSATION
+            or (
+                stored_workbench is not None
+                and stored_workbench.get("interaction_mode") == "continuous"
+            )
+        )
         locked_project = await session.scalar(
             select(Project)
             .where(Project.id == project_id)
@@ -799,6 +858,7 @@ async def create_operator_project_message(
             resident_snapshot
             and resident_snapshot.get("status") == "active"
             and not resident_snapshot.get("stop_requested")
+            and resident_mode_selected
         )
         resident_session_id = (
             str(resident_snapshot.get("session_id"))
@@ -806,7 +866,7 @@ async def create_operator_project_message(
             else None
         )
         refresh_was_pending = strategic_refresh_pending(locked_vision)
-        if resident_active:
+        if resident_active and surface == MessageSurface.CONVERSATION:
             arming = ARMING_RESIDENT_SESSION
 
     if (

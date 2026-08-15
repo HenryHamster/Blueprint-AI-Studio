@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act, createRef } from 'react';
+import { waitFor } from '@testing-library/react';
+// Preload the code-split renderer before importing the list so isolated
+// viewport labels observe the same settled body as the full viewport file.
+import './MarkdownContentInner';
 import { MessagesListView, type MessagesListViewProps, type ConversationListImperativeApi, buildTriageItems, type BuildParams } from './MessagesListView';
 import { preserveScrollAnchorAfterPrepend } from '../utils/conversationScrollAnchor';
 import type { ProjectMessage } from './MessageBubble';
@@ -203,14 +207,71 @@ describe('MessagesListView — viewport regression', () => {
     });
 
     await renderView(baseProps({ presentation: 'conversation', messages: [reply] }));
-    await vi.waitFor(() => {
-      expect(host?.querySelector('[data-message-id="fast-workday-reply"]')).not.toBeNull();
+    await waitFor(() => {
+      const rendered = host?.querySelector('[data-message-id="fast-workday-reply"]');
+      expect(rendered?.textContent).toContain('Durable answer from Fast.');
     });
     const bubble = host?.querySelector('[data-message-id="fast-workday-reply"]');
     expect(bubble?.className).not.toContain('opacity-75');
     expect(bubble?.textContent).toContain('Strategic');
     expect(bubble?.textContent).toContain('Workday consulted');
     expect(bubble?.textContent).toContain('Durable answer from Fast.');
+  });
+
+  test('renders the server-owned Workday request receipt on the Fast acknowledgement', async () => {
+    const reply = makeMsg({
+      id: 'fast-workday-request',
+      sequence: 1,
+      from_type: 'strategic',
+      surface: 'conversation',
+      content: 'I have an initial answer for you.',
+      context: {
+        audience: 'operator-fyi',
+        event_type: 'question_answer',
+        _conversation_public_reply_owner: 'fast',
+        message_role: 'operator_reply',
+        _workday_consultation_requested: true,
+      },
+    });
+
+    await expectNoOverflowAt(375, async () => {
+      await renderView(baseProps({ presentation: 'conversation', messages: [reply] }));
+      await waitFor(() => {
+        const rendered = host?.querySelector('[data-message-id="fast-workday-request"]');
+        expect(rendered?.textContent).toContain('I have an initial answer for you.');
+      });
+      const bubble = host?.querySelector('[data-message-id="fast-workday-request"]');
+      expect(bubble?.textContent).toContain('Workday requested');
+      expect(bubble?.textContent).toContain('I have an initial answer for you.');
+    });
+  });
+
+  test('renders the server-owned Fast-only receipt on a reply without a Workday request', async () => {
+    const reply = makeMsg({
+      id: 'fast-only-reply',
+      sequence: 1,
+      from_type: 'strategic',
+      surface: 'conversation',
+      content: 'This answer did not need a private consultation.',
+      context: {
+        audience: 'operator-fyi',
+        event_type: 'question_answer',
+        _conversation_public_reply_owner: 'fast',
+        message_role: 'operator_reply',
+        _workday_consultation_requested: false,
+      },
+    });
+
+    await expectNoOverflowAt(375, async () => {
+      await renderView(baseProps({ presentation: 'conversation', messages: [reply] }));
+      await waitFor(() => {
+        const rendered = host?.querySelector('[data-message-id="fast-only-reply"]');
+        expect(rendered?.textContent).toContain('This answer did not need a private consultation.');
+      });
+      const bubble = host?.querySelector('[data-message-id="fast-only-reply"]');
+      expect(bubble?.textContent).toContain('Fast only');
+      expect(bubble?.textContent).not.toContain('Workday requested');
+    });
   });
 
   test('imperative conversation navigation renders an offscreen target before resolving', async () => {

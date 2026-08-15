@@ -3313,6 +3313,7 @@ async def _rebind_predecessor_conversation_handoff(
     from app.conversation_coordinator import (
         reset_conversation_claim_for_session_handoff,
     )
+    from app.project_message_projection import WAKEUP_STATE_CONTEXT_KEY
 
     # Repair any still-stamped rows first. This classifies already-answered rows
     # through the canonical handoff evidence check and stamps unanswered rows with
@@ -3391,6 +3392,11 @@ async def _rebind_predecessor_conversation_handoff(
         row.handling_state = MessageHandlingState.PENDING
         row.handled_by_task_id = None
         reset_conversation_claim_for_session_handoff(row)
+        row.context = {
+            **dict(row.context or {}),
+            WAKEUP_STATE_CONTEXT_KEY: "queued",
+        }
+        flag_modified(row, "context")
         row.updated_at = now
         session.add(row)
         rebound += 1
@@ -4866,6 +4872,209 @@ async def _auto_start_on_workday_entry(
             session_factory=session_factory,
         )
         return None
+
+
+async def _bind_pending_operator_message_to_resident(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    message_id: uuid.UUID,
+    resident_session_id: str,
+    operator_user_id: str,
+) -> bool:
+    """Bind one exact unowned operator turn to the newly ensured Resident.
+
+    This is the narrow fallback for a Workday message accepted after the prior
+    Resident's lease ended. Normal predecessor handoff already binds the row in
+    ``start_resident_session``'s transaction. The exact-row pass also covers a
+    project with no parseable predecessor without pulling older NULL-session
+    backlog across the new conversation floor.
+    """
+
+    resident_session_id = resident_session_id.strip()
+    if not resident_session_id:
+        return False
+    # Lock the canonical mode before the Project (the same prefs -> Project
+    # order used by mode updates). A committed or concurrently committing Chat
+    # decision must win over an active-but-not-yet-stopped Resident blob.
+    workbench = await get_strategic_workbench_state(
+        session,
+        operator_user_id,
+        project_id,
+        for_update=True,
+        populate_existing=True,
+    )
+    if workbench.get("interaction_mode") != "continuous":
+        return False
+    # Match the canonical Project -> message lock order used by message create
+    # and session stop. The earlier ensure snapshot is only advisory: a Stop or
+    # replacement can commit before this fallback transaction reaches the row.
+    locked_project = await session.scalar(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked_project is None:
+        return False
+    current = read_resident_session(locked_project.vision)
+    if (
+        not resident_session_is_active(current)
+        or str((current or {}).get("session_id") or "") != resident_session_id
+    ):
+        return False
+    row = await session.scalar(
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.id == message_id,
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.from_type == "user",
+            ProjectMessage.surface == MessageSurface.CONVERSATION,
+            ProjectMessage.status == "open",
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if row is None:
+        return False
+    if row.resident_session_id not in (None, resident_session_id):
+        return False
+    if (
+        row.handling_state != MessageHandlingState.PENDING
+        or row.handled_by_task_id is not None
+        or row.conversation_claim_id is not None
+        or row.resolution
+    ):
+        return row.resident_session_id == resident_session_id
+
+    from app.conversation_coordinator import (
+        reset_conversation_claim_for_session_handoff,
+    )
+    from app.project_message_projection import WAKEUP_STATE_CONTEXT_KEY
+
+    row.resident_session_id = resident_session_id
+    row.handling_state = MessageHandlingState.PENDING
+    row.handled_by_task_id = None
+    reset_conversation_claim_for_session_handoff(row)
+    row.context = {
+        **dict(row.context or {}),
+        WAKEUP_STATE_CONTEXT_KEY: "queued",
+    }
+    flag_modified(row, "context")
+    row.updated_at = _utcnow()
+    session.add(row)
+    await session.commit()
+    return True
+
+
+async def ensure_resident_session_for_operator_message(
+    project_id: uuid.UUID,
+    message_id: uuid.UUID,
+    *,
+    operator_user_id: str,
+    session_factory=None,
+) -> dict[str, Any] | None:
+    """Rearm Workday after an operator message crosses an idle-lease boundary.
+
+    The message is already committed before this runs, so a runner outage can
+    never lose operator input. Manual Stop is respected because it atomically
+    persists Chat mode; only a still-selected Workday (continuous) session may
+    restart. The start path is project-locked/idempotent, so duplicate or
+    concurrent sends converge on one Resident task.
+    """
+
+    factory = session_factory or AsyncSessionLocal
+    try:
+        async with factory() as inspect_session:
+            message = await inspect_session.get(ProjectMessage, message_id)
+            if (
+                message is None
+                or message.project_id != project_id
+                or message.from_type != "user"
+                or message.surface != MessageSurface.CONVERSATION
+                or message.status != "open"
+                or message.handling_state != MessageHandlingState.PENDING
+                or message.resolution
+            ):
+                return None
+        snapshot = await ensure_resident_session_before_operator_message(
+            project_id,
+            operator_user_id=operator_user_id,
+            session_factory=factory,
+        )
+        if snapshot is None or snapshot.get("status") != STATUS_ACTIVE:
+            return snapshot
+        async with factory() as bind_session:
+            bound = await _bind_pending_operator_message_to_resident(
+                bind_session,
+                project_id,
+                message_id=message_id,
+                resident_session_id=str(snapshot.get("session_id") or ""),
+                operator_user_id=operator_user_id,
+            )
+        return snapshot if bound else None
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] post-message Workday ensure failed for project "
+            "%s message %s; durable input remains pending",
+            project_id,
+            message_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def ensure_resident_session_before_operator_message(
+    project_id: uuid.UUID,
+    *,
+    operator_user_id: str,
+    session_factory=None,
+) -> dict[str, Any] | None:
+    """Ensure the Workday owner before a new non-idempotent send is inserted.
+
+    The caller invokes this only after proving an idempotency key is new. A
+    stored Chat mode is a deliberate Stop and returns without side effects. In
+    Workday mode, the persisted runner preference (falling back to the ended
+    session's pin) is authoritative; an unavailable preferred device fails
+    visibly instead of silently migrating the conversation or cloud-arming a
+    one-shot strategic task.
+    """
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as fresh:
+        project = await fresh.get(Project, project_id)
+        if project is None:
+            return None
+        workbench = await get_strategic_workbench_state(
+            fresh,
+            operator_user_id,
+            project_id,
+        )
+        if workbench.get("interaction_mode") != "continuous":
+            return None
+        current = read_resident_session(project.vision)
+        runner_id = str(
+            workbench.get("preferred_runner_id")
+            or ((current or {}).get("runner_id") if isinstance(current, dict) else "")
+            or ""
+        ).strip() or None
+        try:
+            snapshot = await start_resident_session(
+                fresh,
+                project,
+                operator_user_id=operator_user_id,
+                runner_id=runner_id,
+                session_factory=factory,
+                expected_interaction_mode="continuous",
+            )
+        except _ResidentEnsureModeChanged:
+            # Explicit Stop won the race and atomically persisted Chat mode.
+            # Let the final message create linearize in Chat without a 500.
+            return None
+        await set_resident_session_blocked_reason(fresh, project, None)
+        # No synthetic activation is enqueued here: the real message that
+        # immediately follows this ensure is the exact activation turn.
+        return snapshot
 
 
 async def _enqueue_resident_activation_turn(

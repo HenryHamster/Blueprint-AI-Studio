@@ -105,6 +105,7 @@ _WORKDAY_ACK_CLAIM_ID_CONTEXT_KEY = "_workday_consultation_ack_claim_id"
 _WORKDAY_RESULT_SUMMARY_CONTEXT_KEY = "_workday_consultation_result_summary"
 _CONSULTATION_RESULT_CONTEXT_KEY = "_workday_consultation_result"
 _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY = "_workday_consultation_atomic_reply_id"
+_CONSULTATION_REQUESTED_CONTEXT_KEY = "_workday_consultation_requested"
 _CONTINUATION_CLAIM_ID_CONTEXT_KEY = "_workday_continuation_claim_id"
 _CONTINUATION_CLAIM_GENERATION_CONTEXT_KEY = "_workday_continuation_claim_generation"
 _CONTINUATION_CLAIM_INCARNATION_CONTEXT_KEY = "_workday_continuation_claim_incarnation"
@@ -1324,12 +1325,14 @@ async def release_workday_consultation_continuation(
         != str(worker_incarnation)
     ):
         raise ValueError("consultation continuation is owned by another worker")
+    # Preserve the durable attempt counter across release/reclaim. The Agent
+    # uses the next attempt to terminalize a repeatedly unrenderable result
+    # instead of reclaiming the same private packet forever.
     for key in (
         _CONTINUATION_CLAIM_ID_CONTEXT_KEY,
         _CONTINUATION_CLAIM_GENERATION_CONTEXT_KEY,
         _CONTINUATION_CLAIM_INCARNATION_CONTEXT_KEY,
         _CONTINUATION_CLAIM_EXPIRES_CONTEXT_KEY,
-        _CONTINUATION_CLAIM_ATTEMPT_CONTEXT_KEY,
     ):
         context.pop(key, None)
     row.context = context
@@ -1679,6 +1682,7 @@ async def complete_claimed_public_turn(
                 "_conversation_claim_id": str(claim_id),
                 _PUBLIC_REPLY_OWNER_CONTEXT_KEY: owner.value,
                 "_resident_reply_covered_message_ids": sorted(str(row.id) for row in rows),
+                _CONSULTATION_REQUESTED_CONTEXT_KEY: normalized_workday_request is not None,
             },
             "question_answer",
             message_type=MessageType.NOTE.value,
