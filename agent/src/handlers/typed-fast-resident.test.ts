@@ -15,7 +15,7 @@ import {
 afterEach(() => { vi.useRealTimers(); });
 
 describe('typed Fast local receipt fence', () => {
-  it('poisons the child when local staging validation rejects its completion', async () => {
+  it('poisons the child when direct managed-execution staging violates its role', async () => {
     let alive = true;
     const close = vi.fn(() => { alive = false; });
     const cleanResult: ResidentTurnResult = {
@@ -46,7 +46,7 @@ describe('typed Fast local receipt fence', () => {
               `${paths.CALL_LOCAL_STAGE_DIR}/complete-invalid.json`,
               JSON.stringify({
                 receipt,
-                content: "I've routed the mode knob removal as a task instead.",
+                content: "I'll edit the configuration now.",
               }),
             );
             return Promise.resolve(cleanResult);
@@ -70,7 +70,7 @@ describe('typed Fast local receipt fence', () => {
     };
     try {
       await expect(controller.dispatch(receipt, 'Answer the operator.')).rejects.toThrow(
-        /without staging a Workday request/,
+        /delegate through Workday task tooling/,
       );
       expect(close).toHaveBeenCalledTimes(1);
       expect(controller.isAlive()).toBe(false);
@@ -151,23 +151,32 @@ describe('typed Fast local receipt fence', () => {
     expect(typedFastFailureBackoffMs(100)).toBe(60_000);
   });
 
-  it('keeps the private Workday fan-out to one request per Fast turn', () => {
+  it('accepts one exact structured Workday request with its public completion', () => {
     expect(MAX_TYPED_WORKDAY_REQUESTS_PER_TURN).toBe(1);
     const receipt = { claim_id: 'c', message_ids: ['m'], idempotency_key: 'k' };
+    const completion = _typedFastInternals.parseCompletion({
+      receipt, content: 'The current evidence is incomplete, so this answer is bounded.',
+    });
     const request = _typedFastInternals.parseWorkdayRequest({
       receipt, delivery_key: 'only-one', prompt: 'Check the derivation.',
     });
-    expect(_typedFastInternals.validateStagedTypedIntents([], [request])).toMatchObject({
-      workdayRequests: [{ delivery_key: 'only-one' }],
-    });
-    expect(() => _typedFastInternals.validateStagedTypedIntents([], [
+    expect(_typedFastInternals.validateStagedTypedIntents(
+      [completion], [request],
+    )).toEqual({ completion, workdayRequests: [request] });
+
+    expect(() => _typedFastInternals.validateStagedTypedIntents([], [request])).toThrow(
+      /without a public completion/,
+    );
+    expect(() => _typedFastInternals.validateStagedTypedIntents([completion], [
+      { ...request, receipt: { ...receipt, message_ids: ['other'] } },
+    ])).toThrow(/different receipt/);
+    expect(() => _typedFastInternals.validateStagedTypedIntents([completion], [
       request,
       { ...request, delivery_key: 'second' },
     ])).toThrow(/too many Workday requests/);
-  });
-
-  it('bounds the atomic completion Workday payload to the coordinator contract', () => {
-    const receipt = { claim_id: 'c', message_ids: ['m'], idempotency_key: 'k' };
+    expect(() => _typedFastInternals.validateStagedTypedIntents(
+      [completion, { ...completion, content: 'Second.' }], [],
+    )).toThrow(/multiple public completions/);
     expect(() => _typedFastInternals.parseWorkdayRequest({
       receipt, delivery_key: 'd'.repeat(129), prompt: 'Check the derivation.',
     })).toThrow(/delivery key/);
@@ -176,19 +185,11 @@ describe('typed Fast local receipt fence', () => {
     })).toThrow(/Workday prompt/);
   });
 
-  it('rejects multiple public completions instead of choosing one arbitrarily', () => {
+  it('rejects direct managed execution', () => {
     const receipt = { claim_id: 'c', message_ids: ['m'], idempotency_key: 'k' };
-    const completion = _typedFastInternals.parseCompletion({ receipt, content: 'One.' });
-    expect(() => _typedFastInternals.validateStagedTypedIntents(
-      [completion, { ...completion, content: 'Two.' }], [],
-    )).toThrow(/multiple public completions/);
-  });
-
-  it('rejects direct execution and couples delegation promises to a Workday request', () => {
-    const receipt = { claim_id: 'c', message_ids: ['m'], idempotency_key: 'k' };
-    const directClaims = [
+    for (const content of [
       "I'll remove the knob entries and delete the branches.",
-      'I will edit the configuration now.',
+      "I'll edit the configuration now.",
       "I'm going to edit the configuration now.",
       'I’m going to deploy the service now.',
       "I'm editing the configuration now.",
@@ -213,6 +214,7 @@ describe('typed Fast local receipt fence', () => {
       "I'll commit it.",
       "I've deployed it already.",
       "I'll deploy now.",
+      "I'm deploying the service now.",
       "I'm deploying now.",
       "I've deployed already.",
       "I'll push shortly.",
@@ -239,14 +241,16 @@ describe('typed Fast local receipt fence', () => {
       'Let me deploy the service change.',
       "I'll fast-forward main now.",
       'I’ll fast-forward main now.',
-    ];
-    for (const content of directClaims) {
+    ]) {
       const completion = _typedFastInternals.parseCompletion({ receipt, content });
       expect(() => _typedFastInternals.validateStagedTypedIntents(
         [completion], [],
-      )).toThrow(/delegate through Workday task tooling/);
+      ), content).toThrow(/delegate through Workday task tooling/);
     }
+  });
 
+  it('accepts neutral strategist prose without body-status classification', () => {
+    const receipt = { claim_id: 'c', message_ids: ['m'], idempotency_key: 'k' };
     for (const content of [
       'We can change the mode after checking the tradeoff.',
       'We are editing the direction together, not touching repository code.',
@@ -274,71 +278,41 @@ describe('typed Fast local receipt fence', () => {
       "I've routed the task wording into the summary.",
       'I have created a request for clarification below.',
       'I have opened a request for your feedback.',
+      'The server badge renders the phrase "Workday requested" when its receipt proves it.',
+      "I've queued a task-list example for this explanation.",
+      'I will follow up by explaining the existing evidence in this reply.',
+      "I've queued a task.",
+      'Workday requested.',
+      'Fast only.',
+      'I will follow up with the result.',
+      'I ran.',
+      'I am running.',
+      'I will run.',
+      'I fixed.',
+      'I will fix.',
     ]) {
-      const proposal = _typedFastInternals.parseCompletion({ receipt, content });
-      expect(_typedFastInternals.validateStagedTypedIntents([proposal], [])).toMatchObject({
-        completion: proposal,
-        workdayRequests: [],
-      });
+      const completion = _typedFastInternals.parseCompletion({ receipt, content });
+      expect(_typedFastInternals.validateStagedTypedIntents(
+        [completion], [],
+      ), content).toEqual({ completion, workdayRequests: [] });
     }
+  });
 
-    const request = _typedFastInternals.parseWorkdayRequest({
-      receipt,
-      delivery_key: 'managed-state-change',
-      prompt: 'Use supported Blueprint task tooling to make the requested change.',
-    });
-    for (const content of [
-      "I'll route a Blueprint task to change it and report the durable outcome.",
-      "I'll create a Blueprint task to change the configuration.",
-      "I'll create a task to deploy the service.",
-      "I'll hand this off to Workday to update the repository.",
-      "I've routed the mode knob removal as a task instead.",
-      'I’ve routed the mode knob removal as a Blueprint task.',
-      'I have already handed this off to Workday.',
-      "I've queued a task to rip them out.",
-      'I have queued up a task to rip them out.',
-      'I have queued a follow-up task to remove them.',
-      'I have queued another task to remove them.',
-      'I’ve routed a job to remove the stale entries.',
-      "I've created a request to audit the configuration.",
-      "I've opened a task to handle it.",
-      "I've launched a job to update the service.",
-      "I've started a request to check the deployment.",
-      "I've spawned a task to investigate the issue.",
-      'I already queued a task to remove the obsolete knobs.',
-      "I'll have Workday look into it.",
-      "I'll get Workday to check it.",
-      "I'm asking Workday to investigate.",
-      "I've asked Workday to check it.",
-      'Workday is looking into this.',
-      'Workday is handling it.',
-      'Workday has reviewed it.',
-    ]) {
-      const delegated = _typedFastInternals.parseCompletion({ receipt, content });
+  it('keeps the managed-execution fence bounded on 20k prose', () => {
+    const receipt = { claim_id: 'c', message_ids: ['m'], idempotency_key: 'k' };
+    const neutralContent = 'neutral architecture explanation, '.repeat(700).slice(0, 20_000);
+    const managedContent = `${'x'.repeat(19_940)} I'll edit the configuration.`;
+    const neutral = _typedFastInternals.parseCompletion({ receipt, content: neutralContent });
+    const managed = _typedFastInternals.parseCompletion({ receipt, content: managedContent });
+    const started = performance.now();
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      expect(_typedFastInternals.validateStagedTypedIntents(
+        [neutral], [],
+      )).toEqual({ completion: neutral, workdayRequests: [] });
       expect(() => _typedFastInternals.validateStagedTypedIntents(
-        [delegated], [],
-      )).toThrow(/without staging a Workday request/);
-      expect(_typedFastInternals.validateStagedTypedIntents([delegated], [request])).toMatchObject({
-        completion: delegated,
-        workdayRequests: [request],
-      });
+        [managed], [],
+      )).toThrow(/delegate through Workday task tooling/);
     }
-
-    const completedConsultation = _typedFastInternals.parseCompletion({
-      receipt,
-      content: 'Workday has reviewed it; here is the bounded result.',
-    });
-    expect(_typedFastInternals.validateStagedTypedIntents(
-      [completedConsultation], [], true,
-    )).toMatchObject({ completion: completedConsultation, workdayRequests: [] });
-
-    const hypothetical = _typedFastInternals.parseCompletion({
-      receipt,
-      content: 'Workday could review this if a deeper pass would help.',
-    });
-    expect(_typedFastInternals.validateStagedTypedIntents([hypothetical], [])).toMatchObject({
-      completion: hypothetical,
-      workdayRequests: [],
-    });
+    expect(performance.now() - started).toBeLessThan(250);
   });
 });

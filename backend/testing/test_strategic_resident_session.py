@@ -850,6 +850,106 @@ async def test_hydration_ensure_cannot_resurrect_after_committed_mode_leave(
 
 
 @pytest.mark.asyncio
+async def test_post_message_bind_revalidates_exact_active_resident(db_session):
+    """A committed Chat decision fences bind before best-effort stop finishes."""
+
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(runner.id),
+    )
+    message = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        actor_user_id=TEST_USER_ID,
+        content="Do not bind me to a stopped Resident.",
+        status="open",
+        resident_session_id=None,
+        context={"_operator_wakeup_state": "paused"},
+    )
+    db_session.add(message)
+    await db_session.commit()
+    project_id = project.id
+    message_id = message.id
+    resident_session_id = started["session_id"]
+    factory = _test_session_factory(db_session)
+
+    # The mode endpoint commits Chat before its separate best-effort stop.
+    # Leave the old Resident blob deliberately active and prove the persisted
+    # mode alone already forbids rebinding a newly accepted row to it.
+    async with factory() as mode_session:
+        await persist_strategic_workbench_update(
+            mode_session,
+            TEST_USER_ID,
+            project_id,
+            {"interaction_mode": "chat"},
+            arm_interaction_mode=False,
+        )
+    async with factory() as bind_session:
+        bound = await resident_session_module._bind_pending_operator_message_to_resident(
+            bind_session,
+            project_id,
+            message_id=message_id,
+            resident_session_id=resident_session_id,
+            operator_user_id=TEST_USER_ID,
+        )
+
+    assert bound is False
+    async with factory() as verify:
+        stored = await verify.get(ProjectMessage, message_id)
+        stored_project = await verify.get(Project, project_id)
+    assert stored is not None
+    assert stored_project is not None
+    assert resident_session_is_active(read_resident_session(stored_project.vision))
+    assert stored.resident_session_id is None
+    assert stored.handling_state == MessageHandlingState.PENDING
+    assert stored.handled_by_task_id is None
+    assert stored.conversation_claim_id is None
+    assert stored.context["_operator_wakeup_state"] == "paused"
+
+
+@pytest.mark.asyncio
+async def test_operator_message_preensure_treats_mode_change_as_chat_safe(
+    db_session,
+    monkeypatch,
+):
+    """The internal expected-mode fence is a normal Stop race, not a 500."""
+
+    project = await _make_project(db_session)
+    await _make_runner(db_session, project)
+    await persist_strategic_workbench_update(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        {"interaction_mode": "continuous"},
+        arm_interaction_mode=False,
+    )
+
+    async def mode_changed(*_args, **_kwargs):
+        raise resident_session_module._ResidentEnsureModeChanged("stopped")
+
+    monkeypatch.setattr(resident_session_module, "start_resident_session", mode_changed)
+    snapshot = await resident_session_module.ensure_resident_session_before_operator_message(
+        project.id,
+        operator_user_id=TEST_USER_ID,
+        session_factory=_test_session_factory(db_session),
+    )
+
+    assert snapshot is None
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert tasks == []
+
+
+@pytest.mark.asyncio
 async def test_continuous_hydration_ensure_succeeds(db_session, monkeypatch):
     monkeypatch.setenv("CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1")
     project = await _make_project(db_session)
@@ -1262,6 +1362,7 @@ async def test_fresh_session_rebinds_only_immediate_predecessor_turn_without_act
     assert reply.message.context["_resident_reply_covered_message_ids"] == [
         str(carried.id)
     ]
+    assert reply.message.context["_workday_consultation_requested"] is False
 
 
 @pytest.mark.asyncio

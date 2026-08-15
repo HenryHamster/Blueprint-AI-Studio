@@ -1232,6 +1232,7 @@ async def test_typed_fast_exact_completion_replay_rebroadcasts_canonical_message
 
     assert replay.status_code == 200, replay.text
     assert replay.json() == {"id": str(reply.id), "status": "duplicate"}
+    assert "_workday_consultation_requested" not in reply.context
     broadcast.assert_awaited_once()
     assert broadcast.await_args.args[:2] == (str(project.id), "message_created")
     assert broadcast.await_args.args[2]["message"]["id"] == str(reply.id)
@@ -1589,6 +1590,16 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     assert duplicate_turn.status_code == 200, duplicate_turn.text
     assert duplicate_turn.json()["status"] == "duplicate"
     assert duplicate_turn.json()["workday_packet"]["packet_id"] == packet_id
+    initial_reply = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.idempotency_key == "typed-workday-initial-answer",
+            )
+        )
+    ).scalars().one()
+    assert initial_reply.context["message_role"] == "operator_reply"
+    assert initial_reply.context["_workday_consultation_requested"] is True
     packet_claim = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
         headers=_headers(task, vm="agent-vm-resident-poll"),
@@ -1626,6 +1637,7 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     )
     assert continuation_claim.status_code == 200, continuation_claim.text
     continuation = continuation_claim.json()["continuation"]
+    assert continuation["attempt"] == 1
     result_packet_id = continuation["result_packet_id"]
     renewed_continuation = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/continuations/{result_packet_id}/renew",
@@ -1654,6 +1666,7 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     )
     assert reclaimed.status_code == 200, reclaimed.text
     follow_up = reclaimed.json()["continuation"]
+    assert follow_up["attempt"] == 2
     completed = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/continuations/{result_packet_id}/complete",
         headers=_headers(task, vm="agent-vm-resident-poll"),

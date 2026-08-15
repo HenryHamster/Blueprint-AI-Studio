@@ -43,6 +43,7 @@ DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
     # continuation fields drive the non-interruptive "Workday consulted" cue.
     "message_role",
     "_workday_result_packet_id",
+    "_workday_consultation_requested",
     "_resident_activation_prompt",
 )
 
@@ -64,6 +65,7 @@ _LIST_CONTEXT_KEYS = frozenset({
     "operator_intent",
     "message_role",
     "_workday_result_packet_id",
+    "_workday_consultation_requested",
     "_resident_activation_prompt",
     "_convergence_link",
     "_provenance_warnings",
@@ -598,7 +600,10 @@ def message_preview_dict(
         value = raw_context.get(key)
         if value is None:
             continue
-        if key == "_resident_activation_prompt":
+        if key in {
+            "_resident_activation_prompt",
+            "_workday_consultation_requested",
+        }:
             # This is a typed server marker, not display text. Stringifying it
             # would defeat the UI's strict boolean suppression guard.
             if isinstance(value, bool):

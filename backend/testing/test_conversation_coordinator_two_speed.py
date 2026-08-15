@@ -537,6 +537,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
         resident_session_id="session",
     )
     assert continuation is not None
+    assert continuation.attempt == 1
     renewed = await renew_workday_consultation_continuation(
         db_session,
         project_id=project.id,
@@ -579,6 +580,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
         resident_session_id="session",
     )
     assert continuation is not None
+    assert continuation.attempt == 2
     reply = await complete_workday_consultation_continuation(
         db_session,
         project_id=project.id,
