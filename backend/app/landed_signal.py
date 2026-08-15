@@ -779,7 +779,7 @@ async def corroborate_and_apply_merged_landed_signal(
         merge_commit_sha=merge_commit_sha,
         github_credentials=github_credentials,
     )
-    return apply_merged_landed_signal(
+    landed = apply_merged_landed_signal(
         task,
         project,
         base_branch=base_branch,
@@ -787,3 +787,19 @@ async def corroborate_and_apply_merged_landed_signal(
         non_merge_reason=non_merge_reason,
         merge_commit_sha=merge_commit_sha,
     )
+    if landed:
+        try:
+            from app.module_finding_chain import record_merged_pr_finding_chains
+
+            await record_merged_pr_finding_chains(
+                task,
+                session,
+                pr_number=pr_number,
+            )
+        except Exception:  # noqa: BLE001 — chain tracking never aborts a merge
+            logger.warning(
+                "[LANDED] module-finding-chain recording failed for task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
+    return landed

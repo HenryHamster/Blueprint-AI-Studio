@@ -907,6 +907,7 @@ _ESCALATION_REASON_LABELS = {
     "standoff": "dispute standoff",
     "repeat-fingerprint": "repeat-fingerprint halt",
     "abandon-candidate": "abandon candidate",
+    "module-finding-chain": "recurring module finding",
 }
 
 

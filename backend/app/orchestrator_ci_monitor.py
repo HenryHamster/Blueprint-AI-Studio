@@ -261,13 +261,29 @@ async def _apply_ci_merged_landed_signal(
         or (ci_task.context or {}).get("hotfix")
         or review_loop.get("hotfix")
     )
-    return apply_merged_landed_signal(
+    landed = apply_merged_landed_signal(
         ci_task,
         project,
         base_branch=base_branch,
         hotfix_lane=hotfix_lane,
         merge_commit_sha=merge_commit_sha,
     )
+    if landed:
+        try:
+            from app.module_finding_chain import record_merged_pr_finding_chains
+
+            await record_merged_pr_finding_chains(
+                ci_task,
+                session,
+                pr_number=review_loop.get("pr_number"),
+            )
+        except Exception:
+            logger.warning(
+                "[CI MONITOR] module-finding-chain recording failed for task %s",
+                getattr(ci_task, "id", None),
+                exc_info=True,
+            )
+    return landed
 
 
 async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
@@ -513,51 +529,51 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                 started
                 and (_utcnow() - started).total_seconds()
                 > CI_WAIT_TIMEOUT_MINUTES * 60
+                and not ci_loop.get("escalated")
             ):
                 # Escalate: alert the user but keep retrying.
                 # The 30-min backstop in services.py is the true hard-kill.
-                if not ci_loop.get("escalated"):
-                    ci_loop["escalated"] = True
-                    ci_task.context = {
-                        **(ci_task.context or {}),
-                        "review_loop": ci_loop,
-                    }
-                    # See note at the ci_wait_started persist above
-                    # — without flag_modified the escalated flag
-                    # silently fails to persist, the next cycle
-                    # reads escalated=False, and this whole block
-                    # re-fires every 2-4s, which is exactly the
-                    # "CI wait exceeded 20min" flap pattern.
-                    from sqlalchemy.orm.attributes import flag_modified
+                ci_loop["escalated"] = True
+                ci_task.context = {
+                    **(ci_task.context or {}),
+                    "review_loop": ci_loop,
+                }
+                # See note at the ci_wait_started persist above
+                # — without flag_modified the escalated flag
+                # silently fails to persist, the next cycle
+                # reads escalated=False, and this whole block
+                # re-fires every 2-4s, which is exactly the
+                # "CI wait exceeded 20min" flap pattern.
+                from sqlalchemy.orm.attributes import flag_modified
 
-                    flag_modified(ci_task, "context")
-                    ci_task.latest_status_message = f"CI wait exceeded {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — retrying, alert sent"
-                    session.add(ci_task)
-                    await _maybe_create_failure_alert(
-                        ci_task,
-                        session,
-                        f"Rollup PR #{ci_pr_number} stuck in CI-wait for >{CI_WAIT_TIMEOUT_MINUTES}min — still retrying",
-                    )
-                    await session.commit()
-                    await broadcast_to_project(
-                        str(ci_task.project_id),
-                        "task_updated",
-                        {
-                            "task_id": str(ci_task.id),
-                            "status": ci_task.status,
-                        },
-                    )
-                    ci_task = await _lock_task_for_mutation(
-                        session,
-                        ci_task_id,
-                        allowed_statuses=(TaskStatus.EVALUATING,),
-                        reason="CI polling after escalation persist",
-                    )
-                    if ci_task is None:
-                        continue
-                    ci_loop = dict(
-                        (ci_task.context or {}).get("review_loop", {}) or {}
-                    )
+                flag_modified(ci_task, "context")
+                ci_task.latest_status_message = f"CI wait exceeded {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — retrying, alert sent"
+                session.add(ci_task)
+                await _maybe_create_failure_alert(
+                    ci_task,
+                    session,
+                    f"Rollup PR #{ci_pr_number} stuck in CI-wait for >{CI_WAIT_TIMEOUT_MINUTES}min — still retrying",
+                )
+                await session.commit()
+                await broadcast_to_project(
+                    str(ci_task.project_id),
+                    "task_updated",
+                    {
+                        "task_id": str(ci_task.id),
+                        "status": ci_task.status,
+                    },
+                )
+                ci_task = await _lock_task_for_mutation(
+                    session,
+                    ci_task_id,
+                    allowed_statuses=(TaskStatus.EVALUATING,),
+                    reason="CI polling after escalation persist",
+                )
+                if ci_task is None:
+                    continue
+                ci_loop = dict(
+                    (ci_task.context or {}).get("review_loop", {}) or {}
+                )
                 # Fall through — continue polling CI even after escalation
 
             (

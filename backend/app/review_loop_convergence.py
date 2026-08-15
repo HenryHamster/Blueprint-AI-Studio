@@ -9,6 +9,10 @@ These names are re-exported from app.review_pipeline so every existing
 ``from app.review_pipeline import X`` caller and test keeps working
 unchanged. This module imports nothing from review_pipeline, so the
 re-export is acyclic.
+
+``CROSS_EPISODE_ABANDON_THRESHOLD`` is intentionally an intra-PR-only census.
+Project-lifetime recurrence across distinct merged PRs is tracked by
+``ModuleFindingChain`` and escalated from the REQUEST_CHANGES path.
 """
 
 import asyncio
@@ -890,7 +894,7 @@ async def _handle_cap_exhaustion(
     from app.routers.agent_status import record_task_result
     from app.shared_state import record_direction_result
 
-    cap_label = scope if scope in ("global", "per-chain") else scope
+    cap_label = scope
     # ── ROLLBACK-EXPIRY CONTRACT (review round 2, BLOCKER 1) ──
     # ``session.rollback()`` expires EVERY loaded instance in the session — even
     # under ``expire_on_commit=False`` — including the CALLER's ``source_task``.

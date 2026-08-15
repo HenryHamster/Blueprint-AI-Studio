@@ -49,7 +49,9 @@ from app.review_pipeline import (
     fix_all_occurrences_directive,
     review_loop_parked_for_operator,
     stale_respawn_delta_base_sha,
+    _surface_module_finding_chain_escalation,
 )
+from app.module_finding_chain import find_and_mark_chain_escalation
 from app.rollup_locking import _OriginalTaskLockTimeout, _lock_original_task
 
 logger = logging.getLogger(__name__)
@@ -634,7 +636,7 @@ async def run_request_changes(
                 _orig_loop[
                     "ci_wait_pause_baseline"
                 ] = await pause_clock.current_baseline(session)
-            except Exception as _pause_err:  # noqa: BLE001
+            except Exception as _pause_err:
                 logger.warning(
                     "[REVIEW PIPELINE] Could not refresh pause "
                     "baseline while revoking parent %s: %r",
@@ -653,6 +655,24 @@ async def run_request_changes(
         # failure must leave the parent safely revoked and the
         # post-commit sweep free to retry the idempotent spawn.
         await session.commit()
+
+    # Cross-PR recurring-concern escalation is advisory to this PR: the marker
+    # and alert route a durable design decision, while this request-changes
+    # cycle continues to receive its ordinary fix task.
+    chain_candidate = await find_and_mark_chain_escalation(
+        session,
+        project_id=task.project_id,
+        issues=issues,
+        authoritative_files=_pr_files,
+    )
+    if chain_candidate is not None:
+        await _surface_module_finding_chain_escalation(
+            task,
+            _orig if original_task_id else None,
+            pr_number=int(pr_number),
+            candidate=chain_candidate,
+            session=session,
+        )
 
     # CI vs reviewer build-gate disagreement detector. When the
     # reviewer flags build/lint complaints but CI shows the

@@ -66,6 +66,7 @@ from app.release_models import (  # noqa: F401
     ReleasePrepromotionDispatch,
     ReleaseVersion,
     ResidualVerdict,
+    ModuleFindingChain,
     VersionAcceptanceCriterion,
 )
 from app.discovery_models import (  # noqa: F401
@@ -5656,15 +5657,18 @@ def _tombstone_project_message_source_receipts_for_privacy_mutation(
             loaded.payload_state = payload_state
             loaded.tombstoned_at = now
         elif (
-            isinstance(loaded, StrategicMemorySourceDisposition)
-            and any(loaded.__dict__.get("source_id") == row[0] for row in affected)
-            and loaded.__dict__.get("status") == "pending"
-        ):
-            session.expire(loaded)
-        elif (
-            isinstance(loaded, StrategicMemoryConsolidationJob)
-            and loaded.__dict__.get("project_id") == project_id
-            and loaded.__dict__.get("status") in {"queued", "running", "retry"}
+            (
+                isinstance(loaded, StrategicMemorySourceDisposition)
+                and any(
+                    loaded.__dict__.get("source_id") == row[0] for row in affected
+                )
+                and loaded.__dict__.get("status") == "pending"
+            )
+            or (
+                isinstance(loaded, StrategicMemoryConsolidationJob)
+                and loaded.__dict__.get("project_id") == project_id
+                and loaded.__dict__.get("status") in {"queued", "running", "retry"}
+            )
         ):
             session.expire(loaded)
 
@@ -5867,18 +5871,20 @@ def _invalidate_strategic_envelopes_for_authority_and_privacy_changes(
                     )
 
     for instance in session.deleted:
-        if isinstance(instance, ProjectMessage):
+        if (
+            isinstance(instance, ProjectMessage)
+            and not _is_derived_strategic_packet_context(
+                instance.__dict__.get("context")
+            )
+        ):
             # ORM deletion is the conservative governed privacy path.  Routine
             # bulk pruning remains explicitly documented above.
-            if not _is_derived_strategic_packet_context(
-                instance.__dict__.get("context")
-            ):
-                mark(instance.__dict__.get("project_id"), privacy=True)
-                tombstone_message_source(
-                    instance.__dict__.get("project_id"),
-                    instance.__dict__.get("id"),
-                    payload_state="deleted",
-                )
+            mark(instance.__dict__.get("project_id"), privacy=True)
+            tombstone_message_source(
+                instance.__dict__.get("project_id"),
+                instance.__dict__.get("id"),
+                payload_state="deleted",
+            )
 
     # Acquire the canonical Project -> state locks before touching jobs,
     # sources, or dispositions. Any failure rolls the entire privacy mutation
@@ -8394,7 +8400,7 @@ class OperatorInboxLivenessObservation(SQLModel, table=True):
     Written once per tick for EVERY measured project (all statuses:
     ``"flagged"``, ``"ok"``, ``"skipped"``) so non-flagged rows break the
     consecutive flagged chain and episode boundaries are detected correctly.
-    When a project goes [flagged×3, clean, flagged], the clean-tick row
+    When a project goes [flagged x3, clean, flagged], the clean-tick row
     separates the two episodes and escalation only fires after >= 3 NEW
     consecutive flagged ticks.  Without clean-tick rows the DB sees an
     unbroken flagged sequence and escalates on the first flagged tick of the

@@ -48,10 +48,11 @@ from app.spawn_calibration import (
 
 # Authoritative issue ledger. Side-effect-free; re-exported here so callers
 # importing from app.review_pipeline keep working.
-from app.issue_ledger import (  # noqa: F401
+from app.issue_ledger import (
     build_issue_ledger,
     ensure_issue_ids,
 )
+from app.module_finding_chain import MODULE_FINDING_CHAIN_ESCALATION_KEY
 
 # Pure, side-effect-free review-loop heuristics live in review_heuristics; they
 # are re-exported here so existing callers/tests that import them from
@@ -788,7 +789,7 @@ async def _halt_for_cross_episode_abandon_candidate(
     original_task: Task | None,
     *,
     pr_number: int,
-    candidate: dict[str, object],
+    candidate: dict[str, Any],
     session: AsyncSession,
 ) -> None:
     """Persist and surface the PR-level stop signal before any new spawn.
@@ -853,6 +854,60 @@ async def _halt_for_cross_episode_abandon_candidate(
             exc_info=True,
         )
     await session.commit()
+
+
+async def _surface_module_finding_chain_escalation(
+    source_task: Task,
+    original_task: Task | None,
+    *,
+    pr_number: int,
+    candidate: dict[str, object],
+    session: AsyncSession,
+) -> None:
+    """Surface a recurring concern without blocking the current PR's fix."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    target = original_task or source_task
+    marker = {
+        **candidate,
+        "pr_number": pr_number,
+        "recorded_at": _utcnow().isoformat(),
+    }
+    target_ctx = dict(target.context or {})
+    target_ctx[MODULE_FINDING_CHAIN_ESCALATION_KEY] = marker
+    target.context = target_ctx
+    flag_modified(target, "context")
+    session.add(target)
+    if source_task.id != target.id:
+        source_ctx = dict(source_task.context or {})
+        source_ctx[MODULE_FINDING_CHAIN_ESCALATION_KEY] = marker
+        source_task.context = source_ctx
+        flag_modified(source_task, "context")
+        session.add(source_task)
+
+    try:
+        from app.alert_dispatch import _maybe_create_escalation_alert
+
+        await _maybe_create_escalation_alert(
+            target,
+            session,
+            pr_number=pr_number,
+            reason="module-finding-chain",
+            iteration=int(
+                candidate.get("verified_occurrences") or candidate["occurrences"]
+            ),
+            detail=(
+                f"Recurring concern in {candidate['file_path']} across "
+                f"{candidate['occurrences']} merged PR(s); current fix continues."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — marker remains durable
+        logger.warning(
+            "[PIPELINE] Failed to create module-finding-chain alert for PR #%s: %s",
+            pr_number,
+            exc,
+            exc_info=True,
+        )
 
 
 def _normalized_review_target(

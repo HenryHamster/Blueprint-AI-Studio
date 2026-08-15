@@ -115,6 +115,11 @@ def _junit_failures(path: Path, *, label: str) -> dict[str, str]:
 def _normalize_failure_detail(detail: str, *, tree_root: Path) -> str:
     """Remove the tree-specific absolute root from a JUnit failure detail."""
     normalized = detail.replace(str(tree_root), "<tree-root>")
+    normalized = re.sub(
+        r"/tmp/pytest-of-[^/]+/pytest-\d+",
+        "<pytest-temp>",
+        normalized,
+    )
     return re.sub(r"(object at )0x[0-9a-fA-F]+", r"\1<address>", normalized)
 
 

@@ -23,6 +23,7 @@ from app.ci_resolution import (
     _CI_RED,
 )
 from app.migration_reconciliation import effective_authorized_divergences
+from app.finding_identity import audit_finding_key
 
 logger = logging.getLogger(__name__)
 _MODULE_SIZE_GOVERNANCE_CAP: int = 3229
@@ -175,7 +176,7 @@ def project_promotion_confidence(
     judged_fraction = _clamp01(judged_tier_met_fraction)
     penalty_factor = 1.0 - JUDGED_TIER_PENALTY_WEIGHT * judged_fraction
     existing_confidence = w_audit * audit + w_test * erosion
-    debt_weight = coerce_completion_debt_weight((resolved_policy.get("weights") or {}))
+    debt_weight = coerce_completion_debt_weight(resolved_policy.get("weights") or {})
     if debt_weight > 0.0 and debt_pressure_score is not None:
         confidence_before_penalty = (
             (1.0 - debt_weight) * existing_confidence
@@ -2226,20 +2227,8 @@ def _finding_match_key(finding: dict[str, str]) -> tuple[str, str]:
 
 
 def _audit_finding_key(summary: str, file: str | None) -> str:
-    """Deterministic content key for a carried audit finding.
-
-    Mirrors the finding-hash convention used elsewhere
-    (``finding_deduplication.finding_hash`` → sha256 truncated to 16 hex) and
-    the ``_finding_match_key`` composition (normalized ``file`` + ``summary``).
-    The same finding content yields the same key across re-extractions so a
-    resolution ledger can durably key findings; a different ``file`` yields a
-    different key.  Computed from the already-normalized/truncated ``summary``
-    and ``file`` the carried payload stores, so the key is stable for what the
-    consumer actually sees.
-    """
-    norm_file = str(file or "").strip().lower()
-    norm_summary = str(summary or "").strip().lower()
-    return hashlib.sha256(f"{norm_file}|{norm_summary}".encode()).hexdigest()[:16]
+    """Compatibility wrapper for the shared durable finding-key helper."""
+    return audit_finding_key(summary, file)
 
 
 def _compute_challenge_synthesis_from_binding_verdicts(
