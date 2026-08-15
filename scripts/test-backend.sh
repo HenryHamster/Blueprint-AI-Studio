@@ -168,7 +168,9 @@ else
   export PATH="$HOME/.local/bin:$PATH"
   # Install dependencies if needed (use uv if pip is unavailable)
   VENV=/tmp/blueprint-backend-venv
-  [ -d "$VENV" ] && export PYTHON="$VENV/bin/python"
+  # Preserve an explicitly selected interpreter.  Read-only harness probes
+  # use this to inject a recorder without requiring an app checkout.
+  [ -n "${PYTHON:-}" ] || { [ -d "$VENV" ] && export PYTHON="$VENV/bin/python"; }
   if ! "${PYTHON:-python3}" -c "import fastapi" &>/dev/null; then
     echo "=== Installing dependencies ==="
     if python3 -m pip install -q -r requirements.txt 2>&1 | tail -5; then

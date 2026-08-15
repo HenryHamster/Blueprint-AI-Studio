@@ -928,6 +928,39 @@ async def _spawn_research_task_inner(
     except LegacyEngineAuthorityExpired:
         await session.rollback()
         return
+
+    # Failure-breaker decay must run before any availability, budget, bootstrap,
+    # or circuit-breaker early return. Otherwise an unavailable model/account can
+    # keep the strategic failure latch alive indefinitely, making the sparse
+    # wall-clock backstop unreachable even after the 48h recovery window.
+    vision_data = project.vision or {}
+    strategic_failures = vision_data.get("_strategic_failures", 0)
+    if strategic_failures >= 3:
+        failures_at = vision_data.get("_strategic_failures_at")
+        try:
+            last_failure = datetime.fromisoformat(
+                str(failures_at).replace("Z", "+00:00")
+            )
+            if last_failure.tzinfo is not None:
+                last_failure = last_failure.astimezone(timezone.utc).replace(tzinfo=None)
+            if (_utcnow() - last_failure).total_seconds() > 48 * 3600:
+
+                def _clear_strategic_failures(vision: dict) -> None:
+                    vision.pop("_strategic_failures", None)
+                    vision.pop("_strategic_failures_at", None)
+
+                await with_vision_locked(session, project.id, _clear_strategic_failures)
+                await commit_legacy_authorized(session, project.id, legacy_generation)
+                await session.refresh(project)
+                strategic_failures = 0
+                vision_data = project.vision or {}
+                logger.info(
+                    f"[STRATEGIC] Auto-decayed _strategic_failures for project {project.id} "
+                    f"(last failure: {failures_at})"
+                )
+        except (ValueError, TypeError, OverflowError):
+            pass  # malformed or missing timestamp, keep current value
+
     from app.research_completion import (
         _compute_momentum_factor,
         _compute_productivity_score,
@@ -1294,33 +1327,6 @@ async def _spawn_research_task_inner(
     # Stop forcing after 3 consecutive strategic failures to prevent infinite loops.
     vision_data = project.vision or {}
     strategic_failures = vision_data.get("_strategic_failures", 0)
-    decay_fired = False
-    # Auto-decay: if last failure was >48h ago, reset counter for recovery purposes
-    if strategic_failures >= 3:
-        failures_at = vision_data.get("_strategic_failures_at")
-        if failures_at:
-            try:
-                last_failure = datetime.fromisoformat(
-                    failures_at.replace("Z", "+00:00")
-                )
-                if (_utcnow() - last_failure).total_seconds() > 48 * 3600:
-                    strategic_failures = 0
-                    decay_fired = True
-                    logger.info(
-                        f"[STRATEGIC] Auto-decayed _strategic_failures for project {project.id} (last failure: {failures_at})"
-                    )
-            except (ValueError, TypeError):
-                pass  # malformed timestamp, keep current value
-
-    # Persist the auto-decay to the database if it fired
-    if decay_fired:
-
-        def _clear_strategic_failures(vision: dict) -> None:
-            vision.pop("_strategic_failures", None)
-            vision.pop("_strategic_failures_at", None)
-
-        await with_vision_locked(session, project.id, _clear_strategic_failures)
-        await commit_legacy_authorized(session, project.id, legacy_generation)
     # Check if ANY direction is active in the project (ignoring cooldown filter).
     # active_directions only contains non-cooldown directions, so a project with
     # active-but-cooling directions should not trigger a strategic cycle.

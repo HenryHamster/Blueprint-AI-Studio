@@ -2337,6 +2337,61 @@ async def _create_strategic_alert(
     )
 
 
+_STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE = (
+    "Strategic engine halted: no completed cycle in window"
+)
+
+
+async def _maybe_create_strategic_cycle_liveness_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    starvation_hours: int,
+    last_completed_at: datetime | None,
+) -> bool:
+    """Persist and broadcast the operator signal for a silent strategic loop."""
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.severity == AlertSeverity.WARNING,
+            Alert.dismissed_at.is_(None),
+            Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+
+    last_completed_label = (
+        last_completed_at.isoformat() if last_completed_at is not None else "never"
+    )
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=_STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+        message=(
+            f"The strategic loop has not completed a cycle in the last "
+            f"{starvation_hours}h. loop=strategic; "
+            f"last_completed_at={last_completed_label}. "
+            "A recent intentional no-delta decision was not recorded, so the "
+            "loop may be halted. Inspect the strategic scheduler and runtime logs."
+        )[:1000],
+        event_type="research.strategic_cycle_liveness",
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
 # Stable title for per-compute-job no-progress watchdog alert. Kept CONSTANT so
 # a persistent stall across monitor cycles dedups to exactly ONE alert per job.
 _NO_PROGRESS_WATCHDOG_ALERT_TITLE = (

@@ -526,7 +526,13 @@ def test_changed_harness_cannot_hide_a_base_corpus_failure(tmp_path: Path) -> No
     """A weakened candidate harness is compared against the untouched base harness."""
     fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "preexisting")
     harness = repo / "scripts" / "test-backend.sh"
-    harness.write_text(harness.read_text() + "\n# WEAKENED_HARNESS\n")
+    harness.write_text(
+        harness.read_text().replace(
+            'CI_SCRIPT_TEST_DISCOVERY_GLOB="test_*.py"',
+            'CI_SCRIPT_TEST_DISCOVERY_GLOB="test_changed_*.py"',
+        )
+        + "\n# WEAKENED_HARNESS\n"
+    )
     result = subprocess.run(
         [
             "python3",
@@ -549,7 +555,7 @@ def test_changed_harness_cannot_hide_a_base_corpus_failure(tmp_path: Path) -> No
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert "changed scripts/test-backend.sh made base corpus" in output
+    assert "changed static test roster made base corpus" in output
 
 
 def test_baseline_scopes_to_current_failures_and_survives_roster_drift(

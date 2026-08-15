@@ -2763,10 +2763,9 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 7: Stalled strategic-cycle reaper. Also detects zero-cycle
-                # starvation (autonomous project with no recent StrategicCycle row
-                # at all) and emits the strategic_cycle_stall Alert here — no
-                # separate emitter (operator decision).
+                # Step 7: Stalled strategic-cycle reaper. Its companion liveness
+                # sweep keys on terminal completion (or a recent intentional
+                # no-delta receipt), then routes a warning through alert dispatch.
                 _mark_reaper_progress()
                 try:
                     await sweep_stalled_strategic_cycles(

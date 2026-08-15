@@ -219,6 +219,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "research.anomaly_auto_adjusted": STRATEGIST_INTERNAL,
     "research.escalation_delivery_failed": OPERATOR_ACTION_NEEDED,
     "research.diagnosis_stalled": OPERATOR_ACTION_NEEDED,
+    "research.strategic_cycle_liveness": OPERATOR_ACTION_NEEDED,
     "research.strategic_issue": OPERATOR_FYI,
     # Dedup / already-fixed deadlock diagnostics: internal pipeline health
     # signals handled by the strategic agent — not surfaced to the operator.

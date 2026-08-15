@@ -351,7 +351,9 @@ class TestStrategicCycleStarvation:
             StrategicCycle(
                 id=uuid.uuid4().hex,
                 project_id=project.id,
-                phase1_started_at=now - timedelta(hours=1),  # inside the window
+                phase1_started_at=now - timedelta(hours=1),
+                phase2_completed_at=now - timedelta(minutes=30),
+                outcome="completed",
             )
         )
         await db_session.commit()
@@ -458,6 +460,8 @@ class TestStrategicCycleStarvation:
                 id=uuid.uuid4().hex,
                 project_id=with_cycle.id,
                 phase1_started_at=now - timedelta(hours=1),
+                phase2_completed_at=now - timedelta(minutes=30),
+                outcome="completed",
             )
         )
         # with_alert already has an open WARNING dedup alert → not duplicated.

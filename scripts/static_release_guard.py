@@ -118,6 +118,21 @@ def _normalize_failure_detail(detail: str, *, tree_root: Path) -> str:
     return re.sub(r"(object at )0x[0-9a-fA-F]+", r"\1<address>", normalized)
 
 
+def _static_roster_changed(base_harness: Path, current_harness: Path) -> bool:
+    """Return whether the harness changed how the static corpus is selected."""
+    start_marker = "CI_TEST_MODULE_ROOTS=("
+    end_marker = "STATIC_GUARD_SELECTORS_ARGS=()"
+    fingerprints = []
+    for harness in (base_harness, current_harness):
+        source = harness.read_text(encoding="utf-8")
+        start = source.find(start_marker)
+        end = source.find(end_marker, start + len(start_marker))
+        if start < 0 or end < 0:
+            return True
+        fingerprints.append(source[start:end])
+    return fingerprints[0] != fingerprints[1]
+
+
 def _run_static_corpus(
     repo: Path, junit: Path, *, selectors: list[str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -350,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
             print("[static guard] ERROR: scripts/test-backend.sh is unavailable", file=sys.stderr)
             return 2
         harness_changed = "scripts/test-backend.sh" in scoped
+        roster_changed = _static_roster_changed(base_harness, current_harness)
         # The route helper is an execution dependency mounted alongside the
         # harness; retain the existing fixture/bootstrap behavior for it. The
         # harness and its roster above remain tree-specific.
@@ -399,10 +415,10 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     new_failures = {
                         "<harness>": (
-                            "changed scripts/test-backend.sh made base corpus "
+                            "changed static test roster made base corpus "
                             "failure(s) disappear"
                         )
-                    } if base_failures else {}
+                    } if base_failures and roster_changed else {}
             else:
                 # Current-tree failures need a baseline comparison; a clean tree
                 # takes the no-failure path above and avoids this second run.

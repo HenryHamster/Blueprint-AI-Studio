@@ -10,10 +10,10 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import and_, delete, or_
+from sqlalchemy import and_, delete, func, or_
 from sqlmodel import select
 from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 
@@ -2116,15 +2116,55 @@ async def sweep_recover_stranded_transient_blockers(
 
 # ── Strategic cycle starvation sweep ─────────────────────────────────────────
 
-# Autonomous projects older than this window with no StrategicCycle row trigger
-# a strategic_cycle_stall WARNING Alert.
+# Autonomous projects older than this window with no completed StrategicCycle
+# (and no recent intentional no-delta receipt) trigger a strategic-cycle
+# liveness WARNING Alert. The previous detector keyed on phase1_started_at,
+# which treated an abandoned/in-flight cycle as proof that the loop was alive.
 _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS = 24
-_STRATEGIC_CYCLE_STALL_ALERT_TITLE = "Strategic engine starved: no cycle in window"
+_STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE = (
+    "Strategic engine halted: no completed cycle in window"
+)
+# Compatibility name used by existing diagnostics/tests.
+_STRATEGIC_CYCLE_STALL_ALERT_TITLE = _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE
+_STRATEGIC_CYCLE_TERMINAL_OUTCOMES = (
+    "completed",
+    "failed_phase1",
+    "failed_phase2",
+    "failed_phase2_spawn",
+    "stalled_phase1",
+    "stalled_phase2",
+    "thinker_artifacts_missing",
+)
+
+
+def _recent_no_delta_skip_at(vision: dict | None, cutoff: datetime) -> datetime | None:
+    """Return the newest intentional no-delta receipt inside ``cutoff``."""
+    newest: datetime | None = None
+    for entry in (vision or {}).get("_strategic_no_delta_skips") or []:
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("skipped_at")
+        if not isinstance(raw, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        if parsed >= cutoff and (newest is None or parsed > newest):
+            newest = parsed
+    return newest
 
 
 async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
-    """Emit a deduped strategic_cycle_stall Alert for autonomous projects with no
-    recent StrategicCycle row at all. Returns the number of alerts created."""
+    """Detect a halted strategic loop and route one operator-visible alert.
+
+    A terminal StrategicCycle completion is the liveness receipt. A recent
+    ``_strategic_no_delta_skips`` entry is the explicit healthy-idle receipt;
+    it suppresses the alert even though no new cycle row was created. An
+    active/incomplete cycle is deliberately not evidence of liveness.
+    """
     from app.models import Alert, AlertSeverity, Project, StrategicCycle
     from app.shared_state import runtime_config as _runtime_config
 
@@ -2139,7 +2179,7 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
 
     project_rows = (
         await session.execute(
-            select(Project.id, Project.created_at).where(
+            select(Project.id, Project.created_at, Project.vision).where(
                 Project.autonomous_enabled.is_(True),
                 Project.not_archived(),
             )
@@ -2150,7 +2190,8 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     # project itself is older than the starvation window. Filter in Python so
     # the two batched lookups below only run over genuine candidates.
     candidate_ids: list = []
-    for project_id, project_created_at in project_rows:
+    candidate_visions: dict = {}
+    for project_id, project_created_at, project_vision in project_rows:
         if project_created_at is not None:
             pc = project_created_at
             if pc.tzinfo is not None:
@@ -2158,29 +2199,32 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             if pc > cutoff:
                 continue
         candidate_ids.append(project_id)
+        candidate_visions[project_id] = project_vision
 
-    created = 0
     if not candidate_ids:
-        return created
+        return 0
 
-    # Batched lookup 1: which candidate projects already have a recent cycle.
-    # Replaces a per-project existence SELECT (the old N+1). Equivalent to the
-    # prior ``phase1_started_at >= cutoff`` LIMIT 1 existence check, collapsed
-    # into one round-trip via DISTINCT.
-    projects_with_recent_cycle = set(
-        (
-            await session.execute(
-                select(StrategicCycle.project_id)
-                .where(
-                    StrategicCycle.project_id.in_(candidate_ids),
-                    StrategicCycle.phase1_started_at >= cutoff,
-                )
-                .distinct()
-            )
-        )
-        .scalars()
-        .all()
+    # Only terminal cycle receipts count. A recently-started row that never
+    # reached a completion timestamp is exactly what this detector surfaces.
+    completion_expr = func.coalesce(
+        StrategicCycle.phase2_completed_at, StrategicCycle.phase1_completed_at
     )
+    completion_rows = (
+        await session.execute(
+            select(StrategicCycle.project_id, func.max(completion_expr))
+            .where(
+                StrategicCycle.project_id.in_(candidate_ids),
+                StrategicCycle.outcome.in_(_STRATEGIC_CYCLE_TERMINAL_OUTCOMES),
+            )
+            .group_by(StrategicCycle.project_id)
+        )
+    ).all()
+    latest_completions = dict(completion_rows)
+    recent_completions = {
+        project_id: completed_at
+        for project_id, completed_at in latest_completions.items()
+        if completed_at is not None and completed_at >= cutoff
+    }
 
     # Batched lookup 2: which candidate projects already have an open WARNING
     # dedup alert. Replaces the per-project dedup SELECT (the second N+1).
@@ -2202,30 +2246,25 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
         .all()
     )
 
+    created = 0
+    from app.alert_dispatch import _maybe_create_strategic_cycle_liveness_alert
+
     for project_id in candidate_ids:
-        if project_id in projects_with_recent_cycle:
+        if project_id in recent_completions:
             continue
         # Dedup: one open WARNING alert per project for this title.
         if project_id in projects_with_open_alert:
             continue
 
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=AlertSeverity.WARNING,
-                title=_STRATEGIC_CYCLE_STALL_ALERT_TITLE,
-                message=(
-                    f"No strategic cycle has started in the last {starvation_hours}h "
-                    "for this autonomous project — the strategic engine appears "
-                    "starved (zero cycles, not merely stalled mid-cycle). Review the "
-                    "strategic loop scheduler and recent orchestrator logs."
-                )[:1000],
-                event_type="research.diagnosis_stalled",
-            )
-        )
-        created += 1
-    if created:
-        await session.commit()
+        if _recent_no_delta_skip_at(candidate_visions.get(project_id), cutoff) is not None:
+            continue
+        if await _maybe_create_strategic_cycle_liveness_alert(
+            project_id,
+            session,
+            starvation_hours=starvation_hours,
+            last_completed_at=latest_completions.get(project_id),
+        ):
+            created += 1
     return created
 
 
