@@ -99,8 +99,12 @@ def attribute_new_failures(
     baseline_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, str]:
     """Keep only failures newly introduced by the current tree."""
-    del current_root, baseline_root
-    return attribute_failure_maps(current, baseline).new_failures
+    return attribute_failure_maps(
+        current,
+        baseline,
+        current_root=current_root,
+        baseline_root=baseline_root,
+    ).new_failures
 
 
 def classify_backend_verification(
@@ -115,7 +119,6 @@ def classify_backend_verification(
     baseline_report: JUnitReport | None = None,
 ) -> dict[str, object]:
     """Compatibility entrypoint for the shared publication attribution."""
-    del current_root, baseline_root
     return _classify_verification(
         runtime_available=runtime_available,
         current_exit_code=current_exit_code,
@@ -123,6 +126,8 @@ def classify_backend_verification(
         baseline_failures=baseline_failures,
         current_report=current_report,
         baseline_report=baseline_report,
+        current_root=current_root,
+        baseline_root=baseline_root,
     )
 
 # Maximum BFS depth for transitive importer expansion. The ``seen_mods`` dedup

@@ -91,7 +91,7 @@ def test_backend_verification_junit_parser_preserves_route_keyed_detail(tmp_path
     ) == {}
 
 
-def test_backend_verification_uses_route_identity_when_rendered_detail_changes():
+def test_backend_verification_treats_changed_failure_detail_as_new():
     current = {"backend/testing/test_x.py::test_old::failure": "line 99: changed"}
     baseline = {"backend/testing/test_x.py::test_old::failure": "line 12: old"}
 
@@ -102,15 +102,10 @@ def test_backend_verification_uses_route_identity_when_rendered_detail_changes()
         baseline_failures=baseline,
     )
 
-    assert outcome["state"] == "preexisting_test_failure"
-    assert outcome["blocking"] is False
-    assert outcome["new_failures"] == {}
-    assert outcome["suppressed_failures"] == {
-        "backend/testing/test_x.py::test_old::failure": {
-            "detail": "line 99: changed",
-            "reason": "same route/test/failure kind failed on baseline",
-        }
-    }
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == current
+    assert outcome["suppressed_failures"] == {}
 
 
 def test_backend_verification_keeps_diff_introduced_route_blocking():

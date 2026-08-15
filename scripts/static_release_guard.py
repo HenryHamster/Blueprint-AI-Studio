@@ -135,54 +135,6 @@ def _task_id() -> str:
     return os.environ.get("TASK_ID", "").strip()
 
 
-def _pytest_selector(
-    classname: str, name: str, *, tree_root: Path
-) -> tuple[str, Path] | None:
-    """Translate pytest's JUnit classname/name pair into a repository node id.
-
-    pytest derives ``classname`` from the failing node id relative to its
-    rootdir, so a file selected from OUTSIDE rootdir keeps the traversal
-    segments — and ``.``-splitting drops the empty ones but keeps any real
-    directory name they walked through.  The harness runs pytest from the
-    backend directory and selects the ``scripts/`` corpus by path, giving two
-    distinct shapes for the same file:
-
-    * non-Docker: ``../scripts/test_x.py`` -> ``...scripts.test_x``
-    * Docker (rootdir ``/app``, repo bind-mounted at ``/repo``):
-      ``/repo/scripts/test_x.py`` -> ``...repo.scripts.test_x``
-
-    The Docker shape retains the ``repo`` mount segment, which exists in the
-    container but not in the tree being resolved.  So resolution walks the
-    leading segments off as well as the trailing ones: the first prefix that
-    names a real file wins, which handles the ``/repo`` mount (and any future
-    mount point) without hard-coding the container layout.
-
-    A COLLECTION error has no test identity: pytest's ``mangle_test_address``
-    yields a single element, so ``classname`` is empty and the dotted MODULE
-    path lands in ``name`` instead.  That shape is resolved by reading the
-    module path out of ``name`` and returning a file-level selector with no
-    ``::`` node — otherwise an import error present in both trees would be
-    unresolvable here and charged as new.
-    """
-    parts = [part for part in classname.split(".") if part]
-    node = name
-    if not parts:
-        parts = [part for part in name.split(".") if part]
-        node = ""
-    for start in range(len(parts)):
-        for module_length in range(len(parts), start, -1):
-            relative = Path(*parts[start:module_length]).with_suffix(".py")
-            for source_root in (tree_root, tree_root / "backend"):
-                source = source_root / relative
-                if source.is_file():
-                    suffix = [part for part in (*parts[module_length:], node) if part]
-                    return (
-                        f"{relative}{''.join(f'::{part}' for part in suffix)}",
-                        source,
-                    )
-    return None
-
-
 def _base_file_selectors(selectors: dict[str, str], *, base_root: Path) -> list[str]:
     """Return FILE-level pytest selectors for failed nodes resolvable in base.
 
@@ -346,20 +298,36 @@ def main(argv: list[str] | None = None) -> int:
         else:
             current_failures = current_report.failures
             new_failures: dict[str, str] = {}
-            accounted_failures: dict[str, str] = {}
-            if not current_failures and current_result.returncode != 0:
+            if not current_failures:
                 # A harness/import failure has no testcase identity. It is still a
                 # real failure, and must not be converted into a green result.
-                new_failures = {"<harness>": current_result.stderr or current_result.stdout}
+                if current_result.returncode != 0:
+                    new_failures = {"<harness>": current_result.stderr or current_result.stdout}
+                elif harness_changed:
+                    # A changed harness is checked against the base roster, but a
+                    # normal test removal or rename is not itself a finding.
+                    base_result = _run_static_corpus(base_root, base_junit)
+                    try:
+                        baseline_report = parse_junit_report(
+                            base_junit, tree_root=base_root, label="base"
+                        )
+                    except RuntimeError as exc:
+                        print(
+                            f"[static guard] ERROR: cannot attribute standalone corpus: {exc}",
+                            file=sys.stderr,
+                        )
+                        print(base_result.stdout, end="")
+                        print(base_result.stderr, end="", file=sys.stderr)
+                        failures.append("standalone static corpus attribution")
+                    else:
+                        if roster_changed and baseline_report.failures:
+                            new_failures["<harness>"] = (
+                                "changed static test roster made base corpus "
+                                "failure(s) disappear"
+                            )
             else:
-                # A clean current report still needs a full baseline: a route
-                # that vanished or became skipped must be explicitly accounted
-                # for rather than silently turning into a green publication.
-                selectors, unresolved = _failed_selectors(current_junit, tree_root=repo) if current_failures else ({}, [])
-                base_selectors: list[str] | None
-                if not current_failures:
-                    base_selectors = None
-                elif unresolved:
+                selectors, unresolved = _failed_selectors(current_junit, tree_root=repo)
+                if unresolved:
                     # At least one current failure has no derivable selector
                     # (e.g. a collection error, which pytest reports with an
                     # empty classname). A scoped baseline cannot cover it, so
@@ -423,18 +391,8 @@ def main(argv: list[str] | None = None) -> int:
                     if baseline_report is not None:
                         attributed = attribute_reports(current_report, baseline_report)
                         new_failures = attributed.new_failures
-                        accounted_failures = {
-                            **{
-                                key: f"baseline route identity: route disappeared from current report; {detail}"
-                                for key, detail in attributed.disappeared_failures.items()
-                            },
-                            **{
-                                key: f"baseline route identity: route is skipped in current report; {detail}"
-                                for key, detail in attributed.skipped_failures.items()
-                            },
-                        }
                         if harness_changed and roster_changed and baseline_report.failures:
-                            accounted_failures["<harness>"] = (
+                            new_failures["<harness>"] = (
                                 "changed static test roster made base corpus "
                                 "failure(s) disappear"
                             )
@@ -451,12 +409,10 @@ def main(argv: list[str] | None = None) -> int:
                                 f"{json.dumps(suppressed, sort_keys=True)}"
                             )
 
-            if new_failures or accounted_failures:
+            if new_failures:
                 try:
                     attributed = _attributed_findings(
-                        {**new_failures, **accounted_failures},
-                        task_id=task_id,
-                        source="standalone static corpus",
+                        new_failures, task_id=task_id, source="standalone static corpus"
                     )
                 except RuntimeError as exc:
                     print(f"[static guard] ERROR: {exc}", file=sys.stderr)

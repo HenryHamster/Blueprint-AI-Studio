@@ -1,14 +1,15 @@
 """Shared, route-keyed attribution for differential test gates.
 
 The publication gates may compare reports produced in different checkout roots
-and by different harness mount layouts.  A traceback is diagnostic output, not
-test identity: its paths, line numbers, counts, and assertion text are all
-allowed to change while the same test remains a baseline failure.
+and by different harness mount layouts.  A traceback is diagnostic output, but
+meaningful changes to its failure detail must remain attributable to the task;
+only known checkout- and runtime-specific noise is normalized.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -61,12 +62,32 @@ def _relative_source(source: Path, tree_root: Path) -> str:
         return source.as_posix()
 
 
+def _normalize_failure_detail(detail: str, *, tree_root: Path | None) -> str:
+    """Remove checkout- and runtime-specific noise from failure diagnostics."""
+
+    if tree_root is None:
+        return detail
+    normalized = detail.replace(str(tree_root), "<tree-root>")
+    normalized = re.sub(
+        r"/tmp/pytest-of-[^/]+/pytest-\d+",
+        "<pytest-temp>",
+        normalized,
+    )
+    return re.sub(r"(object at )0x[0-9a-fA-F]+", r"\1<address>", normalized)
+
+
 def _resolve_route(
     classname: str, name: str, *, tree_root: Path | None
 ) -> tuple[str, str, str | None]:
     """Resolve pytest's classname/name into route, testcase, and source path."""
 
     parts = [part for part in classname.split(".") if part]
+    node = name
+    if not parts:
+        # pytest's collection-error JUnit shape puts the dotted module path in
+        # ``name`` and leaves ``classname`` empty.
+        parts = [part for part in name.split(".") if part]
+        node = ""
     if tree_root is not None:
         for start in range(len(parts)):
             for module_length in range(len(parts), start, -1):
@@ -74,7 +95,7 @@ def _resolve_route(
                 for source_root in (tree_root, tree_root / "backend"):
                     source = source_root / relative
                     if source.is_file():
-                        suffix = [part for part in (*parts[module_length:], name) if part]
+                        suffix = [part for part in (*parts[module_length:], node) if part]
                         return (
                             _relative_source(source, tree_root),
                             "::".join(suffix),
@@ -108,7 +129,7 @@ def parse_junit_report(
     tree_root: str | os.PathLike[str] | None = None,
     label: str = "report",
 ) -> JUnitReport:
-    """Parse identity and status, ignoring diagnostic text for attribution."""
+    """Parse identity and status, normalizing only known diagnostic noise."""
 
     root_path = Path(tree_root).resolve() if tree_root is not None else None
     parsed = JUnitReport()
@@ -129,9 +150,10 @@ def parse_junit_report(
         if detail_node is None:
             continue
         identity = FailureIdentity(route=route, testcase=testcase, kind=kind)
-        parsed.failures[identity.key] = (
-            detail_node.text or detail_node.attrib.get("message", "")
-        ).strip()
+        parsed.failures[identity.key] = _normalize_failure_detail(
+            (detail_node.text or detail_node.attrib.get("message", "")).strip(),
+            tree_root=root_path,
+        )
         if source is not None:
             suffix = f"::{testcase}" if testcase else ""
             source_path = Path(source)
@@ -165,16 +187,25 @@ def _test_key(failure_key: str) -> str:
 
 
 def attribute_reports(current: JUnitReport, baseline: JUnitReport) -> Attribution:
-    """Compare reports by route/test/kind, and account for missing routes."""
+    """Compare reports by route/test/kind and normalized failure detail."""
 
     current_keys = set(current.failures)
     baseline_keys = set(baseline.failures)
+    shared = current_keys & baseline_keys
     suppressed = {
-        key: current.failures[key] for key in sorted(current_keys & baseline_keys)
+        key: current.failures[key]
+        for key in sorted(shared)
+        if current.failures[key] == baseline.failures[key]
     }
     new = {
         key: current.failures[key] for key in sorted(current_keys - baseline_keys)
     }
+    new.update(
+        {
+            key: current.failures[key]
+            for key in sorted(shared - set(suppressed))
+        }
+    )
     disappeared = {
         key: baseline.failures[key]
         for key in sorted(baseline_keys)
@@ -193,19 +224,32 @@ def attribute_reports(current: JUnitReport, baseline: JUnitReport) -> Attributio
     )
 
 
-def _report_from_failures(failures: dict[str, str]) -> JUnitReport:
+def _report_from_failures(
+    failures: dict[str, str], *, tree_root: str | os.PathLike[str] | None = None
+) -> JUnitReport:
+    root_path = Path(tree_root).resolve() if tree_root is not None else None
     return JUnitReport(
-        failures=dict(failures),
+        failures={
+            key: _normalize_failure_detail(detail, tree_root=root_path)
+            for key, detail in failures.items()
+        },
         test_routes={_test_key(key) for key in failures},
     )
 
 
 def attribute_failure_maps(
-    current: dict[str, str], baseline: dict[str, str]
+    current: dict[str, str],
+    baseline: dict[str, str],
+    *,
+    current_root: str | os.PathLike[str] | None = None,
+    baseline_root: str | os.PathLike[str] | None = None,
 ) -> Attribution:
     """Compatibility adapter for callers that already have failure maps."""
 
-    return attribute_reports(_report_from_failures(current), _report_from_failures(baseline))
+    return attribute_reports(
+        _report_from_failures(current, tree_root=current_root),
+        _report_from_failures(baseline, tree_root=baseline_root),
+    )
 
 
 def classify_verification(
@@ -216,6 +260,8 @@ def classify_verification(
     baseline_failures: dict[str, str] | None = None,
     current_report: JUnitReport | None = None,
     baseline_report: JUnitReport | None = None,
+    current_root: str | os.PathLike[str] | None = None,
+    baseline_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
     """Return a fail-closed publication verdict for a differential run."""
 
@@ -232,8 +278,12 @@ def classify_verification(
             "new_failures": current_failures,
         }
 
-    current_report = current_report or _report_from_failures(current_failures)
-    baseline_report = baseline_report or _report_from_failures(baseline_failures or {})
+    current_report = current_report or _report_from_failures(
+        current_failures, tree_root=current_root
+    )
+    baseline_report = baseline_report or _report_from_failures(
+        baseline_failures or {}, tree_root=baseline_root
+    )
     if current_exit_code == 0 and not baseline_report.failures:
         return {
             "state": "passed",

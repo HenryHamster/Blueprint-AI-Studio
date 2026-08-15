@@ -498,12 +498,12 @@ def test_identical_failure_with_tree_specific_path_is_preexisting(tmp_path: Path
 
 @pytest.mark.parametrize(
     ("current_state", "expected_corpus_runs", "expected_returncode"),
-    [("clean", 2, 1), ("preexisting", 2, 0)],
+    [("clean", 1, 0), ("preexisting", 2, 0)],
 )
 def test_baseline_corpus_is_lazy_after_current_tree_result(
     tmp_path: Path, current_state: str, expected_corpus_runs: int, expected_returncode: int
 ) -> None:
-    """A clean report still gets a baseline to detect vanished failure routes."""
+    """The baseline runs only when current failures need subtraction."""
     fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, current_state)
     call_log = tmp_path / "corpus-calls.log"
     result = subprocess.run(
@@ -529,8 +529,6 @@ def test_baseline_corpus_is_lazy_after_current_tree_result(
 
     output = result.stdout + result.stderr
     assert result.returncode == expected_returncode, output
-    if current_state == "clean":
-        assert "baseline route identity" in output
     assert len(call_log.read_text().splitlines()) == expected_corpus_runs
 
 
@@ -568,7 +566,6 @@ def test_changed_harness_cannot_hide_a_base_corpus_failure(tmp_path: Path) -> No
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
     assert "changed static test roster made base corpus" in output
-    assert "baseline route identity" in output
 
 
 def test_baseline_scopes_to_current_failures_and_survives_roster_drift(
@@ -693,14 +690,13 @@ def _run_attribution_guard(
     )
 
 
-def test_sole_collection_error_is_subtracted_but_missing_base_routes_are_reported(tmp_path: Path) -> None:
-    """A shared collection error is suppressed; other vanished routes block.
+def test_sole_collection_error_is_subtracted_without_blocking_missing_routes(tmp_path: Path) -> None:
+    """A shared collection error is suppressed; other vanished routes do not block.
 
     pytest reports a collection error with an EMPTY classname and the dotted
-    module path in ``name``. A classname-only resolver yields no selector, the
-    key never reaches the scoped baseline, and — when it is the ONLY failure —
-    the empty-selector branch skips the base run entirely and charges every
-    current failure as new. The full-corpus baseline used to subtract it.
+    module path in ``name``. The shared resolver translates that shape to the
+    containing file, so the baseline stays scoped while unrelated vanished
+    routes remain non-blocking.
     """
     fake_bin, repo = _prepare_docker_attribution_repo(
         tmp_path, "collect_only", base_state="collect_base"
@@ -711,13 +707,12 @@ def test_sole_collection_error_is_subtracted_but_missing_base_routes_are_reporte
     )
 
     output = result.stdout + result.stderr
-    assert result.returncode != 0, output
-    assert "baseline route identity: route disappeared" in output
-    # The baseline actually ran — the skip-the-base-run branch must not trigger.
+    assert result.returncode == 0, output
+    assert "no new failures vs base" in output
+    # The baseline actually ran and stayed scoped to the collection-error file.
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     assert len(calls) == 2, calls
-    assert "testing/test_security.py" in calls[1]
-    assert "testing/test_collect_boom.py" not in calls[1], calls[1]
+    assert "testing/test_collect_boom.py" in calls[1], calls[1]
 
 
 def test_collection_error_alongside_resolvable_failure_charges_only_the_new_one(
@@ -736,7 +731,7 @@ def test_collection_error_alongside_resolvable_failure_charges_only_the_new_one(
     assert result.returncode != 0, output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
-    assert "testing/test_security.py" in baseline
+    assert "testing/test_collect_boom.py" in baseline
     assert "standalone static corpus attribution" not in output
     new_line = output.split("new failures:", 1)[1].split("\n")[0]
     assert "test_newly_introduced" in new_line
@@ -761,8 +756,8 @@ def test_unresolvable_failure_id_falls_back_to_full_base_corpus(
     )
 
     output = result.stdout + result.stderr
-    assert result.returncode != 0, output
-    assert "baseline route identity: route disappeared" in output
+    assert result.returncode == 0, output
+    assert "no new failures vs base" in output
     assert "unresolvable failure id(s)" in output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
@@ -773,36 +768,30 @@ def test_unresolvable_failure_id_falls_back_to_full_base_corpus(
     assert "testing/test_security.py" in baseline
 
 
-def test_docker_classname_repo_mount_resolves_to_scripts_path() -> None:
-    """The /repo bind-mount segment must not defeat classname->path resolution."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "static_release_guard", REPO_ROOT / "scripts" / "static_release_guard.py"
-    )
-    assert spec is not None and spec.loader is not None
-    guard = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(guard)
+def test_shared_report_resolver_handles_docker_and_collection_shapes() -> None:
+    """The shared resolver handles both mounted paths and collection errors."""
+    from testing.fixgate_attribution import _resolve_route
 
     # Docker: rootdir /app, file selected as /repo/scripts/... -> node id
     # ../repo/scripts/test_runner_isolation.py -> classname "...repo.scripts...".
-    selector = guard._pytest_selector(
+    route, testcase, source = _resolve_route(
         "...repo.scripts.test_runner_isolation", "test_x", tree_root=REPO_ROOT
     )
-    assert selector is not None
-    assert selector[0] == "scripts/test_runner_isolation.py::test_x"
+    assert route == "scripts/test_runner_isolation.py"
+    assert testcase == "test_x"
+    assert source is not None
     # Non-Docker: ../scripts/test_runner_isolation.py -> "...scripts...".
-    selector = guard._pytest_selector(
+    route, testcase, _ = _resolve_route(
         "...scripts.test_runner_isolation", "test_x", tree_root=REPO_ROOT
     )
-    assert selector is not None
-    assert selector[0] == "scripts/test_runner_isolation.py::test_x"
-    # Backend tests are rootdir-relative and keep resolving unchanged.
-    selector = guard._pytest_selector(
-        "testing.test_invariants", "test_x", tree_root=REPO_ROOT
+    assert route == "scripts/test_runner_isolation.py"
+    assert testcase == "test_x"
+    # Empty-classname collection errors resolve to a file-level route.
+    route, testcase, _ = _resolve_route(
+        "", "testing.test_invariants", tree_root=REPO_ROOT
     )
-    assert selector is not None
-    assert selector[0] == "testing/test_invariants.py::test_x"
+    assert route == "backend/testing/test_invariants.py"
+    assert testcase == ""
 
 
 def test_new_static_finding_without_task_identity_fails_closed(tmp_path: Path) -> None:
