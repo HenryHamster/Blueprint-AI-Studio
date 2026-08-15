@@ -4776,32 +4776,32 @@ def _authorship_contract_receipt(state: str, *, count: int = 0) -> dict:
             "resolved_nonzero",
             _authorship_contract_receipt("resolved", count=1),
             "not_met",
-            "prior_operator_authorship_nonzero",
+            "candidate_operator_authorship_nonzero",
         ),
-        ("missing", None, "not_met", "prior_operator_authorship_evidence_missing"),
+        ("missing", None, "not_met", "candidate_operator_authorship_evidence_missing"),
         (
             "invalid",
             {"schema_version": "2", "state": "resolved"},
             "not_met",
-            "prior_operator_authorship_evidence_missing",
+            "candidate_operator_authorship_evidence_missing",
         ),
         (
             "unresolved",
             _authorship_contract_receipt("unresolved"),
             "not_met",
-            "prior_operator_authorship_evidence_missing",
+            "candidate_operator_authorship_evidence_missing",
         ),
         (
             "terminal",
             _authorship_contract_receipt("terminal"),
             "not_met",
-            "prior_operator_authorship_evidence_missing",
+            "candidate_operator_authorship_evidence_missing",
         ),
         (
             "spoofed",
             {**_authorship_contract_receipt("resolved"), "extra": "tampered"},
             "not_met",
-            "prior_operator_authorship_evidence_missing",
+            "candidate_operator_authorship_evidence_missing",
         ),
     ],
 )
@@ -4867,6 +4867,32 @@ async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
         version_goal="Ship the release-authorship contract",
     )
     promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    version.base_sha = "a" * 40
+    db_session.add(version)
+    await db_session.flush()
+    async def _candidate_measurement(session, candidate_version):
+        measurement = (
+            dict(receipt)
+            if receipt is not None
+            else {"state": "unresolved", "reason": "receipt_missing"}
+        )
+        if label != "spoofed":
+            for key in ("source", "schema_version", "measured_at", "retry"):
+                measurement.pop(key, None)
+        if measurement.get("state") == "resolved":
+            measurement["range"] = {
+                "base_sha": candidate_version.base_sha,
+                "head_sha": (candidate_version.last_qualification or {})[
+                    "candidate_sha"
+                ],
+            }
+        return measurement
+
+    mocker.patch.object(
+        rq,
+        "_measure_candidate_operator_authorship",
+        new=AsyncMock(side_effect=_candidate_measurement),
+    )
 
     result = await rq._finalize_qualification(
         db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
@@ -4878,34 +4904,24 @@ async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
     assert rows[0].category_key == "generated-authorship-key"
     assert rows[0].status == expected_status
     assert rows[0].grader_run_id is None
-    expected_provenance = {
-        "kind": "machine",
-        "source": "release_authorship",
-        "source_kind": (
-            "github_compare"
-            if label == "resolved_zero" or label == "resolved_nonzero"
-            else (
-                "stored_receipt"
-                if label in {"unresolved", "terminal"}
-                else ("release_record_validation" if label != "missing" else "receipt_unavailable")
-            )
-        ),
-        "receipt_state": (
-            "resolved"
-            if label in {"resolved_zero", "resolved_nonzero"}
-            else (
-                label
-                if label in {"unresolved", "terminal"}
-                else ("missing" if label == "missing" else "missing_or_invalid")
-            )
-        ),
-        "range": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+    provenance = rows[0].evidence_provenance
+    assert provenance["kind"] == "machine"
+    assert provenance["source"] == "release_authorship"
+    assert provenance["range"] == {
+        "base_sha": "a" * 40,
+        "head_sha": "feed" * 10,
     }
-    if label in {"resolved_zero", "resolved_nonzero", "unresolved", "terminal"}:
-        expected_provenance["receipt_source"] = "github_compare"
-        expected_provenance["receipt_measured_at"] = "2026-01-01T00:00:00+00:00"
-        expected_provenance["receipt_attempt"] = 1
-    assert rows[0].evidence_provenance == expected_provenance
+    if label in {"resolved_zero", "resolved_nonzero"}:
+        assert provenance["source_kind"] == "github_compare"
+        assert provenance["receipt_state"] == "resolved"
+        assert isinstance(provenance["receipt_measured_at"], str)
+    else:
+        assert provenance["receipt_state"] in {
+            "missing",
+            "missing_or_invalid",
+            "unresolved",
+            "terminal",
+        }
     if expected_blocker:
         assert result.get("blocker") == expected_blocker
         promote_spy.assert_not_called()

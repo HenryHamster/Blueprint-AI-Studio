@@ -961,79 +961,70 @@ def _score_env_preflight(
     return 1.0, [], deploy_target_scope
 
 
-def evaluate_prior_operator_authorship_gate(
-    prior_promoted_version: Any | None,
+def evaluate_candidate_operator_authorship_gate(
+    candidate_version: Any,
+    measurement: Any,
+    categories: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate the persisted receipt from the prior promoted release.
+    """Evaluate authorship over the candidate's complete base-to-head range.
 
-    The current candidate cannot have a post-promotion serving window yet, so
-    its own authorship count is unavailable at qualification time. This gate
-    consumes only the prior promoted ``ReleaseVersion`` record and never calls
-    GitHub. ``None`` is the explicit first-promotion bootstrap case; once a
-    promoted row exists, every missing, unserved, or invalid receipt fails closed.
+    ``measurement`` is produced by ``count_non_bot_authored_commits`` against
+    ``candidate_authorship_range``.  The gate deliberately does not consult a
+    previously promoted release: that serving-window receipt cannot change
+    while the candidate is blocked and therefore creates a self-blocking gate.
+    ``max_count`` is the existing structured authorship predicate used by
+    category grading; multiple contracts use the strictest declared budget.
     """
-    if prior_promoted_version is None:
-        return {
-            "status": "bootstrap",
-            "passed": True,
-            "count": None,
-            "reason": "no_prior_promoted_version",
-        }
-
-    if isinstance(prior_promoted_version, dict):
-        get_value = prior_promoted_version.get
-    else:
-        def get_value(key: str, default: Any = None) -> Any:
-            return getattr(prior_promoted_version, key, default)
-
-    status = get_value("status")
-    serving_status = get_value("serving_status")
-    qualification = get_value("last_qualification")
-    from app.release_commit_authorship import serving_authorship_range
-
-    promoted_sha, served_sha = serving_authorship_range(prior_promoted_version)
-    receipt = (
-        qualification.get("operator_authored_commits")
-        if isinstance(qualification, dict)
-        else None
+    from app.release_commit_authorship import (
+        authorship_receipt_for_measurement,
+        candidate_authorship_range,
+        normalize_authorship_evidence_contract,
+        validate_authorship_receipt,
     )
 
-    # Reuse the exact server-receipt contract used by the read API. The import
-    # stays lazy so this pure scoring module has no ORM or I/O dependency.
-    from app.release_commit_authorship import validate_authorship_receipt
-
-    validated = (
-        validate_authorship_receipt(receipt, promoted_sha, served_sha)
-        if status == "promoted" and serving_status == "serving_confirmed"
-        else None
-    )
+    base_sha, candidate_sha = candidate_authorship_range(candidate_version)
+    receipt = authorship_receipt_for_measurement(measurement, base_sha, candidate_sha)
+    validated = validate_authorship_receipt(receipt, base_sha, candidate_sha)
     if validated is None or validated.get("state") != "resolved":
         return {
             "status": "unresolved",
             "passed": False,
             "count": None,
-            "blocker": "prior_operator_authorship_evidence_missing",
+            "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "blocker": "candidate_operator_authorship_evidence_missing",
             "reason": (
-                "prior_promoted_version_authorship_receipt_invalid"
-                if receipt is not None
-                else "prior_promoted_version_authorship_receipt_absent"
+                receipt.get("reason") or "candidate_operator_authorship_receipt_invalid"
             ),
         }
 
     count = validated.get("count")
-    if count == 0:
+    max_counts = [
+        contract["predicate"]["max_count"]
+        for category in categories or []
+        if isinstance(category, dict)
+        for contract in [
+            normalize_authorship_evidence_contract(category.get("evidence_contract"))
+        ]
+        if contract is not None
+    ]
+    max_count = min(max_counts, default=0)
+    if isinstance(count, int) and count <= max_count:
         return {
             "status": "passed",
             "passed": True,
-            "count": 0,
-            "reason": "prior_promoted_version_operator_authored_count_zero",
+            "count": count,
+            "max_count": max_count,
+            "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "reason": "candidate_operator_authored_count_within_contract",
         }
     return {
         "status": "blocked",
         "passed": False,
         "count": count,
-        "blocker": "prior_operator_authorship_nonzero",
-        "reason": "prior_promoted_version_operator_authored_count_nonzero",
+        "max_count": max_count,
+        "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+        "blocker": "candidate_operator_authorship_nonzero",
+        "reason": "candidate_operator_authored_count_exceeds_contract",
     }
 
 
@@ -1059,7 +1050,7 @@ def compute_composite(
     env_preflight_score: float | None = None,
     env_preflight_missing: list[str] | None = None,
     env_preflight_ack_override: bool = False,
-    prior_operator_authorship_gate: dict[str, Any] | None = None,
+    candidate_operator_authorship_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -1092,11 +1083,10 @@ def compute_composite(
         caller precomputes this via
         ``migration_apply_gate.run_migration_apply_gate`` — this function stays
         pure and only consumes the boolean.
-      * ``prior_operator_authorship_gate`` is the persisted receipt result from
-        the prior promoted release. A non-zero count blocks with
-        ``"prior_operator_authorship_nonzero"``; absent or invalid evidence
-        blocks with ``"prior_operator_authorship_evidence_missing"``. The
-        explicit ``"bootstrap"`` result is the only no-prior-version pass.
+      * ``candidate_operator_authorship_gate`` is the measured receipt result
+        for this candidate's complete base-to-head range. A count above the
+        declared ``max_count`` blocks; absent or invalid evidence blocks
+        fail-closed.
       * ``merge_grade_misses`` is True — the required blind merge-grade ran and
         found that the candidate misses the frozen version goal
         (``"merge_grade_misses"``).  Checked before the category gate so an
@@ -1241,13 +1231,13 @@ def compute_composite(
         # candidate failing both reports the identity collision first.
         blocker = "migration_apply_drift"
         failing_gates.append(blocker)
-    if prior_operator_authorship_gate is not None:
-        prior_gate_status = prior_operator_authorship_gate.get("status")
-        if prior_gate_status == "blocked":
-            blocker = "prior_operator_authorship_nonzero"
+    if candidate_operator_authorship_gate is not None:
+        candidate_gate_status = candidate_operator_authorship_gate.get("status")
+        if candidate_gate_status == "blocked":
+            blocker = "candidate_operator_authorship_nonzero"
             failing_gates.append(blocker)
-        elif prior_gate_status not in {"passed", "bootstrap"}:
-            blocker = "prior_operator_authorship_evidence_missing"
+        elif candidate_gate_status != "passed":
+            blocker = "candidate_operator_authorship_evidence_missing"
             failing_gates.append(blocker)
     if env_preflight_enabled and env_preflight_score is None:
         # No boot/env-prerequisite evidence was produced by the candidate — the
@@ -1361,11 +1351,13 @@ def compute_composite(
             if env_preflight_ack_override:
                 sub_scores["env_preflight_ack_override"] = True
 
-    if prior_operator_authorship_gate is not None:
-        sub_scores["prior_operator_authorship"] = {
-            "status": prior_operator_authorship_gate.get("status"),
-            "count": prior_operator_authorship_gate.get("count"),
-            "reason": prior_operator_authorship_gate.get("reason"),
+    if candidate_operator_authorship_gate is not None:
+        sub_scores["candidate_operator_authorship"] = {
+            "status": candidate_operator_authorship_gate.get("status"),
+            "count": candidate_operator_authorship_gate.get("count"),
+            "max_count": candidate_operator_authorship_gate.get("max_count"),
+            "range": candidate_operator_authorship_gate.get("range"),
+            "reason": candidate_operator_authorship_gate.get("reason"),
         }
 
     # Goal-verification observability (redesign): surface the per-category grade
@@ -1511,7 +1503,8 @@ def compute_composite(
 #                 SHA and compares the candidate against the deployed promotion
 #                 target / production's recorded schema.  A fix to this check on
 #                 automain is INERT until it is itself promoted (release-machinery
-#                 self-reference): the divergence self-clears only on promotion.
+#                 self-reference); the blocker must still have a candidate,
+#                 operator, or other non-promotional clearing path.
 #   "candidate" — the check runs against CANDIDATE content (the merged diff, the
 #                 candidate's CI, or a candidate-side grade).  A fix on
 #                 automain resolves the blocker on the NEXT qualification, no
@@ -1522,12 +1515,13 @@ EXECUTION_SITE_OPERATOR_ENV = "operator_env"
 
 BLOCKER_EXECUTION_SITE: dict[str, str] = {
     # Deployed-side: both compare the candidate against the deployed promotion
-    # target / production's live recorded schema; the divergence self-clears only
-    # once the version itself promotes, so a fix on automain is inert until then.
+    # target / production's live recorded schema.  A candidate migration repair
+    # remains a separate clearing path; this site label describes where the
+    # current validator runs, not an impossible requirement to promote first.
     "migration_identity_collision": EXECUTION_SITE_DEPLOYED,
     "migration_apply_drift": EXECUTION_SITE_DEPLOYED,
-    "prior_operator_authorship_nonzero": EXECUTION_SITE_DEPLOYED,
-    "prior_operator_authorship_evidence_missing": EXECUTION_SITE_DEPLOYED,
+    "candidate_operator_authorship_nonzero": EXECUTION_SITE_CANDIDATE,
+    "candidate_operator_authorship_evidence_missing": EXECUTION_SITE_CANDIDATE,
     # Operator-env site (Slice 4, design 245212a4): the env-preflight judge runs in
     # the DEPLOYED process and compares the candidate's declared boot prerequisites
     # against the deployed process's OWN environ (a presence-proxy of the deploy
@@ -1573,6 +1567,50 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     # goal-verification gate (which blocks as ``criterion_coverage_incomplete``),
     # and no code path emits the code any more.  Classifying a blocker nothing
     # emits is dead vocabulary that reads as a live gate to operators.
+}
+
+# Every hard promotion gate must name a way to become clear that does not
+# require the blocked version to promote first.  The qualifier test treats this
+# as an executable design contract rather than allowing a new gate to be added
+# with only an execution-site label.
+HARD_GATE_CLEARING_PATHS: dict[str, dict[str, str]] = {
+    "migration_identity_collision": {
+        "kind": "input", "evidence": "repair candidate revision"
+    },
+    "migration_apply_drift": {
+        "kind": "input", "evidence": "repair candidate migration chain"
+    },
+    "candidate_operator_authorship_nonzero": {
+        "kind": "input", "evidence": "reduce candidate count to max_count"
+    },
+    "candidate_operator_authorship_evidence_missing": {
+        "kind": "input", "evidence": "produce candidate range measurement"
+    },
+    "boot_prereq_missing": {
+        "kind": "override", "evidence": "bind env or acknowledge same-deploy binding"
+    },
+    "boot_prereq_evidence_missing": {
+        "kind": "input", "evidence": "produce candidate env evidence"
+    },
+    "ci_not_green": {"kind": "input", "evidence": "make candidate CI green"},
+    "ci_unresolved": {"kind": "input", "evidence": "resolve candidate CI state"},
+    "audit_missing": {"kind": "input", "evidence": "produce candidate audit"},
+    "test_file_deleted": {
+        "kind": "input", "evidence": "restore or authorize the test deletion"
+    },
+    "walkthrough_e2e_failed": {
+        "kind": "input", "evidence": "fix candidate walkthrough result"
+    },
+    "walkthrough_e2e_contract_failed": {
+        "kind": "input", "evidence": "emit a valid walkthrough contract"
+    },
+    "criterion_coverage_incomplete": {
+        "kind": "input", "evidence": "meet every candidate category"
+    },
+    "merge_grade_misses": {"kind": "input", "evidence": "satisfy the candidate goal"},
+    "capability_proof_gate_blocked": {
+        "kind": "input", "evidence": "prove candidate capabilities"
+    },
 }
 
 # Short operator-facing phrase per execution-site, appended to blocker labels.

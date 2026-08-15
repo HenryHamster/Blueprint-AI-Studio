@@ -74,56 +74,47 @@ def _authorship_receipt(base_sha: str, head_sha: str, count: int) -> dict:
     }
 
 
-def test_prior_authorship_gate_uses_only_the_promote_to_serving_window():
-    """Development commits before promotion never enter the release gate."""
+def _authorship_measurement(base_sha: str, head_sha: str, count: int) -> dict:
+    receipt = _authorship_receipt(base_sha, head_sha, count)
+    return {
+        key: receipt[key] for key in ("state", "count", "offenders", "range")
+    }
+
+
+def test_candidate_authorship_gate_uses_the_complete_candidate_range():
+    """The release gate measures base-to-candidate, not promote-to-serving."""
     development_sha = "a" * 40
-    promoted_sha = "b" * 40
     served_sha = "c" * 40
-    prior_version = {
-        "status": "promoted",
-        "serving_status": "serving_confirmed",
+    candidate_version = {
         "base_sha": development_sha,
-        "promoted_sha": promoted_sha,
-        "served_sha": served_sha,
-        "last_qualification": {
-            "operator_authored_commits": _authorship_receipt(
-                promoted_sha, served_sha, 0
-            )
+        "candidate_sha": served_sha,
+    }
+    category = {
+        "category_key": "candidate-authorship",
+        "evidence_contract": {
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 1},
         },
     }
 
-    clean_window = rs.evaluate_prior_operator_authorship_gate(prior_version)
+    clean_window = rs.evaluate_candidate_operator_authorship_gate(
+        candidate_version,
+        _authorship_measurement(development_sha, served_sha, 1),
+        [category],
+    )
 
     assert clean_window["status"] == "passed"
-    assert clean_window["count"] == 0
+    assert clean_window["count"] == 1
+    assert clean_window["max_count"] == 1
 
-    in_window_operator_commit = {
-        **prior_version,
-        "last_qualification": {
-            "operator_authored_commits": _authorship_receipt(
-                promoted_sha, served_sha, 1
-            )
-        },
-    }
-    blocked_window = rs.evaluate_prior_operator_authorship_gate(
-        in_window_operator_commit
+    blocked_window = rs.evaluate_candidate_operator_authorship_gate(
+        candidate_version,
+        _authorship_measurement(development_sha, served_sha, 2),
+        [category],
     )
 
     assert blocked_window["status"] == "blocked"
-    assert blocked_window["count"] == 1
-
-    whole_version_receipt = {
-        **prior_version,
-        "last_qualification": {
-            "operator_authored_commits": _authorship_receipt(
-                development_sha, served_sha, 1
-            )
-        },
-    }
-    rejected_range = rs.evaluate_prior_operator_authorship_gate(whole_version_receipt)
-
-    assert rejected_range["status"] == "unresolved"
-    assert rejected_range["reason"] == "prior_promoted_version_authorship_receipt_invalid"
+    assert blocked_window["blocker"] == "candidate_operator_authorship_nonzero"
 
 
 # ---------------------------------------------------------------------------
@@ -1157,10 +1148,11 @@ class TestCategoryGateNonEngagingPaths:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
-            "prior_operator_authorship_gate": {
-                "status": "bootstrap",
+            "candidate_operator_authorship_gate": {
+                "status": "passed",
                 "passed": True,
-                "count": None,
+                "count": 0,
+                "max_count": 0,
             },
             "category_verdicts": None,  # no rubric or exempt at finalize time
         }
@@ -1186,10 +1178,11 @@ class TestCategoryGateNonEngagingPaths:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
-            "prior_operator_authorship_gate": {
-                "status": "bootstrap",
+            "candidate_operator_authorship_gate": {
+                "status": "passed",
                 "passed": True,
-                "count": None,
+                "count": 0,
+                "max_count": 0,
             },
             "category_verdicts": [
                 {
@@ -1226,10 +1219,11 @@ class TestCategoryGateNonEngagingPaths:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
-            "prior_operator_authorship_gate": {
-                "status": "bootstrap",
+            "candidate_operator_authorship_gate": {
+                "status": "passed",
                 "passed": True,
-                "count": None,
+                "count": 0,
+                "max_count": 0,
             },
             "category_verdicts": [
                 {

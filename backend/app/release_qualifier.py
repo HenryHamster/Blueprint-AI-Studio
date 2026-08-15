@@ -98,7 +98,9 @@ from app.release_policy_projection import (
 from app.release_models import CriterionEvidence
 from app.release_commit_authorship import (
     authorship_category_evidence,
-    serving_authorship_range,
+    authorship_receipt_for_measurement,
+    candidate_authorship_range,
+    count_non_bot_authored_commits,
 )
 from app.notification_dispatch import (
     dispatch_external_notification,  # noqa: F401 — re-exported for tests / compat patch point
@@ -205,7 +207,7 @@ from app.release_scoring import (
     _score_env_preflight,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
-    evaluate_prior_operator_authorship_gate,
+    evaluate_candidate_operator_authorship_gate,
     evaluate_merge_grade,
     is_contentless_goal,
     promotion_threshold_for_policy,  # noqa: F401 — canonical enforcement helper
@@ -4165,13 +4167,13 @@ _BLOCKER_LABELS: dict[str, str] = {
         "the candidate's migration chain does not apply cleanly against "
         "production's recorded schema state (deploy-fatal drift)"
     ),
-    "prior_operator_authorship_nonzero": (
-        "the prior promoted release recorded one or more operator-authored "
-        "commits in its serving window"
+    "candidate_operator_authorship_nonzero": (
+        "the candidate's complete base-to-head range recorded more "
+        "operator-authored commits than its contracted repair budget"
     ),
-    "prior_operator_authorship_evidence_missing": (
-        "the prior promoted release has no valid persisted operator-authorship "
-        "receipt; the gate fails closed until that evidence is resolved"
+    "candidate_operator_authorship_evidence_missing": (
+        "the candidate has no valid complete-range operator-authorship "
+        "measurement; the gate fails closed until that evidence is resolved"
     ),
     "criterion_coverage_incomplete": (
         "the blind merge-grade found the merged diff does not yet satisfy the "
@@ -6246,34 +6248,33 @@ async def _record_rubric_provenance_outcome(
         "rubric_provenance_error": provenance_error,
     }
 
-async def _load_prior_operator_authorship_gate(
+async def _measure_candidate_operator_authorship(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
 ) -> dict[str, Any]:
-    """Read and validate the latest prior promoted release receipt.
-
-    Qualification runs before the current version's serving window exists, so
-    this query intentionally excludes the open candidate and never performs a
-    live authorship measurement. The scoring helper owns receipt validation and
-    the explicit no-prior bootstrap result.
-    """
-    prior = (
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion)
-                .where(
-                    release_version.ReleaseVersion.project_id == version.project_id,
-                    release_version.ReleaseVersion.status == "promoted",
-                    release_version.ReleaseVersion.version_number < version.version_number,
-                )
-                .order_by(release_version.ReleaseVersion.version_number.desc())
-                .limit(1)
-            )
+    """Measure the candidate's immutable base-to-head authorship range."""
+    base_sha, candidate_sha = candidate_authorship_range(version)
+    project = await session.get(Project, version.project_id)
+    try:
+        return await count_non_bot_authored_commits(
+            base_sha,
+            candidate_sha,
+            session=session,
+            project=project,
         )
-        .scalars()
-        .first()
-    )
-    return evaluate_prior_operator_authorship_gate(prior)
+    except Exception as exc:  # noqa: BLE001 - evidence remains fail-closed
+        logger.warning(
+            "[RELEASE_QUALIFIER] candidate authorship measurement failed for v%d: %s",
+            version.version_number,
+            exc,
+        )
+        return {
+            "state": "unresolved",
+            "count": None,
+            "offenders": [],
+            "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "reason": "candidate_authorship_measurement_unavailable",
+        }
 
 
 async def _finalize_qualification(
@@ -6385,9 +6386,6 @@ async def _finalize_qualification(
 
     ci_state = ci_resolution.get("state", _CI_RED)
     _policy_project = await session.get(Project, version.project_id)
-    prior_operator_authorship_gate = await _load_prior_operator_authorship_gate(
-        session, version
-    )
     ci_required = True
     if _pre_gates is not None and "ci_required" in _pre_gates:
         ci_required = bool(_pre_gates["ci_required"])
@@ -8180,41 +8178,36 @@ async def _finalize_qualification(
     # release attempt.
     validate_prepromotion_gradeability(active_categories)
 
-    # The latest promoted release is the only immutable source for this
-    # cross-version qualifier evidence.  Bind it by rubric text through the
-    # generic adapter; invalid, unresolved, terminal, and missing receipts all
-    # become fail-closed category evidence.
-    authorship_evidence: list[dict[str, Any]] = []
-    if active_categories:
-        latest_promoted = (
-            (
-                await session.execute(
-                    select(release_version.ReleaseVersion)
-                    .where(
-                        release_version.ReleaseVersion.project_id == version.project_id,
-                        release_version.ReleaseVersion.status == "promoted",
-                    )
-                    .order_by(release_version.ReleaseVersion.version_number.desc())
-                    .limit(1)
-                )
-            )
-            .scalars()
-            .first()
+    # Measure and grade the candidate's complete base-to-head range.  The
+    # previously promoted serving receipt is intentionally not consulted here:
+    # it is immutable while this candidate is blocked and would make the hard
+    # gate impossible to clear by changing the candidate.
+    authorship_measurement = (
+        _pre_gates.get("candidate_authorship_measurement")
+        if _pre_gates is not None
+        else None
+    )
+    if authorship_measurement is None:
+        authorship_measurement = await _measure_candidate_operator_authorship(
+            session, version
         )
-        promoted_qualification = (
-            latest_promoted.last_qualification
-            if latest_promoted is not None
-            else None
-        )
-        authorship_evidence = authorship_category_evidence(
-            (
-                promoted_qualification.get("operator_authored_commits")
-                if isinstance(promoted_qualification, dict)
-                else None
-            ),
-            *serving_authorship_range(latest_promoted),
-            active_categories,
-        )
+    candidate_base_sha, candidate_head_sha = candidate_authorship_range(version)
+    candidate_authorship_receipt = authorship_receipt_for_measurement(
+        authorship_measurement,
+        candidate_base_sha,
+        candidate_head_sha,
+    )
+    candidate_operator_authorship_gate = evaluate_candidate_operator_authorship_gate(
+        version,
+        authorship_measurement,
+        active_categories,
+    )
+    authorship_evidence = authorship_category_evidence(
+        candidate_authorship_receipt,
+        candidate_base_sha,
+        candidate_head_sha,
+        active_categories,
+    )
     from app.release_prepromotion_rehearsal import (  # noqa: PLC0415
         apply_rehearsal_evidence,
         persisted_rehearsal_for_version,
@@ -8765,7 +8758,7 @@ async def _finalize_qualification(
         # Slice 4: OWNER-armed one-shot override of the boot_prereq_missing block
         # (scoped to that blocker only — see _env_ack above).
         env_preflight_ack_override=env_preflight_ack_override,
-        prior_operator_authorship_gate=prior_operator_authorship_gate,
+        candidate_operator_authorship_gate=candidate_operator_authorship_gate,
     )
 
     # --- Explicit product probe: decision-bearing walkthrough --------------
@@ -9010,10 +9003,9 @@ async def _finalize_qualification(
         "failing_gates": composite.get("failing_gates") or [],
         "confidence_ceiling": composite.get("confidence_ceiling"),
         "required_sub_scores": composite.get("required_sub_scores") or {},
-        # The current candidate cannot have a post-promotion serving window.
-        # Persist the prior-release gate result so CI-unresolved recovery reuses
-        # the same decision without a fresh database or GitHub interpretation.
-        "prior_operator_authorship_gate": prior_operator_authorship_gate,
+        # Persist the candidate-range gate result so CI-unresolved recovery
+        # reuses the same decision without a fresh database or GitHub read.
+        "candidate_operator_authorship_gate": candidate_operator_authorship_gate,
         "stranded_approved_prs": qual.get("stranded_approved_prs"),
         "blocker": composite["blocker"],
         # Execution-site of the responsible check (dir: tag promotion blockers
@@ -10424,6 +10416,9 @@ async def _finalize_locked_version(
         ) = await _resolve_migration_apply_at_finalize(
             session, peek, peek_candidate_sha
         )
+        pre_authorship_measurement = await _measure_candidate_operator_authorship(
+            session, peek
+        )
         _pre_gates = {
             "ci_green": pre_ci_green,
             "ci_resolution": pre_ci_resolution,
@@ -10431,6 +10426,7 @@ async def _finalize_locked_version(
             "migration_detail": pre_migration_detail,
             "apply_verdict": pre_apply_verdict,
             "apply_detail": pre_apply_detail,
+            "candidate_authorship_measurement": pre_authorship_measurement,
         }
         if pre_ci_resolution.get("state") == _CI_NO_CHECKS:
             _pre_proj_for_ci_gate = await session.get(Project, peek.project_id)
