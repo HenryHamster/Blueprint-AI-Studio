@@ -98,7 +98,8 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
 
     const checkScript = capturedScripts['/tmp/workspace/check'];
     expect(checkScript).toBeDefined();
-    expect(checkScript).toContain('run "admin-ui playwright chromium"');
+    expect(checkScript).toContain('VIEWPORT_CAPTURE_SKIPPED');
+    expect(checkScript).not.toContain('run "admin-ui playwright chromium"');
     expect(checkScript).toContain('npm run test:viewport');
     expect(checkScript).toContain('Playwright Chromium');
     // Bootstrap step uses the smart install logic (cache check + fallback chain).

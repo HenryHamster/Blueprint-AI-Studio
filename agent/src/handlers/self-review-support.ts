@@ -1,14 +1,14 @@
 /** Small helpers for the consolidated author self-review path. */
 
-export const VIEWPORT_INFRA_SKIP_GUIDANCE = `## Viewport gate: infra-skip sentinel
+export const VIEWPORT_INFRA_SKIP_GUIDANCE = `## Viewport gate: CI-owned browser verification
 
-If \`./check\` output contains \`VIEWPORT_GATE_INFRA_UNAVAILABLE:\` OR the
-"admin-ui playwright chromium" bootstrap step fails AND \`docker info\` also
-errors (Docker unavailable), this is an infrastructure shortfall — NOT a code
-defect. Chromium and its system-library dependencies cannot be installed by a
-code edit on this VM. Call \`./blocked "VIEWPORT_GATE_INFRA_UNAVAILABLE: <reason>"\`
-immediately. Do NOT attempt to install Chromium, modify viewport tests to bypass
-the browser requirement, or weaken test assertions to work around the missing runtime.
+When the VM cannot provide the Chromium substrate, \`./check\` and the viewport
+capture helpers report \`VIEWPORT_CAPTURE_SKIPPED:\` with the concrete reason.
+Record that skip and continue to \`./pr\`: this is an infrastructure shortfall,
+not a code defect, and it must never be reported as a \`BLOCKER:\` or routed to
+\`./blocked\`. Do not modify viewport tests or weaken assertions to work around
+the missing runtime. The CI \`frontend-viewport\` job owns the browser-backed
+viewport gate and must still fail on real viewport assertion failures.
 `;
 
 type SelfReviewCatchRateCategory = {

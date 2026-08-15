@@ -572,19 +572,21 @@ describe('viewport infra skip guidance in prompt', () => {
     vi.clearAllMocks();
   });
 
-  it('includes VIEWPORT_GATE_INFRA_UNAVAILABLE sentinel guidance in handleCreate prompt', async () => {
+  it('includes advisory viewport skip guidance in handleCreate prompt', async () => {
     const task = { title: 'Task', description: '' };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = capturedPrompt();
-    expect(prompt).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
-    expect(prompt).toContain('./blocked');
+    expect(prompt).toContain('VIEWPORT_CAPTURE_SKIPPED');
+    expect(prompt).toContain('continue to `./pr`');
+    expect(VIEWPORT_INFRA_SKIP_GUIDANCE).not.toMatch(/call[\s\S]*\.\/blocked/i);
   });
 
   it('includes viewport infra skip guidance in handleRefactor prompt', async () => {
     const task = { title: 'Refactor task', description: '' };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = capturedPrompt();
-    expect(prompt).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+    expect(prompt).toContain('VIEWPORT_CAPTURE_SKIPPED');
+    expect(VIEWPORT_INFRA_SKIP_GUIDANCE).not.toMatch(/call[\s\S]*\.\/blocked/i);
   });
 });
 

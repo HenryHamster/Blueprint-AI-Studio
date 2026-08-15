@@ -269,9 +269,10 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
                 )
             )
             if "VIEWPORT_GATE_INFRA_UNAVAILABLE" in blocker_text:
-                # The VM viewport gate is retired: browser capture is now an
-                # advisory CI-owned check. Clear legacy rows immediately rather
-                # than preserving their obsolete runner-capability park.
+                # This legacy marker came from the retired VM-side viewport gate.
+                # Viewport capture is now advisory on agent VMs and enforced in
+                # CI, so requeue old rows for the corrected prompt instead of
+                # parking them for the deterministic 6-hour escalation path.
                 return "clear"
             return "retry"
         return "waiting"

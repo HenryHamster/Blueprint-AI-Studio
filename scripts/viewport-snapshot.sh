@@ -19,9 +19,8 @@
 #       Requires ORCHESTRATOR_URL + AGENT_API_TOKEN in the environment.
 #
 # It is INFORMATIONAL and never a gate: it exits 0 even when pairs differ. The
-# one non-zero exit is 75 with the VIEWPORT_GATE_INFRA_UNAVAILABLE sentinel on a
-# Chromium bootstrap failure, reusing check-viewport.sh's classification so the
-# existing failure handling (backend/app/failure_classification.py) applies.
+# Chromium bootstrap failure is recorded as VIEWPORT_CAPTURE_SKIPPED and exits
+# successfully on an agent VM; the CI frontend-viewport job is the enforcing gate.
 #
 # Output lives under absolute /tmp (NEVER the repo tree) because `./pr` runs
 # `git add -A` and src/**/__screenshots__/ is deliberately gitignored.
@@ -78,10 +77,10 @@ VPORT_ENV=(
 )
 
 infra_unavailable() {
-  echo "VIEWPORT_GATE_INFRA_UNAVAILABLE: $1"
+  echo "VIEWPORT_CAPTURE_SKIPPED: $1; CI frontend-viewport enforces browser verification"
   # Best-effort worktree cleanup before bailing.
   git worktree remove --force "$WT" >/dev/null 2>&1 || true
-  exit 75
+  exit 0
 }
 
 # ── base ref resolution ─────────────────────────────────────────────────────

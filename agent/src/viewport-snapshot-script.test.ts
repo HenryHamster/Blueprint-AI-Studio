@@ -45,8 +45,9 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
     // Dedicated worktree path — must NOT clobber ./check's baseline worktree.
     expect(src).toContain('WT="/tmp/viewport_snap_wt"');
     expect(src).not.toContain('WT="/tmp/check_viewport_baseline_wt"');
-    // Infra-skip sentinel reused from check-viewport.sh.
-    expect(src).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+    // VM substrate failures are advisory; CI owns the enforcing browser run.
+    expect(src).toContain('VIEWPORT_CAPTURE_SKIPPED');
+    expect(src).not.toContain('exit 75');
   });
 
   // Requires python3 on PATH (spawns py_compile).
@@ -181,8 +182,9 @@ describe('scripts/viewport-live.sh — live capture script', () => {
 
   it('drives the external capture helper and manifest by reference (no inline heredoc)', () => {
     const src = readFileSync(LIVE_SH, 'utf-8');
-    // Infra-skip sentinel surfaces a Chromium bootstrap failure as exit 75.
-    expect(src).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+    // Infra-skip is recorded and allowed to continue on an agent VM.
+    expect(src).toContain('VIEWPORT_CAPTURE_SKIPPED');
+    expect(src).not.toContain('exit 75');
     // Delegates to the real .js helper rather than embedding Node in a heredoc.
     expect(src).toContain('scripts/viewport-live-capture.js');
     // PNGs land under the live-capture tmp tree.
@@ -322,6 +324,6 @@ describe('writeViewportLiveHelper — generated ./viewport-live wrapper', () => 
     expect(VIEWPORT_LIVE_HINT).toContain('/tmp/viewport_live/');
     expect(VIEWPORT_LIVE_HINT).toContain('ORCHESTRATOR_URL');
     expect(VIEWPORT_LIVE_HINT).toContain('ADMIN_API_KEY');
-    expect(VIEWPORT_LIVE_HINT).toContain('75');
+    expect(VIEWPORT_LIVE_HINT).toContain('VIEWPORT_CAPTURE_SKIPPED');
   });
 });
