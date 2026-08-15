@@ -13806,12 +13806,18 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log_path = tmp_path / "python-argv.log"
-    fake_python = fake_bin / "python3"
+    fake_python = tmp_path / "probe-python"
     fake_python.write_text(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ROSTER_PROBE_LOG\"\n",
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
+    path_python = fake_bin / "python3"
+    path_python.write_text(
+        '#!/bin/sh\nexec "$ROSTER_REAL_PYTHON" "$@"\n',
+        encoding="utf-8",
+    )
+    path_python.chmod(0o755)
     fake_docker = fake_bin / "docker"
     fake_docker.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     fake_docker.chmod(0o755)
@@ -13820,12 +13826,15 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     env.pop("CI", None)
     env.update(
         {
+            # Keep python3 on PATH real so the test distinguishes the explicit
+            # probe interpreter from the subprocess command under test.
             "PATH": f"{fake_bin}:{env['PATH']}",
             # The real harness may select an existing task-VM venv by absolute
             # path; pin the probe to the fake interpreter so this test remains
             # about roster argv even when that venv is present.
             "PYTHON": str(fake_python),
             "ROSTER_PROBE_LOG": str(log_path),
+            "ROSTER_REAL_PYTHON": sys.executable,
             "TESTMON_NO_FETCH": "1",
             "ALLOW_LOW_MEM": "1",
         }
@@ -13847,6 +13856,10 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     invoked = result.stdout
     assert "test_roster_placeholder" in invoked, (
         "standalone harness did not execute its pytest roster"
+    )
+    probe_invocations = log_path.read_text(encoding="utf-8").splitlines()
+    assert not any("-m pytest" in line for line in probe_invocations), (
+        "standalone harness rewrote its literal python3 pytest subprocess"
     )
     expected = on_disk - set(exemptions)
     missing = sorted(

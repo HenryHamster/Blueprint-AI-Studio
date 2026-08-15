@@ -123,6 +123,7 @@ PG_SOCKET=""
 PG_BIN=""
 VERIFICATION_OUTPUT_DIR=""
 VERIFICATION_OUTPUT_DIR_OWNED=0
+PYTHON_REWRITE_ENABLED=0
 cleanup() {
   [ -n "$PG_CONTAINER" ] && docker rm -f "$PG_CONTAINER" &>/dev/null || true
   [ -n "$PG_NETWORK" ] && docker network rm "$PG_NETWORK" &>/dev/null || true
@@ -146,6 +147,7 @@ trap cleanup EXIT
 if [ "$SANDBOX_POSTGRES" = "1" ]; then
   USE_DOCKER=0
   PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
+  PYTHON_REWRITE_ENABLED=1
   [ -x "$PYTHON" ] || {
     echo "ERROR: --sandbox-postgres requires $PYTHON" >&2
     exit 2
@@ -154,6 +156,7 @@ elif [ "$USE_POSTGRES" = "1" ] && _AUTO_POSTGRES_FLAG="$(select_backend_test_rou
   SANDBOX_POSTGRES=1
   USE_DOCKER=0
   PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
+  PYTHON_REWRITE_ENABLED=1
   echo "=== Using off-image pgserver PostgreSQL sandbox ==="
 elif command -v docker &>/dev/null && docker info >/dev/null 2>&1; then
   USE_DOCKER=1
@@ -170,7 +173,10 @@ else
   VENV=/tmp/blueprint-backend-venv
   # Preserve an explicitly selected interpreter.  Read-only harness probes
   # use this to inject a recorder without requiring an app checkout.
-  [ -n "${PYTHON:-}" ] || { [ -d "$VENV" ] && export PYTHON="$VENV/bin/python"; }
+  if [ -z "${PYTHON:-}" ] && [ -d "$VENV" ]; then
+    export PYTHON="$VENV/bin/python"
+    PYTHON_REWRITE_ENABLED=1
+  fi
   if ! "${PYTHON:-python3}" -c "import fastapi" &>/dev/null; then
     echo "=== Installing dependencies ==="
     if python3 -m pip install -q -r requirements.txt 2>&1 | tail -5; then
@@ -180,6 +186,7 @@ else
       uv pip install --python "$VENV/bin/python" -q -r requirements.txt
       uv pip install --python "$VENV/bin/python" -q "setuptools<81"
       export PYTHON="$VENV/bin/python"
+      PYTHON_REWRITE_ENABLED=1
     fi
   fi
   PYTHON="${PYTHON:-python3}"
@@ -201,6 +208,7 @@ else
       if [ -n "$PYTHON_311" ]; then
         echo "=== Using Python 3.11 (found $PYTHON_311; system python is $PYTHON_VERSION) ==="
         PYTHON="$PYTHON_311"
+        PYTHON_REWRITE_ENABLED=1
       else
         echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
         echo "!!! WARNING: NON-AUTHORITATIVE ENVIRONMENT !!!" >&2
@@ -481,8 +489,10 @@ _run() {
       MSYS_NO_PATHCONV=1 docker run --rm $ENV_ARGS blueprint-backend-test "$@"
     fi
   else
-    # Replace leading "python3" with $PYTHON if set (venv interpreter)
-    if [ -n "${PYTHON:-}" ] && [ "$1" = "python3" ]; then
+    # Replace leading "python3" only when the harness selected the venv.
+    # An explicit PYTHON is also used by read-only probes that deliberately
+    # exercise the literal python3 subprocess command.
+    if [ "$PYTHON_REWRITE_ENABLED" = "1" ] && [ "$1" = "python3" ]; then
       shift; env $ENV_VARS PYTHONPATH="$(pwd)" "$PYTHON" "$@"
     else
       env $ENV_VARS PYTHONPATH="$(pwd)" "$@"
