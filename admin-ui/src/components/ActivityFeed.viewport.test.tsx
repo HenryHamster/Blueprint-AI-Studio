@@ -248,7 +248,7 @@ describe('ActivityFeed — viewport regression', () => {
     }
   });
 
-  test('Running pill filters feed to TASK_IN_PROGRESS events only', async () => {
+  test('In progress pill filters feed to TASK_IN_PROGRESS events only', async () => {
     host = document.createElement('div');
     host.style.width = '800px';
     host.style.height = '600px';
@@ -280,12 +280,12 @@ describe('ActivityFeed — viewport regression', () => {
       throw new Error('Expected in-progress event in initial render');
     }
 
-    // Click "Running" pill
+    // Click "In progress" pill
     const runningPill = Array.from(host?.querySelectorAll('button') ?? []).find(btn =>
-      btn.textContent?.trim() === 'Running',
+      btn.textContent?.trim() === 'In progress',
     ) as HTMLButtonElement | null;
     if (!runningPill) {
-      throw new Error('Running pill not found');
+      throw new Error('In progress pill not found');
     }
 
     await act(async () => {
@@ -296,13 +296,13 @@ describe('ActivityFeed — viewport regression', () => {
     // Only in-progress task should be visible
     const filteredText = host?.textContent ?? '';
     if (!filteredText.includes('migrate user sessions')) {
-      throw new Error('In-progress event should be visible after Running filter');
+      throw new Error('In-progress event should be visible after In progress filter');
     }
     if (filteredText.includes('OAuth2 PKCE')) {
-      throw new Error('Completed event should be hidden after Running filter');
+      throw new Error('Completed event should be hidden after In progress filter');
     }
     if (filteredText.includes('connection pool exhaustion')) {
-      throw new Error('Failed event should be hidden after Running filter');
+      throw new Error('Failed event should be hidden after In progress filter');
     }
 
     // Click "All" to restore

@@ -157,6 +157,16 @@ from app.strategic_spawn_requests import (
     cancel_deferred_spawn_request,
     submit_strategic_spawn,
 )
+from app.strategic_op_request import StrategicOp
+from app.strategic_autonomous_handoff import handle_autonomous_handoff_operation
+from app.strategic_fast_public_egress import (
+    enforce_typed_fast_public_claim,
+    has_exact_live_fast_public_claim,
+)
+from app.strategic_workday_mutation_rebind import (
+    prepare_bound_workday_operation,
+    workday_operation_replay_response,
+)
 from app.auth import require_admin
 from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
@@ -227,6 +237,9 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "dismiss_knowledge_followup",
     "dismiss_knowledge",
     "request_qualification",
+    "begin_autonomous_turn",
+    "report_autonomous_finding",
+    "end_autonomous_turn",
 })
 
 def _cap_str(
@@ -1107,54 +1120,6 @@ async def _enforce_resident_mutation_fence(
         )
 
 
-async def _has_exact_live_fast_public_claim(
-    session: AsyncSession,
-    *,
-    project_id: uuid.UUID,
-    task_id: uuid.UUID,
-    resident_session_id: str,
-    worker_generation: int,
-    worker_incarnation_id: uuid.UUID | None,
-) -> bool:
-    """Whether this exact Resident process currently has a Fast-owned turn.
-
-    ``create_message`` predates the typed foreground route and remains available
-    to the broad Workday process for genuine internal artifacts.  It is *not* a
-    second public-reply capability: while Fast owns a canonical input, an
-    unscoped operator-visible generic message would be indistinguishable from a
-    competing answer.  Keep this check server-side rather than relying on the
-    Workday prompt or a ``reply_to`` field supplied by the model.
-    """
-    if worker_incarnation_id is None:
-        return False
-    rows = (
-        (
-            await session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.from_type == "user",
-                    ProjectMessage.surface == MessageSurface.CONVERSATION,
-                    ProjectMessage.status == "open",
-                    ProjectMessage.handling_state == MessageHandlingState.CLAIMED,
-                    ProjectMessage.handled_by_task_id == task_id,
-                    ProjectMessage.conversation_claim_generation == worker_generation,
-                    ProjectMessage.conversation_claim_incarnation
-                    == worker_incarnation_id,
-                    ProjectMessage.conversation_claim_expires_at > _utcnow(),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return any(
-        row.resident_session_id in {None, resident_session_id}
-        and isinstance(row.context, dict)
-        and row.context.get("_conversation_public_reply_owner") == "fast"
-        for row in rows
-    )
-
-
 async def _resolve_spawn_task_dependencies(
     session: AsyncSession,
     *,
@@ -1317,19 +1282,6 @@ async def _reject_dependency_cycles(
             )
 
 
-class StrategicOp(BaseModel):
-    """Incremental strategic review operation from an agent."""
-
-    task_id: uuid.UUID
-    resident_incarnation_id: uuid.UUID | None = None
-    # The accepted op vocabulary is the canonical registry mirrored in
-    # app/strategic_ops_manifest.json (single source of truth for the ./strategic
-    # CLI and this dispatch chain). test_strategic_ops_registry.py
-    # asserts the dispatch below accepts EXACTLY the manifest's op names.
-    op: str
-    data: Any = {}
-
-
 @router.post("/api/agent/strategic")
 @limiter.limit("60/minute")
 async def strategic_operation(
@@ -1457,49 +1409,6 @@ async def strategic_operation(
                     status_code=409,
                     detail="Call lease owns public replies for this Resident generation",
                 )
-            # A private typed-Fast consultation deliberately shares this
-            # Resident process with broad Workday tools.  Prompts are not an
-            # authority boundary: while an exact internal packet lease is live,
-            # the generic/native reply route must not be able to publish a
-            # second answer.  Only the receipt-bound Fast completion routes in
-            # agent_strategic_messages may produce public text in that window.
-            from app.conversation_coordinator import _workday_claim_expiry
-
-            workday_packets = (
-                await session.execute(
-                    select(ProjectMessage).where(
-                        ProjectMessage.project_id == project.id,
-                        ProjectMessage.from_type == "system",
-                        ProjectMessage.status == "open",
-                        ProjectMessage.handling_state == MessageHandlingState.CLAIMED,
-                        ProjectMessage.handled_by_task_id == task.id,
-                    )
-                )
-            ).scalars().all()
-            exact_private_lease = any(
-                isinstance(packet.context, dict)
-                and packet.context.get("_conversation_consultation_packet") is True
-                and packet.context.get("audience") == "strategist-internal"
-                and packet.context.get("message_role") == "workday_consultation"
-                and packet.context.get("_workday_consultation_claim_generation")
-                == task_generation
-                and str(packet.context.get("_workday_consultation_claim_incarnation"))
-                == str(payload.resident_incarnation_id)
-                and _workday_claim_expiry(
-                    packet.context.get("_workday_consultation_claim_expires_at")
-                )
-                is not None
-                and _workday_claim_expiry(
-                    packet.context.get("_workday_consultation_claim_expires_at")
-                )
-                > _utcnow()
-                for packet in workday_packets
-            )
-            if exact_private_lease:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Private Workday consultation lease forbids native public replies",
-                )
     data = payload.data
     warnings: List[str] = []
 
@@ -1509,9 +1418,39 @@ async def strategic_operation(
             status_code=400, detail="Data payload too large (max 100KB)"
         )
 
-    # Normalize the few historically surprising envelopes before their domain
-    # handlers run.  Keeping this at the API boundary makes field errors
-    # consistent for CLI, direct API, and future non-shell clients.
+    def _resp(body: dict) -> dict:
+        if warnings:
+            body["warnings"] = list(warnings)
+        return body
+
+    if payload.op == "begin_autonomous_turn" or payload.op == "report_autonomous_finding" or payload.op == "end_autonomous_turn":
+        return await handle_autonomous_handoff_operation(
+            session, project=project, task=task, payload=payload
+        )
+
+    workday_operation, workday_replay = (
+        await prepare_bound_workday_operation(
+            session,
+            project=project,
+            task=task,
+            resident_incarnation_id=payload.resident_incarnation_id,
+            packet_id=payload.packet_id,
+            workday_claim_id=payload.workday_claim_id,
+            operation_id=payload.workday_operation_id,
+            op=payload.op,
+            data=data,
+        )
+    )
+    if workday_replay is not None:
+        replay_body = workday_operation_replay_response(workday_replay)
+        if replay_body["status"] == "deferred":
+            return JSONResponse(content=_resp(replay_body), status_code=202)
+        return _resp(replay_body)
+
+    # Bind replay identity to the exact client request above, before any
+    # normalization that reads current project state. An identical retry after
+    # a committed write must keep the same fingerprint even when that write
+    # advanced a problem-model revision or otherwise changed normalization.
     if payload.op == "create_direction":
         data = normalize_create_direction(data)
     elif payload.op == "update_direction":
@@ -1539,10 +1478,12 @@ async def strategic_operation(
         if compatibility_warning:
             warnings.append(compatibility_warning)
 
-    def _resp(body: dict) -> dict:
-        if warnings:
-            body["warnings"] = list(warnings)
-        return body
+    async def _record_workday_entity(
+        kind: str, entity_id: object, effect: str = "updated"
+    ) -> None:
+        await workday_operation.record_entity(
+            entity_kind=kind, entity_id=str(entity_id), effect=effect
+        )
 
     async def _emit_updated(
         kind: str,
@@ -1702,6 +1643,11 @@ async def strategic_operation(
         task.context = {**(task.context or {}), "_strategic_vision_set": True}
         flag_modified(task, "context")
         session.add(task)
+        await workday_operation.record_state(
+            target_kind="vision",
+            target_revision=new_vision["revision"],
+            value={k: v for k, v in new_vision.items() if not str(k).startswith("_")},
+        )
         await session.commit()
         logger.info(
             f"[STRATEGIC API] Vision updated for project {project.id} (rev {new_vision['revision']})"
@@ -2056,6 +2002,7 @@ async def strategic_operation(
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("direction", new_dir["id"], "created")
         await session.commit()
         if criterion_keys_supplied and criterion_keys:
             await _backfill_direction_merge_evidence_after_mapping(
@@ -2501,6 +2448,7 @@ async def strategic_operation(
         }
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("direction", dir_id)
         await session.commit()
         if criterion_keys_supplied and criterion_keys:
             await _backfill_direction_merge_evidence_after_mapping(
@@ -2646,6 +2594,7 @@ async def strategic_operation(
         }
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("direction", dir_id)
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_DIRECTIONS,
@@ -2782,6 +2731,7 @@ async def strategic_operation(
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("direction", dir_id)
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_DIRECTIONS,
@@ -2911,6 +2861,7 @@ async def strategic_operation(
         }
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("direction", dir_id)
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_DIRECTIONS,
@@ -3033,6 +2984,7 @@ async def strategic_operation(
         }
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("direction", dir_id)
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_DIRECTIONS,
@@ -3139,6 +3091,7 @@ async def strategic_operation(
         }
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("direction", dir_id)
         await session.commit()
         for vm_id in vm_ids_to_delete:
             # Lazy import avoids a circular dependency: main.py includes this
@@ -3286,6 +3239,7 @@ async def strategic_operation(
         }
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("direction", dir_id)
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_DIRECTIONS,
@@ -3561,6 +3515,15 @@ async def strategic_operation(
                 ),
             )
         is_routine = event_type in ROUTINE_EVENT_TYPES
+        enforce_typed_fast_public_claim(
+            task=task,
+            resident_context=resident_ctx,
+            is_routine=is_routine,
+            audience=msg_ctx.get("audience"),
+            operator_audiences={OPERATOR_ACTION_NEEDED, OPERATOR_FYI},
+            conversation_claim_id=conversation_claim_id,
+            covered_message_ids=covered_message_ids,
+        )
         # The generic Workday message route remains available for internal
         # artifacts and activity-surface bookkeeping.  It must not, however,
         # become an unscoped second public answer while the restricted Fast
@@ -3582,7 +3545,7 @@ async def strategic_operation(
                     task.id, int(resident_ctx.get("_resident_worker_generation") or 1)
                 )
             )
-            if await _has_exact_live_fast_public_claim(
+            if await has_exact_live_fast_public_claim(
                 session,
                 project_id=project.id,
                 task_id=task.id,
@@ -4572,6 +4535,11 @@ async def strategic_operation(
             "spawned_by": "strategic_direct",
             "parent_strategic_task_id": str(task.id),
         }
+        if workday_operation.binding is not None:
+            new_task_ctx["_workday_consultation_provenance"] = {
+                "packet_id": str(workday_operation.binding.packet_id),
+                "workday_claim_id": str(workday_operation.binding.workday_claim_id),
+            }
         if direction_id:
             new_task_ctx["direction_id"] = direction_id
 
@@ -4692,11 +4660,16 @@ async def strategic_operation(
                 burst_window_minutes=int(
                     _runtime_config.get("strategist_spawn_window_minutes", 60)
                 ),
+                commit=False,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         new_task = submission.task
         if new_task is None:
+            await _record_workday_entity(
+                "strategic_spawn_request", submission.request.id, "deferred"
+            )
+            await session.commit()
             return JSONResponse(
                 content=_resp(
                     {
@@ -4739,7 +4712,10 @@ async def strategic_operation(
                 return None
 
             await _with_directions_locked(session, project.id, _apply_spawn_clear)
-            await session.commit()
+        await _record_workday_entity(
+            "task", new_task.id, "replayed" if submission.replayed else "created"
+        )
+        await session.commit()
         logger.info(
             f"[STRATEGIC API] Accepted {spawn_type} task {new_task.id} "
             f"(priority={spawn_priority}) from strategic review {task.id} "
@@ -5019,6 +4995,7 @@ async def strategic_operation(
             new_ctx.pop(_applied_key, None)
         task.context = new_ctx
         flag_modified(task, "context")
+        await workday_operation.record_problem_model(new_pm_raw)
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_PROBLEM_MODEL,
@@ -5131,6 +5108,12 @@ async def strategic_operation(
         }
         flag_modified(task, "context")
         session.add(task)
+        current_running_update = project.running_update or ""
+        await workday_operation.record_state(
+            target_kind="running_update",
+            target_revision=len(current_running_update),
+            value=current_running_update,
+        )
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_RUNNING_UPDATE,
@@ -5350,6 +5333,7 @@ async def strategic_operation(
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("knowledge_document", doc.id, "created")
         await session.commit()
         logger.info(
             f"[STRATEGIC API] Wrote strategic_memory KnowledgeDocument {doc.id} "
@@ -5426,6 +5410,7 @@ async def strategic_operation(
             task.context = {**ctx, "_strategic_api_called": True}
             flag_modified(task, "context")
             session.add(task)
+            await workday_operation.record_problem_model(current_model.model_dump())
             await session.commit()
             return _resp({"status": "ok", "op": "pending_confirm", "id": pending.id})
         if len(current_model.pending_user_confirmation) >= PENDING_USER_CONFIRMATION_MAX:
@@ -5474,6 +5459,7 @@ async def strategic_operation(
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
+        await workday_operation.record_problem_model(current_model.model_dump())
         await session.commit()
         logger.info(
             f"[STRATEGIC API] Added pending_confirmation '{pending.id}' to project {project.id}"
@@ -5556,6 +5542,7 @@ async def strategic_operation(
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
+        await workday_operation.record_problem_model(current_model.model_dump())
         await session.commit()
         logger.info(
             f"[STRATEGIC API] resolve_pending_confirm '{target_id}' on project "
@@ -6418,6 +6405,11 @@ async def strategic_operation(
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
+        await workday_operation.record_entity(
+            entity_kind="completion_debt",
+            entity_id=str(entry.id),
+            effect="updated",
+        )
         await session.commit()
         return _resp(
             {
@@ -6653,6 +6645,9 @@ async def strategic_operation(
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity(
+            "task_watch", watch.id, "created" if created else "updated"
+        )
         await session.commit()
         return _resp(
             {
@@ -6686,6 +6681,7 @@ async def strategic_operation(
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("task_watch", watch.id)
         await session.commit()
         return _resp(
             {
@@ -6715,6 +6711,7 @@ async def strategic_operation(
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("task_watch", watch.id)
         await session.commit()
         return _resp(
             {
@@ -6777,6 +6774,7 @@ async def strategic_operation(
                 "cancel_reason": reason,
             }
             session.add(request)
+            await _record_workday_entity("strategic_spawn_request", request.id)
             await session.commit()
             return _resp(
                 {
@@ -6845,6 +6843,7 @@ async def strategic_operation(
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("task", target_task.id)
         await session.commit()
 
         logger.info(

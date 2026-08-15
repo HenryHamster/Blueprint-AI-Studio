@@ -8,15 +8,19 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select
 
 from app.models import (
     MessageSurface,
     Project,
     ProjectMessage,
     StrategicContextEnvelopeSnapshot,
+    StrategicMemorySource,
+    _PROJECT_MESSAGE_PRIVACY_CONTEXT_KEYS,
+    _project_message_privacy_context_changed,
 )
 from app.reaper_sweeps import sweep_strategic_context_retention
+from app.strategic_conversation_query import _CONVERSATION_VISIBILITY_CONTEXT_KEYS
 from app.strategic_memory_envelope import (
     ENVELOPE_SCHEMA_VERSION,
     MAX_CANONICAL_ENVELOPE_BYTES,
@@ -33,6 +37,7 @@ from app.strategic_memory_envelope import (
     get_or_create_project_memory_state,
     pin_fenced_context_envelope_for_packet,
     purge_expired_context_envelope_snapshots,
+    _TRANSCRIPT_CONTEXT_ALLOWLIST,
 )
 from app.time_utils import _utcnow
 
@@ -60,6 +65,68 @@ def test_agent_verifier_supports_the_backend_envelope_schema_version():
     )
     assert match is not None
     assert int(match.group(1)) == ENVELOPE_SCHEMA_VERSION
+
+
+@pytest.mark.parametrize(
+    ("key", "old_value", "new_value"),
+    (
+        ("event_type", "question_answer", "strategic_check_in"),
+        ("message_role", "operator_reply", "workday_consultation_continuation"),
+        ("source", "operator", "system"),
+        ("topic", "planning", "privacy"),
+        ("audience", "operator-fyi", "strategist-internal"),
+        (
+            "_resident_reply_covered_message_ids",
+            ["11111111-1111-1111-1111-111111111111"],
+            ["22222222-2222-2222-2222-222222222222"],
+        ),
+    ),
+)
+def test_every_governed_message_context_key_is_privacy_fenced(
+    key,
+    old_value,
+    new_value,
+):
+    assert _PROJECT_MESSAGE_PRIVACY_CONTEXT_KEYS == (
+        _TRANSCRIPT_CONTEXT_ALLOWLIST | _CONVERSATION_VISIBILITY_CONTEXT_KEYS
+    )
+    assert _project_message_privacy_context_changed(
+        old_contexts=[{key: old_value}],
+        new_context={key: new_value},
+    )
+
+
+def test_message_context_privacy_projection_ignores_bookkeeping_but_fails_closed():
+    assert not _project_message_privacy_context_changed(
+        old_contexts=[{"source": "operator"}],
+        new_context={
+            "source": "operator",
+            "_conversation_public_reply_owner": "fast",
+            "_conversation_claim_idempotency_key": "claim-1",
+            "_operator_wakeup_state": "queued",
+        },
+    )
+    assert not _project_message_privacy_context_changed(
+        old_contexts=[
+            {
+                "_conversation_consultation_packet": True,
+                "audience": "strategist-internal",
+            }
+        ],
+        new_context={
+            "_conversation_consultation_packet": True,
+            "audience": "strategist-internal",
+            "_workday_consultation_claim_id": str(uuid.uuid4()),
+        },
+    )
+    assert _project_message_privacy_context_changed(
+        old_contexts=[{}],
+        new_context={"_conversation_consultation_packet": True},
+    )
+    assert _project_message_privacy_context_changed(
+        old_contexts=[],
+        new_context={"_operator_wakeup_state": "queued"},
+    )
 
 
 def test_canonical_core_has_stable_bytes_independent_of_mapping_order():
@@ -855,6 +922,98 @@ async def test_private_packet_lease_bookkeeping_does_not_spuriously_fence_core(d
         project_id=project.id,
         reference=context_envelope_reference(transport),
     ) == transport
+
+    # Keeping the private marker cannot exempt a change that makes the packet
+    # operator-visible. The governed audience transition must still purge.
+    packet.context = {**packet.context, "audience": "operator-fyi"}
+    await db_session.flush()
+    state = await get_or_create_project_memory_state(db_session, project.id)
+    assert state.privacy_generation == 1
+    assert await db_session.get(ProjectMessage, packet.id) is None
+    assert (
+        await db_session.get(StrategicContextEnvelopeSnapshot, transport.snapshot_id)
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_public_claim_metadata_preserves_private_workday_packet_and_receipts(
+    db_session,
+):
+    project = Project(name="claim metadata privacy fence", user_id="envelope-test-user")
+    db_session.add(project)
+    await db_session.flush()
+    source = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="keep the pending Workday consultation",
+        context={"source": "operator"},
+    )
+    packet = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        from_type="system",
+        content="private Workday question",
+        context={
+            "_conversation_consultation_packet": True,
+            "audience": "strategist-internal",
+        },
+    )
+    db_session.add_all([source, packet])
+    await db_session.flush()
+    transport = await build_and_store_context_envelope_snapshot(
+        db_session,
+        project_id=project.id,
+        session_id="claim-metadata-privacy",
+        claim_id=uuid.uuid4(),
+        worker_generation=1,
+        worker_incarnation=uuid.uuid4(),
+        input_revision=1,
+        transcript_sequence=1,
+        decision_authority={},
+    )
+    source_receipt = await db_session.scalar(
+        select(StrategicMemorySource).where(
+            StrategicMemorySource.project_id == project.id,
+            StrategicMemorySource.source_type == "project_message",
+            StrategicMemorySource.source_key == str(source.id),
+        )
+    )
+    assert source_receipt is not None
+    assert source_receipt.payload_state == "active"
+
+    source.context = {
+        **source.context,
+        "_conversation_public_reply_owner": "fast",
+        "_conversation_claim_idempotency_key": "fast-claim-1",
+    }
+    await db_session.flush()
+    state = await get_or_create_project_memory_state(db_session, project.id)
+    assert state.privacy_generation == 0
+    assert await db_session.get(ProjectMessage, packet.id) is packet
+    assert await get_fenced_context_envelope_by_reference(
+        db_session,
+        project_id=project.id,
+        reference=context_envelope_reference(transport),
+    ) == transport
+    assert source_receipt.payload_state == "active"
+
+    # Audience participates in canonical visibility. Changing it remains a
+    # governed privacy mutation and must still scrub every derived copy.
+    source.context = {**source.context, "audience": "strategist-internal"}
+    await db_session.flush()
+    state = await get_or_create_project_memory_state(db_session, project.id)
+    assert state.privacy_generation == 1
+    assert await db_session.get(ProjectMessage, packet.id) is None
+    assert (
+        await db_session.get(StrategicContextEnvelopeSnapshot, transport.snapshot_id)
+        is None
+    )
+    await db_session.refresh(source_receipt)
+    assert source_receipt.payload_state == "redacted"
 
 
 @pytest.mark.asyncio

@@ -485,13 +485,13 @@ describe('PipelineWorkspace task stream', () => {
     const nowPanel = within(sideboard).getByTestId('pipeline-now-panel');
     expect(nowPanel).toBeInTheDocument();
     expect(within(nowPanel).getByText('Now')).toBeInTheDocument();
-    expect(within(nowPanel).getByText('1 running')).toBeInTheDocument();
+    expect(within(nowPanel).getByText('1 in progress')).toBeInTheDocument();
     expect(within(nowPanel).getByText('1 tracked')).toBeInTheDocument();
     expect(within(screen.getByTestId('pipeline-now-row-task-stream-1')).getByText('Selected')).toBeInTheDocument();
     const healthPanel = within(sideboard).getByTestId('pipeline-health-panel');
     expect(within(healthPanel).getByText('Task health')).toBeInTheDocument();
     expect(within(healthPanel).getByText('filtered')).toBeInTheDocument();
-    expect(within(healthPanel).getByText('Running')).toBeInTheDocument();
+    expect(within(healthPanel).getByText('In progress')).toBeInTheDocument();
     expect(within(healthPanel).getByText('Queued')).toBeInTheDocument();
     expect(within(healthPanel).getByText('Waiting')).toBeInTheDocument();
     expect(within(healthPanel).getByText('Parked')).toBeInTheDocument();
@@ -544,9 +544,9 @@ describe('PipelineWorkspace task stream', () => {
 
     const nowPanel = screen.getByTestId('pipeline-now-panel');
     expect(within(nowPanel).getByText('Now')).toBeInTheDocument();
-    expect(within(nowPanel).getByText('1 running')).toBeInTheDocument();
+    expect(within(nowPanel).getByText('1 in progress')).toBeInTheDocument();
     expect(within(nowPanel).getByText('1 tracked')).toBeInTheDocument();
-    expect(within(screen.getByTestId('pipeline-now-row-task-now-active')).getByText('Running')).toBeInTheDocument();
+    expect(within(screen.getByTestId('pipeline-now-row-task-now-active')).getByText('In progress')).toBeInTheDocument();
     expect(within(screen.getByTestId('pipeline-now-row-task-now-blocked')).getByText('Blocked')).toBeInTheDocument();
     expect(within(screen.getByTestId('pipeline-now-row-task-now-parked')).getByText('Parked')).toBeInTheDocument();
     expect(within(screen.getByTestId('pipeline-now-row-task-now-queued')).getByText('Queued')).toBeInTheDocument();
@@ -559,7 +559,7 @@ describe('PipelineWorkspace task stream', () => {
     expect(onTrackTask).toHaveBeenCalledWith(blockedTask);
   });
 
-  test('shows a quiet Now panel empty state when no active work is visible', () => {
+  test('shows a quiet Now panel empty state when no in-progress work is visible', () => {
     renderWorkspace({
       flow: {
         tasks: [],
@@ -579,7 +579,77 @@ describe('PipelineWorkspace task stream', () => {
     });
 
     const nowPanel = screen.getByTestId('pipeline-now-panel');
-    expect(within(nowPanel).getByText('No active pipeline work in view.')).toBeInTheDocument();
+    expect(within(nowPanel).getByText('No in-progress pipeline work in view.')).toBeInTheDocument();
+  });
+
+  test('separates evaluation coordination from executing work', () => {
+    const evaluatingTask = makeTask({
+      id: 'task-evaluating-parent',
+      title: 'Research parent awaiting rollup',
+      status: 'EVALUATING',
+    });
+
+    renderWorkspace({
+      flow: {
+        tasks: [evaluatingTask],
+        hasActiveFilters: false,
+        onViewLogs: vi.fn(),
+        onNavigateToParent: vi.fn(),
+        onArchiveGroup: vi.fn(),
+        onUnarchiveTask: vi.fn(),
+      },
+      metrics: {
+        activeTasks: [],
+        queuedTasks: [],
+        blockedTasks: [],
+        failedTasks: [],
+        terminalTasks: [],
+      },
+    });
+
+    const nowPanel = screen.getByTestId('pipeline-now-panel');
+    expect(within(nowPanel).queryByText(/in progress$/)).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('pipeline-now-row-task-evaluating-parent')).getByText('Evaluating')).toBeInTheDocument();
+
+    const healthPanel = screen.getByTestId('pipeline-health-panel');
+    const healthRows = Array.from(healthPanel.querySelectorAll('div'));
+    expect(healthRows.find(row => row.textContent?.includes('In progress'))?.textContent).toContain('0');
+    expect(healthRows.find(row => row.textContent?.includes('Evaluating'))?.textContent).toContain('1');
+  });
+
+  test('separates a runner reservation from executing work', () => {
+    const startingTask = makeTask({
+      id: 'task-starting-reservation',
+      title: 'Waiting for runner claim',
+      status: 'PROVISIONING',
+    });
+
+    renderWorkspace({
+      flow: {
+        tasks: [startingTask],
+        hasActiveFilters: false,
+        onViewLogs: vi.fn(),
+        onNavigateToParent: vi.fn(),
+        onArchiveGroup: vi.fn(),
+        onUnarchiveTask: vi.fn(),
+      },
+      metrics: {
+        activeTasks: [],
+        queuedTasks: [],
+        blockedTasks: [],
+        failedTasks: [],
+        terminalTasks: [],
+      },
+    });
+
+    const nowPanel = screen.getByTestId('pipeline-now-panel');
+    expect(within(screen.getByTestId('pipeline-now-row-task-starting-reservation')).getByText('Starting')).toBeInTheDocument();
+    expect(within(nowPanel).queryByText(/in progress$/)).not.toBeInTheDocument();
+
+    const healthPanel = screen.getByTestId('pipeline-health-panel');
+    const healthRows = Array.from(healthPanel.querySelectorAll('div'));
+    expect(healthRows.find(row => row.textContent?.includes('In progress'))?.textContent).toContain('0');
+    expect(healthRows.find(row => row.textContent?.includes('Starting'))?.textContent).toContain('1');
   });
 
   test('counts parked-only tasks as attention in task health', () => {

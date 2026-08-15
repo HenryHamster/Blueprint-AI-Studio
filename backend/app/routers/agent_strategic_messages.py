@@ -48,7 +48,6 @@ from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from slowapi.util import get_remote_address
 from sqlmodel import select
@@ -84,6 +83,17 @@ from app.resident_conversation_scope import (
     resident_conversation_scope,
 )
 from app.strategic_payload_summaries import _fetch_open_operator_cursor_floor
+from app.strategic_consultation_status import (
+    completed_workday_consultation_id as _completed_workday_consultation_id,
+    emit_consultation_activity_if_changed as _emit_consultation_activity_if_changed,
+    project_current_consultation_activity as _project_current_consultation_activity,
+)
+from app.strategic_fast_live_work import _fast_live_work_authority
+from app.strategic_workday_handoff_recovery import (
+    PRIVATE_HANDOFF_RETIREMENT_LIMIT as _PRIVATE_HANDOFF_RETIREMENT_LIMIT,
+    recover_retired_private_handoff as _recover_retired_private_handoff,
+    retire_unavailable_private_handoff as _retire_unavailable_private_handoff,
+)
 from app.time_utils import _utcnow
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
@@ -232,7 +242,7 @@ class AcknowledgeWorkdayConsultation(BaseModel):
     worker_generation: int = Field(..., ge=1)
     incarnation_id: uuid.UUID
     workday_claim_id: uuid.UUID
-    outcome: Literal["completed", "abandoned"]
+    outcome: Literal["completed", "abandoned", "failed"]
     result_summary: str | None = Field(default=None, max_length=20_000)
 
 
@@ -519,58 +529,6 @@ async def _resolve_message_context_envelope(
         reference=context.get("envelope"),
     )
     return row, envelope
-
-
-_PRIVATE_HANDOFF_RETIREMENT_CONTEXT_KEY = "_private_handoff_retirement"
-_PRIVATE_HANDOFF_RETIREMENT_REASON = "context_envelope_unavailable"
-# Each coordinator call scans the current private queue while holding Project
-# authority. Bound abnormal cleanup per HTTP request so a corrupt backlog cannot
-# turn one poll into an unbounded lock hold; the next normal poll resumes cleanup.
-_PRIVATE_HANDOFF_RETIREMENT_LIMIT = 8
-_PRIVATE_HANDOFF_CLAIM_CONTEXT_KEYS = (
-    "_workday_consultation_claim_id",
-    "_workday_consultation_claim_generation",
-    "_workday_consultation_claim_incarnation",
-    "_workday_consultation_claim_expires_at",
-    "_workday_consultation_claim_attempt",
-    "_workday_continuation_claim_id",
-    "_workday_continuation_claim_generation",
-    "_workday_continuation_claim_incarnation",
-    "_workday_continuation_claim_expires_at",
-    "_workday_continuation_claim_attempt",
-)
-
-
-async def _retire_unavailable_private_handoff(
-    session: AsyncSession,
-    *,
-    row: ProjectMessage,
-) -> None:
-    """Terminalize one private queue row whose fenced prompt no longer exists.
-
-    The claim-next routes hold Project/Task authority locks, and the coordinator
-    has already selected this exact row with ``FOR UPDATE``.  Keep the content
-    private, erase every transient lease identity, and retain only a bounded
-    server-authored audit marker before moving on to the next queue candidate.
-    """
-
-    now = _utcnow()
-    context = dict(row.context or {})
-    for key in _PRIVATE_HANDOFF_CLAIM_CONTEXT_KEYS:
-        context.pop(key, None)
-    context[_PRIVATE_HANDOFF_RETIREMENT_CONTEXT_KEY] = {
-        "reason": _PRIVATE_HANDOFF_RETIREMENT_REASON,
-        "retired_at": now.isoformat(),
-    }
-    row.context = context
-    row.status = "resolved"
-    row.handling_state = MessageHandlingState.SUPERSEDED
-    row.handled_by_task_id = None
-    row.resolution = "private_handoff_context_envelope_unavailable"
-    row.resolved_at = now
-    row.updated_at = now
-    session.add(row)
-    await session.flush()
 
 
 @router.post("/projects/{project_id}/strategic-call/finalized-transcript")
@@ -1129,6 +1087,11 @@ async def claim_public_conversation_turn(
     )
 
     try:
+        live_work_authority = await _fast_live_work_authority(
+            session,
+            project=project,
+            resident_task_id=task.id,
+        )
         envelope = await build_and_store_context_envelope_snapshot(
             session,
             project_id=project_id,
@@ -1138,7 +1101,7 @@ async def claim_public_conversation_turn(
             worker_incarnation=accepted_incarnation,
             input_revision=transcript_sequence,
             transcript_sequence=transcript_sequence,
-            decision_authority={},
+            decision_authority=live_work_authority,
             memory_query=_memory_query_from_claimed_operator_rows(claim.rows),
         )
     except (ContextEnvelopeFenceError, ValueError) as exc:
@@ -1266,6 +1229,9 @@ async def complete_public_conversation_turn(
         )
         response["workday_packet"] = {
             "packet_id": str(result.consultation_packet.id),
+            "consultation_id": packet_context.get(
+                "_workday_consultation_atomic_reply_id"
+            ),
             "continuation_key": packet_context.get(
                 "_conversation_consultation_continuation"
             ),
@@ -1322,11 +1288,21 @@ async def abandon_public_conversation_turn(
     except ValueError as exc:
         await session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from None
+    consultation_id = (
+        await _completed_workday_consultation_id(
+            session,
+            project_id=project_id,
+            claim_id=payload.claim_id,
+        )
+        if status == "already_completed"
+        else None
+    )
     await session.commit()
     return {
         "status": status,
         "legacy_fallback_admissible": status
         in {"abandoned", "already_abandoned"},
+        "consultation_id": consultation_id,
     }
 
 
@@ -1405,6 +1381,11 @@ async def deliver_workday_consultation(
         lease_expires_at=max(row.conversation_claim_expires_at for row in claim_rows if row.conversation_claim_expires_at is not None),
         attempt=max(row.conversation_claim_attempt for row in claim_rows),
     )
+    live_work_authority = await _fast_live_work_authority(
+        session,
+        project=project,
+        resident_task_id=task.id,
+    )
     envelope = await build_and_store_context_envelope_snapshot(
         session,
         project_id=project_id,
@@ -1414,7 +1395,7 @@ async def deliver_workday_consultation(
         worker_incarnation=payload.incarnation_id,
         input_revision=max(int(row.sequence or 0) for row in claim_rows),
         transcript_sequence=max(int(row.sequence or 0) for row in claim_rows),
-        decision_authority={},
+        decision_authority=live_work_authority,
         memory_query=_memory_query_from_claimed_operator_rows(claim_rows),
     )
     try:
@@ -1458,6 +1439,7 @@ def _workday_consultation_packet_response(
         "claim_id": context.get("claim_id"),
         "delivery_key": context.get("delivery_key"),
         "continuation_key": context.get("_conversation_consultation_continuation"),
+        "consultation_id": context.get("_workday_consultation_atomic_reply_id"),
         "question": packet.content,
         "envelope": envelope.model_dump(mode="json"),
     }
@@ -1528,6 +1510,15 @@ async def claim_next_workday_consultation(
             await _retire_unavailable_private_handoff(
                 session,
                 row=packet_claim.message,
+            )
+            await _recover_retired_private_handoff(
+                session,
+                project=project,
+                task=task,
+                row=packet_claim.message,
+                worker_generation=payload.worker_generation,
+                worker_incarnation=accepted_incarnation,
+                resident_session_id=payload.session_id,
             )
             logger.warning(
                 "[STRATEGIC] Retired private Workday packet %s because its "
@@ -1619,7 +1610,17 @@ async def acknowledge_workday_consultation(
     except ValueError as exc:
         await session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from None
+    activity_transition = await _project_current_consultation_activity(
+        session,
+        project=project,
+        resident_session_id=payload.session_id,
+    )
     await session.commit()
+    await _emit_consultation_activity_if_changed(
+        project_id,
+        task_id=task.id,
+        activity=activity_transition,
+    )
     return {"status": "duplicate" if duplicate else "acknowledged"}
 
 
@@ -1691,8 +1692,9 @@ async def renew_workday_consultation(
 def _workday_continuation_response(
     claim: Any,
     envelope: Any,
+    current_live_work_authority: dict[str, Any],
 ) -> dict[str, Any]:
-    """Project only a server-created result and its Fast continuation receipt."""
+    """Project a server-created result plus current bounded managed-state truth."""
     packet = claim.message
     context = packet.context if isinstance(packet.context, dict) else {}
     return {
@@ -1703,8 +1705,10 @@ def _workday_continuation_response(
         "claim_id": context.get("claim_id"),
         "delivery_key": context.get("delivery_key"),
         "continuation_key": context.get("_conversation_consultation_continuation"),
+        "consultation_id": context.get("_workday_consultation_atomic_reply_id"),
         "result_summary": packet.content,
         "envelope": envelope.model_dump(mode="json"),
+        "current_live_work_authority": current_live_work_authority,
     }
 
 
@@ -1749,6 +1753,7 @@ async def claim_next_workday_continuation(
     claim = None
     resolved_envelope = None
     retired_handoffs = 0
+    missing_recovery_checked = False
     while True:
         claim = await claim_next_workday_consultation_continuation(
             session,
@@ -1760,6 +1765,22 @@ async def claim_next_workday_continuation(
             lease_seconds=payload.lease_seconds,
         )
         if claim is None:
+            if not missing_recovery_checked:
+                missing_recovery_checked = True
+                from app.strategic_workday_handoff_recovery import (
+                    recover_one_missing_workday_request,
+                )
+
+                recovered = await recover_one_missing_workday_request(
+                    session,
+                    project=project,
+                    task=task,
+                    worker_generation=payload.worker_generation,
+                    worker_incarnation=accepted_incarnation,
+                    session_id=payload.session_id,
+                )
+                if recovered is not None:
+                    continue
             break
         try:
             _, resolved_envelope = await _resolve_message_context_envelope(
@@ -1773,6 +1794,15 @@ async def claim_next_workday_continuation(
             await _retire_unavailable_private_handoff(
                 session,
                 row=claim.message,
+            )
+            await _recover_retired_private_handoff(
+                session,
+                project=project,
+                task=task,
+                row=claim.message,
+                worker_generation=payload.worker_generation,
+                worker_incarnation=accepted_incarnation,
+                resident_session_id=payload.session_id,
             )
             logger.warning(
                 "[STRATEGIC] Retired private Workday continuation %s because "
@@ -1791,13 +1821,52 @@ async def claim_next_workday_continuation(
                 break
             continue
         break
-    await session.commit()
     if claim is None:
+        await session.commit()
         return {"status": "empty"}
+    from app.strategic_workday_mutation_rebind import (
+        bounded_workday_mutation_receipts,
+        workday_mutation_receipts_have_more,
+    )
+
+    result_context = claim.message.context if isinstance(claim.message.context, dict) else {}
+    try:
+        source_packet_id = uuid.UUID(str(result_context.get("source_packet_id")))
+        workday_claim_id = uuid.UUID(
+            str(result_context.get("_workday_consultation_ack_claim_id"))
+        )
+    except (TypeError, ValueError, AttributeError):
+        source_packet_id = workday_claim_id = None
+    mutation_receipts = bounded_workday_mutation_receipts(
+        result_context,
+        packet_id=source_packet_id,
+        workday_claim_id=workday_claim_id,
+        task_id=task.id,
+        resident_session_id=payload.session_id,
+        worker_generation=payload.worker_generation,
+        worker_incarnation=accepted_incarnation,
+    )
+    current_live_work_authority = await _fast_live_work_authority(
+        session,
+        project=project,
+        resident_task_id=task.id,
+        result_evidence_text=claim.message.content,
+        consultation_operation_receipts=mutation_receipts,
+    )
+    current_live_work_authority["consultation_mutation_receipts"] = mutation_receipts
+    current_live_work_authority.setdefault("collection_metadata", {})[
+        "consultation_mutation_receipts"
+    ] = {
+        "returned_count": len(mutation_receipts),
+        "has_more": workday_mutation_receipts_have_more(result_context),
+    }
+    await session.commit()
     return {
         "status": "claimed",
         "continuation": _workday_continuation_response(
-            claim, resolved_envelope
+            claim,
+            resolved_envelope,
+            current_live_work_authority,
         ),
     }
 
@@ -1877,7 +1946,17 @@ async def complete_workday_continuation(
         # identity comparison above proves this is the canonical committed
         # continuation, so replaying its row-id event is safe and closes the
         # commit-succeeded/event-lost window without creating any new output.
+        activity_transition = await _project_current_consultation_activity(
+            session,
+            project=project,
+            resident_session_id=payload.session_id,
+        )
         await session.commit()
+        await _emit_consultation_activity_if_changed(
+            project_id,
+            task_id=task.id,
+            activity=activity_transition,
+        )
         await broadcast_to_project(
             str(project_id),
             "message_created",
@@ -1907,7 +1986,17 @@ async def complete_workday_continuation(
     except ValueError as exc:
         await session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from None
+    activity_transition = await _project_current_consultation_activity(
+        session,
+        project=project,
+        resident_session_id=payload.session_id,
+    )
     await session.commit()
+    await _emit_consultation_activity_if_changed(
+        project_id,
+        task_id=task.id,
+        activity=activity_transition,
+    )
     await broadcast_to_project(
         str(project_id), "message_created", message_event_payload(result.message)
     )

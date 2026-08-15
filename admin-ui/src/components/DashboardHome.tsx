@@ -88,7 +88,7 @@ export interface DashboardHomeProps {
   projects?: Project[];
   // Membership-scoped aggregate task counts from the tasks hook (/api/admin/tasks).
   // These cover the whole accessible fleet (global*) or the selected project
-  // (scoped*), NOT the current paginated task page, so the Active/Queued cards
+  // (scoped*), NOT the current paginated task page, so the In progress/Queued cards
   // can render true counts instead of a slice. All optional/additive: when
   // undefined the cards fall back to deriving from the `tasks` page.
   globalActiveCount?: number;
@@ -133,7 +133,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
   }
 
   // Compute task counts from props before hook calls — used by useDashboardDigest for sparkline
-  const pageActiveCount = useMemo(() => tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length, [tasks]);
+  const pageActiveCount = useMemo(() => tasks.filter(t => t.status === 'IN_PROGRESS').length, [tasks]);
   const pageQueuedCount = useMemo(() => tasks.filter(t => t.status === 'QUEUED').length, [tasks]);
   const activeCount = selectedProjectId && scopedActiveCount != null
     ? scopedActiveCount
@@ -338,7 +338,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
               </div>
             )}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-              <MetricCard label="Active" value={activeCount} color="emerald" spark={sparkData} dataKey="active" loading={loading} />
+              <MetricCard label="In progress" value={activeCount} color="emerald" spark={sparkData} dataKey="active" loading={loading} />
               <MetricCard label="Queued" value={queuedCount} color="blue" spark={sparkData} dataKey="queued" loading={loading} />
               <MetricCard label="Completed" value={digest?.completed_count ?? 0} color="violet" spark={[]} dataKey="active" loading={loading} />
               <FailedCard value={failedCount} groups={digest?.failure_groups} spark={sparkData} loading={loading} windowHours={windowHours} />

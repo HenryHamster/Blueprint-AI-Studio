@@ -13102,7 +13102,7 @@ class TestProblemModelWritePathInvariants:
     # When changing a file, update these line numbers.
     _SAFE_SITES: dict[tuple[str, int], str] = {
         # task_locking.py: project.problem_model write-back inside with_problem_model_locked
-        ("task_locking.py", 1127): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
+        ("task_locking.py", 1135): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
         # lifecycle.py: sanitize_problem_model_raw -> startup healing write-back
         ("lifecycle.py", 505): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
@@ -13110,37 +13110,37 @@ class TestProblemModelWritePathInvariants:
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
         ("direction_lifecycle.py", 874): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5360): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 5411): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5397): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 5448): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 7080): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 7131): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
         ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
         ("reaper_sweeps.py", 1381): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
-        ("routers/admin_projects.py", 851): "validated pydantic model_dump",
+        ("routers/admin_projects.py", 857): "validated pydantic model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1264): "current_model pydantic model_dump",
+        ("routers/admin_projects.py", 1270): "current_model pydantic model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1376): "current_model pydantic model_dump",
+        ("routers/admin_projects.py", 1382): "current_model pydantic model_dump",
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
-        ("routers/admin_agent_ops.py", 2019): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2445): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2892): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 3005): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 3260): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 1965): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2392): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2842): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2956): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 3213): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4911): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4887): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4939): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4915): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5470): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5455): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5552): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5538): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):
@@ -13725,6 +13725,31 @@ def test_every_script_test_is_discovered_or_has_a_written_exemption():
 
 def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path):
     """Docker-less standalone execution must not silently drop discovered entries."""
+    bash_executable = "bash"
+    if os.name == "nt":
+        git_executable = shutil.which("git")
+        git_bash_candidates = []
+        if git_executable:
+            git_bash_candidates.append(
+                Path(git_executable).resolve().parent.parent / "bin" / "bash.exe"
+            )
+        program_files = os.environ.get("ProgramFiles")
+        if program_files:
+            git_bash_candidates.append(Path(program_files) / "Git" / "bin" / "bash.exe")
+        bash_executable = str(
+            next(
+                candidate
+                for candidate in git_bash_candidates
+                if candidate.is_file()
+            )
+        )
+
+    def _bash_path(path: Path) -> str:
+        value = path.resolve().as_posix()
+        if os.name == "nt" and len(value) >= 3 and value[1:3] == ":/":
+            return f"/{value[0].lower()}/{value[3:]}"
+        return value
+
     harness = _script_test_harness()
     _discovery_globs, exemptions = _parse_script_test_roster(harness)
     scripts_root = harness.parent
@@ -13749,9 +13774,15 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     (run_app / "main.py").write_text(
         "class _App:\n    routes = []\n\napp = _App()\n", encoding="utf-8"
     )
-    shutil.copy2(harness, run_scripts / harness.name)
-    shutil.copy2(
-        harness.parent / "backend-test-route.sh", run_scripts / "backend-test-route.sh"
+    # Normalize the executable shell boundary to LF. A Windows developer
+    # checkout can legitimately be CRLF even though the Docker/Linux gate that
+    # executes this copied fixture requires POSIX line endings.
+    (run_scripts / harness.name).write_bytes(
+        harness.read_bytes().replace(b"\r\n", b"\n")
+    )
+    route_helper = harness.parent / "backend-test-route.sh"
+    (run_scripts / route_helper.name).write_bytes(
+        route_helper.read_bytes().replace(b"\r\n", b"\n")
     )
     root_claude = harness.parent.parent / "CLAUDE.md"
     if root_claude.is_file():
@@ -13808,7 +13839,12 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     log_path = tmp_path / "python-argv.log"
     fake_python = tmp_path / "probe-python"
     fake_python.write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ROSTER_PROBE_LOG\"\n",
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *\"import fastapi\"*) exit 0 ;;\n"
+        "  *\"sys.version_info\"*) printf '%s\\n' '3.11'; exit 0 ;;\n"
+        "esac\n"
+        "printf '%s\\n' \"$*\" >> \"$ROSTER_PROBE_LOG\"\n",
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
@@ -13826,21 +13862,23 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     env.pop("CI", None)
     env.update(
         {
-            # Keep python3 on PATH real so the test distinguishes the explicit
-            # probe interpreter from the subprocess command under test.
-            "PATH": f"{fake_bin}:{env['PATH']}",
-            # The real harness may select an existing task-VM venv by absolute
-            # path; pin the probe to the fake interpreter so this test remains
-            # about roster argv even when that venv is present.
-            "PYTHON": str(fake_python),
-            "ROSTER_PROBE_LOG": str(log_path),
+            "PATH": f"{_bash_path(fake_bin)}:{env['PATH']}",
+            "ROSTER_PROBE_LOG": _bash_path(log_path),
+            # Keep the explicit probe interpreter separate from the literal
+            # python3 subprocess under test. The latter must remain on PATH.
+            "PYTHON": _bash_path(fake_python),
             "ROSTER_REAL_PYTHON": sys.executable,
             "TESTMON_NO_FETCH": "1",
             "ALLOW_LOW_MEM": "1",
+            # Keep this roster-only probe on its fake-python boundary even on
+            # agent hosts that have a cached /tmp backend venv. The harness must
+            # honor the explicit interpreter instead of letting host residue
+            # import the deliberately absent fake checkout's app.
+            "BLUEPRINT_BACKEND_TEST_PYTHON": _bash_path(fake_python),
         }
     )
     result = subprocess.run(
-        ["bash", str(run_harness), "--standalone", "--no-postgres"],
+        [bash_executable, _bash_path(run_harness), "--standalone", "--no-postgres"],
         cwd=run_backend,
         env=env,
         capture_output=True,
@@ -13869,6 +13907,49 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         "Docker-less standalone execution omitted non-exempt discovered entries: "
         + ", ".join(missing)
     )
+
+    # Explicit interpreter selection is fail-closed: host venv residue must
+    # never replace an interpreter that cannot satisfy the requested boundary.
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in *\"import fastapi\"*) exit 1 ;; esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    missing_deps = subprocess.run(
+        [bash_executable, _bash_path(run_harness), "--standalone", "--no-postgres"],
+        cwd=run_backend,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert missing_deps.returncode == 2
+    assert "explicit BLUEPRINT_BACKEND_TEST_PYTHON cannot import" in (
+        missing_deps.stderr + missing_deps.stdout
+    )
+
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *\"import fastapi\"*) exit 0 ;;\n"
+        "  *\"sys.version_info\"*) printf '%s\\n' '3.10'; exit 0 ;;\n"
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    old_python = subprocess.run(
+        [bash_executable, _bash_path(run_harness), "--standalone", "--no-postgres"],
+        cwd=run_backend,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert old_python.returncode == 2
+    assert "Python 3.11+ is required" in old_python.stderr + old_python.stdout
     execution_residue = _script_test_execution_residue(scripts_root, on_disk)
     assert not execution_residue, (
         "classified scripts/test_*.py files contain no discoverable pytest or "

@@ -15,6 +15,7 @@ from app.conversation_coordinator import (
     claim_next_workday_consultation_packet,
     claim_next_workday_consultation_continuation,
     claim_operator_messages,
+    complete_claimed_public_turn,
     complete_workday_consultation_continuation,
     create_or_get_workday_consultation_packet,
     native_resident_reply_may_complete_claim,
@@ -456,6 +457,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     )
     assert claim is not None
     envelope = await _envelope(db_session, project, claim)
+    atomic_reply_id = uuid.uuid4()
     packet = await create_or_get_workday_consultation_packet(
         db_session,
         project_id=project.id,
@@ -464,7 +466,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
         delivery_key="needs-evidence",
         question="Find the exact evidence.",
         resident_session_id="session",
-        atomic_public_reply_id=uuid.uuid4(),
+        atomic_public_reply_id=atomic_reply_id,
     )
     await db_session.commit()
 
@@ -538,6 +540,9 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     )
     assert continuation is not None
     assert continuation.attempt == 1
+    assert continuation.message.context["_workday_consultation_atomic_reply_id"] == str(
+        atomic_reply_id
+    )
     renewed = await renew_workday_consultation_continuation(
         db_session,
         project_id=project.id,
@@ -597,6 +602,218 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     assert reply.message.context["_workday_result_packet_id"] == str(
         continuation.message.id
     )
+    assert reply.message.context["_workday_consultation_atomic_reply_id"] == str(
+        atomic_reply_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_workday_empty_result_retries_once_then_creates_terminal_failure(db_session):
+    project, message, task = await _project_with_input(db_session)
+    incarnation_id = uuid.uuid4()
+    claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id="session",
+        task_id=task.id,
+        worker_generation=1,
+        incarnation_id=incarnation_id,
+        message_ids=[message.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+    )
+    assert claim is not None
+    packet = await create_or_get_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        claim=claim,
+        envelope=await _envelope(db_session, project, claim),
+        delivery_key="empty-result",
+        question="Find exact evidence.",
+        resident_session_id="session",
+        atomic_public_reply_id=uuid.uuid4(),
+    )
+    first = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert first is not None and first.attempt == 1
+    with pytest.raises(ValueError, match="at least two attempts"):
+        await acknowledge_workday_consultation_packet(
+            db_session,
+            project_id=project.id,
+            packet_id=packet.message.id,
+            task_id=task.id,
+            worker_generation=1,
+            worker_incarnation=incarnation_id,
+            resident_session_id="session",
+            workday_claim_id=first.workday_claim_id,
+            outcome="failed",
+        )
+    await acknowledge_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        packet_id=packet.message.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+        workday_claim_id=first.workday_claim_id,
+        outcome="abandoned",
+    )
+    await db_session.commit()
+    second = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert second is not None and second.attempt == 2
+    assert not await acknowledge_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        packet_id=packet.message.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+        workday_claim_id=second.workday_claim_id,
+        outcome="failed",
+    )
+    await db_session.commit()
+    assert await acknowledge_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        packet_id=packet.message.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+        workday_claim_id=second.workday_claim_id,
+        outcome="failed",
+    )
+    assert await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    ) is None
+    continuation = await claim_next_workday_consultation_continuation(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert continuation is not None
+    assert continuation.message.context["result_state"] == "failed"
+    assert "failure notice itself does not verify" in continuation.message.content
+
+
+@pytest.mark.asyncio
+async def test_claiming_next_fast_turn_preserves_prior_workday_packet(db_session):
+    project, first_input, task = await _project_with_input(db_session)
+    first_incarnation_id = uuid.uuid4()
+    first_claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id="session",
+        task_id=task.id,
+        worker_generation=1,
+        incarnation_id=first_incarnation_id,
+        message_ids=[first_input.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+    )
+    assert first_claim is not None
+    envelope = await _envelope(db_session, project, first_claim)
+    first_completion = await complete_claimed_public_turn(
+        db_session,
+        project_id=project.id,
+        claim_id=first_claim.claim_id,
+        task_id=task.id,
+        worker_generation=1,
+        incarnation_id=first_incarnation_id,
+        owner=ConversationPublicReplyOwner.FAST,
+        content="I can answer now while Workday verifies the implementation.",
+        idempotency_key="fast-reply-with-workday-turn-1",
+        resident_session_id="session",
+        workday_request={
+            "delivery_key": "turn-1-verification",
+            "question": "Verify the exact implementation evidence.",
+        },
+        envelope=envelope,
+    )
+    assert not first_completion.duplicate
+    assert first_completion.consultation_packet is not None
+    assert first_completion.message.context["_workday_consultation_requested"] is True
+    assert (
+        first_completion.consultation_packet.context[
+            "_workday_consultation_atomic_reply_id"
+        ]
+        == str(first_completion.message.id)
+    )
+    packet_id = first_completion.consultation_packet.id
+    next_sequence = max(
+        int(first_completion.message.sequence or 0),
+        int(first_completion.consultation_packet.sequence or 0),
+    ) + 1
+    await db_session.commit()
+
+    persisted_packet = await db_session.get(ProjectMessage, packet_id)
+    assert persisted_packet is not None
+    assert persisted_packet.context["audience"] == "strategist-internal"
+
+    second_input = ProjectMessage(
+        project_id=project.id,
+        sequence=next_sequence,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="Here is the next operator turn.",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+    )
+    db_session.add(second_input)
+    await db_session.commit()
+
+    second_incarnation_id = uuid.uuid4()
+    second_claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id="session",
+        task_id=task.id,
+        worker_generation=1,
+        incarnation_id=second_incarnation_id,
+        message_ids=[second_input.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+    )
+    assert second_claim is not None
+    await db_session.commit()
+
+    persisted_packet = await db_session.get(ProjectMessage, packet_id)
+    assert persisted_packet is not None
+    delivery = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=second_incarnation_id,
+        resident_session_id="session",
+    )
+    assert delivery is not None
+    assert delivery.message.id == packet_id
 
 
 @pytest.mark.asyncio

@@ -909,6 +909,7 @@ _BACKEND_VERIFICATION_FRAGMENT = (
     _BLUEPRINT_ROOT / "agent" / "src" / "prompts" / "check_backend_verification.sh"
 )
 _TRACKED_CHECK = _BLUEPRINT_ROOT / "check"
+_DEFAULT_CHECK = _BLUEPRINT_ROOT / "scripts" / "check-default.sh"
 
 
 def _read_packer_hcl() -> str:
@@ -1995,7 +1996,7 @@ class TestProjectVerificationRuntimeContract:
         # comes up), not sit after the final success echo.
         assert probe.index("$SANDBOX_PYTHON") < probe.index('"$POSTGRES_BIN/initdb"')
         for label, path in (
-            ("tracked check", _TRACKED_CHECK),
+            ("tracked developer check", _DEFAULT_CHECK),
             ("generated fragment", _BACKEND_VERIFICATION_FRAGMENT),
         ):
             assert "source scripts/backend-test-route.sh" in path.read_text(
@@ -2019,7 +2020,7 @@ class TestProjectVerificationRuntimeContract:
         assert "POSTGRES_BIN=\"$(resolve_pg_bindir)\"" in _PROJECT_VERIFICATION_PROBE.read_text(
             encoding="utf-8"
         )
-        for path in (_TRACKED_CHECK, _BACKEND_TEST_HARNESS, _BACKEND_VERIFICATION_FRAGMENT):
+        for path in (_DEFAULT_CHECK, _BACKEND_TEST_HARNESS, _BACKEND_VERIFICATION_FRAGMENT):
             assert "backend-test-route.sh" in path.read_text(encoding="utf-8")
 
     def test_packer_runs_probe_as_agent_before_success_sentinel(self):
@@ -2082,7 +2083,19 @@ class TestProjectVerificationRuntimeContract:
 
     def test_generated_fragment_and_tracked_check_share_fail_closed_contract(self):
         fragment = _BACKEND_VERIFICATION_FRAGMENT.read_text(encoding="utf-8")
-        tracked = _TRACKED_CHECK.read_text(encoding="utf-8")
+        dispatcher = _TRACKED_CHECK.read_text(encoding="utf-8")
+        tracked = _DEFAULT_CHECK.read_text(encoding="utf-8")
+        # The repo-root entrypoint remains part of the contract: task work must
+        # reach the generated gate, a missing task gate must fail before the
+        # developer fallback, and only a true developer checkout may execute
+        # the tracked default implementation compared below.
+        assert 'TASK_GATE="$WORKSPACE/.check-task"' in dispatcher
+        assert 'DEFAULT_GATE="$WORKSPACE/scripts/check-default.sh"' in dispatcher
+        assert 'exec "$TASK_GATE" "$@"' in dispatcher
+        assert 'exec "$DEFAULT_GATE" "$@"' in dispatcher
+        missing_task_gate = dispatcher.index("generated self-repo gate is missing")
+        developer_exec = dispatcher.index('exec "$DEFAULT_GATE" "$@"')
+        assert missing_task_gate < developer_exec
         rendered_fragment = (
             fragment.replace("@TASK_ID@", "6867e9ef-f0d6-41cb-8b9d-1be50b02c806")
             .replace("@DIR@", "backend")
@@ -2102,14 +2115,39 @@ class TestProjectVerificationRuntimeContract:
             '\n  fi\nfi\n\nif touches "golden_tasks/"',
             start,
         )
-        assert tracked[start:end] == rendered_fragment, (
-            "the tracked root gate must be rendered from the canonical "
-            "backend verification fragment"
+        tracked_verification = tracked[start:end]
+        # The developer gate is a stable tracked fallback, not a per-task
+        # rendering of the generator fragment. Pin the concrete Blueprint
+        # selectors it carries, then compare the security-relevant behavior
+        # below instead of requiring byte identity across the two surfaces.
+        assert "_VERIFICATION_DIR='backend'" in tracked_verification
+        assert "_VERIFICATION_HARNESS='scripts/test-backend.sh'" in tracked_verification
+        assert "grep -E '^backend/.*\\.py$'" in tracked_verification
+        for script, label in (
+            (rendered_fragment, "generated fragment"),
+            (tracked_verification, "tracked developer check"),
+        ):
+            for required in (
+                "required backend-authoring verification",
+                "python3 -m ruff check --select E,F,W --ignore E501",
+                "USE_TEST_POSTGRES=true bash",
+                "select_backend_test_route",
+                "PostgreSQL runtime unavailable",
+                "no impacted pytest file/node",
+                "_VERIFY_RECEIPT",
+                "postgres_sidecar",
+            ):
+                assert required in script, f"{label} missing fail-closed token {required}"
+            for forbidden in ("--standalone --no-postgres", "GATE-ENVIRONMENT"):
+                assert forbidden not in script, (
+                    f"{label} must not weaken required verification via {forbidden}"
         )
+        assert "route helper unavailable or invalid" in rendered_fragment
+        assert "_VERIFY_CAPABILITY_RECEIPT" in rendered_fragment
         helper = (_BLUEPRINT_ROOT / "scripts" / "backend-test-route.sh").read_text(
             encoding="utf-8"
         )
-        contract_sources = (fragment, tracked, helper)
+        contract_sources = (rendered_fragment, tracked, helper)
         for required in (
             "python3 -m ruff check --select E,F,W --ignore E501",
             "USE_TEST_POSTGRES=true bash",
@@ -2128,16 +2166,6 @@ class TestProjectVerificationRuntimeContract:
         ):
             assert any(required in source for source in contract_sources), (
                 f"shared backend route contract missing {required}"
-            )
-        for forbidden in ("--standalone --no-postgres", "GATE-ENVIRONMENT"):
-            required_start = fragment.index("required backend-authoring verification")
-            assert forbidden not in fragment[required_start:]
-        for script, label in ((fragment, "generated fragment"), (tracked, "tracked check")):
-            assert "select_backend_test_route" in script, (
-                f"{label} must use the shared route selector"
-            )
-            assert "PostgreSQL runtime unavailable" in script, (
-                f"{label} must stay fail-closed when neither path is available"
             )
         assert "backend_test_sandbox_available" in helper
 

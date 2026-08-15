@@ -38,6 +38,10 @@ STRATEGIC_UPDATED = "strategic_updated"
 # emission is one coarsened per-sentence / per-turn chunk streamed to the operator
 # chat. Contract with admin-ui/src/hooks/useLogViewer.ts — do not rename.
 STRATEGIC_SESSION = "strategic_session"
+# Durable resident activity/actability transition. Unlike transcript deltas,
+# this carries no prose stream; it is a scoped refetch trigger emitted only when
+# normalized semantic activity fields change.
+STRATEGIC_SESSION_STATE = "strategic_session_state"
 
 # Allowed ``kind`` values for a ``strategic_session`` delta. Scopes what the
 # strategic agent may stream: chunk of reasoning, an applied strategic action, a
@@ -496,6 +500,40 @@ async def emit_strategic_session_delta(
         str(project_id),
         STRATEGIC_SESSION,
         _strategic_session_payload(payload),
+    )
+
+
+async def emit_strategic_session_state_updated(
+    project_id: Any,
+    *,
+    task_id: Any,
+    activity: Mapping[str, Any] | None,
+) -> None:
+    """Broadcast one durable Resident activity transition after commit."""
+    source = activity if isinstance(activity, Mapping) else {}
+    semantic = {
+        key: source.get(key)
+        for key in (
+            "phase",
+            "reason_code",
+            "consultation_id",
+            "autonomy_state",
+            "autonomy_reason_code",
+        )
+    }
+    await broadcast_to_project(
+        str(project_id),
+        STRATEGIC_SESSION_STATE,
+        {
+            **_event_envelope(
+                project_id,
+                resource="strategic_session",
+                action="activity_updated",
+                refetch_surfaces=(SURFACE_STRATEGIC_SESSION,),
+            ),
+            "task_id": _compact_str(task_id, max_chars=80),
+            "activity": semantic,
+        },
     )
 
 

@@ -238,6 +238,54 @@ _read_running_update_input() {
   esac
 }
 
+_private_turn_provenance() {
+  if [ ! -e "$RESIDENT_PRIVATE_TURN_MARKER_PATH" ] && [ ! -L "$RESIDENT_PRIVATE_TURN_MARKER_PATH" ]; then
+    if [ "$2" = "report_autonomous_finding" ]; then
+      echo "[ERROR] report-autonomous-finding is available only inside a server-leased private autonomous Workday turn" >&2
+      return 1
+    fi
+    return 0
+  fi
+  local marker
+  if command -v "$NODE_BIN" >/dev/null 2>&1; then
+    marker=$(_read_regular_bounded "$RESIDENT_PRIVATE_TURN_MARKER_PATH" 4096) || {
+      echo "[ERROR] private Workday turn marker is not a safe bounded regular file" >&2
+      return 1
+    }
+  elif command -v python3 >/dev/null 2>&1; then
+    marker=$(python3 -c 'import os,stat,sys;p=sys.argv[1];limit=int(sys.argv[2]);before=os.lstat(p);stat.S_ISREG(before.st_mode) or sys.exit(2);fd=os.open(p,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_BINARY",0));opened=os.fstat(fd);(stat.S_ISREG(opened.st_mode) and opened.st_dev==before.st_dev and opened.st_ino==before.st_ino and opened.st_size<=limit) or sys.exit(2);f=os.fdopen(fd,"rb",closefd=True);data=f.read(limit+1);after=os.fstat(f.fileno());(len(data)==opened.st_size and after.st_size==opened.st_size) or sys.exit(2);sys.stdout.buffer.write(data);f.close()' "$RESIDENT_PRIVATE_TURN_MARKER_PATH" 4096 2>/dev/null) || {
+      echo "[ERROR] private Workday turn marker is not a safe bounded regular file" >&2
+      return 1
+    }
+  else
+    echo "[ERROR] no private Workday provenance decoder available (python3/node missing)" >&2
+    return 1
+  fi
+  if command -v "$NODE_BIN" >/dev/null 2>&1; then
+    "$NODE_BIN" -e 'const m=JSON.parse(process.argv[1]),inc=process.argv[2],oid=process.argv[3],op=process.argv[4]; const kinds=new Set(["active-call","typed-consultation","typed-autonomous"]); if(!m||!kinds.has(m.kind)||typeof m.incarnation_id!=="string"||!inc||m.incarnation_id!==inc)process.exit(2); if(op==="report_autonomous_finding"){if(m.kind!=="typed-autonomous"||typeof m.autonomous_turn_id!=="string"||!m.autonomous_turn_id||typeof m.autonomous_turn_lease_id!=="string"||!m.autonomous_turn_lease_id||typeof m.autonomous_handoff_idempotency_key!=="string"||!m.autonomous_handoff_idempotency_key){process.stderr.write("[ERROR] report-autonomous-finding requires exact server-owned autonomous turn provenance\\n");process.exit(4)} process.stdout.write(","+JSON.stringify({autonomous_turn_id:m.autonomous_turn_id,autonomous_turn_lease_id:m.autonomous_turn_lease_id,autonomous_handoff_idempotency_key:m.autonomous_handoff_idempotency_key}).slice(1,-1));process.exit(0)} if(m.kind==="typed-consultation"){if(op==="request_qualification"){process.stderr.write("[ERROR] request-qualification is unavailable inside a private consultation; report readiness or dispatch and watch verification work instead\\n");process.exit(3)} if(typeof m.packet_id!=="string"||!m.packet_id||typeof m.workday_claim_id!=="string"||!m.workday_claim_id||typeof oid!=="string"||!oid)process.exit(2); process.stdout.write(","+JSON.stringify({packet_id:m.packet_id,workday_claim_id:m.workday_claim_id,workday_operation_id:oid}).slice(1,-1));}' "$marker" "$RESIDENT_INCARNATION_ID" "$1" "$2"
+    return $?
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys;m=json.loads(sys.argv[1]);inc,oid,op=sys.argv[2:5];fail=lambda code,msg=None:(print(msg,file=sys.stderr) if msg else None,sys.exit(code));kind=m.get("kind") if isinstance(m,dict) else None;(isinstance(kind,str) and kind in {"active-call","typed-consultation","typed-autonomous"} and isinstance(m.get("incarnation_id"),str) and bool(inc) and m["incarnation_id"]==inc) or fail(2);auto=op=="report_autonomous_finding";keys=("autonomous_turn_id","autonomous_turn_lease_id","autonomous_handoff_idempotency_key");(not auto or (kind=="typed-autonomous" and all(isinstance(m.get(k),str) and m.get(k) for k in keys))) or fail(4,"[ERROR] report-autonomous-finding requires exact server-owned autonomous turn provenance");(not auto) or sys.stdout.write(","+json.dumps({k:m[k] for k in keys},separators=(",",":"))[1:-1]);consult=kind=="typed-consultation";(not consult or op!="request_qualification") or fail(3,"[ERROR] request-qualification is unavailable inside a private consultation; report readiness or dispatch and watch verification work instead");(not consult or (isinstance(m.get("packet_id"),str) and bool(m["packet_id"]) and isinstance(m.get("workday_claim_id"),str) and bool(m["workday_claim_id"]) and bool(oid))) or fail(2);(not consult) or sys.stdout.write(","+json.dumps({"packet_id":m["packet_id"],"workday_claim_id":m["workday_claim_id"],"workday_operation_id":oid},separators=(",",":"))[1:-1])' "$marker" "$RESIDENT_INCARNATION_ID" "$1" "$2"
+    return $?
+  fi
+  echo "[ERROR] no private Workday provenance decoder available (python3/node missing)" >&2
+  return 1
+}
+
+_operation_uuid() {
+  if command -v "$NODE_BIN" >/dev/null 2>&1; then
+    "$NODE_BIN" -e 'process.stdout.write(require("crypto").randomUUID())'
+    return $?
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys,uuid; sys.stdout.write(str(uuid.uuid4()))'
+    return $?
+  fi
+  echo "[ERROR] no operation UUID generator available (python3/node missing)" >&2
+  return 1
+}
+
 if [ "$OP" = "set-running-update" ]; then
   _read_running_update_input "$@"
 else
@@ -245,7 +293,8 @@ else
 fi
 
 _call() {
-  local attempt=0 saw_auth=0 max=3 delay http_code body dump response
+  local attempt=0 saw_auth=0 max=3 delay http_code body dump response private_turn_json workday_operation_id
+  workday_operation_id=$(_operation_uuid) || return 1
   while [ $attempt -lt $max ]; do
     # Re-read the live token each attempt so a token that rotated between tries
     # (the agent refreshes at ~45min) is picked up — the long-lived-session
@@ -256,7 +305,8 @@ _call() {
     if [ -n "$RESIDENT_INCARNATION_ID" ]; then
       RESIDENT_INCARNATION_JSON=$(printf ',"resident_incarnation_id":%s' "$(_json_str "$RESIDENT_INCARNATION_ID")")
     fi
-    response=$(printf '{"task_id":"%s","op":"%s"%s,"data":%s}' "$TASK" "$1" "$RESIDENT_INCARNATION_JSON" "$DATA" | \\
+    private_turn_json=$(_private_turn_provenance "$workday_operation_id" "$1") || return 1
+    response=$(printf '{"task_id":"%s","op":"%s"%s%s,"data":%s}' "$TASK" "$1" "$RESIDENT_INCARNATION_JSON" "$private_turn_json" "$DATA" | \\
       curl -sS --max-time 30 --connect-timeout 10 \\
         -X POST "$API/api/agent/strategic" \\
         -H "Content-Type: application/json" \\
@@ -315,6 +365,8 @@ case "$OP" in
 ${caseBody}
   *) echo "Unknown op: $OP" >&2; exit 1 ;;
 esac
+exit_code=$?
+[ "$exit_code" -eq 0 ] || exit "$exit_code"
 echo ""
 `;
 }

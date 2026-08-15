@@ -58,7 +58,7 @@ const EVENT_ICON: Record<ActivityEventType, ReactElement> = {
   TASK_FAILED: <XCircle className="w-4 h-4 text-red-400 shrink-0" />,
   RESEARCH_FINDINGS: <Microscope className="w-4 h-4 text-blue-400 shrink-0" />,
   DEPLOY_EVENT: <Rocket className="w-4 h-4 text-purple-400 shrink-0" />,
-  TASK_IN_PROGRESS: <Loader2 className="w-4 h-4 text-amber-400 shrink-0 animate-spin" />,
+  TASK_IN_PROGRESS: <Clock className="w-4 h-4 text-amber-400 shrink-0" />,
 };
 
 const EVENT_BORDER: Record<ActivityEventType, string> = {
@@ -96,7 +96,7 @@ type FilterOption = ActivityEventType | 'ALL' | 'NEEDS_REVIEW';
 
 const FILTER_PILLS: { label: string; value: FilterOption; activeClass: string }[] = [
   { label: 'All', value: 'ALL', activeClass: 'bg-neutral-600 text-neutral-100 border-neutral-500' },
-  { label: 'Running', value: 'TASK_IN_PROGRESS', activeClass: 'bg-amber-500/20 text-amber-400 border-amber-500/40' },
+  { label: 'In progress', value: 'TASK_IN_PROGRESS', activeClass: 'bg-amber-500/20 text-amber-400 border-amber-500/40' },
   { label: 'Completed', value: 'TASK_COMPLETED', activeClass: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40' },
   { label: 'Failed', value: 'TASK_FAILED', activeClass: 'bg-red-500/20 text-red-400 border-red-500/40' },
   { label: 'Research', value: 'RESEARCH_FINDINGS', activeClass: 'bg-blue-500/20 text-blue-400 border-blue-500/40' },
@@ -630,7 +630,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
               : activeFilter === 'ALL'
                 ? 'No recent activity'
                 : activeFilter === 'TASK_IN_PROGRESS'
-                  ? 'No running tasks'
+                  ? 'No tasks in progress'
                   : 'No matching events'}
           </p>
           <p className="text-xs mt-1 opacity-70">
@@ -639,7 +639,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
               : activeFilter === 'ALL'
                 ? 'Events will appear here as tasks run'
                 : activeFilter === 'TASK_IN_PROGRESS'
-                  ? 'Running tasks will appear here'
+                  ? 'Tasks in progress will appear here'
                   : 'Try a different filter'}
           </p>
         </div>

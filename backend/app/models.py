@@ -12,7 +12,7 @@ field-level reference.
 """
 
 from enum import Enum
-from typing import Dict, Any, List, Mapping
+from typing import Dict, Any, List, Mapping, Sequence
 from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
 from sqlalchemy import (
@@ -5475,6 +5475,28 @@ _DERIVED_STRATEGIC_PACKET_CONTEXT_KEYS = (
     "_workday_consultation_result",
 )
 
+# ProjectMessage.context also carries server-owned claim, lease, delivery, and
+# wakeup bookkeeping that is deliberately absent from both the canonical
+# Strategic transcript and the operator-conversation visibility predicate.
+# Only this union can change those governed projections:
+#
+# * strategic_memory_envelope._TRANSCRIPT_CONTEXT_ALLOWLIST
+# * strategic_conversation_query.strategic_conversation_predicate
+#
+# Keep the definition here because both modules import ProjectMessage from this
+# foundational model module. Tests exercise every key so future projection
+# changes cannot silently skip the privacy fence.
+_PROJECT_MESSAGE_PRIVACY_CONTEXT_KEYS = frozenset(
+    {
+        "event_type",
+        "message_role",
+        "source",
+        "topic",
+        "audience",
+        "_resident_reply_covered_message_ids",
+    }
+)
+
 
 def _is_derived_strategic_packet_context(value: object) -> bool:
     """Whether a message is private derived Workday coordination state.
@@ -5487,6 +5509,41 @@ def _is_derived_strategic_packet_context(value: object) -> bool:
 
     return isinstance(value, Mapping) and any(
         value.get(key) is True for key in _DERIVED_STRATEGIC_PACKET_CONTEXT_KEYS
+    )
+
+
+def _project_message_privacy_context_projection(value: object) -> dict[str, object]:
+    """Return the context subset copied into transcript/visibility authority."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: value[key]
+        for key in _PROJECT_MESSAGE_PRIVACY_CONTEXT_KEYS
+        if key in value
+    }
+
+
+def _project_message_privacy_context_changed(
+    *,
+    old_contexts: Sequence[object],
+    new_context: object,
+) -> bool:
+    """Whether a context rewrite changes governed transcript/visibility bytes.
+
+    SQLAlchemy normally retains the old JSON value for a whole-dict assignment.
+    If history is unavailable, fail closed: silently retaining a derived copy
+    after an unclassifiable context rewrite is a privacy boundary violation.
+    """
+
+    if not old_contexts:
+        return True
+    new_projection = _project_message_privacy_context_projection(new_context)
+    return any(
+        _is_derived_strategic_packet_context(old_context)
+        != _is_derived_strategic_packet_context(new_context)
+        or _project_message_privacy_context_projection(old_context) != new_projection
+        for old_context in old_contexts
     )
 
 
@@ -5832,7 +5889,6 @@ def _invalidate_strategic_envelopes_for_authority_and_privacy_changes(
             # redaction even when its body is unchanged.
             privacy_fields = (
                 "content",
-                "context",
                 "from_type",
                 "sequence",
                 "surface",
@@ -5840,17 +5896,19 @@ def _invalidate_strategic_envelopes_for_authority_and_privacy_changes(
             )
             context_history = inspected.attrs.context.history
             old_contexts = list(context_history.deleted)
-            remains_private_packet = (
-                _is_derived_strategic_packet_context(instance.__dict__.get("context"))
-                and old_contexts
-                and all(
-                    _is_derived_strategic_packet_context(value)
-                    for value in old_contexts
+            context_privacy_changed = (
+                context_history.has_changes()
+                and _project_message_privacy_context_changed(
+                    old_contexts=old_contexts,
+                    new_context=instance.__dict__.get("context"),
                 )
             )
-            if not remains_private_packet and any(
-                inspected.attrs[field].history.has_changes()
-                for field in privacy_fields
+            if (
+                context_privacy_changed
+                or any(
+                    inspected.attrs[field].history.has_changes()
+                    for field in privacy_fields
+                )
             ):
                 mark(instance.__dict__.get("project_id"), privacy=True)
                 tombstone_message_source(

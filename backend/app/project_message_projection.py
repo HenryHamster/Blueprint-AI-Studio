@@ -44,6 +44,7 @@ DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
     "message_role",
     "_workday_result_packet_id",
     "_workday_consultation_requested",
+    "_workday_consultation_atomic_reply_id",
     "_resident_activation_prompt",
 )
 
@@ -66,6 +67,7 @@ _LIST_CONTEXT_KEYS = frozenset({
     "message_role",
     "_workday_result_packet_id",
     "_workday_consultation_requested",
+    "_workday_consultation_atomic_reply_id",
     "_resident_activation_prompt",
     "_convergence_link",
     "_provenance_warnings",

@@ -67,6 +67,7 @@ from app.strategic_runtime_work import (
     task_awaiting_strategic_local_runner_since,
 )
 from app.task_movement import build_task_movement_explanation
+from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.terminal_rollup_pr_sweep import TERMINAL_ROLLUP_PR_ATTENTION_KEY
 from app.time_utils import _utcnow
 from app.workbench_contracts import compact_text, normalize_target
@@ -161,11 +162,17 @@ def _local_runner_hold_preview_statement(
     )
     combined = union_all(
         select(*projection)
-        .where(*local_runner_hold_filters)
+        .where(
+            *local_runner_hold_filters,
+            non_resident_infrastructure_task_filter(),
+        )
         .order_by(Task.priority.asc(), Task.created_at.asc())
         .limit(4),
         select(*projection)
-        .where(*strategic_local_runner_hold_filters)
+        .where(
+            *strategic_local_runner_hold_filters,
+            non_resident_infrastructure_task_filter(),
+        )
         .order_by(Task.priority.asc(), Task.created_at.asc())
         .limit(4),
     ).subquery()
@@ -1079,6 +1086,7 @@ def _runner_pin_filter(project_id: uuid.UUID) -> tuple[Any, ...]:
     return (
         Task.project_id == project_id,
         Task.archived.is_(False),
+        non_resident_infrastructure_task_filter(),
         Task.status == TaskStatus.PROVISIONING,
         Task.requires_approval.is_not(True),
         Task.started_at.is_(None),
@@ -1096,6 +1104,7 @@ def _handmerge_preserved_task_filter(project_id: uuid.UUID) -> tuple[Any, ...]:
     return (
         Task.project_id == project_id,
         Task.archived.is_(False),
+        non_resident_infrastructure_task_filter(),
         Task.status == TaskStatus.FAILED,
         Task.context["pr_preserved_for_handmerge"].as_boolean().is_(True),
     )
@@ -1367,6 +1376,7 @@ async def _load_stale_provisioning_tasks(
                 .where(
                     Task.project_id == project_id,
                     Task.archived.is_(False),
+                    non_resident_infrastructure_task_filter(),
                     Task.status == TaskStatus.PROVISIONING,
                     Task.requires_approval.is_not(True),
                     (Task.vm_instance_id.is_(None) | ~Task.vm_instance_id.like("runner:%")),
@@ -1449,6 +1459,7 @@ async def _load_stale_queued_dependency_tasks(
                 .where(
                     Task.project_id == project_id,
                     Task.archived.is_(False),
+                    non_resident_infrastructure_task_filter(),
                     Task.status == TaskStatus.QUEUED,
                     Task.requires_approval.is_not(True),
                     Task.created_at < cutoff,
@@ -2355,6 +2366,7 @@ async def build_operator_attention(
             .where(
                 Task.project_id == project.id,
                 Task.archived.is_(False),
+                non_resident_infrastructure_task_filter(),
             )
         )
     ).one()
@@ -2374,6 +2386,7 @@ async def build_operator_attention(
     terminal_rollup_attention_filters = (
         Task.project_id == project.id,
         Task.archived.is_(False),
+        non_resident_infrastructure_task_filter(),
         Task.status == TaskStatus.FAILED,
         Task.context[TERMINAL_ROLLUP_PR_ATTENTION_KEY].as_string().is_not(None),
         operator_visible_audience_filter(Task.context),
@@ -2409,6 +2422,7 @@ async def build_operator_attention(
             .where(
                 Task.project_id == project.id,
                 Task.archived.is_(False),
+                non_resident_infrastructure_task_filter(),
                 Task.status == TaskStatus.QUEUED,
                 Task.requires_approval.is_not(True),
             )
@@ -2475,6 +2489,7 @@ async def build_operator_attention(
     experiment_outcome_filters = (
         Task.project_id == project.id,
         Task.archived.is_(False),
+        non_resident_infrastructure_task_filter(),
         Task.payloads[0]["type"].as_string() == "compute_experiment",
         Task.status.in_(list(_EXPERIMENT_TERMINAL_STATUSES)),
         Task.completed_at.is_not(None),
@@ -2547,6 +2562,7 @@ async def build_operator_attention(
                     Task.requires_approval.is_(True),
                     Task.status.in_(list(_APPROVAL_TASK_STATUSES)),
                     operator_visible_audience_filter(Task.context),
+                    non_resident_infrastructure_task_filter(),
                 )
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(4)
@@ -2567,6 +2583,7 @@ async def build_operator_attention(
                     Task.context["pr_preserved_for_handmerge"].as_boolean().is_not(True),
                     Task.context[TERMINAL_ROLLUP_PR_ATTENTION_KEY].as_string().is_(None),
                     operator_visible_audience_filter(Task.context),
+                    non_resident_infrastructure_task_filter(),
                 )
                 .order_by(Task.updated_at.desc())
                 .limit(3)
@@ -2599,6 +2616,7 @@ async def build_operator_attention(
                     Task.status.in_([TaskStatus.BLOCKED, TaskStatus.PARKED]),
                     Task.requires_approval.is_not(True),
                     operator_visible_audience_filter(Task.context),
+                    non_resident_infrastructure_task_filter(),
                 )
                 .order_by(Task.updated_at.desc())
                 .limit(4)

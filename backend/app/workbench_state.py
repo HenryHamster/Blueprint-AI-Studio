@@ -454,6 +454,12 @@ def _effective_last_active(state: dict[str, Any]) -> str | None:
 
 def _workbench_session_expired(state: dict[str, Any]) -> bool:
     """Return True when the session has been idle longer than SESSION_IDLE_TTL_SECONDS."""
+    # Workday is an explicit persistent mode. Its lifetime is fenced by the
+    # Resident process heartbeat and explicit Chat/Stop writes, not by operator
+    # typing frequency. Expiring it here would silently turn a healthy quiet
+    # Continuous session into Chat before the resident liveness check runs.
+    if state.get("interaction_mode") == "continuous":
+        return False
     ts = _effective_last_active(state)
     if not ts:
         return False
@@ -584,17 +590,11 @@ def apply_strategic_local_continuation_marker(
 ) -> None:
     """Update the compact project-level marker for local Strategic continuation.
 
-    This is the canonical renewal entry point. Marker freshness is legitimately
-    renewed here on an OPERATOR INTERACTION (a workbench save carries a fresh
-    ``last_interaction_at``) or, via ``renewal_reason``, on an APPLIED STRATEGIC
-    OP (progress). When ``renewal_reason`` is supplied the marker's freshness is
-    bumped to *now* (and the reason recorded on the marker) even if the caller's
-    ``workbench_state`` does not carry a fresh ``last_interaction_at`` — this is
-    what a progress heartbeat calls to renew the lease on progress.
-
-    Bare runner liveness must NOT reach this path: the dead-man's switch depends
-    on freshness tracking real interaction/progress, not the runner merely being
-    alive (see ``refresh_strategic_local_continuation_on_runner_heartbeat``).
+    This is the canonical renewal entry point. Operator interaction and applied
+    progress renew here, as does an exact Resident process heartbeat after the
+    server has validated session/task/generation/incarnation and locked the
+    canonical Continuous preference. Generic runner liveness never reaches this
+    path (see ``refresh_strategic_local_continuation_on_runner_heartbeat``).
     """
 
     operator_id = _string(str(operator_user_id), max_chars=160)
@@ -637,20 +637,9 @@ def apply_strategic_local_continuation_marker(
 
     prior_marker = marker if isinstance(marker, dict) else None
     now = _utcnow().isoformat()
-    # ``last_seen_at`` is the dead-man's-switch FRESHNESS anchor. It advances to
-    # *now* ONLY on a genuine renewal — a truthy ``renewal_reason``
-    # ('operator_interaction' from an operator workbench save, or
-    # 'strategic_progress' from a heartbeat reporting an applied
-    # strategic op). A ``renewal_reason`` of None is a LIVENESS-ONLY touch (e.g.
-    # a bare heartbeat with progress=False): record that the marker was
-    # seen (bump ``updated_at`` below) but DO NOT advance freshness, so an
-    # alive-but-idle session still goes stale on schedule and the cloud cadence /
-    # cloud fallback can reclaim it. Freshness must track real interaction /
-    # progress, NOT mere liveness — bumping it from ``workbench_state``'s
-    # ``last_interaction_at`` on every touch (the old behavior) made the reason
-    # parameter dead and let a heartbeating-but-idle session pin authority
-    # forever. Preserve the prior anchor on a liveness touch; a brand-new marker
-    # with no reason anchors to now so its first write is fresh.
+    # ``last_seen_at`` is the dead-man's-switch freshness anchor. It advances only
+    # for a truthy, validated renewal reason. A reason-less generic liveness touch
+    # preserves the prior anchor; a brand-new marker anchors to now.
     if renewal_reason:
         last_seen_at = now
     elif prior_marker is not None:

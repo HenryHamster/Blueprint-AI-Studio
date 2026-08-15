@@ -582,6 +582,7 @@ from app.orchestrator_runner_dispatch import (  # noqa: F401
     _emit_all_accounts_blocked_stall,
     _fail_compute_experiment_task,
     _fail_stale_local_runner_holds,
+    _hold_task_for_learned_execution_capabilities,
     _hold_task_for_local_only_placement,
     _hold_strategic_local_runner_task,
     _load_active_runners_cache,
@@ -3524,6 +3525,11 @@ async def orchestrator_worker():
                             )
                         ):
                             _cycle_dispatched += 1
+                            continue
+
+                        if await _hold_task_for_learned_execution_capabilities(
+                            session, task
+                        ):
                             continue
 
                         if await _hold_strategic_local_runner_task(session, task):

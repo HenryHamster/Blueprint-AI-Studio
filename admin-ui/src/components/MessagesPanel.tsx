@@ -44,6 +44,8 @@ import {
   type StrategicWorkbenchState,
 } from '../strategicStateApi';
 import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
+import { computeResidentActivityState } from '../utils/strategicSessionLive';
+import { buildConversationWorkdayStatus } from '../utils/conversationWorkdayStatus';
 import { messageHasClientIdentity, mergeCanonicalConversationMessage } from '../utils/conversationMessageIdentity';
 import { clearComposerDraftIfCurrent, loadComposerDraft, saveComposerDraft } from '../utils/conversationDraftState';
 import { finalizeLastAttachmentRemoval, type ConversationComposerIntent, updateConversationComposerIntent } from '../utils/conversationAttachmentDraftFinalization';
@@ -1250,6 +1252,25 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       .slice()
       .sort(compareConversationMessages);
   }, [messages, eventPrefs, tempMutes]);
+  const conversationWorkdayStatus = useMemo(() => {
+    const interactionMode = strategicWorkbenchState?.interaction_mode
+      ?? currentStrategicState?.workbench?.interaction_mode
+      ?? currentStrategicState?.work_session?.mode
+      ?? 'chat';
+    const residentActivity = computeResidentActivityState(
+      [],
+      conversationMessages,
+      currentStrategicState?.resident_session,
+    );
+    return buildConversationWorkdayStatus({
+      interactionMode,
+      residentActivity,
+      residentAvailability: currentStrategicState?.resident_session_availability,
+      taskFocus: currentStrategicState?.tasks?.focus,
+      residentTaskId: currentStrategicState?.resident_session?.task_id,
+      conversationMessages,
+    });
+  }, [conversationMessages, currentStrategicState, strategicWorkbenchState?.interaction_mode]);
   // Render the operator's optimistic bubble until the durable copy lands. Client
   // identity, never message content, is the reconciliation key: identical text
   // sent intentionally must remain two distinct turns.
@@ -2887,6 +2908,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         <ConversationUtilityBar
           expanded={chatChromeExpanded} onExpand={() => persistChatChrome(true)} onCollapse={() => persistChatChrome(false)}
           searchQuery={searchQuery} onSearchChange={setSearchQuery}
+          workdayStatus={conversationWorkdayStatus}
         />
       )}
 

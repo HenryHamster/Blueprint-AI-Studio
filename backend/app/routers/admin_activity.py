@@ -28,6 +28,7 @@ from app.findings_index import (
     resolve_research_findings_for_surface_from_state,
 )
 from app.sr_review_quality_metrics import _stash_projected_task_fields
+from app.task_surface_visibility import non_resident_infrastructure_task_filter
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,7 @@ async def get_activity(
         Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
         terminal_activity_at >= cutoff,
         Task.project_id.in_(user_project_ids),
+        non_resident_infrastructure_task_filter(),
     ]
     if project_id:
         task_filters.append(Task.project_id == project_id)
@@ -288,12 +290,11 @@ async def get_activity(
                 }
             )
 
-    # --- 3b: In-progress tasks (QUEUED / PROVISIONING / IN_PROGRESS) ---
+    # --- 3b: Tasks that have actually claimed execution ---
     inprogress_filters = [
-        Task.status.in_(
-            [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-        ),
+        Task.status == TaskStatus.IN_PROGRESS,
         Task.project_id.in_(user_project_ids),
+        non_resident_infrastructure_task_filter(),
     ]
     if project_id:
         inprogress_filters.append(Task.project_id == project_id)

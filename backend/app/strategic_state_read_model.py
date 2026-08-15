@@ -29,6 +29,7 @@ from app.strategic_resident_session import (
     resident_session_snapshot,
 )
 from app.task_movement import build_task_movement_explanation
+from app.task_surface_visibility import non_resident_infrastructure_task_filter
 
 TASK_FOCUS_BUCKET_LIMIT = 8
 
@@ -207,6 +208,7 @@ async def _task_focus_bucket(
     base_filters = [
         Task.project_id == project_id,
         Task.archived.is_(False),
+        non_resident_infrastructure_task_filter(),
         *filters,
     ]
     direction_id_expr = func.coalesce(
@@ -312,6 +314,7 @@ async def _build_task_focus(
         ).select_from(Task).where(
             Task.project_id == project_id,
             Task.archived.is_(False),
+            non_resident_infrastructure_task_filter(),
         )
     )).one()
 

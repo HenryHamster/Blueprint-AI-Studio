@@ -186,16 +186,37 @@ async def reconcile_terminal_task(
     task: Task,
     *,
     source: str,
+    allow_completed_resident_infrastructure: bool = False,
 ) -> Optional[StrategicCycle]:
-    """Terminalize the active cycle phase linked to a failed/cancelled task.
+    """Terminalize the active cycle phase linked to a lifecycle-only task end.
 
     The phase comes from the row's task linkage, rather than the task payload:
     a phase-1 task can legitimately become terminal after its cycle advanced to
     phase 2.  In that case this is deliberately a no-op.  The same strict
     outcome checks make repeated delivery idempotent and leave completed or
     otherwise terminal cycles untouched.
+
+    ``allow_completed_resident_infrastructure`` is a narrow bridge for a
+    Continuous Workday process generation that returned normally without
+    producing a one-shot strategic result.  The raw infrastructure Task remains
+    COMPLETED audit provenance, while its adopted cadence cycle is closed with a
+    cancelled disposition instead of being stranded in ``phase2_running``.  The
+    explicit opt-in and server-owned Resident marker keep an ordinary completed
+    strategic task from entering this path.
     """
-    if task.status not in _TERMINAL_FAILURE_TASK_STATUSES:
+    task_context = task.context or {}
+    completed_resident_infrastructure = bool(
+        allow_completed_resident_infrastructure
+        and task.status == TaskStatus.COMPLETED
+        and (
+            task_context.get("_resident_session") is True
+            or task_context.get("_resident_infrastructure") is True
+        )
+    )
+    if (
+        task.status not in _TERMINAL_FAILURE_TASK_STATUSES
+        and not completed_resident_infrastructure
+    ):
         return None
 
     phase1_match = and_(
@@ -230,7 +251,7 @@ async def reconcile_terminal_task(
     metadata = dict(reconciled.cycle_metadata or {})
     metadata[CYCLE_META_TERMINAL_DISPOSITION] = (
         TERMINAL_DISPOSITION_CANCELLED
-        if task.status == TaskStatus.CANCELLED
+        if task.status == TaskStatus.CANCELLED or completed_resident_infrastructure
         else TERMINAL_DISPOSITION_FAILED
     )
     reconciled.cycle_metadata = metadata
@@ -274,10 +295,13 @@ def terminal_completion_event(
     # "Strategist working" state, but including ``completion`` makes the client
     # surface a second, sticky "Strategic cycle cancelled" receipt.  Preserve the
     # completion payload for every unexpected cancellation and every failure.
+    quiet_resident_lifecycle_end = (
+        task.status == TaskStatus.COMPLETED and source == "resident_generation_terminal"
+    )
     intentional_resident_stop = (
         task.status == TaskStatus.CANCELLED and source == "resident_operator_stop"
     )
-    if not intentional_resident_stop:
+    if not intentional_resident_stop and not quiet_resident_lifecycle_end:
         event["completion"] = {
             "status": getattr(task.status, "value", str(task.status)),
             "status_message": task.latest_status_message,

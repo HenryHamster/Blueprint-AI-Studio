@@ -61,11 +61,20 @@ describe('TaskStreamPanel', () => {
     expect(screen.getByText('last event 2m ago')).toBeInTheDocument();
   });
 
-  test('distinguishes active tracked tasks with no events yet', () => {
+  test('labels a claimed task with no events as in progress', () => {
     renderPanel();
 
     expect(screen.getByText('0 entries')).toBeInTheDocument();
-    expect(screen.getByText('active, no events yet')).toBeInTheDocument();
+    expect(screen.getByText('in progress, no events yet')).toBeInTheDocument();
     expect(screen.getByText('Waiting for events')).toBeInTheDocument();
+  });
+
+  test.each([
+    ['PROVISIONING', 'starting, no events yet'],
+    ['EVALUATING', 'evaluating, no events yet'],
+  ] as const)('does not call a %s task active before execution evidence', (status, label) => {
+    renderPanel({ task: makeTask({ status }) });
+
+    expect(screen.getByText(label)).toBeInTheDocument();
   });
 });

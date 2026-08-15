@@ -127,9 +127,14 @@ proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
 proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
 
 const exitCode = await new Promise<number>((resolve) => {
-  proc.on('close', (code) => { resolve(code ?? 1); });
-  // Safety timeout: kill after 90s if the subprocess hangs unexpectedly.
-  setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } resolve(1); }, 90_000);
+  const safetyTimer = setTimeout(() => {
+    try { proc.kill(); } catch { /* ignore */ }
+    resolve(1);
+  }, 90_000);
+  proc.on('close', (code) => {
+    clearTimeout(safetyTimer);
+    resolve(code ?? 1);
+  });
 });
 
 server.close();

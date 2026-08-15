@@ -12,6 +12,8 @@ function createMockDigest(overrides: Partial<DigestData> = {}): DigestData {
     completed_count: 0,
     active_count: 0,
     running_count: 0,
+    starting_count: 0,
+    evaluating_count: 0,
     queued_count: 0,
     research_cycles: 0,
     prs_opened: 0,

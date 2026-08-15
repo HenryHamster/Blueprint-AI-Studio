@@ -76,6 +76,209 @@ describe('writeStrategicHelpers', () => {
     );
   });
 
+  it('injects stable typed-consultation provenance across transport retries', () => {
+    const incarnation = '00000000-0000-0000-0000-000000000733';
+    const packetId = '00000000-0000-0000-0000-000000000734';
+    const workdayClaimId = '00000000-0000-0000-0000-000000000735';
+    const markerPath = path.join(testWorkspace, '.resident-private-workday-turn');
+    const capturedPath = path.join(testWorkspace, 'captured-strategic-request.json');
+    const attemptPath = path.join(testWorkspace, 'strategic-request-attempt');
+    writeStrategicHelpers('task-consultation', 'project', testWorkspace, {
+      residentIncarnationId: incarnation,
+      privateTurnMarkerPath: markerPath,
+    });
+    fs.writeFileSync(markerPath, JSON.stringify({
+      kind: 'typed-consultation',
+      incarnation_id: incarnation,
+      packet_id: packetId,
+      workday_claim_id: workdayClaimId,
+    }));
+    const bashPath = (value: string): string => value
+      .replace(/^([A-Za-z]):/, (_m, drive: string) => `/${drive.toLowerCase()}`)
+      .replace(/\\/g, '/');
+    const bashEnv = path.join(testWorkspace, 'bash-env-consultation');
+    fs.writeFileSync(
+      bashEnv,
+      `sleep() { :; }
+curl() {
+  local body n
+  body=$(cat)
+  n=0
+  [ ! -f '${bashPath(attemptPath)}' ] || n=$(cat '${bashPath(attemptPath)}')
+  n=$((n+1))
+  printf '%s' "$n" > '${bashPath(attemptPath)}'
+  printf '%s\\n' "$body" >> '${bashPath(capturedPath)}'
+  if [ "$n" -eq 1 ]; then printf '{"error":"retry"}\\n500\\n'; else printf '%s\\n200\\n' "$body"; fi
+}
+`,
+    );
+    const bashExecutable = process.platform === 'win32'
+      ? 'C:\\Program Files\\Git\\bin\\bash.exe'
+      : 'bash';
+    const executionPath = process.platform === 'win32'
+      ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
+      : process.env.PATH ?? '';
+    execFileSync(
+      bashExecutable,
+      [
+        bashPath(path.join(testWorkspace, 'strategic')),
+        'set-problem-model',
+        '--json',
+        JSON.stringify({ intent: { purpose: 'Ground the consultation write' } }),
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+          AGENT_API_TOKEN: 'test-token',
+          BASH_ENV: bashPath(bashEnv),
+          NODE_BINARY: bashPath(process.execPath),
+          PATH: executionPath,
+        },
+      },
+    );
+    const requests = fs.readFileSync(capturedPath, 'utf8').trim().split('\n').map(
+      (line) => JSON.parse(line) as Record<string, unknown>,
+    );
+    expect(requests).toHaveLength(2);
+    const request = requests[1];
+    expect(request).toMatchObject({
+      resident_incarnation_id: incarnation,
+      packet_id: packetId,
+      workday_claim_id: workdayClaimId,
+    });
+    expect(request.workday_operation_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(requests[0]?.workday_operation_id).toBe(request.workday_operation_id);
+    expect(request.data).not.toHaveProperty('packet_id');
+    expect(request.data).not.toHaveProperty('workday_claim_id');
+    expect(request.data).not.toHaveProperty('workday_operation_id');
+    expect(() => execFileSync(
+      bashExecutable,
+      [
+        bashPath(path.join(testWorkspace, 'strategic')),
+        'request-qualification',
+        '--json',
+        JSON.stringify({ reason: 'ready' }),
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+          AGENT_API_TOKEN: 'test-token',
+          BASH_ENV: bashPath(bashEnv),
+          NODE_BINARY: bashPath(process.execPath),
+          PATH: executionPath,
+        },
+      },
+    )).toThrow();
+    expect(fs.readFileSync(capturedPath, 'utf8').trim().split('\n')).toHaveLength(2);
+  }, 15_000);
+
+  it('injects exact autonomous-turn provenance and rejects every unleased report', () => {
+    const incarnation = '00000000-0000-0000-0000-000000000741';
+    const turnId = '00000000-0000-0000-0000-000000000742';
+    const leaseId = '00000000-0000-0000-0000-000000000743';
+    const handoffKey = '00000000-0000-0000-0000-000000000744';
+    const markerPath = path.join(testWorkspace, '.resident-private-workday-turn');
+    const capturedPath = path.join(testWorkspace, 'captured-autonomous-request.json');
+    const attemptPath = path.join(testWorkspace, 'autonomous-request-attempt');
+    writeStrategicHelpers('task-autonomous', 'project', testWorkspace, {
+      residentIncarnationId: incarnation,
+      privateTurnMarkerPath: markerPath,
+    });
+    fs.writeFileSync(markerPath, JSON.stringify({
+      kind: 'typed-autonomous',
+      incarnation_id: incarnation,
+      autonomous_turn_id: turnId,
+      autonomous_turn_lease_id: leaseId,
+      autonomous_handoff_idempotency_key: handoffKey,
+    }));
+    const bashPath = (value: string): string => value
+      .replace(/^([A-Za-z]):/, (_m, drive: string) => `/${drive.toLowerCase()}`)
+      .replace(/\\/g, '/');
+    const bashEnv = path.join(testWorkspace, 'bash-env-autonomous');
+    fs.writeFileSync(
+      bashEnv,
+      `sleep() { :; }
+curl() {
+  local body n
+  body=$(cat)
+  n=0
+  [ ! -f '${bashPath(attemptPath)}' ] || n=$(cat '${bashPath(attemptPath)}')
+  n=$((n+1))
+  printf '%s' "$n" > '${bashPath(attemptPath)}'
+  printf '%s\\n' "$body" >> '${bashPath(capturedPath)}'
+  if [ "$n" -eq 1 ]; then printf '{"error":"retry"}\\n500\\n'; else printf '%s\\n200\\n' "$body"; fi
+}
+`,
+    );
+    const bashExecutable = process.platform === 'win32'
+      ? 'C:\\Program Files\\Git\\bin\\bash.exe'
+      : 'bash';
+    const executionPath = process.platform === 'win32'
+      ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
+      : process.env.PATH ?? '';
+    const args = [
+      bashPath(path.join(testWorkspace, 'strategic')),
+      'report-autonomous-finding',
+      '--json',
+      JSON.stringify({
+        kind: 'finding',
+        summary: 'One bounded finding for Fast.',
+        evidence_refs: ['task:bounded'],
+      }),
+    ];
+    const options = {
+      encoding: 'utf8' as const,
+      env: {
+        ...process.env,
+        ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+        AGENT_API_TOKEN: 'test-token',
+        BASH_ENV: bashPath(bashEnv),
+        NODE_BINARY: bashPath(process.execPath),
+        PATH: executionPath,
+      },
+    };
+    execFileSync(bashExecutable, args, options);
+    const requests = fs.readFileSync(capturedPath, 'utf8').trim().split('\n').map(
+      (line) => JSON.parse(line) as Record<string, unknown>,
+    );
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toMatchObject({
+      autonomous_turn_id: turnId,
+      autonomous_turn_lease_id: leaseId,
+      autonomous_handoff_idempotency_key: handoffKey,
+    });
+    expect(requests[1]).toMatchObject({
+      autonomous_turn_id: turnId,
+      autonomous_turn_lease_id: leaseId,
+      autonomous_handoff_idempotency_key: handoffKey,
+    });
+    expect(requests[0]).not.toHaveProperty('workday_operation_id');
+    expect(requests[0]?.data).not.toHaveProperty('autonomous_turn_id');
+
+    fs.unlinkSync(markerPath);
+    expect(() => execFileSync(bashExecutable, args, options)).toThrow();
+    fs.writeFileSync(markerPath, JSON.stringify({
+      kind: 'typed-consultation',
+      incarnation_id: incarnation,
+      packet_id: turnId,
+      workday_claim_id: leaseId,
+    }));
+    expect(() => execFileSync(bashExecutable, args, options)).toThrow();
+    fs.writeFileSync(markerPath, JSON.stringify({
+      kind: 'typed-autonomous',
+      incarnation_id: incarnation,
+      autonomous_turn_id: turnId,
+    }));
+    expect(() => execFileSync(bashExecutable, args, options)).toThrow();
+    expect(fs.readFileSync(capturedPath, 'utf8').trim().split('\n')).toHaveLength(2);
+  }, 15_000);
+
   it('keeps compute-image build requests short and non-polling', () => {
     writeStrategicHelpers('task', 'project', testWorkspace);
     const script = fs.readFileSync(`${testWorkspace}/compute-image`, 'utf-8');
@@ -882,9 +1085,18 @@ describe('writeStrategicHelpers', () => {
 // pointing NODE_BINARY at a nonexistent path — exactly the live condition.
 describe('_validate_json python3 fallback (node-less VM survival)', () => {
   const ws = path.join(os.tmpdir(), 'test-validate-json-workspace');
+  const pythonShimDir = path.join(ws, 'python-bin');
 
   beforeEach(() => {
     if (!fs.existsSync(ws)) fs.mkdirSync(ws, { recursive: true });
+    if (process.platform === 'win32') {
+      fs.mkdirSync(pythonShimDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(pythonShimDir, 'python3'),
+        '#!/bin/sh\nexec "$BLUEPRINT_TEST_PYTHON" "$@"\n',
+        { mode: 0o755 },
+      );
+    }
   });
   afterEach(() => {
     if (fs.existsSync(ws)) {
@@ -903,9 +1115,22 @@ describe('_validate_json python3 fallback (node-less VM survival)', () => {
   const bashAbsolute = process.platform === 'win32'
     ? 'C:\\Program Files\\Git\\bin\\bash.exe'
     : execFileSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).trim();
+  const windowsPython = process.platform === 'win32'
+    ? process.env.BLUEPRINT_BACKEND_TEST_PYTHON ?? path.join(
+      path.dirname(execFileSync(
+        'C:\\Program Files\\Git\\cmd\\git.exe',
+        ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+        { encoding: 'utf8' },
+      ).trim()),
+      'backend', '.venv', 'Scripts', 'python.exe',
+    )
+    : '';
   const executionPath = process.platform === 'win32'
-    ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
+    ? `${bashPath(pythonShimDir)}:/usr/bin:/bin`
     : process.env.PATH ?? '';
+  const pythonShimEnv = process.platform === 'win32'
+    ? { BLUEPRINT_TEST_PYTHON: bashPath(windowsPython) }
+    : {};
   const NO_NODE = '/nonexistent/node';
 
   function extractValidateJson(script: string): string {
@@ -938,6 +1163,7 @@ describe('_validate_json python3 fallback (node-less VM survival)', () => {
           BASH_ENV: bashPath(bashEnv),
           NODE_BINARY: NO_NODE,
           PATH: executionPath,
+          ...pythonShimEnv,
         },
         stdio: 'pipe',
       },
@@ -948,6 +1174,76 @@ describe('_validate_json python3 fallback (node-less VM survival)', () => {
     expect(JSON.parse(sent)).toMatchObject({ op: 'set_problem_model' });
     expect((JSON.parse(sent) as { data: { problem_model: string } }).data.problem_model).toBe('node-less-vm');
   });
+
+  it('injects exact private-turn provenance with one stable Python UUID across retries', () => {
+    const incarnation = '00000000-0000-0000-0000-000000000761';
+    const packetId = '00000000-0000-0000-0000-000000000762';
+    const claimId = '00000000-0000-0000-0000-000000000763';
+    const marker = path.join(ws, 'private-turn-marker.json');
+    const captured = path.join(ws, 'python-provenance-requests.jsonl');
+    const attempts = path.join(ws, 'python-provenance-attempts');
+    writeStrategicHelpers('task', 'project', ws, {
+      residentIncarnationId: incarnation,
+      privateTurnMarkerPath: marker,
+    });
+    fs.writeFileSync(marker, JSON.stringify({
+      kind: 'typed-consultation',
+      incarnation_id: incarnation,
+      packet_id: packetId,
+      workday_claim_id: claimId,
+    }));
+    const bashEnv = path.join(ws, 'bash-env-python-provenance');
+    fs.writeFileSync(bashEnv, `sleep() { :; }
+curl() {
+  local body n
+  body=$(cat)
+  n=0
+  [ ! -f '${bashPath(attempts)}' ] || n=$(cat '${bashPath(attempts)}')
+  n=$((n+1))
+  printf '%s' "$n" > '${bashPath(attempts)}'
+  printf '%s\n' "$body" >> '${bashPath(captured)}'
+  if [ "$n" -eq 1 ]; then printf '{"error":"retry"}\n500\n'; else printf '%s\n200\n' "$body"; fi
+}
+`);
+    execFileSync(
+      bashExecutable,
+      [
+        bashPath(path.join(ws, 'strategic')),
+        'set-problem-model',
+        '--json',
+        JSON.stringify({ problem_model: 'python-private-turn' }),
+      ],
+      {
+        cwd: ws,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+          AGENT_API_TOKEN: 'test-token',
+          BASH_ENV: bashPath(bashEnv),
+          NODE_BINARY: NO_NODE,
+          PATH: executionPath,
+          ...pythonShimEnv,
+        },
+        stdio: 'pipe',
+      },
+    );
+    const requests = fs.readFileSync(captured, 'utf8').trim().split('\n').map(
+      (line) => JSON.parse(line) as Record<string, unknown>,
+    );
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toMatchObject({
+      resident_incarnation_id: incarnation,
+      packet_id: packetId,
+      workday_claim_id: claimId,
+    });
+    expect(requests[1]).toMatchObject(requests[0]);
+    expect(requests[0]?.workday_operation_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(requests[1]?.workday_operation_id).toBe(requests[0]?.workday_operation_id);
+    expect(requests[0]?.data).toEqual({ problem_model: 'python-private-turn' });
+  }, 15_000);
 
   it('rejects malformed JSON with the existing message + exit 2 via python3 when node is absent', () => {
     writeStrategicHelpers('task', 'project', ws);
@@ -971,6 +1267,7 @@ describe('_validate_json python3 fallback (node-less VM survival)', () => {
             BASH_ENV: bashPath(bashEnv),
             NODE_BINARY: NO_NODE,
             PATH: executionPath,
+            ...pythonShimEnv,
           },
           stdio: 'pipe',
         },

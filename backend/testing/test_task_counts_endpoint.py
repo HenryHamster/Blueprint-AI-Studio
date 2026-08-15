@@ -21,27 +21,33 @@ class TestGetTaskCounts:
     """GET /api/admin/tasks/counts returns aggregate counts without loading task rows."""
 
     @pytest.mark.asyncio
-    async def test_counts_global_includes_active_and_evaluating(
+    async def test_counts_split_executing_starting_and_evaluating(
         self, client: AsyncClient, db_session
     ):
-        """Global counts reflect active/evaluating/queued tasks across user projects."""
+        """Reservations stay separate from tasks that are actually executing."""
         from testing.factories import make_task
 
         project = await _make_project(db_session)
         db_session.add_all([
             make_task(project_id=project.id, status=TaskStatus.IN_PROGRESS),
+            make_task(project_id=project.id, status=TaskStatus.PROVISIONING),
             make_task(project_id=project.id, status=TaskStatus.EVALUATING),
             make_task(project_id=project.id, status=TaskStatus.QUEUED),
             make_task(project_id=project.id, status=TaskStatus.COMPLETED),
         ])
         await db_session.commit()
 
-        resp = await client.get("/api/admin/tasks/counts")
+        resp = await client.get(f"/api/admin/tasks/counts?project_id={project.id}")
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data["active_count"] >= 1
+        assert data["starting_count"] >= 1
         assert data["evaluating_count"] >= 1
         assert data["queued_count"] >= 1
+        assert data["scoped_active_count"] == 1
+        assert data["scoped_starting_count"] == 1
+        assert data["scoped_evaluating_count"] == 1
+        assert data["scoped_queued_count"] == 1
         assert "tasks" not in data
 
     @pytest.mark.asyncio
@@ -61,6 +67,7 @@ class TestGetTaskCounts:
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data["scoped_active_count"] == 1
+        assert data["scoped_starting_count"] == 0
         assert data["scoped_evaluating_count"] == 0
         assert data["scoped_queued_count"] == 0
 

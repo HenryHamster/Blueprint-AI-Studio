@@ -105,11 +105,35 @@ export interface ResidentWakeBarrierReceipt {
   context?: Record<string, unknown>;
 }
 
+export type ResidentActivityReasonCode =
+  | 'consultation_queued'
+  | 'consultation_running'
+  | 'consultation_delivering';
+
+export type ResidentAutonomyReasonCode =
+  | 'authority_not_held'
+  | 'foreground_call'
+  | 'chat_or_disabled'
+  | 'consultation_queued'
+  | 'consultation_running'
+  | 'consultation_delivering'
+  | 'repository_unavailable';
+
 export interface ResidentActivityUpdate {
   phase: 'working' | 'waiting';
   phase_started_at: string;
   last_action: string;
   next_review_at?: string | null;
+  /** Bounded machine-readable reason for operator-facing status. Human prose
+   * remains diagnostic only and must never be parsed to infer this state. */
+  reason_code: ResidentActivityReasonCode | null;
+  /** Server-owned public Fast reply id which correlates a request with its
+   * eventual continuation. Null outside one exact consultation lifecycle. */
+  consultation_id: string | null;
+  /** Whether private Continuous Workday can take an autonomous turn now. */
+  autonomy_state: 'active' | 'paused';
+  /** Machine-readable cause when autonomy_state is paused. */
+  autonomy_reason_code: ResidentAutonomyReasonCode | null;
 }
 
 export interface SessionHeartbeatResponse {
