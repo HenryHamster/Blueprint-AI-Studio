@@ -3866,6 +3866,148 @@ async def test_fetch_efficiency_snapshot_includes_llm_cost_attribution(
 
 
 @pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot_handles_zero_merge_and_unpriced_rows(
+    client: AsyncClient, db_session
+):
+    """The read path remains useful when denominators and pricing are absent."""
+    from datetime import datetime, timezone
+
+    from app.models import TaskStatus
+
+    project, token_task = await _make_project_task(
+        db_session, vm="agent-vm-effdeg"
+    )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            updated_at=datetime.now(timezone.utc),
+            vm_provisioned_at=datetime.now(timezone.utc),
+            vm_stopped_at=datetime.now(timezone.utc),
+            provider="unknown-provider",
+            model="unknown-model",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 100,
+                "llm_call_count": 1,
+            },
+            context={"pr_merged": False},
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-effdeg")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["cohort_task_count"] == 1
+    assert data["cohort_capped"] is False
+    assert data["cost_per_merged_pr"] is None
+    assert data["llm_cost_per_merged_pr"] is None
+    assert data["llm_cost_attribution"]["unpriced_coverage"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot_handles_landed_row_with_no_pricing(
+    client: AsyncClient, db_session
+):
+    """The origination aggregate also handles a landed, unpriced completion."""
+    from datetime import datetime, timezone
+
+    from app.models import TaskStatus
+
+    project, token_task = await _make_project_task(
+        db_session, vm="agent-vm-efflanded"
+    )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            updated_at=datetime.now(timezone.utc),
+            vm_provisioned_at=datetime.now(timezone.utc),
+            vm_stopped_at=datetime.now(timezone.utc),
+            provider="unknown-provider",
+            model="unknown-model",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 100,
+                "llm_call_count": 1,
+            },
+            context={"pr_merged": True},
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-efflanded")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["cohort_task_count"] == 1
+    assert data["cost_per_merged_pr"] is not None
+    assert data["llm_cost_per_merged_pr"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot_loads_strategic_cycle_timestamps(
+    client: AsyncClient, db_session
+):
+    """PostgreSQL's projected cohort includes timestamps used by cycle slicing."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.models import TaskStatus
+
+    now = datetime.now(timezone.utc)
+    project, token_task = await _make_project_task(
+        db_session, vm="agent-vm-effcycle"
+    )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.COMPLETED,
+            strategic_cycle_id="cycle-efficiency-test",
+            created_at=now - timedelta(minutes=2),
+            started_at=now - timedelta(minutes=1),
+            completed_at=now,
+            updated_at=now,
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 100,
+                "llm_call_count": 1,
+            },
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-effcycle")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+
+    assert res.status_code == 200, res.text
+    slices = res.json()["data"]["llm_cost_attribution"][
+        "strategic_cycle_cost_per_event"
+    ]
+    assert slices["by_cycle"][0]["cycle_id"] == "cycle-efficiency-test"
+
+
+@pytest.mark.asyncio
 async def test_fetch_efficiency_snapshot_includes_llm_cache_hit_rate(
     client: AsyncClient, db_session
 ):
