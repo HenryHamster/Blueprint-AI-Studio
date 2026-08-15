@@ -8,7 +8,8 @@
 #
 # Exits 0 on success (capture failures are non-fatal).
 # Exits 1 if --upload is passed without --task-id.
-# Exits 75 with VIEWPORT_GATE_INFRA_UNAVAILABLE on Chromium bootstrap failure.
+# Records VIEWPORT_CAPTURE_SKIPPED and exits successfully on Chromium bootstrap
+# failure; the CI frontend-viewport job is the enforcing browser gate.
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,8 +47,8 @@ OUT_DIR="/tmp/viewport_live/$RUN_ID"
 
 # ── infra sentinel ─────────────────────────────────────────────────────────────
 infra_unavailable() {
-  echo "VIEWPORT_GATE_INFRA_UNAVAILABLE: $1"
-  exit 75
+  echo "VIEWPORT_CAPTURE_SKIPPED: $1; CI frontend-viewport enforces browser verification"
+  exit 0
 }
 
 # ── cleanup on exit ────────────────────────────────────────────────────────────

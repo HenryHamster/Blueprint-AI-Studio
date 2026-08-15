@@ -1954,30 +1954,11 @@ async def test_pull_time_browser_backstop_uses_context_only_requirement(
 
 
 @pytest.mark.asyncio
-async def test_viewport_block_retries_when_capable_runner_appears(monkeypatch):
-    """A formerly permanent viewport block re-arms when the fleet can satisfy it."""
-    from app import orchestrator_runner_dispatch as dispatch
+async def test_viewport_infra_block_is_advisory_and_requeues():
+    """Legacy VM viewport blocks requeue instead of entering escalation."""
     from app.blocked_task_unblock_sweeps import _blocked_precondition_state
-    from app.runner_eligibility import RunnerDispatchSnapshot
 
-    project_id = uuid.uuid4()
-    capable = RunnerDispatchSnapshot(
-        id=uuid.uuid4(),
-        project_id=project_id,
-        capabilities={
-            "isolation_backends": {
-                "docker_usable": True,
-                "playwright_chromium_usable": True,
-            }
-        },
-    )
-
-    async def _active_runners(_session):
-        return {project_id: [capable]}
-
-    monkeypatch.setattr(dispatch, "_load_active_runners_cache", _active_runners)
     task = SimpleNamespace(
-        project_id=project_id,
         depends_on=[],
         blocker_kind=None,
         blocked_reason="BLOCKER: VIEWPORT_GATE_INFRA_UNAVAILABLE: no Docker",
@@ -1989,7 +1970,7 @@ async def test_viewport_block_retries_when_capable_runner_appears(monkeypatch):
         },
     )
 
-    assert await _blocked_precondition_state(task, object(), lambda: None) == "retry"
+    assert await _blocked_precondition_state(task, object(), lambda: None) == "clear"
 
 
 @pytest.mark.asyncio

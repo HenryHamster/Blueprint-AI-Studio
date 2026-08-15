@@ -13743,20 +13743,59 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     run_backend = run_root / "backend"
     run_scripts.mkdir(parents=True)
     run_backend.mkdir()
+    run_app = run_backend / "app"
+    run_app.mkdir()
+    (run_app / "__init__.py").write_text("", encoding="utf-8")
+    (run_app / "main.py").write_text(
+        "class _App:\n    routes = []\n\napp = _App()\n", encoding="utf-8"
+    )
     shutil.copy2(harness, run_scripts / harness.name)
     shutil.copy2(
         harness.parent / "backend-test-route.sh", run_scripts / "backend-test-route.sh"
     )
-    bootstrap_test = harness.parent / "test_bootstrap_local_app_release.py"
-    if bootstrap_test.is_file():
-        shutil.copy2(bootstrap_test, run_scripts / bootstrap_test.name)
     root_claude = harness.parent.parent / "CLAUDE.md"
     if root_claude.is_file():
         shutil.copy2(root_claude, run_root / "CLAUDE.md")
-    # The real checkout contains the discovered files.  Empty stand-ins are
-    # enough here because fake_python records argv rather than collecting them.
+    # The real checkout contains the discovered files.  Passing stand-ins keep
+    # this read-only fixture focused on the harness roster rather than backend
+    # application imports or unrelated test dependencies.
     for filename in sorted(on_disk):
-        (run_scripts / filename).write_text("", encoding="utf-8")
+        (run_scripts / filename).write_text(
+            "def test_roster_placeholder():\n    pass\n", encoding="utf-8"
+        )
+    backend_tests = [
+        "test_security.py",
+        "test_pipeline.py",
+        "test_invariants.py",
+        "test_impacted_tests.py",
+        "test_audit_finding_class_guards.py",
+        "test_admin_auth_invariant.py",
+        "test_release_promotion_metric_manifest.py",
+        "test_dependency_deprecations.py",
+        "test_websocket_emitter_inventory.py",
+        "test_operator_workbench_contracts.py",
+        "test_monthly_budget_alerts.py",
+        "test_migration_chain.py",
+        "test_message_audience.py",
+        "test_event_type_invariants.py",
+        "test_salvage_bundle_standalone.py",
+        "test_test_durations_freshness.py",
+        "test_shard_balance.py",
+        "test_conversational_workday_protection.py",
+        "test_vitest_durations_freshness.py",
+    ]
+    run_testing = run_backend / "testing"
+    run_testing.mkdir()
+    for filename in backend_tests:
+        test_body = "def test_roster_placeholder():\n    pass\n"
+        if filename == "test_operator_workbench_contracts.py":
+            test_body += (
+                "\ndef test_websocket_emitter_inventory_covers_current_emitters():\n"
+                "    pass\n"
+            )
+        (run_testing / filename).write_text(
+            test_body, encoding="utf-8"
+        )
     run_harness = run_scripts / harness.name
 
     for path in sorted(
@@ -13805,15 +13844,13 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         "read-only harness execution must not stage CLAUDE.md into backend/"
     )
 
-    pytest_commands = [
-        line for line in log_path.read_text(encoding="utf-8").splitlines()
-        if "-m pytest" in line
-    ]
-    assert pytest_commands, "standalone harness did not invoke pytest"
-    invoked = "\n".join(pytest_commands)
+    invoked = result.stdout
+    assert "test_roster_placeholder" in invoked, (
+        "standalone harness did not execute its pytest roster"
+    )
     expected = on_disk - set(exemptions)
     missing = sorted(
-        name for name in expected if f"../scripts/{name}" not in invoked
+        name for name in expected if f"scripts/{name}" not in invoked
     )
     assert not missing, (
         "Docker-less standalone execution omitted non-exempt discovered entries: "
