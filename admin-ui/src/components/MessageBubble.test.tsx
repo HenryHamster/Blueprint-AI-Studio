@@ -284,6 +284,47 @@ describe('MessageBubble', () => {
     expect(onOpenStrategicContext).not.toHaveBeenCalled();
   });
 
+  test('renders only strict server-owned Workday consultation receipts', () => {
+    const { rerender } = render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      msg: makeMsg({
+        from_type: 'strategic',
+        context: {
+          message_role: 'operator_reply',
+          _workday_consultation_requested: true,
+        },
+      }),
+    })} />);
+    expect(screen.getByText('Workday requested')).toBeTruthy();
+
+    rerender(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      msg: makeMsg({
+        from_type: 'strategic',
+        context: {
+          message_role: 'operator_reply',
+          _workday_consultation_requested: false,
+        },
+      }),
+    })} />);
+    expect(screen.getByText('Fast only')).toBeTruthy();
+    expect(screen.queryByText('Workday requested')).toBeNull();
+
+    for (const context of [
+      { message_role: 'operator_reply', _workday_consultation_requested: 'true' },
+      { message_role: 'operator_reply', _workday_consultation_requested: 'false' },
+      { message_role: 'workday_consultation_continuation', _workday_consultation_requested: true },
+      { message_role: 'operator_reply' },
+    ]) {
+      rerender(<MessageBubble {...makeProps({
+        presentation: 'chat',
+        msg: makeMsg({ from_type: 'strategic', context }),
+      })} />);
+      expect(screen.queryByText('Workday requested')).toBeNull();
+      expect(screen.queryByText('Fast only')).toBeNull();
+    }
+  });
+
   test('triage presentation keeps operator Strategic context receipt hidden', () => {
     render(<MessageBubble {...makeProps({
       msg: makeMsg({

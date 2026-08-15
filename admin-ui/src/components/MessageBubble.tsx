@@ -277,6 +277,14 @@ export const MessageBubble = memo(function MessageBubble({
     && msg.context.message_role === 'workday_consultation_continuation'
     && typeof msg.context._workday_result_packet_id === 'string'
     && msg.context._workday_result_packet_id.trim().length > 0;
+  const workdayRequested = chatMode
+    && !userMsg
+    && msg.context.message_role === 'operator_reply'
+    && msg.context._workday_consultation_requested === true;
+  const fastOnly = chatMode
+    && !userMsg
+    && msg.context.message_role === 'operator_reply'
+    && msg.context._workday_consultation_requested === false;
 
   return (
     <>
@@ -323,6 +331,28 @@ export const MessageBubble = memo(function MessageBubble({
                   title="This final reply incorporates a completed Workday consultation"
                 >
                   Workday consulted
+                </span>
+              </>
+            )}
+            {workdayRequested && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span
+                  className="text-neutral-600"
+                  title="The server atomically created a private Workday consultation with this reply"
+                >
+                  Workday requested
+                </span>
+              </>
+            )}
+            {fastOnly && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span
+                  className="text-neutral-600"
+                  title="No private Workday consultation was committed with this reply"
+                >
+                  Fast only
                 </span>
               </>
             )}

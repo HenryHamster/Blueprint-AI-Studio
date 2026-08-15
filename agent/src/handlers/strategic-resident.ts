@@ -3241,6 +3241,10 @@ export async function handleStrategicResident(
     result_summary: string;
     envelope: StrategicContextEnvelopeTransport;
   };
+  const typedContinuationSafeFallback = (
+    'The private consultation completed, but I could not safely format its result. '
+    + 'Please ask me to retry the explanation.'
+  );
 
   const ackTypedConsultation = async (
     packet: ClaimedTypedConsultation,
@@ -3435,14 +3439,11 @@ export async function handleStrategicResident(
       '</workday_result>',
       '',
       'Use mcp__call__complete_turn exactly once with the concise, useful researched follow-up for the operator.',
+      'State the researched result directly. Do not narrate a new Workday request or current Workday status; the server renders the authoritative Workday consulted receipt for this continuation.',
       'Do not request another Workday consultation from a continuation turn.',
     ].join('\n');
     const dispatchContinuation = async () => {
-      const turnPromise = typedController.dispatch(receipt, prompt, {
-        // Only this server-created receipt proves that Workday already produced
-        // a durable result, so completed-consultation attribution is truthful.
-        allowCompletedWorkdayAttribution: true,
-      }).then(
+      const turnPromise = typedController.dispatch(receipt, prompt).then(
         value => ({ status: 'fulfilled' as const, value }),
         (reason: unknown) => ({ status: 'rejected' as const, reason }),
       );
@@ -3519,23 +3520,39 @@ export async function handleStrategicResident(
       if (attempt.outcome !== 'done') return attempt.outcome;
       dispatchAttempt = attempt.attempt;
     }
+    let protocolFailure: string | null = null;
+    let completionContent: string | null = null;
     if (dispatchAttempt.status === 'rejected') {
+      protocolFailure = `Fast Resident rejected Workday continuation staging: ${sanitize(String(dispatchAttempt.reason))}`;
+    } else {
+      const turn = dispatchAttempt.value;
+      if (turn.workdayRequests.length > 0) {
+        protocolFailure = 'Fast Resident attempted nested Workday work from a continuation';
+      } else if (
+        turn.result.processGone || turn.result.timedOut || turn.result.hardTimedOut
+        || !turn.completion
+      ) {
+        protocolFailure = 'Fast Resident did not stage Workday continuation completion';
+      } else {
+        completionContent = turn.completion.content;
+      }
+    }
+    if (protocolFailure !== null) {
       await retireTypedFastController('continuation_protocol_failure');
-      throw new Error(
-        `Fast Resident rejected Workday continuation staging: ${sanitize(String(dispatchAttempt.reason))}`,
+      if (continuation.attempt < 2) throw new Error(protocolFailure);
+      // The durable private result must not cycle forever when a deterministic
+      // model keeps violating the typed completion protocol. After one full
+      // release/reprovision cycle, terminalize the exact server claim with a
+      // fixed non-sensitive explanation; the trusted continuation badge still
+      // proves that Workday completed, while no hidden result text is leaked.
+      completionContent = typedContinuationSafeFallback;
+      sendLog(
+        ws,
+        `[resident] typed Workday continuation used safe fallback after repeated protocol failure: ${protocolFailure}\n`,
       );
     }
-    const turn = dispatchAttempt.value;
-    if (turn.workdayRequests.length > 0) {
-      await retireTypedFastController('continuation_protocol_failure');
-      throw new Error('Fast Resident attempted nested Workday work from a continuation');
-    }
-    if (
-      turn.result.processGone || turn.result.timedOut || turn.result.hardTimedOut
-      || !turn.completion
-    ) {
-      await retireTypedFastController('continuation_protocol_failure');
-      throw new Error('Fast Resident did not stage Workday continuation completion');
+    if (completionContent === null) {
+      throw new Error('Fast Resident continuation completion content was unavailable');
     }
     await apiPost(
       `/api/agent/projects/${projectId}/workday-consultations/continuations/${continuation.result_packet_id}/complete`,
@@ -3545,7 +3562,7 @@ export async function handleStrategicResident(
         worker_generation: workerGeneration,
         incarnation_id: residentProcessIncarnation,
         continuation_claim_id: continuation.continuation_claim_id,
-        content: turn.completion.content,
+        content: completionContent,
         idempotency_key: receipt.idempotency_key,
       },
       TYPED_COORDINATOR_API_ATTEMPTS,

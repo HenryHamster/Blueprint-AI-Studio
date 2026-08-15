@@ -71,8 +71,10 @@ from app.project_message_creation import (
 )
 from app.project_message_projection import (
     MESSAGE_EVENT_REFETCH_SURFACES,
+    message_event_payload,
     message_preview_dict,
 )
+from app.strategic_trigger import ARMING_RESIDENT_SESSION
 from app.knowledge_query import build_strategic_memory_index
 from app.livekit_tokens import (
     LiveKitConfigurationError,
@@ -166,6 +168,8 @@ from app.strategic_resident_session import (
     release_resident_call_lease,
     resident_call_is_active,
     resident_call_snapshot,
+    ensure_resident_session_before_operator_message,
+    ensure_resident_session_for_operator_message,
     start_resident_session,
     stop_resident_session,
     sync_resident_session_for_interaction_mode,
@@ -3302,6 +3306,24 @@ async def create_project_strategic_session_message(
             ),
         )
 
+    # A message carries a bounded context snapshot, not lifecycle authority.
+    # The mode/start/stop endpoints own these fields. In particular, a stale UI
+    # send after explicit Stop must not write ``continuous`` back over the
+    # server's canonical Chat decision and immediately restart Workday.
+    message_workbench_context = None
+    if payload.workbench_context is not None:
+        message_workbench_context = {
+            key: value
+            for key, value in payload.workbench_context.items()
+            if key
+            not in {
+                "interaction_mode",
+                "preferred_runner_id",
+                "session_started_at",
+                "last_interaction_at",
+            }
+        }
+
     result = await create_operator_project_message(
         session,
         project=project,
@@ -3314,7 +3336,7 @@ async def create_project_strategic_session_message(
             else "Sent attachment."
         ),
         context=message_context,
-        workbench_context=payload.workbench_context,
+        workbench_context=message_workbench_context,
         idempotency_key=payload.idempotency_key,
         persist_empty_workbench_context=False,
         sync_local_continuation_marker=False,
@@ -3322,28 +3344,76 @@ async def create_project_strategic_session_message(
         reply_to_message_id=payload.reply_to_message_id,
         include_strategic_session_snapshot=False,
         precommit_validate=_revalidate_message_context,
+        precreate_ensure=lambda: ensure_resident_session_before_operator_message(
+            project_id,
+            operator_user_id=current_user["user_id"],
+        ),
     )
+    result_message_id = uuid.UUID(result.message_id)
+    result_status = result.status
+    result_arming = result.arming
+    should_broadcast_message = result.message_event is not None
+    message_was_bound = result.message.resident_session_id is not None
+    # Creation committed the durable input, but its trailing refresh opened a
+    # read transaction. Release that connection before the isolated ensure (the
+    # test pool may be single-connection, and production should not pin one
+    # pooled connection while another performs the start transaction).
+    await session.rollback()
+    ensured_session = None
+    if result_status == "created" and not message_was_bound:
+        # A lease can end in the narrow window between pre-create ensure and the
+        # message's final Project lock. Repair only that observed race after the
+        # durable insert; normal sends never take this second start path.
+        ensured_session = await ensure_resident_session_for_operator_message(
+            project_id,
+            result_message_id,
+            operator_user_id=current_user["user_id"],
+        )
+    # The ensure uses a dedicated transaction and may have rebound the exact
+    # message. Expire this request's identity map before building the receipt so
+    # both the HTTP response and the one message_created event carry canonical
+    # session/wakeup provenance.
+    await session.rollback()
+    message = await session.scalar(
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.id == result_message_id,
+            ProjectMessage.project_id == project_id,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if message is None:
+        raise HTTPException(status_code=500, detail="Created message could not be reloaded")
     # The send receipt is intentionally lightweight. The canonical message has
     # all visible chips/reply metadata needed for reconciliation; fetching the
     # full strategic-state/runtime model here made send latency scale with the
     # entire project and duplicated data the client refreshes independently.
-    message_preview = _message_preview(result.message, content_max_chars=None)
+    message_preview = _message_preview(message, content_max_chars=None)
+    wakeup_state = stored_wakeup_state(message)
+    arming = result_arming
+    if (
+        result_status == "created"
+        and ensured_session is not None
+        and ensured_session.get("status") == "active"
+        and message.resident_session_id == ensured_session.get("session_id")
+    ):
+        arming = ARMING_RESIDENT_SESSION
     response = {
-        "id": result.message_id,
-        "status": result.status,
-        "arming": result.arming,
-        "wakeup_state": result.wakeup_state,
+        "id": str(result_message_id),
+        "status": result_status,
+        "arming": arming,
+        "wakeup_state": wakeup_state,
         "message": message_preview,
         "project_id": str(project_id),
     }
-    call_input_revision = (result.message.context or {}).get("input_revision")
+    call_input_revision = (message.context or {}).get("input_revision")
     if isinstance(call_input_revision, int):
         response["input_revision"] = call_input_revision
-    if result.message_event is not None:
+    if should_broadcast_message:
         await broadcast_to_project(
             str(project_id),
             "message_created",
-            result.message_event,
+            message_event_payload(message),
         )
     return response
 

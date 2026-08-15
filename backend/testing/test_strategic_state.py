@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -6,10 +7,12 @@ import pytest
 from fastapi import HTTPException
 from httpx import AsyncClient
 from sqlalchemy import func
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 
 from app import acceptance_criteria as ac
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+from app.database import resolve_async_engine
 from app.models import (
     ReleaseVersion,
     Alert,
@@ -22,6 +25,7 @@ from app.models import (
     Direction,
     KnowledgeDocument,
     LocalRunner,
+    MessageHandlingState,
     MessageType,
     MessageSurface,
     MessagesLastSeen,
@@ -335,6 +339,470 @@ async def _make_project(session) -> Project:
     session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
     await session.commit()
     return project
+
+
+def _ended_resident_fixture(
+    session_id: str, *, started_minutes_ago: int = 10,
+    ended_seconds_ago: int = 30, runner_id: str | None = None,
+    include_runner: bool = False, version: int | None = None,
+    include_updated_at: bool = False,
+    last_action: str | None = None,
+) -> dict:
+    ended_at = _utcnow() - timedelta(seconds=ended_seconds_ago)
+    resident = {
+        "session_id": session_id,
+        "task_id": str(uuid.uuid4()),
+        "worker_generation": 1,
+        "operator_user_id": TEST_USER_ID,
+        "status": "ended",
+        "stop_requested": True,
+        "started_at": (_utcnow() - timedelta(minutes=started_minutes_ago)).isoformat(),
+        "ended_at": ended_at.isoformat(),
+    }
+    if include_runner:
+        resident["runner_id"] = runner_id
+    if version is not None:
+        resident["version"] = version
+    if include_updated_at:
+        resident["updated_at"] = ended_at.isoformat()
+    if last_action is not None:
+        resident["activity"] = {"phase": "ended", "last_action": last_action}
+    return resident
+
+
+async def _make_resident_test_project(
+    session, *, name: str, resident: dict, interaction_mode: str,
+    preferred_runner_id: uuid.UUID | None = None,
+    runner_specs: tuple[tuple[uuid.UUID | None, int], ...] = (),
+    resident_task_status: TaskStatus | None = None,
+) -> Project:
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+    project = Project(name=name, user_id=TEST_USER_ID, vision={RESIDENT_SESSION_KEY: resident})
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    workbench = {"version": 1, "interaction_mode": interaction_mode,
+                 "active_surface": "messages", "selected_refs": []}
+    if preferred_runner_id is not None:
+        workbench["preferred_runner_id"] = str(preferred_runner_id)
+    runners = [
+        LocalRunner(
+            project_id=project.id, token_hash=uuid.uuid4().hex * 2, status="active",
+            capabilities={"task_types": "all", "max_concurrent": 2},
+            last_seen_at=_utcnow() - timedelta(minutes=seen_minutes_ago),
+            **({"id": runner_id} if runner_id is not None else {}),
+        )
+        for runner_id, seen_minutes_ago in runner_specs
+    ]
+    rows = [
+        ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"),
+        MessagesNoisePrefs(project_id=project.id, user_id=TEST_USER_ID,
+                           prefs={"_strategic_workbench": workbench}),
+        *runners,
+    ]
+    if resident_task_status is not None:
+        rows.append(
+            Task(
+                id=uuid.UUID(str(resident["task_id"])), project_id=project.id,
+                title="Resident session predecessor",
+                payloads=[{"type": "strategic_review", "resident_session": True}],
+                status=resident_task_status, created_by="STRATEGIC_AGENT",
+                vm_instance_id=f"runner:{resident.get('runner_id')}",
+                started_at=_utcnow() - timedelta(minutes=5),
+                last_heartbeat=_utcnow(),
+                context={
+                    "_resident_session": True,
+                    "strategic_session_id": resident["session_id"],
+                    "_resident_worker_generation": resident["worker_generation"],
+                },
+            )
+        )
+    session.add_all(rows)
+    await session.commit()
+    return project
+
+
+async def _project_rows(session, model, project_id):
+    return (await session.execute(select(model).where(model.project_id == project_id))).scalars().all()
+
+
+async def _fresh_project(session, project_id):
+    query = select(Project).where(Project.id == project_id).execution_options(populate_existing=True)
+    return await session.scalar(query)
+
+
+async def _post_with_stale_active_resident(client, session, *, mode, task_status, key):
+    from app.strategic_resident_session import read_resident_session
+    runner_id, task_id, generation = uuid.uuid4(), uuid.uuid4(), 4
+    stale = _ended_resident_fixture(
+        f"ss-{key}", runner_id=str(runner_id), include_runner=True, version=2
+    )
+    stale.update(task_id=str(task_id), worker_generation=generation, status="active",
+                 stop_requested=False, ended_at=None, worker_state="ready",
+                 last_progress_at=_utcnow().isoformat())
+    project = await _make_resident_test_project(
+        session, name=key, resident=stale, interaction_mode=mode,
+        runner_specs=((runner_id, 0),), resident_task_status=task_status,
+    )
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={"message_type": "NOTE", "content": key, "idempotency_key": key},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    await session.rollback()
+    fresh = await _fresh_project(session, project.id)
+    stored = await session.get(ProjectMessage, uuid.UUID(body["id"]))
+    tasks = await _project_rows(session, Task, project.id)
+    return stale, task_id, generation, body, read_resident_session(fresh.vision), stored, tasks
+
+
+@pytest.mark.asyncio
+async def test_message_after_workday_lease_lapse_rearms_once_and_rebinds_exact_input(
+    client: AsyncClient,
+    db_session,
+):
+    """A send that lands just after the dead-man lease ends is not orphaned."""
+    from app.strategic_resident_session import (
+        RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY,
+        read_resident_session,
+    )
+    project = await _make_resident_test_project(
+        db_session,
+        name="Workday lapse rearm",
+        resident=_ended_resident_fixture(
+            "ss-lapsed-before-send",
+            started_minutes_ago=20,
+            ended_seconds_ago=25,
+            include_runner=True,
+            version=2,
+            include_updated_at=True,
+            last_action="Continuation lease lapsed",
+        ),
+        interaction_mode="continuous",
+        runner_specs=((None, 0),),
+    )
+    body = {
+        "message_type": "NOTE",
+        "content": "Answer this exact post-lapse message once.",
+        "idempotency_key": "workday-post-lapse-rearm-1",
+    }
+    first = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json=body,
+    )
+    assert first.status_code == 200, first.text
+    first_json = first.json()
+    assert first_json["status"] == "created"
+    assert first_json["arming"] == "resident_session"
+    assert first_json["wakeup_state"] == "queued"
+    duplicate = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json=body,
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["status"] == "duplicate"
+    assert duplicate.json()["id"] == first_json["id"]
+    assert duplicate.json()["wakeup_state"] == "queued"
+    await db_session.rollback()
+    stored_project = await _fresh_project(db_session, project.id)
+    assert stored_project is not None
+    resident = read_resident_session(stored_project.vision)
+    assert resident is not None
+    assert resident["status"] == "active"
+    assert resident["session_id"] != "ss-lapsed-before-send"
+    stored = await db_session.get(ProjectMessage, uuid.UUID(first_json["id"]))
+    assert stored is not None
+    assert stored.status == "open"
+    assert stored.handling_state == MessageHandlingState.PENDING
+    assert stored.handled_by_task_id is None
+    assert stored.resident_session_id == resident["session_id"]
+    assert stored.context["_operator_wakeup_state"] == "queued"
+    tasks = await _project_rows(db_session, Task, project.id)
+    assert len(tasks) == 1
+    assert str(tasks[0].id) == resident["task_id"]
+    messages = await _project_rows(db_session, ProjectMessage, project.id)
+    assert [row.id for row in messages] == [stored.id]
+    assert not any(
+        dict(row.context or {}).get(RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY) is True
+        for row in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_send_does_not_bind_active_resident_left_by_mode_leave(
+    client: AsyncClient, db_session
+):
+    stale, task_id, _, body, resident, stored, tasks = await _post_with_stale_active_resident(
+        client, db_session, mode="chat", task_status=TaskStatus.IN_PROGRESS,
+        key="chat-before-resident-stop",
+    )
+    assert (body["status"], body["wakeup_state"], body["arming"] != "resident_session") == (
+        "created", "paused", True
+    )
+    assert stored is not None
+    assert (stored.resident_session_id, stored.handling_state) == (
+        None, MessageHandlingState.PENDING
+    )
+    assert (stored.handled_by_task_id, stored.conversation_claim_id) == (None, None)
+    assert stored.context["_operator_wakeup_state"] == "paused"
+    assert resident == stale
+    assert [(row.id, row.status) for row in tasks] == [(task_id, TaskStatus.IN_PROGRESS)]
+
+
+@pytest.mark.asyncio
+async def test_continuous_send_replaces_terminal_active_resident_task(
+    client: AsyncClient, db_session
+):
+    stale, task_id, generation, body, resident, stored, tasks = (
+        await _post_with_stale_active_resident(
+            client, db_session, mode="continuous", task_status=TaskStatus.COMPLETED,
+            key="replace-terminal-resident",
+        )
+    )
+    assert (body["status"], body["arming"], body["wakeup_state"]) == (
+        "created", "resident_session", "queued"
+    )
+    assert resident is not None
+    assert (resident["status"], resident["session_id"], resident["worker_generation"]) == (
+        "active", stale["session_id"], generation + 1
+    )
+    assert resident["task_id"] != str(task_id) and stored is not None
+    assert (stored.resident_session_id, stored.handling_state, stored.handled_by_task_id) == (
+        resident["session_id"], MessageHandlingState.PENDING, None
+    )
+    assert stored.context["_operator_wakeup_state"] == "queued"
+    assert len(tasks) == 2
+    predecessor = next(row for row in tasks if row.id == task_id)
+    replacement = next(row for row in tasks if str(row.id) == resident["task_id"])
+    assert predecessor.status == TaskStatus.COMPLETED
+    assert (replacement.context["strategic_session_id"],
+            replacement.context["_resident_worker_generation"]) == (
+        resident["session_id"], generation + 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_after_explicit_stop_does_not_rearm_chat_mode(
+    client: AsyncClient, db_session,
+):
+    project = await _make_resident_test_project(
+        db_session, name="Explicitly stopped Workday",
+        resident=_ended_resident_fixture(
+            "ss-explicitly-stopped", ended_seconds_ago=0,
+            last_action="Session stopped by operator",
+        ),
+        interaction_mode="chat",
+    )
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "message_type": "NOTE",
+            "content": "Remain in Chat after explicit Stop.",
+            "idempotency_key": "chat-after-explicit-stop-1",
+            "workbench_context": {
+                "version": 1,
+                "interaction_mode": "continuous",
+                "preferred_runner_id": str(uuid.uuid4()),
+                "active_surface": "messages",
+                "selected_refs": [],
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["arming"] != "resident_session"
+    await db_session.rollback()
+    tasks = await _project_rows(db_session, Task, project.id)
+    assert tasks == []
+    stored = await db_session.get(ProjectMessage, uuid.UUID(response.json()["id"]))
+    assert stored is not None
+    assert stored.resident_session_id is None
+    prefs = await db_session.scalar(
+        select(MessagesNoisePrefs).where(MessagesNoisePrefs.project_id == project.id,
+                                         MessagesNoisePrefs.user_id == TEST_USER_ID)
+        .execution_options(populate_existing=True)
+    )
+    assert prefs is not None
+    assert prefs.prefs["_strategic_workbench"]["interaction_mode"] == "chat"
+    assert "preferred_runner_id" not in prefs.prefs["_strategic_workbench"]
+
+
+@pytest.mark.asyncio
+async def test_operator_send_racing_mode_leave_commits_unbound_chat_message(
+    client: AsyncClient, db_session, monkeypatch,
+):
+    import app.strategic_resident_session as resident_session_module
+    from app.strategic_resident_session import read_resident_session
+    from app.workbench_state import persist_strategic_workbench_update
+    project = await _make_resident_test_project(
+        db_session, name="Send races Workday mode leave",
+        resident=_ended_resident_fixture("ss-ended-before-mode-race"),
+        interaction_mode="continuous", runner_specs=((None, 0),),
+    )
+    project_id = project.id
+    factory = async_sessionmaker(resolve_async_engine(db_session), class_=AsyncSession,
+                                 expire_on_commit=False)
+    runner_resolved = asyncio.Event()
+    resume_ensure = asyncio.Event()
+    async def pause_before_start_claim(_session, _project_id):
+        runner_resolved.set()
+        await resume_ensure.wait()
+        return None
+    monkeypatch.setattr(
+        resident_session_module, "_find_adoptable_strategic_review_task",
+        pause_before_start_claim,
+    )
+    send_task = asyncio.create_task(
+        client.post(
+            f"/api/admin/projects/{project_id}/strategic-session/messages",
+            json={
+                "message_type": "NOTE",
+                "content": "Linearize this send in Chat after Stop wins.",
+                "idempotency_key": "send-races-mode-leave-1",
+            },
+        )
+    )
+    await asyncio.wait_for(runner_resolved.wait(), timeout=5)
+    try:
+        async with factory() as leave_session:
+            await persist_strategic_workbench_update(
+                leave_session, TEST_USER_ID, project_id, {"interaction_mode": "chat"},
+                arm_interaction_mode=False,
+            )
+    finally:
+        resume_ensure.set()
+    response = await asyncio.wait_for(send_task, timeout=10)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "created"
+    assert body["arming"] != "resident_session"
+    assert body["wakeup_state"] == "paused"
+    async with factory() as verify:
+        stored_project = await verify.get(Project, project_id)
+        stored = await verify.get(ProjectMessage, uuid.UUID(body["id"]))
+        prefs = await verify.scalar(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.project_id == project_id,
+                MessagesNoisePrefs.user_id == TEST_USER_ID,
+            )
+        )
+        tasks = await _project_rows(verify, Task, project_id)
+    assert stored_project is not None
+    resident = read_resident_session(stored_project.vision)
+    assert resident is not None and resident["status"] == "ended"
+    assert stored is not None
+    assert stored.resident_session_id is None
+    assert stored.handling_state == MessageHandlingState.PENDING
+    assert stored.conversation_claim_id is None
+    assert stored.context["_operator_wakeup_state"] == "paused"
+    assert prefs is not None
+    assert prefs.prefs["_strategic_workbench"]["interaction_mode"] == "chat"
+    assert tasks == []
+
+
+@pytest.mark.asyncio
+async def test_post_lapse_exact_message_replay_never_restarts_workday(
+    client: AsyncClient,
+    db_session,
+):
+    """A replay is an observation of the prior send, not a new Start action."""
+    from app.strategic_resident_session import read_resident_session
+    project = await _make_resident_test_project(
+        db_session,
+        name="Post-lapse exact replay",
+        resident=_ended_resident_fixture("ss-ended-before-replay"),
+        interaction_mode="continuous",
+        runner_specs=((None, 0),),
+    )
+    existing = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        actor_user_id=TEST_USER_ID,
+        content="This exact input was already accepted.",
+        status="open",
+        idempotency_key="post-lapse-existing-replay",
+        resident_session_id=None,
+        context={"_operator_wakeup_state": "paused"},
+    )
+    db_session.add(existing)
+    await db_session.commit()
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "message_type": "NOTE",
+            "content": existing.content,
+            "idempotency_key": existing.idempotency_key,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "duplicate"
+    assert response.json()["id"] == str(existing.id)
+    assert response.json()["wakeup_state"] == "paused"
+    await db_session.rollback()
+    fresh_project = await _fresh_project(db_session, project.id)
+    assert fresh_project is not None
+    resident = read_resident_session(fresh_project.vision)
+    assert resident is not None and resident["status"] == "ended"
+    stored = await db_session.scalar(
+        select(ProjectMessage)
+        .where(ProjectMessage.id == existing.id)
+        .execution_options(populate_existing=True)
+    )
+    assert stored is not None
+    assert stored.resident_session_id is None
+    assert stored.context["_operator_wakeup_state"] == "paused"
+    tasks = await _project_rows(db_session, Task, project.id)
+    assert tasks == []
+
+
+@pytest.mark.asyncio
+async def test_post_lapse_rearm_does_not_migrate_from_offline_preferred_runner(
+    client: AsyncClient,
+    db_session,
+):
+    """A pinned offline device is a visible block, even when another is online."""
+
+    from app.strategic_resident_session import read_resident_session
+
+    preferred_runner_id = uuid.uuid4()
+    project = await _make_resident_test_project(
+        db_session,
+        name="Pinned offline Workday rearm",
+        resident=_ended_resident_fixture(
+            "ss-ended-on-preferred-runner",
+            runner_id=str(preferred_runner_id),
+            include_runner=True,
+        ),
+        interaction_mode="continuous",
+        preferred_runner_id=preferred_runner_id,
+        runner_specs=((preferred_runner_id, 10), (None, 0)),
+    )
+
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "message_type": "NOTE",
+            "content": "Do not silently migrate this conversation.",
+            "idempotency_key": "offline-preferred-rearm",
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert "offline" in response.text.lower()
+
+    await db_session.rollback()
+    messages = await _project_rows(db_session, ProjectMessage, project.id)
+    tasks = await _project_rows(db_session, Task, project.id)
+    assert messages == []
+    assert tasks == []
+    fresh_project = await _fresh_project(db_session, project.id)
+    assert fresh_project is not None
+    resident = read_resident_session(fresh_project.vision)
+    assert resident is not None and resident["status"] == "ended"
+    assert resident["runner_id"] == str(preferred_runner_id)
 
 
 @pytest.mark.asyncio
@@ -2510,9 +2978,37 @@ async def test_strategic_conversation_preserves_workday_ui_provenance(
         content="Internal Workday activation instruction",
         context={"_resident_activation_prompt": True},
     )
-    continuation = ProjectMessage(
+    requested = ProjectMessage(
         project_id=project.id,
         sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="Here is the immediate answer while deeper evidence is requested.",
+        context={
+            "event_type": "question_answer",
+            "audience": "operator-fyi",
+            "message_role": "operator_reply",
+            "_workday_consultation_requested": True,
+            "_conversation_public_reply_owner": "fast",
+        },
+    )
+    private_packet = ProjectMessage(
+        project_id=project.id,
+        sequence=3,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="Private Workday question must not reach the operator transcript.",
+        context={
+            "audience": "strategist-internal",
+            "_conversation_consultation_packet": True,
+            "_workday_consultation_atomic_reply_id": str(requested.id),
+        },
+    )
+    continuation = ProjectMessage(
+        project_id=project.id,
+        sequence=4,
         surface=MessageSurface.CONVERSATION,
         message_type=MessageType.NOTE,
         from_type="strategic",
@@ -2527,14 +3023,20 @@ async def test_strategic_conversation_preserves_workday_ui_provenance(
     )
     operator_message = ProjectMessage(
         project_id=project.id,
-        sequence=3,
+        sequence=5,
         surface=MessageSurface.CONVERSATION,
         message_type=MessageType.NOTE,
         from_type="user",
         content="This real operator turn must remain visible.",
         context={},
     )
-    db_session.add_all([activation, continuation, operator_message])
+    db_session.add_all([
+        activation,
+        requested,
+        private_packet,
+        continuation,
+        operator_message,
+    ])
     await db_session.commit()
 
     resp = await client.get(
@@ -2546,6 +3048,13 @@ async def test_strategic_conversation_preserves_workday_ui_provenance(
     assert by_id[str(activation.id)]["context"][
         "_resident_activation_prompt"
     ] is True
+    assert by_id[str(requested.id)]["context"] == {
+        "event_type": "question_answer",
+        "audience": "operator-fyi",
+        "message_role": "operator_reply",
+        "_workday_consultation_requested": True,
+    }
+    assert str(private_packet.id) not in by_id
     assert by_id[str(continuation.id)]["context"] == {
         "event_type": "question_answer",
         "audience": "operator-fyi",
@@ -4643,7 +5152,7 @@ async def test_strategic_message_idempotency_rejects_actor_or_chip_collision(
 
 
 @pytest.mark.asyncio
-async def test_strategic_session_message_touches_workbench_freshness(
+async def test_strategic_session_message_without_snapshot_preserves_workbench(
     client: AsyncClient, db_session
 ):
     project = await _make_project(db_session)
@@ -4655,7 +5164,7 @@ async def test_strategic_session_message_touches_workbench_freshness(
             prefs={
                 "_strategic_workbench": {
                     "version": 1,
-                    "interaction_mode": "continuous",
+                    "interaction_mode": "chat",
                     "active_surface": "pipeline",
                     "selected_refs": [
                         {"kind": "task", "id": "task-9", "label": "Watch task"}
@@ -4688,7 +5197,7 @@ async def test_strategic_session_message_touches_workbench_freshness(
         )
     ).scalar_one()
     workbench = stored.prefs["_strategic_workbench"]
-    assert workbench["interaction_mode"] == "continuous"
+    assert workbench["interaction_mode"] == "chat"
     assert workbench["active_surface"] == "pipeline"
     assert workbench["selected_refs"] == [
         {"kind": "task", "id": "task-9", "label": "Watch task"}

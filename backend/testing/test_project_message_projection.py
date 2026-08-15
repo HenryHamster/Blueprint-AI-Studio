@@ -155,7 +155,27 @@ def test_message_preview_compacts_content_and_context_subset():
 
 def test_message_preview_preserves_bounded_workday_chat_provenance():
     result_packet_id = "packet-" + ("a" * 200)
-    msg = _message(
+    requested = _message(
+        from_type="strategic",
+        surface=MessageSurface.CONVERSATION,
+        context={
+            "event_type": "question_answer",
+            "message_role": "operator_reply",
+            "_workday_consultation_requested": True,
+            "_conversation_public_reply_owner": "fast",
+        },
+    )
+    fast_only = _message(
+        from_type="strategic",
+        surface=MessageSurface.CONVERSATION,
+        context={
+            "event_type": "question_answer",
+            "message_role": "operator_reply",
+            "_workday_consultation_requested": False,
+            "_conversation_public_reply_owner": "fast",
+        },
+    )
+    continuation = _message(
         from_type="strategic",
         surface=MessageSurface.CONVERSATION,
         context={
@@ -167,12 +187,29 @@ def test_message_preview_preserves_bounded_workday_chat_provenance():
         },
     )
 
-    data = message_preview_dict(msg)
-    event = message_event_payload(msg)
+    requested_data = message_preview_dict(requested)
+    requested_event = message_event_payload(requested)
+    fast_only_data = message_preview_dict(fast_only)
+    fast_only_event = message_event_payload(fast_only)
+    data = message_preview_dict(continuation)
+    event = message_event_payload(continuation)
 
+    assert requested_data["context"] == {
+        "event_type": "question_answer",
+        "message_role": "operator_reply",
+        "_workday_consultation_requested": True,
+    }
+    assert requested_event["message"]["context"] == requested_data["context"]
+    assert fast_only_data["context"] == {
+        "event_type": "question_answer",
+        "message_role": "operator_reply",
+        "_workday_consultation_requested": False,
+    }
+    assert fast_only_event["message"]["context"] == fast_only_data["context"]
     assert data["context"]["message_role"] == "workday_consultation_continuation"
     assert data["context"]["_workday_result_packet_id"].endswith("…")
     assert len(data["context"]["_workday_result_packet_id"]) <= 120
+    assert "_workday_consultation_requested" not in data["context"]
     assert data["context"]["_resident_activation_prompt"] is True
     assert "_conversation_public_reply_owner" not in data["context"]
     assert event["message"]["context"] == data["context"]

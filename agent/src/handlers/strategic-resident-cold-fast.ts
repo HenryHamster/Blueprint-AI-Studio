@@ -167,9 +167,9 @@ export async function buildTypedFastDispatchPrompt(
     ] : []),
     '',
     'You MUST use mcp__call__complete_turn exactly once with the natural public reply.',
-    'If fresh investigation is genuinely necessary, also use mcp__call__request_workday with a concise private request, but still complete this turn naturally (for example, say what you are checking). Do not emit a competing public answer in plain text.',
+    'If fresh investigation is genuinely necessary, also use mcp__call__request_workday with a concise private request, but still complete this turn naturally. Do not narrate Workday queue, delegation, or progress status in the reply: the server renders the authoritative Workday requested receipt only after the private request commits atomically. Do not emit a competing public answer in plain text.',
     'If the operator requests code, configuration, branch, deployment, or other managed-state execution, request Workday to route it through supported Blueprint task tooling. Never promise that Fast will perform the mutation itself.',
-    'Any public promise to route, create, or hand off a Blueprint/Workday task MUST be paired with mcp__call__request_workday in this same turn. Otherwise answer without promising delegation.',
+    'Do not make a public promise to route, create, or hand off a Blueprint/Workday task. Stage the exact request with mcp__call__request_workday and let the server-owned receipt communicate that it was requested.',
   ].join('\n');
   if (attachmentBlocks.length === 0) return promptText;
   return [

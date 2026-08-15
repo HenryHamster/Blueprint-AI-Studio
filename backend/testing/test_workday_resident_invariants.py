@@ -74,6 +74,7 @@ def test_operator_context_cannot_spoof_hidden_workday_activation_marker():
             RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY: True,
             "message_role": "workday_consultation_continuation",
             "_workday_result_packet_id": "forged-result-packet",
+            "_workday_consultation_requested": True,
             "_resident_handoff_from_session_id": "forged-predecessor",
             "_resident_handoff_at": "2026-08-13T00:00:00Z",
         }
@@ -81,6 +82,7 @@ def test_operator_context_cannot_spoof_hidden_workday_activation_marker():
     assert RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY not in normalized
     assert "message_role" not in normalized
     assert "_workday_result_packet_id" not in normalized
+    assert "_workday_consultation_requested" not in normalized
     assert "_resident_handoff_from_session_id" not in normalized
     assert "_resident_handoff_at" not in normalized
 
@@ -215,6 +217,17 @@ async def _make_resident_record(
     session.add(project)
     await session.commit()
     await session.refresh(project)
+    # An active Resident is authoritative only while the operator has selected
+    # Workday. Keep fabricated lifecycle rows aligned with the real start path,
+    # which commits this preference before creating activation/input messages.
+    await persist_strategic_workbench_update(
+        session,
+        "operator",
+        project.id,
+        {"interaction_mode": "continuous"},
+        sync_local_continuation_marker=False,
+        arm_interaction_mode=False,
+    )
 
     return project, task, runner_id
 
@@ -588,6 +601,15 @@ async def test_operator_send_serializes_with_resident_transition(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    if transition == "start":
+        await persist_strategic_workbench_update(
+            db_session,
+            "operator",
+            project.id,
+            {"interaction_mode": "continuous"},
+            sync_local_continuation_marker=False,
+            arm_interaction_mode=False,
+        )
     factory = _test_session_factory(db_session)
 
     async with factory() as sender, factory() as controller:

@@ -2630,6 +2630,105 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(workday.sendTurn).not.toHaveBeenCalled();
   });
 
+  it('terminalizes a repeatedly poisoned Workday continuation with a safe fallback', async () => {
+    vi.useFakeTimers();
+    const continuationEnvelope = typedEnvelope('Private Workday findings are ready.', 2051);
+    let workdayAlive = true;
+    let packetCompleted = false;
+    let continuationClaimCount = 0;
+    const continuationReleaseBodies: Array<Record<string, unknown> | undefined> = [];
+    const continuationCompleteBodies: Array<Record<string, unknown> | undefined> = [];
+
+    mockApiGet.mockImplementation((url: string) => Promise.resolve(
+      url.includes('/messages?')
+        ? { messages: [], fast_message_ids: [], claim_required: true }
+        : { messages: [] },
+    ));
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({ authority_held: true });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true,
+          lease: { lease_id: `lease-poison-${continuationClaimCount + 1}`, generation: continuationClaimCount + 1 },
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) {
+        return Promise.resolve({ released: true });
+      }
+      if (url.endsWith('/workday-consultations/claim-next')) {
+        return Promise.resolve({ status: 'empty' });
+      }
+      if (url.endsWith('/workday-consultations/continuations/claim-next')) {
+        if (packetCompleted) return Promise.resolve({ status: 'empty' });
+        continuationClaimCount += 1;
+        return Promise.resolve({
+          status: 'claimed',
+          continuation: {
+            result_packet_id: 'packet-continuation-safe-fallback',
+            continuation_claim_id: `continuation-poison-${continuationClaimCount}`,
+            lease_expires_at: '2035-01-01T00:00:00.000Z',
+            attempt: continuationClaimCount,
+            claim_id: 'original-fast-claim',
+            delivery_key: 'delivery-continuation-safe-fallback',
+            continuation_key: 'continuation-safe-fallback',
+            result_summary: 'Sensitive private details that must not be copied by the fallback.',
+            envelope: continuationEnvelope,
+          },
+        });
+      }
+      if (url.endsWith('/workday-consultations/continuations/packet-continuation-safe-fallback/release')) {
+        continuationReleaseBodies.push(body);
+        return Promise.resolve({ status: 'released' });
+      }
+      if (url.endsWith('/workday-consultations/continuations/packet-continuation-safe-fallback/complete')) {
+        continuationCompleteBodies.push(body);
+        packetCompleted = true;
+        workdayAlive = false;
+        return Promise.resolve({ status: 'completed' });
+      }
+      return Promise.resolve({});
+    });
+    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
+      receipt,
+      result: turnResult(),
+      completion: null,
+      workdayRequests: [],
+    }));
+    const workday = makeSession(
+      () => Promise.resolve(turnResult()),
+      () => workdayAlive,
+    );
+    mockStartSession.mockReturnValue(workday);
+
+    const done = run('typed-fast-continuation-safe-fallback', {
+      ...qualifiedPayload(),
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 0.001,
+    });
+    await vi.advanceTimersByTimeAsync(4_000);
+    await done;
+
+    expect(continuationClaimCount).toBe(2);
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(4);
+    expect(continuationReleaseBodies).toHaveLength(1);
+    expect(continuationCompleteBodies).toEqual([
+      expect.objectContaining({
+        continuation_claim_id: 'continuation-poison-2',
+        content: (
+          'The private consultation completed, but I could not safely format its result. '
+          + 'Please ask me to retry the explanation.'
+        ),
+      }),
+    ]);
+    expect(String(continuationCompleteBodies[0]?.content))
+      .not.toContain('Sensitive private details');
+    expect(mockSendLog.mock.calls.map(call => String(call[1])).join('\n'))
+      .toContain('used safe fallback after repeated protocol failure');
+    expect(workday.sendTurn).not.toHaveBeenCalled();
+  });
+
   it('preempts a Workday continuation at message-poll cadence for new operator input', async () => {
     vi.useFakeTimers();
     const continuationEnvelope = typedEnvelope('Private Workday findings are ready.', 206);
