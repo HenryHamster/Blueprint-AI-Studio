@@ -9,7 +9,6 @@ from typing import Any
 
 from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.conversation_coordinator import _workday_claim_expiry
@@ -22,6 +21,7 @@ from app.models import (
     StrategicMemorySource,
 )
 from app.strategic_conversation_query import strategic_conversation_predicate
+from app.task_locking import with_vision_locked
 from app.time_utils import _utcnow
 
 
@@ -311,11 +311,26 @@ async def project_current_consultation_activity(
         project_id=project.id,
         resident_session_id=resident_session_id,
     )
-    return project_consultation_activity(
-        project,
+    vision = dict(project.vision or {})
+    transition = project_consultation_activity(
+        vision,
         resident_session_id=resident_session_id,
         verified=verified,
     )
+    if transition is None:
+        return None
+
+    def _mutate(current: dict[str, Any]) -> None:
+        current.clear()
+        current.update(vision)
+
+    await with_vision_locked(
+        session,
+        project.id,
+        _mutate,
+        _locked_project=project,
+    )
+    return transition
 
 
 async def emit_consultation_activity_if_changed(
@@ -374,17 +389,17 @@ async def completed_workday_consultation_id(
 
 
 def project_consultation_activity(
-    project: Project,
+    vision: dict[str, Any],
     *,
     resident_session_id: str,
     verified: VerifiedConsultationActivity | None,
 ) -> dict[str, Any] | None:
-    """Atomically mirror canonical queue state into the locked Project vision.
+    """Prepare the canonical queue-state mutation for a locked Project vision.
 
     The returned activity is non-null only for a semantic transition and is
-    safe to broadcast after the surrounding transaction commits.
+    safe to broadcast after the caller applies ``vision`` with the canonical
+    lock helper and commits.
     """
-    vision = dict(project.vision or {})
     resident_raw = vision.get(_RESIDENT_SESSION_KEY)
     if not isinstance(resident_raw, dict):
         return None
@@ -425,8 +440,6 @@ def project_consultation_activity(
     resident["activity"] = updated
     resident["updated_at"] = now_iso
     vision[_RESIDENT_SESSION_KEY] = resident
-    project.vision = vision
-    flag_modified(project, "vision")
     return updated
 
 

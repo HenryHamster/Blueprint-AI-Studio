@@ -17,7 +17,6 @@ import uuid
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -34,6 +33,7 @@ from app.project_message_creation import (
     build_project_message,
     lock_project_and_next_message_sequence,
 )
+from app.task_locking import with_vision_locked
 from app.strategic_fast_live_work import _fast_live_work_authority
 from app.strategic_memory_envelope import build_and_store_context_envelope_snapshot
 from app.time_utils import _utcnow
@@ -141,13 +141,24 @@ def _lease_response(lease: dict[str, Any], *, duplicate: bool) -> dict[str, Any]
     }
 
 
-def _store_lease(project: Project, resident: dict[str, Any], lease: dict[str, Any]) -> None:
+async def _store_lease(
+    session: AsyncSession,
+    project: Project,
+    resident: dict[str, Any],
+    lease: dict[str, Any],
+) -> None:
     resident[_LEASE_KEY] = lease
     resident["updated_at"] = _utcnow().isoformat()
-    vision = dict(project.vision or {})
-    vision[_RESIDENT_KEY] = resident
-    project.vision = vision
-    flag_modified(project, "vision")
+
+    def _mutate(vision: dict[str, Any]) -> None:
+        vision[_RESIDENT_KEY] = resident
+
+    await with_vision_locked(
+        session,
+        project.id,
+        _mutate,
+        _locked_project=project,
+    )
 
 
 def _same_lease(
@@ -294,7 +305,7 @@ async def _begin(
         "updated_at": now.isoformat(),
         "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat(),
     }
-    _store_lease(project, resident, lease)
+    await _store_lease(session, project, resident, lease)
     session.add(project)
     await session.commit()
     return _lease_response(lease, duplicate=False)
@@ -558,7 +569,7 @@ async def _report(
         updated_at=now.isoformat(),
     )
     resident = _resident(project)
-    _store_lease(project, resident, lease)
+    await _store_lease(session, project, resident, lease)
     session.add(project)
     await session.commit()
     return {
@@ -599,7 +610,7 @@ async def _end(
         return {"status": "duplicate", "autonomous_turn_id": str(turn_id)}
     lease = dict(lease)
     lease.update(status="ended", ended_at=_utcnow().isoformat(), updated_at=_utcnow().isoformat())
-    _store_lease(project, resident, lease)
+    await _store_lease(session, project, resident, lease)
     session.add(project)
     await session.commit()
     return {"status": "ended", "autonomous_turn_id": str(turn_id)}

@@ -63,7 +63,10 @@ async function makeFixture(helper: 'fail' | 'blocked', mode: PushMode): Promise<
   const os = await vi.importActual<typeof import('node:os')>('node:os');
   const path = await vi.importActual<typeof import('node:path')>('node:path');
   const bash = process.platform === 'win32' ? 'C:/Program Files/Git/bin/bash.exe' : 'bash';
-  const git = process.platform === 'win32' ? 'C:/Program Files/Git/cmd/git.exe' : 'git';
+  const git = process.platform === 'win32'
+    ? 'C:/Program Files/Git/cmd/git.exe'
+    : cp.execFileSync(bash, ['-lc', 'command -v git'], { encoding: 'utf8' }).trim();
+  if (!path.isAbsolute(git)) throw new Error(`Expected absolute real Git path, got: ${git}`);
   const taskId = `checkpoint-focused-${helper}-${mode}-${process.pid}-${sequence++}`;
   const workBranch = `blueprint/${taskId}`;
   const dir = realFs.mkdtempSync(path.join(os.tmpdir(), 'terminal-checkpoint-focused-'));

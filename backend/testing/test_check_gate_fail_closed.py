@@ -27,6 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if not (_REPO_ROOT / "check").exists() and Path("/repo/check").exists():
     _REPO_ROOT = Path("/repo")
 _CHECK = _REPO_ROOT / "check"
+_DEFAULT_CHECK = _REPO_ROOT / "scripts" / "check-default.sh"
 _ROUTE_HELPER = _REPO_ROOT / "scripts" / "backend-test-route.sh"
 
 
@@ -39,8 +40,17 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _install_developer_check(repo: Path) -> None:
+    """Install the tracked developer gate where the dispatcher resolves it."""
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    destination = scripts_dir / "check-default.sh"
+    shutil.copy2(_DEFAULT_CHECK, destination)
+    destination.chmod(destination.stat().st_mode | stat.S_IXUSR)
+
+
 def _init_repo(repo: Path) -> None:
-    """Bootstrap a minimal git repo with one committed file."""
+    """Bootstrap a minimal repo with the tracked developer gate committed."""
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     _git(repo, "config", "user.email", "check-gate-test@example.com")
@@ -48,8 +58,13 @@ def _init_repo(repo: Path) -> None:
     # A host-level gpg signing config would otherwise make the throwaway commit
     # try to sign (and fail) for reasons unrelated to the gate under test.
     _git(repo, "config", "commit.gpgsign", "false")
+    # ``check`` is now a dispatcher: task work reaches ``.check-task`` while a
+    # true developer checkout reaches this tracked fallback. Commit the fallback
+    # into the fixture before creating the base ref so it does not manufacture
+    # an unrelated untracked diff in tests whose subject is an empty diff.
+    _install_developer_check(repo)
     (repo / "file.txt").write_text("hello\n", encoding="utf-8")
-    _git(repo, "add", "file.txt")
+    _git(repo, "add", "file.txt", "scripts/check-default.sh")
     _git(repo, "commit", "-q", "-m", "initial")
 
 
@@ -57,6 +72,9 @@ def _run_check(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Run the tracked ``./check`` script against the throwaway repo."""
     env = os.environ.copy()
     env["WORKSPACE"] = str(repo)
+    # This fixture exercises the tracked developer route. A host/CI TASK_ID
+    # must not accidentally select the generated task-gate route instead.
+    env.pop("TASK_ID", None)
     return subprocess.run(
         ["bash", str(_CHECK), *args],
         capture_output=True,
@@ -136,7 +154,6 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
     repo = tmp_path / "repo"
     _init_repo(repo)
     _git(repo, "branch", "automain")
-    (repo / "scripts").mkdir()
     (repo / "backend" / "app").mkdir(parents=True)
     (repo / "backend" / "testing").mkdir(parents=True)
     shutil.copy2(_ROUTE_HELPER, repo / "scripts" / "backend-test-route.sh")
@@ -172,6 +189,7 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
 
     env = os.environ.copy()
     env["WORKSPACE"] = str(repo)
+    env.pop("TASK_ID", None)
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["BLUEPRINT_SANDBOX_PYTHON"] = str(tmp_path / "missing-python")
     result = subprocess.run(

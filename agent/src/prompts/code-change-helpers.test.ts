@@ -1715,7 +1715,7 @@ describe('writeCodeChangeHelpers — executable terminal checkpoint lease', () =
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
     const realPath = await vi.importActual<typeof import('node:path')>('node:path');
     const bash = process.platform === 'win32' ? 'C:/Program Files/Git/bin/bash.exe' : 'bash';
-    const git = process.platform === 'win32' ? 'C:/Program Files/Git/cmd/git.exe' : 'git';
+    const git = process.platform === 'win32' ? 'C:/Program Files/Git/cmd/git.exe' : realCp.execFileSync(bash, ['-lc', 'command -v git'], { encoding: 'utf8' }).trim();
     const taskId = `checkpoint-${helper}-${mode}-${process.pid}-${sequence++}`;
     const workBranch = `blueprint/${taskId}`;
     const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'terminal-checkpoint-'));
