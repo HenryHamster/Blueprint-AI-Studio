@@ -582,6 +582,75 @@ async def test_update_drain_heartbeat_releases_unpulled_pins(db_session):
 
 
 @pytest.mark.asyncio
+async def test_update_drain_heartbeat_keeps_unpulled_resident_pin(db_session):
+    """An auto-update drain preserves only the canonical active Resident pin."""
+    project, runner = await _make_runner(db_session)
+    resident = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{runner.id}",
+        vm_provisioned_at=_utcnow(),
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "ss-hard-pin",
+            "_resident_worker_generation": 2,
+            "runner_target_id": str(runner.id),
+            "strategic_local_runner_required": True,
+            "strategic_local_runner_reason": "resident_session",
+        },
+        started_at=None,
+    )
+    stale_marker = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{runner.id}",
+        vm_provisioned_at=_utcnow(),
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "ss-stale-marker",
+            "_resident_worker_generation": 1,
+            "runner_target_id": str(runner.id),
+            "preferred_runner_target_id": str(runner.id),
+        },
+        started_at=None,
+    )
+    project.vision = {
+        **(project.vision or {}),
+        "_resident_strategic_session": {
+            "session_id": "ss-hard-pin",
+            "task_id": str(resident.id),
+            "worker_generation": 2,
+            "runner_id": str(runner.id),
+            "status": "active",
+            "stop_requested": False,
+        },
+    }
+    db_session.add_all([project, resident, stale_marker])
+    await db_session.commit()
+    pinned_at = resident.vm_provisioned_at
+    pinned_context = dict(resident.context or {})
+
+    for _ in range(2):
+        await heartbeat(
+            payload=HeartbeatRequest(update_draining=True),
+            runner=runner,
+            session=db_session,
+        )
+    await db_session.refresh(resident)
+    await db_session.refresh(stale_marker)
+
+    assert resident.status == TaskStatus.PROVISIONING
+    assert resident.vm_instance_id == f"runner:{runner.id}"
+    assert resident.vm_provisioned_at == pinned_at
+    assert resident.context == pinned_context
+    assert stale_marker.status == TaskStatus.QUEUED
+    assert stale_marker.vm_instance_id is None
+    assert "runner_target_id" not in stale_marker.context
+
+
+@pytest.mark.asyncio
 async def test_daemon_heartbeat_omission_invalidates_stale_gpu_proof(db_session):
     """An old replacement daemon cannot inherit a prior process's proof."""
     stale_proof = {

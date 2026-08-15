@@ -128,6 +128,51 @@ describe('PipelineView task status visibility', () => {
     expect(nodeFor('running-task').className).not.toMatch(/opacity-40/);
   });
 
+  it('labels evaluating coordination separately from executing work', () => {
+    render(
+      <PipelineView
+        tasks={[makeTask({ id: 'evaluating-parent', title: 'Evaluating parent', status: 'EVALUATING' })]}
+        onViewLogs={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTitle('1 evaluating; not executing work')).toHaveTextContent('1 eval');
+    expect(document.querySelector('.text-yellow-400')).toBeNull();
+  });
+
+  it('labels an IN_PROGRESS lifecycle claim without asserting live execution', () => {
+    render(
+      <PipelineView
+        tasks={[makeTask({ id: 'claimed-task', title: 'Claimed task', status: 'IN_PROGRESS' })]}
+        onViewLogs={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByTitle('1 in progress; lifecycle claim does not prove a live heartbeat'),
+    ).toHaveTextContent('1 in progress');
+    expect(screen.queryByText(/running/i)).not.toBeInTheDocument();
+  });
+
+  it('labels a provisioning reservation as starting rather than running', () => {
+    render(
+      <PipelineView
+        tasks={[makeTask({
+          id: 'starting-task',
+          title: 'Reserved runner',
+          status: 'PROVISIONING',
+          last_heartbeat: new Date().toISOString(),
+        })]}
+        onViewLogs={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTitle('1 starting; runner reserved but work not yet claimed')).toHaveTextContent('1 starting');
+    expect(screen.queryByTitle(/in progress; lifecycle claim/)).not.toBeInTheDocument();
+    expect(nodeFor('starting-task').textContent).toContain('Starting');
+    expect(nodeFor('starting-task').querySelector('[title="Healthy (< 2m)"]')).toBeNull();
+  });
+
   it('expands groups with waiting children by default', () => {
     const tasks = [
       makeTask({ id: 'root-waiting', title: 'Root waiting group', status: 'QUEUED' }),

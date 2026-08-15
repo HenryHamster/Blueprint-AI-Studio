@@ -15054,6 +15054,153 @@ async def test_runtime_unavailable_local_runner_records_decline_without_retry_bu
 
 
 @pytest.mark.asyncio
+async def test_postgres_runtime_sentinel_learns_verification_and_declines_runner(
+    client: AsyncClient, db_session, mocker
+):
+    """A real status lifecycle persists the PG gate without a code retry burn."""
+    from app.execution_capability_requirements import (
+        CAPABILITY_BACKEND_VERIFICATION,
+        POSTGRES_RUNTIME_UNAVAILABLE_SENTINEL,
+        learned_execution_capabilities,
+    )
+    from app.routers.agent import _terminated_task_ids
+    from app.runner_decline import recently_declined_runner_ids
+
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._restore_resident_retry_binding",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(name="PG learned route", user_id="test-user-pg-learned")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = uuid.uuid4()
+    runner_vm_id = f"runner:{runner_id}"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "refactor", "prompt": "finish backend work"}],
+        vm_instance_id=runner_vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+        context={
+            "runner_target_id": str(runner_id),
+            "runner_hostname": "no-postgres-runner",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    _terminated_task_ids.pop(task_id, None)
+    response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id,
+            "status": "FAILED",
+            "failure_category": "agent_self_failed",
+            "logs": POSTGRES_RUNTIME_UNAVAILABLE_SENTINEL,
+            "execution_capability": "backend_verification",
+        },
+        headers={"x-agent-token": create_agent_token(task_id, runner_vm_id)},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "retrying"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 3
+    assert task.retry_after_until is None
+    assert learned_execution_capabilities(task.context) == {
+        CAPABILITY_BACKEND_VERIFICATION
+    }
+    assert recently_declined_runner_ids(task) == {str(runner_id)}
+    assert task.context["declined_by"][str(runner_id)][
+        "same_runner_retryable"
+    ] is False
+    assert (task.context or {}).get("failure_category") is None
+    _terminated_task_ids.pop(task_id, None)
+
+
+@pytest.mark.asyncio
+async def test_fenced_exact_capability_sentinels_do_not_grant_routing_authority(
+    client: AsyncClient, db_session, mocker
+):
+    """Model prose can affect classification, but not routing or retry budget."""
+    from app.execution_capability_requirements import (
+        POSTGRES_RUNTIME_UNAVAILABLE_SENTINEL,
+        learned_execution_capabilities,
+    )
+    from app.routers.agent import _terminated_task_ids
+
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._restore_resident_retry_binding",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(name="Quoted sentinel", user_id="test-user-quoted-sentinel")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    runner_id = uuid.uuid4()
+    runner_vm_id = f"runner:{runner_id}"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "refactor", "prompt": "explain infrastructure"}],
+        vm_instance_id=runner_vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        context={
+            "runner_target_id": str(runner_id),
+            "runner_hostname": "quoted-sentinel-runner",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+    _terminated_task_ids.pop(task_id, None)
+    logs = (
+        "The following are examples, not helper results:\n"
+        "```text\n"
+        f"{POSTGRES_RUNTIME_UNAVAILABLE_SENTINEL}\n"
+        "```"
+    )
+
+    response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id,
+            "status": "FAILED",
+            "failure_category": "agent_self_failed",
+            "logs": logs,
+        },
+        headers={"x-agent-token": create_agent_token(task_id, runner_vm_id)},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "retrying"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1
+    assert learned_execution_capabilities(task.context) == frozenset()
+    assert not (task.context or {}).get("declined_by")
+    _terminated_task_ids.pop(task_id, None)
+
+
+@pytest.mark.asyncio
 async def test_completed_terminal_populates_terminated_cache(
     client: AsyncClient, db_session, mocker
 ):

@@ -7,7 +7,10 @@ import {
 import { writeGitTokenFile } from '../git-credential.js';
 import type { BuildConfig } from '../index.js';
 import { writeCodeChangeHelpers, SELF_REVIEW_PROMPT_VERSION } from '../prompt.js';
-import { buildTaskCheckpointCommitMessage } from '../task-checkpoint.js';
+import {
+  buildTaskCheckpointCommitMessage,
+  parseTaskCheckpointCommitMessage,
+} from '../task-checkpoint.js';
 // buildPromptSizeTelemetry / setPromptSizeTelemetry are NOT called here —
 // callers (standard.ts, review-fix.ts, specialized.ts) set richer
 // per-section decompositions before invoking runCodeChangeTask.
@@ -208,6 +211,22 @@ function workspaceHasChanges(baseCommit: string): boolean {
   }
 }
 
+function readRemoteBranchSha(workBranch: string): string | null {
+  const ref = `refs/heads/${workBranch}`;
+  const output = git(['ls-remote', '--heads', 'origin', ref]).trim();
+  if (!output) return null;
+
+  const matches = output.split('\n').map(line => line.trim()).filter(Boolean);
+  if (matches.length !== 1) {
+    throw new Error(`Expected one remote checkpoint ref for ${ref}, got ${matches.length}`);
+  }
+  const [sha, remoteRef] = matches[0].split(/\s+/, 2);
+  if (remoteRef !== ref || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(sha)) {
+    throw new Error(`Malformed remote checkpoint ref returned for ${ref}`);
+  }
+  return sha;
+}
+
 /** Persist work that reached the fail-closed path without a terminal marker.
  *
  * The provenance-marked commit is intentionally pushed to the canonical task
@@ -215,16 +234,34 @@ function workspaceHasChanges(baseCommit: string): boolean {
  * this marker in prepareTaskWorkBranch and restores its diff onto the current
  * base. force-with-lease permits a second failed retry to replace the previous
  * checkpoint while refusing to clobber an unexpected concurrent branch update.
+ * The lease is pinned to the SHA observed before the first push. It is never
+ * refreshed to a competing remote tip: after an ambiguous push failure we only
+ * accept remote==local (the response was lost) or remote==the original lease
+ * (safe to retry). Every other state fails closed.
  */
 async function checkpointUnshippedWork(
   opts: Pick<CodeChangeTaskOpts, 'taskId' | 'workBranch' | 'baseCommit'>,
   ws: WebSocket | null,
-): Promise<boolean> {
+): Promise<{ branch: string; sha: string } | null> {
   try {
-    git(['add', '-A']);
-    const message = buildTaskCheckpointCommitMessage(opts.taskId, opts.baseCommit);
-    const [subject, ...bodyLines] = message.split('\n');
-    git(['commit', '--allow-empty', '-m', subject, '-m', bodyLines.join('\n').trim()]);
+    // A generated ./fail|./blocked helper may have committed and pushed before
+    // its status request lost a response. Reuse that exact checkpoint rather
+    // than stacking another provenance commit on every recovery pass.
+    let existingCheckpoint = false;
+    try {
+      const workspaceDirty = git(['status', '--porcelain']).length > 0;
+      const metadata = parseTaskCheckpointCommitMessage(
+        git(['show', '-s', '--format=%B', 'HEAD']),
+        opts.taskId,
+      );
+      existingCheckpoint = !workspaceDirty && metadata?.baseCommit === opts.baseCommit;
+    } catch { /* create a fresh provenance commit below */ }
+    if (!existingCheckpoint) {
+      git(['add', '-A']);
+      const message = buildTaskCheckpointCommitMessage(opts.taskId, opts.baseCommit);
+      const [subject, ...bodyLines] = message.split('\n');
+      git(['commit', '--allow-empty', '-m', subject, '-m', bodyLines.join('\n').trim()]);
+    }
     // Refresh here: a long session may outlive its installation token.
     try {
       const fresh = await apiGet(
@@ -241,23 +278,74 @@ async function checkpointUnshippedWork(
         `${error instanceof Error ? error.message : String(error)}\n`,
       );
     }
-    await gitAsync([
-      'push', '--force-with-lease', 'origin',
-      `HEAD:refs/heads/${opts.workBranch}`,
-    ]);
+    const localSha = git(['rev-parse', 'HEAD']);
+    const expectedRemoteSha = readRemoteBranchSha(opts.workBranch);
+    if (expectedRemoteSha === localSha) {
+      sendLog(
+        ws,
+        `[wrapper] Existing checkpoint ${localSha.slice(0, 12)} is already durable on ` +
+        `${opts.workBranch}; not pushing it again.\n`,
+      );
+      return { branch: opts.workBranch, sha: localSha };
+    }
+
+    const remoteRef = `refs/heads/${opts.workBranch}`;
+    const lease = `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ''}`;
+    let pushError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await gitAsync([
+          'push', lease, 'origin', `HEAD:${remoteRef}`,
+        ]);
+        pushError = undefined;
+        break;
+      } catch (error) {
+        pushError = error;
+        try {
+          const observedRemoteSha = readRemoteBranchSha(opts.workBranch);
+          if (observedRemoteSha === localSha) {
+            // The remote write happened and only the client response was lost.
+            pushError = undefined;
+            break;
+          }
+          if (observedRemoteSha !== expectedRemoteSha) {
+            throw new Error(
+              `Checkpoint branch ${opts.workBranch} changed concurrently ` +
+              `(expected ${expectedRemoteSha ?? 'absent'}, observed ${observedRemoteSha ?? 'absent'}); ` +
+              'refusing to overwrite it.',
+            );
+          }
+        } catch (reconcileError) {
+          // A definite competing SHA is terminal. A remote-read failure remains
+          // retryable because the unchanged explicit lease still prevents a
+          // later push from overwriting either an accepted or competing write.
+          if (reconcileError instanceof Error && reconcileError.message.includes('changed concurrently')) {
+            throw reconcileError;
+          }
+          pushError = reconcileError;
+        }
+        if (attempt < 3) {
+          await new Promise(resolve => setTimeout(resolve, attempt * 1_000));
+        }
+      }
+    }
+    if (pushError !== undefined) {
+      if (pushError instanceof Error) throw pushError;
+      throw new Error('Checkpoint push failed with a non-Error rejection');
+    }
     sendLog(
       ws,
       `[wrapper] Preserved unshipped work on durable checkpoint branch ${opts.workBranch}; ` +
       'the next retry will restore it before running.\n',
     );
-    return true;
+    return { branch: opts.workBranch, sha: localSha };
   } catch (error) {
     sendLog(
       ws,
       `[wrapper] WARNING: failed to persist unshipped-work checkpoint: ` +
       `${error instanceof Error ? error.message : String(error)}\n`,
     );
-    return false;
+    return null;
   }
 }
 
@@ -291,11 +379,14 @@ async function inspectTerminalMarkers(
     return 'handled';
   }
   if (fs.existsSync(failMarker)) {
-    sendLog(ws, `[wrapper] ./fail marker present${note} — Claude posted FAILED. Exiting cleanly.\n`);
+    // The generated helper checkpoints before posting status or writing this
+    // marker. Re-checkpointing here would stack redundant commits after the
+    // terminal transition and is too late to protect an immediate retry.
+    sendLog(ws, `[wrapper] ./fail marker present${note} — Claude checkpointed pending work and posted FAILED. Exiting cleanly.\n`);
     return 'handled';
   }
   if (fs.existsSync(blockedMarker)) {
-    sendLog(ws, `[wrapper] ./blocked marker present${note} — Claude posted BLOCKED_PRECONDITION. Exiting cleanly.\n`);
+    sendLog(ws, `[wrapper] ./blocked marker present${note} — Claude checkpointed pending work and posted BLOCKED_PRECONDITION. Exiting cleanly.\n`);
     return 'handled';
   }
 
@@ -379,6 +470,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     `/tmp/fix_sr_context_${taskId}.json`,
     `/tmp/task_${taskId}_result.json`,
     `/tmp/test_baseline_${taskId}.json`,
+    `/tmp/execution_capability_receipt_${taskId}`,
   ]) {
     try { fs.unlinkSync(f); } catch { /* not present — fine */ }
   }
@@ -578,8 +670,20 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     : `Claude subprocess exited with code ${exitCode} without shipping a PR.`;
   const logs = `${reason}\n\n--- Claude output tail ---\n${sanitize(allOutput.slice(-10_000))}`;
   sendLog(ws, `[wrapper] ${reason}\n`);
+  let checkpointReceipt: { branch: string; sha: string } | null = null;
   if (hasChanges) {
-    await checkpointUnshippedWork(opts, ws);
+    checkpointReceipt = await checkpointUnshippedWork(opts, ws);
+    if (!checkpointReceipt) {
+      // Posting a retryable terminal transition now would release this runner
+      // while its disposable worktree still owns the only copy of the diff.
+      // Keep the task non-terminal so recovery cannot race from an empty clone.
+      sendLog(
+        ws,
+        '[wrapper] Refusing to post retryable FAILED status because every durable ' +
+        'checkpoint path failed; preserving task ownership for operator recovery.\n',
+      );
+      return;
+    }
   }
   await persistAndPostStatus(taskId, {
     task_id: taskId,
@@ -590,5 +694,9 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     ...(opts.fileChangeDetails && opts.fileChangeDetails.length > 0
       ? { file_change_details: opts.fileChangeDetails.slice(0, 50) } : {}),
     ...(opts.analysisContext ? { analysis_plan: opts.analysisContext.slice(0, 5000) } : {}),
+    ...(checkpointReceipt ? {
+      commit_hash: checkpointReceipt.sha,
+      storage_uri: `git-ref:refs/heads/${checkpointReceipt.branch}`,
+    } : {}),
   });
 }

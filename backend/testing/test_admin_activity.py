@@ -94,6 +94,63 @@ async def test_completed_task_missing_context_fields_are_none(
     assert ev["review_iterations"] is None
 
 
+@pytest.mark.asyncio
+async def test_activity_running_event_requires_execution_and_hides_resident_rows(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session, name="Activity lifecycle truth")
+    executing = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+        title="Actually executing",
+        context={},
+        last_heartbeat=_utcnow(),
+    )
+    nonexecuting = [
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=status,
+            title=f"Not executing: {status.value}",
+            context={},
+        )
+        for status in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.EVALUATING,
+        )
+    ]
+    resident = [
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=status,
+            title=f"Resident: {status.value}",
+            context={"_resident_infrastructure": True},
+        )
+        for status in (
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+        )
+    ]
+    db_session.add_all([executing, *nonexecuting, *resident])
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/activity?project_id={project.id}")
+
+    assert response.status_code == 200, response.text
+    task_events = [
+        event
+        for event in response.json()["events"]
+        if event["type"].startswith("TASK_")
+    ]
+    assert [(event["type"], event["task_id"]) for event in task_events] == [
+        ("TASK_IN_PROGRESS", str(executing.id))
+    ]
+
+
 @pytest.mark.parametrize(
     ("task_status", "event_type"),
     [

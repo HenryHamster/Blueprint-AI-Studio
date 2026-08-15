@@ -3539,6 +3539,8 @@ def compute_narrative_summary(
     sorted_failures: List[Task],
     direction_progress_list: List[Dict[str, Any]],
     running_count: int,
+    starting_count: int,
+    evaluating_count: int,
     queued_count: int,
     pr_count: int,
     error_log_map: Dict[str, str],
@@ -3792,10 +3794,19 @@ def compute_narrative_summary(
         if dir_summaries:
             narrative_parts.append("Research: " + "; ".join(dir_summaries) + ".")
 
-    if running_count > 0 or queued_count > 0:
+    if (
+        running_count > 0
+        or starting_count > 0
+        or evaluating_count > 0
+        or queued_count > 0
+    ):
         pipeline_parts = []
         if running_count > 0:
-            pipeline_parts.append(f"{running_count} running")
+            pipeline_parts.append(f"{running_count} in progress")
+        if starting_count > 0:
+            pipeline_parts.append(f"{starting_count} starting")
+        if evaluating_count > 0:
+            pipeline_parts.append(f"{evaluating_count} evaluating")
         if queued_count > 0:
             pipeline_parts.append(f"{queued_count} queued")
         narrative_parts.append(", ".join(pipeline_parts) + ".")

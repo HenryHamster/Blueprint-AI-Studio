@@ -879,8 +879,8 @@ export function StrategicContextWorkspace({
                   <SessionSummaryButton
                     icon={<Activity className="h-4 w-4" aria-hidden="true" />}
                     label="Work"
-                    value={`${formatCompactNumber(state?.tasks?.counts.running ?? 0)} running`}
-                    detail={`${formatCompactNumber(state?.tasks?.counts.queued ?? 0)} queued / ${formatCompactNumber(state?.tasks?.counts.blocked ?? 0)} blocked`}
+                    value={`${formatCompactNumber(state?.tasks?.counts.running ?? 0)} in progress`}
+                    detail={`${formatCompactNumber(state?.tasks?.counts.starting ?? 0)} starting / ${formatCompactNumber(state?.tasks?.counts.evaluating ?? 0)} evaluating / ${formatCompactNumber(state?.tasks?.counts.queued ?? 0)} queued / ${formatCompactNumber(state?.tasks?.counts.blocked ?? 0)} blocked`}
                     target={{ surface: 'pipeline', section: 'flow' }}
                     onOpenTarget={handleOpenTarget}
                   />

@@ -295,7 +295,7 @@ describe('PipelineWorkspace viewport regression', () => {
     expect(Boolean(aside.compareDocumentPosition(main) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
     expect(aside.getBoundingClientRect().right).toBeLessThanOrEqual(376);
     expect(aside.getBoundingClientRect().bottom).toBeLessThanOrEqual(main.getBoundingClientRect().top + 1);
-    expect(main.textContent).toContain('In Progress');
+    expect(main.textContent).toContain('In progress');
     expect(main.textContent).toContain(trackedTask.title);
     const nowButtons = Array.from(sideboard.querySelectorAll<HTMLButtonElement>('[data-testid="pipeline-now-panel"] button'));
     expect(nowButtons.length).toBeGreaterThan(0);

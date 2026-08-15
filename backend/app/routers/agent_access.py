@@ -867,6 +867,7 @@ def _project_agent_task_list(
         ),
         "counts": {
             "active": int(raw_response.get("scoped_active_count") or 0),
+            "starting": int(raw_response.get("scoped_starting_count") or 0),
             "evaluating": int(raw_response.get("scoped_evaluating_count") or 0),
             "queued": int(raw_response.get("scoped_queued_count") or 0),
         },
@@ -1379,6 +1380,7 @@ async def list_agent_tasks(
         spawned_by=None,
         approval_needed=approval_needed,
         include_backend_managed=False,
+        include_resident_infrastructure=False,
         session=session,
         current_user=current_user,
     )

@@ -249,6 +249,8 @@ def _build_narrative_summary(**overrides):
         sorted_failures=[],
         direction_progress_list=[],
         running_count=0,
+        starting_count=0,
+        evaluating_count=0,
         queued_count=0,
         pr_count=0,
         error_log_map={},
@@ -267,6 +269,15 @@ def test_compute_narrative_summary_all_clear():
             pr_count=1,
         )
         == "All clear — 1 task completed with 1 PR merged, no action needed."
+    )
+
+
+def test_compute_narrative_summary_names_starting_and_evaluating_separately():
+    assert (
+        _build_narrative_summary(
+            running_count=3, starting_count=1, evaluating_count=2
+        )
+        == "3 in progress, 1 starting, 2 evaluating."
     )
 
 

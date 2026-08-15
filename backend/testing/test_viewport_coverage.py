@@ -11,9 +11,27 @@ dispatcher signal that formerly consumed the snapshot.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from testing.factories import make_project
+
+
+@pytest.mark.asyncio
+async def test_viewport_infra_unavailable_is_advisory_and_not_deterministic_blocked():
+    """The retired VM marker is requeued, never parked for operator escalation."""
+    from app.blocked_task_unblock_sweeps import _blocked_precondition_state
+
+    task = SimpleNamespace(
+        depends_on=[],
+        blocker_kind=None,
+        blocked_reason="BLOCKER: VIEWPORT_GATE_INFRA_UNAVAILABLE: no Docker",
+        latest_status_message="viewport bootstrap unavailable",
+        context={"blocker": {"source": "agent"}},
+    )
+
+    assert await _blocked_precondition_state(task, object(), lambda: None) == "clear"
 
 
 class TestComputeViewportCoverageSnapshot:

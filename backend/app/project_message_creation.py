@@ -123,6 +123,7 @@ SERVER_OWNED_CHAT_CONTEXT_KEYS = frozenset(
         "message_role",
         "_workday_result_packet_id",
         "_workday_consultation_requested",
+        "_workday_consultation_atomic_reply_id",
         "_resident_handoff_from_session_id",
         "_resident_handoff_at",
     }

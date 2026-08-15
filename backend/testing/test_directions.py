@@ -2409,6 +2409,83 @@ async def test_task_counts_excludes_cancelled_and_failed(
 
 
 @pytest.mark.asyncio
+async def test_task_counts_returns_only_visible_nonterminal_work(
+    client: AsyncClient, db_session, mocker
+):
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Visible live work")
+    direction_id = direction["id"]
+    project_uuid = uuid.UUID(project_id)
+
+    visible = [
+        Task(
+            project_id=project_uuid,
+            title=f"Visible {status.value}",
+            payloads=[{"type": "create"}],
+            context={"direction_id": direction_id},
+            status=status,
+        )
+        for status in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+            TaskStatus.BLOCKED,
+            TaskStatus.PARKED,
+        )
+    ]
+    excluded = [
+        Task(
+            project_id=project_uuid,
+            title=f"Terminal {status.value}",
+            payloads=[{"type": "create"}],
+            context={"direction_id": direction_id},
+            status=status,
+        )
+        for status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        )
+    ]
+    excluded.extend(
+        [
+            Task(
+                project_id=project_uuid,
+                title="Resident process row",
+                payloads=[{"type": "strategic_review"}],
+                context={
+                    "direction_id": direction_id,
+                    "_resident_infrastructure": True,
+                },
+                status=TaskStatus.IN_PROGRESS,
+            ),
+            Task(
+                project_id=project_uuid,
+                title="Archived live row",
+                payloads=[{"type": "create"}],
+                context={"direction_id": direction_id},
+                status=TaskStatus.IN_PROGRESS,
+                archived=True,
+            ),
+        ]
+    )
+    db_session.add_all([*visible, *excluded])
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project_id}/directions/task-counts"
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["counts"][direction_id] == len(visible)
+    assert {item["id"] for item in body["active_tasks"][direction_id]} == {
+        str(task.id) for task in visible
+    }
+
+
+@pytest.mark.asyncio
 async def test_task_counts_project_not_found(client: AsyncClient):
     """task-counts returns 404 for a nonexistent project."""
     fake_id = str(uuid.uuid4())

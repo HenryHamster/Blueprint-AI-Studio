@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from app.execution_capability_requirements import (
+    classify_execution_capability_failure_frames,
+)
 from app.time_utils import _utcnow
 
 # Residual-remediation / fingerprinting / per-account-failure-log seam lives in
@@ -49,6 +52,19 @@ if TYPE_CHECKING:
     from app.models import Task
 
 logger = logging.getLogger(__name__)
+
+
+def _trusted_execution_capability_unavailable(
+    task: "Task", logs: str | None = None
+) -> bool:
+    """Use only Blueprint-owned exact sentinels for capability infra routing."""
+
+    return bool(
+        classify_execution_capability_failure_frames(
+            task.latest_status_message or "",
+            logs or "",
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -2138,6 +2154,8 @@ def normalize_agent_failure_category(
             override = _text_provider_failure_override(task, combined)
             if override:
                 return override
+            if _trusted_execution_capability_unavailable(task):
+                return PROVISION_FAILURE
             if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
                 return PROVISION_FAILURE
             # Deployment check tasks (smoketest): a generic code error is an
@@ -2720,6 +2738,8 @@ def _classify_failure_class(
                     override = _text_provider_failure_override(task, combined)
                     if override:
                         return override
+                if _trusted_execution_capability_unavailable(task, logs):
+                    return PROVISION_FAILURE
                 if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
                     return PROVISION_FAILURE
                 if any(kw in combined for kw in _VIEWPORT_PATTERNS):
@@ -3010,6 +3030,8 @@ def _classify_failure_class(
 
     # Viewport gate infra-unavailable sentinel — Chromium missing or Docker fallback absent.
     # Checked before VIEWPORT_REGRESSION so infra shortfalls don't land in CODE_ERROR residuals.
+    if _trusted_execution_capability_unavailable(task, logs):
+        return PROVISION_FAILURE
     if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
         return PROVISION_FAILURE
 

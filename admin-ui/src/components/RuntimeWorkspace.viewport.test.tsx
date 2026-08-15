@@ -148,5 +148,7 @@ describe('RuntimeWorkspace viewport regression', () => {
     await expectNoOverflowAt(375, () => renderRuntime('compute'));
     expect(document.querySelector('[data-testid="project-resource-availability"]')).not.toBeNull();
     expect(document.body.textContent).not.toContain('Active experiments, held approvals, and terminal run analysis.');
+    expect(document.body.textContent).toContain('1 in progress / 2 queued');
+    expect(document.body.textContent).toContain('3 in progress / 4 queued');
   });
 });

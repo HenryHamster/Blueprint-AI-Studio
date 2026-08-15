@@ -25,7 +25,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
   const style = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
   const Icon = style?.icon;
   const statusColor = taskStatusDotColor(task.status);
-  const isRunning = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
+  const isRunning = task.status === 'IN_PROGRESS';
   const heartbeat = isRunning && task.last_heartbeat ? getHeartbeatStatus(task.last_heartbeat) : null;
   const attemptNumber = task.attempt_number ?? ((task.attempt_count ?? 0) + 1);
 
@@ -35,6 +35,11 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
     ? task.history[task.history.length - 1].timestamp
     : isTerminal ? task.created_at : undefined;
   const duration = useElapsedTime(task.created_at, isActiveForDuration ? undefined : endTime);
+  const durationLabel = task.status === 'PROVISIONING'
+    ? `Starting ${duration}`
+    : task.status === 'EVALUATING'
+      ? `Evaluating ${duration}`
+      : duration;
   // Surface the durable blocker metadata (backend models.py) on the pipeline node
   // tooltip — the only board view that renders its own compact card instead of
   // <TaskCard> (which already shows these). All fields are nullable and absent on
@@ -192,7 +197,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
 
       {/* Duration */}
       <span className="text-ui-sm text-neutral-500 font-mono shrink-0">
-        {['QUEUED', 'PARKED', 'BLOCKED'].includes(task.status) ? 'Waiting' : duration}
+        {['QUEUED', 'PARKED', 'BLOCKED'].includes(task.status) ? 'Waiting' : durationLabel}
       </span>
     </div>
   );
@@ -478,7 +483,7 @@ function RootGroup({
     PARKED: parkedInGroup,
     QUEUED: queuedInGroup,
   } = statusCounts;
-  const runningInGroup = inProgressInGroup + provisioningInGroup + evaluatingInGroup;
+  const activeInGroup = inProgressInGroup + provisioningInGroup + evaluatingInGroup;
 
   return (
     <div
@@ -517,7 +522,7 @@ function RootGroup({
           })()}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
-          {onArchiveGroup && runningInGroup === 0 && !isSynthetic && (
+          {onArchiveGroup && activeInGroup === 0 && !isSynthetic && (
             <button
               onClick={e => { e.stopPropagation(); onArchiveGroup(collectAllIds(root).filter(id => !id.startsWith('synthetic-'))); }}
               className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity text-ui-sm text-neutral-500 hover:text-neutral-300 min-h-[44px] min-w-[44px] flex items-center justify-center gap-1 px-2 rounded border border-neutral-700 hover:border-neutral-600 mr-1"
@@ -526,10 +531,25 @@ function RootGroup({
               <Archive className="w-3 h-3" />
             </button>
           )}
-          {runningInGroup > 0 && (
-            <span className="flex items-center gap-1 rounded border border-yellow-500/30 bg-yellow-500/10 px-1.5 py-0.5 text-ui-sm font-medium text-yellow-400">
+          {inProgressInGroup > 0 && (
+            <span
+              className="flex items-center gap-1 rounded border border-yellow-500/30 bg-yellow-500/10 px-1.5 py-0.5 text-ui-sm font-medium text-yellow-400"
+              title={`${inProgressInGroup} in progress; lifecycle claim does not prove a live heartbeat`}
+            >
               <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 shrink-0" />
-              {runningInGroup}
+              {inProgressInGroup} in progress
+            </span>
+          )}
+          {provisioningInGroup > 0 && (
+            <span className="flex items-center gap-1 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-ui-sm font-medium text-amber-300" title={`${provisioningInGroup} starting; runner reserved but work not yet claimed`}>
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
+              {provisioningInGroup} starting
+            </span>
+          )}
+          {evaluatingInGroup > 0 && (
+            <span className="flex items-center gap-1 rounded border border-indigo-500/30 bg-indigo-500/10 px-1.5 py-0.5 text-ui-sm font-medium text-indigo-300" title={`${evaluatingInGroup} evaluating; not executing work`}>
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-400" />
+              {evaluatingInGroup} eval
             </span>
           )}
           {blockedInGroup > 0 && (
@@ -740,7 +760,7 @@ export function PipelineView({ tasks, loading, onViewLogs, hasActiveFilters, onN
                 className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center px-2 text-xs text-yellow-400 hover:text-yellow-300 bg-yellow-500/10 border border-yellow-500/30 rounded transition-colors"
                 onClick={jumpToActive}
               >
-                Jump to active
+              Jump to current work
               </button>
             )}
             {onArchiveGroup && donePipelineIds.length > 0 && (

@@ -1,16 +1,10 @@
-"""Tests for the inbound strategic-message poll endpoint
-(app.routers.agent_strategic_messages).
+"""Inbound Strategic message polling and receipt-bound conversation routes."""
 
-The strategic agent polls
-``GET /api/agent/projects/{project_id}/messages`` with a ``since`` cursor to
-drain new operator messages. These cover: the exact response shape, ascending
-order, the ``since`` cursor, the ``from_type`` / ``status`` filters, the limit
-cap, cross-project 404, invalid-cursor 400, and server_time round-tripping as
-the next cursor.
-"""
-
-from datetime import datetime, timedelta, timezone
+import base64
+import hashlib
+import json
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import AsyncClient
@@ -22,11 +16,15 @@ from app.auth import create_agent_token
 from app.conversation_coordinator import renew_conversation_claim
 from app.main import app
 from app.models import (
+    KnowledgeDocument,
     MessageHandlingState,
     MessageSurface,
     MessageType,
+    MessagesNoisePrefs,
     Project,
     ProjectMessage,
+    ReleaseDeployArtifact,
+    ReleaseVersion,
     StrategicContextEnvelopeSnapshot,
     Task,
     TaskStatus,
@@ -47,6 +45,7 @@ from app.strategic_memory_envelope import (
     get_or_create_project_memory_state,
     purge_expired_context_envelope_snapshots,
 )
+from app.strategic_memory_sources import canonical_json_bytes
 from app.resident_conversation_scope import (
     RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY,
     RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY,
@@ -54,6 +53,7 @@ from app.resident_conversation_scope import (
 from app.project_message_creation import lock_project_and_next_message_sequence
 from app.session_message_handoff import handoff_session_messages
 from app.time_utils import _utcnow
+from app.workbench_state import WORKBENCH_STATE_KEY
 
 # The inbound-poll router is intentionally NOT wired into app.main here — that
 # registration line is reported to the operator, not committed by the plumbing
@@ -61,6 +61,8 @@ from app.time_utils import _utcnow
 # the app the `client` fixture serves so the real route + auth + rate-limit are
 # exercised end-to-end. Guarded so a re-import can't double-register the path.
 _POLL_PATH = "/api/agent/projects/{project_id}/messages"
+
+
 if not any(getattr(r, "path", None) == _POLL_PATH for r in app.routes):
     app.include_router(_messages_router)
 
@@ -140,7 +142,8 @@ async def _add_message(db_session, project, *, created_at=None, **kwargs):
 
 
 def _headers(task, vm="agent-vm-msgpoll"):
-    return {"x-agent-token": create_agent_token(str(task.id), vm)}
+    task_type = str(task.first_payload.get("type") or "")
+    return {"x-agent-token": create_agent_token(str(task.id), vm, task_type)}
 
 
 # Fixed base clock (naive UTC — the column stores naive-UTC values).
@@ -643,13 +646,20 @@ async def _make_resident_poll_worker(
         "_resident_worker_generation": generation,
     }
     task.status = TaskStatus.IN_PROGRESS
+    now = _utcnow().isoformat()
     project.vision = {
         "_resident_strategic_session": {
             "session_id": session_id,
             "task_id": str(task.id),
             "worker_generation": generation,
             "status": "active",
-        }
+            "operator_user_id": "test-user-msgpoll",
+        },
+        "_strategic_local_continuation": {
+            "version": 1, "active": True,
+            "operator_user_id": "test-user-msgpoll",
+            "updated_at": now, "last_seen_at": now,
+        },
     }
     db_session.add_all([project, task])
     await db_session.commit()
@@ -1097,6 +1107,77 @@ async def test_typed_fast_claim_replay_completion_fences_and_abandon(
     """The typed public-turn boundary survives response loss and rejects stale owners."""
     project, task = await _make_resident_poll_worker(db_session)
     incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    project.directions = [
+        {
+            "id": "d-expired-work",
+            "status": "expired",
+            "text": "This direction must not be presented as live work",
+            "priority": "high",
+        },
+        {
+            "id": "d-superseded-work",
+            "status": "superseded",
+            "text": "This superseded direction must not be presented as live work",
+            "priority": "high",
+        },
+        {
+            "id": "d-auto-completed-work",
+            "status": "active",
+            "auto_completed": True,
+            "text": "This auto-completed direction must not be presented as live work",
+            "priority": "high",
+        },
+        {
+            "id": "d-live-work",
+            "status": "active",
+            "text": "Keep the Strategic design grounded in durable work",
+            "priority": "high",
+        },
+    ]
+    existing_work = Task(
+        project_id=project.id,
+        title="Implement the grounded Strategic surface",
+        status=TaskStatus.BLOCKED,
+        created_by="STRATEGIC_AGENT",
+        origination="STRATEGIST",
+        latest_status_message="Waiting for the viewport gate",
+        blocked_reason="Chromium bootstrap unavailable",
+        context={"direction_id": "d-live-work"},
+    )
+    completed_work = Task(
+        project_id=project.id,
+        title="Verify the grounded Strategic backend",
+        status=TaskStatus.COMPLETED,
+        created_by="STRATEGIC_AGENT",
+        origination="STRATEGIST",
+        completed_at=_utcnow(),
+        context={"direction_id": "d-live-work"},
+    )
+    now = _utcnow().isoformat()
+    continuous_workbench = MessagesNoisePrefs(
+        user_id=project.user_id,
+        project_id=project.id,
+        prefs={
+            WORKBENCH_STATE_KEY: {
+                "version": 1,
+                "interaction_mode": "continuous",
+                "active_surface": "strategic",
+                "selected_refs": [],
+                "session_started_at": now,
+                "last_interaction_at": now,
+            }
+        },
+    )
+    project.vision["_resident_strategic_session"]["activity"] = {
+        "autonomy_state": "active",
+        "autonomy_reason_code": None,
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    db_session.add(existing_work)
+    db_session.add(completed_work)
+    db_session.add(continuous_workbench)
+    await db_session.commit()
     inbound = await _add_typed_fast_input(db_session, project)
     client_claim_id = str(uuid.uuid4())
     claim_payload = _typed_fast_claim_payload(
@@ -1110,6 +1191,53 @@ async def test_typed_fast_claim_replay_completion_fences_and_abandon(
         json=claim_payload,
     )
     assert claimed.status_code == 200, claimed.text
+    canonical = json.loads(base64.b64decode(
+        claimed.json()["envelope"]["canonical_envelope_b64"]
+    ))
+    assert canonical["decisions"]["role_contract"] == {
+        "public_reply_owner": "fast",
+        "workday_request_receipt": "private_consultation_only",
+        "interaction_mode": "continuous",
+        "private_workday_autonomy_configured": True,
+        "private_workday_autonomy": "enabled",
+        "private_workday_autonomy_reason_code": None,
+        "project_autonomous_enabled": True,
+    }
+    assert canonical["decisions"]["resident"]["interaction_mode"] == "continuous"
+    assert canonical["decisions"]["resident"]["private_autonomy_enabled"] is True
+    assert canonical["decisions"]["collection_metadata"] == {
+        "active_directions": {"returned_count": 1, "has_more": False},
+        "active_tasks": {"returned_count": 1, "has_more": False},
+        "recent_terminal_tasks": {"returned_count": 1, "has_more": False},
+        "release_deployments": {"returned_count": 0, "has_more": False},
+        "result_correlated_tasks": {"returned_count": 0, "has_more": False},
+        "result_correlated_documents": {"returned_count": 0, "has_more": False},
+        "result_correlated_releases": {"returned_count": 0, "has_more": False},
+        "receipt_correlated_directions": {"returned_count": 0, "has_more": False},
+        "receipt_correlated_tasks": {"returned_count": 0, "has_more": False},
+        "receipt_correlated_documents": {"returned_count": 0, "has_more": False},
+        "absence_rule": (
+            "When a collection has_more, an unlisted id or state is unknown; "
+            "absence never proves that a direction, task, document, release, or "
+            "deployment does not exist or has not reached a particular state."
+        ),
+    }
+    assert canonical["decisions"]["active_directions"] == [{
+        "id": "d-live-work",
+        "status": "active",
+        "text": "Keep the Strategic design grounded in durable work",
+        "priority": "high",
+    }]
+    live_task = canonical["decisions"]["active_tasks"][0]
+    assert live_task["id"] == str(existing_work.id)
+    assert live_task["status"] == "BLOCKED"
+    assert live_task["direction_id"] == "d-live-work"
+    assert live_task["blocked_reason"] == "Chromium bootstrap unavailable"
+    terminal_task = canonical["decisions"]["recent_terminal_tasks"][0]
+    assert terminal_task["id"] == str(completed_work.id)
+    assert terminal_task["status"] == "COMPLETED"
+    assert terminal_task["direction_id"] == "d-live-work"
+    assert terminal_task["completed_at"] == completed_work.completed_at.isoformat()
     replay = await client.post(
         path,
         headers=_headers(task, vm="agent-vm-resident-poll"),
@@ -1175,6 +1303,7 @@ async def test_typed_fast_claim_replay_completion_fences_and_abandon(
     assert abandoned.json() == {
         "status": "abandoned",
         "legacy_fallback_admissible": True,
+        "consultation_id": None,
     }
 
 
@@ -1357,91 +1486,6 @@ async def test_post_ledger_fast_claim_and_workday_consultation_use_live_envelope
 
 
 @pytest.mark.asyncio
-async def test_workday_claim_retires_stale_private_packet_and_delivers_next(
-    client: AsyncClient, db_session
-):
-    """A purged private prompt cannot poison the FIFO Workday packet queue."""
-
-    project, task = await _make_resident_poll_worker(db_session)
-    incarnation = await _activate_typed_fast_worker(db_session, project, task)
-    inbound = await _add_typed_fast_input(db_session, project)
-    claim = await client.post(
-        f"/api/agent/projects/{project.id}/conversation/turns/claim",
-        headers=_headers(task, vm="agent-vm-resident-poll"),
-        json=_typed_fast_claim_payload(
-            task, incarnation, inbound.id, client_claim_id=str(uuid.uuid4())
-        ),
-    )
-    assert claim.status_code == 200, claim.text
-    live_reference = context_envelope_reference(claim.json()["envelope"])
-    stale_reference = {**live_reference, "snapshot_id": str(uuid.uuid4())}
-    common_context = {
-        "_conversation_consultation_packet": True,
-        "audience": "strategist-internal",
-        "message_role": "workday_consultation",
-        "public_reply_owner": "fast",
-        "_workday_consultation_atomic_reply_id": str(uuid.uuid4()),
-    }
-    stale = await _add_message(
-        db_session,
-        project,
-        sequence=10,
-        surface=MessageSurface.CONVERSATION,
-        message_type=MessageType.NOTE,
-        from_type="system",
-        status="open",
-        handling_state=MessageHandlingState.PENDING,
-        content="stale private question must never be surfaced",
-        resident_session_id="resident-session",
-        context={
-            **common_context,
-            "delivery_key": "stale",
-            "envelope": stale_reference,
-        },
-    )
-    valid = await _add_message(
-        db_session,
-        project,
-        sequence=11,
-        surface=MessageSurface.CONVERSATION,
-        message_type=MessageType.NOTE,
-        from_type="system",
-        status="open",
-        handling_state=MessageHandlingState.PENDING,
-        content="valid private question",
-        resident_session_id="resident-session",
-        context={**common_context, "delivery_key": "valid", "envelope": live_reference},
-    )
-
-    response = await client.post(
-        f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
-        headers=_headers(task, vm="agent-vm-resident-poll"),
-        json={
-            "task_id": str(task.id),
-            "session_id": "resident-session",
-            "worker_generation": 2,
-            "incarnation_id": incarnation,
-            "lease_seconds": 45,
-        },
-    )
-
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "claimed"
-    assert response.json()["packet"]["packet_id"] == str(valid.id)
-    assert response.json()["packet"]["question"] == "valid private question"
-    await db_session.refresh(stale)
-    retired = stale
-    assert retired.status == "resolved"
-    assert retired.handling_state == MessageHandlingState.SUPERSEDED
-    assert retired.handled_by_task_id is None
-    assert retired.resolution == "private_handoff_context_envelope_unavailable"
-    assert retired.context["_private_handoff_retirement"]["reason"] == (
-        "context_envelope_unavailable"
-    )
-    assert "_workday_consultation_claim_id" not in retired.context
-
-
-@pytest.mark.asyncio
 async def test_fast_claim_retires_stale_private_result_and_delivers_next_continuation(
     client: AsyncClient, db_session
 ):
@@ -1532,6 +1576,10 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
 ):
     """Private delivery and public continuation use distinct renewable receipts."""
     project, task = await _make_resident_poll_worker(db_session)
+    task.payloads = [{"type": "strategic_review", "typed_fast_enabled": True}]
+    flag_modified(task, "payloads")
+    db_session.add(task)
+    await db_session.commit()
     incarnation = await _activate_typed_fast_worker(db_session, project, task)
     inbound = await _add_typed_fast_input(db_session, project)
     claim = await client.post(
@@ -1569,6 +1617,7 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     )
     assert completed_turn.status_code == 200, completed_turn.text
     packet_id = completed_turn.json()["workday_packet"]["packet_id"]
+    consultation_id = completed_turn.json()["workday_packet"]["consultation_id"]
     duplicate_turn = await client.post(
         f"/api/agent/projects/{project.id}/conversation/turns/complete",
         headers=_headers(task, vm="agent-vm-resident-poll"),
@@ -1590,6 +1639,7 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     assert duplicate_turn.status_code == 200, duplicate_turn.text
     assert duplicate_turn.json()["status"] == "duplicate"
     assert duplicate_turn.json()["workday_packet"]["packet_id"] == packet_id
+    assert duplicate_turn.json()["workday_packet"]["consultation_id"] == consultation_id
     initial_reply = (
         await db_session.execute(
             select(ProjectMessage).where(
@@ -1608,6 +1658,8 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     assert packet_claim.status_code == 200, packet_claim.text
     packet = packet_claim.json()["packet"]
     assert packet["packet_id"] == packet_id
+    assert packet["consultation_id"] == str(initial_reply.id)
+    assert consultation_id == str(initial_reply.id)
     renewed_packet = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/{packet_id}/renew",
         headers=_headers(task, vm="agent-vm-resident-poll"),
@@ -1618,6 +1670,196 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
         },
     )
     assert renewed_packet.status_code == 200, renewed_packet.text
+    problem_model_op = {
+        "task_id": str(task.id),
+        "resident_incarnation_id": incarnation,
+        "op": "set_problem_model",
+        "data": {
+            "intent": {
+                "purpose": "Ground the missing derivation.",
+                "current_focus": "Verify the correction.",
+            },
+            "capabilities": [],
+            "gaps": [],
+        },
+    }
+    workday_operation_id = str(uuid.uuid4())
+    missing_provenance = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=problem_model_op,
+    )
+    assert missing_provenance.status_code == 409, missing_provenance.text
+    missing_pair = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**problem_model_op, "packet_id": packet_id},
+    )
+    assert missing_pair.status_code == 422, missing_pair.text
+    wrong_claim = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **problem_model_op,
+            "packet_id": packet_id,
+            "workday_claim_id": str(uuid.uuid4()),
+            "workday_operation_id": workday_operation_id,
+        },
+    )
+    assert wrong_claim.status_code == 409, wrong_claim.text
+    problem_model_write = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **problem_model_op,
+            "packet_id": packet_id,
+            "workday_claim_id": packet["workday_claim_id"],
+            "workday_operation_id": workday_operation_id,
+        },
+    )
+    assert problem_model_write.status_code == 200, problem_model_write.text
+    problem_model_revision = problem_model_write.json()["revision"]
+    replayed_problem_model_write = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **problem_model_op,
+            "packet_id": packet_id,
+            "workday_claim_id": packet["workday_claim_id"],
+            "workday_operation_id": workday_operation_id,
+        },
+    )
+    assert replayed_problem_model_write.status_code == 200, replayed_problem_model_write.text
+    assert replayed_problem_model_write.json()["idempotent_replay"] is True
+    assert replayed_problem_model_write.json()["revision"] == problem_model_revision
+    conflicting_problem_model_write = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **problem_model_op,
+            "data": {
+                **problem_model_op["data"],
+                "intent": {
+                    "purpose": "A conflicting replay must fail.",
+                    "current_focus": "Do not mutate.",
+                },
+            },
+            "packet_id": packet_id,
+            "workday_claim_id": packet["workday_claim_id"],
+            "workday_operation_id": workday_operation_id,
+        },
+    )
+    assert conflicting_problem_model_write.status_code == 409
+    await db_session.refresh(project)
+    problem_model_sha = hashlib.sha256(
+        canonical_json_bytes(project.problem_model)
+    ).hexdigest()
+    correlated_terminal_task = Task(
+        project_id=project.id,
+        title="Derivation implementation",
+        status=TaskStatus.COMPLETED,
+        completed_at=_utcnow(),
+        updated_at=_utcnow() - timedelta(hours=2),
+        context={
+            "direction_id": "direction-derive-bound",
+            "strategic_work_order_id": "work-order-derive-bound",
+        },
+    )
+    unrelated_terminal_task = Task(
+        project_id=project.id,
+        title="Unrelated completed work",
+        status=TaskStatus.COMPLETED,
+        completed_at=_utcnow() - timedelta(seconds=1),
+        updated_at=_utcnow() - timedelta(hours=3),
+        context={"strategic_work_order_id": "unrelated-work-order"},
+    )
+    newer_linked_terminal_tasks = [
+        Task(
+            project_id=project.id,
+            title=f"Newer unrelated linked outcome {index}",
+            status=TaskStatus.COMPLETED,
+            completed_at=_utcnow() + timedelta(minutes=index),
+            updated_at=_utcnow() + timedelta(minutes=index),
+            context={"strategic_work_order_id": f"newer-work-order-{index}"},
+        )
+        for index in range(7)
+    ]
+    foreign_project = Project(
+        name="Foreign result authority",
+        user_id="test-user-msgpoll",
+    )
+    foreign_task = Task(
+        project_id=foreign_project.id,
+        title="Other project task",
+        status=TaskStatus.COMPLETED,
+        completed_at=_utcnow(),
+        context={"strategic_work_order_id": "foreign-work-order"},
+    )
+    random_result_uuid = uuid.uuid4()
+    correlated_document = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=correlated_terminal_task.id,
+        source_kind="strategic_memory",
+        title="Durable derivation note",
+        summary="The derivation failure and its correction.",
+        body="Canonical bounded note body.",
+    )
+    foreign_document = KnowledgeDocument(
+        project_id=foreign_project.id,
+        source_task_id=foreign_task.id,
+        source_kind="strategic_memory",
+        title="Other project note",
+        summary="Must not cross the project authority boundary.",
+        body="Foreign canonical note body.",
+    )
+    served_sha = "c" * 40
+    unsupported_served_sha = "d" * 40
+    served_release = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        promoted_sha=served_sha,
+        promoted_at=_utcnow(),
+        serving_status="serving_confirmed",
+        served_sha=served_sha,
+        served_at=_utcnow(),
+    )
+    served_release_artifact = ReleaseDeployArtifact(
+        version_id=served_release.id,
+        artifact_kind="promotion_merge",
+        serving_status="serving_confirmed",
+        served_identifier=served_sha,
+        served_at=_utcnow(),
+    )
+    newer_unconfirmed_releases = [
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=index,
+            status="promoted",
+            promoted_sha=str(index) * 40,
+            promoted_at=_utcnow() + timedelta(minutes=index),
+            serving_status="unconfirmed",
+        )
+        for index in range(2, 7)
+    ]
+    project.running_update = "The derivation is now implemented and under review."
+    db_session.add_all(
+        [
+            project,
+            foreign_project,
+            correlated_terminal_task,
+            unrelated_terminal_task,
+            *newer_linked_terminal_tasks,
+            foreign_task,
+            served_release,
+            *newer_unconfirmed_releases,
+        ]
+    )
+    await db_session.flush()
+    db_session.add_all(
+        [correlated_document, foreign_document, served_release_artifact]
+    )
+    await db_session.commit()
     acknowledged = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/{packet_id}/ack",
         headers=_headers(task, vm="agent-vm-resident-poll"),
@@ -1625,7 +1867,15 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
             **identity,
             "workday_claim_id": packet["workday_claim_id"],
             "outcome": "completed",
-            "result_summary": "The missing step follows by conditioning.",
+            "result_summary": (
+                f"Task {correlated_terminal_task.id} completed; "
+                f"task {foreign_task.id} from another project also completed; "
+                f"document {correlated_document.id} was written, while foreign "
+                f"document {foreign_document.id} also exists; unknown receipt "
+                f"{random_result_uuid}; Workday reports {served_sha} "
+                f"and {unsupported_served_sha} are serving and the "
+                "failure was durably recorded in a project note."
+            ),
         },
     )
     assert acknowledged.status_code == 200, acknowledged.text
@@ -1638,6 +1888,136 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     assert continuation_claim.status_code == 200, continuation_claim.text
     continuation = continuation_claim.json()["continuation"]
     assert continuation["attempt"] == 1
+    assert str(correlated_terminal_task.id) in continuation["result_summary"]
+    assert unsupported_served_sha in continuation["result_summary"]
+    original_envelope = json.loads(
+        base64.b64decode(
+            continuation["envelope"]["canonical_envelope_b64"]
+        ).decode("utf-8")
+    )
+    assert str(correlated_terminal_task.id) not in json.dumps(original_envelope)
+    assert served_sha not in json.dumps(original_envelope)
+    current_authority = continuation["current_live_work_authority"]
+    current_terminal_tasks = current_authority["recent_terminal_tasks"]
+    assert len(current_terminal_tasks) == 6
+    assert str(correlated_terminal_task.id) not in {
+        item["id"] for item in current_terminal_tasks
+    }
+    assert current_authority["collection_metadata"]["recent_terminal_tasks"] == {
+        "returned_count": 6,
+        "has_more": True,
+    }
+    assert current_authority["result_correlation"] == {
+        "candidate_source": "bounded_workday_result_refs_for_correlation_only",
+        "canonical_state_source": "project_scoped_database_projection",
+        "uuid_candidate_count": 5,
+        "sha_candidate_count": 2,
+        "candidate_refs_have_more": False,
+    }
+    correlated_tasks = current_authority["result_correlated_tasks"]
+    assert [item["id"] for item in correlated_tasks] == [
+        str(correlated_terminal_task.id)
+    ]
+    correlated_projection = correlated_tasks[0]
+    assert correlated_projection["correlation_refs"] == [
+        str(correlated_terminal_task.id)
+    ]
+    assert correlated_projection["direction_id"] == "direction-derive-bound"
+    assert correlated_projection["strategic_work_order_id"] == "work-order-derive-bound"
+    assert "serving_status" not in correlated_projection
+    assert current_authority["collection_metadata"]["result_correlated_tasks"] == {
+        "returned_count": 1,
+        "has_more": False,
+    }
+    authority_json = json.dumps(current_authority)
+    assert str(foreign_task.id) not in authority_json
+    assert str(random_result_uuid) not in authority_json
+    correlated_documents = current_authority["result_correlated_documents"]
+    assert [item["id"] for item in correlated_documents] == [
+        str(correlated_document.id)
+    ]
+    assert correlated_documents[0]["correlation_refs"] == [
+        str(correlated_document.id)
+    ]
+    assert correlated_documents[0]["source_task_id"] == str(
+        correlated_terminal_task.id
+    )
+    assert correlated_documents[0]["summary"] == (
+        "The derivation failure and its correction."
+    )
+    assert "body" not in correlated_documents[0]
+    assert str(foreign_document.id) not in authority_json
+    assert current_authority["collection_metadata"][
+        "result_correlated_documents"
+    ] == {"returned_count": 1, "has_more": False}
+    assert current_authority["current_project_state_authority"] == {
+        "problem_model": {
+            "present": True,
+            "revision": problem_model_revision,
+            "sha256": problem_model_sha,
+            "last_updated": project.problem_model["last_updated"],
+            "last_updated_by": "agent",
+        },
+        "running_update": {
+            "present": True,
+            "sha256": hashlib.sha256(
+                project.running_update.encode("utf-8")
+            ).hexdigest(),
+            "bytes": len(project.running_update.encode("utf-8")),
+        },
+        "vision": {
+            "present": False,
+            "revision": None,
+            "sha256": hashlib.sha256(b"{}").hexdigest(),
+        },
+        "authorship_rule": (
+            "Current existence, revision, or digest does not identify which actor "
+            "or consultation wrote it without an exact durable mutation receipt."
+        ),
+    }
+
+    assert str(served_release.id) not in {
+        item["id"] for item in current_authority["release_deployments"]
+    }
+    assert all(
+        item["serving_status"] != "serving_confirmed"
+        for item in current_authority["release_deployments"]
+    )
+    assert current_authority["collection_metadata"]["release_deployments"] == {
+        "returned_count": 4,
+        "has_more": True,
+    }
+    correlated_releases = current_authority["result_correlated_releases"]
+    assert len(correlated_releases) == 1
+    current_release = correlated_releases[0]
+    assert current_release["id"] == str(served_release.id)
+    assert current_release["correlation_refs"] == [served_sha]
+    assert current_release["promoted_sha"] == served_sha
+    assert current_release["served_sha"] == served_sha
+    assert current_release["serving_status"] == "serving_confirmed"
+    assert current_authority["collection_metadata"][
+        "result_correlated_releases"
+    ] == {"returned_count": 1, "has_more": False}
+    assert unsupported_served_sha not in json.dumps(correlated_releases)
+    mutation_receipts = current_authority["consultation_mutation_receipts"]
+    assert len(mutation_receipts) == 1
+    mutation_receipt = mutation_receipts[0]
+    assert mutation_receipt["packet_id"] == packet_id
+    assert mutation_receipt["workday_claim_id"] == packet["workday_claim_id"]
+    assert mutation_receipt["operation_id"] == workday_operation_id
+    assert mutation_receipt["task_id"] == str(task.id)
+    assert mutation_receipt["session_id"] == "resident-session"
+    assert mutation_receipt["worker_generation"] == 2
+    assert mutation_receipt["incarnation_id"] == incarnation
+    assert mutation_receipt["op"] == "set_problem_model"
+    assert mutation_receipt["target_revision"] == problem_model_revision
+    assert mutation_receipt["target_sha256"] == problem_model_sha
+    assert mutation_receipt["context_authority_generation_after"] == (
+        mutation_receipt["context_authority_generation_before"] + 1
+    )
+    assert current_authority["collection_metadata"][
+        "consultation_mutation_receipts"
+    ] == {"returned_count": 1, "has_more": False}
     result_packet_id = continuation["result_packet_id"]
     renewed_continuation = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/continuations/{result_packet_id}/renew",
@@ -1682,13 +2062,11 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     # cache. A lost HTTP response must still be exactly replayable after that
     # cache has expired and been purged: no new prompt, packet, or public text
     # is needed to return the already-created receipt.
-    snapshot = (
-        await db_session.execute(
-            select(StrategicContextEnvelopeSnapshot).where(
-                StrategicContextEnvelopeSnapshot.project_id == project.id
-            )
-        )
-    ).scalars().one()
+    snapshot = await db_session.get(
+        StrategicContextEnvelopeSnapshot,
+        uuid.UUID(continuation["envelope"]["snapshot_id"]),
+    )
+    assert snapshot is not None
     snapshot.created_at = _utcnow() - timedelta(minutes=20)
     snapshot.expires_at = _utcnow() - timedelta(seconds=1)
     db_session.add(snapshot)

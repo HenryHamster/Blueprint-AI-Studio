@@ -513,6 +513,7 @@ async def submit_strategic_spawn(
     discovery_cycle_id: uuid.UUID | None = None,
     burst_cap: int = DEFAULT_BURST_CAP,
     burst_window_minutes: int = DEFAULT_BURST_WINDOW_MINUTES,
+    commit: bool = True,
 ) -> SpawnSubmission:
     """Persist one intent and immediately dispatch unless the abuse guard trips."""
 
@@ -582,7 +583,7 @@ async def submit_strategic_spawn(
             if existing_task is not None
             else None
         )
-        if linked_debt_id is not None:
+        if linked_debt_id is not None and commit:
             await session.commit()
         return SpawnSubmission(existing, existing_task, True, linked_debt_id)
 
@@ -638,7 +639,8 @@ async def submit_strategic_spawn(
             request=request,
             task=active_task,
         )
-        await session.commit()
+        if commit:
+            await session.commit()
         return SpawnSubmission(request, active_task, True, linked_debt_id)
 
     now = _utcnow()
@@ -680,7 +682,8 @@ async def submit_strategic_spawn(
     if budget_guard is not None:
         _defer_for_budget(request, guard=budget_guard, now=now)
         session.add(request)
-        await session.commit()
+        if commit:
+            await session.commit()
         return SpawnSubmission(request, None, False)
 
     since = now - timedelta(minutes=window)
@@ -699,11 +702,13 @@ async def submit_strategic_spawn(
             window_minutes=window,
         )
         session.add(request)
-        await session.commit()
+        if commit:
+            await session.commit()
         return SpawnSubmission(request, None, False)
 
     child, linked_debt_id = await _dispatch_request(session, request=request)
-    await session.commit()
+    if commit:
+        await session.commit()
     return SpawnSubmission(request, child, False, linked_debt_id)
 
 

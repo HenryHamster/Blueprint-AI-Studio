@@ -35,7 +35,7 @@ import { useSettingsRouterProps } from './hooks/useSettingsRouterProps';
 import { normalizePrimaryTab, resolvePrimaryTabTarget, type PrimaryTab } from './hooks/useUIState';
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import type { SortBy } from './components/KanbanBoard';
-import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
+import { CANCELLABLE_STATUSES, COLUMNS, EXECUTING_PIPELINE_STATUSES, isLocalPipelineAttentionTask, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
 import { refreshAndSelectProject } from './utils/projectSelection';
 import { Pagination } from './components/Pagination';
 const UserManagement = lazy(() => import('./components/UserManagement').then(m => ({ default: m.UserManagement })));
@@ -654,21 +654,20 @@ export default function App() {
   }, [addTaskLookupToast, handleOpenTaskDetails, taskLookupTasks]);
 
   const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
-  const { visibleActiveTasks, visibleQueuedTasks, visibleBlockedTasks, visibleFailedTasks, visibleTerminalTasks } = useMemo(() => {
+  const { visibleExecutingTasks, visibleQueuedTasks, visibleBlockedTasks, visibleFailedTasks, visibleTerminalTasks } = useMemo(() => {
     const active: typeof filteredTasks = [];
     const queued: typeof filteredTasks = [];
     const blocked: typeof filteredTasks = [];
     const failed: typeof filteredTasks = [];
     const terminal: typeof filteredTasks = [];
     for (const t of filteredTasks) {
-      if (ACTIVE_PIPELINE_STATUSES.has(t.status)) active.push(t);
+      if (EXECUTING_PIPELINE_STATUSES.has(t.status)) active.push(t);
       if (t.status === 'QUEUED') queued.push(t);
       if (t.status === 'BLOCKED') blocked.push(t);
       if (t.status === 'FAILED') failed.push(t);
       if (TERMINAL_STATUSES.has(t.status)) terminal.push(t);
     }
-    return { visibleActiveTasks: active, visibleQueuedTasks: queued, visibleBlockedTasks: blocked, visibleFailedTasks: failed, visibleTerminalTasks: terminal };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    return { visibleExecutingTasks: active, visibleQueuedTasks: queued, visibleBlockedTasks: blocked, visibleFailedTasks: failed, visibleTerminalTasks: terminal };
   }, [filteredTasks]);
   const backendPipelineAttentionItems = useMemo(() => {
     const byTaskId = new Map<string, StrategicStateAttentionItem>();
@@ -692,11 +691,10 @@ export default function App() {
       if (task.status === 'FAILED') return 5;
       if (task.status === 'BLOCKED') return 4;
       if (stuckTaskIds.has(task.id)) return 3;
-      if (ACTIVE_PIPELINE_STATUSES.has(task.status)) return 2;
       return 1;
     };
     return [...filteredTasks]
-      .filter(t => t.status === 'FAILED' || t.status === 'BLOCKED' || stuckTaskIds.has(t.id) || ACTIVE_PIPELINE_STATUSES.has(t.status))
+      .filter(t => isLocalPipelineAttentionTask(t.status, stuckTaskIds.has(t.id)))
       .sort((a, b) => priority(b) - priority(a) || parseTimestamp(b.created_at).getTime() - parseTimestamp(a.created_at).getTime());
   }, [filteredTasks, stuckTaskIds]);
   const selectedPipelineContextTask = useMemo(() => {
@@ -946,7 +944,7 @@ export default function App() {
     toggleAutonomousMode: toggleSelectedProjectAutonomy,
     directionsCount: directions.length,
     filteredTaskCount: filteredTasks.length,
-    visibleActiveCount: visibleActiveTasks.length,
+    visibleActiveCount: visibleExecutingTasks.length,
     visibleQueuedCount: visibleQueuedTasks.length,
     maxPlanAccountCount: s.maxPlanAccounts.length,
     apiHealthy: s.apiHealthy,
@@ -1583,7 +1581,7 @@ export default function App() {
             onDirectionClick: handleBoardDirectionClick,
           }}
           metrics={{
-            activeTasks: visibleActiveTasks,
+            activeTasks: visibleExecutingTasks,
             queuedTasks: visibleQueuedTasks,
             blockedTasks: visibleBlockedTasks,
             failedTasks: visibleFailedTasks,
@@ -1650,7 +1648,7 @@ export default function App() {
                 tracking {s.trackedTaskIds.size}
               </button>
             )}
-            <span>{s.globalActiveCount} active</span>
+            <span>{s.globalActiveCount} in progress</span>
             <span>{s.globalQueuedCount} queued</span>
             <span>${s.cumulativeCost.toFixed(2)}</span>
           </>

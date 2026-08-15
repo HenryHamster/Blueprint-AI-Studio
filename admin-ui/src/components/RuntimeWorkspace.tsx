@@ -312,7 +312,7 @@ export function RuntimeWorkspace({
             />
             <RuntimeStatusPill
               label="fleet"
-              value={`${globalActiveCount} active / ${globalQueuedCount} queued`}
+              value={`${globalActiveCount} in progress / ${globalQueuedCount} queued`}
               tone={globalActiveCount > 0 ? 'info' : 'neutral'}
             />
           </RuntimeSectionIntro>
@@ -393,12 +393,12 @@ export function RuntimeWorkspace({
           >
             <RuntimeStatusPill
               label="project"
-              value={`${scopedActiveCount ?? 0} active / ${scopedQueuedCount ?? 0} queued`}
+              value={`${scopedActiveCount ?? 0} in progress / ${scopedQueuedCount ?? 0} queued`}
               tone={(scopedActiveCount ?? 0) > 0 ? 'info' : 'neutral'}
             />
             <RuntimeStatusPill
               label="fleet"
-              value={`${globalActiveCount} active / ${globalQueuedCount} queued`}
+              value={`${globalActiveCount} in progress / ${globalQueuedCount} queued`}
               tone={globalActiveCount > 0 ? 'info' : 'neutral'}
             />
           </RuntimeSectionIntro>

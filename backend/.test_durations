@@ -13715,7 +13715,6 @@
   "testing/test_reaper.py::test_unblock_sweep_deadline_escalation": 0.36033463000057964,
   "testing/test_reaper.py::test_unblock_sweep_defers_deadline_escalation_while_paused": 0.3460433310010558,
   "testing/test_reaper.py::test_unblock_sweep_does_not_broadcast_on_commit_failure": 0.3629594720023306,
-  "testing/test_reaper.py::test_unblock_sweep_does_not_retry_viewport_capability_sentinel": 0.34020225900167134,
   "testing/test_reaper.py::test_unblock_sweep_does_not_revalidate_same_green_head": 0.3550294569995458,
   "testing/test_reaper.py::test_unblock_sweep_does_not_treat_ghost_merge_as_completed_foundation": 0.3602748870016512,
   "testing/test_reaper.py::test_unblock_sweep_entrypoints_reexport_identity": 0.0020678319997387007,

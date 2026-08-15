@@ -181,6 +181,55 @@ async def test_compute_digest_counts_active_tasks_without_display_row_cap(db_ses
 
 
 @pytest.mark.asyncio
+async def test_compute_digest_splits_lifecycle_counts_and_hides_resident_rows(
+    db_session,
+):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    ordinary = [
+        make_task(project_id=project.id, status=status, context={})
+        for status in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        )
+    ]
+    resident = [
+        make_task(
+            project_id=project.id,
+            status=status,
+            context={"_resident_infrastructure": True},
+        )
+        for status in (
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+        )
+    ]
+    db_session.add_all([*ordinary, *resident])
+    await db_session.commit()
+
+    data = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+
+    assert data["active_count"] == 4
+    assert data["queued_count"] == 1
+    assert data["starting_count"] == 1
+    assert data["running_count"] == 1
+    assert data["evaluating_count"] == 1
+    assert data["completed_count"] == 0
+    assert data["failed_count"] == 0
+    assert {row["task_id"] for row in data["active_tasks"]} == {
+        str(task.id) for task in ordinary
+    }
+
+
+@pytest.mark.asyncio
 async def test_lane_pilot_kill_survives_digest_session_rollback(db_session):
     """A digest-computed lane-pilot KILL is committed outside the digest session."""
     from app.shared_state import runtime_config
@@ -7360,6 +7409,8 @@ async def test_digest_top_level_schema_keys(client: AsyncClient):
         "prs_opened",
         "active_count",
         "running_count",
+        "starting_count",
+        "evaluating_count",
         "queued_count",
         "active_tasks",
         "needs_attention",

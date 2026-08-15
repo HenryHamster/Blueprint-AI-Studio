@@ -561,7 +561,7 @@ const TASK_FOCUS_SECTIONS: Array<{
   limit: number;
 }> = [
   { key: 'needs_judgment', label: 'Needs judgment', dot: 'bg-amber-300', text: 'text-amber-300', limit: 2 },
-  { key: 'active', label: 'Active', dot: 'bg-cyan-400', text: 'text-cyan-300', limit: 2 },
+  { key: 'active', label: 'Pipeline', dot: 'bg-cyan-400', text: 'text-cyan-300', limit: 2 },
   { key: 'friction', label: 'Friction', dot: 'bg-rose-400', text: 'text-rose-300', limit: 2 },
   { key: 'queued', label: 'Queued', dot: 'bg-neutral-500', text: 'text-neutral-400', limit: 1 },
   { key: 'recent_completed', label: 'Recent result', dot: 'bg-emerald-400', text: 'text-emerald-300', limit: 1 },

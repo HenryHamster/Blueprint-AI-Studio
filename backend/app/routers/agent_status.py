@@ -114,6 +114,9 @@ from app.runner_decline import (
     maybe_create_decline_alert,
     record_runner_decline,
 )
+from app.execution_capability_requirements import (
+    persist_learned_execution_capabilities,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1656,6 +1659,23 @@ async def update_agent_status(
         not payload.artifact_type or payload.status == TaskStatus.FAILED
     ):
         task.latest_status_message = _sanitize_log_tail(payload.logs, 8000)
+    # Only the bounded, schema-validated helper provenance field may mint a
+    # durable routing requirement. Raw logs/latest status remain useful for
+    # classification, but model-authored text is never routing authority.
+    _learned_execution_capabilities = (
+        frozenset({payload.execution_capability})
+        if payload.execution_capability is not None
+        else frozenset()
+    )
+    if _learned_execution_capabilities:
+        learned_context, learned_changed = persist_learned_execution_capabilities(
+            task.context,
+            _learned_execution_capabilities,
+            observed_at=_utcnow(),
+        )
+        if learned_changed:
+            task.context = learned_context
+            flag_modified(task, "context")
     # Persist the structured provider-run error report BEFORE failure-category
     # normalization so normalize_agent_failure_category consumes it as the
     # primary classification signal. On a FAILED status WITHOUT a report (old
@@ -2263,6 +2283,27 @@ async def update_agent_status(
 
                     _blk_acct_id = get_task_llm_account_id(task)
                     _blocked_vm_id = task.vm_instance_id
+                    if (
+                        _learned_execution_capabilities
+                        and str(_blocked_vm_id or "").startswith("runner:")
+                    ):
+                        _blocked_runner_id = str(_blocked_vm_id).removeprefix(
+                            "runner:"
+                        )
+                        if _blocked_runner_id:
+                            record_runner_decline(
+                                task,
+                                _blocked_runner_id,
+                                reason=(
+                                    "execution_capability_unavailable: "
+                                    + _sanitize_log_tail(payload.logs or "", 470)
+                                ),
+                                hostname=str(
+                                    (task.context or {}).get("runner_hostname") or ""
+                                )
+                                or None,
+                                same_runner_retryable=False,
+                            )
                     if _blk_acct_id and not (task.context or {}).get("_slot_released"):
                         await release_max_plan_account(
                             _blk_acct_id,
@@ -3577,9 +3618,9 @@ async def update_agent_status(
         _NON_GENUINE_TERMINAL_CLASSES = (SCOPE_EMPTY, REASSIGNED)
 
         # A local runner can pass dispatch-time capability checks and only then
-        # discover that its provider CLI cannot satisfy a stricter runtime
-        # contract (for example Anthropic text-only strict-MCP support). Treat
-        # that deterministic host mismatch exactly like a pre-claim decline:
+        # discover that its provider CLI or verification runtime cannot satisfy
+        # a stricter contract. Treat that deterministic host mismatch exactly
+        # like a pre-claim decline:
         # preserve the provider pin, exclude this runner for the task, and do
         # not consume a code retry.  The runner identity must be captured before
         # reset_task_for_fresh_attempt clears the per-attempt dispatch binding.
@@ -3588,8 +3629,12 @@ async def update_agent_status(
         _runtime_decline_hostname: str | None = None
         _runtime_decline_reason: str | None = None
         _current_vm_id = str(task.vm_instance_id or "")
+        _execution_capability_failure = bool(_learned_execution_capabilities)
         if (
-            _raw_failure_category == "runtime_unavailable"
+            (
+                _raw_failure_category == "runtime_unavailable"
+                or _execution_capability_failure
+            )
             and _current_vm_id.startswith("runner:")
             and _current_vm_id.removeprefix("runner:")
         ):
@@ -3597,9 +3642,12 @@ async def update_agent_status(
             _runtime_decline_hostname = str(
                 (task.context or {}).get("runner_hostname") or ""
             ) or None
-            _runtime_decline_reason = "runtime_unavailable: " + _sanitize_log_tail(
-                payload.logs or "provider runtime cannot satisfy task contract",
-                470,
+            _runtime_decline_reason = (
+                "execution_capability_unavailable: "
+                + _sanitize_log_tail(
+                    payload.logs or "provider runtime cannot satisfy task contract",
+                    470,
+                )
             )
 
         # Retry logic for failed tasks
@@ -3607,12 +3655,16 @@ async def update_agent_status(
             payload.status == TaskStatus.FAILED
             and (
                 _runtime_decline_runner_id is not None
+                or _execution_capability_failure
                 or task.attempt_count < _runtime_config["max_retries"]
             )
             and failure_class not in _NON_GENUINE_TERMINAL_CLASSES
         ):
             _current_attempt_ordinal = get_task_lifetime_attempt_ordinal(task)
-            if _runtime_decline_runner_id is None:
+            if (
+                _runtime_decline_runner_id is None
+                and not _execution_capability_failure
+            ):
                 task.attempt_count += 1
             bank_task_current_attempt(
                 task,
@@ -3656,10 +3708,22 @@ async def update_agent_status(
             _terminated_task_ids.pop(str(task.id), None)
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             # Add retry delay for transient failures to avoid hammering exhausted resources
-            if _runtime_decline_runner_id is not None:
+            if _execution_capability_failure:
                 # The next dispatch should immediately select another eligible
-                # runner (or fall through to cloud); a generic provision-delay
-                # would only postpone that already-safe handoff.
+                # runner. Learned requirements are held ahead of cloud fallback;
+                # a generic provision-delay would only postpone that handoff.
+                task.retry_after_until = None
+                ctx.pop("provision_failures", None)
+                logger.info(
+                    "[ORCHESTRATOR] Task %s learned execution capabilities %s; "
+                    "runner=%s decline #%d — retrying only on a capable site "
+                    "without consuming attempt budget",
+                    task.id,
+                    sorted(_learned_execution_capabilities),
+                    _runtime_decline_runner_id or "managed-site",
+                    _runtime_decline_total,
+                )
+            elif _runtime_decline_runner_id is not None:
                 task.retry_after_until = None
                 ctx.pop("provision_failures", None)
                 logger.info(

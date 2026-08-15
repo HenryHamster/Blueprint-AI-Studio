@@ -32,36 +32,43 @@ export const BLUEPRINT_BACKEND_RUFF_FORMAT_CMD = 'python3 -m ruff format --check
 // Lazy-loaded so test suites which mock fs do not crash on module import.
 const _CHECK_HELPER_DIR = path.dirname(fileURLToPath(import.meta.url));
 
+function readShellFragment(fragmentPath: string): string {
+  // Git may materialize checked-in shell fragments with CRLF on Windows.
+  // Normalize at the generator boundary so concatenated fragments remain one
+  // valid, byte-stable Bash program on every authoring host.
+  return fs.readFileSync(fragmentPath, 'utf8').replace(/\r\n?/g, '\n');
+}
+
 const _BACKEND_VERIFICATION_PATH = path.join(_CHECK_HELPER_DIR, 'check_backend_verification.sh');
 function loadBackendVerificationScript(): string {
-  try { return fs.readFileSync(_BACKEND_VERIFICATION_PATH, 'utf8'); } catch {
+  try { return readShellFragment(_BACKEND_VERIFICATION_PATH); } catch {
     return '    echo "[check] required backend verification fragment missing — failing closed"\n    FAILED+=("required backend verification fragment")\n';
   }
 }
 
 const _CI_FAILURE_VERIFY_PATH = path.join(_CHECK_HELPER_DIR, 'check_ci_failure_verify.sh');
 function loadCiFailureVerifyScript(): string {
-  try { return fs.readFileSync(_CI_FAILURE_VERIFY_PATH, 'utf8'); } catch { return ''; }
+  try { return readShellFragment(_CI_FAILURE_VERIFY_PATH); } catch { return ''; }
 }
 
 const _MERGE_VERIFY_PATH = path.join(_CHECK_HELPER_DIR, 'check_merge_verify.sh');
 function loadMergeVerifyScript(): string {
-  try { return fs.readFileSync(_MERGE_VERIFY_PATH, 'utf8'); } catch { return ''; }
+  try { return readShellFragment(_MERGE_VERIFY_PATH); } catch { return ''; }
 }
 
 const _IMPACTED_TEST_PATH = path.join(_CHECK_HELPER_DIR, 'check_impacted_test.sh');
 function loadImpactedTestScript(): string {
-  try { return fs.readFileSync(_IMPACTED_TEST_PATH, 'utf8'); } catch { return ''; }
+  try { return readShellFragment(_IMPACTED_TEST_PATH); } catch { return ''; }
 }
 
 const _VIEWPORT_UPLOAD_PATH = path.join(_CHECK_HELPER_DIR, 'check_viewport_upload.sh');
 function loadViewportUploadScript(): string {
-  try { return fs.readFileSync(_VIEWPORT_UPLOAD_PATH, 'utf8'); } catch { return ''; }
+  try { return readShellFragment(_VIEWPORT_UPLOAD_PATH); } catch { return ''; }
 }
 
 const _VISUAL_CAPTURE_PATH = path.join(_CHECK_HELPER_DIR, 'check_visual_capture.sh');
 function loadVisualCaptureScript(): string {
-  try { return fs.readFileSync(_VISUAL_CAPTURE_PATH, 'utf8'); } catch { return ''; }
+  try { return readShellFragment(_VISUAL_CAPTURE_PATH); } catch { return ''; }
 }
 
 const _SIZE_GUARDRAIL_PATH = path.join(_CHECK_HELPER_DIR, 'check_size_guardrail.sh');
@@ -69,7 +76,7 @@ const _SIZE_GUARDRAIL_PATH = path.join(_CHECK_HELPER_DIR, 'check_size_guardrail.
 // guardrail is an ALWAYS-ON gate: a missing/unreadable fragment must fail
 // ./check closed, not silently emit a script with no size gate at all.
 function loadSizeGuardrailScript(): string {
-  try { return fs.readFileSync(_SIZE_GUARDRAIL_PATH, 'utf8'); } catch {
+  try { return readShellFragment(_SIZE_GUARDRAIL_PATH); } catch {
     return '\necho "[check] size guardrail fragment missing from agent build — failing closed"\nFAILED+=("size guardrail")\n';
   }
 }
@@ -306,7 +313,8 @@ ${jsonFieldFn}
 _VERIFY_TASK_ID="\${TASK_ID:-${cfg.taskId}}"
 _VERIFY_RECEIPT="/tmp/project_verification_receipt_\${_VERIFY_TASK_ID}.json"
 _VERIFY_HARNESS_RECEIPT="/tmp/backend_verification_harness_\${_VERIFY_TASK_ID}.json"
-if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT"; then
+_VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_\${_VERIFY_TASK_ID}"
+if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT"; then
   echo "[check] unable to remove prior verification receipt(s) — refusing to run" >&2
   exit 1
 fi
@@ -531,13 +539,14 @@ if admin_ui_runtime_touched; then
   fi
 
   if [ "$VIEWPORT_RUN" = "1" ]; then
-    # Bootstrap Playwright Chromium binary before the viewport gate.
+    # Bootstrap Playwright Chromium for the optional VM-side viewport check.
     # The baked agent VM already includes the system libs (libatk, libnss,
     # etc.) — and may already have the browser cached, so we cache-check
     # first and fall through to the bare install, with --with-deps as a
     # last-resort fallback for fresh local machines.
     # See admin-ui/CONTRIBUTING.md for developer-machine setup.
-    run "admin-ui playwright chromium" bash -c '
+    VIEWPORT_BOOTSTRAP_LOG=/tmp/check_viewport_bootstrap.log
+    if ( bash -c '
       cd admin-ui || exit 1
       if [ -d "$HOME/.cache/ms-playwright" ] && ls "$HOME/.cache/ms-playwright"/chromium-* >/dev/null 2>&1; then
         exit 0
@@ -550,7 +559,13 @@ if admin_ui_runtime_touched; then
       fi
       echo "[check] Retrying inside Docker container..." >&2
       docker run --rm -v "$PWD:/work" -w /work mcr.microsoft.com/playwright:v1.59.1-jammy npx playwright install chromium 2>&1 || exit 1
-    ' 2>&1
+    ' ) > "$VIEWPORT_BOOTSTRAP_LOG" 2>&1; then
+      echo "[check] admin-ui playwright chromium OK"
+    else
+      echo "[check] VIEWPORT_CAPTURE_SKIPPED: Chromium substrate unavailable on this VM; CI frontend-viewport enforces browser verification"
+      tail -30 "$VIEWPORT_BOOTSTRAP_LOG" || true
+      VIEWPORT_RUN=0
+    fi
   fi
 
   if [ "$FULL_SCOPE" = "1" ]; then

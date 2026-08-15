@@ -10063,10 +10063,10 @@ async def test_unblock_sweep_optimistically_retries_agent_precondition_without_d
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_does_not_retry_viewport_capability_sentinel(
+async def test_unblock_sweep_requeues_legacy_viewport_capability_sentinel(
     reaper_db, mocker
 ):
-    """A deterministic missing browser capability must not rerun all tests."""
+    """The retired VM gate must not park a task for operator escalation."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
@@ -10090,11 +10090,10 @@ async def test_unblock_sweep_does_not_retry_viewport_capability_sentinel(
 
     requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
 
-    assert requeued == 0
+    assert requeued == 1
     await reaper_db.refresh(t)
-    assert t.status == TaskStatus.BLOCKED
+    assert t.status == TaskStatus.QUEUED
     assert t.context.get("_blocked_optimistic_retries") is None
-    assert t.context.get("_blocked_recheck_attempts") == 1
 
 
 @pytest.mark.asyncio

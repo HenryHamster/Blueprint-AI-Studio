@@ -1012,6 +1012,13 @@ async def with_vision_locked(
         if str(_locked_project.id) != str(project_id):
             raise ValueError("_locked_project does not match project_id")
         _apply(_locked_project)
+        # A caller can next acquire a different narrow Project projection in
+        # this same transaction. Those locks use populate_existing=True; with
+        # autoflush disabled, that refresh would otherwise restore the old DB
+        # value over this still-dirty vision attribute. Persist the canonical
+        # JSON mutation before returning, matching the directions and
+        # problem-model helpers' cross-projection guarantee.
+        await session.flush([_locked_project])
         return True
 
     async with project_lock(
@@ -1024,6 +1031,7 @@ async def with_vision_locked(
         if project is None:
             return False
         _apply(project)
+        await session.flush([project])
     return True
 
 

@@ -166,10 +166,22 @@ else
   echo "=== Docker unavailable — running pytest directly ==="
   # Ensure pip-installed binaries are on PATH
   export PATH="$HOME/.local/bin:$PATH"
+  # An explicit interpreter is an authority boundary for roster/invariant
+  # probes. Do not silently replace it with a host-cached venv: that makes the
+  # same checkout collect different tests depending on runner residue.
+  EXPLICIT_BACKEND_TEST_PYTHON=0
+  if [ -n "${BLUEPRINT_BACKEND_TEST_PYTHON:-}" ]; then
+    export PYTHON="$BLUEPRINT_BACKEND_TEST_PYTHON"
+    EXPLICIT_BACKEND_TEST_PYTHON=1
+  fi
   # Install dependencies if needed (use uv if pip is unavailable)
   VENV=/tmp/blueprint-backend-venv
-  [ -d "$VENV" ] && export PYTHON="$VENV/bin/python"
+  [ -z "${PYTHON:-}" ] && [ -d "$VENV" ] && export PYTHON="$VENV/bin/python"
   if ! "${PYTHON:-python3}" -c "import fastapi" &>/dev/null; then
+    if [ "$EXPLICIT_BACKEND_TEST_PYTHON" = "1" ]; then
+      echo "ERROR: explicit BLUEPRINT_BACKEND_TEST_PYTHON cannot import backend dependencies" >&2
+      exit 2
+    fi
     echo "=== Installing dependencies ==="
     if python3 -m pip install -q -r requirements.txt 2>&1 | tail -5; then
       true
@@ -184,10 +196,19 @@ else
 
   # Verify Python 3.11+ is available (required for asyncio.timeout)
   PYTHON_VERSION=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "unknown")
-  if [ "$PYTHON_VERSION" != "unknown" ]; then
+  if [ -z "$PYTHON_VERSION" ] || [ "$PYTHON_VERSION" = "unknown" ]; then
+    if [ "$EXPLICIT_BACKEND_TEST_PYTHON" = "1" ]; then
+      echo "ERROR: explicit BLUEPRINT_BACKEND_TEST_PYTHON did not report a Python version" >&2
+      exit 2
+    fi
+  else
     MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
     MINOR=$(echo "$PYTHON_VERSION" | cut -d. -f2)
     if [ "$MAJOR" -lt 3 ] || ([ "$MAJOR" -eq 3 ] && [ "$MINOR" -lt 11 ]); then
+      if [ "$EXPLICIT_BACKEND_TEST_PYTHON" = "1" ]; then
+        echo "ERROR: explicit BLUEPRINT_BACKEND_TEST_PYTHON is $PYTHON_VERSION; Python 3.11+ is required" >&2
+        exit 2
+      fi
       # Try to find python3.11
       PYTHON_311=""
       for candidate in python3.11 python311 python3.11.* /usr/bin/python3.11 /usr/local/bin/python3.11; do

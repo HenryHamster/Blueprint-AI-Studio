@@ -1189,6 +1189,47 @@ async def test_with_vision_locked_applies_mutation(db_session):
 
 
 @pytest.mark.asyncio
+async def test_with_vision_locked_survives_follow_on_directions_projection(db_session):
+    """A later projected directions lock must not erase a dirty vision write.
+
+    The test session deliberately disables autoflush.  ``project_lock`` uses
+    ``populate_existing=True`` for each narrow projection, so the canonical
+    vision helper must flush its JSON mutation before a follow-on directions
+    lock refreshes the shared identity-mapped Project instance.  This is the
+    exact update-direction retirement chain: record durable retirement memory,
+    then mutate the direction portfolio in the same transaction.
+    """
+    retired = {"id": "d-retired", "text": "Preserve this retirement memory"}
+    project = Project(
+        name="vision-lock-follow-on-projection",
+        user_id="user",
+        vision={"purpose": "initial"},
+        directions=[{"id": retired["id"], "status": "paused"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    await with_vision_locked(
+        db_session,
+        project.id,
+        lambda vision: vision.update({"_recently_retired_directions": [retired]}),
+    )
+
+    def _retire(directions: list) -> None:
+        directions[0]["status"] = "retired"
+
+    await with_directions_locked(db_session, project.id, _retire)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert project.vision == {
+        "purpose": "initial",
+        "_recently_retired_directions": [retired],
+    }
+    assert project.directions == [{"id": "d-retired", "status": "retired"}]
+
+
+@pytest.mark.asyncio
 async def test_with_vision_locked_reuses_caller_owned_project_lock(db_session):
     project = Project(name="vision-reentrant-lock", user_id="user")
     project.vision = {"existing": "kept"}

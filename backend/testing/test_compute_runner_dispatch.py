@@ -1954,30 +1954,11 @@ async def test_pull_time_browser_backstop_uses_context_only_requirement(
 
 
 @pytest.mark.asyncio
-async def test_viewport_block_retries_when_capable_runner_appears(monkeypatch):
-    """A formerly permanent viewport block re-arms when the fleet can satisfy it."""
-    from app import orchestrator_runner_dispatch as dispatch
+async def test_viewport_infra_block_is_advisory_and_requeues():
+    """Legacy VM viewport blocks requeue instead of entering escalation."""
     from app.blocked_task_unblock_sweeps import _blocked_precondition_state
-    from app.runner_eligibility import RunnerDispatchSnapshot
 
-    project_id = uuid.uuid4()
-    capable = RunnerDispatchSnapshot(
-        id=uuid.uuid4(),
-        project_id=project_id,
-        capabilities={
-            "isolation_backends": {
-                "docker_usable": True,
-                "playwright_chromium_usable": True,
-            }
-        },
-    )
-
-    async def _active_runners(_session):
-        return {project_id: [capable]}
-
-    monkeypatch.setattr(dispatch, "_load_active_runners_cache", _active_runners)
     task = SimpleNamespace(
-        project_id=project_id,
         depends_on=[],
         blocker_kind=None,
         blocked_reason="BLOCKER: VIEWPORT_GATE_INFRA_UNAVAILABLE: no Docker",
@@ -1989,6 +1970,263 @@ async def test_viewport_block_retries_when_capable_runner_appears(monkeypatch):
         },
     )
 
+    assert await _blocked_precondition_state(task, object(), lambda: None) == "clear"
+
+
+@pytest.mark.asyncio
+async def test_learned_backend_verification_routes_only_to_verified_runner(db_session):
+    """A learned PG requirement excludes runners without live verification."""
+    from datetime import datetime, timezone
+
+    from app import auth as auth_mod
+    from app import orchestrator as orch
+    from app.execution_capability_requirements import (
+        CAPABILITY_BACKEND_VERIFICATION,
+        persist_learned_execution_capabilities,
+    )
+    from app.models import LocalRunner
+
+    project = Project(name="Learned capability route", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _runner(*, verified: bool):
+        token = auth_mod.create_runner_token(uuid.uuid4())
+        capabilities = {
+            "task_types": "all",
+            "agent_available": True,
+            "isolation_backends": {
+                "docker_usable": True,
+                "playwright_chromium_usable": True,
+            },
+        }
+        if verified:
+            capabilities["project_verification"] = {
+                "version": 1,
+                "ready": True,
+                "boundary": {"class": "agent", "backend": "bwrap"},
+                "probes": {
+                    "ruff": {"ok": True, "exit_code": 0},
+                    "docker_postgres": {"ok": True, "exit_code": 0},
+                },
+            }
+        return LocalRunner(
+            project_id=project.id,
+            token_hash=auth_mod.hash_runner_token(token),
+            capabilities=capabilities,
+        )
+
+    unverified = _runner(verified=False)
+    verified_runner = _runner(verified=True)
+    db_session.add_all([unverified, verified_runner])
+    await db_session.commit()
+    await db_session.refresh(unverified)
+    await db_session.refresh(verified_runner)
+
+    context, _ = persist_learned_execution_capabilities(
+        {},
+        {CAPABILITY_BACKEND_VERIFICATION},
+        observed_at=datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "refactor", "prompt": "continue"}],
+        context=context,
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    assert (
+        await orch._try_runner_dispatch(
+            db_session, task, {project.id: [unverified]}
+        )
+        is False
+    )
+    assert (
+        await orch._try_runner_dispatch(
+            db_session, task, {project.id: [unverified, verified_runner]}
+        )
+        is True
+    )
+    assert task.vm_instance_id == f"runner:{verified_runner.id}"
+
+
+@pytest.mark.asyncio
+async def test_learned_capability_without_runner_is_held_before_cloud(db_session):
+    from datetime import datetime, timezone
+
+    from app.orchestrator_runner_dispatch import (
+        _hold_task_for_learned_execution_capabilities,
+    )
+    from app.execution_capability_requirements import (
+        CAPABILITY_BACKEND_VERIFICATION,
+        EXECUTION_CAPABILITY_WAIT_CONTEXT_KEY,
+        persist_learned_execution_capabilities,
+    )
+
+    project = Project(name="Learned capability hold", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    context, _ = persist_learned_execution_capabilities(
+        {},
+        {CAPABILITY_BACKEND_VERIFICATION},
+        observed_at=datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        vm_instance_id="agent-vm-unproved-cloud",
+        context=context,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    assert await _hold_task_for_learned_execution_capabilities(db_session, task)
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id is None
+    assert (task.context or {})[EXECUTION_CAPABILITY_WAIT_CONTEXT_KEY][
+        "capabilities"
+    ] == [CAPABILITY_BACKEND_VERIFICATION]
+
+
+@pytest.mark.asyncio
+async def test_idempotent_learned_capability_hold_releases_row_lock(db_session):
+    """The no-change hold path must end the caller's FOR UPDATE transaction."""
+    from datetime import datetime, timezone
+
+    from sqlmodel import select
+
+    from app.orchestrator_runner_dispatch import (
+        _hold_task_for_learned_execution_capabilities,
+    )
+    from app.execution_capability_requirements import (
+        CAPABILITY_BACKEND_VERIFICATION,
+        persist_learned_execution_capabilities,
+    )
+
+    project = Project(name="Learned capability lock release", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    context, _ = persist_learned_execution_capabilities(
+        {},
+        {CAPABILITY_BACKEND_VERIFICATION},
+        observed_at=datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        context=context,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    task_id = task.id
+
+    # Establish the durable hold so the next helper call is the idempotent path.
+    assert await _hold_task_for_learned_execution_capabilities(db_session, task)
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    async with session_factory() as holder:
+        locked_task = (
+            await holder.execute(
+                select(Task).where(Task.id == task_id).with_for_update()
+            )
+        ).scalar_one()
+        assert await _hold_task_for_learned_execution_capabilities(
+            holder, locked_task
+        )
+
+        # PostgreSQL NOWAIT proves that the helper's no-change return did not
+        # leak the holder transaction's row lock into the orchestration cycle.
+        async with session_factory() as probe:
+            available_task = (
+                await probe.execute(
+                    select(Task).where(Task.id == task_id).with_for_update(nowait=True)
+                )
+            ).scalar_one()
+            assert available_task.id == task_id
+            await probe.rollback()
+
+
+@pytest.mark.asyncio
+async def test_learned_backend_block_ignores_contradicted_runner(monkeypatch):
+    """A contradicted PG runner cannot satisfy a learned unblock requirement."""
+    from datetime import datetime, timezone
+
+    from app import orchestrator_runner_dispatch as dispatch
+    from app.blocked_task_unblock_sweeps import _blocked_precondition_state
+    from app.execution_capability_requirements import (
+        CAPABILITY_BACKEND_VERIFICATION,
+        persist_learned_execution_capabilities,
+    )
+    from app.runner_eligibility import RunnerDispatchSnapshot
+
+    project_id = uuid.uuid4()
+
+    def _runner(*, verified: bool):
+        capabilities = {
+            "task_types": "all",
+            "agent_available": True,
+        }
+        if verified:
+            capabilities["project_verification"] = {
+                "version": 1,
+                "ready": True,
+                "boundary": {"class": "agent", "backend": "bwrap"},
+                "probes": {
+                    "ruff": {"ok": True, "exit_code": 0},
+                    "docker_postgres": {"ok": True, "exit_code": 0},
+                },
+            }
+        return RunnerDispatchSnapshot(
+            id=uuid.uuid4(),
+            project_id=project_id,
+            capabilities=capabilities,
+        )
+
+    contradicted = _runner(verified=True)
+    unverified = _runner(verified=False)
+    replacement = _runner(verified=True)
+    fleet = [contradicted, unverified]
+
+    async def _active_runners(_session):
+        return {project_id: list(fleet)}
+
+    monkeypatch.setattr(dispatch, "_load_active_runners_cache", _active_runners)
+    context, _ = persist_learned_execution_capabilities(
+        {"blocker": {"source": "agent"}},
+        {CAPABILITY_BACKEND_VERIFICATION},
+        observed_at=datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+    context["declined_by"] = {
+        str(contradicted.id): {
+            "count": 1,
+            "same_runner_retryable": False,
+            "reason": "execution_capability_unavailable",
+        }
+    }
+    task = SimpleNamespace(
+        project_id=project_id,
+        depends_on=[],
+        blocker_kind=None,
+        blocked_reason="BLOCKER: PostgreSQL runtime unavailable",
+        latest_status_message="backend verification runtime unavailable",
+        first_payload={"type": "refactor"},
+        context=context,
+    )
+
+    assert await _blocked_precondition_state(task, object(), lambda: None) == "waiting"
+    fleet.append(replacement)
     assert await _blocked_precondition_state(task, object(), lambda: None) == "retry"
 
 

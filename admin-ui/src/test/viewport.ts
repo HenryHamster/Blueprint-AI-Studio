@@ -456,6 +456,7 @@ export function stressDigestPayload(): Record<string, unknown> {
     generated_at: '2026-05-06T00:00:00Z',
     completed_count: 12, failed_count: 4, pending_approval_count: 3,
     research_cycles: 3, prs_opened: 7, active_count: 2, running_count: 2,
+    starting_count: 0, evaluating_count: 0,
     needs_attention: [
       { task_id: 'ta1', title, reason: 'failed', error_snippet: errorSnippet,
         pr_url: null, failure_class: 'CODE_ERROR', scope: 'medium',

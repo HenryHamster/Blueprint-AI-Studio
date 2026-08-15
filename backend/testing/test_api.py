@@ -1218,9 +1218,10 @@ async def test_patch_post_commit_pending_false_is_noop_when_already_false(
 async def test_admin_tasks_project_id_filter_returns_scoped_counts(
     client: AsyncClient, db_session
 ):
-    """GET /api/admin/tasks?project_id=<id> returns scoped_active_count,
-    scoped_evaluating_count, and scoped_queued_count reflecting only that
-    project, while active_count remains the global fleet total."""
+    """GET /api/admin/tasks?project_id=<id> returns scoped lifecycle counts.
+
+    Active is executing-only; provisioning reservations are reported as starting.
+    """
     # Project A — the scoped project
     project_a = Project(
         name="Project A",
@@ -1262,6 +1263,12 @@ async def test_admin_tasks_project_id_filter_returns_scoped_counts(
         status=TaskStatus.EVALUATING,
         payloads=[{"type": "create"}],
     )
+    task_a_starting = Task(
+        project_id=project_a.id,
+        title="A starting",
+        status=TaskStatus.PROVISIONING,
+        payloads=[{"type": "create"}],
+    )
     # Task in project B (must NOT appear in scoped counts for project A)
     task_b_active = Task(
         project_id=project_b.id,
@@ -1269,7 +1276,9 @@ async def test_admin_tasks_project_id_filter_returns_scoped_counts(
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "create"}],
     )
-    db_session.add_all([task_a_active, task_a_evaluating, task_b_active])
+    db_session.add_all(
+        [task_a_active, task_a_starting, task_a_evaluating, task_b_active]
+    )
     await db_session.commit()
 
     resp = await client.get(
@@ -1286,9 +1295,11 @@ async def test_admin_tasks_project_id_filter_returns_scoped_counts(
 
     # Scoped counts are present and only reflect project A
     assert "scoped_active_count" in data
+    assert "scoped_starting_count" in data
     assert "scoped_evaluating_count" in data
     assert "scoped_queued_count" in data
     assert data["scoped_active_count"] == 1
+    assert data["scoped_starting_count"] == 1
     assert data["scoped_evaluating_count"] == 1
     assert data["scoped_queued_count"] == 0
 
@@ -1339,6 +1350,7 @@ async def test_admin_tasks_project_id_filter_hides_non_member_counts(
     assert data["tasks"] == []
     assert data["total"] == 0
     assert data["scoped_active_count"] == 0
+    assert data["scoped_starting_count"] == 0
     assert data["scoped_evaluating_count"] == 0
     assert data["scoped_queued_count"] == 0
 
@@ -1365,7 +1377,9 @@ async def test_admin_tasks_no_project_id_omits_scoped_counts(
     data = resp.json()
 
     assert "active_count" in data
+    assert "starting_count" in data
     assert "scoped_active_count" not in data
+    assert "scoped_starting_count" not in data
     assert "scoped_evaluating_count" not in data
     assert "scoped_queued_count" not in data
 
@@ -1446,6 +1460,7 @@ async def test_task_counts_scoped_to_member_projects(client: AsyncClient, db_ses
     assert data2["scoped_active_count"] == 0, (
         "non-member must see zero scoped_active_count"
     )
+    assert data2["scoped_starting_count"] == 0
     assert data2["scoped_evaluating_count"] == 0
     assert data2["scoped_queued_count"] == 0
 

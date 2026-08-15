@@ -285,6 +285,34 @@ describe('computeResidentActivityState', () => {
     expect(state?.endMs).toBe(new Date(staleAt).getTime());
   });
 
+  it('QUIET CONTINUOUS: stale progress cannot override a fresh process heartbeat', () => {
+    const staleProgressAt = new Date(
+      NOW - RESIDENT_HEARTBEAT_STALE_MS - 5000,
+    ).toISOString();
+    const freshHeartbeatAt = new Date(NOW - 3000).toISOString();
+    const state = computeResidentActivityState(
+      [],
+      [],
+      session({
+        last_progress_at: staleProgressAt,
+        worker_heartbeat_at: freshHeartbeatAt,
+        updated_at: freshHeartbeatAt,
+        activity: {
+          phase: 'waiting',
+          last_action: 'Watching for project movement',
+        },
+      }),
+      NOW,
+    );
+
+    expect(state).toMatchObject({
+      phase: 'idle',
+      durablePhase: 'waiting',
+      label: 'Waiting',
+    });
+    expect(state?.label).not.toBe('Workday needs restart');
+  });
+
   it('RECONNECTING: an ensured starting worker stays recoverable with a stale prior heartbeat', () => {
     const staleAt = new Date(NOW - RESIDENT_HEARTBEAT_STALE_MS - 5000).toISOString();
     const state = computeResidentActivityState(
@@ -346,6 +374,10 @@ describe('computeResidentActivityState', () => {
           phase: 'waiting',
           phase_started_at: '2026-06-01T11:59:00Z',
           last_action: 'Watching task completions',
+          reason_code: 'consultation_queued',
+          consultation_id: '11111111-1111-4111-8111-111111111111',
+          autonomy_state: 'paused',
+          autonomy_reason_code: 'consultation_queued',
           pending_operator_messages: 2,
           idle_remaining_seconds: 3540,
           pending_watches: 1,
@@ -359,6 +391,10 @@ describe('computeResidentActivityState', () => {
       durablePhase: 'waiting',
       label: 'Waiting',
       detail: 'Watching task completions',
+      reasonCode: 'consultation_queued',
+      consultationId: '11111111-1111-4111-8111-111111111111',
+      autonomyState: 'paused',
+      autonomyReasonCode: 'consultation_queued',
       idleRemainingSeconds: 3540,
       pendingOperatorMessages: 2,
       pendingWatches: 1,

@@ -1109,6 +1109,7 @@ describe('useLogViewer strategist events', () => {
       'message_updated',
       'messages_superseded',
       'strategic_updated',
+      'strategic_session_state',
       'strategic_cycle_started',
       'strategic_cycle_completed',
     ];

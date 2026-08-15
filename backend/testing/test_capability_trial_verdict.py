@@ -4838,6 +4838,10 @@ class TestPersistTrialVerdictsRowLock:
         mock_session.get = AsyncMock(return_value=None)  # must NOT be called
         mock_session.commit = AsyncMock()
         mock_session.rollback = AsyncMock()
+        # The adopt path also arms a best-effort Strategic refresh through the
+        # same real AsyncSession. Model its awaitable flush faithfully so this
+        # row-lock test does not manufacture a transaction error and rollback.
+        mock_session.flush = AsyncMock()
         mock_session.execute = AsyncMock(side_effect=execute_side_effect)
         mock_session.add = MagicMock()
 
