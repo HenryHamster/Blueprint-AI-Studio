@@ -24,7 +24,16 @@ from app.models import MessageSurface, ProjectMessage
 
 _CHECK_IN_EVENT_TYPE = "strategic_check_in"
 _MODE_KNOB_CUT_EVENT_TYPE = "mode_knob_cut_recommended"
+_EVENT_TYPE_CONTEXT_KEY = "event_type"
+_AUDIENCE_CONTEXT_KEY = "audience"
 _COVERED_MESSAGE_IDS_KEY = "_resident_reply_covered_message_ids"
+_CONVERSATION_VISIBILITY_CONTEXT_KEYS = frozenset(
+    {
+        _EVENT_TYPE_CONTEXT_KEY,
+        _AUDIENCE_CONTEXT_KEY,
+        _COVERED_MESSAGE_IDS_KEY,
+    }
+)
 _CANONICAL_UUID_RE = (
     "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     "[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -126,7 +135,7 @@ def strategic_conversation_predicate() -> Any:
             _HasVerifiedCoveredInput(ProjectMessage.context),
         ),
     )
-    event_type = ProjectMessage.context["event_type"].as_string()
+    event_type = ProjectMessage.context[_EVENT_TYPE_CONTEXT_KEY].as_string()
     return and_(
         ProjectMessage.surface == MessageSurface.CONVERSATION,
         or_(
@@ -142,8 +151,8 @@ def strategic_conversation_predicate() -> Any:
         ),
         or_(
             proven_operator_reply,
-            ProjectMessage.context["audience"].as_string().is_(None),
-            ~ProjectMessage.context["audience"]
+            ProjectMessage.context[_AUDIENCE_CONTEXT_KEY].as_string().is_(None),
+            ~ProjectMessage.context[_AUDIENCE_CONTEXT_KEY]
             .as_string()
             .in_([STRATEGIST_INTERNAL, PIPELINE_LOG]),
         ),

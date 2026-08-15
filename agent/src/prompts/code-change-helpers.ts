@@ -3,7 +3,7 @@ import { WORKSPACE } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { effectiveLintCmd, effectiveTestCmd } from '../utils/test-runners.js';
 import { SHELL_CMD_RE } from '../shell-safety.js';
-import { agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
+import { agentTokenShellFn, jsonFieldShellFn, jsonStrShellFn } from '../token-file.js';
 import { writeCheckHelper } from './check-helper.js';
 import { writeDoneHelper } from './done-helper.js';
 import { writePrHelper } from './pr-helper.js';
@@ -368,6 +368,136 @@ function validateBuildConfigShellSafety(buildConfig: BuildConfig | undefined): v
     }
   }
 }
+/**
+ * Bash function shared by ./fail and ./blocked.
+ *
+ * The lifecycle helpers POST terminal state themselves, so a wrapper-side
+ * checkpoint is necessarily too late: the backend may already have queued and
+ * claimed a retry. This function writes the same provenance commit understood
+ * by prepareTaskWorkBranch and pushes it before the terminal HTTP request.
+ */
+function terminalCheckpointShellFn(cfg: CodeChangeHelperConfig): string {
+  return `
+_checkpoint_remote_sha() {
+  _CHECKPOINT_REMOTE_REF="refs/heads/${cfg.workBranch}"
+  _CHECKPOINT_REMOTE_OUTPUT=$(git -C "$_CHECKPOINT_REPO" ls-remote --heads origin \\
+    "$_CHECKPOINT_REMOTE_REF" 2>/tmp/checkpoint_remote_${cfg.taskId}.log) || return 1
+  if [ -z "$_CHECKPOINT_REMOTE_OUTPUT" ]; then
+    return 0
+  fi
+  _CHECKPOINT_REMOTE_SHA=$(printf '%s\\n' "$_CHECKPOINT_REMOTE_OUTPUT" | \\
+    awk 'NF { count += 1; sha = $1 } END { if (count == 1) print sha; else exit 1 }') || return 1
+  if ! printf '%s' "$_CHECKPOINT_REMOTE_SHA" | grep -qE '^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$'; then
+    return 1
+  fi
+  printf '%s' "$_CHECKPOINT_REMOTE_SHA"
+}
+
+_checkpoint_terminal_work() {
+  _CHECKPOINT_REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null) || {
+    echo "[checkpoint] Cannot prove workspace state because the helper is not inside a Git repository." >&2
+    return 1
+  }
+  _CHECKPOINT_BASE_FILE="/tmp/base_commit_${cfg.taskId}"
+  if [ ! -s "$_CHECKPOINT_BASE_FILE" ]; then
+    echo "[checkpoint] Missing exact base-commit marker $_CHECKPOINT_BASE_FILE" >&2
+    return 1
+  fi
+  _CHECKPOINT_BASE=$(cat "$_CHECKPOINT_BASE_FILE")
+  if ! printf '%s' "$_CHECKPOINT_BASE" | grep -qE '^[0-9a-fA-F]{7,64}$'; then
+    echo "[checkpoint] Invalid base commit in $_CHECKPOINT_BASE_FILE" >&2
+    return 1
+  fi
+  _CHECKPOINT_HEAD=$(git -C "$_CHECKPOINT_REPO" rev-parse HEAD 2>/dev/null) || return 1
+  _CHECKPOINT_DIRTY=$(git -C "$_CHECKPOINT_REPO" status --porcelain 2>/dev/null) || return 1
+  if [ -z "$_CHECKPOINT_DIRTY" ] && [ "$_CHECKPOINT_HEAD" = "$_CHECKPOINT_BASE" ]; then
+    return 0
+  fi
+
+  _CHECKPOINT_MESSAGE=$(git -C "$_CHECKPOINT_REPO" show -s --format=%B HEAD 2>/dev/null) || return 1
+  _CHECKPOINT_FIRST_LINE=$(printf '%s\\n' "$_CHECKPOINT_MESSAGE" | sed -n '1p')
+  _CHECKPOINT_IS_CURRENT=0
+  if [ -z "$_CHECKPOINT_DIRTY" ] && \\
+    [ "$_CHECKPOINT_FIRST_LINE" = "blueprint-checkpoint: preserve unshipped task ${cfg.taskId}" ] && \\
+    printf '%s\\n' "$_CHECKPOINT_MESSAGE" | grep -qFx 'Blueprint-Checkpoint-Version: 1' && \\
+    printf '%s\\n' "$_CHECKPOINT_MESSAGE" | grep -qFx 'Blueprint-Task-Id: ${cfg.taskId}' && \\
+    printf '%s\\n' "$_CHECKPOINT_MESSAGE" | grep -qFx "Blueprint-Base-Commit: $_CHECKPOINT_BASE"; then
+    _CHECKPOINT_IS_CURRENT=1
+  fi
+  if [ "$_CHECKPOINT_IS_CURRENT" != "1" ]; then
+    git -C "$_CHECKPOINT_REPO" add -A || return 1
+    git -C "$_CHECKPOINT_REPO" commit --allow-empty \\
+      -m "blueprint-checkpoint: preserve unshipped task ${cfg.taskId}" \\
+      -m "Blueprint-Checkpoint-Version: 1" \\
+      -m "Blueprint-Task-Id: ${cfg.taskId}" \\
+      -m "Blueprint-Base-Commit: $_CHECKPOINT_BASE" >/tmp/checkpoint_commit_${cfg.taskId}.log 2>&1 || {
+        cat /tmp/checkpoint_commit_${cfg.taskId}.log >&2
+        return 1
+      }
+  fi
+
+  # Refresh the credential-helper token before the network write. Failure is
+  # non-fatal while the existing file may still be valid; the push itself is
+  # the authority and remains fail-closed.
+  _CHECKPOINT_TOKEN_RESP=$(curl -f -sS --max-time 30 \\
+    -H "X-Agent-Token: $TOKEN" \\
+    "$API/api/agent/github/token?task_id=$TASK&force_refresh=true" 2>/dev/null) || _CHECKPOINT_TOKEN_RESP=""
+  _CHECKPOINT_GH_TOKEN=$(printf '%s' "$_CHECKPOINT_TOKEN_RESP" | _json_field data.token 2>/dev/null || true)
+  if [ -n "$_CHECKPOINT_GH_TOKEN" ] && [ -n "\${GITHUB_TOKEN_FILE:-}" ]; then
+    umask 077
+    printf '%s' "$_CHECKPOINT_GH_TOKEN" > "$GITHUB_TOKEN_FILE" || return 1
+  fi
+
+  _CHECKPOINT_LOCAL_SHA=$(git -C "$_CHECKPOINT_REPO" rev-parse HEAD 2>/dev/null) || return 1
+  _CHECKPOINT_EXPECTED_SHA=$(_checkpoint_remote_sha) || {
+    cat /tmp/checkpoint_remote_${cfg.taskId}.log >&2 2>/dev/null || true
+    echo "[checkpoint] Could not establish the initial remote lease; refusing terminal status." >&2
+    return 1
+  }
+  if [ "$_CHECKPOINT_EXPECTED_SHA" = "$_CHECKPOINT_LOCAL_SHA" ]; then
+    echo "[checkpoint] Existing checkpoint is already durable on ${cfg.workBranch}."
+    return 0
+  fi
+
+  # Pin the lease to the state observed before the first write. Never refresh
+  # it to an arbitrary fetched tip: that turns force-with-lease into a competing
+  # checkpoint overwrite. An empty expected SHA explicitly requires absence.
+  _CHECKPOINT_LEASE="--force-with-lease=refs/heads/${cfg.workBranch}:$_CHECKPOINT_EXPECTED_SHA"
+  _CHECKPOINT_PUSHED=0
+  for _CHECKPOINT_ATTEMPT in 1 2 3; do
+    if git -C "$_CHECKPOINT_REPO" push "$_CHECKPOINT_LEASE" origin \\
+      "HEAD:refs/heads/${cfg.workBranch}" >/tmp/checkpoint_push_${cfg.taskId}.log 2>&1; then
+      _CHECKPOINT_PUSHED=1
+      break
+    fi
+    _CHECKPOINT_OBSERVED_SHA=$(_checkpoint_remote_sha) || _CHECKPOINT_OBSERVED_SHA_READ_FAILED=1
+    if [ "\${_CHECKPOINT_OBSERVED_SHA_READ_FAILED:-0}" != "1" ]; then
+      if [ "$_CHECKPOINT_OBSERVED_SHA" = "$_CHECKPOINT_LOCAL_SHA" ]; then
+        # The remote accepted the write but the client lost its response.
+        _CHECKPOINT_PUSHED=1
+        break
+      fi
+      if [ "$_CHECKPOINT_OBSERVED_SHA" != "$_CHECKPOINT_EXPECTED_SHA" ]; then
+        cat /tmp/checkpoint_push_${cfg.taskId}.log >&2
+        echo "[checkpoint] Remote ${cfg.workBranch} changed concurrently; refusing to overwrite it." >&2
+        return 1
+      fi
+    fi
+    _CHECKPOINT_OBSERVED_SHA_READ_FAILED=0
+    if [ "$_CHECKPOINT_ATTEMPT" -lt 3 ]; then
+      sleep "$_CHECKPOINT_ATTEMPT"
+    fi
+  done
+  if [ "$_CHECKPOINT_PUSHED" != "1" ]; then
+    cat /tmp/checkpoint_push_${cfg.taskId}.log >&2
+    return 1
+  fi
+  echo "[checkpoint] Preserved pending work on ${cfg.workBranch} before terminal status."
+  return 0
+}
+`;
+}
+
 function writeFailHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   // Explicit failure signal — Claude calls this when it determines the task
@@ -375,7 +505,9 @@ function writeFailHelper(cfg: CodeChangeHelperConfig): void {
   // requirements). Posts FAILED with the reason. Wrapper sees the marker
   // and exits cleanly without trying its own fallback push.
   const agentTokenFn = agentTokenShellFn();
+  const jsonFieldFn = jsonFieldShellFn();
   const jsonStrFn = jsonStrShellFn();
+  const terminalCheckpointFn = terminalCheckpointShellFn(cfg);
   const script = `#!/bin/bash
 # ./fail "reason" — mark task FAILED with an operator-readable reason.
 # Use when the task can't be completed cleanly: scope is wrong, blocker
@@ -383,8 +515,16 @@ function writeFailHelper(cfg: CodeChangeHelperConfig): void {
 # failures — keep iterating with ./check instead.
 
 set -uo pipefail
+case "\${1:-}" in
+  -h|--help)
+    echo 'Usage: ./fail "<reason>"'
+    exit 0
+    ;;
+esac
 ${agentTokenFn}
+${jsonFieldFn}
 ${jsonStrFn}
+${terminalCheckpointFn}
 REASON="\${1:?Usage: ./fail \\"<reason>\\"}"
 
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
@@ -396,8 +536,46 @@ if [ -f /tmp/fail_${cfg.taskId} ]; then
   exit 0
 fi
 
+# A FAILED transition can be optimistically retried immediately. Publish the
+# exact task branch before that transition so the next worker cannot start from
+# an empty clone while this disposable workspace still owns the only diff.
+_checkpoint_terminal_work || {
+  echo "[fail] Refusing to post FAILED because pending work was not durably checkpointed." >&2
+  exit 1
+}
+
+# A generated ./check owns this task-bound negative receipt. It is removed at
+# the start of every later check and every task attempt, so only the latest
+# local verification run can upgrade a generic ./fail into an infrastructure
+# failure. Reject links, oversized content, and every non-exact frame.
+_CAPABILITY_FRAME="[check] required backend verification state=runtime_unavailable — PostgreSQL runtime unavailable"
+_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${cfg.taskId}"
+_CAPABILITY_EXPECTED="backend_verification:runtime_unavailable:v1:$TASK"
+_CAPABILITY_RECEIPT_VALID=0
+if [ -f "$_CAPABILITY_RECEIPT" ] && [ ! -L "$_CAPABILITY_RECEIPT" ]; then
+  _CAPABILITY_RECEIPT_BYTES=$(wc -c <"$_CAPABILITY_RECEIPT" 2>/dev/null || printf 0)
+  case "$_CAPABILITY_RECEIPT_BYTES" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$_CAPABILITY_RECEIPT_BYTES" -le 256 ] \
+        && printf '%s\n' "$_CAPABILITY_EXPECTED" | cmp -s - "$_CAPABILITY_RECEIPT"; then
+        _CAPABILITY_RECEIPT_VALID=1
+      fi
+      ;;
+  esac
+fi
+if [ "$_CAPABILITY_RECEIPT_VALID" = "1" ]; then
+  REASON="$_CAPABILITY_FRAME"
+fi
+
 PAYLOAD=$(printf '{"task_id":%s,"status":"FAILED","artifact_type":"ERROR_LOG","logs":%s,"failure_category":"agent_self_failed"}' \\
   "$(_json_str "$TASK")" "$(_json_str "$REASON")")
+if [ "$_CAPABILITY_RECEIPT_VALID" = "1" ]; then
+  PAYLOAD="\${PAYLOAD%?},\\"execution_capability\\":\\"backend_verification\\"}"
+fi
+if [ -n "\${_CHECKPOINT_LOCAL_SHA:-}" ]; then
+  PAYLOAD="\${PAYLOAD%?},\\"commit_hash\\":$(_json_str "$_CHECKPOINT_LOCAL_SHA"),\\"storage_uri\\":$(_json_str "git-ref:refs/heads/${cfg.workBranch}")}"
+fi
 POSTED=0
 for attempt in 1 2 3 4 5; do
   HTTP=$(printf '%s' "$PAYLOAD" | curl -sS -o /tmp/fail_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
@@ -439,7 +617,9 @@ function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
   // chain, and the strategic agent gets a ProjectMessage so it can decide
   // whether to spawn a precondition-fix direction.
   const agentTokenFn = agentTokenShellFn();
+  const jsonFieldFn = jsonFieldShellFn();
   const jsonStrFn = jsonStrShellFn();
+  const terminalCheckpointFn = terminalCheckpointShellFn(cfg);
   const script = `#!/bin/bash
 # ./blocked "<reason>" — mark task BLOCKED_PRECONDITION (no retry burn).
 #
@@ -465,8 +645,16 @@ function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
 # to spawn a precondition-fix direction.
 
 set -uo pipefail
+case "\${1:-}" in
+  -h|--help)
+    echo 'Usage: ./blocked "<reason>" [--needs-task <id>|--needs-pr <n>|--needs-capability "<desc>"]'
+    exit 0
+    ;;
+esac
 ${agentTokenFn}
+${jsonFieldFn}
 ${jsonStrFn}
+${terminalCheckpointFn}
 
 # Optional structured prerequisite flags. When given, the blocker carries a
 # normalized machine-resolvable need ({kind, ref}) alongside the free-text
@@ -509,6 +697,14 @@ if [ -f /tmp/blocked_${cfg.taskId} ]; then
   exit 0
 fi
 
+# BLOCKED_PRECONDITION is eligible for an immediate optimistic retry. The
+# branch must exist first, otherwise the retry races this process and repeats
+# the entire edit/gate loop from a blank clone.
+_checkpoint_terminal_work || {
+  echo "[blocked] Refusing to post BLOCKED_PRECONDITION because pending work was not durably checkpointed." >&2
+  exit 1
+}
+
 # "BLOCKER:" prefix is the canonical orchestrator-side signal for the
 # BLOCKED_PRECONDITION class (see backend/app/failure_classification.py).
 # We send both the explicit failure_category AND the prefixed reason so
@@ -525,6 +721,9 @@ if [ -n "$NEED_KIND" ] && [ -n "$NEED_REF" ]; then
 else
   PAYLOAD=$(printf '{"task_id":%s,"status":"FAILED","artifact_type":"ERROR_LOG","logs":%s,"failure_category":"BLOCKED_PRECONDITION"}' \\
     "$(_json_str "$TASK")" "$(_json_str "BLOCKER: $REASON")")
+fi
+if [ -n "\${_CHECKPOINT_LOCAL_SHA:-}" ]; then
+  PAYLOAD="\${PAYLOAD%?},\\"commit_hash\\":$(_json_str "$_CHECKPOINT_LOCAL_SHA"),\\"storage_uri\\":$(_json_str "git-ref:refs/heads/${cfg.workBranch}")}"
 fi
 POSTED=0
 for attempt in 1 2 3 4 5; do

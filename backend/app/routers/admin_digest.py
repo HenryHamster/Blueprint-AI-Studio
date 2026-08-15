@@ -42,6 +42,7 @@ from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SP
 from app import strategic_cycle as _strategic_cycle
 from app.strategic_analysis import _compute_prediction_calibration
 from app.strategic_completion import strategic_challenge_summary
+from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.capability_trial_verdict import (
     LANE_PILOT_CAP_NAME,
     evaluate_lane_pilot_verdict,
@@ -332,6 +333,8 @@ DIGEST_PAYLOAD_METRIC_MANIFEST: dict[str, dict] = {
     "prs_opened": {"consumer": "CatchUpStatsRow, CatchUpPanel"},
     "active_count": {"consumer": "DashboardHome, CatchUpStatsRow"},
     "running_count": {"consumer": "CatchUpStatsRow"},
+    "starting_count": {"consumer": "CatchUpStatsRow"},
+    "evaluating_count": {"consumer": "CatchUpStatsRow"},
     "queued_count": {"consumer": "DashboardHome"},
     "stale_heartbeat_count": {"consumer": "OrchestratorHealthBar"},
     "active_tasks": {"consumer": "CatchUpInProgressSection"},
@@ -465,6 +468,7 @@ async def _compute_digest(
         Task.status.in_(
             [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
         ),
+        non_resident_infrastructure_task_filter(),
     ]
     if project_id:
         terminal_filters.append(Task.project_id == project_id)
@@ -479,6 +483,7 @@ async def _compute_digest(
         Task.status.not_in(
             [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
         ),
+        non_resident_infrastructure_task_filter(),
     ]
     if project_id:
         approval_filters.append(Task.project_id == project_id)
@@ -596,6 +601,7 @@ async def _compute_digest(
             Task.status.in_(
                 [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
             ),
+            non_resident_infrastructure_task_filter(),
         ]
         if project_id:
             trend_filters.append(Task.project_id == project_id)
@@ -660,6 +666,7 @@ async def _compute_digest(
             Task.status.in_(
                 [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
             ),
+            non_resident_infrastructure_task_filter(),
         ]
         if project_id:
             trend_filters.append(Task.project_id == project_id)
@@ -731,7 +738,10 @@ async def _compute_digest(
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
     ]
-    active_filters = [Task.status.in_(_active_statuses)]
+    active_filters = [
+        Task.status.in_(_active_statuses),
+        non_resident_infrastructure_task_filter(),
+    ]
     if project_id:
         active_filters.append(Task.project_id == project_id)
     active_counts_result = await session.execute(
@@ -748,6 +758,7 @@ async def _compute_digest(
     stale_filters = [
         Task.status == TaskStatus.IN_PROGRESS,
         Task.last_heartbeat < _stale_threshold,
+        non_resident_infrastructure_task_filter(),
     ]
     if project_id:
         stale_filters.append(Task.project_id == project_id)
@@ -1168,15 +1179,11 @@ async def _compute_digest(
             }
         )
 
-    running_statuses = {TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING}
-    queued_statuses = {TaskStatus.QUEUED, TaskStatus.EVALUATING}
-    running_count = sum(
-        active_count_by_status.get(status, 0) for status in running_statuses
-    )
-    queued_count = sum(
-        active_count_by_status.get(status, 0) for status in queued_statuses
-    )
-    active_count = running_count + queued_count
+    running_count = active_count_by_status.get(TaskStatus.IN_PROGRESS, 0)
+    starting_count = active_count_by_status.get(TaskStatus.PROVISIONING, 0)
+    evaluating_count = active_count_by_status.get(TaskStatus.EVALUATING, 0)
+    queued_count = active_count_by_status.get(TaskStatus.QUEUED, 0)
+    active_count = running_count + starting_count + evaluating_count + queued_count
 
     total_terminal = len(completed_tasks) + len(failed_tasks)
     success_rate = (
@@ -1278,6 +1285,8 @@ async def _compute_digest(
         sorted_failures=sorted_failures,
         direction_progress_list=direction_progress_list,
         running_count=running_count,
+        starting_count=starting_count,
+        evaluating_count=evaluating_count,
         queued_count=queued_count,
         pr_count=pr_count,
         error_log_map=error_log_map,
@@ -2152,6 +2161,8 @@ async def _compute_digest(
         "prs_opened": pr_count,
         "active_count": active_count,
         "running_count": running_count,
+        "starting_count": starting_count,
+        "evaluating_count": evaluating_count,
         "queued_count": queued_count,
         "active_tasks": active_tasks_list,
         "success_rate": success_rate,

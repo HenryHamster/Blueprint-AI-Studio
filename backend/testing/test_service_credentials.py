@@ -715,6 +715,7 @@ def test_coding_agent_task_list_caps_escaped_control_text_and_redacts_secrets():
         ],
         "total": 20,
         "scoped_active_count": 0,
+        "scoped_starting_count": 2,
         "scoped_evaluating_count": 0,
         "scoped_queued_count": 0,
     }
@@ -744,6 +745,8 @@ def test_coding_agent_task_list_caps_escaped_control_text_and_redacts_secrets():
     assert projected["offset"] == 0
     assert projected["filters"]["status"] == ["FAILED"]
     assert projected["filters"]["direction_id"] == "direction-test"
+    assert projected["counts"]["active"] == 0
+    assert projected["counts"]["starting"] == 2
     assert all("attempt_number" in item for item in projected["tasks"])
     assert all(
         len(json.dumps(item["title"], ensure_ascii=False).encode("utf-8"))

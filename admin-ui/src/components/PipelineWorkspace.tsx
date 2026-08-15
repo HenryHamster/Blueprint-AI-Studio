@@ -412,7 +412,15 @@ function pipelineNowItems(rail: PipelineRailProps, metrics: PipelineMetricsProps
     .slice(0, 2)
     .forEach(task => push(task, 'Waiting', 'waiting', `${task.depends_on?.length ?? 0} upstream`));
   tasks.filter(task => task.status === 'PARKED').slice(0, 2).forEach(task => push(task, 'Parked', 'waiting'));
-  metrics.activeTasks.slice(0, 3).forEach(task => push(task, 'Running', 'active'));
+  metrics.activeTasks.slice(0, 3).forEach(task => push(task, 'In progress', 'active'));
+  tasks
+    .filter(task => task.status === 'PROVISIONING')
+    .slice(0, 2)
+    .forEach(task => push(task, 'Starting', 'waiting'));
+  tasks
+    .filter(task => task.status === 'EVALUATING')
+    .slice(0, 2)
+    .forEach(task => push(task, 'Evaluating', 'waiting'));
   metrics.queuedTasks
     .filter(task => (task.depends_on?.length ?? 0) === 0)
     .slice(0, 2)
@@ -487,7 +495,7 @@ function PipelineNowPanel({ rail, metrics, tasks }: { rail: PipelineRailProps; m
         <div className="flex shrink-0 items-center gap-1.5">
           {activeCount > 0 && (
             <span className="rounded border border-emerald-500/20 bg-emerald-500/10 px-1.5 py-0.5 font-mono text-ui-sm text-emerald-300">
-              {activeCount} running
+              {activeCount} in progress
             </span>
           )}
           {trackedCount > 0 && (
@@ -510,7 +518,7 @@ function PipelineNowPanel({ rail, metrics, tasks }: { rail: PipelineRailProps; m
           ))}
         </div>
       ) : (
-        <div className="px-2.5 py-3 text-xs text-neutral-600">No active pipeline work in view.</div>
+        <div className="px-2.5 py-3 text-xs text-neutral-600">No in-progress pipeline work in view.</div>
       )}
     </section>
   );
@@ -518,6 +526,8 @@ function PipelineNowPanel({ rail, metrics, tasks }: { rail: PipelineRailProps; m
 
 function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardProps) {
   const parkedTasks = flow.tasks.filter(task => task.status === 'PARKED');
+  const startingTasks = flow.tasks.filter(task => task.status === 'PROVISIONING');
+  const evaluatingTasks = flow.tasks.filter(task => task.status === 'EVALUATING');
   const waitingTasks = metrics.queuedTasks.filter(task => (task.depends_on?.length ?? 0) > 0);
   const queuedReadyTasks = metrics.queuedTasks.filter(task => (task.depends_on?.length ?? 0) === 0);
   const attentionTaskIds = new Set<string>();
@@ -554,7 +564,9 @@ function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardPro
           </span>
         </div>
         <dl className="divide-y divide-neutral-800/70">
-          <PipelineHealthRow label="Running" value={metrics.activeTasks.length} tone="good" />
+          <PipelineHealthRow label="In progress" value={metrics.activeTasks.length} tone="good" />
+          <PipelineHealthRow label="Starting" value={startingTasks.length} />
+          <PipelineHealthRow label="Evaluating" value={evaluatingTasks.length} tone={evaluatingTasks.length > 0 ? 'info' : 'neutral'} />
           <PipelineHealthRow label="Queued" value={queuedReadyTasks.length} />
           <PipelineHealthRow label="Waiting" value={waitingTasks.length} tone={waitingTasks.length > 0 ? 'warn' : 'neutral'} />
           <PipelineHealthRow label="Blocked" value={metrics.blockedTasks.length} tone={metrics.blockedTasks.length > 0 ? 'warn' : 'neutral'} />

@@ -71,6 +71,12 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
 # Non-zero on any failure — error tail printed; fix and retry.
 
 set -uo pipefail
+case "\${1:-}" in
+  -h|--help)
+    echo 'Usage: ./pr open --title <title> --body <body> [--with-tests]  |  ./pr close [--superseded-by <PR#>]'
+    exit 0
+    ;;
+esac
 ${agentTokenFn}
 ${githubTokenFn}
 ${jsonStrFn}

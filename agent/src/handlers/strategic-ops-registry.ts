@@ -192,6 +192,21 @@ const INPUTS = {
       'Omit probes for ordinary code/release judgment. Request walkthrough_e2e only when the release claim requires live product behavior.',
     ],
   },
+  report_autonomous_finding: {
+    kind: 'json' as const,
+    required: ['kind', 'summary'],
+    fields: ['kind', 'summary', 'evidence_refs'],
+    example: {
+      kind: 'finding',
+      summary: 'The queued task is blocked on an operator-owned credential.',
+      evidence_refs: ['123e4567-e89b-42d3-a456-426614174000'],
+    },
+    notes: [
+      'Available only inside the exact server-leased typed-autonomous Workday turn.',
+      'kind is question|blocker|finding. Fast remains the sole public author.',
+      'Evidence refs are bounded correlation candidates; they do not establish managed state.',
+    ],
+  },
   cancel_task: {
     kind: 'json' as const,
     required: ['reason'],
@@ -283,12 +298,20 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
     description: 'Persist a behavioral lesson or operator preference for future sessions.' },
   { op: 'set_session_summary', alias: 'set-session-summary', cli: true, prompt: true, internalReason: null,
     description: 'Record a running summary of session context and progress for continuity across restarts.' },
+  { op: 'report_autonomous_finding', alias: 'report-autonomous-finding', cli: true, prompt: false, internalReason: null,
+    description: 'Privately hand one leased autonomous Workday question, blocker, or finding to Fast for receipt-bound public delivery.', input: inputFor('report_autonomous_finding') },
 
   // ── Internal-only / auto-invoked backend ops (deliberately NOT on the CLI or
   //    bootstrap prompt). They are accepted by the dispatch chain but are invoked
   //    programmatically by the one-shot cycle / operator seams, never as a
   //    `./strategic <alias>` command. Excluded EXPLICITLY (flagged), not by
   //    omission, so the drift-guard covers them too.
+  { op: 'begin_autonomous_turn', alias: null, cli: false, prompt: false,
+    internalReason: 'Agent-runtime-only server lease minting for one typed-autonomous Workday turn.',
+    description: 'Mint or replay the exact server-owned private autonomous-turn lease.' },
+  { op: 'end_autonomous_turn', alias: null, cli: false, prompt: false,
+    internalReason: 'Agent-runtime-only settlement of the exact typed-autonomous Workday turn lease.',
+    description: 'Settle one exact server-owned private autonomous-turn lease.' },
   { op: 'decide_churn_retirement', alias: null, cli: false, prompt: false,
     internalReason: 'Autonomous keep/retire decision for a churn/zombie-flagged direction; mirrors the operator seam and is not surfaced as a standalone CLI verb.',
     description: 'Decide keep/retire for a direction the churn/zombie ladder paused pending review.' },

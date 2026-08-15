@@ -229,7 +229,7 @@ export function ConsoleHome({
   onCreateTask,
   isAdmin = false,
 }: ConsoleHomeProps) {
-  const pageActiveCount = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
+  const pageActiveCount = tasks.filter(t => t.status === 'IN_PROGRESS').length;
   const pageQueuedCount = tasks.filter(t => t.status === 'QUEUED').length;
   const activeCount = selectedProjectId && scopedActiveCount != null ? scopedActiveCount : (globalActiveCount ?? pageActiveCount);
   const queuedCount = selectedProjectId && scopedQueuedCount != null ? scopedQueuedCount : (globalQueuedCount ?? pageQueuedCount);
@@ -312,7 +312,7 @@ export function ConsoleHome({
 
       {/* 4 metric cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <MetricCard label="Active" value={activeCount} color="emerald" spark={sparkData} dataKey="active" loading={loading} />
+        <MetricCard label="In progress" value={activeCount} color="emerald" spark={sparkData} dataKey="active" loading={loading} />
         <MetricCard label="Queued" value={queuedCount} color="blue" spark={sparkData} dataKey="queued" loading={loading} />
         <SuccessRateCard
           rate={successRate}
@@ -336,7 +336,7 @@ export function ConsoleHome({
         <p className="text-xs text-red-400 px-1">{fetchError}</p>
       )}
 
-      {/* Empty-state CTA: shown when nothing is running or queued */}
+      {/* Empty-state CTA: shown when nothing is in progress or queued */}
       {!loading && activeCount === 0 && queuedCount === 0 && onCreateTask && (
         <button
           onClick={onCreateTask}
@@ -345,7 +345,7 @@ export function ConsoleHome({
           <PlusCircle className="w-5 h-5 text-neutral-500 shrink-0" />
           <div>
             <p className="text-sm font-medium text-neutral-300">Create your first task</p>
-            <p className="text-xs text-neutral-500 mt-0.5">Nothing is running yet — launch a task to get started</p>
+            <p className="text-xs text-neutral-500 mt-0.5">Nothing is in progress yet — launch a task to get started</p>
           </div>
         </button>
       )}

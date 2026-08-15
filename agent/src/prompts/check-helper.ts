@@ -306,7 +306,8 @@ ${jsonFieldFn}
 _VERIFY_TASK_ID="\${TASK_ID:-${cfg.taskId}}"
 _VERIFY_RECEIPT="/tmp/project_verification_receipt_\${_VERIFY_TASK_ID}.json"
 _VERIFY_HARNESS_RECEIPT="/tmp/backend_verification_harness_\${_VERIFY_TASK_ID}.json"
-if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT"; then
+_VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_\${_VERIFY_TASK_ID}"
+if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT"; then
   echo "[check] unable to remove prior verification receipt(s) — refusing to run" >&2
   exit 1
 fi

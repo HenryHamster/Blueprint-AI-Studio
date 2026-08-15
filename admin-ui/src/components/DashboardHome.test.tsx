@@ -367,7 +367,7 @@ describe('DashboardHome', () => {
     expect(screen.getAllByText('0').length).toBeGreaterThan(2);
   });
 
-  it('Active/Queued cards reflect aggregate counts, not the current task page slice', async () => {
+  it('In progress/Queued cards reflect aggregate counts, not the current task page slice', async () => {
     // The `tasks` prop is the current paginated page — here a single IN_PROGRESS
     // task. The membership-scoped aggregate props report the true fleet totals.
     // The headline cards must render the aggregate so a one-task page can't make
@@ -395,7 +395,7 @@ describe('DashboardHome', () => {
     );
 
     const section = (await screen.findByText('Task Status')).closest('section') as HTMLElement;
-    const activeCard = (await within(section).findByText('Active')).closest('div') as HTMLElement;
+    const activeCard = (await within(section).findByText('In progress')).closest('div') as HTMLElement;
     expect(within(activeCard).getByText('12')).toBeInTheDocument();
     // Not the page-slice value of 1.
     expect(within(activeCard).queryByText('1')).not.toBeInTheDocument();
@@ -404,7 +404,33 @@ describe('DashboardHome', () => {
     expect(within(queuedCard).getByText('7')).toBeInTheDocument();
   });
 
-  it('Active/Queued cards prefer the project-scoped aggregate when a project is selected', async () => {
+  it('does not count a provisioning reservation as In progress in the page fallback', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(
+      <DashboardHome
+        tasks={[makeTask({ id: 'starting-only', status: 'PROVISIONING' })]}
+        selectedProjectId={null}
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    const section = (await screen.findByText('Task Status')).closest('section') as HTMLElement;
+    const activeCard = within(section).getByText('In progress').closest('div') as HTMLElement;
+    expect(within(activeCard).getByText('0')).toBeInTheDocument();
+  });
+
+  it('In progress/Queued cards prefer the project-scoped aggregate when a project is selected', async () => {
     setupApiMocks({
       digest: {
         failed_count: 0,
@@ -430,7 +456,7 @@ describe('DashboardHome', () => {
     );
 
     const section = (await screen.findByText('Task Status')).closest('section') as HTMLElement;
-    const activeCard = (await within(section).findByText('Active')).closest('div') as HTMLElement;
+    const activeCard = (await within(section).findByText('In progress')).closest('div') as HTMLElement;
     // Project-scoped (3), not fleet (12).
     expect(within(activeCard).getByText('3')).toBeInTheDocument();
     const queuedCard = within(section).getByText('Queued').closest('div') as HTMLElement;

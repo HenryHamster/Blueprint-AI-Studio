@@ -10,7 +10,6 @@ from typing import Any
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.messages_last_seen import (
@@ -454,7 +453,6 @@ async def _update_receipt_result(
     command_context["result"] = _bounded_mapping(result) or {}
     context[OPERATOR_COMMAND_EVENT_TYPE] = command_context
     receipt.context = context
-    flag_modified(receipt, "context")
     session.add(receipt)
     await session.commit()
     await session.refresh(receipt)

@@ -237,7 +237,8 @@ class TestGetAllProjects:
         target = next(p for p in items if p["id"] == str(project.id))
         counts = target["task_status_counts"]
         assert counts["queued"] == 2
-        assert counts["running"] == 2  # IN_PROGRESS + PROVISIONING
+        assert counts["starting"] == 1
+        assert counts["running"] == 1
         assert counts["evaluating"] == 1
         assert counts["blocked"] == 1
         assert counts["failed"] == 1
@@ -342,6 +343,7 @@ class TestGetAllProjects:
         target = next(p for p in items if p["name"] == "Empty Project")
         counts = target["task_status_counts"]
         assert counts["queued"] == 0
+        assert counts["starting"] == 0
         assert counts["running"] == 0
         assert counts["total"] == 0
 
@@ -373,6 +375,7 @@ class TestGetAllProjects:
         # All named buckets must reconcile with total.
         bucket_sum = (
             counts["queued"]
+            + counts["starting"]
             + counts["running"]
             + counts["evaluating"]
             + counts["blocked"]

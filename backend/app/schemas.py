@@ -8,6 +8,9 @@ from typing import Any, Dict, List, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.failure_classification import _CRED_FIELD_RE, _CRED_REDACT_SUBS
+from app.execution_capability_requirements import (
+    POSTGRES_RUNTIME_UNAVAILABLE_SENTINEL,
+)
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
 from app.vm_cost_rates import SUPPORTED_ACCELERATORS, supported_machine_types
 from app.payload_schemas import RepoDomainOverview, RepoBootstrapOverview
@@ -217,6 +220,9 @@ class AgentStatusPayload(BaseModel):
     logs: str | None = Field(None, max_length=500000)
     verdict_json: str | None = Field(None, max_length=10000)
     failure_category: str | None = Field(None, max_length=50)
+    # Set only by the generated terminal helpers after recognizing an exact
+    # Blueprint-owned runtime frame. Free-form logs are never routing authority.
+    execution_capability: Literal["backend_verification"] | None = None
     # Structured provider-run error report captured by the agent runner for the
     # last provider CLI run (exit code, stderr tail, provider error events,
     # model_output_seen / result_event_seen run shape). Shipped on FAILED
@@ -319,6 +325,23 @@ class AgentStatusPayload(BaseModel):
     # status endpoint, then upserted as a KnowledgeDocument by the completion
     # handler. Absent payloads are a clean no-op — domain capture is best-effort.
     domain_overview: RepoDomainOverview | None = None
+
+    @model_validator(mode="after")
+    def _validate_execution_capability_provenance(self):
+        capability = self.execution_capability
+        if capability is None:
+            return self
+        if self.status != TaskStatus.FAILED:
+            raise ValueError("execution_capability requires FAILED status")
+        compatible = (
+            self.failure_category == "agent_self_failed"
+            and self.logs == POSTGRES_RUNTIME_UNAVAILABLE_SENTINEL
+        )
+        if not compatible:
+            raise ValueError(
+                "execution_capability is incompatible with terminal category/frame"
+            )
+        return self
 
     @field_validator("blocked_need", mode="before")
     @classmethod

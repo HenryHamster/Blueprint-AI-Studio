@@ -551,6 +551,8 @@ export interface DigestData<DP = unknown> {
   generated_at?: string;
   active_count: number;
   running_count: number;
+  starting_count: number;
+  evaluating_count: number;
   queued_count: number;
   // Fleet- or project-scoped count of IN_PROGRESS tasks whose last heartbeat is
   // older than 5 minutes. Covers the whole fleet (or the selected project), not

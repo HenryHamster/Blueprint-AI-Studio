@@ -13,6 +13,10 @@
 import type { ProjectMessage } from '../types/messages';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
 import type { StrategicResidentSessionSnapshot } from '../strategicStateApi';
+import type {
+  StrategicResidentActivityReasonCode,
+  StrategicResidentAutonomyReasonCode,
+} from '../strategicStateApi';
 import { parseTimestamp } from './time';
 
 /** One classified run of contiguous streamed reply/reasoning text for a turn.
@@ -246,6 +250,11 @@ export interface ResidentActivityState {
   /** Short human-readable label for the state. */
   label: string;
   detail?: string;
+  reasonCode?: StrategicResidentActivityReasonCode | null;
+  consultationId?: string | null;
+  consultationVerified?: boolean;
+  autonomyState?: 'active' | 'paused';
+  autonomyReasonCode?: StrategicResidentAutonomyReasonCode | null;
   idleRemainingSeconds?: number | null;
   pendingOperatorMessages?: number;
   pendingWatches?: number;
@@ -305,7 +314,21 @@ export function computeResidentActivityState(
 ): ResidentActivityState | null {
   if (!residentSession) return null;
 
-  const heartbeat = residentSession.last_progress_at || residentSession.updated_at || null;
+  const activityContract = {
+    reasonCode: residentSession.activity?.reason_code ?? null,
+    consultationId: residentSession.activity?.consultation_id ?? null,
+    consultationVerified: residentSession.activity?.consultation_verified === true,
+    autonomyState: residentSession.activity?.autonomy_state,
+    autonomyReasonCode: residentSession.activity?.autonomy_reason_code ?? null,
+  };
+
+  // Liveness and progress are separate clocks. A healthy quiet Continuous
+  // Resident deliberately leaves last_progress_at unchanged while its exact
+  // process heartbeat advances, so an old successful turn must never make the
+  // still-heartbeating process look dead.
+  const heartbeat = residentSession.worker_heartbeat_at
+    || residentSession.updated_at
+    || null;
   const heartbeatMs = heartbeat ? parseTimestamp(heartbeat).getTime() : NaN;
   const endedAtMs = residentSession.ended_at ? parseTimestamp(residentSession.ended_at).getTime() : NaN;
   const stale = !Number.isNaN(heartbeatMs) && nowMs - heartbeatMs > RESIDENT_HEARTBEAT_STALE_MS;
@@ -321,6 +344,7 @@ export function computeResidentActivityState(
       ? endedAtMs
       : (!Number.isNaN(heartbeatMs) ? heartbeatMs : undefined);
     return {
+      ...activityContract,
       phase: 'dead', durablePhase: 'ended', endMs: frozen, label: 'Session ended',
       detail: residentSession.activity?.last_action ?? undefined,
       idleRemainingSeconds: residentSession.activity?.idle_remaining_seconds,
@@ -332,6 +356,7 @@ export function computeResidentActivityState(
   // must never make the still-owned Workday session look dead.
   if (retryWaiting) {
     return {
+      ...activityContract,
       phase: 'idle',
       durablePhase: 'retrying',
       endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
@@ -350,6 +375,7 @@ export function computeResidentActivityState(
   // recoverable transition, never as the contradictory "Active / Session ended".
   if (residentSession.worker_state === 'starting') {
     return {
+      ...activityContract,
       phase: 'idle',
       durablePhase: 'waiting',
       endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
@@ -363,6 +389,7 @@ export function computeResidentActivityState(
   // of claiming the operator intentionally ended the conversation.
   if (residentSession.worker_state === 'restart_failed' || stale) {
     return {
+      ...activityContract,
       phase: 'dead',
       durablePhase: 'ended',
       endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
@@ -387,6 +414,7 @@ export function computeResidentActivityState(
       ? parseTimestamp(durable.phase_started_at).getTime()
       : NaN;
     return {
+      ...activityContract,
       phase: durablePhase === 'working' ? 'executing' : 'idle',
       durablePhase,
       startMs: durablePhase === 'working' && !Number.isNaN(phaseStartedMs)
@@ -419,12 +447,14 @@ export function computeResidentActivityState(
 
   if (executing && last) {
     return {
+      ...activityContract,
       phase: 'executing', durablePhase: 'working', commandText: last.text,
       startMs: last.ts, label: 'Working',
     };
   }
 
   return {
+    ...activityContract,
     phase: 'idle',
     durablePhase: 'waiting',
     endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,

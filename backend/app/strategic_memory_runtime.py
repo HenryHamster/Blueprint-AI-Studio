@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Literal
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -25,6 +25,8 @@ from app.models import (
     StrategicMemoryBackfillCursor,
     StrategicMemoryConsolidationJob,
     StrategicMemoryProjectState,
+    StrategicMemorySource,
+    StrategicMemorySourceDisposition,
     Task,
     TaskStatus,
 )
@@ -246,13 +248,38 @@ async def dispatch_pending_memory_consolidation(
 
     if not 1 <= project_limit <= MAX_DISPATCH_PROJECTS_PER_TICK:
         raise ValueError("memory dispatch project limit is outside the bounded range")
+    from app.strategic_memory_claim_redaction_repair import (
+        REPAIR_DISPOSITION_REASON,
+        enqueue_next_repaired_claim_source,
+    )
+
+    repaired_project_ids = (
+        select(StrategicMemorySource.project_id)
+        .join(
+            StrategicMemorySourceDisposition,
+            StrategicMemorySourceDisposition.source_id == StrategicMemorySource.id,
+        )
+        .where(
+            StrategicMemorySource.payload_state == "active",
+            StrategicMemorySource.tombstoned_at.is_(None),
+            StrategicMemorySourceDisposition.status == "quarantined",
+            StrategicMemorySourceDisposition.reason == REPAIR_DISPOSITION_REASON,
+            StrategicMemorySourceDisposition.consolidation_job_id.is_(None),
+        )
+        .distinct()
+    )
     project_ids = list(
         (
             await session.execute(
                 select(StrategicMemoryProjectState.project_id)
                 .where(
-                    StrategicMemoryProjectState.source_high_watermark
-                    > StrategicMemoryProjectState.incorporated_source_sequence
+                    or_(
+                        StrategicMemoryProjectState.source_high_watermark
+                        > StrategicMemoryProjectState.incorporated_source_sequence,
+                        StrategicMemoryProjectState.project_id.in_(
+                            repaired_project_ids
+                        ),
+                    )
                 )
                 .order_by(StrategicMemoryProjectState.updated_at)
                 .limit(project_limit)
@@ -269,6 +296,10 @@ async def dispatch_pending_memory_consolidation(
 
         if not memory_v2_rollout(project_id).shadow_enabled:
             continue
+        # Let the canonical enqueue path validate/reap any active job first,
+        # including a reconsolidation invalidated by a later authority/privacy
+        # generation. Only when no active contiguous work remains do we issue
+        # the next one-source historical repair.
         job = await enqueue_contiguous_job(
             session,
             project_id,
@@ -276,6 +307,11 @@ async def dispatch_pending_memory_consolidation(
             max_input_bytes=MEMORY_TASK_MAX_INPUT_BYTES,
             max_prompt_tokens=MEMORY_TASK_MAX_PROMPT_TOKENS,
         )
+        if job is None:
+            job = await enqueue_next_repaired_claim_source(
+                session,
+                project_id=project_id,
+            )
         if job is None:
             continue
         queued_jobs += 1

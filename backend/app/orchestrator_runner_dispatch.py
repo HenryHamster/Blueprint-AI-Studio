@@ -31,6 +31,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.deploy_identity import deploy_repo_identity, project_matches_deploy_identity
+from app.execution_capability_requirements import (
+    CAPABILITY_BACKEND_VERIFICATION,
+    EXECUTION_CAPABILITY_WAIT_CONTEXT_KEY,
+    has_learned_execution_capability,
+    learned_execution_capabilities,
+)
 from app.models import (
     ComputeJob,
     ComputeJobStatus,
@@ -45,6 +51,7 @@ from app.resource_envelope import (
     resolve_project_require_local_runner,
 )
 from app.runner_project_binding import allowed_project_ids
+from app.runner_pins import release_unpulled_runner_pins
 from app.runner_decline import (
     decline_exclusion_is_advisory,
     decline_record_for_runner,
@@ -788,6 +795,7 @@ def _runner_lacks_required_browser(runner: LocalRunner, task: Task) -> bool:
     """Return whether ``runner`` must refuse this task's browser contract."""
     return not _runner_chromium_usable(runner) and _task_requires_browser(task)
 
+
 async def _try_runner_dispatch(
     session: AsyncSession,
     task: Task,
@@ -859,11 +867,16 @@ async def _try_runner_dispatch(
             ).scalar_one_or_none()
         )
     requires_project_verification = bool(
-        project is not None
-        and _task_is_authoring(task_type)
-        and (
-            is_deploy_repo
-            or _task_requires_project_verification(task_type, project.build_config)
+        has_learned_execution_capability(
+            task.context, CAPABILITY_BACKEND_VERIFICATION
+        )
+        or (
+            project is not None
+            and _task_is_authoring(task_type)
+            and (
+                is_deploy_repo
+                or _task_requires_project_verification(task_type, project.build_config)
+            )
         )
     )
     # A declared accelerator (flat or nested compute_experiment form) restricts
@@ -938,6 +951,7 @@ async def _try_runner_dispatch(
     new_ctx.pop(LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
     new_ctx.pop(CONTAINER_RUNNER_HOLD_CONTEXT_KEY, None)
     new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
+    new_ctx.pop(EXECUTION_CAPABILITY_WAIT_CONTEXT_KEY, None)
     new_ctx.pop("runner_pin_hold", None)
     _clear_execution_placement_wait(new_ctx)
     task.context = new_ctx
@@ -999,6 +1013,51 @@ async def _try_runner_dispatch(
         logger.exception(
             "[RUNNERS] Failed to dismiss hold alert for task %s (non-fatal)", task.id
         )
+    return True
+
+
+async def _hold_task_for_learned_execution_capabilities(
+    session: AsyncSession,
+    task: Task,
+) -> bool:
+    """Hold a learned requirement instead of trying an unproved cloud site."""
+
+    capabilities = learned_execution_capabilities(task.context)
+    if not capabilities:
+        return False
+    ctx = dict(task.context or {})
+    prior_wait = ctx.get(EXECUTION_CAPABILITY_WAIT_CONTEXT_KEY)
+    since = (
+        prior_wait.get("since")
+        if isinstance(prior_wait, dict) and isinstance(prior_wait.get("since"), str)
+        else _utcnow().isoformat()
+    )
+    wait_record = {
+        "capabilities": sorted(capabilities),
+        "since": since,
+    }
+    wait_message = (
+        "Waiting for a live runner with learned execution capabilities: "
+        + ", ".join(sorted(capabilities))
+    )[:500]
+    if (
+        prior_wait == wait_record
+        and task.vm_instance_id is None
+        and task.vm_provisioned_at is None
+        and task.latest_status_message == wait_message
+        and not ctx.get("runner_target_id")
+        and not ctx.get("runner_hostname")
+    ):
+        return True
+    ctx[EXECUTION_CAPABILITY_WAIT_CONTEXT_KEY] = wait_record
+    ctx.pop("runner_target_id", None)
+    ctx.pop("runner_hostname", None)
+    task.context = ctx
+    task.vm_instance_id = None
+    task.vm_provisioned_at = None
+    task.latest_status_message = wait_message
+    session.add(task)
+    await session.commit()
     return True
 
 
@@ -2846,13 +2905,12 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
     """Mark runners that missed the heartbeat window as inactive.
 
     Keeps the dispatch cache query clean and surfaces stale runners in the admin
-    listing. Any task pinned to a now-inactive runner that the runner never
-    pulled (``started_at IS NULL``) is released back to QUEUED so the next
-    dispatch cycle can re-pin it to a live runner, hold it (enforce-local, with
-    the 6h safety-fail), or fall back to cloud. This recovery is required because
-    the orphaned-task reaper intentionally no longer reaps awaiting-pull runner
-    pins (they are not dead GCE VMs); without it a pin would wedge forever if its
-    runner went offline in the pin->pull window.
+    listing. Ordinary tasks pinned to a now-inactive runner that the runner
+    never pulled (``started_at IS NULL``) are released back to QUEUED so the
+    next dispatch cycle can re-pin them. The exact canonical active Resident is
+    preserved for session lifecycle recovery instead of silently migrating it.
+    This recovery is required because the orphaned-task reaper intentionally no
+    longer reaps awaiting-pull runner pins (they are not dead GCE VMs).
     """
     from sqlalchemy import or_, update as _sa_update
 
@@ -2891,36 +2949,27 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
         .values(status="inactive")
     )
 
-    # Release unpulled pins on the now-inactive runners back to QUEUED. A pin the
-    # runner never claimed has started_at IS NULL and vm_instance_id "runner:{id}"
-    # (set together in _try_runner_dispatch); clearing the pin lets the dispatch
-    # loop re-decide next cycle.
-    stale_vm_ids = [f"runner:{rid}" for rid in stale_ids]
-    pinned = (
-        await session.execute(
-            select(Task).where(
-                Task.status == TaskStatus.PROVISIONING,
-                Task.started_at.is_(None),
-                Task.vm_instance_id.in_(stale_vm_ids),
-            )
-        )
-    ).scalars().all()
+    # Release ordinary pins while preserving only the exact canonical active
+    # Resident for each automatic runner transition.  Stale Resident-shaped
+    # markers are releasable; explicit admin pause/delete callers retain the
+    # helper's default generic-release behavior.
     released_pins_by_project: dict[uuid.UUID, int] = {}
-    for task in pinned:
-        task.status = TaskStatus.QUEUED
-        task.vm_instance_id = None
-        task.vm_provisioned_at = None
-        new_ctx = dict(task.context or {})
-        new_ctx.pop("runner_target_id", None)
-        task.context = new_ctx
-        session.add(task)
-        released_pins_by_project[task.project_id] = (
-            released_pins_by_project.get(task.project_id, 0) + 1
+    for runner_id, project_id, *_rest in stale_rows:
+        released = await release_unpulled_runner_pins(
+            session,
+            runner_id,
+            preserve_active_resident=True,
+        )
+        if not released:
+            continue
+        released_pins_by_project[project_id] = (
+            released_pins_by_project.get(project_id, 0) + released
         )
         logger.info(
-            "[RUNNERS] Released unpulled pin for task %s from a now-inactive "
-            "runner (back to QUEUED for re-dispatch)",
-            task.id,
+            "[RUNNERS] Released %d unpulled pin(s) from now-inactive runner %s "
+            "(back to QUEUED for re-dispatch)",
+            released,
+            runner_id,
         )
 
     await session.commit()

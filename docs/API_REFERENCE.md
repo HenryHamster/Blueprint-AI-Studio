@@ -627,7 +627,7 @@ otherwise).
 ```json
 {
   "task_id": "uuid",
-  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | resolve_discovery | create_message | resolve_message | spawn_task | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | consume_knowledge | dismiss_knowledge | request_qualification",
+  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | resolve_discovery | create_message | resolve_message | spawn_task | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | report_autonomous_finding | consume_knowledge | dismiss_knowledge | request_qualification",
   "data": { }
 }
 ```
@@ -991,6 +991,17 @@ grouped by domain. Deep-dives for onboarding and branch/build config follow.
 | POST | `/api/admin/projects/{project_id}/strategic-cycle` | Manually trigger a strategic cycle. |
 | GET | `/api/admin/projects/{project_id}/messages` | List messages for a project. |
 | POST | `/api/admin/projects/{project_id}/messages` | Create a message from the user to the autonomous system. |
+
+#### Strategic Memory Repair (`admin_strategic_memory.py`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/admin/projects/{project_id}/memory/repairs/fast-claim-redactions` | Owner-only, two-phase repair for receipts falsely redacted by the Fast claim-metadata regression. `mode=dry_run` returns only an exact candidate count and digest; `mode=apply` additionally requires that reviewed count/digest, an idempotent operation ID, the buggy and currently served revisions, and the identical timestamp window. |
+
+Operators should use `blueprint ops repair-fast-claim-redactions dry-run|apply`
+instead of constructing this request directly. The CLI requires timezone-aware
+window bounds and makes `--yes` mandatory for apply; the endpoint re-locks and
+recomputes the candidate set before restoring any receipt.
 
 #### Project Automation & Config (`admin_project_config.py`)
 

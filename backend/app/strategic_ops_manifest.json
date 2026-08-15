@@ -502,6 +502,54 @@
         "internal_reason": null
     },
     {
+        "op": "report_autonomous_finding",
+        "alias": "report-autonomous-finding",
+        "description": "Privately hand one leased autonomous Workday question, blocker, or finding to Fast for receipt-bound public delivery.",
+        "cli": true,
+        "prompt": false,
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "kind",
+                "summary"
+            ],
+            "fields": [
+                "kind",
+                "summary",
+                "evidence_refs"
+            ],
+            "example": {
+                "kind": "finding",
+                "summary": "The queued task is blocked on an operator-owned credential.",
+                "evidence_refs": [
+                    "123e4567-e89b-42d3-a456-426614174000"
+                ]
+            },
+            "notes": [
+                "Available only inside the exact server-leased typed-autonomous Workday turn.",
+                "kind is question|blocker|finding. Fast remains the sole public author.",
+                "Evidence refs are bounded correlation candidates; they do not establish managed state."
+            ]
+        }
+    },
+    {
+        "op": "begin_autonomous_turn",
+        "alias": null,
+        "description": "Mint or replay the exact server-owned private autonomous-turn lease.",
+        "cli": false,
+        "prompt": false,
+        "internal_reason": "Agent-runtime-only server lease minting for one typed-autonomous Workday turn."
+    },
+    {
+        "op": "end_autonomous_turn",
+        "alias": null,
+        "description": "Settle one exact server-owned private autonomous-turn lease.",
+        "cli": false,
+        "prompt": false,
+        "internal_reason": "Agent-runtime-only settlement of the exact typed-autonomous Workday turn lease."
+    },
+    {
         "op": "decide_churn_retirement",
         "alias": null,
         "description": "Decide keep/retire for a direction the churn/zombie ladder paused pending review.",

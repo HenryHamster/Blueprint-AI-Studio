@@ -3252,10 +3252,12 @@ def _render_promote_recover(data: dict) -> None:
 # ── ops (system intervention) ────────────────────────────────────────────────
 
 def cmd_ops(args: argparse.Namespace) -> None:
-    """Dispatch ops subcommands: repair / reset-health / requeue-failed / restart-orchestrator / circuit-breaker."""
+    """Dispatch narrowly bounded system-intervention subcommands."""
     sub = getattr(args, "ops_cmd", None)
     if sub == "repair":
         _ops_repair(args)
+    elif sub == "repair-fast-claim-redactions":
+        _ops_repair_fast_claim_redactions(args)
     elif sub == "reset-health":
         _ops_reset_health(args)
     elif sub == "requeue-failed":
@@ -3267,6 +3269,80 @@ def cmd_ops(args: argparse.Namespace) -> None:
     else:
         print("ERROR: ops requires a subcommand", file=sys.stderr)
         sys.exit(1)
+
+
+def _ops_repair_fast_claim_redactions(args: argparse.Namespace) -> None:
+    """Review or apply the owner-only false Fast-claim redaction repair."""
+
+    # Even dry-run is owner-only. Refuse the agent-JWT/read-only fallback before
+    # project resolution or any HTTP request; scoped ServiceCredentials are
+    # rejected even earlier by _enforce_scoped_cli_command.
+    _require_write_config("ops repair-fast-claim-redactions")
+    mode = getattr(args, "fast_claim_repair_mode", None)
+    if mode not in {"dry-run", "apply"}:
+        print(
+            "ERROR: ops repair-fast-claim-redactions requires dry-run or apply",
+            file=sys.stderr,
+        )
+        raise APIError("fast-claim redaction repair mode is required")
+    if mode == "apply" and not getattr(args, "yes", False):
+        # argparse requires --yes, and this defense keeps direct callers safe.
+        print(
+            "ERROR: applying the Fast-claim redaction repair requires --yes.",
+            file=sys.stderr,
+        )
+        raise APIError("fast-claim redaction repair apply requires --yes")
+
+    project_id = get_project_id(getattr(args, "project_id", None))
+    body = {
+        "mode": "dry_run" if mode == "dry-run" else "apply",
+        "window_start": args.window_start,
+        "window_end": args.window_end,
+        "buggy_serving_revision": args.buggy_serving_revision,
+        "expected_serving_revision": args.expected_serving_revision,
+    }
+    if mode == "apply":
+        body.update(
+            {
+                "operation_id": args.operation_id,
+                "expected_candidate_count": args.expected_candidate_count,
+                "expected_candidate_digest": args.expected_candidate_digest,
+            }
+        )
+
+    result = api(
+        "POST",
+        f"/api/admin/projects/{project_id}/memory/repairs/fast-claim-redactions",
+        body,
+    )
+    _emit(args, result, _render_fast_claim_redaction_repair)
+
+
+def _render_fast_claim_redaction_repair(data: dict) -> None:
+    mode = data.get("mode") or "?"
+    action = "REVIEW" if mode == "dry_run" else "APPLY"
+    print(f"=== FAST-CLAIM REDACTION REPAIR {action} ===")
+    print(f"  Project:             {data.get('project_id', '?')}")
+    print(f"  Serving revision:    {data.get('serving_revision', '?')}")
+    if data.get("buggy_serving_revision"):
+        print(f"  Buggy revision:      {data['buggy_serving_revision']}")
+    if data.get("window_start") and data.get("window_end"):
+        print(
+            "  Window:              "
+            f"{data['window_start']} .. {data['window_end']}"
+        )
+    print(f"  Candidate count:     {data.get('candidate_count', '?')}")
+    print(f"  Candidate digest:    {data.get('candidate_digest', '?')}")
+    if mode == "apply":
+        print(f"  Operation id:        {data.get('operation_id', '?')}")
+        print(f"  Restored:            {data.get('restored_count', '?')}")
+        print(
+            "  Reconsolidation due: "
+            f"{data.get('reconsolidation_pending_count', '?')}"
+        )
+        print(f"  Queued job:          {data.get('queued_job_id') or '-'}")
+        print(f"  Idempotent replay:   {bool(data.get('replayed', False))}")
+    print(f"  Content returned:    {bool(data.get('content_returned', False))}")
 
 
 def _ops_repair(args: argparse.Namespace) -> None:
@@ -5718,6 +5794,50 @@ def _message_offset(value: str) -> int:
     return offset
 
 
+def _repair_timestamp(value: str) -> str:
+    """Require an ISO-8601 repair fence with an explicit UTC offset."""
+
+    normalized = f"{value[:-1]}+00:00" if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "timestamp must be ISO-8601 (for example 2026-08-01T00:00:00Z)"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise argparse.ArgumentTypeError("timestamp must include a timezone")
+    return value
+
+
+def _repair_safe_identifier(value: str) -> str:
+    """Match the endpoint's bounded revision/operation identifier alphabet."""
+
+    normalized = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", normalized):
+        raise argparse.ArgumentTypeError(
+            "value must be 1..128 safe identifier characters"
+        )
+    return normalized
+
+
+def _repair_candidate_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("candidate count must be an integer") from exc
+    if not 1 <= count <= 250:
+        raise argparse.ArgumentTypeError("candidate count must be between 1 and 250")
+    return count
+
+
+def _repair_candidate_digest(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise argparse.ArgumentTypeError(
+            "candidate digest must be exactly 64 lowercase hex characters"
+        )
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the full argparse tree. Every subcommand exposes --help."""
     # Shared parent so --json works before OR after the subcommand. SUPPRESS
@@ -5823,6 +5943,82 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Repair stuck state (orphaned parents, stale locks).")
     p_ops_repair.add_argument("--yes", action="store_true",
                               help="Skip the confirmation prompt (for scripting).")
+    p_ops_claim_repair = ops_sub.add_parser(
+        "repair-fast-claim-redactions",
+        parents=[common],
+        help="Review or apply the exact false Fast-claim redaction repair set.",
+        description=(
+            "Owner-only two-phase repair. Run dry-run first, then copy its exact "
+            "candidate count and digest into apply."
+        ),
+    )
+    claim_repair_sub = p_ops_claim_repair.add_subparsers(
+        dest="fast_claim_repair_mode",
+        required=True,
+    )
+
+    def add_claim_repair_fences(mode_parser: argparse.ArgumentParser) -> None:
+        mode_parser.add_argument(
+            "--window-start",
+            required=True,
+            type=_repair_timestamp,
+            help="Inclusive ISO-8601 start timestamp with timezone.",
+        )
+        mode_parser.add_argument(
+            "--window-end",
+            required=True,
+            type=_repair_timestamp,
+            help="Exclusive ISO-8601 end timestamp with timezone.",
+        )
+        mode_parser.add_argument(
+            "--buggy-serving-revision",
+            required=True,
+            type=_repair_safe_identifier,
+            help="Exact revision that produced the false redactions.",
+        )
+        mode_parser.add_argument(
+            "--expected-serving-revision",
+            required=True,
+            type=_repair_safe_identifier,
+            help="Exact fixed revision currently expected to be serving.",
+        )
+
+    p_ops_claim_dry_run = claim_repair_sub.add_parser(
+        "dry-run",
+        parents=[common],
+        help="Return only the bounded candidate count and digest; mutate nothing.",
+    )
+    add_claim_repair_fences(p_ops_claim_dry_run)
+    p_ops_claim_apply = claim_repair_sub.add_parser(
+        "apply",
+        parents=[common],
+        help="Apply one previously reviewed and revision-fenced repair set.",
+    )
+    add_claim_repair_fences(p_ops_claim_apply)
+    p_ops_claim_apply.add_argument(
+        "--operation-id",
+        required=True,
+        type=_repair_safe_identifier,
+        help="Immutable idempotency id for this reviewed repair operation.",
+    )
+    p_ops_claim_apply.add_argument(
+        "--expected-candidate-count",
+        required=True,
+        type=_repair_candidate_count,
+        help="Exact non-zero candidate count returned by dry-run (1..250).",
+    )
+    p_ops_claim_apply.add_argument(
+        "--expected-candidate-digest",
+        required=True,
+        type=_repair_candidate_digest,
+        help="Exact lowercase SHA-256 candidate digest returned by dry-run.",
+    )
+    p_ops_claim_apply.add_argument(
+        "--yes",
+        required=True,
+        action="store_true",
+        help="Required explicit acknowledgement that the reviewed repair may mutate.",
+    )
     p_ops_reset = ops_sub.add_parser("reset-health", parents=[common],
                        help="Force-reset health checks.")
     p_ops_reset.add_argument("--yes", action="store_true",

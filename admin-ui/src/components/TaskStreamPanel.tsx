@@ -41,7 +41,9 @@ function statusDotColor(status?: string): string {
 function streamFreshnessLabel(task: Task | undefined, entries: TrackLogEntry[]): string {
   const lastEntry = entries.at(-1);
   if (lastEntry) return `last event ${timeAgo(lastEntry.t)}`;
-  if (task && ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(task.status)) return 'active, no events yet';
+  if (task?.status === 'IN_PROGRESS') return 'in progress, no events yet';
+  if (task?.status === 'PROVISIONING') return 'starting, no events yet';
+  if (task?.status === 'EVALUATING') return 'evaluating, no events yet';
   if (task?.status === 'QUEUED') return 'queued, no events yet';
   return 'no events yet';
 }

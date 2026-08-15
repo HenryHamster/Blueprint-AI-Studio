@@ -37,11 +37,66 @@
         "test_typed_fast_exact_completion_replay_rebroadcasts_canonical_message",
         "test_typed_workday_packet_and_continuation_routes_are_receipt_bound",
         "test_workday_continuation_exact_replay_rebroadcasts_canonical_message",
-        "test_workday_claim_retires_stale_private_packet_and_delivers_next",
         "test_fast_claim_retires_stale_private_result_and_delivers_next_continuation",
         "test_resident_final_fence_orders_equal_timestamps_deterministically",
         "test_resident_poll_rejects_query_identity_spoof",
         "test_stale_resident_poll_is_rejected_without_generation_query"
+      ]
+    },
+    {
+      "path": "backend/testing/test_strategic_fast_live_work.py",
+      "reason": "Protects Fast's scalar-only bounded live-work, recent-terminal-task, canonical serving, and configured-versus-current Workday authority contract. These tests prevent raw task context, unrelated Resident churn, or configuration alone from being promoted into managed-state or deployment claims.",
+      "test_ids": [
+        "test_fast_live_task_projection_never_selects_complete_context_json",
+        "test_result_evidence_ref_extraction_scans_full_bounded_summary",
+        "test_fast_live_role_contract_disables_private_autonomy_in_chat",
+        "test_fast_live_work_marks_bounded_collections_as_truncated",
+        "test_receipts_resolve_exact_project_entities_outside_global_windows"
+      ]
+    },
+    {
+      "path": "backend/testing/test_strategic_workday_mutation_rebind.py",
+      "reason": "Protects full per-packet Workday operation idempotency beyond the bounded Fast receipt projection, including old replay, fingerprint conflict, capacity rejection, and a fresh next-consultation ledger.",
+      "test_ids": [
+        "test_workday_operation_replay_survives_projection_window_and_is_packet_scoped"
+      ]
+    },
+    {
+      "path": "backend/testing/test_strategic_workday_handoff_recovery.py",
+      "reason": "Protects privacy-safe exactly-once settlement when typed Workday packets or results are stale, revoked, or missing, while forbidding recovery after the canonical public source is deleted.",
+      "test_ids": [
+        "test_stale_workday_packet_settles_source_once_without_private_leak",
+        "test_stale_workday_result_is_replaced_by_neutral_terminal_result",
+        "test_missing_handoff_recovers_but_deleted_source_publishes_nothing"
+      ]
+    },
+    {
+      "path": "backend/testing/test_conversation_coordinator_two_speed.py",
+      "reason": "Protects the bounded two-attempt initial Workday failure protocol and its single server-owned neutral terminal result.",
+      "test_ids": [
+        "test_workday_empty_result_retries_once_then_creates_terminal_failure"
+      ]
+    },
+    {
+      "path": "backend/testing/test_strategic_resident_continuous_liveness.py",
+      "reason": "Protects quiet Continuous Workday authority across the operator-silence horizon, exact pause/resume and Chat/Stop lock ordering, stale-incarnation fencing, and dead-process reaping.",
+      "test_ids": [
+        "test_quiet_continuous_liveness_renews_past_ttl_cap_and_daily_interval",
+        "test_activity_snapshot_does_not_report_operator_silence_as_stopping",
+        "test_competing_strategic_task_pauses_then_restores_continuous_authority",
+        "test_committed_chat_mode_fences_heartbeat_before_best_effort_stop",
+        "test_heartbeat_first_then_explicit_stop_linearizes_without_rearming",
+        "test_explicit_stop_before_heartbeat_cannot_be_rearmed",
+        "test_competing_incarnation_cannot_renew_continuous_liveness",
+        "test_dead_resident_process_remains_reapable_without_heartbeat"
+      ]
+    },
+    {
+      "path": "backend/testing/test_strategic_resident_pipeline_projection.py",
+      "reason": "Protects operator-facing pipeline truth by collapsing Resident generation churn to one real work item while retaining raw audit history and bypassing generic failure handling for terminal infrastructure tasks.",
+      "test_ids": [
+        "test_four_resident_generations_project_as_one_real_pipeline_work_item",
+        "test_resident_terminal_without_result_skips_generic_strategic_failure_path"
       ]
     },
     {
@@ -85,7 +140,8 @@
       "path": "backend/testing/test_admin_routers__strategic_directions.py",
       "reason": "Protects the generic Strategic create_message boundary from forging server-owned Chat hiding and Workday-consultation provenance fields.",
       "test_ids": [
-        "test_strategic_create_message_strips_server_owned_chat_provenance"
+        "test_strategic_create_message_strips_server_owned_chat_provenance",
+        "test_typed_fast_autonomy_cannot_emit_unclaimed_public_messages"
       ]
     },
     {
@@ -119,6 +175,37 @@
       "reason": "Protects strict server-owned Fast only and Workday requested receipts from caller-spoofed booleans, wrong message roles, or missing provenance.",
       "test_ids": [
         "renders only strict server-owned Workday consultation receipts"
+      ]
+    },
+    {
+      "path": "admin-ui/src/components/ConversationUtilityBar.test.tsx",
+      "reason": "Protects the compact, server-derived private Continuous Workday status line, its non-global wording, and operator-task priority order.",
+      "test_ids": [
+        "shows Chat as Workday off without claiming other project autonomy stopped",
+        "maps a live executing Resident to working and prioritizes friction over active work",
+        "shows requested, running, and delivering consultation states without parsing prose",
+        "keeps a server-verified running consultation visible outside the message window",
+        "keeps Chat mode consultation visible and clears stale working after its continuation",
+        "does not clear a second queued consultation when the first continuation arrives",
+        "keeps queued request count and structured pause reason visible without hover",
+        "preserves open request count when Workday is dead or unavailable",
+        "ignores spoofed receipts and mismatched structured consultation ids",
+        "autonomy pause outranks a stale generic executing phase",
+        "prioritizes operator judgment over friction and active work",
+        "maps durable retry and dead states without inventing activity",
+        "uses server availability when a Continuous session has no activity snapshot yet",
+        "renders one bounded, server-derived status line with full detail in its title"
+      ]
+    },
+    {
+      "path": "admin-ui/src/components/ConversationUtilityBar.viewport.test.tsx",
+      "reason": "Protects the unobtrusive Workday status and bounded task detail at the supported narrow conversation viewport.",
+      "test_ids": [
+        "collapsed search control does not overflow at 375px",
+        "expanded search input does not overflow at 375px",
+        "Workday status and bounded task detail do not overflow at 375px",
+        "expanded search plus Workday status does not overflow at 375px",
+        "requested and paused Workday remains truthful without hover at 375px"
       ]
     },
     {
@@ -282,17 +369,21 @@
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
-      "reason": "Covers the core conversational Workday session lifecycle — start/adopt, liveness heartbeat/lease, stop/handoff, and message handoff. These are the primary backend seams for the operator-driven Workday session; deleting this file would leave the session start/stop/handoff contract completely untested.",
+      "reason": "Covers the core conversational Workday session lifecycle — start/adopt, liveness heartbeat/lease, runner-pin preservation across the spawn/finalize race, stop/handoff, and message handoff. These are the primary backend seams for the operator-driven Workday session; deleting this file would leave the session start/stop/handoff contract completely untested.",
       "test_ids": [
         "test_session_state_helpers_remain_table_free",
-        "test_session_snapshot_exposes_bounded_activity_and_live_idle_remaining",
-        "test_session_snapshot_warns_near_idle_end_and_freezes_when_ended",
+        "test_session_snapshot_exposes_bounded_activity_without_silence_deadline",
+        "test_session_snapshot_keeps_quiet_continuous_waiting_and_marks_explicit_end",
+        "test_runner_pin_release_preserves_post_spawn_provisional_resident",
+        "test_runner_pin_release_rechecks_finalized_vision_after_candidate_scan",
+        "test_explicit_runner_pin_release_waits_for_contended_project",
+        "test_runner_pin_release_does_not_preserve_mismatched_provisional_marker",
         "test_hydration_ensure_cannot_resurrect_after_committed_mode_leave",
         "test_post_message_bind_revalidates_exact_active_resident",
         "test_operator_message_preensure_treats_mode_change_as_chat_safe",
         "test_continuous_hydration_ensure_succeeds",
         "test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_start_works",
-        "test_start_adopts_task_and_liveness_heartbeat_preserves_lease",
+        "test_start_adopts_task_and_liveness_heartbeat_renews_lease",
         "test_member_started_resident_spawn_persists_launcher",
         "test_failed_start_compensation_reconciles_cycle_and_emits_receipt",
         "test_retry_wait_is_persisted_reload_idempotent_and_heartbeat_clears",
@@ -305,17 +396,21 @@
         "test_reload_ensure_replaces_worker_after_task_corroboration_grace",
         "test_stale_worker_supersession_reconciles_cycle_and_emits_receipt",
         "test_incarnation_takeover_uses_time_sampled_after_project_lock",
-        "test_heartbeat_samples_operator_reengagement_after_project_lock",
+        "test_heartbeat_samples_committed_chat_mode_and_fails_closed",
+        "test_heartbeat_persists_authority_pause_before_returning_false",
+        "test_heartbeat_rearms_stale_server_owned_pause_before_returning_true",
         "test_new_process_waits_for_bounded_legacy_incarnation_during_rollout",
         "test_predeploy_legacy_grace_is_retryable_for_replacement",
         "test_resident_heartbeat_fences_overlapping_process_incarnations",
         "test_stop_ends_task_releases_continuation_and_hands_off_messages",
         "test_stop_handoff_is_atomic_with_session_end",
+        "test_stop_survives_poisoned_handoff_statement",
         "test_stop_with_strategic_api_marker_preserves_cancelled_cycle_disposition",
-        "test_unattended_cap_persists_message_handoff",
-        "test_unattended_cap_handoff_is_atomic_with_cap_end",
-        "test_stale_continuation_lease_atomically_terminalizes_resident_task",
-        "test_cap_never_terminalizes_cross_project_resident_task_pointer",
+        "test_operator_silence_preserves_claimed_message_and_resident_task",
+        "test_committed_chat_mode_handoff_is_atomic_with_mode_end",
+        "test_committed_chat_mode_end_survives_poisoned_handoff_statement",
+        "test_stale_marker_exact_heartbeat_renews_without_terminalizing_task",
+        "test_chat_mode_end_never_terminalizes_cross_project_resident_pointer",
         "test_handoff_releases_unanswered_and_resolves_answered",
         "test_handoff_survives_rearm_rollback",
         "test_handoff_treats_canonical_child_reply_as_answer_evidence",
@@ -356,9 +451,9 @@
         "test_explicit_runner_change_rejects_active_session",
         "test_explicit_runner_replaces_a_genuinely_stale_active_worker",
         "test_first_agent_heartbeat_reanchors_born_stale_session",
-        "test_post_claim_idle_still_lapses",
-        "test_autonomous_turn_does_not_bypass_unattended_cap",
-        "test_autonomous_turn_flag_does_not_rescue_operator_chat_idle_lapse",
+        "test_post_claim_quiet_heartbeat_renews_continuous_liveness",
+        "test_autonomous_turn_survives_operator_silence_with_exact_heartbeat",
+        "test_autonomous_turn_flag_cannot_rescue_committed_chat_mode",
         "test_autonomous_working_turn_renews_freshness_without_mutation"
       ]
     },
@@ -385,6 +480,22 @@
         "rejects direct managed execution",
         "accepts neutral strategist prose without body-status classification",
         "keeps the managed-execution fence bounded on 20k prose"
+      ]
+    },
+    {
+      "path": "backend/testing/test_strategic_consultation_status.py",
+      "reason": "Protects server-derived consultation phase truth, canonical privacy-visible source authority, heartbeat mismatch correction, and the ACK/result/continuation realtime ordering contract that keeps the unobtrusive Workday cue truthful.",
+      "test_ids": [
+        "test_consultation_activity_verification_requires_live_canonical_packet",
+        "test_heartbeat_emits_only_ordered_semantic_activity_transitions",
+        "test_short_consultation_projects_delivering_then_settles_before_message"
+      ]
+    },
+    {
+      "path": "agent/src/handlers/strategic-helpers.test.ts",
+      "reason": "Protects generated Strategic helper provenance, stable mutation identity across retries, and the deliberate private-consultation qualification boundary.",
+      "test_ids": [
+        "injects stable typed-consultation provenance across transport retries"
       ]
     },
     {
@@ -462,6 +573,9 @@
         "revalidates an existing claim before retrying the provider turn",
         "waits through retryable legacy grace without publishing loser helpers",
         "publishes a ready waiting state before entering the conversational loop",
+        "publishes a bounded active-to-authority-paused follow-up heartbeat",
+        "rearms an authority-paused projection with one bounded follow-up heartbeat",
+        "rearms a foreground-call-paused projection with one bounded follow-up heartbeat",
         "completes a preserved Fast turn after resolved workspace prep before Workday identity launch fails",
         "does not start a Fast foreground child for a resolved workspace with no Fast message",
         "completes Fast with autonomous authority lapsed while workspace preparation is unresolved",
@@ -476,7 +590,12 @@
         "acquires the fenced slot before readiness and releases it on normal shutdown",
         "closes a lease-lost Fast controller without giving its next tagged message to Workday",
         "waits for a standard Fast prompt to settle after %s fences its exact owner",
-        "does not acknowledge or answer an Activity remainder in the same Fast turn",
+        "keeps Activity private while Fast replies and Continuous Workday stays autonomous",
+        "fails closed on %s before a private autonomous turn can execute",
+        "keeps Chat mode Workday on demand when typed Fast owns the foreground",
+        "does not preempt an active autonomous Workday turn for a Fast-only reply",
+        "settles active autonomous Workday before claiming a confirmed Fast consultation",
+        "settles active autonomous Workday when the committed Fast consultation completion response is lost",
         "preserves the operator message without broad Workday fallback when Fast capacity is denied",
         "continues polling and heartbeating while the Fast readiness probe is pending",
         "ignores a stale heartbeat response sent before the Fast lease was acquired",

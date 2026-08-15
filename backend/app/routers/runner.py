@@ -1755,7 +1755,11 @@ async def heartbeat(
             # the first drain report and pin one final task after that report's
             # release query. Repeating this cheap bounded query closes that race
             # within one heartbeat instead of stranding the late pin.
-            released_pins = await release_unpulled_runner_pins(session, runner.id)
+            released_pins = await release_unpulled_runner_pins(
+                session,
+                runner.id,
+                preserve_active_resident=True,
+            )
             if released_pins or not was_update_draining:
                 logger.warning(
                     "[RUNNERS] Runner %s %s auto-update drain; "

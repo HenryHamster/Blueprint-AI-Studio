@@ -7917,6 +7917,75 @@ class TestOrchestratorRunnerRouting:
         assert "runner_target_id" not in (pinned.context or {})
 
     @pytest.mark.asyncio
+    async def test_deactivate_stale_runners_keeps_unpulled_resident_pin(
+        self, db_session
+    ):
+        """Stale-runner recovery preserves only the canonical active Resident."""
+        project = await _make_project(db_session)
+        stale, _ = await _make_runner(
+            db_session, project.id, last_seen_at=_utcnow() - timedelta(minutes=10)
+        )
+        resident = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{stale.id}",
+            vm_provisioned_at=_utcnow(),
+            context={
+                "_resident_session": True,
+                "strategic_session_id": "ss-stale-hard-pin",
+                "_resident_worker_generation": 3,
+                "runner_target_id": str(stale.id),
+                "preferred_runner_target_id": str(stale.id),
+                "strategic_local_runner_required": True,
+                "strategic_local_runner_reason": "resident_session",
+            },
+        )
+        stale_marker = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{stale.id}",
+            vm_provisioned_at=_utcnow(),
+            context={
+                "_resident_session": True,
+                "strategic_session_id": "ss-orphan-marker",
+                "_resident_worker_generation": 1,
+                "runner_target_id": str(stale.id),
+                "preferred_runner_target_id": str(stale.id),
+            },
+        )
+        project.vision = {
+            **(project.vision or {}),
+            "_resident_strategic_session": {
+                "session_id": "ss-stale-hard-pin",
+                "task_id": str(resident.id),
+                "worker_generation": 3,
+                "runner_id": str(stale.id),
+                "status": "active",
+                "stop_requested": False,
+            },
+        }
+        db_session.add_all([project, resident, stale_marker])
+        await db_session.commit()
+        pinned_at = resident.vm_provisioned_at
+        pinned_context = dict(resident.context or {})
+
+        await orch._deactivate_stale_runners(db_session)
+
+        await db_session.refresh(stale)
+        await db_session.refresh(resident)
+        await db_session.refresh(stale_marker)
+        assert stale.status == "inactive"
+        assert resident.status == TaskStatus.PROVISIONING
+        assert resident.vm_instance_id == f"runner:{stale.id}"
+        assert resident.vm_provisioned_at == pinned_at
+        assert resident.context == pinned_context
+        assert stale_marker.status == TaskStatus.QUEUED
+        assert stale_marker.vm_instance_id is None
+        assert "runner_target_id" not in stale_marker.context
+
+    @pytest.mark.asyncio
     async def test_deactivate_stale_runners_keeps_pulled_pins(self, db_session):
         # A pin the runner already pulled (started_at set) is in-flight work, not
         # an awaiting-pull pin — deactivation must NOT yank it back to QUEUED.

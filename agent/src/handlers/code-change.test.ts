@@ -569,6 +569,7 @@ describe('durable unshipped-work checkpoint retry transition', () => {
   const taskId = 'checkpoint-retry-task';
   const workBranch = 'blueprint/task-checkpoint';
   const baseCommit = 'abc1234567890';
+  const localCheckpointSha = '1111111111111111111111111111111111111111';
   const baseOpts = {
     taskId,
     prompt: 'make the requested code change',
@@ -589,7 +590,9 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     vi.mocked(fs.unlinkSync).mockImplementation(() => {});
     vi.mocked(git).mockImplementation((args: string[]) => {
       if (args[0] === 'status') return ' M agent/src/handlers/code-change.ts';
-      if (args[0] === 'rev-parse') return baseCommit;
+      if (args[0] === 'rev-parse') return localCheckpointSha;
+      if (args[0] === 'show') return '';
+      if (args[0] === 'ls-remote') return '';
       return '';
     });
     vi.mocked(gitAsync).mockResolvedValue('');
@@ -610,7 +613,7 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     expect(commitCall?.[0].join('\n')).toContain(`blueprint-checkpoint: preserve unshipped task ${taskId}`);
     expect(commitCall?.[0].join('\n')).toContain(`Blueprint-Base-Commit: ${baseCommit}`);
     expectCalledWith(gitAsync, [
-      'push', '--force-with-lease', 'origin',
+      'push', `--force-with-lease=refs/heads/${workBranch}:`, 'origin',
       `HEAD:refs/heads/${workBranch}`,
     ]);
     expectCalledWith(apiGet,
@@ -624,6 +627,145 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     expect(failedCall?.[1].failure_category).toBe('incomplete');
     expect(vi.mocked(gitAsync).mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(persistAndPostStatus).mock.invocationCallOrder[0],
+    );
+  });
+
+  it.each(['blocked', 'fail'] as const)(
+    'does not redundantly checkpoint after the generated ./%s helper wrote its marker',
+    async (terminalVerb) => {
+      let markerVisible = false;
+      vi.mocked(fs.existsSync).mockImplementation(path =>
+        markerVisible && String(path) === `/tmp/${terminalVerb}_${taskId}`,
+      );
+      vi.mocked(runClaudeCode).mockImplementationOnce(() => {
+        markerVisible = true;
+        return Promise.resolve({
+          exitCode: 0,
+          allOutput: `./${terminalVerb} posted after the publication gate failed`,
+          lastResultText: '',
+        });
+      });
+
+      await runCodeChangeTask({ ...baseOpts });
+
+      expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(gitAsync)).not.toHaveBeenCalled();
+      expect(vi.mocked(git).mock.calls.some(([args]) => args[0] === 'commit')).toBe(false);
+      // The terminal helper already posted status. The wrapper's responsibility
+      // here is only to accept the marker, not checkpoint or transition again.
+      expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalled();
+    },
+  );
+
+  it('reconciles a lost checkpoint-push response when remote already equals local', async () => {
+    let remoteRead = 0;
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'status') return ' M agent/src/handlers/code-change.ts';
+      if (args[0] === 'rev-parse') return localCheckpointSha;
+      if (args[0] === 'show') return '';
+      if (args[0] === 'ls-remote') {
+        remoteRead += 1;
+        return remoteRead === 1 ? '' : `${localCheckpointSha}\trefs/heads/${workBranch}`;
+      }
+      return '';
+    });
+    vi.mocked(gitAsync).mockRejectedValueOnce(new Error('push response lost'));
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    expect(vi.mocked(gitAsync)).toHaveBeenCalledTimes(1);
+    const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      ([, payload]) => payload.status === 'FAILED',
+    );
+    expect(failedCall?.[1].failure_category).toBe('incomplete');
+    expect(failedCall?.[1].commit_hash).toBe(localCheckpointSha);
+    expect(failedCall?.[1].storage_uri).toBe(`git-ref:refs/heads/${workBranch}`);
+  });
+
+  it('fails closed when a competing remote SHA appears and never overwrites it', async () => {
+    const competingSha = '2222222222222222222222222222222222222222';
+    let remoteRead = 0;
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'status') return ' M agent/src/handlers/code-change.ts';
+      if (args[0] === 'rev-parse') return localCheckpointSha;
+      if (args[0] === 'show') return '';
+      if (args[0] === 'ls-remote') {
+        remoteRead += 1;
+        const sha = remoteRead === 1 ? null : competingSha;
+        return sha ? `${sha}\trefs/heads/${workBranch}` : '';
+      }
+      return '';
+    });
+    vi.mocked(gitAsync).mockRejectedValueOnce(new Error('lease rejected'));
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    expect(vi.mocked(gitAsync)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalled();
+  });
+
+  it('does not post retryable terminal status when the initial remote lease is unavailable', async () => {
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'status') return ' M agent/src/handlers/code-change.ts';
+      if (args[0] === 'rev-parse') return localCheckpointSha;
+      if (args[0] === 'show') return '';
+      if (args[0] === 'ls-remote') throw new Error('remote unavailable');
+      return '';
+    });
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    expect(vi.mocked(gitAsync)).not.toHaveBeenCalled();
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalled();
+  });
+
+  it('reuses an already-durable helper checkpoint without another commit or push', async () => {
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'status') return '';
+      if (args[0] === 'rev-parse') return localCheckpointSha;
+      if (args[0] === 'show') return buildTaskCheckpointCommitMessage(taskId, baseCommit);
+      if (args[0] === 'ls-remote') {
+        return `${localCheckpointSha}\trefs/heads/${workBranch}`;
+      }
+      return '';
+    });
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    // Clean checkpoint HEAD still differs from baseCommit, so it is unshipped
+    // work; idempotent durability recognition must avoid stacking a commit.
+    expect(vi.mocked(git).mock.calls.some(([args]) => args[0] === 'commit')).toBe(false);
+    expect(vi.mocked(gitAsync)).not.toHaveBeenCalled();
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      taskId,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'incomplete' }),
+    );
+  });
+
+  it('advances an existing checkpoint when the retry added a new dirty edit', async () => {
+    const priorCheckpointSha = '3333333333333333333333333333333333333333';
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'status') return ' M work.txt';
+      if (args[0] === 'rev-parse') return localCheckpointSha;
+      if (args[0] === 'show') return buildTaskCheckpointCommitMessage(taskId, baseCommit);
+      if (args[0] === 'ls-remote') {
+        return `${priorCheckpointSha}\trefs/heads/${workBranch}`;
+      }
+      return '';
+    });
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    expect(vi.mocked(git).mock.calls.some(([args]) => args[0] === 'commit')).toBe(true);
+    expectCalledWith(gitAsync, [
+      'push',
+      `--force-with-lease=refs/heads/${workBranch}:${priorCheckpointSha}`,
+      'origin',
+      `HEAD:refs/heads/${workBranch}`,
+    ]);
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      taskId,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'incomplete' }),
     );
   });
 

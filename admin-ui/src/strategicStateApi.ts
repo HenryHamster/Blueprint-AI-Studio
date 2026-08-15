@@ -843,6 +843,24 @@ export interface StrategicConversationQuery {
  * start/stop endpoints (mirrors `resident_session_snapshot` in
  * `strategic_resident_session.py`). Null when no resident session exists.
  */
+export type StrategicResidentActivityReasonCode =
+  | 'consultation_queued'
+  | 'consultation_running'
+  | 'consultation_delivering';
+
+export type StrategicResidentAutonomyReasonCode =
+  | 'authority_not_held'
+  | 'foreground_call'
+  | 'chat_or_disabled'
+  | 'consultation_queued'
+  | 'consultation_running'
+  | 'consultation_delivering'
+  | 'repository_unavailable'
+  | 'provider_retry'
+  | 'session_stopping'
+  | 'session_ended'
+  | 'activity_unreported';
+
 export interface StrategicResidentSessionSnapshot {
   session_id?: string | null;
   task_id?: string | null;
@@ -855,6 +873,7 @@ export interface StrategicResidentSessionSnapshot {
   stop_requested?: boolean;
   started_at?: string | null;
   updated_at?: string | null;
+  worker_heartbeat_at?: string | null;
   ended_at?: string | null;
   last_progress_at?: string | null;
   last_operator_interaction_at?: string | null;
@@ -864,6 +883,11 @@ export interface StrategicResidentSessionSnapshot {
     phase: 'working' | 'waiting' | 'retrying' | 'stopping' | 'ended' | string;
     phase_started_at?: string | null;
     last_action?: string | null;
+    reason_code?: StrategicResidentActivityReasonCode | null;
+    consultation_id?: string | null;
+    consultation_verified?: boolean;
+    autonomy_state?: 'active' | 'paused';
+    autonomy_reason_code?: StrategicResidentAutonomyReasonCode | null;
     pending_operator_messages?: number;
     next_review_at?: string | null;
     idle_remaining_seconds?: number | null;
@@ -1050,6 +1074,7 @@ export interface StrategicStateResponse {
   tasks: {
     counts: {
       queued: number;
+      starting: number;
       running: number;
       evaluating: number;
       blocked: number;

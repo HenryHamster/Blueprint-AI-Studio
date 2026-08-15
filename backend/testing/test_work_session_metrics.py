@@ -10,6 +10,8 @@ EXPECTED_WORK_SESSION_METRIC_IDS = {
     "messages.open",
     "messages.linked",
     "tasks.running",
+    "tasks.starting",
+    "tasks.evaluating",
     "tasks.blocked",
     "tasks.parked",
     "tasks.failed",
@@ -28,6 +30,11 @@ EXPECTED_WORK_SESSION_METRIC_IDS = {
 
 def test_work_session_metric_registry_covers_curated_metrics():
     assert set(WORK_SESSION_METRIC_REGISTRY) == EXPECTED_WORK_SESSION_METRIC_IDS
+    assert WORK_SESSION_METRIC_REGISTRY["tasks.starting"].path == "tasks.counts.starting"
+    assert (
+        WORK_SESSION_METRIC_REGISTRY["tasks.evaluating"].path
+        == "tasks.counts.evaluating"
+    )
 
     for metric_id, spec in WORK_SESSION_METRIC_REGISTRY.items():
         metric = build_work_session_metric(metric_id, 0)

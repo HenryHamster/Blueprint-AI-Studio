@@ -923,6 +923,22 @@ describe('TaskCard stuck-task inline triage', () => {
     await user.click(btn);
     expect(baseProps.onRetry).toHaveBeenCalledWith('task-1');
   });
+
+  it('renders provisioning as starting without execution heartbeat or stuck triage', () => {
+    const staleHeartbeat = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const task = makeTask({
+      status: 'PROVISIONING',
+      created_at: new Date(Date.now() - 60 * 1000).toISOString(),
+      last_heartbeat: staleHeartbeat,
+    });
+
+    render(<TaskCard task={task} {...baseProps} />);
+
+    expect(screen.getByText('Starting…')).toBeInTheDocument();
+    expect(screen.getByText(/^Starting \d/)).toBeInTheDocument();
+    expect(screen.queryByTitle('Stale (> 5m)')).toBeNull();
+    expect(screen.queryByTestId('stuck-silence-duration')).toBeNull();
+  });
 });
 
 describe('TaskCard evaluation verdict pill', () => {

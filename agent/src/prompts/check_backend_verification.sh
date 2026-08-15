@@ -86,6 +86,16 @@
           :
         else
           echo "[check] required backend verification state=runtime_unavailable — PostgreSQL runtime unavailable"
+          _verification_capability_tmp="${_VERIFY_CAPABILITY_RECEIPT}.$$"
+          if ( umask 077; printf 'backend_verification:runtime_unavailable:v1:%s\n' \
+            "$_VERIFY_TASK_ID" >"$_verification_capability_tmp" ) \
+            && mv -f "$_verification_capability_tmp" "$_VERIFY_CAPABILITY_RECEIPT"; then
+            echo "[check] execution capability receipt: $_VERIFY_CAPABILITY_RECEIPT"
+          else
+            echo "[check] unable to record backend verification capability receipt" >&2
+            rm -f "$_verification_capability_tmp" "$_VERIFY_CAPABILITY_RECEIPT"
+            FAILED+=("$_VERIFICATION_DIR verification: capability receipt")
+          fi
           FAILED+=("$_VERIFICATION_DIR verification: runtime_unavailable")
         fi
       fi

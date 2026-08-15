@@ -62,6 +62,12 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
 #       incorrectly inferring a proven fix.
 
 set -uo pipefail
+case "\${1:-}" in
+  -h|--help)
+    echo 'Usage: ./done [--warn-out-of-scope "<reason>"|--already-done "<reason>"|--reproduced "<reason>"|--indeterminate "<reason>"]'
+    exit 0
+    ;;
+esac
 ${agentTokenFn}
 ${jsonStrFn}
 ${jsonFieldFn}

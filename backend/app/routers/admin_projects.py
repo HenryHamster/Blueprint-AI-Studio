@@ -49,6 +49,7 @@ from app.capability_proof import enrich_problem_model_capability_proofs
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
 from app.task_direction_refs import task_primary_direction_ids_shallow
+from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.onboarding_proof import build_onboarding_proof_block
 from app.project_outcome_projection import build_project_outcome_projection
 from app.release_models import (
@@ -265,6 +266,7 @@ async def get_all_projects(
             select(Task.project_id, Task.status, func.count())
             .where(Task.project_id.in_(project_ids_for_page))
             .where(Task.archived.is_(False))
+            .where(non_resident_infrastructure_task_filter())
             .group_by(Task.project_id, Task.status)
         )
         for proj_id, status, count in counts_result.all():
@@ -272,6 +274,7 @@ async def get_all_projects(
             if proj_key not in task_status_counts:
                 task_status_counts[proj_key] = {
                     "queued": 0,
+                    "starting": 0,
                     "running": 0,
                     "evaluating": 0,
                     "blocked": 0,
@@ -286,7 +289,9 @@ async def get_all_projects(
             bucket["total"] += n
             if status == TaskStatus.QUEUED:
                 bucket["queued"] += n
-            elif status in (TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING):
+            elif status == TaskStatus.PROVISIONING:
+                bucket["starting"] += n
+            elif status == TaskStatus.IN_PROGRESS:
                 bucket["running"] += n
             elif status == TaskStatus.EVALUATING:
                 bucket["evaluating"] += n
@@ -303,6 +308,7 @@ async def get_all_projects(
 
     _empty_counts = {
         "queued": 0,
+        "starting": 0,
         "running": 0,
         "evaluating": 0,
         "blocked": 0,
@@ -1785,7 +1791,18 @@ async def get_direction_task_counts(
         select(Task)
         .where(
             Task.project_id == project_id,
-            Task.status.not_in([TaskStatus.CANCELLED, TaskStatus.FAILED]),
+            Task.archived.is_(False),
+            Task.status.in_(
+                [
+                    TaskStatus.QUEUED,
+                    TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS,
+                    TaskStatus.EVALUATING,
+                    TaskStatus.BLOCKED,
+                    TaskStatus.PARKED,
+                ]
+            ),
+            non_resident_infrastructure_task_filter(),
         )
         .options(
             load_only(

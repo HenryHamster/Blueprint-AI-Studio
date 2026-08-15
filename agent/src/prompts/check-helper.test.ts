@@ -921,6 +921,8 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       sandboxPython?: boolean;
       /** Whether a usable PostgreSQL server bindir exists (defaults to `docker`). */
       pgBindir?: 'present' | 'missing';
+      /** Seed a valid prior negative receipt; this run must clear or replace it. */
+      seedCapabilityReceipt?: boolean;
     },
   ): Promise<{
     status: number;
@@ -928,6 +930,7 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     log: string;
     taskId: string;
     receipt?: Record<string, unknown>;
+    capabilityReceipt?: string;
   }> => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
@@ -958,8 +961,18 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       runtimeTmp,
       `project_verification_receipt_${runtimeTaskId}.json`,
     );
+    const capabilityReceiptPath = realPath.join(
+      runtimeTmp,
+      `execution_capability_receipt_${runtimeTaskId}`,
+    );
     try {
       try { realFs.unlinkSync(receiptPath); } catch { /* absent */ }
+      if (scenario.seedCapabilityReceipt) {
+        realFs.writeFileSync(
+          capabilityReceiptPath,
+          `backend_verification:runtime_unavailable:v1:${runtimeTaskId}\n`,
+        );
+      }
       const bin = realPath.join(dir, 'bin');
       const changedPaths = scenario.changedPaths ?? [scenario.changedPath ?? 'backend/x.py'];
       const missingPaths = new Set(scenario.missingPaths ?? []);
@@ -1005,7 +1018,10 @@ case "$*" in
   *) exit 0 ;;
 esac
 `, { mode: 0o755 });
-      const realPython = realCp.execFileSync('sh', ['-c', 'command -v python3'], { encoding: 'utf8' }).trim();
+      const pythonName = process.platform === 'win32' ? 'python' : 'python3';
+      const realPython = realCp.execFileSync(
+        'sh', ['-c', 'command -v "$1"', 'python-probe', pythonName], { encoding: 'utf8' },
+      ).trim();
       realFs.writeFileSync(realPath.join(bin, 'python3'), `#!/bin/sh
 if [ "$1" = "-m" ] && [ "$2" = "ruff" ]; then
   echo "ruff $*" >> "$LOGFILE"
@@ -1077,21 +1093,26 @@ exit ${scenario.harnessExit}
       const receipt = realFs.existsSync(receiptPath)
         ? JSON.parse(realFs.readFileSync(receiptPath, 'utf8')) as Record<string, unknown>
         : undefined;
+      const capabilityReceipt = realFs.existsSync(capabilityReceiptPath)
+        ? realFs.readFileSync(capabilityReceiptPath, 'utf8')
+        : undefined;
       return {
         status,
         stdout,
         log: realFs.readFileSync(logPath, 'utf8'),
         taskId: runtimeTaskId,
         receipt,
+        capabilityReceipt,
       };
     } finally {
       try { realFs.unlinkSync(receiptPath); } catch { /* absent */ }
+      try { realFs.unlinkSync(capabilityReceiptPath); } catch { /* absent */ }
       realFs.rmSync(dir, { recursive: true, force: true });
     }
   };
   it('runtime: mints a receipt only after real-shaped Ruff and targeted Postgres evidence', async () => {
     const result = await runRequiredCheck(await render(), {
-      ruffExit: 0, docker: true, harnessExit: 0,
+      ruffExit: 0, docker: true, harnessExit: 0, seedCapabilityReceipt: true,
     });
     expect(result.status, result.stdout).toBe(0);
     expect(result.log).toContain('ruff -m ruff check');
@@ -1108,6 +1129,7 @@ exit ${scenario.harnessExit}
         exit_code: 0,
       },
     });
+    expect(result.capabilityReceipt).toBeUndefined();
   });
   it('runtime: combines changed tests with resolver output, filters deletions, and deduplicates', async () => {
     const result = await runRequiredCheck(await render(), {
@@ -1172,6 +1194,9 @@ exit ${scenario.harnessExit}
     expect(result.status, result.stdout).not.toBe(0);
     expect(result.stdout).toContain('PostgreSQL runtime unavailable');
     expect(result.receipt).toBeUndefined();
+    expect(result.capabilityReceipt).toBe(
+      `backend_verification:runtime_unavailable:v1:${result.taskId}\n`,
+    );
   });
   it('runtime: an opted-in ./backend project executes for repo-relative Python changes and fails closed', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
@@ -1198,6 +1223,9 @@ exit ${scenario.harnessExit}
     expect(result.status, result.stdout).not.toBe(0);
     expect(result.stdout).toContain('PostgreSQL runtime unavailable');
     expect(result.receipt).toBeUndefined();
+    expect(result.capabilityReceipt).toBe(
+      `backend_verification:runtime_unavailable:v1:${result.taskId}\n`,
+    );
   });
   it.each([
     ['missing Ruff', { ruffExit: 1, docker: true, harnessExit: 0 }],

@@ -71,6 +71,7 @@ from app.acceptance_gate import (
 )
 from app.landed_signal import landed_signal_predicate
 from app.models import Artifact, ArtifactType, Project, ReleaseVersion, Task, TaskStatus
+from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.time_utils import _coerce_naive_utc, _utcnow
 _MODULE_SIZE_GOVERNANCE_CAP: int = 1836
 
@@ -576,17 +577,15 @@ async def count_in_flight_tasks(
     session: AsyncSession,
     project_id: uuid.UUID,
 ) -> int:
-    """Count ``project_id`` tasks still in flight (non-terminal status).
+    """Count ordinary ``project_id`` work still in flight (non-terminal status).
 
     "In flight" means the task is in a non-terminal status
     (``QUEUED`` / ``PROVISIONING`` / ``IN_PROGRESS`` / ``EVALUATING`` /
     ``BLOCKED`` / ``PARKED``) — work that a version cut does NOT stop. Such
-    tasks keep running and land against the freshly-opened next version, so the
-    version-cut confirmation surfaces this count to make that consequence
-    explicit.
-
-    Terminal statuses (``COMPLETED`` / ``FAILED`` / ``CANCELLED``) are
-    excluded — they are already resolved and unaffected by a cut.
+    ordinary tasks keep running against the freshly-opened next version. The
+    confirmation surfaces that consequence. Resident generations are audit records,
+    not independent work, and are excluded from this ordinary-work consequence.
+    Terminal statuses are already resolved and excluded.
     """
     stmt = (
         select(func.count())
@@ -594,6 +593,7 @@ async def count_in_flight_tasks(
         .where(
             Task.project_id == project_id,
             Task.status.in_(_IN_FLIGHT_TASK_STATUSES),
+            non_resident_infrastructure_task_filter(),
         )
     )
     result = await session.execute(stmt)
