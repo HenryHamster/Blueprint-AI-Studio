@@ -1,6 +1,5 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
-
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', () => ({
   normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),

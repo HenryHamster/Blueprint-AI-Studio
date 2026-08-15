@@ -32,36 +32,43 @@ export const BLUEPRINT_BACKEND_RUFF_FORMAT_CMD = 'python3 -m ruff format --check
 // Lazy-loaded so test suites which mock fs do not crash on module import.
 const _CHECK_HELPER_DIR = path.dirname(fileURLToPath(import.meta.url));
 
+function readShellFragment(fragmentPath: string): string {
+  // Git may materialize checked-in shell fragments with CRLF on Windows.
+  // Normalize at the generator boundary so concatenated fragments remain one
+  // valid, byte-stable Bash program on every authoring host.
+  return fs.readFileSync(fragmentPath, 'utf8').replace(/\r\n?/g, '\n');
+}
+
 const _BACKEND_VERIFICATION_PATH = path.join(_CHECK_HELPER_DIR, 'check_backend_verification.sh');
 function loadBackendVerificationScript(): string {
-  try { return fs.readFileSync(_BACKEND_VERIFICATION_PATH, 'utf8'); } catch {
+  try { return readShellFragment(_BACKEND_VERIFICATION_PATH); } catch {
     return '    echo "[check] required backend verification fragment missing — failing closed"\n    FAILED+=("required backend verification fragment")\n';
   }
 }
 
 const _CI_FAILURE_VERIFY_PATH = path.join(_CHECK_HELPER_DIR, 'check_ci_failure_verify.sh');
 function loadCiFailureVerifyScript(): string {
-  try { return fs.readFileSync(_CI_FAILURE_VERIFY_PATH, 'utf8'); } catch { return ''; }
+  try { return readShellFragment(_CI_FAILURE_VERIFY_PATH); } catch { return ''; }
 }
 
 const _MERGE_VERIFY_PATH = path.join(_CHECK_HELPER_DIR, 'check_merge_verify.sh');
 function loadMergeVerifyScript(): string {
-  try { return fs.readFileSync(_MERGE_VERIFY_PATH, 'utf8'); } catch { return ''; }
+  try { return readShellFragment(_MERGE_VERIFY_PATH); } catch { return ''; }
 }
 
 const _IMPACTED_TEST_PATH = path.join(_CHECK_HELPER_DIR, 'check_impacted_test.sh');
 function loadImpactedTestScript(): string {
-  try { return fs.readFileSync(_IMPACTED_TEST_PATH, 'utf8'); } catch { return ''; }
+  try { return readShellFragment(_IMPACTED_TEST_PATH); } catch { return ''; }
 }
 
 const _VIEWPORT_UPLOAD_PATH = path.join(_CHECK_HELPER_DIR, 'check_viewport_upload.sh');
 function loadViewportUploadScript(): string {
-  try { return fs.readFileSync(_VIEWPORT_UPLOAD_PATH, 'utf8'); } catch { return ''; }
+  try { return readShellFragment(_VIEWPORT_UPLOAD_PATH); } catch { return ''; }
 }
 
 const _VISUAL_CAPTURE_PATH = path.join(_CHECK_HELPER_DIR, 'check_visual_capture.sh');
 function loadVisualCaptureScript(): string {
-  try { return fs.readFileSync(_VISUAL_CAPTURE_PATH, 'utf8'); } catch { return ''; }
+  try { return readShellFragment(_VISUAL_CAPTURE_PATH); } catch { return ''; }
 }
 
 const _SIZE_GUARDRAIL_PATH = path.join(_CHECK_HELPER_DIR, 'check_size_guardrail.sh');
@@ -69,7 +76,7 @@ const _SIZE_GUARDRAIL_PATH = path.join(_CHECK_HELPER_DIR, 'check_size_guardrail.
 // guardrail is an ALWAYS-ON gate: a missing/unreadable fragment must fail
 // ./check closed, not silently emit a script with no size gate at all.
 function loadSizeGuardrailScript(): string {
-  try { return fs.readFileSync(_SIZE_GUARDRAIL_PATH, 'utf8'); } catch {
+  try { return readShellFragment(_SIZE_GUARDRAIL_PATH); } catch {
     return '\necho "[check] size guardrail fragment missing from agent build — failing closed"\nFAILED+=("size guardrail")\n';
   }
 }

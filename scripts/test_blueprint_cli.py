@@ -352,13 +352,17 @@ def test_load_config_missing_raises_library_error(monkeypatch, tmp_path, capsys)
 
 
 def test_check_test_delegates_to_standalone_harness():
-    """./check test script delegates to scripts/test-backend.sh --standalone --no-postgres."""
+    """The tracked developer fallback keeps ./check test's standalone gate."""
     check_path = os.path.join(REPO_ROOT, "check")
     with open(check_path) as f:
-        content = f.read()
-    assert "scripts/test-backend.sh" in content, "./check does not reference scripts/test-backend.sh"
-    assert "--standalone" in content, "./check does not pass --standalone to scripts/test-backend.sh"
-    assert "--no-postgres" in content, "./check does not pass --no-postgres to scripts/test-backend.sh"
+        wrapper = f.read()
+    assert 'DEFAULT_GATE="$WORKSPACE/scripts/check-default.sh"' in wrapper
+    default_path = os.path.join(REPO_ROOT, "scripts", "check-default.sh")
+    with open(default_path) as f:
+        default_gate = f.read()
+    assert "scripts/test-backend.sh" in default_gate
+    assert "--standalone" in default_gate
+    assert "--no-postgres" in default_gate
 
 
 def test_blueprint_wrapper_shell_syntax():
@@ -369,10 +373,15 @@ def test_blueprint_wrapper_shell_syntax():
 
 
 def test_check_wrapper_shell_syntax():
-    """./check passes bash -n (no syntax errors)."""
-    wrapper = os.path.join(REPO_ROOT, "check")
-    result = subprocess.run(["bash", "-n", wrapper], capture_output=True, text=True)
-    assert result.returncode == 0, f"bash -n failed on ./check: {result.stderr}"
+    """Both ./check dispatch and its developer fallback pass bash -n."""
+    for relative_path in ("check", "scripts/check-default.sh"):
+        result = subprocess.run(
+            ["bash", "-n", relative_path],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"bash -n failed on {relative_path}: {result.stderr}"
 
 
 def test_install_cli_shell_syntax():

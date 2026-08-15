@@ -1048,6 +1048,11 @@ async def _hold_task_for_learned_execution_capabilities(
         and not ctx.get("runner_target_id")
         and not ctx.get("runner_hostname")
     ):
+        # The orchestrator selected this task FOR UPDATE before reaching this
+        # helper.  An idempotent hold has nothing dirty for its outer commit
+        # gate, so explicitly end the transaction instead of retaining the row
+        # lock through the rest of the orchestration cycle.
+        await session.rollback()
         return True
     ctx[EXECUTION_CAPABILITY_WAIT_CONTEXT_KEY] = wait_record
     ctx.pop("runner_target_id", None)

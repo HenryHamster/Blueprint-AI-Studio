@@ -1,5 +1,15 @@
     # required backend-authoring verification. No skip can mint this receipt.
-    source scripts/backend-test-route.sh
+    _VERIFICATION_ROUTE_HELPER_OK=0
+    unset -f select_backend_test_route 2>/dev/null || true
+    if [ -r scripts/backend-test-route.sh ] \
+      && bash -n scripts/backend-test-route.sh >/dev/null 2>&1 \
+      && source scripts/backend-test-route.sh \
+      && declare -F select_backend_test_route >/dev/null 2>&1; then
+      _VERIFICATION_ROUTE_HELPER_OK=1
+    else
+      echo "[check] required backend verification FAILED — route helper unavailable or invalid"
+      FAILED+=("backend verification route helper")
+    fi
     _VERIFICATION_DIR='@DIR@'
     _VERIFICATION_HARNESS='@HARNESS@'
     _VERIFICATION_CHANGED=$(mktemp /tmp/check_verification_changed.XXXXXX)
@@ -77,11 +87,11 @@
       fi
       mapfile -t _verification_selector_args < <(printf '%s\n' "$_VERIFICATION_SELECTORS" | head -n 8)
       _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
+      _verification_postgres_flag=""
       if [ -z "$_VERIFICATION_HARNESS" ] || [ ! -f "$_VERIFICATION_HARNESS" ]; then
         echo "[check] required backend verification FAILED — sanctioned harness missing: $_VERIFICATION_HARNESS"
         FAILED+=("$_VERIFICATION_DIR verification: harness missing")
-      else
-        _verification_postgres_flag=""
+      elif [ "$_VERIFICATION_ROUTE_HELPER_OK" = "1" ]; then
         if _verification_postgres_flag="$(select_backend_test_route)"; then
           :
         else

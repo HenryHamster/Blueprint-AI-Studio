@@ -1509,6 +1509,55 @@ async def test_start_adopts_task_and_liveness_heartbeat_renews_lease(db_session,
 
 
 @pytest.mark.asyncio
+async def test_poisoned_blocked_reason_write_recovers_before_activation(
+    db_session, monkeypatch
+):
+    """Best-effort reason SQL cannot poison the following activation commit."""
+
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    await db_session.refresh(project)
+    vision = dict(project.vision or {})
+    vision[resident_session_module.RESIDENT_SESSION_REASON_KEY] = {
+        "reason": "stale reason",
+        "recorded_at": _utcnow().isoformat(),
+    }
+    project.vision = vision
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    async def _poison_reason_write(current_session, *_args, **_kwargs):
+        await current_session.execute(
+            text("SELECT * FROM __missing_resident_reason_relation__")
+        )
+
+    monkeypatch.setattr(
+        resident_session_module, "with_vision_locked", _poison_reason_write
+    )
+    await resident_session_module.set_resident_session_blocked_reason(
+        db_session, project, None
+    )
+    await resident_session_module._enqueue_resident_activation_turn(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        snapshot=started,
+    )
+    activation = await db_session.scalar(
+        select(ProjectMessage).where(
+            ProjectMessage.idempotency_key
+            == f"resident-activation:{started['session_id']}"
+        )
+    )
+    assert activation is not None
+    assert activation.context["_resident_activation_prompt"] is True
+
+
+@pytest.mark.asyncio
 async def test_fresh_session_rebinds_only_immediate_predecessor_turn_without_activation_cobatch(
     db_session,
 ):

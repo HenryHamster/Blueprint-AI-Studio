@@ -13881,13 +13881,16 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         "read-only harness execution must not stage CLAUDE.md into backend/"
     )
 
-    invoked = result.stdout
-    assert "test_roster_placeholder" in invoked, (
-        "standalone harness did not execute its pytest roster"
-    )
+    pytest_commands = [
+        line
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if "-m pytest" in line
+    ]
+    assert pytest_commands, "standalone harness did not invoke pytest"
+    invoked = "\n".join(pytest_commands)
     expected = on_disk - set(exemptions)
     missing = sorted(
-        name for name in expected if f"scripts/{name}" not in invoked
+        name for name in expected if f"../scripts/{name}" not in invoked
     )
     assert not missing, (
         "Docker-less standalone execution omitted non-exempt discovered entries: "

@@ -419,6 +419,7 @@
         "test_resident_reaper_uses_own_heartbeat_window",
         "test_heartbeat_handled_ids_only_affect_own_session",
         "test_new_resident_start_repairs_stale_message_ownership_without_cadence",
+        "test_poisoned_blocked_reason_write_recovers_before_activation",
           "test_fresh_session_rebinds_only_immediate_predecessor_turn_without_activation_cobatch",
           "test_restart_retires_predecessor_activation_before_enqueuing_new_one",
           "test_restart_rebinds_pending_workday_packet_with_fresh_lease",

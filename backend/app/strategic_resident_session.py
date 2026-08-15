@@ -1324,6 +1324,7 @@ async def set_resident_session_blocked_reason(
     blocked must never itself break the operator's mode switch. A no-op clear
     (nothing recorded) is skipped so it never churns ``vision``.
     """
+    project_id = project.id
     if reason is None and read_resident_session_blocked_reason(project.vision) is None:
         return
     try:
@@ -1341,10 +1342,22 @@ async def set_resident_session_blocked_reason(
         await session.commit()
         await session.refresh(project)
     except Exception:
+        try:
+            await session.rollback()
+            # Rollback expires every ORM attribute. Restore the caller's
+            # instance so its next best-effort operation can safely reuse it.
+            await session.refresh(project)
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] failed to recover blocked-reason session "
+                "for project %s",
+                project_id,
+                exc_info=True,
+            )
         logger.warning(
             "[RESIDENT_SESSION] failed to %s blocked-reason for project %s",
             "clear" if reason is None else "record",
-            project.id,
+            project_id,
             exc_info=True,
         )
 
@@ -1360,6 +1373,7 @@ async def _set_cycle_in_flight_reason(
     handler can re-run the Workday auto-start with the right user identity once
     the blocking cycle finishes. Best-effort: failure is logged and swallowed.
     """
+    project_id = project.id
     try:
 
         def _apply(vision: dict[str, Any]) -> None:
@@ -1373,9 +1387,19 @@ async def _set_cycle_in_flight_reason(
         await session.commit()
         await session.refresh(project)
     except Exception:
+        try:
+            await session.rollback()
+            await session.refresh(project)
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] failed to recover cycle-in-flight session "
+                "for project %s",
+                project_id,
+                exc_info=True,
+            )
         logger.warning(
             "[RESIDENT_SESSION] failed to record cycle_in_flight reason for project %s",
-            project.id,
+            project_id,
             exc_info=True,
         )
 

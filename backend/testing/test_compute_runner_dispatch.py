@@ -2095,6 +2095,70 @@ async def test_learned_capability_without_runner_is_held_before_cloud(db_session
 
 
 @pytest.mark.asyncio
+async def test_idempotent_learned_capability_hold_releases_row_lock(db_session):
+    """The no-change hold path must end the caller's FOR UPDATE transaction."""
+    from datetime import datetime, timezone
+
+    from sqlmodel import select
+
+    from app.orchestrator_runner_dispatch import (
+        _hold_task_for_learned_execution_capabilities,
+    )
+    from app.execution_capability_requirements import (
+        CAPABILITY_BACKEND_VERIFICATION,
+        persist_learned_execution_capabilities,
+    )
+
+    project = Project(name="Learned capability lock release", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    context, _ = persist_learned_execution_capabilities(
+        {},
+        {CAPABILITY_BACKEND_VERIFICATION},
+        observed_at=datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        context=context,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    task_id = task.id
+
+    # Establish the durable hold so the next helper call is the idempotent path.
+    assert await _hold_task_for_learned_execution_capabilities(db_session, task)
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    async with session_factory() as holder:
+        locked_task = (
+            await holder.execute(
+                select(Task).where(Task.id == task_id).with_for_update()
+            )
+        ).scalar_one()
+        assert await _hold_task_for_learned_execution_capabilities(
+            holder, locked_task
+        )
+
+        # PostgreSQL NOWAIT proves that the helper's no-change return did not
+        # leak the holder transaction's row lock into the orchestration cycle.
+        async with session_factory() as probe:
+            available_task = (
+                await probe.execute(
+                    select(Task).where(Task.id == task_id).with_for_update(nowait=True)
+                )
+            ).scalar_one()
+            assert available_task.id == task_id
+            await probe.rollback()
+
+
+@pytest.mark.asyncio
 async def test_learned_backend_block_ignores_contradicted_runner(monkeypatch):
     """A contradicted PG runner cannot satisfy a learned unblock requirement."""
     from datetime import datetime, timezone
