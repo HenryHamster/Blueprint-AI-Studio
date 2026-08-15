@@ -2587,7 +2587,7 @@ class TestMessages:
     async def test_strategic_session_message_persists_workbench_snapshot_and_arms(
         self, client: AsyncClient, db_session
     ):
-        """Strategic messages persist workbench state without hiding it in chat."""
+        """Strategic messages persist bounded workbench state, not lifecycle authority."""
         project = await _make_project(db_session)
         resp = await client.post(
             f"/api/admin/projects/{project.id}/strategic-session/messages",
@@ -2634,7 +2634,11 @@ class TestMessages:
             )
         ).scalar_one()
         stored_workbench = prefs_row.prefs["_strategic_workbench"]
-        assert stored_workbench["interaction_mode"] == "continuous"
+        # Message snapshots may update presentation context, but only the
+        # mode/start/stop endpoints may switch Chat into Workday.  Accepting
+        # this stale ``continuous`` value would resurrect an explicitly
+        # stopped Resident.
+        assert stored_workbench["interaction_mode"] == "chat"
         assert stored_workbench["active_surface"] == "pipeline"
         assert stored_workbench["selected_refs"] == [
             {"kind": "task", "id": "task-1", "label": "Release blocker"}
