@@ -87,6 +87,34 @@ def serving_authorship_range(version: Any) -> tuple[str | None, str | None]:
     )
 
 
+def candidate_authorship_range(version: Any) -> tuple[str | None, str | None]:
+    """Return the candidate's entire compare range: base main to candidate head."""
+    if isinstance(version, dict):
+        base_sha = version.get("base_sha")
+        candidate_sha = version.get("candidate_sha")
+        if candidate_sha is None:
+            qualification = version.get("last_qualification")
+            candidate_sha = (
+                qualification.get("candidate_sha")
+                if isinstance(qualification, dict)
+                else None
+            )
+    else:
+        base_sha = getattr(version, "base_sha", None)
+        candidate_sha = getattr(version, "candidate_sha", None)
+        if candidate_sha is None:
+            qualification = getattr(version, "last_qualification", None)
+            candidate_sha = (
+                qualification.get("candidate_sha")
+                if isinstance(qualification, dict)
+                else None
+            )
+    return (
+        base_sha if isinstance(base_sha, str) else None,
+        candidate_sha if isinstance(candidate_sha, str) else None,
+    )
+
+
 AUTHORSHIP_EVIDENCE_CONTRACT_TYPE = "operator_authored_commits"
 
 

@@ -10,6 +10,7 @@
 
 ## File Restrictions
 - Do NOT modify files in `.github/workflows/` — CI workflows are managed separately and the GitHub App token cannot push workflow changes
+- `.github/workflows/` is an OPERATOR-ONLY surface: agents may not author workflow files. If a needed change belongs there, raise it as an operator request rather than working around it.
 - Do NOT modify **existing** migration files in `backend/alembic/versions/` — applied history is immutable. Adding a new migration file (next revision, chained from the latest `down_revision`) is fine and expected when `models.py` changes; also bump `EXPECTED_SCHEMA_REVISION` in `backend/app/main.py` to match.
 
 ## Code Style
@@ -44,6 +45,7 @@
 - If a test is testing the wrong thing (stale API, renamed function), fix the test to correctly test current behavior
 - Tests may be removed only when the tested functionality itself was removed
 - Do NOT weaken assertions without clear justification
+- **Require self-certifying-diff review.** Keep at least one literal pin for security-relevant constants. A diff that deletes code and its tests together, or replaces a literal assertion with the very constant it changed, is unreviewable on CI even when it merges green; call out that self-certifying diff explicitly and require independent evidence.
 
 ## Common Patterns
 - `task.first_payload` is the standard accessor for the first payload element (not `(task.payloads or [{}])[0]`)
