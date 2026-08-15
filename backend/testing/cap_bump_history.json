@@ -3153,10 +3153,18 @@
       ],
       "project_message_creation.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-13T04:44:25.631925+00:00",
+          "commit_sha": "728be43710415e901ae96ba091d3e106f991ef9e",
+          "commit_date": "2026-08-12T21:49:51-07:00",
           "old_cap": 950,
           "new_cap": 1250
+        }
+      ],
+      "review_learning.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-15T02:12:05.331474+00:00",
+          "old_cap": 1100,
+          "new_cap": 1400
         }
       ]
     },
@@ -4343,8 +4351,8 @@
           "new_cap": 4500
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-13T05:23:46.211369+00:00",
+          "commit_sha": "6e53679ee52428c5fbf22bd7e72d3d8cadbb50fe",
+          "commit_date": "2026-08-12T22:29:42-07:00",
           "old_cap": 4500,
           "new_cap": 5500
         }
@@ -4393,8 +4401,8 @@
           "new_cap": 2250
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-13T05:23:01.639418+00:00",
+          "commit_sha": "6e53679ee52428c5fbf22bd7e72d3d8cadbb50fe",
+          "commit_date": "2026-08-12T22:29:42-07:00",
           "old_cap": 2250,
           "new_cap": 2950
         }

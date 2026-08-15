@@ -24,6 +24,10 @@ from app.inline_llm import (
     inline_llm_unavailable_reason,
     resolve_inline_llm_settings,
 )
+from app.landed_signal import (
+    LANDED_ON_INTEGRATION_KEY,
+    has_landed_signal_context,
+)
 from app.models import Project, Task, _utcnow
 from app.playbook_capacity import maybe_archive_for_capacity, _mark_stale_review_entries
 from app.playbook_sr_metrics import (
@@ -1016,6 +1020,122 @@ async def compute_review_effectiveness(
     return result
 
 
+def replay_cross_pr_repeat_concern_detector(
+    tasks: list[dict],
+    *,
+    project_id: str | None = None,
+    min_distinct_prs: int = 2,
+    similarity_threshold: float = 0.5,
+) -> dict:
+    """Replay the cross-PR detector over completed, genuinely landed tasks.
+
+    This is intentionally a read-only boundary for operator diagnostics. It
+    accepts the admin task-list shape, deduplicates task IDs, rejects non-
+    completed or non-landed rows, and delegates all concern identity to the
+    pure heuristic. Landing is decided by the canonical
+    :func:`app.landed_signal.has_landed_signal_context` predicate rather than
+    a local re-derivation, so explicit ``landed_on_integration=False`` AND the
+    legacy ``pr_merged=True`` + ``_non_merge_unblock_reason`` shape (staging-
+    only rollup children, no-PR success-closes) are both rejected and stranded
+    PRs cannot enter the chain.
+    """
+    from app.review_heuristics import detect_cross_pr_repeat_concern_chains
+
+    seen_task_ids: set[str] = set()
+    normalized: list[dict] = []
+    excluded_not_landed = 0
+    excluded_status = 0
+    duplicate_tasks = 0
+    excluded_project = 0
+    malformed_tasks = 0
+
+    for raw in tasks or []:
+        if not isinstance(raw, dict):
+            malformed_tasks += 1
+            continue
+        task_id = str(raw.get("id") or "").strip()
+        if task_id:
+            if task_id in seen_task_ids:
+                duplicate_tasks += 1
+                continue
+            seen_task_ids.add(task_id)
+
+        raw_project_id = raw.get("project_id")
+        if project_id is not None and str(raw_project_id or "") != str(project_id):
+            excluded_project += 1
+            continue
+
+        status = raw.get("status")
+        status = getattr(status, "value", status)
+        if status is not None and str(status).upper() != "COMPLETED":
+            excluded_status += 1
+            continue
+
+        context = raw.get("context")
+        context = context if isinstance(context, dict) else {}
+        # Admin task-list rows sometimes surface the landing marker at the top
+        # level rather than inside ``context``. Fold it into the context view
+        # so the canonical predicate sees exactly one mapping.
+        landing_context = context
+        if (
+            LANDED_ON_INTEGRATION_KEY not in context
+            and LANDED_ON_INTEGRATION_KEY in raw
+        ):
+            landing_context = {
+                **context,
+                LANDED_ON_INTEGRATION_KEY: raw.get(LANDED_ON_INTEGRATION_KEY),
+            }
+        if not has_landed_signal_context(landing_context):
+            excluded_not_landed += 1
+            continue
+
+        review_loop = context.get("review_loop")
+        review_loop = review_loop if isinstance(review_loop, dict) else {}
+        payloads = raw.get("payloads")
+        payload = payloads[0] if isinstance(payloads, list) and payloads and isinstance(payloads[0], dict) else {}
+        pr_number = raw.get("pr_number")
+        if pr_number is None:
+            pr_number = review_loop.get("pr_number")
+        if pr_number is None:
+            pr_number = payload.get("pr_number")
+
+        normalized.append(
+            {
+                "id": task_id,
+                "project_id": raw_project_id,
+                "pr_number": pr_number,
+                "created_at": raw.get("created_at"),
+                "review_history": review_loop.get("review_history")
+                if isinstance(review_loop.get("review_history"), list)
+                else raw.get("review_history", []),
+            }
+        )
+
+    normalized.sort(
+        key=lambda record: (
+            str(record.get("created_at") or ""),
+            str(record.get("pr_number") or ""),
+            str(record.get("id") or ""),
+        )
+    )
+    result = detect_cross_pr_repeat_concern_chains(
+        normalized,
+        min_distinct_prs=min_distinct_prs,
+        similarity_threshold=similarity_threshold,
+    )
+    result.update(
+        {
+            "landed_tasks": len(normalized),
+            "excluded_not_landed": excluded_not_landed,
+            "excluded_status": excluded_status,
+            "duplicate_tasks": duplicate_tasks,
+            "excluded_project": excluded_project,
+            "malformed_tasks": malformed_tasks,
+        }
+    )
+    return result
+
+
 __all__ = [
     "_DIRECTION_FIRST_ATTEMPT_KEY",
     "_FIRST_ATTEMPT_PLAYBOOK_THRESHOLD",
@@ -1043,4 +1163,5 @@ __all__ = [
     "compute_review_effectiveness",
     "extract_review_feedback_to_playbook",
     "read_direction_first_attempt_feedback",
+    "replay_cross_pr_repeat_concern_detector",
 ]

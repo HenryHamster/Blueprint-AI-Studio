@@ -90,14 +90,21 @@ def has_merge_unblock_signal(task: Task) -> bool:
     return (task.context or {}).get(LANDED_SIGNAL_KEY) is True
 
 
-def has_landed_signal(task: Task) -> bool:
-    """Canonical read of the integration-branch landing signal.
+def has_landed_signal_context(context: dict[str, Any] | None) -> bool:
+    """Canonical landing predicate evaluated against a raw context mapping.
 
-    New writes stamp ``landed_on_integration`` explicitly. Legacy rows that
-    predate the split fall back to ``pr_merged is True`` unless they carry the
-    explicit non-merge marker introduced by :func:`mark_unblocked_non_merge`.
+    Callers that hold a plain ``task.context``-shaped dict (admin task-list
+    payloads, replay/diagnostic readers) must use this rather than
+    re-deriving the clauses, so the three-clause rule below lives in exactly
+    one place:
+
+      1. explicit ``landed_on_integration is True`` → landed,
+      2. explicit ``landed_on_integration is False`` → not landed,
+      3. otherwise the legacy ``pr_merged is True`` fallback, valid only while
+         the explicit non-merge marker written by
+         :func:`mark_unblocked_non_merge` is ABSENT.
     """
-    ctx = task.context or {}
+    ctx = context or {}
     landed = ctx.get(LANDED_ON_INTEGRATION_KEY)
     if landed is True:
         return True
@@ -106,6 +113,16 @@ def has_landed_signal(task: Task) -> bool:
     return (
         ctx.get(LANDED_SIGNAL_KEY) is True and NON_MERGE_UNBLOCK_REASON_KEY not in ctx
     )
+
+
+def has_landed_signal(task: Task) -> bool:
+    """Canonical read of the integration-branch landing signal.
+
+    New writes stamp ``landed_on_integration`` explicitly. Legacy rows that
+    predate the split fall back to ``pr_merged is True`` unless they carry the
+    explicit non-merge marker introduced by :func:`mark_unblocked_non_merge`.
+    """
+    return has_landed_signal_context(task.context)
 
 
 async def has_landed_signal_via_rollup(task: Task, session: AsyncSession) -> bool:

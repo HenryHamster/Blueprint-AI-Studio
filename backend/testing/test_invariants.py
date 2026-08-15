@@ -13782,6 +13782,10 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     env.update(
         {
             "PATH": f"{fake_bin}:{env['PATH']}",
+            # The real harness may select an existing task-VM venv by absolute
+            # path; pin the probe to the fake interpreter so this test remains
+            # about roster argv even when that venv is present.
+            "PYTHON": str(fake_python),
             "ROSTER_PROBE_LOG": str(log_path),
             "TESTMON_NO_FETCH": "1",
             "ALLOW_LOW_MEM": "1",

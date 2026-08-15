@@ -12,6 +12,7 @@ tokenization/similarity, and the diff-size/test-file utilities shared with
 ``review_policy`` (which owns the review-skip decisions).
 """
 
+import hashlib
 import re
 
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.55
@@ -71,6 +72,15 @@ _FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 # Issue-churn: fix agent keeps rotating CRITICAL+MAJOR issues without the total
 # count decreasing — evades Jaccard stuck-cycle detection but still unproductive.
 ISSUE_CHURN_WINDOW = 2
+
+# Cross-PR repeat-concern replay deliberately uses a lower threshold than the
+# intra-PR stuck-cycle detector: it compares one finding across independently
+# merged PRs, where wording changes are expected. The file path remains the
+# hard identity boundary; a symbol, when both reviews provide one, is also
+# required to match.
+CROSS_PR_CONCERN_JACCARD_THRESHOLD = 0.5
+CROSS_PR_MIN_DISTINCT_PRS = 2
+_CROSS_PR_ACTIONABLE_SEVERITIES = frozenset({"CRITICAL", "MAJOR"})
 
 
 def _critical_major_count(entry: dict) -> int:
@@ -543,6 +553,228 @@ def _feedback_jaccard(a: str, b: str) -> float:
     if not tokens_a or not tokens_b:
         return 0.0
     return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+
+
+def _cross_pr_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _cross_pr_record_pr_number(record: dict) -> int | None:
+    """Read a PR number from normalized or historical task-shaped records."""
+    context = record.get("context") or {}
+    context = context if isinstance(context, dict) else {}
+    review_loop = context.get("review_loop") or {}
+    review_loop = review_loop if isinstance(review_loop, dict) else {}
+    payloads = record.get("payloads") or []
+    payload = payloads[0] if payloads and isinstance(payloads[0], dict) else {}
+    for value in (
+        record.get("pr_number"),
+        review_loop.get("pr_number"),
+        payload.get("pr_number"),
+        context.get("rollup_pr_number"),
+    ):
+        number = _cross_pr_int(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _cross_pr_review_history(record: dict) -> list:
+    direct = record.get("review_history")
+    if isinstance(direct, list):
+        return direct
+    context = record.get("context") or {}
+    context = context if isinstance(context, dict) else {}
+    review_loop = context.get("review_loop") or {}
+    review_loop = review_loop if isinstance(review_loop, dict) else {}
+    history = review_loop.get("review_history")
+    return history if isinstance(history, list) else []
+
+
+def _cross_pr_file(issue: dict) -> str:
+    path = issue.get("file") or issue.get("file_path") or ""
+    if not isinstance(path, str):
+        return ""
+    return path.strip().replace("\\", "/").removeprefix("./")
+
+
+def _cross_pr_symbol(issue: dict) -> str:
+    symbol = issue.get("symbol") or issue.get("region") or ""
+    return str(symbol).strip() if symbol else ""
+
+
+def _cross_pr_description(issue: dict) -> str:
+    description = issue.get("description") or issue.get("summary") or ""
+    return str(description).strip() if description else ""
+
+
+def _cross_pr_concern_similarity(left: dict, right: dict) -> float:
+    if left["file"] != right["file"]:
+        return 0.0
+    if left["symbol"] and right["symbol"] and left["symbol"] != right["symbol"]:
+        return 0.0
+    return _feedback_jaccard(left["description"], right["description"])
+
+
+def detect_cross_pr_repeat_concern_chains(
+    records: list[dict],
+    *,
+    min_distinct_prs: int = CROSS_PR_MIN_DISTINCT_PRS,
+    similarity_threshold: float = CROSS_PR_CONCERN_JACCARD_THRESHOLD,
+) -> dict:
+    """Replay repeat-concern identity across distinct PRs without side effects.
+
+    ``records`` are task-shaped dictionaries. Each record may expose
+    ``review_history`` directly or under ``context.review_loop`` and must carry
+    a PR number directly, in that review loop, or in its first payload. A group
+    is a repeat-concern chain only when the same file and compatible region
+    recur on at least ``min_distinct_prs`` PRs. Repeated observations on one PR
+    are retained as iterative-hardening evidence, never as cross-PR burden.
+    """
+    groups: list[dict] = []
+    malformed_records = 0
+    concern_observations = 0
+
+    for record_index, record in enumerate(records or []):
+        if not isinstance(record, dict):
+            malformed_records += 1
+            continue
+        pr_number = _cross_pr_record_pr_number(record)
+        history = _cross_pr_review_history(record)
+        if pr_number is None or not history:
+            malformed_records += 1
+            continue
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("verdict") or "").upper() == "APPROVE":
+                continue
+            iteration = _cross_pr_int(entry.get("iteration"))
+            iteration = iteration if iteration is not None else 0
+            for issue in entry.get("issues") or []:
+                if not isinstance(issue, dict):
+                    continue
+                severity = str(issue.get("severity") or "").upper()
+                description = _cross_pr_description(issue)
+                file_path = _cross_pr_file(issue)
+                if severity not in _CROSS_PR_ACTIONABLE_SEVERITIES or not description or not file_path:
+                    continue
+                concern = {
+                    "pr_number": pr_number,
+                    "iteration": iteration,
+                    "severity": severity,
+                    "description": description,
+                    "file": file_path,
+                    "symbol": _cross_pr_symbol(issue),
+                    "record_index": record_index,
+                }
+                concern_observations += 1
+                group = next(
+                    (
+                        candidate
+                        for candidate in groups
+                        if any(
+                            _cross_pr_concern_similarity(observation, concern)
+                            >= similarity_threshold
+                            for observation in candidate["observations"]
+                        )
+                    ),
+                    None,
+                )
+                if group is None:
+                    groups.append(
+                        {
+                            "representative": concern,
+                            "pr_numbers": [pr_number],
+                            "iterations_by_pr": {str(pr_number): [iteration]},
+                            "severities": [severity],
+                            "descriptions": [description],
+                            "observations": [concern],
+                        }
+                    )
+                    continue
+                if pr_number not in group["pr_numbers"]:
+                    group["pr_numbers"].append(pr_number)
+                group["iterations_by_pr"].setdefault(str(pr_number), []).append(iteration)
+                if severity not in group["severities"]:
+                    group["severities"].append(severity)
+                if description not in group["descriptions"] and len(group["descriptions"]) < 5:
+                    group["descriptions"].append(description)
+                group["observations"].append(concern)
+
+    chain_groups = [
+        group
+        for group in groups
+        if len(group["pr_numbers"]) >= max(2, int(min_distinct_prs))
+    ]
+    hardening_groups = [
+        group
+        for group in groups
+        if len(group["pr_numbers"]) == 1
+        and len(set(group["iterations_by_pr"][str(group["pr_numbers"][0])])) > 1
+    ]
+
+    chains: list[dict] = []
+    for group in chain_groups:
+        representative = group["representative"]
+        normalized_tokens = " ".join(
+            sorted(_feedback_token_set(representative["description"]))
+        )
+        # The grouping identity is (file, compatible symbol, description
+        # tokens) at a given similarity threshold — see
+        # _cross_pr_concern_similarity, which refuses to merge two concerns
+        # that carry different symbols. The key must hash every one of those
+        # components, or two independent chains on the same file (different
+        # symbols) collapse onto one key and any consumer keying escalation or
+        # dedup on chain_key silently merges them.
+        identity = (
+            f"{representative['file']}"
+            f"|{representative['symbol']}"
+            f"|{normalized_tokens}"
+            f"|{float(similarity_threshold):.4f}"
+        )
+        chain = {
+            "chain_key": hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16],
+            "file": representative["file"],
+            "symbol": representative["symbol"] or None,
+            "representative_description": representative["description"],
+            "pr_numbers": list(group["pr_numbers"]),
+            "distinct_prs": len(group["pr_numbers"]),
+            "occurrences": len(group["pr_numbers"]),
+            "iterations_by_pr": {
+                pr: sorted(set(iterations))
+                for pr, iterations in group["iterations_by_pr"].items()
+            },
+            "severities": sorted(group["severities"]),
+            "descriptions": list(group["descriptions"]),
+            "resolved_before_next_pr": max(0, len(group["pr_numbers"]) - 1),
+            "same_pr_hardening_prs": sorted(
+                int(pr)
+                for pr, iterations in group["iterations_by_pr"].items()
+                if len(set(iterations)) > 1
+            ),
+        }
+        chains.append(chain)
+
+    return {
+        "records_seen": len(records or []),
+        "concern_observations": concern_observations,
+        "malformed_records": malformed_records,
+        "concern_groups": len(groups),
+        "repeat_concern_chain_count": len(chains),
+        "repeat_concern_chains": chains,
+        "same_pr_hardening_count": len(hardening_groups),
+        "resolved_before_next_pr": sum(
+            chain["resolved_before_next_pr"] for chain in chains
+        ),
+        "similarity_threshold": similarity_threshold,
+    }
 
 
 # ── Mechanical hedge detection (anti-hedging enforcement) ─────────────────────
