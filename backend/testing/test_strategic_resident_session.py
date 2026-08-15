@@ -15,12 +15,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 from sqlalchemy.orm.attributes import flag_modified
 
+import app.runner_pins as runner_pins_module
 import app.strategic_resident_session as resident_session_module
-from app.database import resolve_async_engine
+from app.database import resolve_async_engine, resolve_dialect_name
 from app.conversation_coordinator import (
     ConversationPublicReplyOwner,
     claim_next_workday_consultation_continuation,
@@ -47,6 +49,7 @@ from app.routers.admin_project_strategic_session import (
     start_project_strategic_resident_session,
 )
 from app.reaper_orphan_classify import _classify_resident_session
+from app.runner_pins import release_unpulled_runner_pins
 from app.resident_conversation_scope import (
     RESIDENT_CONVERSATION_FLOOR_SEQUENCE_KEY,
     RESIDENT_OPEN_MESSAGE_CURSOR_FLOOR_KEY,
@@ -481,6 +484,342 @@ def _test_session_factory(session):
     )
 
 
+@pytest.mark.asyncio
+async def test_runner_pin_release_preserves_post_spawn_provisional_resident(
+    db_session,
+    monkeypatch,
+):
+    """A drain in the spawn/finalize gap cannot orphan the new Resident task."""
+
+    if resolve_async_engine(db_session).dialect.name != "postgresql":
+        pytest.skip("requires independent PostgreSQL transactions")
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    factory = _test_session_factory(db_session)
+    task_born = asyncio.Event()
+    resume_start = asyncio.Event()
+    original_spawn = resident_session_module._spawn_resident_strategic_task
+    born_task_id: uuid.UUID | None = None
+
+    async def pause_after_spawn_commit(*args, **kwargs):
+        nonlocal born_task_id
+        task = await original_spawn(*args, **kwargs)
+        assert task is not None
+        born_task_id = task.id
+        task_born.set()
+        await resume_start.wait()
+        return task
+
+    monkeypatch.setattr(
+        resident_session_module,
+        "_spawn_resident_strategic_task",
+        pause_after_spawn_commit,
+    )
+
+    async def run_start():
+        async with factory() as start_session:
+            start_project = await start_session.get(Project, project.id)
+            assert start_project is not None
+            return await start_resident_session(
+                start_session,
+                start_project,
+                operator_user_id=TEST_USER_ID,
+                runner_id=str(runner.id),
+                session_factory=factory,
+            )
+
+    start_task = asyncio.create_task(run_start())
+    await asyncio.wait_for(task_born.wait(), timeout=10)
+    try:
+        assert born_task_id is not None
+        async with factory() as release_session:
+            provisional_project = await release_session.get(Project, project.id)
+            assert provisional_project is not None
+            provisional = read_resident_session(provisional_project.vision)
+            assert provisional is not None
+            assert provisional["task_id"] is None
+            assert provisional["worker_state"] == "starting"
+
+            released = await release_unpulled_runner_pins(
+                release_session,
+                runner.id,
+                preserve_active_resident=True,
+            )
+            await release_session.commit()
+            assert released == 0
+    finally:
+        resume_start.set()
+
+    started = await asyncio.wait_for(start_task, timeout=15)
+    assert started["task_id"] == str(born_task_id)
+    async with factory() as verify_session:
+        fresh_project = await verify_session.get(Project, project.id)
+        fresh_task = await verify_session.get(Task, born_task_id)
+    assert fresh_project is not None
+    assert fresh_task is not None
+    assert read_resident_session(fresh_project.vision)["task_id"] == str(
+        born_task_id
+    )
+    assert fresh_task.status == TaskStatus.PROVISIONING
+    assert fresh_task.vm_instance_id == f"runner:{runner.id}"
+    assert fresh_task.context["runner_target_id"] == str(runner.id)
+
+
+@pytest.mark.asyncio
+async def test_runner_pin_release_rechecks_finalized_vision_after_candidate_scan(
+    db_session,
+    monkeypatch,
+):
+    """A stale candidate scan cannot overwrite a later canonical finalization."""
+
+    if resolve_async_engine(db_session).dialect.name != "postgresql":
+        pytest.skip("requires independent PostgreSQL transactions")
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    resident = Task(
+        project_id=project.id,
+        title="Resident born before finalization",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{runner.id}",
+        vm_provisioned_at=_utcnow(),
+        created_by="ORCHESTRATOR",
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "ss-runner-pin-stale-read",
+            "_resident_worker_generation": 4,
+            "runner_target_id": str(runner.id),
+        },
+    )
+    db_session.add(resident)
+    await db_session.flush()
+    project.vision = {
+        **(project.vision or {}),
+        RESIDENT_SESSION_KEY: {
+            "session_id": "ss-runner-pin-stale-read",
+            "task_id": None,
+            "worker_generation": 4,
+            "worker_state": "starting",
+            "runner_id": str(runner.id),
+            "status": "active",
+            "stop_requested": False,
+        },
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    factory = _test_session_factory(db_session)
+    candidate_scanned = asyncio.Event()
+    vision_finalized = asyncio.Event()
+    original_project_lock = runner_pins_module.project_lock
+
+    @asynccontextmanager
+    async def pause_before_locked_reread(*args, **kwargs):
+        candidate_scanned.set()
+        await vision_finalized.wait()
+        async with original_project_lock(*args, **kwargs) as locked:
+            yield locked
+
+    monkeypatch.setattr(
+        runner_pins_module,
+        "project_lock",
+        pause_before_locked_reread,
+    )
+
+    async def run_release():
+        async with factory() as release_session:
+            released = await release_unpulled_runner_pins(
+                release_session,
+                runner.id,
+                preserve_active_resident=True,
+            )
+            await release_session.commit()
+            return released
+
+    release_task = asyncio.create_task(run_release())
+    await asyncio.wait_for(candidate_scanned.wait(), timeout=5)
+    try:
+        async with factory() as finalize_session:
+            async with resident_session_module.project_lock(
+                finalize_session,
+                project.id,
+                skip_locked=False,
+            ) as locked_project:
+                assert locked_project is not None
+                vision = dict(locked_project.vision or {})
+                blob = dict(vision[RESIDENT_SESSION_KEY])
+                blob["task_id"] = str(resident.id)
+                blob["worker_state"] = "ready"
+                vision[RESIDENT_SESSION_KEY] = blob
+                locked_project.vision = vision
+                flag_modified(locked_project, "vision")
+                finalize_session.add(locked_project)
+                await finalize_session.commit()
+    finally:
+        vision_finalized.set()
+
+    assert await asyncio.wait_for(release_task, timeout=10) == 0
+    async with factory() as verify_session:
+        fresh_project = await verify_session.get(Project, project.id)
+        fresh_task = await verify_session.get(Task, resident.id)
+    assert fresh_project is not None
+    assert fresh_task is not None
+    assert read_resident_session(fresh_project.vision)["task_id"] == str(resident.id)
+    assert fresh_task.status == TaskStatus.PROVISIONING
+    assert fresh_task.vm_instance_id == f"runner:{runner.id}"
+
+
+@pytest.mark.asyncio
+async def test_explicit_runner_pin_release_waits_for_contended_project(
+    db_session,
+):
+    """One-shot admin release is complete rather than a skip-locked best effort."""
+
+    if resolve_async_engine(db_session).dialect.name != "postgresql":
+        pytest.skip("requires independent PostgreSQL transactions")
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    pinned = Task(
+        project_id=project.id,
+        title="Explicitly released runner pin",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{runner.id}",
+        vm_provisioned_at=_utcnow(),
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(pinned)
+    await db_session.commit()
+
+    factory = _test_session_factory(db_session)
+    project_locked = asyncio.Event()
+    release_project = asyncio.Event()
+
+    async def hold_project_lock():
+        async with factory() as holder_session:
+            async with resident_session_module.project_lock(
+                holder_session,
+                project.id,
+                skip_locked=False,
+            ) as locked_project:
+                assert locked_project is not None
+                project_locked.set()
+                await release_project.wait()
+                await holder_session.commit()
+
+    async def run_explicit_release():
+        async with factory() as release_session:
+            released = await release_unpulled_runner_pins(
+                release_session,
+                runner.id,
+                preserve_active_resident=False,
+            )
+            await release_session.commit()
+            return released
+
+    holder_task = asyncio.create_task(hold_project_lock())
+    await asyncio.wait_for(project_locked.wait(), timeout=5)
+    release_task = asyncio.create_task(run_explicit_release())
+    await asyncio.sleep(0.1)
+    try:
+        assert not release_task.done()
+    finally:
+        release_project.set()
+    await asyncio.wait_for(holder_task, timeout=5)
+    assert await asyncio.wait_for(release_task, timeout=5) == 1
+    async with factory() as verify_session:
+        fresh_task = await verify_session.get(Task, pinned.id)
+    assert fresh_task is not None
+    assert fresh_task.status == TaskStatus.QUEUED
+    assert fresh_task.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mismatch",
+    (
+        "session",
+        "generation",
+        "runner",
+        "stopped",
+        "ended",
+        "worker_state",
+        "task_id",
+        "task_runner_target",
+    ),
+)
+async def test_runner_pin_release_does_not_preserve_mismatched_provisional_marker(
+    db_session,
+    mismatch,
+):
+    """Only the exact active starting claim receives provisional protection."""
+
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    resident_context = {
+        "_resident_session": True,
+        "strategic_session_id": "ss-provisional-exactness",
+        "_resident_worker_generation": 7,
+        "runner_target_id": str(runner.id),
+    }
+    resident = Task(
+        project_id=project.id,
+        title="Provisional Resident marker",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{runner.id}",
+        vm_provisioned_at=_utcnow(),
+        created_by="ORCHESTRATOR",
+        context=resident_context,
+    )
+    db_session.add(resident)
+    await db_session.flush()
+    blob = {
+        "session_id": "ss-provisional-exactness",
+        "task_id": None,
+        "worker_generation": 7,
+        "worker_state": "starting",
+        "runner_id": str(runner.id),
+        "status": "active",
+        "stop_requested": False,
+    }
+    if mismatch == "session":
+        resident_context["strategic_session_id"] = "ss-other"
+    elif mismatch == "generation":
+        resident_context["_resident_worker_generation"] = 8
+    elif mismatch == "runner":
+        blob["runner_id"] = str(uuid.uuid4())
+    elif mismatch == "stopped":
+        blob["stop_requested"] = True
+    elif mismatch == "ended":
+        blob["status"] = "ended"
+    elif mismatch == "worker_state":
+        blob["worker_state"] = "ready"
+    elif mismatch == "task_id":
+        blob["task_id"] = str(uuid.uuid4())
+    elif mismatch == "task_runner_target":
+        resident_context["runner_target_id"] = str(uuid.uuid4())
+    resident.context = resident_context
+    project.vision = {**(project.vision or {}), RESIDENT_SESSION_KEY: blob}
+    flag_modified(project, "vision")
+    db_session.add_all([project, resident])
+    await db_session.commit()
+
+    released = await release_unpulled_runner_pins(
+        db_session,
+        runner.id,
+        preserve_active_resident=True,
+    )
+    await db_session.commit()
+    await db_session.refresh(resident)
+
+    assert released == 1
+    assert resident.status == TaskStatus.QUEUED
+    assert resident.vm_instance_id is None
+    assert "runner_target_id" not in resident.context
+
+
 def test_session_state_helpers_remain_table_free():
     assert new_session_id().startswith("ss-")
     assert read_resident_session(None) is None
@@ -694,10 +1033,7 @@ async def test_typed_fast_capacity_denial_persists_no_lease_for_workday_fallback
     assert resident_typed_fast_snapshot(project.vision) is None
 
 
-def test_session_snapshot_exposes_bounded_activity_and_live_idle_remaining(
-    monkeypatch,
-):
-    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 7200)
+def test_session_snapshot_exposes_bounded_activity_without_silence_deadline():
     now = datetime.fromisoformat("2026-07-25T12:00:00")
     snapshot = resident_session_snapshot(
         {
@@ -712,6 +1048,10 @@ def test_session_snapshot_exposes_bounded_activity_and_live_idle_remaining(
                     "phase": "working",
                     "phase_started_at": "2026-07-25T11:59:00",
                     "last_action": "x" * 500,
+                    "reason_code": "consultation_running",
+                    "consultation_id": "11111111-1111-4111-8111-111111111111",
+                    "autonomy_state": "paused",
+                    "autonomy_reason_code": "consultation_running",
                     "pending_operator_messages": 3,
                     "next_review_at": "2026-07-25T12:05:00",
                     "pending_watches": 2,
@@ -727,16 +1067,22 @@ def test_session_snapshot_exposes_bounded_activity_and_live_idle_remaining(
         "phase": "working",
         "phase_started_at": "2026-07-25T11:59:00",
         "last_action": "x" * 240,
+        "reason_code": "consultation_running",
+        "consultation_id": "11111111-1111-4111-8111-111111111111",
+        "consultation_verified": False,
+        "autonomy_state": "paused",
+        "autonomy_reason_code": "consultation_running",
         "pending_operator_messages": 3,
         "next_review_at": "2026-07-25T12:05:00",
-        "idle_remaining_seconds": 3600,
+        # Operator silence is not a Continuous-session stop clock. The process
+        # heartbeat and explicit mode/Stop fences own liveness instead.
+        "idle_remaining_seconds": None,
         "pending_watches": 2,
         "fired_watches": 1,
     }
 
 
-def test_session_snapshot_warns_near_idle_end_and_freezes_when_ended(monkeypatch):
-    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 600)
+def test_session_snapshot_keeps_quiet_continuous_waiting_and_marks_explicit_end():
     vision = {
         RESIDENT_SESSION_KEY: {
             "session_id": "ss-idle-warning",
@@ -748,13 +1094,13 @@ def test_session_snapshot_warns_near_idle_end_and_freezes_when_ended(monkeypatch
             "activity": {"phase": "waiting", "last_action": "Watching tasks"},
         }
     }
-    warning = resident_session_snapshot(
+    quiet = resident_session_snapshot(
         vision,
         now=datetime.fromisoformat("2026-07-25T11:56:00"),
     )
-    assert warning is not None
-    assert warning["activity"]["phase"] == "stopping"
-    assert warning["activity"]["idle_remaining_seconds"] == 240
+    assert quiet is not None
+    assert quiet["activity"]["phase"] == "waiting"
+    assert quiet["activity"]["idle_remaining_seconds"] is None
 
     vision[RESIDENT_SESSION_KEY].update(
         {
@@ -769,7 +1115,7 @@ def test_session_snapshot_warns_near_idle_end_and_freezes_when_ended(monkeypatch
     )
     assert ended is not None
     assert ended["activity"]["phase"] == "ended"
-    assert ended["activity"]["idle_remaining_seconds"] == 0
+    assert ended["activity"]["idle_remaining_seconds"] is None
 
 
 @pytest.mark.asyncio
@@ -1110,7 +1456,7 @@ async def test_explicit_runner_change_rejects_active_session(db_session):
     assert blob["runner_id"] == str(first_runner.id)
 
 
-async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_session, monkeypatch):
+async def test_start_adopts_task_and_liveness_heartbeat_renews_lease(db_session, monkeypatch):
     monkeypatch.setenv("CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1")
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
@@ -1155,7 +1501,59 @@ async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_sessi
         progress=False,
     )
     assert liveness["authority_held"] is True
-    assert liveness["leased_until"] == lease
+    assert datetime.fromisoformat(liveness["leased_until"]) > datetime.fromisoformat(lease)
+    refreshed = await db_session.get(Project, project.id)
+    marker = refreshed.vision[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["last_renewal_reason"] == "continuous_liveness"
+
+
+@pytest.mark.asyncio
+async def test_poisoned_blocked_reason_write_recovers_before_activation(
+    db_session, monkeypatch
+):
+    """Best-effort reason SQL cannot poison the following activation commit."""
+
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    await db_session.refresh(project)
+    vision = dict(project.vision or {})
+    vision[resident_session_module.RESIDENT_SESSION_REASON_KEY] = {
+        "reason": "stale reason",
+        "recorded_at": _utcnow().isoformat(),
+    }
+    project.vision = vision
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    async def _poison_reason_write(current_session, *_args, **_kwargs):
+        await current_session.execute(
+            text("SELECT * FROM __missing_resident_reason_relation__")
+        )
+
+    monkeypatch.setattr(
+        resident_session_module, "with_vision_locked", _poison_reason_write
+    )
+    await resident_session_module.set_resident_session_blocked_reason(
+        db_session, project, None
+    )
+    await resident_session_module._enqueue_resident_activation_turn(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        snapshot=started,
+    )
+    activation = await db_session.scalar(
+        select(ProjectMessage).where(
+            ProjectMessage.idempotency_key
+            == f"resident-activation:{started['session_id']}"
+        )
+    )
+    assert activation is not None
+    assert activation.context["_resident_activation_prompt"] is True
 
 
 @pytest.mark.asyncio
@@ -2121,6 +2519,83 @@ async def test_resident_heartbeat_fences_overlapping_process_incarnations(
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_persists_authority_pause_before_returning_false(db_session):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    competing = Task(
+        project_id=project.id,
+        title="Foreground strategic cycle",
+        payloads=[{"type": "design_doc_update"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(competing)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        activity={
+            "phase": "waiting",
+            "last_action": "Waiting",
+            "reason_code": None,
+            "consultation_id": None,
+            "autonomy_state": "active",
+            "autonomy_reason_code": None,
+        },
+    )
+
+    assert response["authority_held"] is False
+    await db_session.refresh(project)
+    persisted = read_resident_session(project.vision)["activity"]
+    assert persisted["autonomy_state"] == "paused"
+    assert persisted["autonomy_reason_code"] == "authority_not_held"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_rearms_stale_server_owned_pause_before_returning_true(
+    db_session,
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    for stale_reason in ("authority_not_held", "foreground_call"):
+        response = await renew_resident_session_lease(
+            db_session,
+            project,
+            session_id=started["session_id"],
+            task_id=started["task_id"],
+            progress=False,
+            activity={
+                "phase": "waiting",
+                "last_action": "Waiting",
+                "reason_code": None,
+                "consultation_id": None,
+                "autonomy_state": "paused",
+                "autonomy_reason_code": stale_reason,
+            },
+        )
+
+        assert response["authority_held"] is True
+        await db_session.refresh(project)
+        persisted = read_resident_session(project.vision)["activity"]
+        assert persisted["autonomy_state"] == "active"
+        assert persisted["autonomy_reason_code"] is None
+
+
+@pytest.mark.asyncio
 async def test_predeploy_legacy_grace_is_retryable_for_replacement(db_session):
     project = await _make_project(db_session)
     await _make_task(db_session, project)
@@ -2214,72 +2689,41 @@ async def test_incarnation_takeover_uses_time_sampled_after_project_lock(
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_samples_operator_reengagement_after_project_lock(
-    db_session, monkeypatch
-):
+async def test_heartbeat_samples_committed_chat_mode_and_fails_closed(db_session):
+    """A committed Chat preference wins even before best-effort Stop runs."""
+
     project = await _make_project(db_session)
-    await _make_task(db_session, project)
+    task = await _make_task(db_session, project)
     await _make_runner(db_session, project)
     snapshot = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
-    now = _utcnow()
-    stale_at = now - timedelta(minutes=10)
-    resident = dict(project.vision[RESIDENT_SESSION_KEY])
-    resident["started_at"] = stale_at.isoformat()
-    resident["last_operator_interaction_at"] = stale_at.isoformat()
-    project.vision = {**project.vision, RESIDENT_SESSION_KEY: resident}
-    flag_modified(project, "vision")
-    db_session.add(project)
-    await db_session.commit()
-    monkeypatch.setitem(
-        runtime_config,
-        STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
-        60,
-    )
-
-    original_project_lock = resident_session_module.project_lock
-    project_lock_held = False
-
-    @asynccontextmanager
-    async def observed_project_lock(*args, **kwargs):
-        nonlocal project_lock_held
-        async with original_project_lock(*args, **kwargs) as locked_project:
-            project_lock_held = True
-            try:
-                yield locked_project
-            finally:
-                project_lock_held = False
-
-    async def latest_operator_interaction(*_args, **_kwargs):
-        assert project_lock_held
-        return now
-
-    monkeypatch.setattr(
-        resident_session_module,
-        "project_lock",
-        observed_project_lock,
-    )
-    monkeypatch.setattr(
-        resident_session_module,
-        "_latest_operator_interaction_at",
-        latest_operator_interaction,
+    await persist_strategic_workbench_update(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        {"interaction_mode": "chat"},
+        arm_interaction_mode=False,
     )
 
     project = await db_session.get(Project, project.id)
-    renewed = await renew_resident_session_lease(
+    fenced = await renew_resident_session_lease(
         db_session,
         project,
         session_id=snapshot["session_id"],
         task_id=snapshot["task_id"],
-        progress=False,
+        progress=True,
     )
 
-    assert renewed["status"] == "active"
-    assert renewed["stop_requested"] is False
+    assert fenced["authority_held"] is False
+    assert fenced["status"] == "ended"
+    assert fenced["stop_requested"] is True
     refreshed = await db_session.get(Project, project.id)
     resident = read_resident_session(refreshed.vision)
-    assert resident["last_operator_interaction_at"] == now.isoformat()
+    assert resident["status"] == "ended"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+    assert task.context["failure_category"] == "ADMIN_CANCEL"
 
 
 @pytest.mark.asyncio
@@ -3151,7 +3595,9 @@ async def test_stop_handoff_is_atomic_with_session_end(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unattended_cap_persists_message_handoff(db_session, monkeypatch):
+async def test_stop_survives_poisoned_handoff_statement(db_session, monkeypatch):
+    """A real SQL handoff failure rolls back its SAVEPOINT, not the stop."""
+
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
     await _make_runner(db_session, project)
@@ -3160,10 +3606,9 @@ async def test_unattended_cap_persists_message_handoff(db_session, monkeypatch):
     )
     pending = ProjectMessage(
         project_id=project.id,
-        message_type=MessageType.FEEDBACK,
+        message_type=MessageType.QUESTION,
         from_type="user",
-        content="Do not lose this turn when the unattended cap ends Workday.",
-        created_at=_utcnow() - timedelta(hours=2),
+        content="Keep the stop durable when handoff SQL fails.",
         status="open",
         handling_state=MessageHandlingState.CLAIMED,
         handled_by_task_id=task.id,
@@ -3171,10 +3616,105 @@ async def test_unattended_cap_persists_message_handoff(db_session, monkeypatch):
     )
     db_session.add(pending)
     await db_session.commit()
+
+    import app.session_message_handoff as handoff_module
+
+    real_apply_handoff_mutations = handoff_module._apply_handoff_mutations
+
+    async def _poison_handoff(current_session, *_args, **_kwargs):
+        # PostgreSQL marks the current transaction failed after this statement;
+        # SQLite raises the same SQLAlchemy DB error. The production SAVEPOINT
+        # must restore a usable outer transaction on both engines.
+        await current_session.execute(
+            text("SELECT * FROM __missing_resident_handoff_relation__")
+        )
+
     monkeypatch.setattr(
-        "app.strategic_trigger.maybe_arm_operator_refresh",
-        AsyncMock(return_value="steering"),
+        handoff_module, "_apply_handoff_mutations", _poison_handoff
     )
+
+    project = await db_session.get(Project, project.id)
+    snapshot = await stop_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert snapshot["status"] == "ended"
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+    await db_session.refresh(pending)
+    assert read_resident_session(project.vision)["status"] == "ended"
+    assert task.status == TaskStatus.CANCELLED
+    # ``begin_nested`` flushes the staged Task cancellation before opening the
+    # SAVEPOINT. PostgreSQL's ProjectMessage/lease consistency hook therefore
+    # returns the message to pending while preserving its terminal producer as
+    # provenance. The failed handoff can leave that owner and the exact stale
+    # Resident session id attached; the repair sweep owns their convergence.
+    assert pending.resident_session_id == started["session_id"]
+    assert pending.handled_by_task_id == task.id
+    if resolve_dialect_name(db_session) == "postgresql":
+        assert pending.handling_state == MessageHandlingState.PENDING
+    else:
+        # The lightweight create_all SQLite fixture does not install the
+        # PostgreSQL ProjectMessage consistency trigger. It still proves that
+        # the failed handoff rolled back without losing the outer stop.
+        assert pending.handling_state == MessageHandlingState.CLAIMED
+
+    monkeypatch.setattr(
+        handoff_module, "_apply_handoff_mutations", real_apply_handoff_mutations
+    )
+    assert (
+        await repair_stale_session_message_handoffs(db_session, project.id) == 1
+    )
+    await db_session.refresh(pending)
+    assert pending.resident_session_id is None
+    assert pending.handling_state == MessageHandlingState.PENDING
+    assert pending.handled_by_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_operator_silence_preserves_claimed_message_and_resident_task(
+    db_session, monkeypatch
+):
+    """A healthy quiet heartbeat must not manufacture a terminal handoff."""
+
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    pending = ProjectMessage(
+        project_id=project.id,
+        sequence=501,
+        message_type=MessageType.FEEDBACK,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="Keep this claimed turn while quiet Continuous Workday stays live.",
+        created_at=_utcnow() - timedelta(hours=2),
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=started["session_id"],
+    )
+    db_session.add(pending)
+    await db_session.commit()
+    incarnation = legacy_resident_worker_incarnation(
+        task.id, started["worker_generation"]
+    )
+    claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id=started["session_id"],
+        task_id=task.id,
+        worker_generation=started["worker_generation"],
+        incarnation_id=incarnation,
+        message_ids=[pending.id],
+        lease_seconds=45,
+        canonical_conversation_only=True,
+    )
+    assert claim is not None
+    await db_session.commit()
+    # The retired setting remains intentionally inert: operator silence is not
+    # process death and cannot end an exact live Continuous worker.
     monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
 
     project = await db_session.get(Project, project.id)
@@ -3190,7 +3730,7 @@ async def test_unattended_cap_persists_message_handoff(db_session, monkeypatch):
     await db_session.commit()
 
     project = await db_session.get(Project, project.id)
-    capped = await renew_resident_session_lease(
+    renewed = await renew_resident_session_lease(
         db_session,
         project,
         session_id=started["session_id"],
@@ -3198,33 +3738,28 @@ async def test_unattended_cap_persists_message_handoff(db_session, monkeypatch):
         progress=True,
     )
 
-    assert capped["authority_held"] is False
-    assert capped["stop_requested"] is True
-    assert capped["status"] == "ended"
+    assert renewed["authority_held"] is True
+    assert renewed["stop_requested"] is False
+    assert renewed["status"] == "active"
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
-    assert task.latest_status_message == (
-        "Resident strategic session ended after reaching the idle limit"
-    )
-    assert task.post_commit_pending is True
-    assert task.context["_post_commit_pending_meta"]["reason"] == (
-        "resident_session_ended"
-    )
-    assert task.context["_post_commit_pending_meta"]["payload"]["status"] == (
-        TaskStatus.COMPLETED
-    )
+    assert task.status not in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+    assert task.post_commit_pending is not True
     await db_session.refresh(pending)
     assert pending.status == "open"
-    assert pending.resident_session_id is None
-    assert pending.handling_state == MessageHandlingState.PENDING
-    assert pending.handled_by_task_id is None
+    assert pending.resident_session_id == started["session_id"]
+    assert pending.handling_state == MessageHandlingState.CLAIMED
+    assert pending.handled_by_task_id == task.id
 
 
 @pytest.mark.asyncio
-async def test_unattended_cap_handoff_is_atomic_with_cap_end(
+async def test_committed_chat_mode_handoff_is_atomic_with_mode_end(
     db_session, monkeypatch
 ):
-    """Message release must commit atomically with the cap-end, not after it.
+    """Message release must commit atomically with the Chat-mode end.
 
     Even if rearm raises after the commit, the message release must be durable.
     """
@@ -3238,7 +3773,7 @@ async def test_unattended_cap_handoff_is_atomic_with_cap_end(
         project_id=project.id,
         message_type=MessageType.FEEDBACK,
         from_type="user",
-        content="Will this survive rearm failure on cap?",
+        content="Will this survive rearm failure after leaving Workday?",
         created_at=_utcnow() - timedelta(hours=2),
         status="open",
         handling_state=MessageHandlingState.CLAIMED,
@@ -3247,30 +3782,26 @@ async def test_unattended_cap_handoff_is_atomic_with_cap_end(
     )
     db_session.add(pending)
     await db_session.commit()
-    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
-
     # Simulate rearm raising after commit — message mutations must be durable.
     import app.session_message_handoff as handoff_module
 
     async def _raise_on_rearm(*args, **kwargs):
-        raise RuntimeError("rearm failed — simulating post-cap crash")
+        raise RuntimeError("rearm failed — simulating post-mode-change crash")
 
     monkeypatch.setattr(handoff_module, "_run_handoff_rearm", _raise_on_rearm)
 
-    project = await db_session.get(Project, project.id)
-    vision = dict(project.vision or {})
-    blob = dict(vision[RESIDENT_SESSION_KEY])
-    blob["last_operator_interaction_at"] = (
-        _utcnow() - timedelta(hours=2)
-    ).isoformat()
-    vision[RESIDENT_SESSION_KEY] = blob
-    project.vision = vision
-    flag_modified(project, "vision")
-    db_session.add(project)
-    await db_session.commit()
+    # Model the real race: Chat is already committed, while the separate
+    # best-effort Stop side effect has not run yet.
+    await persist_strategic_workbench_update(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        {"interaction_mode": "chat"},
+        arm_interaction_mode=False,
+    )
 
     project = await db_session.get(Project, project.id)
-    capped = await renew_resident_session_lease(
+    ended = await renew_resident_session_lease(
         db_session,
         project,
         session_id=started["session_id"],
@@ -3278,41 +3809,116 @@ async def test_unattended_cap_handoff_is_atomic_with_cap_end(
         progress=True,
     )
 
-    assert capped["authority_held"] is False
-    assert capped["status"] == "ended"
+    assert ended["authority_held"] is False
+    assert ended["stop_requested"] is True
+    assert ended["status"] == "ended"
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
-    assert task.post_commit_pending is True
+    assert task.status == TaskStatus.CANCELLED
+    assert task.context["failure_category"] == "ADMIN_CANCEL"
     # Message must be released even though rearm raised
     await db_session.refresh(pending)
     assert pending.resident_session_id is None, (
-        "message.resident_session_id must be None: cap handoff must commit "
-        "atomically with the cap-end, not in a separate follow-up transaction"
+        "message.resident_session_id must be None: mode-change handoff must "
+        "commit atomically with the session end"
     )
     assert pending.handling_state == MessageHandlingState.PENDING
     assert pending.handled_by_task_id is None
 
 
 @pytest.mark.asyncio
-async def test_stale_continuation_lease_atomically_terminalizes_resident_task(
+async def test_committed_chat_mode_end_survives_poisoned_handoff_statement(
     db_session, monkeypatch
 ):
-    """A POST-CLAIM idle session past the TTL still lapses (born-stale backstop).
+    """A failed handoff query cannot roll back the heartbeat's Chat-mode end."""
 
-    The session has already taken its first agent heartbeat (arm-at-claim
-    exemption consumed), then goes idle past the continuation TTL with no
-    progress. This SUBSEQUENT stale beat must terminalize the resident task and
-    hand authority back to the cadence — the arm-at-claim first-beat exemption
-    covers ONLY provisioning latency and must not weaken this idle-reclaim.
-    """
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
     await _make_runner(db_session, project)
     started = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
-    monkeypatch.setitem(
-        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
+    pending = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.FEEDBACK,
+        from_type="user",
+        content="Keep the mode end durable when handoff SQL fails.",
+        status="open",
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        resident_session_id=started["session_id"],
+    )
+    db_session.add(pending)
+    await db_session.commit()
+
+    import app.session_message_handoff as handoff_module
+
+    real_apply_handoff_mutations = handoff_module._apply_handoff_mutations
+
+    async def _poison_handoff(current_session, *_args, **_kwargs):
+        await current_session.execute(
+            text("SELECT * FROM __missing_resident_mode_handoff_relation__")
+        )
+
+    monkeypatch.setattr(
+        handoff_module, "_apply_handoff_mutations", _poison_handoff
+    )
+    await persist_strategic_workbench_update(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        {"interaction_mode": "chat"},
+        arm_interaction_mode=False,
+    )
+
+    project = await db_session.get(Project, project.id)
+    ended = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=True,
+    )
+
+    assert ended["authority_held"] is False
+    assert ended["stop_requested"] is True
+    assert ended["status"] == "ended"
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+    await db_session.refresh(pending)
+    assert read_resident_session(project.vision)["status"] == "ended"
+    assert task.status == TaskStatus.CANCELLED
+    # As in explicit Stop, the pre-SAVEPOINT flush terminalizes the Task.
+    # PostgreSQL returns the row to pending while preserving the terminal task
+    # as provenance until the bounded handoff-repair sweep clears both bindings.
+    assert pending.resident_session_id == started["session_id"]
+    assert pending.handled_by_task_id == task.id
+    if resolve_dialect_name(db_session) == "postgresql":
+        assert pending.handling_state == MessageHandlingState.PENDING
+    else:
+        assert pending.handling_state == MessageHandlingState.CLAIMED
+
+    monkeypatch.setattr(
+        handoff_module, "_apply_handoff_mutations", real_apply_handoff_mutations
+    )
+    assert (
+        await repair_stale_session_message_handoffs(db_session, project.id) == 1
+    )
+    await db_session.refresh(pending)
+    assert pending.resident_session_id is None
+    assert pending.handling_state == MessageHandlingState.PENDING
+    assert pending.handled_by_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_stale_marker_exact_heartbeat_renews_without_terminalizing_task(
+    db_session, monkeypatch
+):
+    """A stale marker is re-anchored by the exact live Continuous process."""
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
     )
     monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
 
@@ -3322,11 +3928,8 @@ async def test_stale_continuation_lease_atomically_terminalizes_resident_task(
     marker["last_seen_at"] = (_utcnow() - timedelta(minutes=5)).isoformat()
     marker["updated_at"] = marker["last_seen_at"]
     vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
-    # Model a POST-CLAIM session: stamp first_agent_heartbeat_at so the
-    # arm-at-claim exemption (which re-anchors freshness on the agent's FIRST
-    # heartbeat, covering provisioning latency exactly once) has already been
-    # consumed. This heartbeat is therefore a SUBSEQUENT beat subject to the
-    # normal TTL freshness gate — not the exempt claim beat.
+    # Model a post-claim session so this exercises ordinary Continuous liveness,
+    # not first-heartbeat compatibility.
     blob = dict(vision[RESIDENT_SESSION_KEY])
     blob["first_agent_heartbeat_at"] = (_utcnow() - timedelta(minutes=6)).isoformat()
     vision[RESIDENT_SESSION_KEY] = blob
@@ -3336,7 +3939,7 @@ async def test_stale_continuation_lease_atomically_terminalizes_resident_task(
     await db_session.commit()
 
     project = await db_session.get(Project, project.id)
-    lapsed = await renew_resident_session_lease(
+    renewed = await renew_resident_session_lease(
         db_session,
         project,
         session_id=started["session_id"],
@@ -3344,33 +3947,36 @@ async def test_stale_continuation_lease_atomically_terminalizes_resident_task(
         progress=False,
     )
 
-    assert lapsed["authority_held"] is False
-    assert lapsed["stop_requested"] is True
-    assert lapsed["status"] == "ended"
+    assert renewed["authority_held"] is True
+    assert renewed["stop_requested"] is False
+    assert renewed["status"] == "active"
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
-    assert task.post_commit_pending is True
-    assert task.latest_status_message == (
-        "Resident strategic session ended after its continuation lease lapsed"
+    assert task.status not in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+    assert task.post_commit_pending is not True
+    refreshed = await db_session.get(Project, project.id)
+    marker = refreshed.vision[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["last_renewal_reason"] == "continuous_liveness"
+    assert _utcnow() - datetime.fromisoformat(marker["last_seen_at"]) < timedelta(
+        minutes=1
     )
-    pending = task.context["_post_commit_pending_meta"]
-    assert pending["reason"] == "resident_session_ended"
-    assert pending["payload"]["status"] == TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio
 async def test_autonomous_working_turn_renews_freshness_without_mutation(
     db_session, monkeypatch
 ):
-    """An UNATTENDED autonomous review renews freshness on examination work.
+    """An autonomous review records examination work without faking mutation.
 
     A completed autonomous working turn (``autonomous_turn=True``) that applied
-    NO strategic op must renew the continuation lease — for an autonomous review
-    examination IS the work, and "no mutation in the whole TTL window" is its
-    healthy steady state, not a stall. Without this the session would be
-    guillotined at the 25-min TTL with zero directions and scored a strategic
-    failure. The 2h unattended cap and the agent-side consecutive-stall detector
-    remain the backstops for a genuinely-stuck session (covered separately).
+    NO strategic op still renews the continuation lease with the distinct
+    ``autonomous_turn`` reason: examination IS work, but it is not mutation
+    progress. Quiet exact heartbeats also renew Continuous liveness; process
+    reaping, incarnation fencing, and the agent-side consecutive-stall detector
+    remain the stuck-worker backstops.
     """
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
@@ -3378,25 +3984,18 @@ async def test_autonomous_working_turn_renews_freshness_without_mutation(
     started = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
-    # Well within the unattended cap so ONLY the TTL freshness gate is under test.
-    monkeypatch.setitem(
-        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
-    )
     monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
 
-    # Drive the marker's freshness past the TTL so a bare/liveness heartbeat would
-    # lapse — the autonomous-turn renewal must rescue it.
+    # Age the legacy marker so this proves the exact autonomous heartbeat
+    # re-anchors it with the autonomous-turn reason.
     project = await db_session.get(Project, project.id)
     vision = dict(project.vision or {})
     marker = dict(vision[STRATEGIC_LOCAL_CONTINUATION_KEY])
     marker["last_seen_at"] = (_utcnow() - timedelta(minutes=5)).isoformat()
     marker["updated_at"] = marker["last_seen_at"]
     vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
-    # Model a POST-CLAIM session: stamp first_agent_heartbeat_at so the
-    # arm-at-claim exemption (which re-anchors freshness on the agent's FIRST
-    # heartbeat, covering provisioning latency exactly once) has already been
-    # consumed. This heartbeat is therefore a SUBSEQUENT beat subject to the
-    # normal TTL freshness gate — not the exempt claim beat.
+    # Model a POST-CLAIM session so the renewal is classified as autonomous work,
+    # not the one-time first-agent-heartbeat compatibility reason.
     blob = dict(vision[RESIDENT_SESSION_KEY])
     blob["first_agent_heartbeat_at"] = (_utcnow() - timedelta(minutes=6)).isoformat()
     vision[RESIDENT_SESSION_KEY] = blob
@@ -3440,25 +4039,15 @@ async def test_autonomous_working_turn_renews_freshness_without_mutation(
 
 
 @pytest.mark.asyncio
-async def test_autonomous_turn_flag_does_not_rescue_operator_chat_idle_lapse(
+async def test_autonomous_turn_flag_cannot_rescue_committed_chat_mode(
     db_session, monkeypatch
 ):
-    """The operator-chat path is unchanged: no autonomous turn ⇒ TTL still lapses.
-
-    A chat/monitor session never runs autonomous turns, so it never sets
-    ``autonomous_turn``. A bare liveness heartbeat (``progress=False`` AND
-    ``autonomous_turn=False``) must still lapse an idle session at the TTL,
-    handing authority back to the cadence — the abandoned-operator reclaim the
-    new autonomous-freshness path must NOT weaken.
-    """
+    """Even an asserted autonomous turn cannot renew after Chat commits."""
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
     await _make_runner(db_session, project)
     started = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
-    )
-    monkeypatch.setitem(
-        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
     )
     monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
 
@@ -3468,11 +4057,6 @@ async def test_autonomous_turn_flag_does_not_rescue_operator_chat_idle_lapse(
     marker["last_seen_at"] = (_utcnow() - timedelta(minutes=5)).isoformat()
     marker["updated_at"] = marker["last_seen_at"]
     vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
-    # Model a POST-CLAIM session: stamp first_agent_heartbeat_at so the
-    # arm-at-claim exemption (which re-anchors freshness on the agent's FIRST
-    # heartbeat, covering provisioning latency exactly once) has already been
-    # consumed. This heartbeat is therefore a SUBSEQUENT beat subject to the
-    # normal TTL freshness gate — not the exempt claim beat.
     blob = dict(vision[RESIDENT_SESSION_KEY])
     blob["first_agent_heartbeat_at"] = (_utcnow() - timedelta(minutes=6)).isoformat()
     vision[RESIDENT_SESSION_KEY] = blob
@@ -3480,24 +4064,31 @@ async def test_autonomous_turn_flag_does_not_rescue_operator_chat_idle_lapse(
     flag_modified(project, "vision")
     db_session.add(project)
     await db_session.commit()
+    await persist_strategic_workbench_update(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        {"interaction_mode": "chat"},
+        arm_interaction_mode=False,
+    )
 
     project = await db_session.get(Project, project.id)
-    lapsed = await renew_resident_session_lease(
+    fenced = await renew_resident_session_lease(
         db_session,
         project,
         session_id=started["session_id"],
         task_id=started["task_id"],
         progress=False,
-        autonomous_turn=False,
+        autonomous_turn=True,
     )
 
-    assert lapsed["authority_held"] is False
-    assert lapsed["stop_requested"] is True
-    assert lapsed["status"] == "ended"
+    assert fenced["authority_held"] is False
+    assert fenced["stop_requested"] is True
+    assert fenced["status"] == "ended"
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
+    assert task.status == TaskStatus.CANCELLED
     assert task.latest_status_message == (
-        "Resident strategic session ended after its continuation lease lapsed"
+        "Resident strategic session stopped after Workday left Continuous mode"
     )
 
 
@@ -3519,10 +4110,6 @@ async def test_first_agent_heartbeat_reanchors_born_stale_session(
     await _make_runner(db_session, project)
     started = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
-    )
-    # Well within the unattended cap so ONLY the TTL freshness gate is under test.
-    monkeypatch.setitem(
-        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
     )
     monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
 
@@ -3562,8 +4149,8 @@ async def test_first_agent_heartbeat_reanchors_born_stale_session(
     }
     assert task.post_commit_pending is not True
 
-    # Freshness re-anchored to now with the first-heartbeat reason, and the blob
-    # now records the claim beat so the NEXT beat is no longer exempt.
+    # Freshness re-anchored to now with the compatibility claim-beat reason; all
+    # later exact heartbeats use the ordinary Continuous-liveness reason.
     refreshed = await db_session.get(Project, project.id)
     fresh_marker = dict(refreshed.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
     assert fresh_marker["last_renewal_reason"] == "first_agent_heartbeat"
@@ -3576,27 +4163,19 @@ async def test_first_agent_heartbeat_reanchors_born_stale_session(
 
 
 @pytest.mark.asyncio
-async def test_post_claim_idle_still_lapses(db_session, monkeypatch):
-    """After the claim beat, a later idle beat past the TTL still lapses.
-
-    Once the first agent heartbeat has re-anchored freshness (arm-at-claim
-    exemption consumed), a SUBSEQUENT heartbeat that finds the marker stale with
-    no progress must terminalize the session — the exemption covers provisioning
-    latency exactly once and never the ongoing idle-reclaim backstop.
-    """
+async def test_post_claim_quiet_heartbeat_renews_continuous_liveness(
+    db_session, monkeypatch
+):
+    """After the claim beat, exact process liveness re-anchors a stale marker."""
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
     await _make_runner(db_session, project)
     started = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
-    monkeypatch.setitem(
-        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
-    )
     monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
 
-    # Claim beat already happened (first_agent_heartbeat_at set), then the marker
-    # went stale — this is a post-claim idle beat, NOT the exempt claim beat.
+    # Claim beat already happened, then the legacy marker aged past its old TTL.
     project = await db_session.get(Project, project.id)
     vision = dict(project.vision or {})
     marker = dict(vision[STRATEGIC_LOCAL_CONTINUATION_KEY])
@@ -3612,7 +4191,7 @@ async def test_post_claim_idle_still_lapses(db_session, monkeypatch):
     await db_session.commit()
 
     project = await db_session.get(Project, project.id)
-    lapsed = await renew_resident_session_lease(
+    renewed = await renew_resident_session_lease(
         db_session,
         project,
         session_id=started["session_id"],
@@ -3620,39 +4199,32 @@ async def test_post_claim_idle_still_lapses(db_session, monkeypatch):
         progress=False,
     )
 
-    assert lapsed["authority_held"] is False
-    assert lapsed["stop_requested"] is True
-    assert lapsed["status"] == "ended"
+    assert renewed["authority_held"] is True
+    assert renewed["stop_requested"] is False
+    assert renewed["status"] == "active"
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
-    assert task.latest_status_message == (
-        "Resident strategic session ended after its continuation lease lapsed"
-    )
+    assert task.status not in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+    refreshed = await db_session.get(Project, project.id)
+    marker = refreshed.vision[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["last_renewal_reason"] == "continuous_liveness"
 
 
 @pytest.mark.asyncio
-async def test_autonomous_turn_does_not_bypass_unattended_cap(
+async def test_autonomous_turn_survives_operator_silence_with_exact_heartbeat(
     db_session, monkeypatch
 ):
-    """The 2h unattended cap still reclaims a stuck autonomous session.
-
-    An autonomous session whose turn loop is alive (``autonomous_turn=True``) but
-    that has had NO operator interaction past the unattended cap must still be
-    ENDED. Autonomous-freshness tracks "the turn loop is alive"; the unattended
-    cap is the separate "alive but should not pin authority forever" backstop and
-    the new renewal path must not let a heartbeat slip past it.
-    """
+    """A live autonomous turn is not terminalized merely for operator silence."""
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
     await _make_runner(db_session, project)
     started = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
-    monkeypatch.setattr(
-        "app.strategic_trigger.maybe_arm_operator_refresh",
-        AsyncMock(return_value="steering"),
-    )
-    # Cap short, TTL long: isolate the unattended-cap backstop from the TTL gate.
+    # The retired cap setting must be inert even for autonomous heartbeats.
     monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
     monkeypatch.setitem(
         runtime_config, "strategic_continuation_ttl_seconds", 86_400
@@ -3671,7 +4243,7 @@ async def test_autonomous_turn_does_not_bypass_unattended_cap(
     await db_session.commit()
 
     project = await db_session.get(Project, project.id)
-    capped = await renew_resident_session_lease(
+    renewed = await renew_resident_session_lease(
         db_session,
         project,
         session_id=started["session_id"],
@@ -3680,19 +4252,23 @@ async def test_autonomous_turn_does_not_bypass_unattended_cap(
         autonomous_turn=True,
     )
 
-    assert capped["authority_held"] is False
-    assert capped["stop_requested"] is True
-    assert capped["status"] == "ended"
+    assert renewed["authority_held"] is True
+    assert renewed["stop_requested"] is False
+    assert renewed["status"] == "active"
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
-    assert task.latest_status_message == (
-        "Resident strategic session ended after reaching the idle limit"
-    )
+    assert task.status not in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+    refreshed = await db_session.get(Project, project.id)
+    marker = refreshed.vision[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["last_renewal_reason"] == "autonomous_turn"
 
 
 @pytest.mark.asyncio
-async def test_cap_never_terminalizes_cross_project_resident_task_pointer(
-    db_session, monkeypatch
+async def test_chat_mode_end_never_terminalizes_cross_project_resident_pointer(
+    db_session,
 ):
     project = await _make_project(db_session)
     await _make_task(db_session, project)
@@ -3721,7 +4297,6 @@ async def test_cap_never_terminalizes_cross_project_resident_task_pointer(
     await db_session.commit()
     await db_session.refresh(foreign_task)
 
-    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
     project = await db_session.get(Project, project.id)
     vision = dict(project.vision or {})
     blob = dict(vision[RESIDENT_SESSION_KEY])
@@ -3740,6 +4315,13 @@ async def test_cap_never_terminalizes_cross_project_resident_task_pointer(
     flag_modified(project, "vision")
     db_session.add(project)
     await db_session.commit()
+    await persist_strategic_workbench_update(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        {"interaction_mode": "chat"},
+        arm_interaction_mode=False,
+    )
 
     project = await db_session.get(Project, project.id)
     ended = await renew_resident_session_lease(

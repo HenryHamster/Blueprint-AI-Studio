@@ -103,6 +103,12 @@ _WORKDAY_CLAIM_EXPIRES_CONTEXT_KEY = "_workday_consultation_claim_expires_at"
 _WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY = "_workday_consultation_claim_attempt"
 _WORKDAY_ACK_CLAIM_ID_CONTEXT_KEY = "_workday_consultation_ack_claim_id"
 _WORKDAY_RESULT_SUMMARY_CONTEXT_KEY = "_workday_consultation_result_summary"
+_WORKDAY_FAILED_RESULT_SUMMARY = (
+    "The private Workday consultation could not produce a usable result after "
+    "two attempts. This failure notice itself does not verify whether any managed "
+    "task or state change occurred; only separately listed durable receipts and "
+    "current canonical state do."
+)
 _CONSULTATION_RESULT_CONTEXT_KEY = "_workday_consultation_result"
 _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY = "_workday_consultation_atomic_reply_id"
 _CONSULTATION_REQUESTED_CONTEXT_KEY = "_workday_consultation_requested"
@@ -995,21 +1001,29 @@ async def acknowledge_workday_consultation_packet(
             and str(context.get(_WORKDAY_CLAIM_INCARNATION_CONTEXT_KEY))
             == str(worker_incarnation)
             and context.get(_WORKDAY_ACK_CLAIM_ID_CONTEXT_KEY) == str(workday_claim_id)
-            and context.get("_workday_consultation_ack_outcome") == "completed"
-            and outcome == "completed"
+            and context.get("_workday_consultation_ack_outcome") in {
+                "completed",
+                "failed",
+            }
+            and outcome == context.get("_workday_consultation_ack_outcome")
         ):
             if (
-                normalized_result_summary
+                outcome == "completed"
+                and normalized_result_summary
                 and context.get(_WORKDAY_RESULT_SUMMARY_CONTEXT_KEY)
                 != normalized_result_summary
             ):
                 raise ValueError("completed consultation result_summary conflicts")
             return True
         raise ValueError("consultation packet is unavailable")
-    if outcome not in {"completed", "abandoned"}:
+    if outcome not in {"completed", "abandoned", "failed"}:
         raise ValueError("consultation outcome is invalid")
     if outcome == "completed" and not normalized_result_summary:
         raise ValueError("completed consultation requires a result_summary")
+    if outcome == "failed":
+        if int(context.get(_WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY) or 0) < 2:
+            raise ValueError("failed consultation requires at least two attempts")
+        normalized_result_summary = _WORKDAY_FAILED_RESULT_SUMMARY
     if (
         row.handling_state != MessageHandlingState.CLAIMED
         or row.handled_by_task_id != task_id
@@ -1025,7 +1039,24 @@ async def acknowledge_workday_consultation_packet(
     )
     if expires_at is None or expires_at <= now:
         raise ValueError("consultation packet lease is expired")
-    if outcome == "completed":
+    if outcome in {"completed", "failed"}:
+        from app.strategic_workday_mutation_rebind import (
+            WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
+            WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY,
+            bounded_workday_mutation_receipts,
+            workday_mutation_receipts_have_more,
+        )
+
+        mutation_receipts = bounded_workday_mutation_receipts(
+            context,
+            packet_id=packet_id,
+            workday_claim_id=workday_claim_id,
+            task_id=task_id,
+            resident_session_id=resident_session_id,
+            worker_generation=worker_generation,
+            worker_incarnation=worker_incarnation,
+        )
+        mutation_receipts_have_more = workday_mutation_receipts_have_more(context)
         result_key = (
             f"workday-consultation-result:{packet_id}:{workday_claim_id}"
         )
@@ -1047,9 +1078,32 @@ async def acknowledge_workday_consultation_packet(
                     _CONSULTATION_CONTINUATION_CONTEXT_KEY
                 ),
                 _WORKDAY_ACK_CLAIM_ID_CONTEXT_KEY: str(workday_claim_id),
+                "result_state": outcome,
                 "message_role": "workday_consultation_result",
                 "public_reply_owner": ConversationPublicReplyOwner.FAST.value,
                 "envelope": context.get("envelope"),
+                **(
+                    {
+                        WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: mutation_receipts,
+                        WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY: (
+                            mutation_receipts_have_more
+                        ),
+                    }
+                    if mutation_receipts or mutation_receipts_have_more
+                    else {}
+                ),
+                **(
+                    {
+                        _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY: context.get(
+                            _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY
+                        )
+                    }
+                    if isinstance(
+                        context.get(_CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY), str
+                    )
+                    and context.get(_CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY)
+                    else {}
+                ),
             },
             "workday_consultation_result",
             message_type=MessageType.NOTE.value,
@@ -1084,7 +1138,7 @@ async def acknowledge_workday_consultation_packet(
             )
             session.add(result)
         context[_WORKDAY_ACK_CLAIM_ID_CONTEXT_KEY] = str(workday_claim_id)
-        context["_workday_consultation_ack_outcome"] = "completed"
+        context["_workday_consultation_ack_outcome"] = outcome
         context[_WORKDAY_RESULT_SUMMARY_CONTEXT_KEY] = normalized_result_summary
         row.context = context
         row.status = "handled"
@@ -1098,7 +1152,6 @@ async def acknowledge_workday_consultation_packet(
         _WORKDAY_CLAIM_GENERATION_CONTEXT_KEY,
         _WORKDAY_CLAIM_INCARNATION_CONTEXT_KEY,
         _WORKDAY_CLAIM_EXPIRES_CONTEXT_KEY,
-        _WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY,
     ):
         context.pop(key, None)
     row.context = context
@@ -1433,6 +1486,18 @@ async def complete_workday_consultation_continuation(
                 "_workday_result_packet_id": str(result_packet_id),
                 _PUBLIC_REPLY_OWNER_CONTEXT_KEY: ConversationPublicReplyOwner.FAST.value,
                 "_resident_reply_covered_message_ids": [],
+                **(
+                    {
+                        _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY: context.get(
+                            _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY
+                        )
+                    }
+                    if isinstance(
+                        context.get(_CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY), str
+                    )
+                    and context.get(_CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY)
+                    else {}
+                ),
             },
             "question_answer",
             message_type=MessageType.NOTE.value,

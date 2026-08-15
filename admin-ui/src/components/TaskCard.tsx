@@ -484,7 +484,7 @@ export function ResearchFindings({ findings }: { findings: ResearchFinding[] }) 
 
 export function StatusBadge({ status }: { status: TaskStatus }) {
   const configs: Partial<Record<TaskStatus, { icon: typeof Activity; label: string; spin?: boolean }>> = {
-    PROVISIONING: { icon: Activity, label: 'Provisioning…', spin: true },
+    PROVISIONING: { icon: Activity, label: 'Starting…', spin: true },
     EVALUATING:   { icon: Clock,    label: 'Evaluating' },
     BLOCKED:      { icon: ShieldAlert, label: 'Blocked' },
     CANCELLED:    { icon: X,        label: 'Cancelled' },
@@ -631,9 +631,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   const dismissTitle = 'Dismiss — marks this failed task cancelled; it stays in history and will not retry';
   const archiveTitle = 'Archive — moves this task off the board to the archive (recoverable via Unarchive)';
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
-  const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
+  const isExecuting = task.status === 'IN_PROGRESS';
 
-  const hbAgeSec = (task.status === 'IN_PROGRESS' || task.status === 'EVALUATING') && task.last_heartbeat
+  const hbAgeSec = task.status === 'IN_PROGRESS' && task.last_heartbeat
     ? Math.max(0, (now30 - parseTimestamp(task.last_heartbeat).getTime()) / 1000)
     : null;
   const hbAgeText = hbAgeSec !== null ? `HB ${formatCompact(hbAgeSec)}` : null;
@@ -649,6 +649,11 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
     ? task.history[task.history.length - 1].timestamp
     : isTerminal ? task.created_at : undefined;
   const duration = useElapsedTime(task.created_at, isActiveForDuration ? undefined : endTime);
+  const durationText = task.status === 'PROVISIONING'
+    ? `Starting ${duration}`
+    : task.status === 'EVALUATING'
+      ? `Evaluating ${duration}`
+      : duration;
 
   const durationStats = useDurationStats(task.project_id);
   const taskType = task.task_type ?? ((task.payloads?.[0] as Record<string, unknown>)?.type as string) ?? 'create';
@@ -656,7 +661,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   const blockedDisplayReason = movementExplanation || task.blocked_reason;
   const parkDisplayReason = movementExplanation || task.park_reason;
   const etaLabel = (() => {
-    if (task.status !== 'IN_PROGRESS' && task.status !== 'PROVISIONING') return null;
+    if (task.status !== 'IN_PROGRESS') return null;
     if (!task.started_at) return null;
     const typeStat = durationStats[taskType];
     if (!typeStat || typeStat.sample_count < 3) return null;
@@ -815,7 +820,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             )}
           </div>}
           <StatusBadge status={task.status} />
-          {isActive && task.last_heartbeat && (
+          {isExecuting && task.last_heartbeat && (
             <div className="flex items-center gap-0.5" title={heartbeat.text}>
               <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${heartbeat.color}`} />
               {hbAgeText && <span className={`text-ui-sm font-mono ${hbAgeColor}`}>{hbAgeText}</span>}
@@ -933,7 +938,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         )}
       </div>
 
-      {isActive && heartbeat.text.startsWith('Stale') && (
+      {isExecuting && heartbeat.text.startsWith('Stale') && (
         <div className="bg-amber-950/40 border border-amber-900/50 text-amber-400 rounded px-2 py-1.5 text-xs mb-2">
           <div className="flex items-center gap-1.5">
             <AlertTriangle className="w-3.5 h-3.5 shrink-0" style={{ width: 14, height: 14 }} />
@@ -1168,7 +1173,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           <Clock className="w-3 h-3" />
           {parseTimestamp(task.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           <span className="text-neutral-400 font-mono">
-            {queueWaitText ?? duration}
+            {queueWaitText ?? durationText}
           </span>
           {etaLabel && (
             <span className={`font-mono ${etaLabel === 'slow' ? 'text-amber-400' : 'text-neutral-400'}`}>
@@ -1186,7 +1191,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         </div>
 
         <div className="flex items-center gap-2">
-          {isActive ? (
+          {isExecuting ? (
             <div className="flex items-center gap-1.5" title={heartbeat.text}>
               <div className={`w-1.5 h-1.5 rounded-full ${heartbeat.color}`} />
               {hbAgeText && <span className={`text-ui-sm font-mono ${hbAgeColor}`}>{hbAgeText}</span>}

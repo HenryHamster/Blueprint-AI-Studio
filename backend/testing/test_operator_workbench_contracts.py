@@ -225,6 +225,8 @@ async def test_operator_workbench_current_state_contract_surfaces(
         "attention.needs_operator",
         "messages.open",
         "tasks.running",
+        "tasks.starting",
+        "tasks.evaluating",
         "runtime.local_strategic_ready",
         "context.items",
     }:

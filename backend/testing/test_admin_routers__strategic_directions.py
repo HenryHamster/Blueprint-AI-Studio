@@ -30,6 +30,7 @@ from app.models import (
     MessageType,
     _utcnow,
 )
+from app.strategic_resident_session import legacy_resident_worker_incarnation
 
 
 # ── Constants ────────────────────────────────────────────────
@@ -188,11 +189,16 @@ async def _make_resident_message_worker(
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
+    worker_incarnation = legacy_resident_worker_incarnation(task.id, generation)
     project.vision = {
         "_resident_strategic_session": {
             "session_id": session_id,
             "task_id": str(task.id),
             "worker_generation": generation,
+            "worker_incarnation_id": str(worker_incarnation),
+            "worker_incarnation_expires_at": (
+                _utcnow() + timedelta(minutes=5)
+            ).isoformat(),
             "status": "active",
         }
     }
@@ -1426,6 +1432,9 @@ async def test_resident_reply_receipt_is_atomic_and_idempotent(
     )
     body = {
         "task_id": str(task.id),
+        "resident_incarnation_id": project.vision[
+            "_resident_strategic_session"
+        ]["worker_incarnation_id"],
         "op": "create_message",
         "data": {
             "type": "NOTE",
@@ -1507,6 +1516,9 @@ async def test_resident_reply_completes_exact_live_conversation_claim(
     )
     body = {
         "task_id": str(task.id),
+        "resident_incarnation_id": project.vision[
+            "_resident_strategic_session"
+        ]["worker_incarnation_id"],
         "op": "create_message",
         "data": {
             "type": "NOTE",
@@ -1578,6 +1590,9 @@ async def test_resident_reply_rejects_partial_conversation_claim(
         headers={"x-agent-token": token},
         json={
             "task_id": str(task.id),
+            "resident_incarnation_id": project.vision[
+                "_resident_strategic_session"
+            ]["worker_incarnation_id"],
             "op": "create_message",
             "data": {
                 "type": "NOTE",
@@ -1649,6 +1664,9 @@ async def test_resident_claim_reply_to_must_belong_to_covered_batch(
         headers={"x-agent-token": token},
         json={
             "task_id": str(task.id),
+            "resident_incarnation_id": project.vision[
+                "_resident_strategic_session"
+            ]["worker_incarnation_id"],
             "op": "create_message",
             "data": {
                 "type": "NOTE",
@@ -1708,6 +1726,9 @@ async def test_resident_reply_to_cannot_bypass_fast_owned_claim(
         headers={"x-agent-token": token},
         json={
             "task_id": str(task.id),
+            "resident_incarnation_id": project.vision[
+                "_resident_strategic_session"
+            ]["worker_incarnation_id"],
             "op": "create_message",
             "data": {
                 "type": "NOTE",
@@ -1831,6 +1852,60 @@ async def test_unscoped_public_generic_message_cannot_bypass_fast_claim(
 
 
 @pytest.mark.asyncio
+async def test_typed_fast_autonomy_cannot_emit_unclaimed_public_messages(
+    client: AsyncClient, db_session, mocker
+):
+    """Server-owned typed-Fast mode fences Workday even between public claims."""
+    from app.auth import create_agent_token
+
+    citation_warning = mocker.patch(
+        "app.routers.admin_agent_ops._compute_message_citation_warning",
+        new=AsyncMock(return_value=None),
+    )
+    project, task = await _make_resident_message_worker(db_session)
+    incarnation = uuid.uuid4()
+    task.payloads = [{**task.first_payload, "typed_fast_enabled": True}]
+    flag_modified(task, "payloads")
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident.update(
+        worker_incarnation_id=str(incarnation),
+        worker_incarnation_expires_at=(_utcnow() + timedelta(minutes=5)).isoformat(),
+    )
+    project.vision = {**project.vision, "_resident_strategic_session": resident}
+    flag_modified(project, "vision")
+    db_session.add_all([project, task])
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+
+    for message_type in ("BUG_REPORT", "BLOCKER", "NOTE"):
+        response = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "resident_incarnation_id": str(incarnation),
+                "op": "create_message",
+                "data": {
+                    "type": message_type,
+                    "content": "Unclaimed private Workday output must stay private.",
+                    "idempotency_key": f"typed-autonomous-public-{message_type}",
+                    "context": {"event_type": "question_answer"},
+                },
+            },
+        )
+        assert response.status_code == 409, response.text
+    citation_warning.assert_not_awaited()
+    replies = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert replies == []
+
+
+@pytest.mark.asyncio
 async def test_resident_direct_message_resolution_is_rejected(
     client: AsyncClient, db_session
 ):
@@ -1860,6 +1935,9 @@ async def test_resident_direct_message_resolution_is_rejected(
         headers={"x-agent-token": token},
         json={
             "task_id": str(task.id),
+            "resident_incarnation_id": project.vision[
+                "_resident_strategic_session"
+            ]["worker_incarnation_id"],
             "op": "resolve_message",
             "data": {"message_id": str(inbound.id), "resolution": "Addressed"},
         },

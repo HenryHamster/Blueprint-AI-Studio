@@ -226,6 +226,38 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
         # source=="agent" so parent-source blockers and metadata-less blocked
         # subtasks keep their existing "wait for explicit recovery" semantics.
         if blocker_source == "agent":
+            from app.execution_capability_requirements import (
+                CAPABILITY_BACKEND_VERIFICATION,
+                learned_execution_capabilities,
+            )
+
+            learned_capabilities = learned_execution_capabilities(task.context)
+            if learned_capabilities:
+                from app.orchestrator_runner_dispatch import (
+                    _load_active_runners_cache,
+                    _select_eligible_runner,
+                )
+                from app.runner_decline import recently_declined_runner_ids
+
+                active_runners = await _load_active_runners_cache(session)
+                declined_ids = recently_declined_runner_ids(task)
+                task_type = str((task.first_payload or {}).get("type") or "")
+                if _select_eligible_runner(
+                    active_runners,
+                    task.project_id,
+                    task_type,
+                    None,
+                    {},
+                    declined_runner_ids=declined_ids,
+                    requires_project_verification=(
+                        CAPABILITY_BACKEND_VERIFICATION in learned_capabilities
+                    ),
+                ):
+                    return "retry"
+                # A stale positive heartbeat from the contradicted runner is
+                # not recovery evidence. Stay parked until another currently
+                # capable runner appears.
+                return "waiting"
             blocker_text = " ".join(
                 str(value or "")
                 for value in (

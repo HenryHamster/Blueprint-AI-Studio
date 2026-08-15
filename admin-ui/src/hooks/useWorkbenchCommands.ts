@@ -241,7 +241,7 @@ function messageCommandAction(message: StrategicStateMessage): StrategicMessageT
 
 function taskFocusBucketLabel(bucket: string): string {
   if (bucket === 'needs_judgment') return 'Needs judgment';
-  if (bucket === 'active') return 'Active';
+  if (bucket === 'active') return 'Pipeline';
   if (bucket === 'friction') return 'Friction';
   if (bucket === 'queued') return 'Queued';
   if (bucket === 'recent_completed') return 'Recent result';
@@ -1298,7 +1298,7 @@ export function useWorkbenchCommands({
         id: 'pipeline.flow',
         label: 'Pipeline tasks',
         section: 'Pipeline',
-        detail: `${visibleActiveCount} active, ${visibleQueuedCount} queued`,
+        detail: `${visibleActiveCount} in progress, ${visibleQueuedCount} queued`,
         keywords: ['tasks', 'flow', 'monitor', 'passive', 'pipeline'],
         shortcut: '2',
         run: () => openPipelineSection('flow'),

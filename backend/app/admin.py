@@ -100,6 +100,7 @@ from app.project_message_projection import compact_text, message_preview_dict
 from app.task_outcomes import build_task_evaluation_summary
 from app.task_direction_refs import first_task_direction_id
 from app.task_movement import build_task_movement_explanation
+from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     PROJECT_WRITE_ROLES,
@@ -331,6 +332,7 @@ async def get_all_tasks(
     spawned_by: str | None = Query(None, max_length=100),
     approval_needed: bool | None = Query(None),
     include_backend_managed: bool = Query(False, include_in_schema=False),
+    include_resident_infrastructure: bool = Query(False, include_in_schema=False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -342,6 +344,8 @@ async def get_all_tasks(
 
     # Build shared filter conditions
     filters = [Task.project_id.in_(_user_project_ids(current_user["user_id"]))]
+    if not include_resident_infrastructure:
+        filters.append(non_resident_infrastructure_task_filter())
     if not include_backend_managed:
         task_type_expr = Task.payloads[0]["type"].as_string()
         filters.append(
@@ -753,29 +757,25 @@ async def get_all_tasks(
     _counts_row = (
         await session.execute(
             select(
-                func.count(
-                    case(
-                        (
-                            Task.status.in_(
-                                [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
-                            ),
-                            1,
-                        )
-                    )
-                ),
+                func.count(case((Task.status == TaskStatus.IN_PROGRESS, 1))),
+                func.count(case((Task.status == TaskStatus.PROVISIONING, 1))),
                 func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
                 func.count(case((Task.status == TaskStatus.QUEUED, 1))),
             )
             .select_from(Task)
-            .where(Task.project_id.in_(_user_project_ids(current_user["user_id"])))
+            .where(
+                Task.project_id.in_(_user_project_ids(current_user["user_id"])),
+                non_resident_infrastructure_task_filter(),
+            )
         )
     ).one()
-    active_count, evaluating_count, queued_count = _counts_row
+    active_count, starting_count, evaluating_count, queued_count = _counts_row
 
     response: Dict[str, Any] = {
         "tasks": result_list,
         "total": total,
         "active_count": active_count,
+        "starting_count": starting_count,
         "evaluating_count": evaluating_count,
         "queued_count": queued_count,
     }
@@ -784,16 +784,8 @@ async def get_all_tasks(
         _scoped_row = (
             await session.execute(
                 select(
-                    func.count(
-                        case(
-                            (
-                                Task.status.in_(
-                                    [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
-                                ),
-                                1,
-                            )
-                        )
-                    ),
+                    func.count(case((Task.status == TaskStatus.IN_PROGRESS, 1))),
+                    func.count(case((Task.status == TaskStatus.PROVISIONING, 1))),
                     func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
                     func.count(case((Task.status == TaskStatus.QUEUED, 1))),
                 )
@@ -801,11 +793,13 @@ async def get_all_tasks(
                 .where(
                     Task.project_id == project_id,
                     Task.project_id.in_(_user_project_ids(current_user["user_id"])),
+                    non_resident_infrastructure_task_filter(),
                 )
             )
         ).one()
-        scoped_active, scoped_evaluating, scoped_queued = _scoped_row
+        scoped_active, scoped_starting, scoped_evaluating, scoped_queued = _scoped_row
         response["scoped_active_count"] = scoped_active
+        response["scoped_starting_count"] = scoped_starting
         response["scoped_evaluating_count"] = scoped_evaluating
         response["scoped_queued_count"] = scoped_queued
 
@@ -820,7 +814,7 @@ async def get_task_counts(
 ):
     """Cheap aggregate counts endpoint for the header badge.
 
-    Returns only active/evaluating/queued counts with no Task rows loaded.
+    Returns only active/starting/evaluating/queued counts with no Task rows loaded.
     Used by non-pipeline tabs so the header stays current without the
     full-row poll overhead.
     """
@@ -828,27 +822,23 @@ async def get_task_counts(
     global_row = (
         await session.execute(
             select(
-                func.count(
-                    case(
-                        (
-                            Task.status.in_(
-                                [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
-                            ),
-                            1,
-                        )
-                    )
-                ),
+                func.count(case((Task.status == TaskStatus.IN_PROGRESS, 1))),
+                func.count(case((Task.status == TaskStatus.PROVISIONING, 1))),
                 func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
                 func.count(case((Task.status == TaskStatus.QUEUED, 1))),
             )
             .select_from(Task)
-            .where(Task.project_id.in_(user_project_ids_expr))
+            .where(
+                Task.project_id.in_(user_project_ids_expr),
+                non_resident_infrastructure_task_filter(),
+            )
         )
     ).one()
-    active_count, evaluating_count, queued_count = global_row
+    active_count, starting_count, evaluating_count, queued_count = global_row
 
     response: Dict[str, Any] = {
         "active_count": active_count,
+        "starting_count": starting_count,
         "evaluating_count": evaluating_count,
         "queued_count": queued_count,
     }
@@ -857,16 +847,8 @@ async def get_task_counts(
         scoped_row = (
             await session.execute(
                 select(
-                    func.count(
-                        case(
-                            (
-                                Task.status.in_(
-                                    [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
-                                ),
-                                1,
-                            )
-                        )
-                    ),
+                    func.count(case((Task.status == TaskStatus.IN_PROGRESS, 1))),
+                    func.count(case((Task.status == TaskStatus.PROVISIONING, 1))),
                     func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
                     func.count(case((Task.status == TaskStatus.QUEUED, 1))),
                 )
@@ -874,11 +856,13 @@ async def get_task_counts(
                 .where(
                     Task.project_id == project_id,
                     Task.project_id.in_(user_project_ids_expr),
+                    non_resident_infrastructure_task_filter(),
                 )
             )
         ).one()
-        scoped_active, scoped_evaluating, scoped_queued = scoped_row
+        scoped_active, scoped_starting, scoped_evaluating, scoped_queued = scoped_row
         response["scoped_active_count"] = scoped_active
+        response["scoped_starting_count"] = scoped_starting
         response["scoped_evaluating_count"] = scoped_evaluating
         response["scoped_queued_count"] = scoped_queued
 

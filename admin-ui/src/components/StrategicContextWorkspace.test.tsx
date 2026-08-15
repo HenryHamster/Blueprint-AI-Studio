@@ -261,13 +261,14 @@ const STATE = {
   tasks: {
     counts: {
       queued: 2,
+      starting: 1,
       running: 1,
-      evaluating: 0,
+      evaluating: 2,
       blocked: 1,
       parked: 0,
       failed: 1,
       completed: 3,
-      total: 8,
+      total: 11,
     },
     cumulative_estimated_cost_usd: 0,
   },
@@ -342,6 +343,13 @@ describe('StrategicContextWorkspace', () => {
   test('does not render while closed', () => {
     const { host } = mount({ open: false });
     expect(host.textContent).toBe('');
+  });
+
+  test('separates starting and evaluating work from in-progress claims', () => {
+    const { host } = mount();
+
+    expect(host.textContent).toContain('1 in progress');
+    expect(host.textContent).toContain('1 starting / 2 evaluating / 2 queued');
   });
 
   test('keeps pending confirmation actions reachable without attention chrome', async () => {

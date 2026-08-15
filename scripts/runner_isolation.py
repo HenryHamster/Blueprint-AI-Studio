@@ -907,24 +907,64 @@ def playwright_cache_dir() -> str:
 
 
 def probe_playwright_chromium() -> bool:
-    """True when the host has a Playwright-managed Chromium browser build.
+    """True when the host has Playwright's runnable headless Chromium build.
 
-    Mirrors the project's existing chromium-usable signal
-    (``scripts/viewport-snapshot.sh``): the Playwright browsers cache contains a
-    ``chromium-*`` directory. A missing cache is unprovable → False (fail-closed:
-    a host that cannot serve Chromium to the walkthrough harness never claims the
-    candidate-stack site). The path probed is :func:`playwright_cache_dir` — the
-    same path :func:`build_bwrap_argv` mounts into the sandbox, so the claim the
-    gate accepts is the path the harness can actually reach.
+    A bare ``chromium-*`` directory is not proof: modern Playwright launches the
+    separately installed ``chromium_headless_shell-*`` payload for headless
+    tests.  The live failure this gate protects against had the former cache
+    directory but not the latter executable, so dispatch repeatedly sent UI
+    work to a runner that could only fail after making code changes.
+
+    Require the actual headless-shell executable under either the modern
+    dedicated cache entry or an older combined Chromium entry.  The cache is
+    the same path :func:`build_bwrap_argv` mounts into the sandbox, so the proof
+    is about the artifact the viewport harness can consume, not a stale install
+    marker or an unrelated host browser.
     """
     cache = playwright_cache_dir()
     try:
         if not os.path.isdir(cache):
             return False
-        return any(
-            name.startswith("chromium-") and os.path.isdir(os.path.join(cache, name))
+        candidate_names = (
+            name
             for name in os.listdir(cache)
+            if name.startswith(("chromium_headless_shell-", "chromium-"))
         )
+        executable_names = {
+            "chrome-headless-shell",
+            "chrome-headless-shell.exe",
+            "headless_shell",
+            "headless_shell.exe",
+        }
+        for name in candidate_names:
+            candidate_root = os.path.join(cache, name)
+            if not os.path.isdir(candidate_root):
+                continue
+            for root, directories, files in os.walk(candidate_root):
+                # Playwright's payload is at most two directories below the
+                # revision root. Bound traversal in case a malformed cache entry
+                # contains an unrelated tree.
+                relative = os.path.relpath(root, candidate_root)
+                if relative != "." and relative.count(os.sep) >= 2:
+                    directories[:] = []
+                for filename in executable_names.intersection(files):
+                    executable = os.path.join(root, filename)
+                    if not os.path.isfile(executable) or not os.access(executable, os.X_OK):
+                        continue
+                    try:
+                        probe = subprocess.run(
+                            [executable, "--version"],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5,
+                            check=False,
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        continue
+                    if probe.returncode == 0:
+                        return True
+        return False
     except OSError:
         return False
 

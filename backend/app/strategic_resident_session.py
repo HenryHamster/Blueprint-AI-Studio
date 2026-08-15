@@ -60,7 +60,6 @@ from app.voice_credentials import (
     validate_resident_call_deployment_configuration,
 )
 from app.models import (
-    ArtifactType,
     Direction,
     MessageHandlingState,
     MessageSurface,
@@ -79,13 +78,19 @@ from app.resident_conversation_scope import (
     resident_broad_message_scope,
     resident_conversation_floor_sequence,
 )
-from app.schemas import AgentStatusPayload
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
+from app.strategic_consultation_status import canonical_consultation_activity_update
 from app.strategic_payload_summaries import (
     _fetch_open_messages,
     _fetch_open_operator_cursor_floor,
     _fetch_recent_handled_conversation,
+)
+from app.strategic_session_activity import (
+    resident_activity_contract,
+    resident_activity_lifecycle_contract,
+    resident_activity_semantics,
+    resident_activity_with_server_fences,
 )
 from app.shared_state import limiter, runtime_config
 from app.task_locking import (
@@ -113,6 +118,8 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 # ``_strategic_workbench`` (per-operator prefs) and ``_strategic_local_continuation``
 # (the lease marker) so the three concerns never clobber one another.
 RESIDENT_SESSION_KEY = "_resident_strategic_session"
+RESIDENT_INFRASTRUCTURE_CONTEXT_KEY = "_resident_infrastructure"
+RESIDENT_LIFECYCLE_DISPOSITION_CONTEXT_KEY = "_resident_lifecycle_disposition"
 _RESIDENT_WORKER_INCARNATION_PROTOCOL = 1
 
 # A call is deliberately a bounded, nested lease on the existing Workday
@@ -183,16 +190,9 @@ _RESIDENT_ACTIVATION_PROMPT = (
 class _ResidentActivationSuppressed(Exception):
     """Internal transaction signal: real current-session input already exists."""
 
-# Runtime-config: max wall-clock a resident session may run WITHOUT any operator
-# interaction before the heartbeat stops renewing the lease (so the legacy
-# cadence reclaims authority) even though the session process is still alive.
-# Operator interaction (a new operator message) re-arms it. Referenced by name;
-# ``runtime_config`` supplies the registered default (7200s / 2h — see
-# ``runtime_config_state.py``); this local fallback only applies if the key is
-# ever absent from the registry, so it is pinned to that same 4h value to keep
-# the effective cap self-documenting rather than silently disagreeing with it.
+# Legacy runtime-config export retained for compatibility. Continuous lifetime
+# is process-liveness-bound now; operator silence is not a terminal condition.
 STRATEGIC_SESSION_MAX_UNATTENDED_SETTING = "strategic_session_max_unattended_seconds"
-_DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS = 7200  # 2h
 
 # Typed Fast is activated by a server-owned Resident payload contract, never by
 # an undocumented environment toggle on an individual runner.  The model map
@@ -283,8 +283,6 @@ _RESIDENT_ACTIVITY_PHASES = {
     "ended",
 }
 _RESIDENT_ACTIVITY_LAST_ACTION_MAX_CHARS = 240
-_RESIDENT_ACTIVITY_IDLE_WARNING_SECONDS = 300
-
 # created_by value stamped on tasks the strategist spawns (mirrors
 # ``agent_tasks._STRATEGIC_AGENT_CREATED_BY`` / admin_agent_ops). Used to scope
 # the heartbeat's work-state signal to the strategist's OWN in-flight work.
@@ -1326,6 +1324,7 @@ async def set_resident_session_blocked_reason(
     blocked must never itself break the operator's mode switch. A no-op clear
     (nothing recorded) is skipped so it never churns ``vision``.
     """
+    project_id = project.id
     if reason is None and read_resident_session_blocked_reason(project.vision) is None:
         return
     try:
@@ -1343,10 +1342,22 @@ async def set_resident_session_blocked_reason(
         await session.commit()
         await session.refresh(project)
     except Exception:
+        try:
+            await session.rollback()
+            # Rollback expires every ORM attribute. Restore the caller's
+            # instance so its next best-effort operation can safely reuse it.
+            await session.refresh(project)
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] failed to recover blocked-reason session "
+                "for project %s",
+                project_id,
+                exc_info=True,
+            )
         logger.warning(
             "[RESIDENT_SESSION] failed to %s blocked-reason for project %s",
             "clear" if reason is None else "record",
-            project.id,
+            project_id,
             exc_info=True,
         )
 
@@ -1362,6 +1373,7 @@ async def _set_cycle_in_flight_reason(
     handler can re-run the Workday auto-start with the right user identity once
     the blocking cycle finishes. Best-effort: failure is logged and swallowed.
     """
+    project_id = project.id
     try:
 
         def _apply(vision: dict[str, Any]) -> None:
@@ -1375,9 +1387,19 @@ async def _set_cycle_in_flight_reason(
         await session.commit()
         await session.refresh(project)
     except Exception:
+        try:
+            await session.rollback()
+            await session.refresh(project)
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] failed to recover cycle-in-flight session "
+                "for project %s",
+                project_id,
+                exc_info=True,
+            )
         logger.warning(
             "[RESIDENT_SESSION] failed to record cycle_in_flight reason for project %s",
-            project.id,
+            project_id,
             exc_info=True,
         )
 
@@ -1454,12 +1476,10 @@ def _resident_activity_snapshot(
 ) -> dict[str, Any]:
     """Return the bounded, operator-facing resident activity projection.
 
-    The agent persists phase/action transitions in the session blob. Time
-    remaining is derived at read time from the same operator-interaction clock
-    used by the unattended backstop, so it keeps ticking without heartbeat
-    writes and freezes cleanly once the session ends.
+    The agent persists phase/action transitions in the session blob. Continuous
+    lifetime is process-liveness-bound, so operator silence has no stop clock.
     """
-    current_now = now or _utcnow()
+    del now  # compatibility for callers that freeze read-model time in tests
     raw = blob.get("activity")
     activity = dict(raw) if isinstance(raw, dict) else {}
     phase = str(activity.get("phase") or "waiting").strip().lower()
@@ -1473,40 +1493,7 @@ def _resident_activity_snapshot(
     elif blob.get("worker_state") == "retry_wait":
         phase = "retrying"
 
-    last_operator = _parse_iso_naive(
-        blob.get("last_operator_interaction_at")
-    ) or _parse_iso_naive(blob.get("started_at"))
-    try:
-        max_unattended = max(
-            0,
-            int(
-                runtime_config.get(
-                    STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
-                    _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS,
-                )
-            ),
-        )
-    except (TypeError, ValueError):
-        max_unattended = _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS
-
-    clock_now = ended_at or current_now
-    idle_remaining: int | None = None
-    if last_operator is not None and max_unattended > 0:
-        idle_remaining = max(
-            0,
-            int(
-                max_unattended
-                - max(0.0, (clock_now - last_operator).total_seconds())
-            ),
-        )
-        if (
-            phase not in {"ended", "retrying"}
-            and idle_remaining <= min(
-                _RESIDENT_ACTIVITY_IDLE_WARNING_SECONDS,
-                max_unattended,
-            )
-        ):
-            phase = "stopping"
+    activity_contract = resident_activity_lifecycle_contract(activity, phase=phase)
 
     last_action = str(activity.get("last_action") or "").strip()
     if not last_action:
@@ -1533,11 +1520,16 @@ def _resident_activity_snapshot(
         or blob.get("updated_at")
         or blob.get("started_at"),
         "last_action": last_action[:_RESIDENT_ACTIVITY_LAST_ACTION_MAX_CHARS],
+        **activity_contract,
+        "consultation_verified": bool(
+            activity.get("consultation_verified")
+            and activity_contract.get("consultation_id")
+        ),
         "pending_operator_messages": _count(
             activity.get("pending_operator_messages")
         ),
         "next_review_at": activity.get("next_review_at"),
-        "idle_remaining_seconds": idle_remaining,
+        "idle_remaining_seconds": None,
         "pending_watches": _count(activity.get("pending_watches")),
         "fired_watches": _count(activity.get("fired_watches")),
     }
@@ -1573,10 +1565,12 @@ def _normalized_activity_update(
     next_review_at = raw.get("next_review_at")
     if not isinstance(next_review_at, str) or _parse_iso_naive(next_review_at) is None:
         next_review_at = None
+
     return {
         "phase": phase,
         "phase_started_at": phase_started_at or now_iso,
         "last_action": last_action[:_RESIDENT_ACTIVITY_LAST_ACTION_MAX_CHARS],
+        **resident_activity_contract(raw, phase=phase),
         "pending_operator_messages": max(0, int(pending_operator_messages)),
         "next_review_at": next_review_at,
         "pending_watches": max(0, int(pending_watches)),
@@ -1996,7 +1990,7 @@ def _session_scope_conditions(
     session — plus legacy/cadence NULL-session rows (never hidden: backward
     compat so pre-migration backlog is not silently dropped) — are matched. A
     message stamped for a DIFFERENT session is excluded, so session A's messages
-    do not re-arm session B's unattended cap or pollute B's pacing signal. When
+    do not pollute session B's pacing signal. When
     ``resident_session_id`` is None (older callers / cadence path) the scope is
     empty and the query behaves project-wide exactly as before.
     """
@@ -2008,37 +2002,6 @@ def _session_scope_conditions(
             conversation_floor_sequence=conversation_floor_sequence,
         )
     ]
-
-
-async def _latest_operator_interaction_at(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    resident_session_id: str | None = None,
-    conversation_floor_sequence: int | None = None,
-) -> datetime | None:
-    """Return the newest operator-authored message time for the project (or None).
-
-    Operator messages are the durable "operator interaction" signal the
-    unattended cap resets on. Naive-UTC ``created_at`` is returned directly. When
-    ``resident_session_id`` is given, only messages addressed to THIS session (or
-    unstamped legacy/cadence rows) reset the clock — see
-    ``_session_scope_conditions``.
-    """
-    return (
-        await session.execute(
-            select(func.max(ProjectMessage.created_at)).where(
-                ProjectMessage.project_id == project_id,
-                ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
-                *_session_scope_conditions(
-                    resident_session_id,
-                    conversation_floor_sequence,
-                ),
-            )
-        )
-    ).scalar_one_or_none()
-
-
 def _resident_wake_barrier_contract():
     return and_(
         ProjectMessage.context["audience"].as_string()
@@ -2466,6 +2429,13 @@ async def _release_start_claim(
                             "Resident strategic session start failed; "
                             "cancelling orphaned strategic_review task"
                         )
+                        task.context = {
+                            **context,
+                            RESIDENT_INFRASTRUCTURE_CONTEXT_KEY: True,
+                            RESIDENT_LIFECYCLE_DISPOSITION_CONTEXT_KEY: (
+                                "start_compensation"
+                            ),
+                        }
                         session.add(task)
                         completion_event = await _reconcile_resident_terminal_task(
                             session,
@@ -2659,6 +2629,8 @@ def _mark_resident_task_superseded(
     )
     context = dict(task.context or {})
     context["failure_category"] = ADMIN_CANCEL
+    context[RESIDENT_INFRASTRUCTURE_CONTEXT_KEY] = True
+    context[RESIDENT_LIFECYCLE_DISPOSITION_CONTEXT_KEY] = "worker_superseded"
     context["_resident_superseded"] = True
     context["_resident_superseded_at"] = now_iso
     context["_resident_superseded_by_generation"] = replacement_generation
@@ -2968,6 +2940,7 @@ def _resident_born_context(
     """
     context: dict[str, Any] = {
         "_resident_session": True,
+        RESIDENT_INFRASTRUCTURE_CONTEXT_KEY: True,
         "strategic_session_id": session_id,
         "_resident_worker_generation": worker_generation,
         "provider_preference": list(_RESIDENT_PROVIDER_PREFERENCE),
@@ -3073,6 +3046,7 @@ def _stamp_resident_context(
         task.payloads = [first_payload, *payloads[1:]]
         flag_modified(task, "payloads")
     context["_resident_session"] = True
+    context[RESIDENT_INFRASTRUCTURE_CONTEXT_KEY] = True
     context["strategic_session_id"] = session_id
     context["_resident_worker_generation"] = worker_generation
     context["provider_preference"] = list(_RESIDENT_PROVIDER_PREFERENCE)
@@ -3164,25 +3138,9 @@ def _arm_and_finalize_vision(
 
     Shared finalize body for both the adopt and spawn paths. Only mutates the
     session blob when it is still the exact session/generation claim we own —
-    never clobbers a newer generation after a provisional-claim timeout. Arms with
-    an explicit
-    ``renewal_reason='operator_interaction'`` because a session START is itself
-    an operator interaction: freshness must anchor to NOW regardless of any
-    leftover (possibly stale) marker, else the brand-new session would be born
-    non-authoritative (fresh==False) and the cloud cadence would keep spawning
-    competing cycles until the first progress op.
-
-    Arm-at-claim (implemented in ``renew_resident_session_lease._renew``): freshness
-    is anchored HERE, at session START (before the agent has claimed/provisioned),
-    so long queue/provision latency alone could otherwise elapse the TTL before the
-    agent runs a single turn — lapsing the session on its very first heartbeat with
-    zero work (observed: tasks b22a6224, bc2ebf44). To close that pre-claim gap the
-    lease's FIRST agent heartbeat re-anchors freshness to NOW and is exempt from the
-    lapse check, tracked by the ``first_agent_heartbeat_at`` blob flag so EXACTLY
-    ONE beat is exempted. The born-stale lapse still fires for a SUBSEQUENT idle
-    beat past the TTL (queue latency vs a genuine post-work lapse are thereby
-    distinguished), so provisioning time is not charged against the work window
-    while the idle-reclaim backstop is preserved.
+    never clobbers a newer generation after a provisional-claim timeout. Session
+    start is an operator interaction, so it anchors the initial marker to now;
+    exact resident process heartbeats own subsequent Continuous renewal.
     """
     current = read_resident_session(vision)
     if (
@@ -3396,7 +3354,6 @@ async def _rebind_predecessor_conversation_handoff(
             **dict(row.context or {}),
             WAKEUP_STATE_CONTEXT_KEY: "queued",
         }
-        flag_modified(row, "context")
         row.updated_at = now
         session.add(row)
         rebound += 1
@@ -4616,6 +4573,8 @@ async def stop_resident_session(
                 )
                 ctx = dict(locked_task.context or {})
                 ctx["failure_category"] = ADMIN_CANCEL
+                ctx[RESIDENT_INFRASTRUCTURE_CONTEXT_KEY] = True
+                ctx[RESIDENT_LIFECYCLE_DISPOSITION_CONTEXT_KEY] = "operator_stop"
                 locked_task.context = ctx
                 flag_modified(locked_task, "context")
                 session.add(locked_task)
@@ -4638,9 +4597,17 @@ async def stop_resident_session(
                 _run_handoff_rearm,
             )
 
-            _, _handoff_rearm = await _apply_handoff_mutations(
-                session, project.id, _session_id
-            )
+            # A handoff statement failure must not poison the outer stop
+            # transaction. ``begin_nested`` flushes the already-staged
+            # Project/Task end state before opening the SAVEPOINT; successful
+            # message mutations still commit with that state, while a failed
+            # handoff rolls back only its SAVEPOINT and leaves the stop
+            # committable. The stale-session repair sweep can converge any
+            # messages that remain attached to the ended generation.
+            async with session.begin_nested():
+                _, _handoff_rearm = await _apply_handoff_mutations(
+                    session, project.id, _session_id
+                )
         except Exception:
             logger.warning(
                 "[RESIDENT_SESSION] message handoff staging raised for session %s — stop still committed",
@@ -4960,7 +4927,6 @@ async def _bind_pending_operator_message_to_resident(
         **dict(row.context or {}),
         WAKEUP_STATE_CONTEXT_KEY: "queued",
     }
-    flag_modified(row, "context")
     row.updated_at = _utcnow()
     session.add(row)
     await session.commit()
@@ -5374,56 +5340,18 @@ async def renew_resident_session_lease(
     last_compaction_at: str | None = None,
     decisions_reg: str | None = None,
     activity: dict[str, Any] | None = None,
+    derive_consultation_status: bool = False,
     repo_head: str | None = None,
 ) -> dict[str, Any]:
     """Renew the continuation lease from a resident-agent heartbeat.
 
-    Validates the heartbeat against the recorded session, then applies four
-    coordinated lease rules:
-
-    * **Progress-gated freshness.** Continuation *freshness* renews on
-      ``progress=True`` (an applied strategic op → ``renewal_reason=
-      'strategic_progress'``) OR fresh operator interaction OR — for an
-      UNATTENDED autonomous review — a completed autonomous working turn
-      (``autonomous_turn=True`` → ``renewal_reason='autonomous_turn'``). The last
-      path exists because examination IS the work for an autonomous review: "no
-      mutation in 25 min" is its healthy steady state, not a stall, so the pure
-      mutation gate would guillotine a healthy CLEAR-verdict session at the TTL.
-      ``autonomous_turn`` is set ONLY by the agent's autonomous turn-loop, which
-      a chat/monitor session never runs — so the operator-chat mutation/operator
-      freshness gate is unchanged, and a genuinely-stuck autonomous session is
-      still reclaimed by the unattended cap + consecutive-stall backstops. A bare
-      liveness heartbeat (``progress=False`` and no ``autonomous_turn``) is
-      liveness-only: it PRESERVES the marker's existing freshness (re-passing its
-      own ``last_seen_at``, no ``renewal_reason``) and never bumps it, so mere
-      runner liveness can't extend the dead-man's switch.
-
-    * **Unattended cap → END the session.** If the operator has not interacted
-      for longer than ``strategic_session_max_unattended_seconds`` (an elapsed,
-      inherently-sustained condition) the session is ENDED: ``stop_requested`` +
-      ``status=ended`` are stamped on the blob and the lease released, and
-      ``stop_requested=True`` / ``authority_held=False`` is returned. The agent
-      ends cleanly on ``stop_requested`` and posts the task terminal, so the
-      resident ``strategic_review`` frees and the legacy cadence resumes — a
-      productive-but-unattended session thus winds down within ≤ the cap rather
-      than pinning strategic authority (and blocking ``_spawn_strategic_review``)
-      forever. A fresh operator message BEFORE the cap elapses re-arms the clock
-      and keeps the session alive.
-
-    * **Lease lapse → END the session.** If, after applying this heartbeat, the
-      continuation freshness is genuinely STALE — a marker with a valid freshness
-      timestamp elapsed past the TTL (``strategic_continuation_ttl_seconds``),
-      i.e. no progress AND no operator interaction for the whole window — the
-      session is likewise ENDED and ``stop_requested=True`` returned, handing
-      authority back to the cadence within ≤ the TTL. This keys off the
-      elapsed-time ``reason == "stale"`` verdict specifically, NOT a transient /
-      benign non-fresh read (a just-armed session, a missing marker, or a missing
-      timestamp is never treated as a lapse), so a freshly-started or
-      actively-chatting / actively-working session is NEVER stop-requested.
-
-    * **Stop/heartbeat race.** The FRESH in-lock blob is re-read inside the row
-      lock; if a stop landed after the pre-lock snapshot the lease is NOT
-      re-armed and ``stop_requested=True`` / ``authority_held=False`` is returned.
+    An exact session/task/generation/incarnation heartbeat renews Continuous
+    authority after locking the server-owned workbench mode. Operator silence is
+    not terminal: a healthy quiet process may remain resident indefinitely. Chat
+    or Stop, a newer process incarnation, and a replacement session fence the
+    renewal. Another live strategic task pauses mutation authority without
+    ending the Resident. A dead process emits no exact heartbeat, so ordinary
+    process-heartbeat reaping still releases it.
 
     Returns the lease view the agent loop steers on:
     ``{authority_held, leased_until, stop_requested, status}``.
@@ -5480,35 +5408,6 @@ async def renew_resident_session_lease(
             for receipt in fired_barrier_receipts
             if receipt["id"] not in handled_message_id_set
         ]
-    # Conversation availability is independent from mutation authority. A
-    # resident may answer while a batch strategic cycle is active, but it must
-    # stay chat-only until that cycle releases the project's strategic lane.
-    other_strategic_rows = (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.id != uuid.UUID(str(task_id)),
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                        ]
-                    ),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    other_strategic_active = any(
-        (row.first_payload or {}).get("type")
-        in {"design_doc_update", _RESIDENT_STRATEGIC_TASK_TYPE}
-        for row in other_strategic_rows
-    )
-
     # Parse the agent's serialized exam-ledger from the heartbeat note (JSON,
     # guarded). When valid, the string is written into the session blob as
     # ``_exam_ledger`` so a restart can restore the ledger instead of beginning
@@ -5564,20 +5463,28 @@ async def renew_resident_session_lease(
             "direction_grounding": direction_grounding,
         }
 
-    max_unattended = runtime_config.get(
-        STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
-        _DEFAULT_STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS,
+    # Canonical ordering for every mode writer is prefs -> Project. Holding this
+    # row lock through commit gives Chat/Stop and heartbeat one linearization:
+    # heartbeat-first may renew once, while a committed Chat preference can never
+    # be overwritten or rearmed by the old Resident.
+    server_workbench = await get_strategic_workbench_state(
+        session,
+        str(op_id or ""),
+        project.id,
+        for_update=True,
+        populate_existing=True,
     )
-    latest_msg_dt: datetime | None = None
+    other_strategic_active = False
 
     holder = {
         "authority_held": False,
+        "effective_authority_held": False,
         "incarnation_held": False,
         "legacy_grace_until": None,
         "lease_now": None,
         "stopped": False,
-        "capped": False,
-        "lapsed": False,
+        "mode_left": False,
+        "typed_fast_account_id": None,
         # Set in-lock when this heartbeat crosses into chronically-low operator-
         # decision capture and no prior notice was posted; drives the single
         # strategist-internal emit after the lease commits.
@@ -5587,17 +5494,13 @@ async def renew_resident_session_lease(
         # strategist-internal notice after the lease commits.
         "emit_absent_notice": False,
     }
+    activity_for_update = activity
+    consultation_verified_for_update = False
 
-    def _end_session(vision: dict[str, Any], current: dict[str, Any]) -> None:
-        """Drive OUR session blob terminal + release the lease, in-lock.
-
-        Stamps ``stop_requested`` + ``status=ended`` so a re-query reflects the
-        ending and the next heartbeat short-circuits at the pre-lock stop check;
-        pops the continuation marker so required-local tasks fall back to cloud
-        and the cadence is no longer pinned (mirrors ``stop_resident_session``).
-        The agent reads ``stop_requested=True`` from the response and ends its
-        loop, posting the resident task terminal so the cadence reclaims.
-        """
+    def _end_for_mode_change(
+        vision: dict[str, Any], current: dict[str, Any]
+    ) -> None:
+        """Atomically end OUR accepted incarnation after Workday leaves Continuous."""
         ended_now = holder.get("lease_now") or now
         ended_now_iso = ended_now.isoformat()
         ended = dict(current)
@@ -5613,9 +5516,23 @@ async def renew_resident_session_lease(
             ),
             "phase": "ended",
             "phase_started_at": ended_now_iso,
-            "last_action": "Session ended after reaching the idle limit",
+            "last_action": "Session stopped after Workday left Continuous mode",
             "next_review_at": None,
         }
+        typed_fast = ended.get(RESIDENT_TYPED_FAST_KEY)
+        if isinstance(typed_fast, dict) and typed_fast.get("status") == CALL_STATUS_ACTIVE:
+            holder["typed_fast_account_id"] = (
+                str(typed_fast.get("account_id") or "") or None
+            )
+            typed_fast = dict(typed_fast)
+            typed_fast.update(
+                status=CALL_STATUS_ENDED,
+                ended_at=ended_now_iso,
+                updated_at=ended_now_iso,
+                failure="parent_stopped",
+                slot_reserved=False,
+            )
+            ended[RESIDENT_TYPED_FAST_KEY] = typed_fast
         vision[RESIDENT_SESSION_KEY] = ended
         vision.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
 
@@ -5678,141 +5595,58 @@ async def renew_resident_session_lease(
         if not isinstance(fresh, dict):
             holder["stopped"] = True
             return
-        # Decide the unattended cap from the in-lock session state and a
-        # message timestamp queried only after this heartbeat acquired Project
-        # authority. Operator sends take the same Project lock for sequencing,
-        # so whichever transaction wins is observed atomically here.
-        last_op_dt = _parse_iso_naive(
-            fresh.get("last_operator_interaction_at")
-        ) or _parse_iso_naive(fresh.get("started_at"))
-        op_reengaged = latest_msg_dt is not None and (
-            last_op_dt is None or latest_msg_dt > last_op_dt
-        )
-        effective_last_op = latest_msg_dt if op_reengaged else last_op_dt
-        unattended_exceeded = (
-            not op_reengaged
-            and effective_last_op is not None
-            and (lease_now - effective_last_op).total_seconds()
-            > float(max_unattended)
-        )
-        # Finding 1 (unattended cap): the session has run past the max-unattended
-        # cap with no operator interaction. This is an elapsed, sustained
-        # condition — END the session (release the lease, stamp ended) so the
-        # resident task can go terminal and the cadence reclaims, rather than
-        # leaving it alive-but-passive and blocking the cadence indefinitely.
-        if unattended_exceeded:
-            holder["capped"] = True
-            _end_session(vision, fresh)
+        # The accepted process incarnation may renew only while the canonical,
+        # server-owned preference remains Continuous. The prefs row is already
+        # locked before Project, so a committed Chat decision wins atomically;
+        # a stale competing incarnation never reaches this terminal mutation.
+        if server_workbench.get("interaction_mode") != "continuous":
+            holder["mode_left"] = True
+            _end_for_mode_change(vision, fresh)
             return
 
-        marker = vision.get(STRATEGIC_LOCAL_CONTINUATION_KEY)
-        owner_started = (
-            marker.get("owner_session_started_at") if isinstance(marker, dict) else None
-        )
-        prior_last_seen = (
-            marker.get("last_seen_at") if isinstance(marker, dict) else None
-        )
-        # Arm-at-claim: the continuation marker is armed at session START (before
-        # the agent claims/provisions the task — see _arm_and_finalize_vision), so
-        # long queue/provision latency ALONE can elapse the TTL before the agent
-        # runs a single turn, lapsing the session on its very first heartbeat with
-        # zero work (observed: bc2ebf44 carried a real exam/decisions ledger yet
-        # ran ~3s before the born-stale marker terminalized it). The FIRST
-        # heartbeat from the executing agent re-anchors freshness to NOW and is
-        # EXEMPT from the lapse check below, so provisioning time is never charged
-        # against the work window. Tracked by an explicit blob flag (NOT
-        # worker_state, which flips at arm; NOT last_operator_interaction_at) so
-        # EXACTLY ONE beat is exempted — a later idle beat past the TTL is a
-        # SUBSEQUENT beat and still lapses. This opens no never-claimed hole: a
-        # session whose agent NEVER heartbeats is reaped by reaper_orphan_classify
-        # (PROVISIONING + last_heartbeat IS NULL), and the unattended cap (above,
-        # keyed off started_at) still bounds a session that provisions past it.
         first_agent_heartbeat = not fresh.get("first_agent_heartbeat_at")
-        # Finding 4: this heartbeat renews freshness when the request body reports
-        # progress==True (an applied strategic op) OR — for an unattended
-        # autonomous review — autonomous_turn==True (a completed autonomous
-        # working turn: tool calls / TICK-VERDICT). The autonomous path exists
-        # because examination IS the work for an autonomous review, so "no
-        # mutation in the whole TTL window" is its HEALTHY steady state, not a
-        # stall; the pure mutation gate would guillotine a healthy CLEAR-verdict
-        # session at the TTL with zero directions. ``autonomous_turn`` is set ONLY
-        # by the agent's autonomous turn-loop, which a chat/monitor session never
-        # runs — so the operator-chat mutation gate is unchanged, and a
-        # genuinely-stuck autonomous session is still reclaimed by the unattended
-        # cap (above) + the agent-side consecutive-stall detector. Operator
-        # interaction also renews freshness per the lease contract, but via the
-        # operator's OWN message/workbench path (sync_local_continuation_marker=
-        # True) — not this heartbeat, which uses a fresh operator message only to
-        # re-arm the unattended cap (above). Bare liveness (progress=False and no
-        # autonomous_turn) NEVER bumps it.
         renew_freshness = bool(progress)
-        # An autonomous working turn advances freshness only when it did NOT also
-        # apply a strategic op (progress already covers that, and keeps
-        # last_progress_at / mutation accounting exact — see the ``if progress:``
-        # branch below, which autonomous_turn deliberately does not trip).
         autonomous_renewal = bool(autonomous_turn) and not progress
-        synthetic_workbench: dict[str, Any] = {
+        heartbeat_workbench: dict[str, Any] = {
+            **server_workbench,
             "interaction_mode": "continuous",
-            "session_started_at": owner_started or fresh.get("started_at"),
+            "session_started_at": (
+                server_workbench.get("session_started_at") or fresh.get("started_at")
+            ),
         }
         if runner_id:
-            synthetic_workbench["preferred_runner_id"] = runner_id
-
-        if renew_freshness or autonomous_renewal or first_agent_heartbeat:
-            apply_strategic_local_continuation_marker(
-                vision,
-                synthetic_workbench,
-                operator_user_id=str(op_id or ""),
-                preferred_runner_id=str(runner_id) if runner_id else None,
-                renewal_reason=(
-                    "strategic_progress"
-                    if renew_freshness
-                    else "autonomous_turn"
-                    if autonomous_renewal
-                    else "first_agent_heartbeat"
-                ),
-            )
-            holder["authority_held"] = True
-        elif isinstance(marker, dict) and prior_last_seen:
-            # Liveness-only heartbeat: PRESERVE the existing freshness (re-pass
-            # the marker's own last_seen_at, no renewal_reason) — never bump it,
-            # so bare liveness cannot extend the dead-man's-switch lease. The
-            # authority we report is then whatever the un-bumped freshness says.
-            synthetic_workbench["last_interaction_at"] = prior_last_seen
-            apply_strategic_local_continuation_marker(
-                vision,
-                synthetic_workbench,
-                operator_user_id=str(op_id or ""),
-                preferred_runner_id=str(runner_id) if runner_id else None,
-                renewal_reason=None,
-            )
-            holder["authority_held"] = True
-        # else: no marker to preserve — do NOT arm one on bare liveness (that
-        # would renew freshness from nothing, defeating the progress gate).
-
-        # Finding 1 (lease lapse): after applying this heartbeat, if the
-        # continuation freshness is genuinely STALE — a marker with a valid
-        # freshness timestamp that has elapsed past the TTL, i.e. no progress AND
-        # no operator interaction for the whole window — END the session so the
-        # cadence reclaims. We key strictly off the elapsed-time ``stale`` verdict
-        # (an inherently-sustained condition): a just-armed/fresh session reads
-        # ``armed``, and a missing marker / missing timestamp reads
-        # ``not_enabled`` / ``missing_timestamp`` — none of which are treated as a
-        # lapse — so a freshly-started or actively-working session is never ended.
+            heartbeat_workbench["preferred_runner_id"] = runner_id
+        apply_strategic_local_continuation_marker(
+            vision,
+            heartbeat_workbench,
+            operator_user_id=str(op_id or ""),
+            preferred_runner_id=str(runner_id) if runner_id else None,
+            renewal_reason=(
+                "strategic_progress"
+                if renew_freshness
+                else "autonomous_turn"
+                if autonomous_renewal
+                else "first_agent_heartbeat"
+                if first_agent_heartbeat
+                else "continuous_liveness"
+            ),
+        )
         post = strategic_local_continuation_status_from_vision(
             vision, operator_user_id=op_id
         )
-        # The first agent heartbeat re-anchored freshness above (its renewal makes
-        # ``post`` read fresh, not stale), so this ``and not first_agent_heartbeat``
-        # guard is belt-and-suspenders: NEVER lapse on the claim beat even if the
-        # marker read is transiently non-fresh — provisioning latency must not be
-        # charged as an idle lapse. A SUBSEQUENT idle beat past the TTL still lapses.
-        if post.get("reason") == "stale" and not first_agent_heartbeat:
-            holder["lapsed"] = True
-            # Report no authority (the marker is stale) and end the session.
-            holder["authority_held"] = False
-            _end_session(vision, fresh)
-            return
+        marker_owner_started = post.get("owner_session_started_at")
+        expected_owner_started = heartbeat_workbench.get("session_started_at")
+        holder["authority_held"] = (
+            bool(post.get("fresh"))
+            and bool(post.get("owned_by_current_operator"))
+            and (
+                not marker_owner_started
+                or marker_owner_started == expected_owner_started
+            )
+        )
+        holder["effective_authority_held"] = bool(holder["authority_held"]) and not (
+            other_strategic_active
+        )
 
         updated = dict(fresh)
         updated["updated_at"] = lease_now_iso
@@ -5821,14 +5655,9 @@ async def renew_resident_session_lease(
         updated.pop("worker_retry_reason", None)
         updated["worker_heartbeat_at"] = lease_now_iso
         if first_agent_heartbeat:
-            # Stamp the claim beat so subsequent heartbeats are NOT exempted from
-            # the lapse check — the arm-at-claim exemption covers provisioning
-            # latency exactly once, then the ordinary progress/TTL gate resumes.
             updated["first_agent_heartbeat_at"] = lease_now_iso
         if progress:
             updated["last_progress_at"] = lease_now_iso
-        if op_reengaged and latest_msg_dt is not None:
-            updated["last_operator_interaction_at"] = latest_msg_dt.isoformat()
         # Persist the agent's serialized exam-ledger so it survives a restart.
         # ``_exam_ledger`` is NOT exposed by ``resident_session_snapshot``; it is
         # an opaque blob the agent reads back via ``task.context`` on startup.
@@ -5905,7 +5734,7 @@ async def renew_resident_session_lease(
         if isinstance(last_compaction_at, str) and last_compaction_at:
             updated["last_compaction_at"] = last_compaction_at
         updated["activity"] = _normalized_activity_update(
-            activity,
+            activity_for_update,
             current=(
                 fresh.get("activity")
                 if isinstance(fresh.get("activity"), dict)
@@ -5920,21 +5749,56 @@ async def renew_resident_session_lease(
             ),
             fired_watches=int(work_state_summary.get("fired_watches") or 0),
         )
+        # The request body necessarily reflects the Agent's state *before* it
+        # receives this heartbeat response. Apply server-owned authority/call
+        # fences in the same locked vision write so Fast cannot claim in the
+        # commit-to-next-heartbeat gap while the persisted activity still says
+        # autonomous Workday is actionable.
+        updated["activity"] = resident_activity_with_server_fences(
+            updated["activity"],
+            authority_held=holder["effective_authority_held"],
+            foreground_call_active=resident_call_is_active(
+                fresh.get(RESIDENT_CALL_KEY), now=lease_now
+            ),
+        )
+        updated["activity"]["consultation_verified"] = bool(
+            consultation_verified_for_update
+            and updated["activity"].get("consultation_id")
+        )
         vision[RESIDENT_SESSION_KEY] = updated
 
+    mode_cancelled_task_id: uuid.UUID | None = None
     async with project_lock(session, project.id, skip_locked=False) as locked_project:
         if locked_project is None:
             holder["stopped"] = True
         else:
-            latest_msg_dt = await _latest_operator_interaction_at(
-                session,
-                project.id,
-                resident_session_id=session_id,
-                conversation_floor_sequence=(
-                    resident_conversation_floor_sequence(
-                        read_resident_session(locked_project.vision)
+            if derive_consultation_status:
+                activity_for_update, consultation_verified_for_update = (
+                    await canonical_consultation_activity_update(
+                        session, project_id=project.id,
+                        resident_session_id=session_id, activity=activity,
                     )
-                ),
+                )
+            # Conversation availability is independent from mutation authority.
+            # Sample competitors under Project serialization so a batch cycle
+            # pauses this heartbeat without terminating the Resident.
+            other_strategic_rows = (
+                (
+                    await session.execute(
+                        select(Task).where(
+                            Task.project_id == project.id,
+                            Task.id != uuid.UUID(str(task_id)),
+                            Task.status.in_(list(_LIVE_TASK_STATUSES)),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            other_strategic_active = any(
+                (row.first_payload or {}).get("type")
+                in {"design_doc_update", _RESIDENT_STRATEGIC_TASK_TYPE}
+                for row in other_strategic_rows
             )
             await with_vision_locked(
                 session,
@@ -5942,12 +5806,7 @@ async def renew_resident_session_lease(
                 _renew,
                 _locked_project=locked_project,
             )
-            # The cap/lapse session end and its backing task terminalization
-            # must share one transaction.  Previously the backend committed
-            # only the ended session blob and trusted the winding-down agent to
-            # make a second status request.  A runner update or process exit in
-            # that gap left a permanently IN_PROGRESS orphan.
-            if holder["capped"] or holder["lapsed"]:
+            if holder["mode_left"]:
                 try:
                     resident_task_uuid = uuid.UUID(str(task_id))
                 except (TypeError, ValueError):
@@ -5966,52 +5825,21 @@ async def renew_resident_session_lease(
                                 worker_generation=worker_generation,
                             )
                         ):
-                            locked_task.status = TaskStatus.COMPLETED
-                            terminal_message = (
-                                "Resident strategic session ended after reaching "
-                                "the idle limit"
-                                if holder["capped"]
-                                else "Resident strategic session ended after its "
-                                "continuation lease lapsed"
+                            locked_task.status = TaskStatus.CANCELLED
+                            locked_task.latest_status_message = (
+                                "Resident strategic session stopped after Workday "
+                                "left Continuous mode"
                             )
-                            locked_task.latest_status_message = terminal_message
-                            terminal_payload = AgentStatusPayload(
-                                task_id=locked_task.id,
-                                resident_incarnation_id=incarnation_id,
-                                status=TaskStatus.COMPLETED,
-                                artifact_type=ArtifactType.RESEARCH_FINDINGS,
-                                logs=(
-                                    f"{terminal_message} (session {session_id}, "
-                                    f"generation {worker_generation})."
-                                ),
-                            )
-                            # Write-ahead the SAME durable recovery contract as
-                            # the ordinary agent terminal-status route.  The
-                            # status, ended session blob, handoff, and marker
-                            # commit atomically; a process death immediately
-                            # after commit is therefore recoverable by the
-                            # post-commit sweep rather than becoming a subtler
-                            # completion-pipeline orphan.
-                            locked_task.post_commit_pending = True
                             locked_task.context = {
                                 **(locked_task.context or {}),
-                                "_post_commit_pending_meta": {
-                                    "at": _utcnow().isoformat(),
-                                    # No inline post-commit pass is running in
-                                    # this heartbeat request: the winding-down
-                                    # agent's idempotent terminal POST normally
-                                    # drives it next.  A distinct reason lets
-                                    # the sweep retry immediately if that POST
-                                    # is lost with the runner process.
-                                    "reason": "resident_session_ended",
-                                    "payload": terminal_payload.model_dump(
-                                        mode="json"
-                                    ),
-                                    "attempts": 0,
-                                },
+                                "failure_category": ADMIN_CANCEL,
+                                RESIDENT_INFRASTRUCTURE_CONTEXT_KEY: True,
+                                RESIDENT_LIFECYCLE_DISPOSITION_CONTEXT_KEY: (
+                                    "workday_mode_left"
+                                ),
                             }
-                            flag_modified(locked_task, "context")
                             session.add(locked_task)
+                            mode_cancelled_task_id = locked_task.id
     if holder["legacy_grace_until"] is not None:
         legacy_grace_until = holder["legacy_grace_until"]
         lease_now = holder["lease_now"] or _utcnow()
@@ -6051,6 +5879,75 @@ async def renew_resident_session_lease(
         return {
             "authority_held": False,
             "resident_incarnation_held": False,
+            "leased_until": cont.get("expires_at"),
+            "stop_requested": True,
+            "status": refreshed.get("status") or STATUS_ENDED,
+            "work_state_rev": work_state_rev,
+            "work_state_summary": work_state_summary,
+            "fired_watches": fired_watch_receipts,
+            "fired_barriers": fired_barrier_receipts,
+            "exam_ledger": None,
+            "active_direction_ids": active_direction_ids,
+            "direction_grounding": direction_grounding,
+        }
+    if holder["mode_left"]:
+        # Release any claimed conversation turn in the SAME transaction as the
+        # ended blob/task. A committed Chat preference therefore cannot strand a
+        # turn even when the mode endpoint's best-effort stop never ran.
+        mode_rearm: tuple | None = None
+        try:
+            from app.session_message_handoff import _apply_handoff_mutations
+
+            # Isolate DB failures from the outer mode-end transaction. Without
+            # a SAVEPOINT, catching a PostgreSQL statement error still leaves
+            # the session rollback-only, so the commit below would discard the
+            # ended blob and task cancellation despite the best-effort contract.
+            async with session.begin_nested():
+                _, mode_rearm = await _apply_handoff_mutations(
+                    session, project.id, session_id
+                )
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] mode-change handoff staging raised for session %s — stop still committed",
+                session_id,
+                exc_info=True,
+            )
+        await session.commit()
+        await session.refresh(project)
+        typed_fast_account_id = holder["typed_fast_account_id"]
+        if typed_fast_account_id:
+            from app.max_plan_pool import release_max_plan_auxiliary_slot
+
+            await release_max_plan_auxiliary_slot(
+                typed_fast_account_id, project_id=str(project.id)
+            )
+        if mode_rearm is not None:
+            try:
+                from app.session_message_handoff import _run_handoff_rearm
+
+                await _run_handoff_rearm(session, project.id, session_id, mode_rearm)
+            except Exception:
+                logger.warning(
+                    "[RESIDENT_SESSION] mode-change handoff rearm raised for session %s — stop still committed",
+                    session_id,
+                    exc_info=True,
+                )
+        if mode_cancelled_task_id is not None:
+            try:
+                await _run_resident_completion_on_stop(mode_cancelled_task_id)
+            except Exception:
+                logger.warning(
+                    "[RESIDENT_SESSION] mode-change completion raised for task %s — stop still committed",
+                    mode_cancelled_task_id,
+                    exc_info=True,
+                )
+        cont = strategic_local_continuation_status_from_vision(
+            project.vision, operator_user_id=op_id
+        )
+        refreshed = read_resident_session(project.vision) or {}
+        return {
+            "authority_held": False,
+            "resident_incarnation_held": holder["incarnation_held"],
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": refreshed.get("status") or STATUS_ENDED,
@@ -6269,37 +6166,8 @@ async def renew_resident_session_lease(
                 session_id,
                 exc_info=True,
             )
-    # Apply handoff mutations BEFORE the commit when the session is being capped
-    # or lapsed, so the message release lands in the same transaction as the
-    # session-end. This closes the non-atomic two-transaction window where a
-    # process death after the first commit (session-end) but before the second
-    # (handoff) would leave messages permanently stamped with the ended session
-    # and invisible to any replacement.
-    _cap_rearm: tuple | None = None
-    if holder["capped"] or holder["lapsed"]:
-        try:
-            from app.session_message_handoff import (
-                _apply_handoff_mutations,
-            )
-
-            _, _cap_rearm = await _apply_handoff_mutations(
-                session, project.id, session_id
-            )
-        except Exception:
-            logger.warning(
-                "[RESIDENT_SESSION] message handoff staging raised for session %s (cap/lapse) — ignored",
-                session_id,
-                exc_info=True,
-            )
     await session.commit()
     await session.refresh(project)
-
-    # Do not hold the heartbeat response open for the potentially minutes-long
-    # terminal pipeline.  The agent observes stop_requested and immediately
-    # makes its ordinary terminal POST; because post_commit_pending is already
-    # durable, the idempotency guard runs the full pipeline instead of returning
-    # already_terminal.  If the runner dies before that POST, the sweep sees the
-    # non-inline marker above and takes over without a grace delay.
 
     cont = strategic_local_continuation_status_from_vision(
         project.vision, operator_user_id=op_id
@@ -6321,43 +6189,10 @@ async def renew_resident_session_lease(
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
         }
-    if holder["capped"] or holder["lapsed"]:
-        # Finding 1: the unattended cap was exceeded, or the lease genuinely
-        # lapsed (stale past TTL). The session has been ENDED in-lock (blob
-        # stamped ended + lease released) so the resident task can go terminal
-        # and the legacy cadence reclaims strategic authority. Signal the agent
-        # to wind down.
-        if _cap_rearm is not None:
-            try:
-                from app.session_message_handoff import _run_handoff_rearm
-
-                await _run_handoff_rearm(
-                    session, project.id, session_id, _cap_rearm
-                )
-            except Exception:
-                logger.warning(
-                    "[RESIDENT_SESSION] message handoff rearm raised for session %s (cap/lapse) — ignored",
-                    session_id,
-                    exc_info=True,
-                )
-        return {
-            "authority_held": False,
-            "leased_until": cont.get("expires_at"),
-            "stop_requested": True,
-            "status": refreshed.get("status") or STATUS_ENDED,
-            "work_state_rev": work_state_rev,
-            "work_state_summary": work_state_summary,
-            "fired_watches": fired_watch_receipts,
-            "fired_barriers": fired_barrier_receipts,
-            "exam_ledger": None,
-            "active_direction_ids": active_direction_ids,
-            "direction_grounding": direction_grounding,
-        }
     return {
         "authority_held": bool(cont.get("fresh"))
         and not refreshed_stop
-        and holder["authority_held"]
-        and not other_strategic_active,
+        and holder["effective_authority_held"],
         "resident_incarnation_held": holder["incarnation_held"],
         "resident_incarnation_id": str(
             incarnation_id
@@ -6674,6 +6509,23 @@ async def resident_session_heartbeat(
     if str(token.get("sub")) != str(payload.task_id):
         # The heartbeat must come from the resident session task's own token.
         raise HTTPException(status_code=403, detail="Token task mismatch")
+    activity_before = resident_activity_semantics(
+        _resident_activity_snapshot(read_resident_session(project.vision) or {})
+    )
+    async def _emit_activity_transition_if_changed() -> None:
+        activity_after = resident_activity_semantics(
+            _resident_activity_snapshot(read_resident_session(project.vision) or {})
+        )
+        if activity_after == activity_before:
+            return
+        from app.strategic_events import emit_strategic_session_state_updated
+
+        await emit_strategic_session_state_updated(
+            project.id,
+            task_id=payload.task_id,
+            activity=activity_after,
+        )
+
     response = await renew_resident_session_lease(
         session,
         project,
@@ -6692,10 +6544,12 @@ async def resident_session_heartbeat(
         last_compaction_at=payload.last_compaction_at,
         decisions_reg=payload.decisions_reg,
         activity=payload.activity,
+        derive_consultation_status=True,
         repo_head=payload.repo_head,
     )
     if response.get("resident_incarnation_held") is False:
         await session.commit()
+        await _emit_activity_transition_if_changed()
         return response
     if (
         payload.conversation_claim_incarnation is not None
@@ -6782,4 +6636,5 @@ async def resident_session_heartbeat(
             )
         except LiveKitConfigurationError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await _emit_activity_transition_if_changed()
     return response

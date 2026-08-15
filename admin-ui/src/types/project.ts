@@ -277,6 +277,7 @@ export interface ProjectResourceEnvelopeResponse extends ResourceEnvelopeConfig 
  */
 interface TaskStatusCounts {
   queued: number;
+  starting: number;
   running: number;
   evaluating: number;
   blocked: number;

@@ -825,7 +825,7 @@ async def test_acceptance_aggregate_malformed_verdict_is_failsafe(db_session):
 @pytest.mark.asyncio
 async def test_count_in_flight_counts_all_non_terminal_statuses(db_session):
     """Every non-terminal status (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING/
-    BLOCKED) is counted as in flight."""
+    BLOCKED/PARKED) is counted as in flight."""
     project = await _make_project(db_session)
     now = _utcnow()
     for status in (
@@ -834,11 +834,47 @@ async def test_count_in_flight_counts_all_non_terminal_statuses(db_session):
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
         TaskStatus.BLOCKED,
+        TaskStatus.PARKED,
     ):
         await _make_task(db_session, project, status=status, context={}, updated_at=now)
 
     count = await rv.count_in_flight_tasks(db_session, project.id)
-    assert count == 5
+    assert count == 6
+
+
+@pytest.mark.asyncio
+async def test_count_in_flight_excludes_resident_generations(db_session):
+    """Resident lifecycle rows do not inflate the ordinary-work consequence.
+
+    This query runs unchanged on SQLite and PostgreSQL. Both the legacy marker
+    and the explicit infrastructure marker remain excluded during rollout,
+    while an ordinary PARKED task proves all non-terminal work states still
+    count.
+    """
+    project = await _make_project(db_session)
+    now = _utcnow()
+    for status, context in (
+        (TaskStatus.QUEUED, {"_resident_session": True}),
+        (
+            TaskStatus.PROVISIONING,
+            {"_resident_session": True, "_resident_infrastructure": True},
+        ),
+        (TaskStatus.IN_PROGRESS, {"_resident_infrastructure": True}),
+        (TaskStatus.BLOCKED, {"_resident_session": True}),
+    ):
+        await _make_task(
+            db_session, project, status=status, context=context, updated_at=now
+        )
+    ordinary = await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.PARKED,
+        context={},
+        updated_at=now,
+    )
+
+    assert await rv.count_in_flight_tasks(db_session, project.id) == 1
+    assert ordinary.status == TaskStatus.PARKED
 
 
 @pytest.mark.asyncio

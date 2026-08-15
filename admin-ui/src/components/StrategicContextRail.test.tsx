@@ -714,7 +714,7 @@ const STATE: StrategicStateResponse = {
     ],
     curated_metrics: [
       { id: 'attention.needs_operator', label: 'needs operator', value: 1, tone: 'warning', target: { surface: 'messages' } },
-      { id: 'tasks.running', label: 'running tasks', value: 2, tone: 'active', target: { surface: 'pipeline' } },
+      { id: 'tasks.running', label: 'in-progress tasks', value: 2, tone: 'active', target: { surface: 'pipeline' } },
     ],
     context_sources: [
       { kind: 'running_update', count: 1 },

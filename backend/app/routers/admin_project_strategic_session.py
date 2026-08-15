@@ -21,7 +21,6 @@ from sqlmodel import select
 from sqlalchemy import func, or_, and_, union_all
 from typing import Any, Dict, Literal
 import uuid
-from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import AsyncSessionLocal, get_session
 from app.artifact_refs import artifact_ref_projection
@@ -143,6 +142,7 @@ from app.work_session_check_in import (
     _message_is_operator_check_in,
     _persist_strategic_check_in_marker,
 )
+from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.server_timing import async_timed
 from app.storage import (
     ARTIFACT_BUCKET_NAME,
@@ -433,6 +433,18 @@ def _build_work_session_summary(
             "tasks.running",
             int(task_counts.get("running") or 0),
             tone="active" if int(task_counts.get("running") or 0) > 0 else "neutral",
+        ),
+        build_work_session_metric(
+            "tasks.starting",
+            int(task_counts.get("starting") or 0),
+            tone="watch" if int(task_counts.get("starting") or 0) > 0 else "neutral",
+        ),
+        build_work_session_metric(
+            "tasks.evaluating",
+            int(task_counts.get("evaluating") or 0),
+            tone="watch"
+            if int(task_counts.get("evaluating") or 0) > 0
+            else "neutral",
         ),
         build_work_session_metric(
             "tasks.blocked",
@@ -1651,7 +1663,6 @@ async def _persist_message_preview_strategic_session_descriptors(
         **context,
         "strategic_session": updated_snapshot,
     }
-    flag_modified(message, "context")
     session.add(message)
     await session.commit()
     await session.refresh(message)
@@ -2219,7 +2230,11 @@ async def get_project_strategic_state(
     )
     _task_status_rows_res = await session.execute(
         select(Task.status, func.count())
-        .where(Task.project_id == project.id, Task.archived.is_(False))
+        .where(
+            Task.project_id == project.id,
+            Task.archived.is_(False),
+            non_resident_infrastructure_task_filter(),
+        )
         .group_by(Task.status)
     )
     # Two bounded status branches use the composite index and are merged into
@@ -2275,6 +2290,7 @@ async def get_project_strategic_state(
 
     task_counts = {
         "queued": 0,
+        "starting": 0,
         "running": 0,
         "evaluating": 0,
         "blocked": 0,
@@ -2289,7 +2305,9 @@ async def get_project_strategic_state(
         task_counts["total"] += n
         if status == TaskStatus.QUEUED:
             task_counts["queued"] += n
-        elif status in (TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING):
+        elif status == TaskStatus.PROVISIONING:
+            task_counts["starting"] += n
+        elif status == TaskStatus.IN_PROGRESS:
             task_counts["running"] += n
         elif status == TaskStatus.EVALUATING:
             task_counts["evaluating"] += n

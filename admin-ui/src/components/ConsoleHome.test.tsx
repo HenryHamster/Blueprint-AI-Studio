@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, cleanup } from '@testing-library/react';
+import { render, screen, waitFor, cleanup, within } from '@testing-library/react';
 import { ConsoleHome } from './ConsoleHome';
 import type { Task } from '../types/task';
 
@@ -27,6 +27,8 @@ function digestResponse(overrides: Record<string, unknown>) {
       failure_groups: [],
       active_count: 0,
       running_count: 0,
+      starting_count: 0,
+      evaluating_count: 0,
       queued_count: 0,
       completed_count: 0,
       research_cycles: 0,
@@ -131,6 +133,20 @@ describe('ConsoleHome — operator inbox', () => {
     await waitFor(() =>
       expect(screen.getByText(/Nothing needs your attention/)).toBeTruthy(),
     );
+  });
+
+  it('does not count a provisioning reservation as In progress in the page fallback', async () => {
+    apiFetchMock.mockImplementation(async (url: string) =>
+      url.includes('/digest') ? digestResponse({}) : new Response('{}', { status: 200 }),
+    );
+
+    renderHome({
+      globalActiveCount: undefined,
+      tasks: [{ id: 'starting-task', status: 'PROVISIONING' } as Task],
+    });
+
+    const activeCard = (await screen.findByText('In progress')).closest('div') as HTMLElement;
+    expect(within(activeCard).getByText('0')).toBeInTheDocument();
   });
 
   it('renders Recently Shipped with an unverified-merge badge', async () => {

@@ -4677,6 +4677,57 @@ async def _handle_strategic_completion(
         or (task.context or {}).get("_strategic_api_called", False)
     )
 
+    resident_infrastructure = bool(
+        (task.context or {}).get("_resident_session") is True
+        or (task.context or {}).get("_resident_infrastructure") is True
+    )
+    if resident_infrastructure and not api_was_used:
+        # A Continuous Workday generation is process infrastructure, not a
+        # one-shot strategic result. Its normal lifecycle terminal carries no
+        # JSON output to parse. Keep the raw Task as audit provenance, but never
+        # turn that expected absence into a false effectiveness failure/alert.
+        # An adopted cadence task can still own an active StrategicCycle. Close
+        # that cycle with a cancelled infrastructure disposition; otherwise a
+        # normally-returned Resident generation (Task COMPLETED) would leave the
+        # cycle stuck in phase2_running because the generic lifecycle backstop
+        # only reconciles FAILED/CANCELLED tasks.
+        reconciled_cycle = await strategic_cycle.reconcile_terminal_task(
+            session,
+            task,
+            source="resident_generation_terminal",
+            allow_completed_resident_infrastructure=True,
+        )
+        completion_event = (
+            strategic_cycle.terminal_completion_event(
+                reconciled_cycle,
+                task,
+                source="resident_generation_terminal",
+            )
+            if reconciled_cycle is not None
+            else None
+        )
+        context = {
+            **(task.context or {}),
+            "_resident_infrastructure": True,
+        }
+        context.setdefault(
+            "_resident_lifecycle_disposition", "resident_generation_terminal"
+        )
+        task.context = context
+        if not task.latest_status_message or task.latest_status_message == (
+            "Strategic output could not be parsed"
+        ):
+            task.latest_status_message = "Resident generation ended (infrastructure)"
+        session.add(task)
+        await session.commit()
+        if completion_event is not None:
+            await strategic_cycle.emit_terminal_completion_events([completion_event])
+        logger.info(
+            "[STRATEGIC] Resident infrastructure task %s ended without result parsing",
+            task.id,
+        )
+        return
+
     if api_was_used:
         cycle_id = (task.context or {}).get("strategic_cycle_id")
         dirs_created = (task.context or {}).get("_strategic_dirs_created", 0)

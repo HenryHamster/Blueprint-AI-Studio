@@ -1871,14 +1871,45 @@ class TestCapabilitiesInventory(unittest.TestCase):
         inv = iso.capabilities_inventory(_caps(playwright_chromium_usable=True))
         self.assertTrue(inv["playwright_chromium_usable"])
 
-    def test_probe_playwright_chromium_detects_browser_cache(self):
+    def test_probe_playwright_chromium_requires_runnable_headless_shell(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(iso.os.path, "expanduser", return_value=tmp):
                 # No Playwright browser cache → unprovable → False (fail-closed).
                 self.assertFalse(iso.probe_playwright_chromium())
                 chromium_dir = os.path.join(tmp, "chromium-1254.0")
                 os.makedirs(chromium_dir)
-                self.assertTrue(iso.probe_playwright_chromium())
+                # A stale/partial full-Chromium directory is the exact live false
+                # positive: Playwright still asks for chromium_headless_shell.
+                chromium_binary = os.path.join(chromium_dir, "chrome-linux", "chrome")
+                os.makedirs(os.path.dirname(chromium_binary))
+                with open(chromium_binary, "wb") as handle:
+                    handle.write(b"not the headless shell")
+                os.chmod(chromium_binary, 0o755)
+                self.assertFalse(iso.probe_playwright_chromium())
+
+                shell_binary = os.path.join(
+                    tmp,
+                    "chromium_headless_shell-1254.0",
+                    "chrome-headless-shell-linux64",
+                    "chrome-headless-shell",
+                )
+                os.makedirs(os.path.dirname(shell_binary))
+                with open(shell_binary, "wb") as handle:
+                    handle.write(b"headless shell")
+                os.chmod(shell_binary, 0o755)
+                with mock.patch.object(iso.subprocess, "run") as launch:
+                    launch.return_value = mock.Mock(returncode=1)
+                    self.assertFalse(iso.probe_playwright_chromium())
+                    launch.return_value = mock.Mock(returncode=0)
+                    self.assertTrue(iso.probe_playwright_chromium())
+                    launch.assert_called_with(
+                        [shell_binary, "--version"],
+                        stdin=iso.subprocess.DEVNULL,
+                        stdout=iso.subprocess.DEVNULL,
+                        stderr=iso.subprocess.DEVNULL,
+                        timeout=5,
+                        check=False,
+                    )
 
 
 # ── LLM CLI probe ────────────────────────────────────────────────────────────

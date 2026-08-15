@@ -41,6 +41,7 @@ from app.models import (
 from app.max_plan_pool import filter_user_task_context
 from app.payload_schemas import format_payload_validation_error, validate_task_payload
 from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
+from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.findings_index import resolve_research_findings_for_surface
 from app.schemas import DeployPayload
 from app.shared_state import backfill_branch_columns, limiter
@@ -330,6 +331,7 @@ async def get_project_tasks(
     direction_id: str | None = None,
     task_type: str | None = None,
     include_backend_managed: bool = Query(False, include_in_schema=False),
+    include_resident_infrastructure: bool = Query(False, include_in_schema=False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -383,6 +385,8 @@ async def get_project_tasks(
 
     # Fetch tasks
     tasks_stmt = select(Task).where(Task.project_id == project_id)
+    if not include_resident_infrastructure:
+        tasks_stmt = tasks_stmt.where(non_resident_infrastructure_task_filter())
     if not include_backend_managed:
         task_type_expr = Task.payloads[0]["type"].as_string()
         tasks_stmt = tasks_stmt.where(

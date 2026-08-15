@@ -94,11 +94,16 @@ def test_archive_extractors_drain_stderr_without_a_pipe_or_read_deadlock(
 
 
 def test_check_runs_static_guard_only_for_test_gate() -> None:
-    """The release guard is invoked only by the explicit test/merge gate."""
-    source = (REPO_ROOT / "check").read_text()
-    release_block_start = source.index("# The database-free release guard corpus")
-    release_block_end = source.index("# Idempotent npm install", release_block_start)
-    release_block = source[release_block_start:release_block_end]
+    """The dispatcher reaches the tracked fallback, whose guard stays test-only."""
+    dispatcher = (REPO_ROOT / "check").read_text()
+    assert 'DEFAULT_GATE="$WORKSPACE/scripts/check-default.sh"' in dispatcher
+    assert 'if [ ! -x "$DEFAULT_GATE" ]; then' in dispatcher
+    assert 'exec "$DEFAULT_GATE" "$@"' in dispatcher
+
+    fallback = (REPO_ROOT / "scripts" / "check-default.sh").read_text()
+    release_block_start = fallback.index("# The database-free release guard corpus")
+    release_block_end = fallback.index("# Idempotent npm install", release_block_start)
+    release_block = fallback[release_block_start:release_block_end]
     guard_call = 'run "static release guards (task diff)" python3 scripts/static_release_guard.py'
     assert 'if [ "$WITH_TESTS" = "1" ]; then' in release_block
     assert guard_call in release_block
@@ -124,6 +129,10 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
     (tmp_path / "backend" / "testing").mkdir(parents=True)
     shutil.copy2(REPO_ROOT / "check", tmp_path / "check")
     shutil.copy2(
+        REPO_ROOT / "scripts" / "check-default.sh",
+        tmp_path / "scripts" / "check-default.sh",
+    )
+    shutil.copy2(
         REPO_ROOT / "scripts" / "static_release_guard.py",
         tmp_path / "scripts" / "static_release_guard.py",
     )
@@ -140,6 +149,7 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
         tmp_path / "backend" / "app" / "size_limit_policy.py",
     )
     os.chmod(tmp_path / "check", 0o755)
+    os.chmod(tmp_path / "scripts" / "check-default.sh", 0o755)
     os.chmod(tmp_path / "scripts" / "static_release_guard.py", 0o755)
     os.chmod(tmp_path / "scripts" / "backend-test-route.sh", 0o755)
     (tmp_path / "backend" / "app" / "size_probe.py").write_text("line_one = 1\nline_two = 2\n")
@@ -163,7 +173,7 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
     result = subprocess.run(
         ["bash", str(tmp_path / "check"), "test"],
         cwd=tmp_path,
-        env={**os.environ, "WORKSPACE": str(tmp_path)},
+        env={**os.environ, "WORKSPACE": str(tmp_path), "TASK_ID": ""},
         capture_output=True,
         text=True,
         check=False,

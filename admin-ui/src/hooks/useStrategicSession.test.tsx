@@ -88,7 +88,7 @@ function makeHeavyState(): StrategicStateResponse {
     problem_model: { active_gap_count: 0, capability_count: 0, pending_confirmation_count: 0, top_gap: null },
     directions: { total_count: 0, active_count: 0, paused_count: 0, primary: null },
     messages: { counts: { open: 0, linked: 0 }, items: [] },
-    tasks: { counts: { queued: 0, running: 0, evaluating: 0, blocked: 0, parked: 0, failed: 0, completed: 0, total: 0 }, cumulative_estimated_cost_usd: 0 },
+    tasks: { counts: { queued: 0, starting: 0, running: 0, evaluating: 0, blocked: 0, parked: 0, failed: 0, completed: 0, total: 0 }, cumulative_estimated_cost_usd: 0 },
     design: { has_design_doc: false },
   } as StrategicStateResponse;
 }

@@ -1585,6 +1585,9 @@ describe('useWorkbenchCommands', () => {
       detail: 'Needs judgment / EVALUATING / Backend says this is waiting for approval',
     });
     captured.find(command => command.id === 'strategic.task_focus.active.task-active')?.run();
+    expect(captured.find(command => command.id === 'strategic.task_focus.active.task-active')).toMatchObject({
+      detail: 'Pipeline / IN_PROGRESS / Adding task-focus command routes',
+    });
     expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'task', task_id: 'task-active' });
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
@@ -1877,7 +1880,7 @@ describe('useWorkbenchCommands', () => {
 
     expect(captured.find(command => command.id === 'pipeline.flow')).toMatchObject({
       label: 'Pipeline tasks',
-      detail: '3 active, 4 queued',
+      detail: '3 in progress, 4 queued',
       section: 'Pipeline',
       shortcut: '2',
     });

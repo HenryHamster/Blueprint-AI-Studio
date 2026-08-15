@@ -1,6 +1,5 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
-
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', () => ({
   normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
@@ -34,7 +33,7 @@ import {
   buildScopedLintOneliner,
   sanitizeCiFailureSelectors,
 } from './code-change-helpers.js';
-
+import { prepareLifecycleHelperTestRepo } from './lifecycle-helper-test-repo.js';
 // Some tests below write a generated bash helper with mode 0o755 and execute it
 // (via a shebang/PATH-resolved curl stub), then parse its output. That requires
 // a Unix executable bit, which Windows lacks — there the subprocess yields empty
@@ -960,6 +959,7 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
         `#!/bin/bash\ncat > "${payloadFile}"\nprintf '200'\n`,
         { mode: 0o755 },
       );
+      prepareLifecycleHelperTestRepo(dir, taskId);
       const env = {
         ...process.env,
         PATH: `${bin}:${process.env.PATH}`,
@@ -978,7 +978,7 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
       return { exit, payload };
     } finally {
       realFs.rmSync(dir, { recursive: true, force: true });
-      try { realFs.unlinkSync(`/tmp/blocked_${taskId}`); } catch { /* ignore */ }
+      for (const marker of [`/tmp/blocked_${taskId}`, `/tmp/base_commit_${taskId}`]) { try { realFs.unlinkSync(marker); } catch { /* ignore */ } }
     }
   };
 
@@ -1432,6 +1432,12 @@ describe('writeCodeChangeHelpers — lifecycle helpers use live token file', () 
     expect(failScript).not.toContain('TOKEN="${AGENT_API_TOKEN:?');
     // Env fallback must still exist inside the function (one-shot agents).
     expect(failScript).toContain('AGENT_API_TOKEN');
+    expect(failScript).toContain('blueprint-checkpoint: preserve unshipped task task-token-test');
+    expect(failScript).toContain('_CHECKPOINT_LEASE="--force-with-lease=refs/heads/blueprint/task-token-test:$_CHECKPOINT_EXPECTED_SHA"');
+    expect(failScript).toContain('push "$_CHECKPOINT_LEASE" origin');
+    expect(failScript.indexOf('_checkpoint_terminal_work ||')).toBeLessThan(
+      failScript.indexOf('-X POST "$API/api/agent/status"'),
+    );
   });
 
   it('generated ./blocked embeds _load_agent_token and does not hard-bind from AGENT_API_TOKEN alone', async () => {
@@ -1446,6 +1452,12 @@ describe('writeCodeChangeHelpers — lifecycle helpers use live token file', () 
     expect(blockedScript).not.toContain('PAYLOAD=$(jq -n');
     expect(blockedScript).not.toContain('TOKEN="${AGENT_API_TOKEN:?');
     expect(blockedScript).toContain('AGENT_API_TOKEN');
+    expect(blockedScript).toContain('Blueprint-Base-Commit: $_CHECKPOINT_BASE');
+    expect(blockedScript).toContain('_CHECKPOINT_LEASE="--force-with-lease=refs/heads/blueprint/task-token-test:$_CHECKPOINT_EXPECTED_SHA"');
+    expect(blockedScript).toContain('push "$_CHECKPOINT_LEASE" origin');
+    expect(blockedScript.indexOf('_checkpoint_terminal_work ||')).toBeLessThan(
+      blockedScript.indexOf('-X POST "$API/api/agent/status"'),
+    );
   });
 
   it('generated ./done embeds _load_agent_token and does not hard-bind from AGENT_API_TOKEN alone', async () => {
@@ -1517,6 +1529,7 @@ describe('writeCodeChangeHelpers — lifecycle helpers use live token file', () 
         ].join('\n'),
         { mode: 0o755 },
       );
+      prepareLifecycleHelperTestRepo(dir, taskId);
 
       // Run with a STALE AGENT_API_TOKEN and a fresh AGENT_TOKEN_FILE.
       // The helper must use the file token, not the stale env snapshot.
@@ -1538,7 +1551,7 @@ describe('writeCodeChangeHelpers — lifecycle helpers use live token file', () 
       expect(agentTokenHeader).not.toContain('stale-env-token');
     } finally {
       realFs.rmSync(dir, { recursive: true, force: true });
-      try { realFs.unlinkSync(`/tmp/fail_${taskId}`); } catch { /* ignore */ }
+      for (const marker of [`/tmp/fail_${taskId}`, `/tmp/base_commit_${taskId}`]) { try { realFs.unlinkSync(marker); } catch { /* ignore */ } }
     }
   });
 });
@@ -1608,6 +1621,7 @@ describe('writeCodeChangeHelpers — jq-free status payload build', () => {
         `#!/bin/bash\necho called > "${jqMarker}"\nexit 1\n`,
         { mode: 0o755 },
       );
+      prepareLifecycleHelperTestRepo(dir, taskId);
       const env = {
         ...process.env,
         PATH: `${bin}:${process.env.PATH}`,
@@ -1627,7 +1641,7 @@ describe('writeCodeChangeHelpers — jq-free status payload build', () => {
       return { exit, jqCalled, payload };
     } finally {
       realFs.rmSync(dir, { recursive: true, force: true });
-      try { realFs.unlinkSync(`/tmp/${helper}_${taskId}`); } catch { /* ignore */ }
+      for (const marker of [`/tmp/${helper}_${taskId}`, `/tmp/base_commit_${taskId}`]) { try { realFs.unlinkSync(marker); } catch { /* ignore */ } }
     }
   };
 
@@ -1662,4 +1676,225 @@ describe('writeCodeChangeHelpers — jq-free status payload build', () => {
     expect(payload?.logs).toBe('BLOCKER: waiting on merge');
     expect(payload?.blocked_need).toEqual({ kind: 'pr', ref: '7910' });
   });
+});
+
+describe('writeCodeChangeHelpers — executable terminal checkpoint lease', () => {
+  let capturedScripts: Record<string, string> = {};
+  let sequence = 0;
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+      if (typeof path === 'string' && path.endsWith('/.check-task')) {
+        capturedScripts[path.replace(/\.check-task$/, 'check')] = content;
+      }
+    });
+  });
+
+  type PushMode = 'normal' | 'lost-response' | 'competing' | 'remote-unavailable'; type RealFixture = {
+    baseCommit: string;
+    bare: string;
+    dir: string;
+    helperPath: string;
+    postLog: string;
+    repo: string;
+    taskId: string;
+    workBranch: string;
+    bash: string;
+    git: string;
+    env: NodeJS.ProcessEnv;
+  };
+
+  const slash = (value: string): string => value.replace(/\\/g, '/');
+
+  async function makeFixture(helper: 'fail' | 'blocked', mode: PushMode): Promise<RealFixture> {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const bash = process.platform === 'win32' ? 'C:/Program Files/Git/bin/bash.exe' : 'bash';
+    const git = process.platform === 'win32' ? 'C:/Program Files/Git/cmd/git.exe' : realCp.execFileSync(bash, ['-lc', 'command -v git'], { encoding: 'utf8' }).trim();
+    const taskId = `checkpoint-${helper}-${mode}-${process.pid}-${sequence++}`;
+    const workBranch = `blueprint/${taskId}`;
+    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'terminal-checkpoint-'));
+    const bare = realPath.join(dir, 'remote.git');
+    const repo = realPath.join(dir, 'work');
+    const bin = realPath.join(dir, 'bin');
+    const postLog = realPath.join(dir, 'status-post.log');
+    const shimState = realPath.join(dir, 'push-shim-fired');
+    realFs.mkdirSync(repo);
+    realFs.mkdirSync(bin);
+
+    const runGit = (cwd: string, args: string[]): string => realCp.execFileSync(
+      git,
+      args,
+      { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    ).trim();
+    runGit(dir, ['init', '--bare', bare]);
+    runGit(repo, ['init']);
+    runGit(repo, ['config', 'user.name', 'Checkpoint Test']);
+    runGit(repo, ['config', 'user.email', 'checkpoint@example.test']);
+    runGit(repo, ['checkout', '-b', 'main']);
+    realFs.writeFileSync(realPath.join(repo, 'work.txt'), 'base\n');
+    runGit(repo, ['add', 'work.txt']);
+    runGit(repo, ['commit', '-m', 'base']);
+    const baseCommit = runGit(repo, ['rev-parse', 'HEAD']);
+    runGit(repo, ['remote', 'add', 'origin', slash(bare)]);
+    runGit(repo, ['push', '-u', 'origin', 'main']);
+
+    let competingSha = '';
+    if (mode === 'competing') {
+      runGit(repo, ['checkout', '-b', 'competitor-seed']);
+      realFs.writeFileSync(realPath.join(repo, 'competitor.txt'), 'do not overwrite\n');
+      runGit(repo, ['add', 'competitor.txt']);
+      runGit(repo, ['commit', '-m', 'competing checkpoint owner']);
+      competingSha = runGit(repo, ['rev-parse', 'HEAD']);
+      runGit(repo, ['push', 'origin', `${competingSha}:refs/heads/competitor-seed`]);
+      runGit(repo, ['checkout', 'main']);
+    }
+    realFs.writeFileSync(realPath.join(repo, 'work.txt'), `base\npending ${helper} work\n`);
+
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId,
+      workBranch,
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+    const helperPath = realPath.join(repo, helper);
+    realFs.writeFileSync(helperPath, capturedScripts[`/tmp/workspace/${helper}`], { mode: 0o755 });
+
+    const gitShim = `#!/bin/bash
+for _arg in "$@"; do
+  if [ "$_arg" = "ls-remote" ] && [ "$CHECKPOINT_MODE" = "remote-unavailable" ]; then
+    exit 74
+  fi
+  if [ "$_arg" = "push" ]; then
+    if [ "$CHECKPOINT_MODE" = "lost-response" ] && [ ! -e "$SHIM_STATE" ]; then
+      : > "$SHIM_STATE"
+      "$REAL_GIT" "$@" || exit $?
+      exit 75
+    fi
+    if [ "$CHECKPOINT_MODE" = "competing" ] && [ ! -e "$SHIM_STATE" ]; then
+      : > "$SHIM_STATE"
+      "$REAL_GIT" --git-dir="$BARE_REMOTE" update-ref \
+        "refs/heads/$WORK_BRANCH" "$COMPETING_SHA" || exit $?
+      exit 75
+    fi
+  fi
+done
+exec "$REAL_GIT" "$@"
+`;
+    realFs.writeFileSync(realPath.join(bin, 'git'), gitShim, { mode: 0o755 });
+    realFs.writeFileSync(
+      realPath.join(bin, 'node'),
+      '#!/bin/bash\n_value=$(cat)\nprintf \'"%s"\' "$_value"\n',
+      { mode: 0o755 },
+    );
+    realFs.writeFileSync(realPath.join(bin, 'sleep'), '#!/bin/bash\nexit 0\n', { mode: 0o755 });
+    const bashEnv = realPath.join(dir, 'bash-env.sh');
+    realFs.writeFileSync(
+      bashEnv,
+      `git() { "$CHECKPOINT_SHIM_BIN/git" "$@"; }
+curl() { "$CHECKPOINT_SHIM_BIN/curl" "$@"; }
+node() { "$CHECKPOINT_SHIM_BIN/node" "$@"; }
+sleep() { return 0; }
+`,
+    );
+    const curlShim = `#!/bin/bash
+for _arg in "$@"; do
+  case "$_arg" in
+    */api/agent/github/token*) printf '%s' '{"data":{"token":""}}'; exit 0 ;;
+  esac
+done
+_remote_sha=$("$REAL_GIT" --git-dir="$BARE_REMOTE" rev-parse \
+  "refs/heads/$WORK_BRANCH" 2>/dev/null) || exit 76
+printf '%s\n' "$_remote_sha" >> "$POST_LOG"
+printf '200'
+`;
+    realFs.writeFileSync(realPath.join(bin, 'curl'), curlShim, { mode: 0o755 });
+
+    const env = Object.fromEntries(Object.entries({
+      ...process.env,
+      ORCHESTRATOR_URL: 'http://orchestrator.test',
+      AGENT_API_TOKEN: 'checkpoint-token',
+      REAL_GIT: slash(git),
+      BARE_REMOTE: slash(bare),
+      WORK_BRANCH: workBranch,
+      CHECKPOINT_MODE: mode,
+      SHIM_STATE: slash(shimState),
+      COMPETING_SHA: competingSha,
+      POST_LOG: slash(postLog),
+      CHECKPOINT_SHIM_BIN: slash(bin),
+      BASH_ENV: slash(bashEnv),
+    }).filter(([key]) => key.toLowerCase() !== 'path')) as NodeJS.ProcessEnv;
+    env.PATH = (process.platform === 'win32'
+      ? [bin, 'C:\\Program Files\\Git\\usr\\bin', 'C:\\Program Files\\Git\\bin']
+      : [bin, '/usr/bin', '/bin']).join(realPath.delimiter);
+    const baseMarker = `/tmp/base_commit_${taskId}`;
+    realCp.execFileSync(
+      bash,
+      ['-c', 'printf %s "$1" > "$2"', 'checkpoint-test', baseCommit, baseMarker],
+      { env, stdio: 'pipe' },
+    );
+    realCp.execFileSync(
+      bash,
+      ['-c', 'rm -f "$@"', 'checkpoint-test', `/tmp/${helper}_${taskId}`],
+      { env, stdio: 'pipe' },
+    );
+    return { baseCommit, bare, dir, helperPath, postLog, repo, taskId, workBranch, bash, git, env };
+  }
+
+  async function disposeFixture(fixture: RealFixture): Promise<void> {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    try {
+      realCp.execFileSync(
+        fixture.bash,
+        [
+          '-c', 'rm -f "$@"', 'checkpoint-test',
+          `/tmp/base_commit_${fixture.taskId}`,
+          `/tmp/fail_${fixture.taskId}`,
+          `/tmp/blocked_${fixture.taskId}`,
+          `/tmp/checkpoint_commit_${fixture.taskId}.log`,
+          `/tmp/checkpoint_push_${fixture.taskId}.log`,
+          `/tmp/checkpoint_remote_${fixture.taskId}.log`,
+        ],
+        { env: fixture.env, stdio: 'pipe' },
+      );
+    } finally {
+      realFs.rmSync(fixture.dir, { recursive: true, force: true });
+    }
+  }
+
+  it('does not POST ./blocked terminal state when the initial lease cannot be read', async () => {
+    const fixture = await makeFixture('blocked', 'remote-unavailable');
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    try {
+      let exit = 0;
+      try {
+        realCp.execFileSync(
+          fixture.bash,
+          [fixture.helperPath, 'remote unavailable'],
+          { cwd: fixture.repo, env: fixture.env, stdio: 'pipe' },
+        );
+      } catch (error: unknown) {
+        exit = (error as { status?: number }).status ?? -1;
+      }
+      expect(exit).not.toBe(0);
+      expect(realFs.existsSync(fixture.postLog)).toBe(false);
+      expect(() => realCp.execFileSync(
+        fixture.git,
+        ['--git-dir', fixture.bare, 'rev-parse', `refs/heads/${fixture.workBranch}`],
+        { stdio: 'pipe' },
+      )).toThrow();
+    } finally {
+      await disposeFixture(fixture);
+    }
+  }, 30_000);
 });
