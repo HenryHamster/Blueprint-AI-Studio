@@ -347,7 +347,10 @@ async def test_claim_fence_retargets_closed_rollup_fix_to_replacement(
         "base_sha": "new-base",
         "head_sha": "new-head",
     }
-    assert loop["reviewed_head_sha"] == "new-head"
+    # The replacement head is an execution target for the carried fix, not a
+    # reviewed snapshot.  Preserve the old review boundary so the fix's next
+    # review covers replacement changes as well as the newly pushed fix.
+    assert loop["reviewed_head_sha"] == "old-head"
     assert loop["review_history"] == [{"verdict": "REQUEST_CHANGES"}]
     assert loop["iteration"] == 4
     assert (task.context or {}).get("rollup_pr_number") == new_pr

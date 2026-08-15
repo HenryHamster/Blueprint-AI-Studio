@@ -180,9 +180,11 @@ async def _retarget_closed_rollup_fix(
             ),
             "fix_target": replacement_target,
             # This is a backend-issued exact target for the same fix task. It
-            # preserves the chain history while preventing the old head from
-            # authorizing writes on the replacement PR.
-            "reviewed_head_sha": replacement_target["head_sha"],
+            # prevents the old head from authorizing writes on the replacement
+            # PR while leaving ``reviewed_head_sha`` untouched.  That field is
+            # the historical review boundary used by the fix-completion handoff
+            # to scope the next review; replacing it with the new live head
+            # would silently review only the fix and skip replacement content.
             "head_drift_retargeted_from": {
                 "pr_number": pr_number,
                 "head_sha": str((closed_pr.get("head") or {}).get("sha") or ""),
@@ -571,7 +573,11 @@ async def lock_pr_task_for_execution(
                 pr_number=pr_number,
                 live_target=live_target,
             )
-        ) or (reviewed_head and reviewed_head != live_target["head_sha"]):
+        ) or (
+            assigned_fix_target is None
+            and reviewed_head
+            and reviewed_head != live_target["head_sha"]
+        ):
             reason = "assigned fix head drift"
             _cancel_pr_task(task, reason)
             session.add(task)
