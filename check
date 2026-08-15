@@ -113,6 +113,7 @@ admin_ui_runtime_touched() {
 }
 
 FAILED=()
+_STATIC_RELEASE_GUARD_PASSED=0
 
 if [ "$BASE_DIFF_OK" -ne 1 ]; then
   echo "[check] ERROR: base diff source unavailable — cannot scope checks. Refusing to report PASS with nothing run; fetch the base branch and re-run (e.g. 'git fetch origin $BASE')." >&2
@@ -140,7 +141,11 @@ source scripts/backend-test-route.sh
 # the mandatory backend publication gate.
 if [ "$WITH_TESTS" = "1" ]; then
   if [ -f scripts/static_release_guard.py ]; then
+    _static_failures_before=${#FAILED[@]}
     run "static release guards (task diff)" python3 scripts/static_release_guard.py --base "$BASE" --repo-root "$PWD"
+    if [ "${#FAILED[@]}" -eq "$_static_failures_before" ]; then
+      _STATIC_RELEASE_GUARD_PASSED=1
+    fi
   else
     echo "[check] static release guard helper is missing — refusing to skip the gate"
     FAILED+=("static release guard helper missing")
@@ -310,8 +315,12 @@ if touches "backend/"; then
       harness)
         run "backend test (sanctioned harness)" bash -c 'set -o pipefail; bash scripts/test-backend.sh 2>&1 | tail -200' ;;
       harness-standalone)
-        echo "[check] note: local gate is a smoke check — full Docker/Postgres suite runs in CI; running the harness standalone mode"
-        run "backend test (harness standalone)" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200' ;;
+        if [ "$_STATIC_RELEASE_GUARD_PASSED" = "1" ] && printf '%s\n' "$CHANGED" | grep -Eq '^backend/testing/|^scripts/(static_release_guard|test_guard_gate_left_shift)\.py$'; then
+          echo "[check] backend test (harness standalone) covered by route-keyed static release guard"
+        else
+          echo "[check] note: local gate is a smoke check — full Docker/Postgres suite runs in CI; running the harness standalone mode"
+          run "backend test (harness standalone)" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'
+        fi ;;
       bare)
         run "backend test" bash -c 'cd "backend" && pytest' ;;
       gate-env)

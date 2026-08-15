@@ -759,8 +759,9 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     expect(script).toContain(
       '_VERIFY_RECEIPT="/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"',
     );
-    expect(script).toContain('mv -f "$_verification_tmp" "$_VERIFY_RECEIPT"');
-    expect(script).toContain('"skipped":runtime["skipped"],"exit_code":0');
+    expect(script).toContain('--current-exit-code "$_verification_exit"');
+    expect(script).toContain('"suppressed_failures":d.get("suppressed_failures",{})');
+    expect(script).toContain('"disappeared_failures":d.get("disappeared_failures",{})');
     expect(script).toContain('no impacted pytest file/node was resolved');
     expect(script).toContain("grep -E '^backend/(testing|tests)/test_.*\\.py$'");
     expect(script).toContain('PostgreSQL runtime unavailable');
@@ -987,6 +988,15 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
         routeHelper,
         realPath.join(dir, 'scripts', 'backend-test-route.sh'),
       );
+      const productionRoot = realPath.resolve(process.cwd(), '..');
+      realFs.copyFileSync(
+        realPath.join(productionRoot, 'scripts', 'backend_verification_guard.py'),
+        realPath.join(dir, 'scripts', 'backend_verification_guard.py'),
+      );
+      realFs.copyFileSync(
+        realPath.join(productionRoot, 'backend', 'testing', 'fixgate_attribution.py'),
+        realPath.join(dir, 'backend', 'testing', 'fixgate_attribution.py'),
+      );
       realFs.writeFileSync(realPath.join(dir, 'backend', 'x.py'), 'value = 1\n');
       realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'test_x.py'), 'def test_x(): assert True\n');
       realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'impacted_tests.py'), '# shimmed by python3\n');
@@ -1002,6 +1012,7 @@ case "$*" in
   *"rev-parse --git-dir"*) echo .git; exit 0 ;;
   *"rev-parse --verify origin/automain"*) exit 0 ;;
   *"diff --name-only origin/automain...HEAD"*) printf '%s\\n' ${changedOutput}; exit 0 ;;
+  *" archive "*) tar -cf - --exclude=.git .; exit $? ;;
   *) exit 0 ;;
 esac
 `, { mode: 0o755 });
@@ -1038,6 +1049,14 @@ exec "${realPython}" "$@"
       realFs.writeFileSync(harnessFile, `#!/bin/sh
 echo "harness USE_TEST_POSTGRES=\${USE_TEST_POSTGRES:-} $*" >> "$LOGFILE"
 case "$*" in *--standalone*) exit 0 ;; esac
+if [ -n "\${BLUEPRINT_VERIFICATION_JUNIT:-}" ] && [ ${scenario.harnessExit} -eq 0 ]; then
+  mkdir -p "$(dirname -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+  if [ ${scenario.skipped ?? 0} -gt 0 ]; then
+    printf '%s\\n' '<testsuite tests="1" failures="0" skipped="1"><testcase classname="testing.test_x" name="test_x"><skipped /></testcase></testsuite>' > "$BLUEPRINT_VERIFICATION_JUNIT"
+  else
+    printf '%s\\n' '<testsuite tests="1" failures="0"><testcase classname="testing.test_x" name="test_x" /></testsuite>' > "$BLUEPRINT_VERIFICATION_JUNIT"
+  fi
+fi
 if [ -n "\${BLUEPRINT_VERIFICATION_RESULT_FILE:-}" ] && [ ${scenario.harnessExit} -eq 0 ]; then
   printf '%s\\n' '{"version":1,"targeted":true,"use_test_postgres":true,"postgres_sidecar":true,"tests":1,"skipped":${scenario.skipped ?? 0},"failures":0,"exit_code":0,"selectors":["testing/test_x.py"]}' > "$BLUEPRINT_VERIFICATION_RESULT_FILE"
 fi

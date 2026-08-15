@@ -22,8 +22,8 @@ import static_release_guard
 
 
 def test_static_guard_base_unpack_uses_data_filter() -> None:
-    """The internal git-archive unpack still uses an explicit safe filter."""
-    source = (REPO_ROOT / "scripts" / "static_release_guard.py").read_text()
+    """The shared git-archive unpack still uses an explicit safe filter."""
+    source = (REPO_ROOT / "backend" / "testing" / "fixgate_attribution.py").read_text()
     assert 'bundle.extractall(destination, filter="data")' in source
 
 
@@ -487,13 +487,13 @@ def test_identical_failure_with_tree_specific_path_is_preexisting(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    ("current_state", "expected_corpus_runs"),
-    [("clean", 1), ("preexisting", 2)],
+    ("current_state", "expected_corpus_runs", "expected_returncode"),
+    [("clean", 2, 1), ("preexisting", 2, 0)],
 )
 def test_baseline_corpus_is_lazy_after_current_tree_result(
-    tmp_path: Path, current_state: str, expected_corpus_runs: int
+    tmp_path: Path, current_state: str, expected_corpus_runs: int, expected_returncode: int
 ) -> None:
-    """The baseline runs only when current-tree failures need subtraction."""
+    """A clean report still gets a baseline to detect vanished failure routes."""
     fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, current_state)
     call_log = tmp_path / "corpus-calls.log"
     result = subprocess.run(
@@ -518,7 +518,9 @@ def test_baseline_corpus_is_lazy_after_current_tree_result(
     )
 
     output = result.stdout + result.stderr
-    assert result.returncode == 0, output
+    assert result.returncode == expected_returncode, output
+    if current_state == "clean":
+        assert "baseline route identity" in output
     assert len(call_log.read_text().splitlines()) == expected_corpus_runs
 
 
@@ -556,6 +558,7 @@ def test_changed_harness_cannot_hide_a_base_corpus_failure(tmp_path: Path) -> No
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
     assert "changed static test roster made base corpus" in output
+    assert "baseline route identity" in output
 
 
 def test_baseline_scopes_to_current_failures_and_survives_roster_drift(
@@ -680,8 +683,8 @@ def _run_attribution_guard(
     )
 
 
-def test_sole_collection_error_is_subtracted_against_base(tmp_path: Path) -> None:
-    """A collection error present in BOTH trees must not be charged as new.
+def test_sole_collection_error_is_subtracted_but_missing_base_routes_are_reported(tmp_path: Path) -> None:
+    """A shared collection error is suppressed; other vanished routes block.
 
     pytest reports a collection error with an EMPTY classname and the dotted
     module path in ``name``. A classname-only resolver yields no selector, the
@@ -698,14 +701,13 @@ def test_sole_collection_error_is_subtracted_against_base(tmp_path: Path) -> Non
     )
 
     output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    assert "no new failures vs base" in output
-    assert "new failures:" not in output
+    assert result.returncode != 0, output
+    assert "baseline route identity: route disappeared" in output
     # The baseline actually ran — the skip-the-base-run branch must not trigger.
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     assert len(calls) == 2, calls
-    assert "testing/test_collect_boom.py" in calls[1]
-    assert "::" not in calls[1], calls[1]
+    assert "testing/test_security.py" in calls[1]
+    assert "testing/test_collect_boom.py" not in calls[1], calls[1]
 
 
 def test_collection_error_alongside_resolvable_failure_charges_only_the_new_one(
@@ -724,10 +726,7 @@ def test_collection_error_alongside_resolvable_failure_charges_only_the_new_one(
     assert result.returncode != 0, output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
-    assert baseline == [
-        "testing/test_collect_boom.py",
-        "testing/test_existing.py",
-    ], baseline
+    assert "testing/test_security.py" in baseline
     assert "standalone static corpus attribution" not in output
     new_line = output.split("new failures:", 1)[1].split("\n")[0]
     assert "test_newly_introduced" in new_line
@@ -752,8 +751,8 @@ def test_unresolvable_failure_id_falls_back_to_full_base_corpus(
     )
 
     output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    assert "no new failures vs base" in output
+    assert result.returncode != 0, output
+    assert "baseline route identity: route disappeared" in output
     assert "unresolvable failure id(s)" in output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
