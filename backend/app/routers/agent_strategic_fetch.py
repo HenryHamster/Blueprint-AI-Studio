@@ -2555,19 +2555,47 @@ async def agent_fetch_capability_trials(
 ):
     """Return all capability-trial verdict entries for the project.
 
-    Returns the full ``capability_adoption_verdicts`` dict, keyed by cap_name.
-    Each entry includes: verdict, verdict_reason, lift, n_with, n_without,
-    arm_composition, thresholds, and — when the admin digest has run —
-    accrual_projection and is_stalled. Read-only; agent-token auth only.
-    Cross-project access returns 404."""
+    Returns the full ``capability_adoption_verdicts`` dict, keyed by cap_name,
+    plus a resolved enablement read model for every registered trial. The
+    resolved entries retain the trial evidence and state whether the verdict
+    graduated the capability to enabled/enforce or left it disabled/off.
+    Read-only; agent-token auth only. Cross-project access returns 404."""
     project = await _resolve_agent_project(project_id, token, session)
-    from app.capability_trial_verdict import get_trial_verdicts  # noqa: PLC0415
+    from app.capability_registry import resolve_capability_enablement  # noqa: PLC0415
+    from app.capability_trial_verdict import (  # noqa: PLC0415
+        get_trial_definitions,
+        get_trial_verdicts,
+    )
 
     verdicts = get_trial_verdicts(project)
+    resolved_enablement: dict[str, dict[str, Any]] = {}
+    for trial_definition in get_trial_definitions():
+        cap_name = trial_definition["cap_name"]
+        entry = verdicts.get(cap_name)
+        projected = dict(entry) if isinstance(entry, dict) else {}
+        for field in (
+            "verdict",
+            "verdict_reason",
+            "lift",
+            "n_with",
+            "n_without",
+            "n_lane",
+            "n_control",
+            "arm_composition",
+            "thresholds",
+            "accrual_projection",
+            "is_stalled",
+        ):
+            projected.setdefault(field, None)
+        if projected["thresholds"] is None:
+            projected["thresholds"] = trial_definition.get("thresholds")
+        projected.update(resolve_capability_enablement(verdicts, cap_name))
+        resolved_enablement[cap_name] = projected
     return {
         "status": "success",
         "data": {
             "verdicts": verdicts,
+            "resolved_enablement": resolved_enablement,
         },
     }
 

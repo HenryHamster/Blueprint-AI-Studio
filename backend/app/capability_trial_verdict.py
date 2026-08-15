@@ -1536,20 +1536,18 @@ def get_effective_holdback_fraction(
     """Return the holdback fraction to apply for a capability, based on its verdict.
 
     - ``adopt``          → 0.0 (stop holding back; use the capability for all tasks)
-    - ``reject``         → 1.0 (always hold back; do not use the capability)
+    - ``reject`` / ``no_effect`` / ``KILL`` → 1.0 (always hold back; do not use
+      the capability)
     - anything else      → ``default_fraction`` (trial still in progress)
 
     Falls back to ``default_fraction`` when ``verdicts`` is not a dict, when
     ``cap_name`` is absent, or when the entry lacks a ``"verdict"`` key.
     """
-    if not isinstance(verdicts, dict):
-        return default_fraction
-    entry = verdicts.get(cap_name)
-    if not isinstance(entry, dict):
-        return default_fraction
-    verdict = entry.get("verdict")
-    if verdict == "adopt":
+    from app.capability_registry import resolve_capability_enablement
+
+    resolution = resolve_capability_enablement(verdicts, cap_name)
+    if resolution["enabled"]:
         return 0.0
-    if verdict in ("reject", "no_effect"):
+    if resolution["verdict"] in ("reject", "no_effect", "KILL"):
         return 1.0
     return default_fraction

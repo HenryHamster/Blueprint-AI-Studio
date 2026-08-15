@@ -1313,9 +1313,21 @@ class TestGetEffectiveHoldbackFraction:
         )
         assert result == 0.0
 
+    def test_effective_holdback_uppercase_adopt_returns_zero(self):
+        result = get_effective_holdback_fraction(
+            self._verdicts("ADOPT"), "repo_map", 0.5
+        )
+        assert result == 0.0
+
     def test_effective_holdback_reject_returns_one(self):
         result = get_effective_holdback_fraction(
             self._verdicts("reject"), "repo_map", 0.5
+        )
+        assert result == 1.0
+
+    def test_effective_holdback_kill_returns_one(self):
+        result = get_effective_holdback_fraction(
+            self._verdicts("KILL"), "repo_map", 0.5
         )
         assert result == 1.0
 

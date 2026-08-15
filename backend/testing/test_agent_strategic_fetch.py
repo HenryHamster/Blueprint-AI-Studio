@@ -3673,7 +3673,14 @@ async def test_agent_fetch_capability_trials_returns_verdicts(
                     "without_7d": 1,
                     "days_to_min_n": 25.0,
                 },
-            }
+            },
+            "related_tests": {
+                "verdict": "adopt",
+                "verdict_reason": "adopt_threshold",
+                "lift": 0.08,
+                "n_with": 40,
+                "n_without": 38,
+            },
         },
     )
     db_session.add(project)
@@ -3701,6 +3708,17 @@ async def test_agent_fetch_capability_trials_returns_verdicts(
     assert entry["n_without"] == 5
     assert entry["arm_composition"]["with_assigned"] == 10
     assert entry["accrual_projection"]["days_to_min_n"] == 25.0
+    resolved = body["data"]["resolved_enablement"]
+    assert resolved["repo_map"]["resolution"] == "disabled"
+    assert resolved["repo_map"]["mode"] == "off"
+    assert resolved["repo_map"]["verdict"] == "continue-trial"
+    assert resolved["related_tests"]["resolution"] == "enabled"
+    assert resolved["related_tests"]["mode"] == "enforce"
+    assert resolved["related_tests"]["enabled"] is True
+    assert resolved["related_tests"]["verdict"] == "adopt"
+    assert resolved["related_tests"]["lift"] == 0.08
+    assert "diagnostics_after_edit" in resolved
+    assert resolved["diagnostics_after_edit"]["resolution"] == "disabled"
 
 
 @pytest.mark.asyncio

@@ -49,12 +49,14 @@ from app.capability_registry import (
     ledger_corroborated_proof_status,
     platform_recorded_alias_map,
     registry_capability_evidence_refs_map,
+    resolve_capability_enablement,
     working_capability_proof_status,
 )
 from app.evidence_primitive import classify_evidence_tiered
 from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
 from app.capability_trial_verdict import (
     evaluate_trial_verdict,
+    get_effective_holdback_fraction,
     get_trial_verdicts,
     record_trial_verdict,
 )
@@ -96,6 +98,40 @@ def _named_test_verdict(test_path="testing/test_foo.py::test_bar", proven=True):
         "reason": f"named_test {test_path!r} was added/modified, ran green",
         "proof_ref": test_path if proven else None,
     }
+
+
+class TestCapabilityTrialGraduation:
+    def test_adopt_verdict_enables_capability_without_manual_flip(self):
+        verdicts = {
+            "repo_map": {
+                "verdict": "adopt",
+                "lift": 0.08,
+                "n_with": 42,
+                "n_without": 40,
+            }
+        }
+
+        resolution = resolve_capability_enablement(verdicts, "repo_map")
+
+        assert resolution["enabled"] is True
+        assert resolution["mode"] == "enforce"
+        assert resolution["resolution"] == "enabled"
+        assert resolution["verdict"] == "adopt"
+        assert resolve_capability_enablement(verdicts, "repo-map")["enabled"] is True
+        assert get_effective_holdback_fraction(verdicts, "repo_map", 0.1) == 0.0
+
+    @pytest.mark.parametrize(
+        "verdict", [None, "continue-trial", "reject", "no_effect", "KILL"]
+    )
+    def test_unproven_or_refuted_verdict_stays_disabled(self, verdict):
+        verdicts = {} if verdict is None else {"repo_map": {"verdict": verdict}}
+
+        resolution = resolve_capability_enablement(verdicts, "repo_map")
+
+        assert resolution["enabled"] is False
+        assert resolution["mode"] == "off"
+        assert resolution["resolution"] == "disabled"
+        assert resolution["verdict"] == verdict
 
 
 def _artifact_verdict(artifact_id="art-123", proven=True):
