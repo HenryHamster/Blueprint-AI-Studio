@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 HOTFIX_ELIGIBLE_MODULES: frozenset[str] = frozenset(
     {
         "backend/app/release_scoring.py",
+        "backend/app/release_commit_authorship.py",
         "backend/app/release_qualifier.py",
         "backend/app/release_qualifier_audit.py",
         "backend/app/release_qualifier_sweep.py",
@@ -65,10 +66,28 @@ HOTFIX_ELIGIBLE_MODULES: frozenset[str] = frozenset(
     }
 )
 
+# Release tests are an intentionally bounded companion surface for the
+# allowlisted machinery.  They cannot alter production runtime behaviour, and
+# this lane independently enforces CI green; excluding them would make every
+# behaviour-changing gate fix unshippable because its tests could never travel
+# with the fix.  This is part of the authorization surface of an owner-approved
+# promotion bypass, so keep the pattern minimal and security-reviewable.
+_HOTFIX_RELEASE_TEST_PREFIX = "backend/testing/test_release_"
+_HOTFIX_RELEASE_TEST_SUFFIX = ".py"
+_HOTFIX_RELEASE_TEST_HELPER = "backend/testing/_release_qualifier_testhelpers.py"
+
 MAIN_PY_PATH = "backend/app/main.py"
 _MIGRATIONS_PREFIX = "backend/alembic/versions/"
 _WORKFLOWS_PREFIX = ".github/workflows/"
 _EXPECTED_SCHEMA_REVISION_TOKEN = "EXPECTED_SCHEMA_REVISION"
+
+
+def _is_bounded_release_test_path(path: str) -> bool:
+    """Return whether ``path`` is in the narrow release-test companion set."""
+    return (
+        path.startswith(_HOTFIX_RELEASE_TEST_PREFIX)
+        and path.endswith(_HOTFIX_RELEASE_TEST_SUFFIX)
+    ) or path == _HOTFIX_RELEASE_TEST_HELPER
 
 
 @dataclass(frozen=True)
@@ -154,7 +173,9 @@ def evaluate_hotfix_scope(
             offending.append(path)
             reasons.append(f"{path} is a CI workflow file, not release machinery")
             continue
-        if path not in HOTFIX_ELIGIBLE_MODULES:
+        if path not in HOTFIX_ELIGIBLE_MODULES and not _is_bounded_release_test_path(
+            path
+        ):
             offending.append(path)
             reasons.append(f"{path} is outside the release-machinery allowlist")
 

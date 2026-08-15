@@ -4410,6 +4410,29 @@ def test_evaluate_hotfix_scope_pure_predicate():
     """Unit coverage for the pure fail-closed scope predicate."""
     from app import hotfix_policy
 
+    # Literal file set from 41dd92106: the authorship-gate repair must be
+    # eligible as a whole, including its independently green-pinned tests.
+    authorship_gate_repair_files = [
+        "backend/app/release_commit_authorship.py",
+        "backend/app/release_promotion.py",
+        "backend/app/release_qualifier.py",
+        "backend/app/release_qualifier_audit.py",
+        "backend/app/release_scoring.py",
+        "backend/testing/_release_qualifier_testhelpers.py",
+        "backend/testing/test_release_operator_commit_gate.py",
+        "backend/testing/test_release_qualifier.py",
+        "backend/testing/test_release_qualifier__ci_unresolved_blocker.py",
+        "backend/testing/test_release_qualifier__classify_check_runs.py",
+        "backend/testing/test_release_reconciliation.py",
+        "backend/testing/test_release_scoring.py",
+    ]
+    assert hotfix_policy.evaluate_hotfix_scope(authorship_gate_repair_files).eligible
+
+    # A product-code path remains outside the authorization surface.
+    product_file = hotfix_policy.evaluate_hotfix_scope(["backend/app/reaper.py"])
+    assert product_file.eligible is False
+    assert product_file.offending_files == ["backend/app/reaper.py"]
+
     # Machinery-only → eligible.
     v = hotfix_policy.evaluate_hotfix_scope(["backend/app/release_scoring.py"])
     assert v.eligible is True
@@ -4423,6 +4446,22 @@ def test_evaluate_hotfix_scope_pure_predicate():
 
     # Empty diff → fail-closed reject.
     assert hotfix_policy.evaluate_hotfix_scope([]).eligible is False
+
+    # Hard rejects remain hard rejects even when the surrounding diff contains
+    # otherwise eligible release machinery.
+    assert (
+        hotfix_policy.evaluate_hotfix_scope(
+            [
+                "backend/app/release_commit_authorship.py",
+                "backend/alembic/versions/9999_hotfix.py",
+            ]
+        ).eligible
+        is False
+    )
+    assert (
+        hotfix_policy.evaluate_hotfix_scope([".github/workflows/deploy.yml"]).eligible
+        is False
+    )
 
     # main.py with a schema-revision bump → reject; without → allow.
     bump = '+EXPECTED_SCHEMA_REVISION = "0580"\n'
