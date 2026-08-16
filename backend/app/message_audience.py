@@ -192,6 +192,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "review.escalated": OPERATOR_ACTION_NEEDED,
     "review.fail_open": OPERATOR_ACTION_NEEDED,
     # Release lifecycle
+    "release_blocked": OPERATOR_ACTION_NEEDED,
     "release.calcifying": OPERATOR_FYI,
     "release.ci_unresolved": OPERATOR_FYI,
     "release.build_stalled": OPERATOR_FYI,
