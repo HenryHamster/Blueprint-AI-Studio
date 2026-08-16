@@ -54,6 +54,9 @@ from app.runner_eligibility import (
 from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import ExecutionSite, LOCAL_RUNNER_EXECUTION_SITE
+from app.release_task_admission import (
+    require_release_task_admission as _require_qualifier_task_admission,
+)
 from app.time_utils import _utcnow
 from app.json_extract import async_json_loads
 from app.deployed_sha import get_serving_sha
@@ -635,6 +638,7 @@ async def _spawn_release_audit_task(
     rubric_fingerprint: str | None = None,
 ) -> Task:
     """Create the qualifier's single holistic final-review task."""
+    await _require_qualifier_task_admission(session, project_id)
     payload: dict[str, Any] = {
         "type": "release_audit",
         "base_branch": base_branch,
@@ -753,6 +757,7 @@ async def _spawn_release_audit_challenge_task(
     still expect audit/challenge task linkage; the binding challenge gate treats
     it as best-effort metadata.
     """
+    await _require_qualifier_task_admission(session, project_id)
     payload: dict[str, Any] = {
         "type": "release_audit_challenge",
         "base_branch": base_branch,
@@ -977,6 +982,7 @@ async def _spawn_qualifier_walkthrough_task(
     precise execution-site reason instead of queueing a child that can never boot
     the candidate stack.
     """
+    await _require_qualifier_task_admission(session, project_id)
     runner, site_reason = await _select_walkthrough_e2e_execution_site(
         session, project_id
     )
@@ -1073,6 +1079,7 @@ async def _spawn_release_merge_grade_task(
     merges actually advanced the goal.  The ``assert`` below is a tripwire that
     fails loudly if a future edit ever leaks a running-update key in.
     """
+    await _require_qualifier_task_admission(session, project_id)
     payload: dict[str, Any] = {
         "type": "release_merge_grade",
         "base_branch": base_branch,
@@ -1331,6 +1338,7 @@ async def _spawn_direction_merge_grade_task(
             direction_id,
         )
         return None
+    await _require_qualifier_task_admission(session, project_id)
     if base_branch is None:
         _project = await session.get(Project, project_id)
         if _project is None:

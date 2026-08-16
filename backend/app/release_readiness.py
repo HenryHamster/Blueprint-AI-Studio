@@ -44,6 +44,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.promotion_ci_dispatch import promotion_ci_dispatch_gate_verdict
 from app.release_scoring import (
     compute_challenged_vs_unchallenged_telemetry,
     _finding_matches_candidate_surface,
@@ -1399,7 +1400,7 @@ async def compute_requalification_readiness(
 # Gate-state vocabulary emitted by ``compute_promotion_ci_green_gate``.  Only
 # ``green`` clears the promotion_failed re-driver; every other state defers.
 _PROMOTION_CI_GATE_STATES = frozenset(
-    {"green", "pending", "red", "cancelled", "dispatched", "no_signal", "unavailable"}
+    "green pending red cancelled dispatched dispatch_rejected no_signal unavailable".split()
 )
 
 # Branch-level dispatch coalescing window for the promotion CI gate.  ci.yml is
@@ -1446,8 +1447,10 @@ async def compute_promotion_ci_green_gate(
     :func:`app.github.get_workflow_run_for_sha` (which filters by ``head_sha``, so a
     returned run is always FOR the current HEAD).
 
-    Returns a small verdict dict ``{gate_state, head_sha, run_id, html_url, reason}``
-    where ``gate_state`` is one of:
+    Returns a small verdict dict with ``gate_state``, HEAD/run identity, and a
+    reason.  When a dispatch is attempted it also preserves the structured
+    dispatch outcome, retry authority, and same-authority suppression key.
+    ``gate_state`` is one of:
 
       * ``green``      — a COMPLETED ``ci.yml`` run for the current HEAD concluded success
       * ``pending``    — a run for HEAD is queued / in_progress (not yet concluded)
@@ -1457,9 +1460,11 @@ async def compute_promotion_ci_green_gate(
                          signal; the caller decides whether a fresh dispatch is
                          warranted — used by the drift sentinel to stop churn)
       * ``dispatched`` — no run existed for HEAD, so one was just dispatched
+      * ``dispatch_rejected`` — terminal rejection; do not churn the same tuple
       * ``no_signal``  — ``dispatch=False`` and no run exists for HEAD, or a
                          cancelled run exists with ``dispatch=False``
-      * ``unavailable``— GitHub creds / HEAD / API unavailable (or an error occurred)
+      * ``unavailable``— GitHub creds / HEAD / API unavailable, dispatch was
+                         ambiguous, or an error occurred
 
     When ``dispatch=True`` and there is no run for the current HEAD, first checks
     whether a ci.yml run is already queued/in-progress ANYWHERE on the
@@ -1622,7 +1627,7 @@ async def compute_promotion_ci_green_gate(
                 ),
             )
 
-        dispatched = await github.dispatch_workflow_run(
+        dispatch_outcome = await github.dispatch_workflow_run_outcome(
             token,
             owner,
             repo,
@@ -1630,19 +1635,13 @@ async def compute_promotion_ci_green_gate(
             integration_branch,
             project_id=str(project_id),
         )
-        if dispatched:
-            return _promotion_ci_gate_verdict(
-                "dispatched",
-                head_sha=head_sha,
-                reason=(
-                    "no ci.yml run for integration HEAD — dispatched a fresh "
-                    f"full-matrix run on {integration_branch}"
-                ),
-            )
-        return _promotion_ci_gate_verdict(
-            "unavailable",
+        return promotion_ci_dispatch_gate_verdict(
+            dispatch_outcome,
+            owner=owner,
+            repo=repo,
+            workflow_file=CI_WORKFLOW_FILE,
+            ref=integration_branch,
             head_sha=head_sha,
-            reason="failed to dispatch ci.yml run for integration HEAD",
         )
     except Exception:
         logger.exception(

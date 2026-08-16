@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app import release_qualifier
-from app.models import ReleaseVersion
+from app.models import Project, ReleaseVersion
 from app.release_qualifier_audit import _spawn_release_audit_task
 
 
@@ -12,6 +12,7 @@ class _RecordingSession:
     def __init__(self, locked_version=None) -> None:
         self.added = []
         self.locked_version = locked_version
+        self.locked_project = Project(name="release-ownership", user_id="test-user")
 
     def add(self, value) -> None:
         self.added.append(value)
@@ -30,7 +31,13 @@ class _RecordingSession:
             def first(self):
                 return self.value
 
-        return _Result(self.locked_version)
+            def scalar_one_or_none(self):
+                return self.value
+
+        return _Result(self.locked_version or self.locked_project)
+
+    async def get(self, _model, _identity):
+        return None
 
 
 @pytest.mark.asyncio

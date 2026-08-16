@@ -18,7 +18,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Project, Task, TaskStatus
-from app.task_locking import lock_project_then_task
+from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    acquire_automatic_task_creation_authority,
+    lock_project_then_task,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +246,11 @@ async def lock_research_spawn_boundary(
 
     project_id, task_id = task.project_id, task.id
     with session.no_autoflush:
+        admission = await acquire_automatic_task_creation_authority(
+            session, project_id, skip_locked=False
+        )
+        if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            return None, []
         async with lock_project_then_task(
             session,
             project_id,
@@ -271,6 +280,11 @@ async def lock_research_spawn_boundary(
 async def relock_research_spawn_retry(session, project_id, task_id) -> Task | None:
     """Reauthorize a spawn retry after rollback released its original locks."""
     with session.no_autoflush:
+        admission = await acquire_automatic_task_creation_authority(
+            session, project_id, skip_locked=False
+        )
+        if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            return None
         async with lock_project_then_task(
             session, project_id, task_id, skip_locked=False
         ) as (project, task):

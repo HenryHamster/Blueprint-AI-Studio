@@ -36,6 +36,10 @@ from app.shared_state import (
     get_project_task_branch_namespace,
     resolve_task_branch as _resolve_task_branch,
 )
+from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    automatic_task_creation_parent_lock,
+)
 
 logger = logging.getLogger("app.admin_task_mutations")
 
@@ -296,11 +300,40 @@ async def _maybe_spawn_rollup_smoketest(
     repo: str,
     base_branch: str,
     session: AsyncSession,
+    *,
+    spawned_by: str = "ADMIN_ROLLUP_MERGE",
 ) -> None:
     """Spawn a smoketest task after a human-approved rollup merge."""
     from app.shared_state import runtime_config as _runtime_config
 
     try:
+        _project_id = task.project_id
+        _parent_task_id = task.id
+        async with automatic_task_creation_parent_lock(
+            session,
+            _project_id,
+            _parent_task_id,
+            skip_locked=False,
+        ) as (_admission, _project, _parent_task):
+            if _project is None or _parent_task is None:
+                raise RuntimeError(
+                    "rollup smoketest admission could not lock project/parent"
+                )
+            task = _parent_task
+        if _admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            task.context = {
+                **(task.context or {}),
+                "automatic_smoketest_creation_suppressed": _admission,
+            }
+            session.add(task)
+            await session.commit()
+            logger.info(
+                "[SMOKETEST] Suppressed post-rollup smoketest for task %s: %s",
+                _parent_task_id,
+                _admission,
+            )
+            return
+
         type_model = (
             _runtime_config.get("task_type_models", {}).get("smoketest") or None
         )
@@ -340,7 +373,7 @@ async def _maybe_spawn_rollup_smoketest(
             task_id=smoketest_task.id,
             action="SPAWNED",
             details={
-                "spawned_by": "ADMIN_ROLLUP_MERGE",
+                "spawned_by": spawned_by,
                 "base_branch": base_branch,
             },
         )

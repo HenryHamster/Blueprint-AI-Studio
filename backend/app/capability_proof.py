@@ -1190,6 +1190,23 @@ async def enroll_capability_proof_trial(
         from sqlalchemy import select
 
         from app.models import Task, TaskStatus
+        from app.task_locking import (
+            AUTOMATIC_TASK_CREATION_ALLOWED,
+            acquire_automatic_task_creation_authority,
+        )
+
+        project_id = getattr(project, "id", None)
+        creation_admission = await acquire_automatic_task_creation_authority(
+            session, project_id
+        )
+        if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            logger.info(
+                "[CAP_TRIAL] automatic enrollment held for cap=%s: %s",
+                norm,
+                creation_admission,
+            )
+            await session.rollback()
+            return None
 
         # Dedup guard: only block re-enrollment when an in-flight (non-terminal)
         # trial exists.  Terminal states (COMPLETED, FAILED) deliberately do NOT
@@ -1198,7 +1215,6 @@ async def enroll_capability_proof_trial(
         # sweeps that both miss the in-flight check can both enroll; this is
         # tolerated (idempotent proof recording handles the duplicate) and only
         # risks one extra runner job per capability per sweep cycle.
-        project_id = getattr(project, "id", None)
         in_flight_statuses = [
             TaskStatus.QUEUED,
             TaskStatus.PROVISIONING,

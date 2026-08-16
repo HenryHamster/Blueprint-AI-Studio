@@ -53,6 +53,8 @@ BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 # JSONB key under Task.context that holds the structured blocker metadata.
 BLOCKER_CONTEXT_KEY = "blocker"
 PUBLICATION_GATE_RECEIPT_KEY = "publication_gate_receipt"
+PUBLICATION_GATE_RECEIPT_HISTORY_KEY = "publication_gate_receipt_history"
+_PUBLICATION_GATE_RECEIPT_HISTORY_LIMIT = 8
 
 
 def sanitize_publication_gate_receipt(raw: object) -> dict[str, object] | None:
@@ -101,6 +103,79 @@ def sanitize_publication_gate_receipt(raw: object) -> dict[str, object] | None:
         "recorded_at": recorded_at,
     }
 
+
+def record_publication_gate_receipt(task: Task, raw: object) -> bool:
+    """Make the latest gate verdict authoritative without losing prior runs.
+
+    ``./pr open`` can run the publication gate repeatedly in one execution
+    episode.  The old writer replaced the current receipt in-place, which made
+    a later pass truthful but erased the failure that caused the repair loop.
+    Keep the existing current-projection key for every reader, while moving a
+    distinct prior projection into a small bounded history before replacement.
+
+    Returns ``True`` iff the task context changed.  Malformed receipts remain a
+    no-op at this boundary, matching :func:`sanitize_publication_gate_receipt`.
+    """
+
+    receipt = sanitize_publication_gate_receipt(raw)
+    if receipt is None:
+        return False
+    ctx = dict(task.context or {})
+    prior = ctx.get(PUBLICATION_GATE_RECEIPT_KEY)
+    if prior == receipt:
+        return False
+    if isinstance(prior, dict):
+        raw_history = ctx.get(PUBLICATION_GATE_RECEIPT_HISTORY_KEY)
+        history = list(raw_history) if isinstance(raw_history, list) else []
+        history.append(prior)
+        ctx[PUBLICATION_GATE_RECEIPT_HISTORY_KEY] = history[
+            -_PUBLICATION_GATE_RECEIPT_HISTORY_LIMIT:
+        ]
+    ctx[PUBLICATION_GATE_RECEIPT_KEY] = receipt
+    task.context = ctx
+    return True
+
+
+def supersede_failed_publication_gate_receipt_on_landing(task: Task) -> bool:
+    """Remove a stale failed *current* verdict after definitive integration.
+
+    Older agents only reported failing publication gates.  Once GitHub proves
+    that the exact task's PR landed, leaving that failure in the current slot is
+    contradictory.  Preserve it in bounded history with an explicit
+    supersession marker, then clear only the current projection.  Passing gate
+    receipts remain current because they already agree with the landing.
+    """
+
+    ctx = dict(task.context or {})
+    prior = ctx.get(PUBLICATION_GATE_RECEIPT_KEY)
+    if not isinstance(prior, dict) or str(prior.get("status") or "").startswith(
+        "passed"
+    ):
+        return False
+    return _archive_current_publication_gate_receipt(
+        task, superseded_by="integration_landing"
+    )
+
+
+def _archive_current_publication_gate_receipt(
+    task: Task, *, superseded_by: str
+) -> bool:
+    """Archive and clear the current gate projection at an authority boundary."""
+
+    ctx = dict(task.context or {})
+    if PUBLICATION_GATE_RECEIPT_KEY not in ctx:
+        return False
+    prior = ctx.pop(PUBLICATION_GATE_RECEIPT_KEY)
+    raw_history = ctx.get(PUBLICATION_GATE_RECEIPT_HISTORY_KEY)
+    history = list(raw_history) if isinstance(raw_history, list) else []
+    if isinstance(prior, dict):
+        history.append({**prior, "superseded_by": superseded_by})
+        ctx[PUBLICATION_GATE_RECEIPT_HISTORY_KEY] = history[
+            -_PUBLICATION_GATE_RECEIPT_HISTORY_LIMIT:
+        ]
+    task.context = ctx
+    return True
+
 # Attempt-scoped context keys that must not survive any path returning a task
 # (or clone) to QUEUED. Retry-guidance history such as
 # ``_previous_failure_class`` / ``_failure_class_history`` is intentionally not
@@ -110,10 +185,15 @@ FRESH_ATTEMPT_CONTEXT_STRIP_KEYS: frozenset[str] = frozenset(
         "failure_class",
         "failure_category",
         BLOCKER_CONTEXT_KEY,
+        # Current gate verdicts are execution-episode projections. The reset
+        # primitive archives them before stripping so history survives while a
+        # fresh attempt truthfully starts with no current verdict.
+        PUBLICATION_GATE_RECEIPT_KEY,
         "_blocked_escalated",
         "_precondition_escalated_key",
         "_blocked_optimistic_retries",
         "_blocked_last_retry_at",
+        "_blocked_retry_precondition_receipt",
         "_retry_after_resets",
         "provision_failures",
         "provision_failures_infra",
@@ -656,6 +736,7 @@ def reset_task_for_fresh_attempt(task: Task) -> None:
     # semantics.
     if (task.first_payload or {}).get("type") == "research":
         task.plan_output = None
+    _archive_current_publication_gate_receipt(task, superseded_by="fresh_attempt")
     clear_blocker_metadata(task)
     task.last_heartbeat = None
     task.started_at = None

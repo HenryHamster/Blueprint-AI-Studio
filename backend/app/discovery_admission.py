@@ -8,6 +8,7 @@ whether it runs.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -24,14 +25,55 @@ from app.time_utils import _utcnow
 
 
 DEFAULT_DISCOVERY_DEADLINE_HOURS = 24
+LIVE_DISCOVERY_CYCLE_STATES = frozenset(
+    {
+        "open",
+        "admission_closed",
+        "review_pending",
+        "reviewing",
+        "review_blocked",
+    }
+)
+POLICY_BLOCKING_DISCOVERY_VERDICTS = frozenset({"park", "stop", "ask_operator"})
 
 
 class DiscoveryCycleUnavailable(RuntimeError):
     """A direction cannot open another root research task yet."""
 
 
+@dataclass(frozen=True)
+class DirectionDiscoveryAdmissionDecision:
+    """One canonical answer for direction-root discovery admission.
+
+    ``can_admit_root`` is deliberately narrower than "the direction pipeline
+    has work to do".  A pending/recoverable decision is not allowed to open a
+    second research root; its reason and next action tell the scheduler and
+    operator which existing stage must move instead.
+    """
+
+    direction_key: str
+    can_admit_root: bool
+    reason_code: str
+    reason: str
+    next_action: str
+    cycle_id: uuid.UUID | None = None
+    cycle_state: str | None = None
+    cycle_generation: int | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "can_admit_root": self.can_admit_root,
+            "reason_code": self.reason_code,
+            "reason": self.reason,
+            "next_action": self.next_action,
+            "cycle_id": str(self.cycle_id) if self.cycle_id is not None else None,
+            "cycle_state": self.cycle_state,
+            "cycle_generation": self.cycle_generation,
+        }
+
+
 def direction_authority_snapshot(direction: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the canonical direction fields that authorize discovery work."""
+    """Return the bounded direction envelope frozen into discovery work."""
 
     snapshot = {
         field: direction.get(field)
@@ -63,6 +105,217 @@ def direction_authority_snapshot(direction: Mapping[str, Any]) -> dict[str, Any]
             if isinstance(path, str) and path.strip()
         ]
     return snapshot
+
+
+def direction_authority_fence_snapshot(
+    direction: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return only immutable fields used by the exact authority fence.
+
+    ``research_context`` remains in the frozen commission envelope because it
+    grounds successor prompts.  It is accumulated outcome memory, however,
+    and research completion is expected to rewrite it.  Comparing that field
+    made a clean cycle invalidate itself before decision (production d-121).
+    """
+
+    snapshot = direction_authority_snapshot(direction)
+    snapshot.pop("research_context", None)
+    return snapshot
+
+
+def direction_authority_matches(
+    frozen_direction: Mapping[str, Any] | None,
+    current_direction: Mapping[str, Any] | None,
+) -> bool | None:
+    """Compare true direction authority, or return ``None`` if proof is absent."""
+
+    if not isinstance(frozen_direction, Mapping) or not isinstance(
+        current_direction, Mapping
+    ):
+        return None
+    frozen = direction_authority_fence_snapshot(frozen_direction)
+    current = direction_authority_fence_snapshot(current_direction)
+    return hashlib.sha256(
+        json.dumps(frozen, sort_keys=True, default=str).encode("utf-8")
+    ).digest() == hashlib.sha256(
+        json.dumps(current, sort_keys=True, default=str).encode("utf-8")
+    ).digest()
+
+
+def direction_discovery_admission_decision(
+    direction: Mapping[str, Any],
+    cycle: DiscoveryCycle | None,
+) -> DirectionDiscoveryAdmissionDecision:
+    """Return the shared scheduler/debug decision for one direction cycle."""
+
+    key = str(direction.get("id") or (cycle.direction_key if cycle else "")).strip()
+
+    def decision(
+        can_admit_root: bool,
+        reason_code: str,
+        reason: str,
+        next_action: str,
+    ) -> DirectionDiscoveryAdmissionDecision:
+        return DirectionDiscoveryAdmissionDecision(
+            direction_key=key,
+            can_admit_root=can_admit_root,
+            reason_code=reason_code,
+            reason=reason,
+            next_action=next_action,
+            cycle_id=cycle.id if cycle is not None else None,
+            cycle_state=cycle.state if cycle is not None else None,
+            cycle_generation=cycle.generation if cycle is not None else None,
+        )
+
+    if cycle is None:
+        return decision(
+            True,
+            "no_discovery_cycle",
+            "No live or policy-blocking discovery cycle exists.",
+            "Commission a new bounded research root.",
+        )
+
+    frozen = (cycle.bet_snapshot or {}).get("direction")
+    authority_match = direction_authority_matches(frozen, direction)
+    authority_reconcilable = cycle.state in {"review_pending", "review_blocked"} or (
+        cycle.state == "reviewed"
+        and cycle.verdict in POLICY_BLOCKING_DISCOVERY_VERDICTS
+    )
+    if authority_reconcilable and authority_match is False:
+        return decision(
+            False,
+            "direction_authority_reconciliation_pending",
+            "The cycle was commissioned under different direction authority.",
+            "Supersede the stale cycle, then commission the current direction.",
+        )
+    if authority_reconcilable and authority_match is None:
+        return decision(
+            False,
+            "direction_authority_proof_missing",
+            "The cycle has no comparable frozen direction-authority proof.",
+            "Resolve, park, or close the cycle explicitly before recommissioning.",
+        )
+
+    if cycle.state == "open":
+        if cycle.source_research_task_id is None:
+            return decision(
+                True,
+                "open_cycle_reservation",
+                "An unbound live cycle reservation can admit this research root.",
+                "Bind the research root to the existing reservation.",
+            )
+        return decision(
+            False,
+            "research_cycle_active",
+            "The live discovery cycle already owns a research root.",
+            "Wait for the source research cohort to settle.",
+        )
+    if cycle.state == "admission_closed":
+        return decision(
+            False,
+            "discovery_admission_closed",
+            "The discovery cohort is closed to new roots while it settles.",
+            "Settle the cohort and advance it to discovery review.",
+        )
+    if cycle.state == "review_pending":
+        return decision(
+            False,
+            "discovery_review_pending",
+            "The settled cycle is waiting for its decision boundary.",
+            "Spawn or recover the bounded discovery-review task.",
+        )
+    if cycle.state == "reviewing":
+        return decision(
+            False,
+            "discovery_review_active",
+            "A discovery decision task currently owns the cycle.",
+            "Wait for that decision or recover its durable task reference.",
+        )
+    if cycle.state == "review_blocked":
+        prior = dict(cycle.review_result or {})
+        error = str(prior.get("error") or "").strip()
+        if authority_match is True and error.startswith(
+            "direction authority changed before "
+        ):
+            return decision(
+                False,
+                "false_authority_block_reconciliation_pending",
+                "The review was blocked by evidence-only drift, while true authority is unchanged.",
+                "Resume the bounded review from review_pending.",
+            )
+        return decision(
+            False,
+            "discovery_review_blocked",
+            error or "The discovery decision failed closed.",
+            "Resolve the blocked cycle explicitly, or repair its decision prerequisite.",
+        )
+    if cycle.state == "reviewed" and cycle.verdict in POLICY_BLOCKING_DISCOVERY_VERDICTS:
+        verdict = str(cycle.verdict)
+        return decision(
+            False,
+            f"discovery_{verdict}_awaiting_resolution",
+            f"The latest discovery disposition is {verdict}.",
+            "Continue with a bounded next bet, park it, or close it explicitly."
+            if verdict == "ask_operator"
+            else "Resolve the disposition explicitly before recommissioning.",
+        )
+    return decision(
+        True,
+        "prior_cycle_settled",
+        "The latest discovery cycle is terminal and does not block a successor.",
+        "Commission the next bounded research root.",
+    )
+
+
+async def load_latest_direction_discovery_cycles(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, DiscoveryCycle]:
+    """Load exactly the latest cycle per direction for shared admission reads."""
+
+    latest_generation = (
+        select(
+            DiscoveryCycle.direction_key.label("direction_key"),
+            func.max(DiscoveryCycle.generation).label("generation"),
+        )
+        .where(DiscoveryCycle.project_id == project_id)
+        .group_by(DiscoveryCycle.direction_key)
+        .subquery()
+    )
+    cycles = (
+        (
+            await session.execute(
+                select(DiscoveryCycle).join(
+                    latest_generation,
+                    (DiscoveryCycle.direction_key == latest_generation.c.direction_key)
+                    & (DiscoveryCycle.generation == latest_generation.c.generation),
+                )
+                .where(DiscoveryCycle.project_id == project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {cycle.direction_key: cycle for cycle in cycles}
+
+
+async def load_direction_discovery_admission_decisions(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    directions: list[Mapping[str, Any]],
+) -> dict[str, DirectionDiscoveryAdmissionDecision]:
+    """Evaluate all supplied directions against one consistent cycle snapshot."""
+
+    cycles = await load_latest_direction_discovery_cycles(session, project_id)
+    decisions: dict[str, DirectionDiscoveryAdmissionDecision] = {}
+    for direction in directions:
+        key = str(direction.get("id") or "").strip()
+        if not key:
+            continue
+        decisions[key] = direction_discovery_admission_decision(
+            direction, cycles.get(key)
+        )
+    return decisions
 
 
 def _discovery_bet_snapshot(
@@ -121,15 +374,7 @@ async def ensure_discovery_cycle_for_research(
             .where(
                 DiscoveryCycle.project_id == project.id,
                 DiscoveryCycle.direction_key == key,
-                DiscoveryCycle.state.in_(
-                    {
-                        "open",
-                        "admission_closed",
-                        "review_pending",
-                        "reviewing",
-                        "review_blocked",
-                    }
-                ),
+                DiscoveryCycle.state.in_(LIVE_DISCOVERY_CYCLE_STATES),
             )
             .with_for_update()
         )
@@ -173,8 +418,10 @@ async def ensure_discovery_cycle_for_research(
                     )
                 ).hexdigest()
             return live
+        admission = direction_discovery_admission_decision(direction, live)
         raise DiscoveryCycleUnavailable(
-            f"direction {key} already has cycle {live.id} in state {live.state}"
+            f"direction {key} already has cycle {live.id} in state {live.state}: "
+            f"{admission.reason} Next action: {admission.next_action}"
         )
 
     latest = (
@@ -188,9 +435,15 @@ async def ensure_discovery_cycle_for_research(
             .limit(1)
         )
     ).scalar_one_or_none()
-    if latest is not None and latest.verdict in {"park", "stop", "ask_operator"}:
+    if (
+        latest is not None
+        and latest.state != "superseded"
+        and latest.verdict in POLICY_BLOCKING_DISCOVERY_VERDICTS
+    ):
+        admission = direction_discovery_admission_decision(direction, latest)
         raise DiscoveryCycleUnavailable(
-            f"direction {key} is awaiting policy resolution after {latest.verdict}"
+            f"direction {key} is awaiting policy resolution after {latest.verdict}: "
+            f"{admission.reason} Next action: {admission.next_action}"
         )
 
     generation = (
@@ -342,15 +595,7 @@ async def resolve_discovery_cycle_lineage(
             select(DiscoveryCycle.id).where(
                 DiscoveryCycle.project_id == normalized_project_id,
                 DiscoveryCycle.direction_key == str(direction_key).strip(),
-                DiscoveryCycle.state.in_(
-                    {
-                        "open",
-                        "admission_closed",
-                        "review_pending",
-                        "reviewing",
-                        "review_blocked",
-                    }
-                ),
+                DiscoveryCycle.state.in_(LIVE_DISCOVERY_CYCLE_STATES),
             )
         )
     ).scalar_one_or_none()

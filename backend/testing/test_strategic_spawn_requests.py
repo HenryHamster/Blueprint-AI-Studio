@@ -59,6 +59,53 @@ def _spec(title: str, *, watch: bool = True) -> dict:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing_parent", [False, True])
+async def test_submit_strategic_spawn_cold_project_keeps_full_read_after_exit(
+    db_session, missing_parent
+):
+    """Admission must not leave a cold projected Project in the identity map."""
+
+    project, owner = await _owner(db_session)
+    project.build_config = {"integration_branch": "automain", "marker": "full-row"}
+    db_session.add(project)
+    await db_session.commit()
+    project_id = project.id
+    parent_task_id = uuid.uuid4() if missing_parent else owner.id
+    db_session.expunge(project)
+
+    if missing_parent:
+        with pytest.raises(
+            ValueError,
+            match="parent task is missing or belongs to another project",
+        ):
+            await submit_strategic_spawn(
+                db_session,
+                project_id=project_id,
+                parent_task_id=parent_task_id,
+                task_type="create",
+                specification=_spec("Rejected cold-session spawn"),
+                idempotency_key="cold-session-rejected",
+                direction_id=None,
+            )
+        await db_session.rollback()
+    else:
+        submission = await submit_strategic_spawn(
+            db_session,
+            project_id=project_id,
+            parent_task_id=parent_task_id,
+            task_type="create",
+            specification=_spec("Accepted cold-session spawn"),
+            idempotency_key="cold-session-accepted",
+            direction_id=None,
+        )
+        assert submission.task is not None
+
+    fully_loaded = await db_session.get(Project, project_id)
+    assert fully_loaded is not None
+    assert fully_loaded.build_config["marker"] == "full-row"
+
+
+@pytest.mark.asyncio
 async def test_direct_strategic_research_with_cycle_keeps_strategist_provenance(
     db_session,
 ):

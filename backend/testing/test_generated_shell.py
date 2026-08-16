@@ -2183,6 +2183,15 @@ def _extract_default_backend_verification() -> str:
 
 def test_default_check_backend_verification_is_rendered_from_fragment():
     """The committed fallback must not drift from its generator fragment."""
+    tracked = _DEFAULT_CHECK.read_text(encoding="utf-8")
+    assert (
+        '_VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${_VERIFY_TASK_ID}"'
+        in tracked
+    )
+    assert (
+        'rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT"'
+        in tracked
+    )
     assert _extract_default_backend_verification() == _render_backend_verification_fragment()
 
 

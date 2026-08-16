@@ -7,15 +7,20 @@ app.reaper_sweeps so existing import sites require no changes.
 
 import contextlib
 import logging
-import uuid
 from datetime import datetime, timedelta
 
 from sqlalchemy import or_
 from sqlmodel import select
 
 from app import pause_clock
+from app.blocked_retry_authority import (
+    BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY as _BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY,
+    blocked_precondition_state as _blocked_precondition_state,
+    execution_capability_retry_receipt as _execution_capability_retry_receipt,  # noqa: F401 -- compatibility re-export
+    relock_blocked_retry_mutation_authority as _relock_blocked_retry_mutation_authority,
+)
 from app.gate_revalidation import GATE_REVALIDATION_QUERY_MARKERS
-from app.models import DeploymentState, Task, TaskStatus
+from app.models import DeploymentState, Project, Task, TaskStatus
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -92,14 +97,10 @@ _BLOCKED_PARKED_REEVAL_INTERVAL = timedelta(hours=6)
 # "foundation might still appear" case keeps its resume behavior within the
 # bound — only an exhausted, never-satisfiable need terminates.
 _BLOCKED_PARKED_REEVAL_CAP = 4
-# A no-dependency agent/lifecycle blocker is often a TRANSIENT infra failure
-# (orchestrator ./pr open 5xx, git push stale-lease) that clears on its own, but
-# can also be a durable precondition (missing base branch/file). We can't tell
-# them apart, so we optimistically requeue such a blocker up to this many times —
-# a transient blip recovers on retry; a durable blocker re-blocks and, once the
-# budget is spent, parks for the normal backoff + 6h operator escalation. The cap
-# is deliberately small: re-dispatch costs a full agent VM run, so this trades a
-# few wasted runs for auto-recovery instead of a multi-hour operator wedge.
+# Maximum number of distinct, server-proven capability epochs admitted for one
+# blocked task. Free-form/no-dependency blockers never consume it: retry requires
+# a task-bound capability receipt whose runner/source/proof fingerprint changed.
+# The bound protects against genuinely changing but repeatedly broken substrate.
 _BLOCKED_OPTIMISTIC_RETRY_CAP = 3
 # Durable context marker stamped on a blocked dependent that the resume system
 # terminally CANCELS because it can provably never resume. The terminal
@@ -152,156 +153,6 @@ def _next_recheck_delay(attempts: int) -> timedelta:
     """Exponential backoff for the next recheck, capped at ``_BLOCKED_RECHECK_MAX``."""
     secs = _BLOCKED_RECHECK_BASE.total_seconds() * (2 ** max(0, attempts))
     return timedelta(seconds=min(secs, _BLOCKED_RECHECK_MAX.total_seconds()))
-
-
-async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
-    """Classify whether a BLOCKED task's recorded precondition is now satisfied.
-
-    Returns one of:
-      - ``"clear"``   — the precondition is satisfied (or is a transient conflict
-                        with no dependency edge); requeue and let dispatch run/
-                        re-judge it.
-      - ``"retry"``   — a no-dependency agent/lifecycle blocker that may be a
-                        transient infra failure; the driver optimistically
-                        requeues it a bounded number of times before parking.
-      - ``"waiting"`` — an upstream dependency is still in flight; stay BLOCKED.
-      - ``"dead"``    — an upstream dependency genuinely failed / was cancelled,
-                        so this work is impossible; escalate terminally.
-
-    Reuses the single source of truth for dependency resolution
-    (``orchestrator_health._check_candidate_task_deps``) rather than
-    reimplementing merge/cancel/scope-empty semantics here.
-    """
-    deps = task.depends_on or []
-    blocker_meta = (task.context or {}).get("blocker") or {}
-    blocker_source = (
-        blocker_meta.get("source") if isinstance(blocker_meta, dict) else None
-    )
-    if not deps:
-        if task.blocker_kind in {"file_conflict", "pending_rollup"}:
-            # Orchestrator-owned blockers with no dependency edges are still
-            # safe to requeue optimistically: dispatch re-judges and re-blocks
-            # them immediately if the conflict is still live.
-            return "clear"
-        if blocker_source == "parent":
-            children = (
-                (
-                    await session.execute(
-                        select(Task).where(Task.parent_task_id == task.id)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            for child in children:
-                child_ctx = child.context or {}
-                if child.status == TaskStatus.BLOCKED:
-                    return "waiting"
-                if child.status == TaskStatus.FAILED and (
-                    child_ctx.get("failure_category") == "BLOCKED_PRECONDITION"
-                    or child_ctx.get("failure_class") == "BLOCKED_PRECONDITION"
-                    or (child.latest_status_message or "")
-                    .lstrip()
-                    .lower()
-                    .startswith("blocker:")
-                ):
-                    return "waiting"
-            # Child blockers have cleared; move the parent back into the
-            # rollup/re-evaluation path instead of normal dispatch.
-            return "re_evaluate"
-        if verify_pr_merged is None:
-            return "waiting"
-        # AGENT-surfaced "BLOCKER:" with no explicit dependency edge (source set
-        # by agent_status.py): these are often TRANSIENT infra failures
-        # (orchestrator ./pr open 5xx, git push stale-lease) that clear on their
-        # own, but can also be durable preconditions (missing base branch/file).
-        # We can't reliably tell them apart from here, so signal a BOUNDED
-        # optimistic requeue: the driver retries up to
-        # _BLOCKED_OPTIMISTIC_RETRY_CAP times before parking + escalating. A
-        # transient blip recovers on retry; a durable blocker re-blocks and is
-        # parked once the retry budget is spent. (Previously this returned
-        # "waiting" unconditionally, which left a transient infra blip wedging
-        # its EVALUATING rollup parent for hours until an operator manually
-        # requeued — incident 2026-06-04, tasks 87ddb2a4/18c8c195.) Scoped to
-        # source=="agent" so parent-source blockers and metadata-less blocked
-        # subtasks keep their existing "wait for explicit recovery" semantics.
-        if blocker_source == "agent":
-            from app.execution_capability_requirements import (
-                CAPABILITY_BACKEND_VERIFICATION,
-                learned_execution_capabilities,
-            )
-
-            learned_capabilities = learned_execution_capabilities(task.context)
-            if learned_capabilities:
-                from app.orchestrator_runner_dispatch import (
-                    _load_active_runners_cache,
-                    _select_eligible_runner,
-                )
-                from app.runner_decline import recently_declined_runner_ids
-
-                active_runners = await _load_active_runners_cache(session)
-                declined_ids = recently_declined_runner_ids(task)
-                task_type = str((task.first_payload or {}).get("type") or "")
-                if _select_eligible_runner(
-                    active_runners,
-                    task.project_id,
-                    task_type,
-                    None,
-                    {},
-                    declined_runner_ids=declined_ids,
-                    requires_project_verification=(
-                        CAPABILITY_BACKEND_VERIFICATION in learned_capabilities
-                    ),
-                ):
-                    return "retry"
-                # A stale positive heartbeat from the contradicted runner is
-                # not recovery evidence. Stay parked until another currently
-                # capable runner appears.
-                return "waiting"
-            blocker_text = " ".join(
-                str(value or "")
-                for value in (
-                    task.blocked_reason,
-                    task.latest_status_message,
-                    blocker_meta.get("reason")
-                    if isinstance(blocker_meta, dict)
-                    else None,
-                )
-            )
-            if "VIEWPORT_GATE_INFRA_UNAVAILABLE" in blocker_text:
-                # This legacy marker came from the retired VM-side viewport gate.
-                # Viewport capture is now advisory on agent VMs and enforced in
-                # CI, so requeue old rows for the corrected prompt instead of
-                # parking them for the deterministic 6-hour escalation path.
-                return "clear"
-            return "retry"
-        return "waiting"
-    if verify_pr_merged is None:
-        return "waiting"
-
-    from app.orchestrator_health import _check_candidate_task_deps
-
-    dep_uuids = []
-    for d in deps:
-        try:
-            dep_uuids.append(uuid.UUID(str(d)))
-        except (ValueError, AttributeError, TypeError):
-            continue
-    if not dep_uuids:
-        return "clear"
-    dep_tasks = (
-        (await session.execute(select(Task).where(Task.id.in_(dep_uuids))))
-        .scalars()
-        .all()
-    )
-    result, _ = await _check_candidate_task_deps(
-        task, dep_tasks, dep_uuids, session, verify_pr_merged
-    )
-    if result == "eligible":
-        return "clear"
-    if result == "cascade_cancel":
-        return "dead"
-    return "waiting"
 
 
 def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None:
@@ -385,6 +236,7 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
         # conflict/rollup blocker escalates to FAILED instead of cycling forever.
         keys.append("_precondition_defer")
         keys.append("_precondition_escalated_key")
+        keys.append(_BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY)
     for k in keys:
         ctx.pop(k, None)
     # Restore the escalated-key for optimistic requeues: it was stripped above by
@@ -393,6 +245,57 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
     if preserve_first_blocked and saved_escalated_key is not None:
         ctx["_precondition_escalated_key"] = saved_escalated_key
     task.context = ctx
+
+
+def _reset_blocked_task_for_requeue(
+    task: Task,
+    *,
+    preserve_first_blocked: bool = False,
+    context_updates: dict | None = None,
+) -> None:
+    """Close the BLOCKED attempt before returning the row to QUEUED.
+
+    ``reset_task_for_fresh_attempt`` is the authoritative transition primitive:
+    it banks immutable runtime/cost/failure evidence and advances the lifetime
+    ordinal before clearing attempt-local state.  The optimistic conflict and
+    capability paths retain only their cross-attempt retry authority; genuine
+    clears drop the old block episode completely.
+    """
+
+    from app.task_blocked import reset_task_for_fresh_attempt
+
+    prior_context = dict(task.context or {})
+    preserved: dict = {}
+    if preserve_first_blocked:
+        for key in (
+            "_blocked_first_at",
+            "_blocked_optimistic_retries",
+            "_blocked_last_retry_at",
+            "_precondition_defer",
+            "_precondition_escalated_key",
+            _BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY,
+        ):
+            if key in prior_context:
+                preserved[key] = prior_context[key]
+
+    reset_task_for_fresh_attempt(task)
+    context = dict(task.context or {})
+    context.pop("_blocked_recheck_attempts", None)
+    if preserve_first_blocked:
+        context.update(preserved)
+    else:
+        for key in (
+            "_blocked_first_at",
+            "_blocked_optimistic_retries",
+            "_blocked_last_retry_at",
+            "_precondition_defer",
+            "_precondition_escalated_key",
+            _BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY,
+        ):
+            context.pop(key, None)
+    if context_updates:
+        context.update(context_updates)
+    task.context = context
 
 
 async def _fetch_active_candidates(session, project_id) -> list:
@@ -993,6 +896,7 @@ async def _apply_needs_disposition(
     completed_cache: dict,
     pending_broadcasts: list,
     parked: bool,
+    project_authority_locked: bool = False,
 ) -> str:
     """Apply a multi-need classification (:func:`_classify_blocker_needs`).
 
@@ -1205,9 +1109,14 @@ async def _apply_needs_disposition(
     # Capture the originating direction before _clear_blocked_fields runs (it
     # preserves direction_id, but read defensively in case that changes), mirroring
     # _cancel_blocker_as_dead.
+    if not project_authority_locked:
+        task = await _relock_blocked_retry_mutation_authority(session, task)
+        if task is None:
+            return "held"
+        ctx = task.context or {}
     direction_id = (task.context or {}).get("direction_id")
     edged = _wire_edges(task, edges)
-    _clear_blocked_fields(task, preserve_first_blocked=False)
+    _reset_blocked_task_for_requeue(task, preserve_first_blocked=False)
     task.status = TaskStatus.QUEUED
     if edged:
         message = "Unblocked — all needs resolved into dependency edges, requeued"
@@ -1274,6 +1183,18 @@ async def sweep_unblock_blocked_tasks(
 
         verify_pr_merged = _verify_pr_merged
 
+    # Requeue is new execution, not passive maintenance.  Respect the existing
+    # project stop/drain controls at selection time: ``autonomous_enabled=False``
+    # stops autonomous resurrection, while ``paused=True`` drains in-flight work
+    # without manufacturing fresh QUEUED attempts.  No parallel retry switch is
+    # introduced; resuming either existing control makes these rows immediately
+    # eligible on the next sweep.
+    retry_enabled_project_ids = select(Project.id).where(
+        Project.autonomous_enabled.is_(True),
+        Project.paused.is_(False),
+        Project.archived.is_(False),
+    )
+
     # Lock-free pre-scan: collect IDs without holding a batch of row locks across
     # the per-task GitHub calls (_blocked_precondition_state → verify_pr_merged,
     # up to 120s each). A batch FOR UPDATE on 200 rows held that entire window —
@@ -1285,6 +1206,7 @@ async def sweep_unblock_blocked_tasks(
         select(Task.id)
         .where(
             Task.status == TaskStatus.BLOCKED,
+            Task.project_id.in_(retry_enabled_project_ids),
             (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
         )
         .order_by(Task.recheck_after.asc().nullsfirst())
@@ -1312,6 +1234,7 @@ async def sweep_unblock_blocked_tasks(
         select(Task.id)
         .where(
             Task.status == TaskStatus.BLOCKED,
+            Task.project_id.in_(retry_enabled_project_ids),
             or_(*gate_text_predicates),
         )
         .order_by(Task.blocked_at.asc().nullsfirst())
@@ -1425,6 +1348,7 @@ async def sweep_unblock_blocked_tasks(
         task_filters = [
             Task.id == task_id,
             Task.status == TaskStatus.BLOCKED,
+            Task.project_id.in_(retry_enabled_project_ids),
         ]
         if task_id not in gate_id_set:
             task_filters.append(
@@ -1481,7 +1405,13 @@ async def sweep_unblock_blocked_tasks(
             ):
                 from sqlalchemy.orm.attributes import flag_modified
 
-                _clear_blocked_fields(task, preserve_first_blocked=False)
+                task = await _relock_blocked_retry_mutation_authority(session, task)
+                if task is None:
+                    await _commit_task_row(_bc_start)
+                    continue
+                _reset_blocked_task_for_requeue(
+                    task, preserve_first_blocked=False
+                )
                 task.status = TaskStatus.QUEUED
                 if _gs.get("green_at_head"):
                     task.latest_status_message = (
@@ -1577,11 +1507,28 @@ async def sweep_unblock_blocked_tasks(
             # the operator.
             is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
             if is_transient:
+                parked_retry_receipt: dict = {}
                 state = await _blocked_precondition_state(
-                    task, session, verify_pr_merged
+                    task,
+                    session,
+                    verify_pr_merged,
+                    retry_receipt_out=parked_retry_receipt,
                 )
                 if state == "clear":
-                    _clear_blocked_fields(task, preserve_first_blocked=False)
+                    receipt = parked_retry_receipt.get("receipt")
+                    task = await _relock_blocked_retry_mutation_authority(session, task)
+                    if task is None:
+                        await _commit_task_row(_bc_start)
+                        continue
+                    _reset_blocked_task_for_requeue(
+                        task,
+                        preserve_first_blocked=False,
+                        context_updates=(
+                            {_BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY: receipt}
+                            if isinstance(receipt, dict)
+                            else None
+                        ),
+                    )
                     task.status = TaskStatus.QUEUED
                     task.latest_status_message = (
                         "Unblocked — transient conflict cleared, requeued"
@@ -1651,30 +1598,24 @@ async def sweep_unblock_blocked_tasks(
                 continue
             # outcome == "none": fall through to the precondition state machine.
 
-        state = await _blocked_precondition_state(task, session, verify_pr_merged)
+        retry_receipt: dict = {}
+        state = await _blocked_precondition_state(
+            task,
+            session,
+            verify_pr_merged,
+            retry_receipt_out=retry_receipt,
+        )
         if state == "clear":
             blocker_meta = (task.context or {}).get("blocker") or {}
             blocker_source = (
                 blocker_meta.get("source") if isinstance(blocker_meta, dict) else None
             )
-            # Conflict/rollup blockers are transient-but-self-re-blocking:
-            # dispatch requeues them every recheck interval and re-blocks if
-            # the precondition still holds. Their deadline must measure from
-            # the TRUE first-blocked onset, so they are escalation-eligible and
-            # onset-preserving even when they carry stale, already-satisfied
-            # dependency edges (a successfully-completed dep id is never
-            # stripped from depends_on). Key the discriminator off the actual
-            # blocker identity, NOT the mere presence of dependency edges —
-            # otherwise a conflict-blocked task with a satisfied dep would skip
-            # escalation and reset its onset every cycle, looping forever.
-            is_optimistic_conflict = task.blocker_kind in {
-                "file_conflict",
-                "pending_rollup",
-            }
-            is_genuine_clear = (not is_optimistic_conflict) and (
+            # A verified clear ends the old blocker episode. File-conflict FIFO
+            # handoff is carried by a bounded server receipt, not by stale onset
+            # or defer counters; an unchanged conflict never reaches this branch.
+            if await _blocked_escalation_due(task, session) and not (
                 bool(task.depends_on) or blocker_source == "parent"
-            )
-            if not is_genuine_clear and await _blocked_escalation_due(task, session):
+            ):
                 await _escalate_blocked_task(
                     task,
                     ctx,
@@ -1686,12 +1627,23 @@ async def sweep_unblock_blocked_tasks(
                 )
                 await _commit_task_row(_bc_start)
                 continue
-            # A conflict/rollup blocker is requeued optimistically and must
-            # preserve its first-blocked onset across the requeue (so the next
-            # block episode keeps counting toward the deadline) — unless it has
-            # already crossed the deadline and was escalated above. A genuine
-            # dependency/parent clear resets all, including the onset.
-            _clear_blocked_fields(task, preserve_first_blocked=is_optimistic_conflict)
+            # ``state == clear`` means a named precondition disappeared, a
+            # dependency/parent resolved, or a one-time server advisory-policy
+            # migration was admitted — never merely that enough time elapsed.
+            receipt = retry_receipt.get("receipt")
+            task = await _relock_blocked_retry_mutation_authority(session, task)
+            if task is None:
+                await _commit_task_row(_bc_start)
+                continue
+            _reset_blocked_task_for_requeue(
+                task,
+                preserve_first_blocked=False,
+                context_updates=(
+                    {_BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY: receipt}
+                    if isinstance(receipt, dict)
+                    else None
+                ),
+            )
             task.status = TaskStatus.QUEUED
             task.latest_status_message = "Unblocked — requeued for dispatch"
             flag_modified(task, "context")
@@ -1708,6 +1660,10 @@ async def sweep_unblock_blocked_tasks(
                 )
             )
         elif state == "re_evaluate":
+            task = await _relock_blocked_retry_mutation_authority(session, task)
+            if task is None:
+                await _commit_task_row(_bc_start)
+                continue
             _clear_blocked_fields(task, preserve_first_blocked=False)
             task.status = TaskStatus.EVALUATING
             task.latest_status_message = "Unblocked — awaiting rollup re-evaluation"
@@ -1737,11 +1693,9 @@ async def sweep_unblock_blocked_tasks(
         else:  # "retry" or "waiting"
             past_deadline = await _blocked_escalation_due(task, session)
             optimistic_used = int(ctx.get("_blocked_optimistic_retries", 0))
-            # "retry": a no-dep agent/lifecycle blocker that may be a transient
-            # infra failure — optimistically requeue (bounded) so a passing blip
-            # auto-recovers instead of wedging its rollup parent until an operator
-            # intervenes. Preserve the first-blocked onset so the 6h deadline
-            # still measures from true onset across the requeue episodes.
+            # "retry": a distinct task-bound capability epoch is now available.
+            # Preserve the first-blocked onset and bound changing-but-broken
+            # substrate without treating elapsed time or free text as authority.
             if (
                 state == "retry"
                 and not past_deadline
@@ -1775,14 +1729,29 @@ async def sweep_unblock_blocked_tasks(
                         session.add(task)
                         await _commit_task_row(_bc_start)
                         continue
+                task = await _relock_blocked_retry_mutation_authority(session, task)
+                if task is None:
+                    await _commit_task_row(_bc_start)
+                    continue
+                ctx = dict(task.context or {})
                 ctx["_blocked_optimistic_retries"] = optimistic_used + 1
                 ctx["_blocked_last_retry_at"] = now.isoformat()
+                receipt = retry_receipt.get("receipt")
+                if isinstance(receipt, dict):
+                    ctx[_BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY] = receipt
                 task.context = ctx
-                # _clear_blocked_fields preserves _blocked_optimistic_retries and
-                # _blocked_last_retry_at on an onset-preserving requeue (only wiped
-                # on a genuine dependency clear), so the budget and evidence
-                # timestamp keep accumulating across re-blocks.
-                _clear_blocked_fields(task, preserve_first_blocked=True)
+                # Close and bank the old BLOCKED execution before clearing its
+                # runtime fields.  Preserve only the bounded retry/receipt state
+                # that proves the next capability epoch is distinct.
+                _reset_blocked_task_for_requeue(
+                    task,
+                    preserve_first_blocked=True,
+                    context_updates=(
+                        {_BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY: receipt}
+                        if isinstance(receipt, dict)
+                        else None
+                    ),
+                )
                 task.status = TaskStatus.QUEUED
                 task.latest_status_message = (
                     f"Unblocked — optimistic infra-precondition retry "
@@ -1864,12 +1833,38 @@ async def _event_driven_unblock_project(
 
     now = _utcnow()
 
+    # Event-driven resolution is DB-local and bounded.  Acquire the operator
+    # authority row before any dependent Task row so this fast path follows the
+    # same Project -> Task order as every canonical cross-table transition.
+    project_authority = (
+        await session.execute(
+            select(Project)
+            .where(
+                Project.id == project_id,
+                Project.autonomous_enabled.is_(True),
+                Project.paused.is_(False),
+                Project.archived.is_(False),
+            )
+            .with_for_update(skip_locked=True, key_share=True)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if project_authority is None:
+        return 0
+
     # Fetch BLOCKED dependents in the same project; skip-lock for sweep parity.
     due_stmt = (
         select(Task)
         .where(
             Task.status == TaskStatus.BLOCKED,
             Task.project_id == project_id,
+            Task.project_id.in_(
+                select(Project.id).where(
+                    Project.autonomous_enabled.is_(True),
+                    Project.paused.is_(False),
+                    Project.archived.is_(False),
+                )
+            ),
         )
         .limit(batch_size)
         .with_for_update(skip_locked=True)
@@ -1919,6 +1914,7 @@ async def _event_driven_unblock_project(
                 completed_cache=completed_cache,
                 pending_broadcasts=pending_broadcasts,
                 parked=parked,
+                project_authority_locked=True,
             )
             if outcome == "resumed":
                 requeued += 1

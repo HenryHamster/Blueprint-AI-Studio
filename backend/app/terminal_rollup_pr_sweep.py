@@ -145,6 +145,17 @@ async def _trigger_merged_parent_classifier(
 async def _reconcile_one(task_id, session: AsyncSession) -> str | None:
     """Lock, reread, reconcile, and commit one candidate."""
 
+    project_id = (
+        await session.execute(select(Task.project_id).where(Task.id == task_id))
+    ).scalar_one_or_none()
+    if project_id is None:
+        await session.rollback()
+        return None
+    from app.task_locking import acquire_automatic_task_creation_authority
+
+    requeue_creation_admission = await acquire_automatic_task_creation_authority(
+        session, project_id
+    )
     locked = (
         (
             await session.execute(
@@ -206,7 +217,11 @@ async def _reconcile_one(task_id, session: AsyncSession) -> str | None:
             session.add(locked)
             from app.task_lifecycle import _requeue_parent_task
 
-            await _requeue_parent_task(locked, session)
+            await _requeue_parent_task(
+                locked,
+                session,
+                automatic_creation_admission=requeue_creation_admission,
+            )
             if locked.status == TaskStatus.FAILED:
                 _mark_operator_attention(locked, outcome, cap_exhausted=True)
                 session.add(locked)

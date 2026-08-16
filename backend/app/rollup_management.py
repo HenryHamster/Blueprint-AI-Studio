@@ -2073,6 +2073,16 @@ async def _check_and_trigger_rollup(
     # downstream `completed_count == 0 and failed_count > 0` guard
     # finalizes the parent. Preserving this contract by carrying
     # `all_done` from the verify loop forward to the existing dispatch.
+    # The Phase-B GitHub window deliberately released every DB row lock.
+    # Re-enter automatic creation authority before re-locking the parent so a
+    # later failed-child clone observes canonical Project -> Task ordering.
+    # Terminal reconciliation continues even when admission is denied; only
+    # `_requeue_parent_task` consumes this decision at its INSERT edge.
+    from app.task_locking import acquire_automatic_task_creation_authority
+
+    _requeue_creation_admission = await acquire_automatic_task_creation_authority(
+        session, child_task.project_id
+    )
     parent = await _relock_parent(
         session,
         parent_id_local,
@@ -2511,7 +2521,11 @@ async def _check_and_trigger_rollup(
                     f"{len(completed_merged)} succeeded. Requeuing failed children "
                     f"(attempt {requeue_count + 1}/{MAX_PARENT_REQUEUES}) before partial rollup."
                 )
-                await _requeue_parent_task(parent, session)
+                await _requeue_parent_task(
+                    parent,
+                    session,
+                    automatic_creation_admission=_requeue_creation_admission,
+                )
                 return
             # Requeue limit exhausted — fall through to partial rollup or full failure.
             logger.warning(

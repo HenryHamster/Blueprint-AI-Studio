@@ -13,6 +13,7 @@ tokenization/similarity, and the diff-size/test-file utilities shared with
 """
 
 import hashlib
+import json
 import re
 
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.55
@@ -92,17 +93,86 @@ def _critical_major_count(entry: dict) -> int:
     )
 
 
+def _entry_target_pair(entry: dict) -> tuple[str, str] | None:
+    base_sha = str(entry.get("reviewed_base_sha") or "").strip()
+    head_sha = str(entry.get("reviewed_head_sha") or "").strip()
+    if not base_sha or not head_sha:
+        return None
+    return (base_sha, head_sha)
+
+
+def _verified_blocking_issue_ids(entry: dict) -> set[str] | None:
+    """Return canonical blocker IDs when the round proves an exact target.
+
+    ``None`` means the older count-only fallback must remain in force. An empty
+    set is valid exact evidence (an approval/no-blocker round).
+    """
+
+    if (
+        entry.get("target_verified_by_backend") is not True
+        or not str(entry.get("review_task_id") or "").strip()
+        or not _entry_target_pair(entry)
+    ):
+        return None
+    issue_ids: set[str] = set()
+    for issue in entry.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        if issue.get("severity", "").upper() not in ("CRITICAL", "MAJOR"):
+            continue
+        if not (issue.get("description") or "").strip():
+            continue
+        issue_id = str(issue.get("issue_id") or "").strip()
+        if not issue_id:
+            return None
+        issue_ids.add(issue_id)
+    return issue_ids
+
+
 def _detect_issue_churn(history: list) -> tuple[bool, list[int]]:
     if len(history) < ISSUE_CHURN_WINDOW:
         return (False, [])
-    counts = [_critical_major_count(e) for e in history[-ISSUE_CHURN_WINDOW:]]
+    window = history[-ISSUE_CHURN_WINDOW:]
+    counts = [_critical_major_count(e) for e in window]
     if any(c == 0 for c in counts):
         return (False, counts)
     non_decreasing = all(counts[i + 1] >= counts[i] for i in range(len(counts) - 1))
     # Oscillating patterns (e.g. [5, 3, 5], [4, 2, 4]) also represent zero net
     # progress: the fix agent removes some issues but reintroduces others.
     no_net_progress = counts[-1] >= counts[0]
-    return (non_decreasing or no_net_progress, counts)
+    count_shape_is_churn = non_decreasing or no_net_progress
+    if not count_shape_is_churn:
+        return (False, counts)
+
+    canonical_ids = [_verified_blocking_issue_ids(entry) for entry in window]
+    if all(issue_ids is not None for issue_ids in canonical_ids):
+        canonical_id_sets = [
+            issue_ids for issue_ids in canonical_ids if issue_ids is not None
+        ]
+        target_pairs = [
+            pair
+            for entry in window
+            if (pair := _entry_target_pair(entry)) is not None
+        ]
+        heads_changed = all(
+            target_pairs[index][1] != target_pairs[index + 1][1]
+            for index in range(len(target_pairs) - 1)
+        ) and len(target_pairs) == len(window)
+        current_ids = canonical_id_sets[-1]
+        prior_canonical_ids: set[str] = set()
+        for prior_entry in history[:-1]:
+            prior_ids = _verified_blocking_issue_ids(prior_entry)
+            if prior_ids is not None:
+                prior_canonical_ids.update(prior_ids)
+        re_raised = bool(current_ids & prior_canonical_ids)
+        if heads_changed and not re_raised:
+            # Every retained canonical blocker disappeared on an actioned head
+            # and every current blocker is genuinely new. Count growth here is
+            # reviewer discovery, not failed repair progress; shortening the
+            # patch budget would punish convergence. Comparing the current set
+            # with all bounded retained history also catches A -> B -> A loops.
+            return (False, counts)
+    return (True, counts)
 
 
 # ── Early non-convergence escalation (whack-a-mole / drift detection) ─────────
@@ -871,9 +941,9 @@ LANE_CAP_CI_DEFAULT = 6
 LANE_CAP_NON_REVIEW_DEFAULT = 8  # conflict + ci collectively
 
 # Number of consecutive conflict-lane fix completions that trigger persistent-
-# conflict escalation BEFORE the lane sub-cap fires. The loop closes the PR and
-# records failure_detail="persistent_merge_conflict" on the orig task so the
-# operator can see the conflict, not a generic cap-exhaustion message.
+# conflict escalation BEFORE the lane sub-cap fires. The loop parks the open PR
+# in the operator-disposition hold with a persistent-conflict marker and exact
+# target evidence; conflict alone is not authority to reject or close the PR.
 # Fires at lane_count >= threshold (default 2) so the first conflict attempt
 # is preserved (keeps hardened prompt behavior for attempt 1), and a second
 # failure without resolution confirms the conflict is not auto-resolvable.
@@ -949,3 +1019,171 @@ def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined] 
     if fix_reason == "ci_failure":
         return LANE_CI
     return LANE_REVIEW_CONVERGENCE
+
+
+def _exact_review_target_identity(target: object) -> tuple[str, int, str, str] | None:
+    """Return the complete immutable review-target identity, if present.
+
+    Review authority is a property of the exact ``(project, PR, base, head)``
+    tuple.  A head-only identity is deliberately not accepted: two reviews of
+    the same head against different integration bases did not inspect the same
+    effective change.
+    """
+
+    if not isinstance(target, dict):
+        return None
+    project_id = str(target.get("project_id") or "").strip()
+    base_sha = str(target.get("base_sha") or "").strip()
+    head_sha = str(target.get("head_sha") or "").strip()
+    try:
+        pr_number = int(target.get("pr_number") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not project_id or pr_number <= 0 or not base_sha or not head_sha:
+        return None
+    return (project_id, pr_number, base_sha, head_sha)
+
+
+def _structured_review_verdict(task: "Task") -> tuple[str, str, str] | None:  # type: ignore[name-defined]  # noqa: F821
+    """Return ``(verdict, reviewed_base, reviewed_head)`` from signed result data.
+
+    ``blueprint_review_verdict`` is a convenient UI mirror, not sufficient
+    provenance for cap accounting.  The replay-safe ``review_result`` retains
+    the agent-stamped exact pair and is therefore the authoritative source.
+    """
+
+    result = (task.context or {}).get("review_result")
+    if not isinstance(result, dict) or result.get("structured") is not True:
+        return None
+    raw = result.get("verdict_json")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    verdict = str(payload.get("verdict") or result.get("verdict") or "").upper()
+    reviewed_base = str(payload.get("reviewed_base_sha") or "").strip()
+    reviewed_head = str(payload.get("reviewed_head_sha") or "").strip()
+    if verdict not in ("APPROVE", "REQUEST_CHANGES"):
+        return None
+    return (verdict, reviewed_base, reviewed_head)
+
+
+def review_cap_generation_identity(
+    task: "Task",  # type: ignore[name-defined]  # noqa: F821
+) -> tuple[object, ...] | None:
+    """Return the actioned generation charged to the review/fix cap.
+
+    A cap unit is an exact patch/open-set generation, not a worker row:
+
+    * a structured REQUEST_CHANGES review and the fix it launches share the
+      same exact target key and therefore consume one unit together;
+    * parallel reviewers of that same target collapse to the same unit;
+    * APPROVE-only, stale-target, and target-mismatched reviews consume none;
+    * mechanical conflict/CI fixes remain bounded independently; and
+    * old unstructured rows retain a task-id fallback so legacy chains cannot
+      become unbounded merely because they predate exact-target receipts.
+    """
+
+    payload = task.first_payload or {}
+    task_type = str(payload.get("type") or "")
+    if task_type not in ("review", "fix"):
+        return None
+    context = task.context or {}
+    if context.get("_review_stale_head") or context.get("_review_stale_target"):
+        return None
+    loop = context.get("review_loop")
+    loop = loop if isinstance(loop, dict) else {}
+    lane = classify_iteration_lane(task)
+
+    if task_type == "fix":
+        target = _exact_review_target_identity(loop.get("fix_target"))
+        if target is not None:
+            # A code-review fix and the REQUEST_CHANGES review that demanded it
+            # are one actioned patch generation. Mechanical lanes keep their
+            # own namespace so their sub-caps remain independent.
+            return (lane, *target)
+        reviewed_base = str(loop.get("reviewed_base_sha") or "").strip()
+        reviewed_head = str(loop.get("reviewed_head_sha") or "").strip()
+        if reviewed_base and reviewed_head:
+            try:
+                pr_number = int(payload.get("pr_number") or 0)
+            except (TypeError, ValueError):
+                return (lane, "legacy-fix", str(task.id))
+            return (
+                lane,
+                str(task.project_id),
+                pr_number,
+                reviewed_base,
+                reviewed_head,
+            )
+        return (lane, "legacy-fix", str(task.id))
+
+    target = _exact_review_target_identity(loop.get("review_target"))
+    signed = _structured_review_verdict(task)
+    if signed is not None:
+        verdict, reviewed_base, reviewed_head = signed
+        if target is None:
+            return None
+        # Both halves are required. A result that was stamped for a different
+        # base or head is stale/non-actionable even if a legacy completion path
+        # happened to leave the row COMPLETED.
+        if (reviewed_base, reviewed_head) != (target[2], target[3]):
+            return None
+        if verdict != "REQUEST_CHANGES":
+            return None
+        return (LANE_REVIEW_CONVERGENCE, *target)
+
+    # Durable authoritative history is accepted for rows that predate the
+    # replay-safe review_result mirror. Require this task's exact id and pair so
+    # a copied/parallel history row cannot make an unrelated reviewer count.
+    for entry in reversed(loop.get("review_history") or []):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("review_task_id") or "") != str(task.id):
+            continue
+        if entry.get("target_verified_by_backend") is not True or target is None:
+            return None
+        entry_base = str(entry.get("reviewed_base_sha") or "").strip()
+        entry_head = str(entry.get("reviewed_head_sha") or "").strip()
+        if (entry_base, entry_head) != (target[2], target[3]):
+            return None
+        if str(entry.get("verdict") or "").upper() != "REQUEST_CHANGES":
+            return None
+        return (LANE_REVIEW_CONVERGENCE, *target)
+
+    # Explicitly parallel rows without exact, actioned verdict evidence are
+    # observation fan-out, not patch generations.
+    if context.get("review_was_parallelized") is True:
+        return None
+    # Legacy rows without target/result receipts remain one bounded unit each.
+    if target is None:
+        return (LANE_REVIEW_CONVERGENCE, "legacy-review", str(task.id))
+    return None
+
+
+def actioned_review_cap_tasks(
+    tasks: "list[Task]",  # type: ignore[name-defined]  # noqa: F821
+) -> list["Task"]:  # type: ignore[name-defined]  # noqa: F821
+    """Collapse eligible task rows into actioned review/fix generations.
+
+    The returned representative rows are used for both global and lane counts,
+    keeping those two views on the same unit. Prefer a fix row when a review and
+    its fix share a target because the fix is the concrete patch action.
+    """
+
+    by_generation: dict[tuple[object, ...], "Task"] = {}  # type: ignore[name-defined]  # noqa: F821
+    for task in tasks:
+        identity = review_cap_generation_identity(task)
+        if identity is None:
+            continue
+        prior = by_generation.get(identity)
+        if prior is None or (
+            (prior.first_payload or {}).get("type") != "fix"
+            and (task.first_payload or {}).get("type") == "fix"
+        ):
+            by_generation[identity] = task
+    return list(by_generation.values())

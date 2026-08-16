@@ -100,6 +100,10 @@ from app.broadcast import broadcast_to_project
 from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
 from app.time_utils import _utcnow
 from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE,
+    automatic_task_creation_decision,
+    automatic_task_creation_parent_lock,
     project_lock,
     with_design_doc_locked,
     with_directions_locked,
@@ -2006,11 +2010,6 @@ async def _handle_security_audit_completion(
         )
         return
 
-    project = await session.get(Project, task.project_id)
-    base_branch = (task.first_payload).get(
-        "base_branch", get_project_integration_branch(project)
-    )
-
     # Spawn create tasks for critical and high severity findings
     actionable = [f for f in findings if f.get("severity") in ("critical", "high")]
     if len(actionable) > 10:
@@ -2040,6 +2039,41 @@ async def _handle_security_audit_completion(
                 grader.id,
             )
             return
+
+    # The findings write above committed and released the completion dispatcher's
+    # original locks.  Re-enter through the canonical Project -> parent Task
+    # boundary before the child dedup query and keep those locks through INSERT.
+    _audit_project_id = task.project_id
+    _audit_task_id = task.id
+    async with automatic_task_creation_parent_lock(
+        session,
+        _audit_project_id,
+        _audit_task_id,
+        skip_locked=False,
+    ) as (_audit_admission, project, _locked_audit):
+        if project is None or _locked_audit is None:
+            raise RuntimeError(
+                f"[SECURITY AUDIT] automatic child admission unavailable for {_audit_task_id}"
+            )
+        task = _locked_audit
+
+    if _audit_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        task.status = TaskStatus.COMPLETED
+        task.latest_status_message = (
+            "Security audit complete; automatic fixes suppressed by "
+            f"{_audit_admission} (0 queued children)"
+        )[:500]
+        task.context = {
+            **(task.context or {}),
+            "automatic_child_creation_suppressed": _audit_admission,
+        }
+        session.add(task)
+        await session.commit()
+        return
+
+    base_branch = (task.first_payload).get(
+        "base_branch", get_project_integration_branch(project)
+    )
 
     # Already-spawned guard: if a prior attempt committed children but died before
     # flipping the parent to EVALUATING, a replay would re-parse the same findings
@@ -2288,17 +2322,47 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         logger.info("[PERF] Task %s failed acceptance probe: %s", task.id, _probe_miss)
         return
 
-    project = await session.get(Project, task.project_id)
-    base_branch = (task.first_payload).get(
-        "base_branch", get_project_integration_branch(project)
-    )
-
     # Collect high-severity findings (capped at 10 as before)
     actionable = [f for f in findings if f.get("severity") == "high"]
     if len(actionable) > 10:
         actionable = actionable[:10]
 
     child_tasks = []
+
+    # Persisting the findings released the dispatcher's original locks.  Re-lock
+    # Project -> parent Task before child dedup/publication so pause/archive and
+    # the INSERT have one deterministic order.
+    _perf_project_id = task.project_id
+    _perf_task_id = task.id
+    async with automatic_task_creation_parent_lock(
+        session,
+        _perf_project_id,
+        _perf_task_id,
+        skip_locked=False,
+    ) as (_perf_admission, project, _locked_perf):
+        if project is None or _locked_perf is None:
+            raise RuntimeError(
+                f"[PERF] automatic child admission unavailable for {_perf_task_id}"
+            )
+        task = _locked_perf
+
+    if _perf_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        task.status = TaskStatus.COMPLETED
+        task.latest_status_message = (
+            "Performance analysis complete; automatic fixes suppressed by "
+            f"{_perf_admission} (0 queued children)"
+        )[:500]
+        task.context = {
+            **(task.context or {}),
+            "automatic_child_creation_suppressed": _perf_admission,
+        }
+        session.add(task)
+        await session.commit()
+        return
+
+    base_branch = (task.first_payload).get(
+        "base_branch", get_project_integration_branch(project)
+    )
 
     # Already-spawned guard: if a prior attempt committed a child but died before
     # flipping the parent to EVALUATING, a replay would re-parse the same findings
@@ -2732,17 +2796,7 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
         flag_modified(registration, "source_metadata")
         session.add(registration)
         await session.commit()
-        await broadcast_to_project(
-            str(task.project_id),
-            "task_updated",
-            {"task_id": str(task.id), "status": task.status},
-        )
-        from app.cost_ceiling import check_daily_cost_ceiling
 
-        await check_daily_cost_ceiling(task, session)
-        from app.monthly_budget_alerts import check_monthly_budget
-
-        await check_monthly_budget(session)
         job = None
         if registration.wake_source_ref:
             with contextlib.suppress(ValueError, TypeError):
@@ -2755,6 +2809,108 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
                 await _clear_post_commit_marker(session, registration)
             return False
         logs = await build_compute_result_logs_async(job)
+
+        # Wake delivery could not safely lock Project behind its already-locked
+        # WakeRegistration/Task rows.  Consume its durable follow-up intent only
+        # after that transaction commits, under a fresh Project -> parent Task
+        # boundary.  Pause/archive clears the intent terminally; admission and
+        # child publication commit atomically.
+        _pending_followup = (task.context or {}).get(
+            _COMPUTE_WAKE_FOLLOWUP_PENDING_KEY
+        )
+        if isinstance(_pending_followup, dict):
+            _wake_project_id = task.project_id
+            _wake_task_id = task.id
+            async with automatic_task_creation_parent_lock(
+                session,
+                _wake_project_id,
+                _wake_task_id,
+                skip_locked=False,
+            ) as (_wake_admission, _wake_project, _wake_task):
+                if _wake_project is None or _wake_task is None:
+                    raise RuntimeError(
+                        "compute wake follow-up admission could not lock project/parent"
+                    )
+                task = _wake_task
+
+            # Re-read intent from the freshly locked parent.  Another post-commit
+            # worker may have consumed or terminally suppressed the marker while
+            # this worker waited for Project; a pre-lock snapshot must never
+            # resurrect that already-settled continuation after a later resume.
+            _pending_followup = (task.context or {}).get(
+                _COMPUTE_WAKE_FOLLOWUP_PENDING_KEY
+            )
+            if not isinstance(_pending_followup, dict):
+                _pending_followup = None
+
+            _wake_failure_mode = bool(
+                _pending_followup and _pending_followup.get("failure_mode")
+            )
+            _wake_sweep_id = (
+                _pending_followup.get("sweep_id") if _pending_followup else None
+            )
+            _wake_result = (
+                (task.plan_output or {}).get("compute_result")
+                if isinstance(task.plan_output, dict)
+                else {}
+            ) or {}
+            if (
+                _pending_followup is not None
+                and _wake_admission == AUTOMATIC_TASK_CREATION_ALLOWED
+            ):
+                if _wake_sweep_id:
+                    _wake_child = await _maybe_spawn_sweep_aggregate_followon(
+                        session,
+                        task,
+                        str(_wake_sweep_id),
+                        _wake_result,
+                        logs,
+                        failure_mode=_wake_failure_mode,
+                        automatic_admission=_wake_admission,
+                        locked_project=_wake_project,
+                    )
+                else:
+                    _wake_child = await _spawn_act_on_verdict_followon(
+                        session,
+                        task,
+                        _wake_result,
+                        logs,
+                        failure_mode=_wake_failure_mode,
+                        automatic_admission=_wake_admission,
+                        locked_project=_wake_project,
+                    )
+                if _wake_child is not None and not _wake_failure_mode:
+                    task.status = TaskStatus.EVALUATING
+                    task.latest_status_message = (
+                        "Compute experiment terminal; spawned reason-and-ship "
+                        f"follow-on {_wake_child.id}"
+                    )[:500]
+            elif _pending_followup is not None:
+                _admit_compute_followup(
+                    task,
+                    _wake_admission,
+                    failure_mode=_wake_failure_mode,
+                    sweep_id=(str(_wake_sweep_id) if _wake_sweep_id else None),
+                    defer_unavailable=False,
+                )
+            _wake_context = dict(task.context or {})
+            _wake_context.pop(_COMPUTE_WAKE_FOLLOWUP_PENDING_KEY, None)
+            task.context = _wake_context
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": task.status},
+        )
+        from app.cost_ceiling import check_daily_cost_ceiling
+
+        await check_daily_cost_ceiling(task, session)
+        from app.monthly_budget_alerts import check_monthly_budget
+
+        await check_monthly_budget(session)
         criterion = (task.context or {}).get("compute_success_criterion")
         persisted = await _persist_compute_experiment_knowledge_best_effort(
             task, logs, criterion, session
@@ -2909,6 +3065,39 @@ _ACT_ON_VERDICT_SOURCE_KEY = "act_on_verdict_source_task_id"
 # (_MAX_PAYLOAD_BYTES). The structured compute_result is always included in full;
 # only the raw result record is truncated.
 _ACT_ON_VERDICT_LOG_CHARS = 16000
+_COMPUTE_WAKE_FOLLOWUP_PENDING_KEY = "_compute_wake_followup_pending"
+
+
+def _admit_compute_followup(
+    task: Task,
+    admission: str,
+    *,
+    failure_mode: bool,
+    sweep_id: str | None,
+    defer_unavailable: bool,
+) -> bool:
+    """Record a compute follow-up decision before any automatic Task query.
+
+    Wake delivery holds WakeRegistration -> Task rather than Project -> Task, so
+    it cannot safely acquire Project inline.  That path records a durable marker
+    consumed after the wake transaction commits.  Pause/archive decisions are
+    terminal suppressions and never create latent work.
+    """
+
+    if admission == AUTOMATIC_TASK_CREATION_ALLOWED:
+        return True
+    context = dict(task.context or {})
+    if admission == AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE and defer_unavailable:
+        context[_COMPUTE_WAKE_FOLLOWUP_PENDING_KEY] = {
+            "failure_mode": bool(failure_mode),
+            **({"sweep_id": str(sweep_id)} if sweep_id else {}),
+        }
+    else:
+        context.pop(_COMPUTE_WAKE_FOLLOWUP_PENDING_KEY, None)
+        context["automatic_followup_creation_suppressed"] = admission
+    task.context = context
+    flag_modified(task, "context")
+    return False
 
 
 def _parse_compute_result_record(logs: str) -> dict[str, Any] | None:
@@ -3084,6 +3273,9 @@ async def _spawn_act_on_verdict_followon(
     logs: str,
     *,
     failure_mode: bool = False,
+    automatic_admission: str,
+    locked_project: Project | None,
+    defer_unavailable: bool = False,
 ) -> Task | None:
     """Spawn ONE write-capable disposition follow-on for a terminal experiment.
 
@@ -3114,6 +3306,17 @@ async def _spawn_act_on_verdict_followon(
     without stamping the dedup key, so the next re-dispatch retries once the
     fleet drains.
     """
+    if not _admit_compute_followup(
+        task,
+        automatic_admission,
+        failure_mode=failure_mode,
+        sweep_id=None,
+        defer_unavailable=defer_unavailable,
+    ):
+        return None
+    if locked_project is None:
+        raise RuntimeError("compute follow-up admitted without a locked Project")
+
     existing_children = (
         (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
@@ -3166,10 +3369,9 @@ async def _spawn_act_on_verdict_followon(
             )
             return None
 
-    project = await session.get(Project, task.project_id)
     base_branch = (task.first_payload or {}).get(
         "base_branch"
-    ) or get_project_integration_branch(project)
+    ) or get_project_integration_branch(locked_project)
     create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
     prompt = _build_act_on_verdict_prompt(
         task, compute_result, logs, failure_mode=failure_mode
@@ -3341,6 +3543,9 @@ async def _maybe_spawn_sweep_aggregate_followon(
     logs: str,
     *,
     failure_mode: bool = False,
+    automatic_admission: str,
+    locked_project: Project | None,
+    defer_unavailable: bool = False,
 ) -> Task | None:
     """Spawn ONE aggregate disposition follow-on when ALL sweep arms are terminal.
 
@@ -3351,6 +3556,17 @@ async def _maybe_spawn_sweep_aggregate_followon(
     Idempotent: guards against double-spawn via ``_ACT_ON_VERDICT_SWEEP_KEY``
     stamped in the child's context.
     """
+    if not _admit_compute_followup(
+        task,
+        automatic_admission,
+        failure_mode=failure_mode,
+        sweep_id=sweep_id,
+        defer_unavailable=defer_unavailable,
+    ):
+        return None
+    if locked_project is None:
+        raise RuntimeError("compute sweep follow-up admitted without a locked Project")
+
     # Load all sibling tasks sharing this sweep_id on the same project.
     sibling_rows = (
         (
@@ -3434,10 +3650,9 @@ async def _maybe_spawn_sweep_aggregate_followon(
     any_failure = any(t.status == TaskStatus.FAILED for t in sibling_rows)
     effective_failure_mode = failure_mode or any_failure
 
-    project = await session.get(Project, task.project_id)
     base_branch = (task.first_payload or {}).get(
         "base_branch"
-    ) or get_project_integration_branch(project)
+    ) or get_project_integration_branch(locked_project)
     create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
 
     prompt = _build_sweep_aggregate_prompt(
@@ -4345,7 +4560,12 @@ async def _handle_walkthrough_e2e_completion(
 
 
 async def _handle_compute_experiment_completion(
-    task: Task, logs: str, session: AsyncSession, *, owns_commit: bool = True
+    task: Task,
+    logs: str,
+    session: AsyncSession,
+    *,
+    owns_commit: bool = True,
+    project: Project | None = None,
 ):
     """Gate and persist a compute_experiment task's terminal job result.
 
@@ -4378,8 +4598,30 @@ async def _handle_compute_experiment_completion(
         task advance atomically, and runs ``run_compute_wake_post_commit`` for the
         broadcast + knowledge AFTER it commits.
     """
+    # Normal completion dispatch supplies its already-canonical Project lock.
+    # Keep a safe public fallback for direct/recovery callers: release any
+    # caller-owned Task-only transaction before reacquiring Project -> Task.
+    if owns_commit and project is None and _compute_followup_is_opted_in(task):
+        _compute_project_id = task.project_id
+        _compute_task_id = task.id
+        await session.commit()
+        async with automatic_task_creation_parent_lock(
+            session,
+            _compute_project_id,
+            _compute_task_id,
+            skip_locked=False,
+        ) as (_fallback_admission, _fallback_project, _fallback_task):
+            if _fallback_project is None or _fallback_task is None:
+                raise RuntimeError(
+                    "compute follow-up admission could not lock project/parent"
+                )
+            project = _fallback_project
+            task = _fallback_task
+
     verdict = evaluate_terminal_output(task, logs)
     sweep_id = (task.first_payload or {}).get("sweep_id") or None
+    _automatic_spawn_admission = automatic_task_creation_decision(project)
+    _defer_unavailable_spawn = not owns_commit
 
     # Record the declared success-criterion verdict DURABLY on the task so the
     # operator and strategic consumers can read whether the experiment's goal
@@ -4435,7 +4677,16 @@ async def _handle_compute_experiment_completion(
             task.id,
         )
         if _compute_followup_is_opted_in(task):
-            await _spawn_act_on_verdict_followon(session, task, {}, logs, failure_mode=True)
+            await _spawn_act_on_verdict_followon(
+                session,
+                task,
+                {},
+                logs,
+                failure_mode=True,
+                automatic_admission=_automatic_spawn_admission,
+                locked_project=project,
+                defer_unavailable=_defer_unavailable_spawn,
+            )
         await _finalize_compute_experiment(
             session, task, TaskStatus.FAILED, logs, criterion, owns_commit=owns_commit
         )
@@ -4591,11 +4842,26 @@ async def _handle_compute_experiment_completion(
         if _compute_followup_is_opted_in(task):
             if sweep_id:
                 await _maybe_spawn_sweep_aggregate_followon(
-                    session, task, sweep_id, {}, logs, failure_mode=True
+                    session,
+                    task,
+                    sweep_id,
+                    {},
+                    logs,
+                    failure_mode=True,
+                    automatic_admission=_automatic_spawn_admission,
+                    locked_project=project,
+                    defer_unavailable=_defer_unavailable_spawn,
                 )
             else:
                 await _spawn_act_on_verdict_followon(
-                    session, task, {}, logs, failure_mode=True
+                    session,
+                    task,
+                    {},
+                    logs,
+                    failure_mode=True,
+                    automatic_admission=_automatic_spawn_admission,
+                    locked_project=project,
+                    defer_unavailable=_defer_unavailable_spawn,
                 )
         await _finalize_compute_experiment(
             session,
@@ -4667,11 +4933,26 @@ async def _handle_compute_experiment_completion(
             ):
                 if sweep_id:
                     await _maybe_spawn_sweep_aggregate_followon(
-                        session, task, sweep_id, compute_result, logs, failure_mode=True
+                        session,
+                        task,
+                        sweep_id,
+                        compute_result,
+                        logs,
+                        failure_mode=True,
+                        automatic_admission=_automatic_spawn_admission,
+                        locked_project=project,
+                        defer_unavailable=_defer_unavailable_spawn,
                     )
                 else:
                     await _spawn_act_on_verdict_followon(
-                        session, task, compute_result, logs, failure_mode=True
+                        session,
+                        task,
+                        compute_result,
+                        logs,
+                        failure_mode=True,
+                        automatic_admission=_automatic_spawn_admission,
+                        locked_project=project,
+                        defer_unavailable=_defer_unavailable_spawn,
                     )
             await _finalize_compute_experiment(
                 session,
@@ -4706,11 +4987,26 @@ async def _handle_compute_experiment_completion(
             if _compute_followup_is_opted_in(task):
                 if sweep_id:
                     await _maybe_spawn_sweep_aggregate_followon(
-                        session, task, sweep_id, compute_result, logs, failure_mode=True
+                        session,
+                        task,
+                        sweep_id,
+                        compute_result,
+                        logs,
+                        failure_mode=True,
+                        automatic_admission=_automatic_spawn_admission,
+                        locked_project=project,
+                        defer_unavailable=_defer_unavailable_spawn,
                     )
                 else:
                     await _spawn_act_on_verdict_followon(
-                        session, task, compute_result, logs, failure_mode=True
+                        session,
+                        task,
+                        compute_result,
+                        logs,
+                        failure_mode=True,
+                        automatic_admission=_automatic_spawn_admission,
+                        locked_project=project,
+                        defer_unavailable=_defer_unavailable_spawn,
                     )
             await _finalize_compute_experiment(
                 session,
@@ -4743,11 +5039,24 @@ async def _handle_compute_experiment_completion(
     ):
         if sweep_id:
             child = await _maybe_spawn_sweep_aggregate_followon(
-                session, task, sweep_id, plan_output.get("compute_result") or {}, logs
+                session,
+                task,
+                sweep_id,
+                plan_output.get("compute_result") or {},
+                logs,
+                automatic_admission=_automatic_spawn_admission,
+                locked_project=project,
+                defer_unavailable=_defer_unavailable_spawn,
             )
         else:
             child = await _spawn_act_on_verdict_followon(
-                session, task, plan_output.get("compute_result") or {}, logs
+                session,
+                task,
+                plan_output.get("compute_result") or {},
+                logs,
+                automatic_admission=_automatic_spawn_admission,
+                locked_project=project,
+                defer_unavailable=_defer_unavailable_spawn,
             )
         if child is not None:
             final_status = TaskStatus.EVALUATING

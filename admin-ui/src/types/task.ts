@@ -182,6 +182,8 @@ export interface Task {
   movement_explanation?: string | null;
   status_log?: { t: string; msg: string }[];
   created_by: string;
+  /** Durable producer class (RESEARCH, STRATEGIST, REVIEW, etc.). */
+  origination?: string;
   requires_approval: boolean;
   parent_task_id?: string;
   depends_on?: string[];

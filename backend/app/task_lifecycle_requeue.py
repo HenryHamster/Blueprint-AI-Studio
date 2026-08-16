@@ -265,6 +265,9 @@ async def _requeue_parent_task(
     parent: Task,
     session: AsyncSession,
     operator_retry_guidance: str | None = None,
+    *,
+    automatic_creation: bool = True,
+    automatic_creation_admission: str | None = None,
 ):
     """Re-evaluate a parent task by retrying its failed children.
     Cancels FAILED children and clones them as new QUEUED tasks.
@@ -435,6 +438,31 @@ async def _requeue_parent_task(
         # Create failure alert
         await _maybe_create_failure_alert(parent, session, parent.latest_status_message)
         return 0
+
+    if automatic_creation:
+        from app.task_locking import (
+            AUTOMATIC_TASK_CREATION_ALLOWED,
+            acquire_automatic_task_creation_authority,
+        )
+
+        if automatic_creation_admission is None:
+            # Direct reaper callers arrive without Task row locks. Prevent an
+            # unrelated pending parent status message from autoflushing before
+            # the canonical Project authority query; the admitted transaction
+            # then keeps the Project lock through every clone INSERT below.
+            with session.no_autoflush:
+                automatic_creation_admission = (
+                    await acquire_automatic_task_creation_authority(
+                        session, parent.project_id
+                    )
+                )
+        if automatic_creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            logger.info(
+                "[REQUEUE] Automatic child cloning held for parent %s: %s",
+                parent.id,
+                automatic_creation_admission,
+            )
+            return 0
 
     children = (
         (

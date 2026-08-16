@@ -183,6 +183,25 @@ def test_list_projects_scoped_credential_follows_bounded_pages(monkeypatch):
     ]
 
 
+def test_projects_renderer_prefers_operational_state_over_legacy_status(capsys):
+    blueprint._render_projects(
+        {
+            "projects": [
+                {
+                    "id": "project-1",
+                    "name": "Blueprint",
+                    "status": "DEPLOYING",
+                    "operational_state": "active",
+                }
+            ]
+        }
+    )
+
+    out = capsys.readouterr().out
+    assert "Blueprint · active" in out
+    assert "DEPLOYING" not in out
+
+
 def test_strategic_chat_sends_required_idempotency_key(monkeypatch):
     """Interactive Strategic sends satisfy the durable message contract."""
     requests = []
@@ -3481,6 +3500,27 @@ def test_health_group(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "ACTIVITY" in out
     assert "Add widget feature" in out
+
+
+def test_health_deploy_renders_cross_process_orchestrator_heartbeat(capsys):
+    blueprint._render_health_deploy(
+        {
+            "status": "STABLE",
+            "external_health": {},
+            "orchestrator": {
+                "status": "ok",
+                "authority": "background_leader_advisory_lock",
+                "heartbeat_age_seconds": 4.0,
+                "stale_after_seconds": 90.0,
+                "cycle_age_seconds": None,
+            },
+        }
+    )
+
+    out = capsys.readouterr().out
+    assert "Authority: background_leader_advisory_lock" in out
+    assert "Last heartbeat: 4s ago" in out
+    assert "loop has not completed" not in out
 
 
 def test_health_alerts_dismiss_read_only_refused(monkeypatch, capsys):

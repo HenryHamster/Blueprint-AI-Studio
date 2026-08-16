@@ -53,7 +53,9 @@ from app.resource_envelope import (
 from app.runner_project_binding import allowed_project_ids
 from app.runner_pins import release_unpulled_runner_pins
 from app.runner_decline import (
+    decline_exclusion_applies_to_runner,
     decline_exclusion_is_advisory,
+    decline_exclusion_is_advisory_for_candidates,
     decline_record_for_runner,
     recently_declined_runner_ids,
 )
@@ -487,6 +489,8 @@ async def _load_active_runners_cache(
                     LocalRunner.capabilities,
                     LocalRunner.consecutive_job_failures,
                     LocalRunner.hostname,
+                    LocalRunner.source_sha,
+                    LocalRunner.agent_source_sha,
                 ).where(
                     LocalRunner.status == "active",
                     LocalRunner.last_seen_at.is_not(None),
@@ -498,7 +502,7 @@ async def _load_active_runners_cache(
         logger.exception("[RUNNERS] Failed to load active-runner cache")
         return {}
     runner_ids_for_load = [
-        runner_id for runner_id, _project_id, _capabilities, _failures, _hostname in rows
+        row[0] for row in rows
     ]
     outstanding_compute_by_runner = await _load_runner_compute_job_assignments(
         session, runner_ids_for_load
@@ -515,7 +519,15 @@ async def _load_active_runners_cache(
         session, runner_ids_for_load
     )
     by_project: dict[uuid.UUID, list[RunnerDispatchSnapshot]] = {}
-    for runner_id, project_id, capabilities, consecutive_job_failures, hostname in rows:
+    for (
+        runner_id,
+        project_id,
+        capabilities,
+        consecutive_job_failures,
+        hostname,
+        source_sha,
+        agent_source_sha,
+    ) in rows:
         caps = dict(capabilities or {})
         # Inject the authoritative active agent-task count so _runner_active_task_count
         # / _runner_at_capacity size AGENT capacity off committed Task rows rather than
@@ -545,6 +557,8 @@ async def _load_active_runners_cache(
             capabilities=caps,
             consecutive_job_failures=consecutive_job_failures or 0,
             hostname=hostname,
+            source_sha=source_sha,
+            agent_source_sha=agent_source_sha,
         )
         # Register the SAME snapshot object under every project on the runner's
         # allow-list (enrollment project UNIONed with its explicit bindings). Sharing
@@ -1648,7 +1662,14 @@ def _select_eligible_runner(
         # instruction to use that runner and nothing else, so it out-ranks the
         # decline heuristic (the hold + decline alert still surface the problem).
         eligible = _eligible(
-            [r for r in candidates if str(r.id) not in declined_runner_ids]
+            [
+                r
+                for r in candidates
+                if not decline_exclusion_applies_to_runner(declined_runner_ids, r)
+            ]
+        )
+        epoch_advisory = decline_exclusion_is_advisory_for_candidates(
+            declined_runner_ids, task_type, candidates
         )
         # The waiver is decided on ELIGIBILITY, not on whether some other runner
         # ROW merely exists. Deciding it on the raw candidate list made the waiver
@@ -1660,7 +1681,7 @@ def _select_eligible_runner(
         # prevent, defeated by a runner that could never have taken the task.
         #
         # So: fall back to the decliner only when no ELIGIBLE runner survives.
-        if not eligible and declined_exclusion_advisory:
+        if not eligible and (declined_exclusion_advisory or epoch_advisory):
             eligible = _eligible(candidates)
     else:
         eligible = _eligible(candidates)
@@ -2284,7 +2305,20 @@ async def _dispatch_compute_experiment_directly(
             declined_record=(
                 None
                 if forced_runner_target_id
-                else decline_record_for_runner(task, pin_runner_id)
+                else decline_record_for_runner(
+                    task,
+                    pin_runner_id,
+                    runner=next(
+                        (
+                            candidate
+                            for candidate in active_runners_cache.get(
+                                task.project_id, []
+                            )
+                            if str(candidate.id) == pin_runner_id
+                        ),
+                        None,
+                    ),
+                )
             ),
         )
         message = (

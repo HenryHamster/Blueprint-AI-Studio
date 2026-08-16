@@ -6530,7 +6530,10 @@ class TestEnrollCapabilityProofTrialGuards:
         project = self._make_project()
         rc = {"capability_proof_execution_trials_enabled": True}
 
-        with patch("app.shared_state.runtime_config", new=rc):
+        with patch("app.shared_state.runtime_config", new=rc), patch(
+            "app.task_locking.acquire_automatic_task_creation_authority",
+            new=AsyncMock(return_value="allowed"),
+        ):
             result = await enroll_capability_proof_trial(
                 session,
                 project,
@@ -6557,7 +6560,10 @@ class TestEnrollCapabilityProofTrialGuards:
         task_mock.id = uuid.uuid4()
         session.refresh = AsyncMock(side_effect=lambda t: setattr(t, "id", task_mock.id))
 
-        with patch("app.shared_state.runtime_config", new=rc):
+        with patch("app.shared_state.runtime_config", new=rc), patch(
+            "app.task_locking.acquire_automatic_task_creation_authority",
+            new=AsyncMock(return_value="allowed"),
+        ):
             await enroll_capability_proof_trial(
                 session,
                 project,

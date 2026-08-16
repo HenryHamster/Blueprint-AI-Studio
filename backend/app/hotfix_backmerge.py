@@ -1291,6 +1291,20 @@ async def _handle_conflict(
         )
         return
 
+    creation_admission = "already_open"
+    if not already_open:
+        from app.task_locking import (
+            AUTOMATIC_TASK_CREATION_ALLOWED,
+            acquire_automatic_task_creation_authority,
+        )
+
+        creation_admission = await acquire_automatic_task_creation_authority(
+            session, project_id
+        )
+    task_creation_allowed = already_open or (
+        creation_admission == AUTOMATIC_TASK_CREATION_ALLOWED
+    )
+
     integration_branch, promotion_target = _lts_branch_names(project)
     conflict_alert_title = (
         f"Back-merge conflict: {promotion_target} -> {integration_branch}"
@@ -1304,8 +1318,9 @@ async def _handle_conflict(
         message=(
             f"The automated {promotion_target} -> {integration_branch} back-merge "
             f"(PR #{pr_number}{trigger_clause}) hit a merge conflict and "
-            f"could not be merged automatically. A resolution task has "
-            f"been spawned. Until {integration_branch} absorbs {promotion_target}, the next "
+            f"could not be merged automatically. "
+            f"{'A resolution task is already active or has been spawned.' if task_creation_allowed else f'Automatic resolution work is held ({creation_admission}).'} "
+            f"Until {integration_branch} absorbs {promotion_target}, the next "
             f"{integration_branch} -> {promotion_target} promotion will conflict. ({message[:160]})"
         ),
     )
@@ -1319,7 +1334,7 @@ async def _handle_conflict(
             "open for project %s — not spawning a duplicate",
             project_id,
         )
-    else:
+    elif task_creation_allowed:
         spawned_task = await _spawn_resolution_task(
             session,
             project_id,
@@ -1328,6 +1343,12 @@ async def _handle_conflict(
             hotfix_task_id,
             trigger_desc,
             project=project,
+        )
+    else:
+        logger.info(
+            "[BACKMERGE] conflict-resolution task held for project %s: %s",
+            project_id,
+            creation_admission,
         )
 
     await _broadcast_alert(project_id, alert)
@@ -1600,6 +1621,20 @@ async def _handle_ci_failure(
         )
         return
 
+    creation_admission = "already_open"
+    if not already_open:
+        from app.task_locking import (
+            AUTOMATIC_TASK_CREATION_ALLOWED,
+            acquire_automatic_task_creation_authority,
+        )
+
+        creation_admission = await acquire_automatic_task_creation_authority(
+            session, project_id
+        )
+    task_creation_allowed = already_open or (
+        creation_admission == AUTOMATIC_TASK_CREATION_ALLOWED
+    )
+
     integration_branch, promotion_target = _lts_branch_names(project)
     checks_str = ", ".join(failed_checks[:5]) or "required checks"
     trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
@@ -1611,8 +1646,9 @@ async def _handle_ci_failure(
         message=(
             f"The automated {promotion_target} -> {integration_branch} back-merge "
             f"(PR #{pr_number}{trigger_clause}) merges cleanly but CI is red on the "
-            f"merged result ({checks_str}) — a semantic merge break. A CI-fix task "
-            f"has been spawned. Until {integration_branch} absorbs {promotion_target}, "
+            f"merged result ({checks_str}) — a semantic merge break. "
+            f"{'A CI-fix task is already active or has been spawned.' if task_creation_allowed else f'Automatic CI-fix work is held ({creation_admission}).'} "
+            f"Until {integration_branch} absorbs {promotion_target}, "
             f"the next {integration_branch} -> {promotion_target} promotion will conflict."
         ),
     )
@@ -1626,7 +1662,7 @@ async def _handle_ci_failure(
             "project %s — not spawning a duplicate CI-fix task",
             project_id,
         )
-    else:
+    elif task_creation_allowed:
         spawned_task = await _spawn_ci_fix_task(
             session,
             project_id,
@@ -1636,6 +1672,12 @@ async def _handle_ci_failure(
             trigger_desc,
             failed_checks=failed_checks,
             project=project,
+        )
+    else:
+        logger.info(
+            "[BACKMERGE] CI-fix task held for project %s: %s",
+            project_id,
+            creation_admission,
         )
 
     await _broadcast_alert(project_id, alert)
@@ -1845,6 +1887,20 @@ async def _handle_migration_block(
         )
         return
 
+    creation_admission = "already_open"
+    if not already_open:
+        from app.task_locking import (
+            AUTOMATIC_TASK_CREATION_ALLOWED,
+            acquire_automatic_task_creation_authority,
+        )
+
+        creation_admission = await acquire_automatic_task_creation_authority(
+            session, project_id
+        )
+    task_creation_allowed = already_open or (
+        creation_admission == AUTOMATIC_TASK_CREATION_ALLOWED
+    )
+
     integration_branch, promotion_target = _lts_branch_names(project)
     trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
     alert = Alert(
@@ -1857,8 +1913,9 @@ async def _handle_migration_block(
             f"(PR #{pr_number}{trigger_clause}) was BLOCKED before merge: it would "
             f"create an invalid Alembic migration chain ({reason}). A hotfix "
             f"migration on {promotion_target} and a feature migration on "
-            f"{integration_branch} collide (dual head / duplicate revision). A "
-            f"resolution task has been spawned. Until {integration_branch} absorbs "
+            f"{integration_branch} collide (dual head / duplicate revision). "
+            f"{'A resolution task is already active or has been spawned.' if task_creation_allowed else f'Automatic resolution work is held ({creation_admission}).'} "
+            f"Until {integration_branch} absorbs "
             f"{promotion_target}, the next {integration_branch} -> {promotion_target} "
             f"promotion will conflict."
         ),
@@ -1873,7 +1930,7 @@ async def _handle_migration_block(
             "project %s — not spawning a duplicate migration resolver",
             project_id,
         )
-    else:
+    elif task_creation_allowed:
         # Compute the concrete renumber plan ONLY now that we know a resolver
         # is actually being spawned (a deduped periodic re-entry returned above
         # and made no GitHub calls). Best-effort + fail-safe: any exception or a
@@ -1909,6 +1966,12 @@ async def _handle_migration_block(
             reason=reason,
             project=project,
             plan=plan,
+        )
+    else:
+        logger.info(
+            "[BACKMERGE] migration-resolution task held for project %s: %s",
+            project_id,
+            creation_admission,
         )
 
     await _broadcast_alert(project_id, alert)

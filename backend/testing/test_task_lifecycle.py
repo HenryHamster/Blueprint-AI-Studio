@@ -5390,6 +5390,16 @@ async def test_process_post_commit_stamps_first_pr_opened(tl_db, mocker):
         return_value=("gh-token", "owner", "repo"),
     )
     mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "base": {"sha": "base-sha", "ref": "main"},
+            "head": {"sha": "head-sha", "ref": "blueprint/task-abc123"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    scan_mock = mocker.patch(
         "app.security.scan_pr_for_injection",
         side_effect=TimeoutError("connection timed out"),
     )
@@ -5426,6 +5436,11 @@ async def test_process_post_commit_stamps_first_pr_opened(tl_db, mocker):
     assert (fetched_project.build_config or {}).get("first_pr_opened_at") is not None, (
         "first_pr_opened_at must be stamped in build_config when a create task "
         "completes with a PULL_REQUEST artifact"
+    )
+    assert scan_mock.await_count == 2
+    assert all(
+        awaited.args == ("gh-token", "owner", "repo", 99)
+        for awaited in scan_mock.await_args_list
     )
 
 
@@ -5682,6 +5697,55 @@ def _patch_approve_merge_env(mocker):
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+
+
+@pytest.mark.asyncio
+async def test_approve_same_head_new_base_is_stale_and_respawns_full_review(
+    tl_db, mocker
+):
+    """PR17355 regression: approval authority is the exact base+head pair."""
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    original, review_task = await _setup_approve_merge(session, project)
+    _patch_approve_merge_env(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": "abc123", "ref": "feat/x"},
+            "base": {"sha": "new-base-456", "ref": "main"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    spawned_review = type("Review", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+
+    result = await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    assert result == {"status": "accepted"}
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.args[1] == "review"
+    assert spawn_mock.await_args.kwargs["delta_base_sha"] == ""
+    assert spawn_mock.await_args.kwargs["review_target"] == {
+        "project_id": str(project.id),
+        "pr_number": 5151,
+        "base_sha": "new-base-456",
+        "head_sha": "abc123",
+    }
+    await session.refresh(review_task)
+    assert (review_task.context or {}).get("_review_stale_target") is True
+    await session.refresh(original)
+    assert ((original.context or {}).get("review_loop") or {}).get(
+        "review_approved"
+    ) is not True
 
 
 @pytest.mark.asyncio
@@ -11127,8 +11191,10 @@ async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker
 
 
 @pytest.mark.asyncio
-async def test_base_only_request_changes_keeps_review_admitted(tl_db, mocker):
-    """Base-only drift keeps the head-bound REQUEST_CHANGES result usable."""
+async def test_base_only_request_changes_is_stale_and_respawns_full_review(
+    tl_db, mocker
+):
+    """Base-only drift changes the effective diff and invalidates guidance."""
     calls, review_task = await _run_stale_head_branch(
         tl_db,
         mocker,
@@ -11138,10 +11204,12 @@ async def test_base_only_request_changes_keeps_review_admitted(tl_db, mocker):
         live_base_sha="newbase111111",
     )
 
-    assert not any(c[0][1] == "review" for c in calls)
-    fix_calls = [c for c in calls if c[0][1] == "fix"]
-    assert len(fix_calls) == 1
-    assert (review_task.context or {}).get("_review_stale_head") is not True
+    assert not any(c[0][1] == "fix" for c in calls)
+    review_calls = [c for c in calls if c[0][1] == "review"]
+    assert len(review_calls) == 1
+    assert review_calls[0][1]["delta_base_sha"] == ""
+    assert review_calls[0][1]["review_target"]["base_sha"] == "newbase111111"
+    assert (review_task.context or {}).get("_review_stale_target") is True
 
 
 @pytest.mark.asyncio

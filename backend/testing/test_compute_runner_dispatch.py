@@ -2216,6 +2216,7 @@ async def test_learned_backend_block_ignores_contradicted_runner(monkeypatch):
         }
     }
     task = SimpleNamespace(
+        id=uuid.uuid4(),
         project_id=project_id,
         depends_on=[],
         blocker_kind=None,

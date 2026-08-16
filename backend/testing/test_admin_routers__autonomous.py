@@ -16,6 +16,7 @@ import pytest
 from httpx import AsyncClient
 
 from app.models import (
+    DiscoveryCycle,
     Project,
     ProjectMember,
     Task,
@@ -644,6 +645,84 @@ class TestAutonomyDebug:
             f"Expected 2 research tasks this hour, got {tasks_this_hour}. "
             "Non-research and out-of-window tasks must be excluded."
         )
+
+    @pytest.mark.asyncio
+    async def test_nine_debug_eligible_but_zero_scheduler_runnable_regression(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        """The debug view and scheduler share discovery-root admission truth.
+
+        This recreates the live 9/10 false-green shape: nine directions look
+        active and out of cooldown but are actually in review_pending; the
+        tenth is refractory.  Both surfaces must report zero runnable roots.
+        """
+
+        from app.autonomous_research import _cycle_blocked_direction_keys
+
+        project = await _make_project(db_session, name="AutonomyDebug Cycle Parity")
+        directions = [
+            {
+                "id": f"d-parity-{index}",
+                "text": f"Direction {index}",
+                "status": "active",
+                "priority": "medium",
+                "completion_criteria": f"Direction {index} is verified.",
+            }
+            for index in range(10)
+        ]
+        directions[-1]["refractory_until"] = (
+            _utcnow() + timedelta(hours=1)
+        ).isoformat()
+        project.directions = directions
+        db_session.add(project)
+        await db_session.flush()
+        db_session.add_all(
+            [
+                DiscoveryCycle(
+                    project_id=project.id,
+                    direction_key=direction["id"],
+                    generation=1,
+                    outcome_kind="mixed",
+                    state="review_pending",
+                    bet_snapshot={"direction": dict(direction)},
+                )
+                for direction in directions[:9]
+            ]
+        )
+        await db_session.commit()
+
+        scheduler_blocked = await _cycle_blocked_direction_keys(
+            db_session,
+            project.id,
+            directions,
+        )
+        assert scheduler_blocked == {
+            direction["id"] for direction in directions[:9]
+        }
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/autonomy-debug")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        by_id = {direction["id"]: direction for direction in data["directions"]}
+
+        assert sum(direction["is_eligible"] for direction in by_id.values()) == 0
+        assert {
+            by_id[direction["id"]]["block_reason_code"]
+            for direction in directions[:9]
+        } == {"discovery_review_pending"}
+        assert all(
+            by_id[direction["id"]]["next_action"]
+            for direction in directions[:9]
+        )
+        guard = next(
+            item
+            for item in data["blocking_guards"]
+            if item["guard"] == "no_eligible_directions"
+        )
+        assert guard["discovery_blocked_direction_count"] == 9
+        assert guard["total_active_directions"] == 10
 
     @pytest.mark.asyncio
     async def test_autonomy_debug_reports_global_backstop_and_project_pause(

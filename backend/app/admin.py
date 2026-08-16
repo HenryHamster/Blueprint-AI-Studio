@@ -101,6 +101,7 @@ from app.task_outcomes import build_task_evaluation_summary
 from app.task_direction_refs import first_task_direction_id
 from app.task_movement import build_task_movement_explanation
 from app.task_surface_visibility import non_resident_infrastructure_task_filter
+from app.landed_signal import is_merged_completion
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     PROJECT_WRITE_ROLES,
@@ -299,7 +300,7 @@ def _artifact_is_current_attempt(
 _TASK_LIST_COLS = [
     Task.id, Task.project_id, Task.title, Task.description, Task.status,
     Task.vm_instance_id, Task.latest_status_message,
-    Task.created_by, Task.requires_approval, Task.parent_task_id, Task.depends_on,
+    Task.created_by, Task.origination, Task.requires_approval, Task.parent_task_id, Task.depends_on,
     Task.plan_output, Task.created_at, Task.started_at, Task.last_heartbeat,
     Task.last_metrics_json, Task.last_tool_use_at, Task.attempt_count,
     Task.blocker_kind, Task.blocked_reason, Task.blocked_at, Task.recheck_after,
@@ -685,6 +686,11 @@ async def get_all_tasks(
             "vm_instance_id": t.vm_instance_id,
             "latest_status_message": t.latest_status_message,
             "created_by": t.created_by,
+            # Durable source-of-work authority. ``created_by`` collapses nearly
+            # every automated producer into ORCHESTRATOR, which made direction
+            # autonomy volume indistinguishable from Strategic/review/system
+            # churn on the operator task surface.
+            "origination": t.origination,
             "requires_approval": t.requires_approval,
             "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
             "depends_on": t.depends_on or [],
@@ -727,7 +733,12 @@ async def get_all_tasks(
             "archived": t.archived,
             "artifacts": artifacts_map.get(str(t.id), []),
             "pr_url": pr_map.get(str(t.id)),
-            "error_logs": logs_map.get(str(t.id)),
+            # ERROR_LOG artifacts remain in ``artifacts`` for audit, but once
+            # integration has been corroborated they are no longer the task's
+            # current failure projection.
+            "error_logs": None
+            if is_merged_completion(t)
+            else logs_map.get(str(t.id)),
             "research_findings": resolve_research_findings_for_surface_from_state(
                 t.plan_output,
                 t.context,
@@ -1206,7 +1217,9 @@ async def _bulk_retry_one_task(
                 )
             old_vm: str | None = None
             if has_children:
-                await _requeue_parent_task(task, scoped_session)
+                await _requeue_parent_task(
+                    task, scoped_session, automatic_creation=False
+                )
             else:
                 old_vm = task.vm_instance_id
                 reset_task_for_fresh_attempt(task)
@@ -2289,6 +2302,7 @@ async def get_task(
         "latest_status_message": task.latest_status_message,
         "status_log": task.status_log or [],
         "created_by": task.created_by,
+        "origination": task.origination,
         "requires_approval": task.requires_approval,
         "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
         "depends_on": task.depends_on or [],
@@ -2343,7 +2357,9 @@ async def get_task(
         "archived": task.archived,
         "artifacts": artifacts_list,
         "pr_url": pr_url,
-        "error_logs": error_logs,
+        # Preserve the immutable ERROR_LOG artifact above without presenting
+        # it as a current blocker after this exact work has landed.
+        "error_logs": None if is_merged_completion(task) else error_logs,
         "commit_hash": commit_hash,
         "repo_url": repo_url,
         "research_findings": resolve_research_findings_for_surface(task)

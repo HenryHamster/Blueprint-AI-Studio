@@ -158,7 +158,7 @@ def first_payload(task: dict) -> dict:
 # ── projects ─────────────────────────────────────────────────────────────────
 
 def cmd_projects(args: argparse.Namespace) -> None:
-    """List every project as ``id · name · status``. Respects ``--json``."""
+    """List every project with its canonical operational state. Respects ``--json``."""
     projects = list_projects()
     _emit(args, {"projects": projects, "total": len(projects)}, _render_projects)
 
@@ -172,7 +172,12 @@ def _render_projects(data: dict) -> None:
     for p in projects:
         pid = p.get("id") or "?"
         name = p.get("name") or "?"
-        status = p.get("status") or p.get("state") or "-"
+        status = (
+            p.get("operational_state")
+            or p.get("state")
+            or p.get("status")
+            or "-"
+        )
         print(f"  {pid} · {name} · {status}")
 
 
@@ -3679,7 +3684,12 @@ def _health_deploy(args: argparse.Namespace) -> None:
         "external_health": eh,
         "orchestrator": {
             "status": orch.get("status"),
+            "authority": orch.get("authority"),
             "cycle_age_seconds": orch.get("cycle_age_seconds"),
+            "cycle_age_kind": orch.get("cycle_age_kind"),
+            "heartbeat_age_seconds": orch.get("heartbeat_age_seconds"),
+            "stale_after_seconds": orch.get("stale_after_seconds"),
+            "reason": orch.get("reason"),
             "queued_tasks": orch.get("queued_tasks"),
             "active_tasks": orch.get("active_tasks"),
         },
@@ -3712,15 +3722,25 @@ def _render_health_deploy(data: dict) -> None:
     required = data.get("health_recovery_streak_required") or 3
     dots = ["OK " if hist[i] else "FAIL" for i in range(min(len(hist), size))]
     dots += ["--  "] * (size - len(dots))
-    print(f"\n=== RING BUFFER (3-of-5 gate) ===")
+    print("\n=== RING BUFFER (3-of-5 gate) ===")
     print(f"  Recovery: [{' | '.join(dots)}]  {streak}/{required} healthy")
     orch = data.get("orchestrator") or {}
-    print(f"\n=== ORCHESTRATOR CYCLE ===")
+    print("\n=== ORCHESTRATOR ===")
     print(f"  Status:    {orch.get('status', '?')}")
+    if orch.get("authority"):
+        print(f"  Authority: {orch['authority']}")
+    heartbeat_age = orch.get("heartbeat_age_seconds")
+    stale_after = orch.get("stale_after_seconds")
+    if heartbeat_age is not None:
+        warning = bool(stale_after is not None and heartbeat_age >= stale_after)
+        print(
+            f"  Last heartbeat: {int(heartbeat_age)}s ago"
+            + ("  WARNING: heartbeat is stale" if warning else "")
+        )
     cycle_age = orch.get("cycle_age_seconds")
-    if cycle_age is None:
+    if cycle_age is None and heartbeat_age is None:
         print("  Last cycle: never (loop has not completed a cycle since process start)")
-    else:
+    elif cycle_age is not None:
         print(f"  Last cycle: {int(cycle_age)}s ago"
               + ("  WARNING: cycle >30s old — loop may be stuck" if cycle_age > 30 else ""))
     errors = data.get("errors") or {}

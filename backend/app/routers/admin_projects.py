@@ -69,6 +69,15 @@ router = APIRouter(
 logger = logging.getLogger(__name__)
 
 
+def _project_operational_state(project: Any) -> str:
+    """Canonical long-lived project state; legacy ``status`` is not runtime truth."""
+    if bool(getattr(project, "archived", False)):
+        return "archived"
+    if bool(getattr(project, "paused", False)):
+        return "paused"
+    return "active"
+
+
 def _redact_build_config(build_config: dict, role: str) -> dict:
     """Return build_config with env_vars omitted for non-owner callers.
 
@@ -325,6 +334,8 @@ async def get_all_projects(
                 "name": row.name,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "status": row.status,
+                "status_semantics": "legacy_finite_lifecycle",
+                "operational_state": _project_operational_state(row),
                 "user_id": row.user_id,
                 "github_owner": row.github_owner,
                 "github_repo": row.github_repo,
@@ -398,6 +409,8 @@ async def get_project(
         "name": project.name,
         "user_id": project.user_id,
         "status": project.status,
+        "status_semantics": "legacy_finite_lifecycle",
+        "operational_state": _project_operational_state(project),
         "github_owner": project.github_owner,
         "github_repo": project.github_repo,
         "created_at": project.created_at.isoformat() if project.created_at else None,
@@ -419,6 +432,7 @@ async def get_project(
         "merge_gate_runtime": merge_gate_runtime_block(project),
         "autonomous_enabled": project.autonomous_enabled,
         "paused": project.paused,
+        "archived": project.archived,
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
         "approval_gate_config": project.approval_gate_config or {},
@@ -477,6 +491,8 @@ async def get_project_summary(
         "name": project.name,
         "user_id": project.user_id,
         "status": project.status,
+        "status_semantics": "legacy_finite_lifecycle",
+        "operational_state": _project_operational_state(project),
         "github_owner": project.github_owner,
         "github_repo": project.github_repo,
         "created_at": project.created_at.isoformat() if project.created_at else None,
@@ -496,6 +512,7 @@ async def get_project_summary(
         "merge_gate_runtime": merge_gate_runtime_block(project),
         "autonomous_enabled": project.autonomous_enabled,
         "paused": project.paused,
+        "archived": project.archived,
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
         "approval_gate_config": project.approval_gate_config or {},

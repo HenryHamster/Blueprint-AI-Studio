@@ -314,7 +314,8 @@ class TestCapExhaustionHonorsPark:
         await park_db.refresh(source_task)
 
         await _handle_cap_exhaustion(
-            source_task, str(orig.id), 16759, 16, park_db, scope="global"
+            source_task, str(orig.id), 16759, 16, park_db,
+            scope="global", verified_disposition="reject"
         )
 
         await park_db.refresh(orig)
@@ -370,7 +371,8 @@ class TestCapExhaustionHonorsPark:
         await park_db.refresh(source_task)
 
         await _handle_cap_exhaustion(
-            source_task, str(orig.id), 720, 16, park_db, scope="per-chain"
+            source_task, str(orig.id), 720, 16, park_db,
+            scope="per-chain", verified_disposition="reject"
         )
 
         await park_db.refresh(orig)

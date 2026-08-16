@@ -799,8 +799,8 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
 
     // The durable remote checkpoint intentionally remains as the lease target.
-    // The generated ./pr publication path must replace it with force-with-lease,
-    // not a plain non-fast-forward push that would wedge the recovered retry.
+    // Publication must bind its lease to the exact observed remote SHA rather
+    // than using Git's ambient tracking state or a plain non-fast-forward push.
     vi.mocked(fs.writeFileSync).mockClear();
     writePrHelper({
       taskId,
@@ -817,6 +817,15 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     const prScript = prWrite?.[1];
     expect(typeof prScript).toBe('string');
     expect(prScript as string).toContain(
+      `_PR_REMOTE_REF="refs/heads/${workBranch}"`,
+    );
+    expect(prScript as string).toContain(
+      '_PR_LEASE="--force-with-lease=$_PR_REMOTE_REF:$_PR_EXPECTED_REMOTE_SHA"',
+    );
+    expect(prScript as string).toContain(
+      'git push "$_PR_LEASE" origin "HEAD:$_PR_REMOTE_REF"',
+    );
+    expect(prScript as string).not.toContain(
       `git push --force-with-lease origin "${workBranch}"`,
     );
   });

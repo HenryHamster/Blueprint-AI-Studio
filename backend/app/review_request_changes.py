@@ -341,10 +341,10 @@ async def run_request_changes(
 
     # Stale/unproven-target guard: REQUEST_CHANGES can launch a
     # code-writing fix only when the reviewer proved the exact
-    # immutable head it inspected. The base branch tip is ambient while
-    # the PR is in flight, so base-only drift does not invalidate head-bound
-    # review guidance; the live base is still required for downstream merge
-    # authority. If GitHub cannot provide the live target, fail closed for
+    # immutable base+head pair it inspected. Base-only drift changes the
+    # effective diff and can invalidate both approval and defect guidance; a
+    # head-relative delta is empty in that case, so the replacement must be a
+    # full exact-target review. If GitHub cannot provide the live target, fail closed for
     # operator attention rather than expanding to an unpinned review.
     if not head_sha or not base_sha:
         task.status = TaskStatus.COMPLETED
@@ -364,7 +364,9 @@ async def run_request_changes(
 
     review_target_unproven = (
         not reviewed_head_sha
+        or not reviewed_base_sha
         or reviewed_head_sha != head_sha
+        or reviewed_base_sha != base_sha
     )
     if review_target_unproven:
         # A stale finding can waste a fix iteration just as a
@@ -405,6 +407,7 @@ async def run_request_changes(
             task.context = {
                 **(task.context or {}),
                 "_review_stale_head": True,
+                "_review_stale_target": True,
             }
             flag_modified(task, "context")
             session.add(task)
@@ -414,7 +417,10 @@ async def run_request_changes(
                 f"{original_task_id[:8]} parked for operator "
                 f"({_stale_park_reason})"
             )
-        elif not (task.context or {}).get("_review_stale_head"):
+        elif not (
+            (task.context or {}).get("_review_stale_head")
+            or (task.context or {}).get("_review_stale_target")
+        ):
             task.status = TaskStatus.COMPLETED
             task.latest_status_message = (
                 f"Stale-target review discarded for PR #{pr_number} "
@@ -438,6 +444,7 @@ async def run_request_changes(
             task.context = {
                 **(task.context or {}),
                 "_review_stale_head": True,
+                "_review_stale_target": True,
             }
             flag_modified(task, "context")
             session.add(task)
@@ -480,9 +487,8 @@ async def run_request_changes(
         await session.commit()
         return True, {"status": "accepted"}
 
-    # A cached verdict must have evaluated this exact head. Base drift is
-    # handled by the final merge-authority gate, not review admission.
-    if reviewed_head_sha == head_sha:
+    # A cached verdict must have evaluated this exact effective target.
+    if reviewed_head_sha == head_sha and reviewed_base_sha == base_sha:
         _record_structured_review_result(
             {
                 "project_id": str(task.project_id),

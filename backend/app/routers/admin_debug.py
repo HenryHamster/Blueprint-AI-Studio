@@ -818,7 +818,18 @@ async def get_autonomy_debug(
             active_research_count += 1
 
     # Guard 3: no_eligible_directions — a direction is eligible only if it's
-    # active, out of refractory, AND not already held by another research task.
+    # active, out of refractory, not held by another research task, AND the
+    # same discovery-cycle admission predicate used by the scheduler admits it.
+    from app.discovery_admission import (
+        direction_discovery_admission_decision,
+        load_direction_discovery_admission_decisions,
+    )
+
+    discovery_admission = await load_direction_discovery_admission_decisions(
+        session,
+        project_id,
+        list(project.directions or []),
+    )
     cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
     directions_info = []
     for d in project.directions or []:
@@ -832,7 +843,15 @@ async def get_autonomy_debug(
             max(0, int(remaining_minutes * 60)) if in_cooldown else None
         )
         is_busy = d.get("id") in busy_direction_ids
-        is_eligible = not in_cooldown and not is_busy
+        direction_key = str(d.get("id") or "").strip()
+        cycle_admission = discovery_admission.get(direction_key)
+        if cycle_admission is None:
+            cycle_admission = direction_discovery_admission_decision(d, None)
+        is_eligible = (
+            not in_cooldown
+            and not is_busy
+            and cycle_admission.can_admit_root
+        )
         entry = {
             "id": d.get("id"),
             "text": d.get("text", ""),
@@ -842,6 +861,7 @@ async def get_autonomy_debug(
             "refractory_reason": refractory_info["refractory_reason"],
             "is_eligible": is_eligible,
             "seconds_until_eligible": seconds_until_eligible,
+            "discovery_admission": cycle_admission.as_dict(),
         }
         if is_busy:
             if d.get("id") in blocked_direction_ids:
@@ -853,6 +873,19 @@ async def get_autonomy_debug(
                 entry["busy_reason"] = (
                     "direction has active research task (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)"
                 )
+            entry["block_reason_code"] = "research_task_busy"
+            entry["block_reason"] = entry["busy_reason"]
+            entry["next_action"] = "Wait for or unblock the owning research task."
+        elif in_cooldown:
+            entry["block_reason_code"] = "direction_refractory"
+            entry["block_reason"] = str(
+                refractory_info["refractory_reason"] or "Direction is in refractory."
+            )
+            entry["next_action"] = "Wait for refractory to expire or clear it explicitly."
+        elif not cycle_admission.can_admit_root:
+            entry["block_reason_code"] = cycle_admission.reason_code
+            entry["block_reason"] = cycle_admission.reason
+            entry["next_action"] = cycle_admission.next_action
         directions_info.append(entry)
 
     eligible_directions = [d for d in directions_info if d["is_eligible"]]
@@ -866,10 +899,26 @@ async def get_autonomy_debug(
             default=None,
         )
         busy_count = sum(1 for d in directions_info if d.get("busy_reason"))
+        cycle_blocked_count = sum(
+            1
+            for direction in directions_info
+            if not direction["discovery_admission"]["can_admit_root"]
+        )
         if not directions_info:
             reason = "No active directions exist"
+        elif cycle_blocked_count == len(directions_info):
+            reason = (
+                f"All {len(directions_info)} active directions are blocked by "
+                "their discovery-cycle admission state"
+            )
         elif busy_count == len(directions_info):
             reason = f"All {len(directions_info)} active directions are held by running research"
+        elif cycle_blocked_count > 0:
+            reason = (
+                "No runnable direction remains; "
+                f"{cycle_blocked_count} blocked by discovery admission and "
+                f"{busy_count} held by running research"
+            )
         elif busy_count > 0:
             reason = f"All remaining directions in cooldown; {busy_count} held by running research"
         else:
@@ -880,6 +929,7 @@ async def get_autonomy_debug(
                 "reason": reason,
                 "time_until_eligible_seconds": min_wait,
                 "busy_direction_count": busy_count,
+                "discovery_blocked_direction_count": cycle_blocked_count,
                 "total_active_directions": len(directions_info),
             }
         )

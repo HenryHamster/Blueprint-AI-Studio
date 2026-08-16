@@ -558,12 +558,82 @@ def test_durable_seed_survives_many_sequential_history_compactions() -> None:
         assert issue_ledger_complete_for_history(ledger, history) is True
 
 
+def test_markerless_legacy_seed_ingests_new_blocker_and_regains_lineage() -> None:
+    legacy_seed = {
+        "open": [
+            {
+                "issue_id": "BP-old",
+                "description": "legacy blocker",
+                "severity": "MAJOR",
+                "file": "legacy.py",
+                "line": 10,
+            }
+        ],
+        "resolved": [],
+    }
+    current = _review(
+        8,
+        "head-current",
+        [_issue("new current blocker", issue_id="BP-new", file="current.py")],
+    )
+
+    rebuilt = build_issue_ledger(
+        [current], seed_ledger=legacy_seed, stamp_complete=True
+    )
+
+    assert {row["description"] for row in rebuilt["open"]} == {
+        "legacy blocker",
+        "new current blocker",
+    }
+    assert rebuilt["complete"] is True
+    assert rebuilt.get("through_entry_key")
+
+    approval = _review(
+        9,
+        "head-final",
+        verdict="APPROVE",
+        resolutions=[
+            {
+                "issue_id": "BP-old",
+                "disposition": "adjudicated",
+                "reason": "operator verified the legacy report is obsolete",
+            }
+        ],
+    )
+    converged = build_issue_ledger(
+        [current, approval], seed_ledger=rebuilt, stamp_complete=True
+    )
+
+    assert converged["open"] == []
+    assert {row["issue_id"] for row in converged["resolved"]} == {
+        "BP-old",
+        _backend_id(
+            _issue("new current blocker", file="current.py"),
+            head="head-current",
+            iteration=8,
+        ),
+    }
+    assert issue_ledger_complete_for_history(converged, [current, approval]) is True
+
+
 def test_discontinuous_capped_history_cannot_extend_stale_seed_proof() -> None:
-    first = _review(1, "head-1", verdict="APPROVE")
+    first = _review(
+        5,
+        "head-5",
+        issues=[
+            {
+                "description": "future-seed blocker",
+                "severity": "MAJOR",
+                "file": "scanner.py",
+                "line": 50,
+            }
+        ],
+    )
     seed = build_issue_ledger([first], stamp_complete=True)
+    seed_marker = seed["through_entry_key"]
     discontinuous_history = [
         _review(iteration, f"head-{iteration}", verdict="APPROVE")
-        for iteration in range(100, 100 + REVIEW_HISTORY_MAX_ENTRIES)
+        for iteration in range(1, 1 + REVIEW_HISTORY_MAX_ENTRIES)
     ]
 
     rebuilt = build_issue_ledger(
@@ -573,6 +643,13 @@ def test_discontinuous_capped_history_cannot_extend_stale_seed_proof() -> None:
     )
 
     assert rebuilt["complete"] is False
+    assert [row["description"] for row in rebuilt["open"]] == [
+        "future-seed blocker"
+    ], "older retained approvals must not resolve a finding from a future seed"
+    assert rebuilt["resolved"] == []
+    assert rebuilt["through_entry_key"] == seed_marker, (
+        "a disconnected history window must not advance the durable lineage marker"
+    )
     assert issue_ledger_complete_for_history(
         rebuilt, discontinuous_history
     ) is False

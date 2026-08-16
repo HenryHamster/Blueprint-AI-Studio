@@ -194,6 +194,10 @@ async def run_completion_dispatch(
                 await _handler(
                     task, _handler_logs, session, project=locked_project
                 )
+            elif _handler_name == "compute_experiment":
+                await _handler(
+                    task, _handler_logs, session, project=locked_project
+                )
             elif _capability.completion_needs_locked_project:
                 await _handler(
                     task, _handler_logs, session, project=locked_project

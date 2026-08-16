@@ -34,6 +34,11 @@ from app.shared_state import (
     get_project_promotion_target as _get_project_promotion_target,
     runtime_config as _runtime_config,
 )
+from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    automatic_task_creation_decision,
+    automatic_task_creation_parent_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +113,8 @@ async def maybe_spawn_smoketest_fix(
     payload: AgentStatusPayload,
     session: AsyncSession,
     task_id_str: str,
+    *,
+    locked_project: Project | None,
 ) -> None:
     """Handle SMOKETEST_RESULT: store in plan_output and on failure spawn a fix plan."""
     # 3b. Parse and store smoketest result in task.plan_output + document in history
@@ -176,6 +183,21 @@ async def maybe_spawn_smoketest_fix(
         and payload.logs
         and not (task.context or {}).get("qualifier_smoketest")
     ):
+        _smoketest_admission = automatic_task_creation_decision(locked_project)
+        if _smoketest_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            task.context = {
+                **(task.context or {}),
+                "automatic_fix_creation_suppressed": _smoketest_admission,
+            }
+            flag_modified(task, "context")
+            session.add(task)
+            logger.info(
+                "[SMOKETEST] Suppressed automatic fix for task %s: %s",
+                task_id_str,
+                _smoketest_admission,
+            )
+            return
+
         # _smoketest_spawn_state captures the Task constructor kwargs before the
         # first session.flush() so that the except block can rebuild and retry the
         # spawn exactly once on the recovered session without re-running the
@@ -211,7 +233,7 @@ async def maybe_spawn_smoketest_fix(
                         # (production) failure only when the LTS model is active.
                         # The LTS model is active when the integration trunk and
                         # promotion target are distinct branches.
-                        _smoketest_project = await session.get(Project, task.project_id)
+                        _smoketest_project = locked_project
                         if _smoketest_project is None:
                             logger.warning(
                                 "[SMOKETEST] project not found for task %s "
@@ -481,42 +503,88 @@ async def maybe_spawn_smoketest_fix(
                     )
                 else:
                     try:
-                        _retry_task = Task(
-                            project_id=_smoketest_spawn_state["project_id"],
-                            title=_smoketest_spawn_state["title"],
-                            description=_smoketest_spawn_state["description"],
-                            parent_task_id=_smoketest_spawn_state["parent_task_id"],
-                            priority=_smoketest_spawn_state["priority"],
-                            payloads=_smoketest_spawn_state["payloads"],
-                            context=_smoketest_spawn_state["context"],
-                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                            status=_smoketest_spawn_state["status"],
-                            created_by=_smoketest_spawn_state["created_by"],
-                            origination=TASK_ORIGINATION_SMOKETEST,
+                        # Rollback released the original Project/Task locks.
+                        # Persist the re-applied terminal status, then reacquire
+                        # Project -> parent Task before retrying the child INSERT.
+                        session.add(task)
+                        await session.commit()
+                        async with automatic_task_creation_parent_lock(
+                            session,
+                            _smoketest_spawn_state["project_id"],
+                            _smoketest_spawn_state["parent_task_id"],
+                            skip_locked=False,
+                        ) as (_retry_admission, _retry_project, _retry_parent):
+                            if _retry_project is None or _retry_parent is None:
+                                raise RuntimeError(
+                                    "smoketest retry could not lock project/parent"
+                                )
+
+                        # Make the post-commit refresh explicit at this call
+                        # site.  The combined lock helper already re-selected
+                        # the parent, but a direct ``session.get`` both keeps
+                        # the ORM instance fresh after the preceding commit
+                        # and makes the MissingGreenlet invariant statically
+                        # verifiable without an allowlist exception.
+                        task = await session.get(
+                            Task,
+                            _smoketest_spawn_state["parent_task_id"],
+                            populate_existing=True,
                         )
-                        session.add(_retry_task)
-                        await session.flush()
-                        session.add(
-                            TaskHistory(
-                                task_id=_retry_task.id,
-                                action="SPAWNED",
-                                details={
-                                    "spawned_by": "SMOKETEST_FAILURE",
-                                    "priority": _smoketest_spawn_state["priority"],
-                                    "failed_tests": [
-                                        t["name"]
-                                        for t in _smoketest_spawn_state["failed_tests"]
-                                    ],
-                                    "retry": True,
-                                },
+                        if task is None:
+                            raise RuntimeError(
+                                "smoketest retry parent disappeared after lock"
                             )
-                        )
-                        _spawn_retry_succeeded = True
-                        logger.info(
-                            "[SMOKETEST] Retry spawn succeeded for task %s -> plan task %s",
-                            task_id_str,
-                            _retry_task.id,
-                        )
+
+                        if _retry_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+                            task.context = {
+                                **(task.context or {}),
+                                "automatic_fix_creation_suppressed": _retry_admission,
+                            }
+                            flag_modified(task, "context")
+                            session.add(task)
+                            _spawn_retry_succeeded = True
+                            logger.info(
+                                "[SMOKETEST] Retry fix suppressed for task %s: %s",
+                                task_id_str,
+                                _retry_admission,
+                            )
+                        else:
+                            _retry_task = Task(
+                                project_id=_smoketest_spawn_state["project_id"],
+                                title=_smoketest_spawn_state["title"],
+                                description=_smoketest_spawn_state["description"],
+                                parent_task_id=_smoketest_spawn_state["parent_task_id"],
+                                priority=_smoketest_spawn_state["priority"],
+                                payloads=_smoketest_spawn_state["payloads"],
+                                context=_smoketest_spawn_state["context"],
+                                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                                status=_smoketest_spawn_state["status"],
+                                created_by=_smoketest_spawn_state["created_by"],
+                                origination=TASK_ORIGINATION_SMOKETEST,
+                            )
+                            session.add(_retry_task)
+                            await session.flush()
+                            session.add(
+                                TaskHistory(
+                                    task_id=_retry_task.id,
+                                    action="SPAWNED",
+                                    details={
+                                        "spawned_by": "SMOKETEST_FAILURE",
+                                        "priority": _smoketest_spawn_state["priority"],
+                                        "failed_tests": [
+                                            t["name"]
+                                            for t in _smoketest_spawn_state["failed_tests"]
+                                        ],
+                                        "retry": True,
+                                    },
+                                )
+                            )
+                            _spawn_retry_succeeded = True
+                            logger.info(
+                                "[SMOKETEST] Retry spawn succeeded for task %s -> plan task %s",
+                                task_id_str,
+                                _retry_task.id,
+                            )
                     except Exception as _retry_err:
                         logger.error(
                             "[SMOKETEST] Retry spawn also failed for task %s: %s",
@@ -563,6 +631,8 @@ async def maybe_spawn_debug_create(
     payload: AgentStatusPayload,
     session: AsyncSession,
     task_id_str: str,
+    *,
+    locked_project: Project | None,
 ) -> None:
     """Handle DEBUG_RESULT: store in plan_output and if confidence is high spawn a fix task."""
     # 3c. Parse debug result, store in plan_output, and optionally spawn a fix task
@@ -576,8 +646,23 @@ async def maybe_spawn_debug_create(
 
             # If confidence is high, auto-spawn a create task using the fix_prompt
             if debug_data.get("confidence") == "high" and debug_data.get("fix_prompt"):
+                _debug_admission = automatic_task_creation_decision(locked_project)
+                if _debug_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+                    task.context = {
+                        **(task.context or {}),
+                        "automatic_fix_creation_suppressed": _debug_admission,
+                    }
+                    flag_modified(task, "context")
+                    session.add(task)
+                    logger.info(
+                        "[DEBUG] Suppressed automatic fix for task %s: %s",
+                        task_id_str,
+                        _debug_admission,
+                    )
+                    return
+
                 failed_task_id = (task.context or {}).get("failed_task_id", "")
-                _debug_project = await session.get(Project, task.project_id)
+                _debug_project = locked_project
                 base_branch = (task.first_payload).get(
                     "base_branch"
                 ) or _get_project_integration_branch(_debug_project)

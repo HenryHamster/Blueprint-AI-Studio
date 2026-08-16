@@ -109,7 +109,7 @@ def test_cross_episode_abandon_candidate_counts_cancelled_superseded_history():
             iteration=index + 1 if index < 6 else (index - 5 if index < 8 else 4),
             original_task_id=first_episode if index < 6 else superseded_episode,
         )
-        for index in range(9)
+        for index in range(10)
     ]
 
     candidate = build_cross_episode_abandon_candidate(attempts, threshold=10)
@@ -117,7 +117,7 @@ def test_cross_episode_abandon_candidate_counts_cancelled_superseded_history():
     assert candidate == {
         "status": "abandon_candidate",
         "threshold": 10,
-        "attempts": 9,
+        "attempts": 10,
         "cycles": 10,
         "burden": 10,
         "cancelled_attempts": 3,
@@ -142,6 +142,33 @@ def test_cross_episode_abandon_candidate_does_not_flag_converging_pr():
     ]
 
     assert build_cross_episode_abandon_candidate(attempts) is None
+
+
+def test_cross_episode_abandon_ignores_stale_and_parallel_observation_rows():
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    episode = uuid.uuid4()
+    rows = []
+    for index in range(20):
+        task = _history_attempt(
+            project_id,
+            task_type="review",
+            status=TaskStatus.COMPLETED,
+            iteration=index + 1,
+            original_task_id=episode,
+        )
+        task.context = {
+            **(task.context or {}),
+            **(
+                {"_review_stale_target": True}
+                if index % 2 == 0
+                else {"review_was_parallelized": True}
+            ),
+        }
+        rows.append(task)
+
+    assert build_cross_episode_abandon_candidate(rows, threshold=1) is None
 
 
 def test_cross_episode_threshold_matches_rollup_review_cap():
@@ -171,7 +198,7 @@ def test_cross_episode_threshold_matches_rollup_review_cap():
 
 @pytest.mark.asyncio
 async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_session, mocker):
-    """The production spawn gate refuses a new fix after the PR threshold."""
+    """Archived exact generations still exhaust the PR-lifetime threshold."""
     from app.review_pipeline import (
         SPAWN_REASON_ABANDON_CANDIDATE,
         _spawn_pipeline_task,
@@ -199,6 +226,8 @@ async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_sessi
         )
         for index in range(16)
     ]
+    for task in history:
+        task.archived = True
     db_session.add_all(history)
     source_task = make_task(
         project_id=project.id,
@@ -262,10 +291,10 @@ async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_sessi
     # Its timestamp starts a fresh cap/census window without deleting history.
     from app.time_utils import _utcnow
 
-    original_task.context = {
-        **(original_task.context or {}),
-        "review_loop": {"iteration_reset_at": _utcnow().isoformat()},
-    }
+    reset_context = dict(original_task.context or {})
+    reset_context.pop("review_loop_abandon_candidate", None)
+    reset_context["review_loop"] = {"iteration_reset_at": _utcnow().isoformat()}
+    original_task.context = reset_context
     db_session.add(original_task)
     await db_session.commit()
     resumed, resumed_created = await _spawn_pipeline_task(
@@ -697,7 +726,8 @@ async def test_cap_preserves_backmerge_resolver_pr(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 710, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 710, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -762,7 +792,8 @@ async def test_cap_closes_nonrollup_nonbackmerge_pr(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 720, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 720, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -820,7 +851,8 @@ async def test_cap_preserves_rollup_pr_unchanged(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 730, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 730, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -985,6 +1017,7 @@ async def test_approved_dirty_rollup_routed_to_preserve_not_close(db_session, mo
         16,
         db_session,
         scope="global",
+        verified_disposition="reject",
     )
 
     await db_session.refresh(orig)
@@ -1092,7 +1125,8 @@ async def test_spawn_lock_released_before_preservability_get(
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 140, 16, db_session, scope="global"
+        source_task, str(orig.id), 140, 16, db_session,
+        scope="global", verified_disposition="reject"
     )
 
     assert seen_in_txn, "preservability GET never fired — test setup is wrong"
@@ -1281,7 +1315,8 @@ async def test_preservability_timeout_does_not_close_the_pr_or_fail_the_task(
 
     # Must NOT raise: the defer is handled inside _handle_cap_exhaustion.
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 143, 16, db_session, scope="global"
+        source_task, str(orig.id), 143, 16, db_session,
+        scope="global", verified_disposition="reject"
     )
 
     close_mock.assert_not_called()
@@ -1425,7 +1460,8 @@ async def test_cap_exhaustion_peer_locked_orig_does_not_expire_caller_source_tas
     mocker.patch.object(db_session, "execute", side_effect=_execute)
 
     await _handle_cap_exhaustion(
-        source_task, orig_id, 144, 16, db_session, scope="global"
+        source_task, orig_id, 144, 16, db_session,
+        scope="global", verified_disposition="reject"
     )
 
     # THE regression assertion. Pre-fix this raises
@@ -1597,7 +1633,8 @@ async def test_preservability_rate_limit_does_not_close_the_pr_or_fail_the_task(
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 145, 16, db_session, scope="global"
+        source_task, str(orig.id), 145, 16, db_session,
+        scope="global", verified_disposition="reject"
     )
 
     close_mock.assert_not_called()
@@ -1816,7 +1853,8 @@ async def test_cap_defer_is_counted_and_alerts_after_threshold(db_session, mocke
 
     for expected in range(1, _CAP_DEFER_ALERT_AFTER + 1):
         await _handle_cap_exhaustion(
-            source_task, str(orig.id), 149, 16, db_session, scope="global"
+            source_task, str(orig.id), 149, 16, db_session,
+            scope="global", verified_disposition="reject"
         )
         await db_session.refresh(orig)
         assert (orig.context or {}).get(_CAP_DEFER_COUNT_KEY) == expected, (
@@ -1934,7 +1972,8 @@ async def test_defer_counter_does_not_erase_a_peer_terminal_write(db_session, mo
     )
 
     await _handle_cap_exhaustion(
-        source_task, str(orig_id), 150, 16, db_session, scope="global"
+        source_task, str(orig_id), 150, 16, db_session,
+        scope="global", verified_disposition="reject"
     )
 
     # Re-read from the DB, bypassing the identity map — it would hide the clobber.

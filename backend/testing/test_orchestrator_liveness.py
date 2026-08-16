@@ -14,6 +14,7 @@ import asyncio
 import threading
 import uuid
 from datetime import timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlmodel import select
@@ -501,6 +502,10 @@ class TestAuthedOrchestratorHealth:
     informational slow-cycle signal. See orchestrator-operator-health-split.
     """
 
+    @pytest.fixture(autouse=True)
+    def _use_local_leader_authority(self, restore_orch_state):
+        _ss.is_leader = True
+
     async def test_debug_slow_but_progressing_is_alive_not_hung(
         self, client, restore_orch_state
     ):
@@ -551,6 +556,41 @@ class TestAuthedOrchestratorHealth:
         assert body["orchestrator_hung"] is True
         assert body["orchestrator_alive"] is False
 
+    async def test_debug_api_role_uses_worker_lock_heartbeat(
+        self, client, restore_orch_state, mocker
+    ):
+        """Split API diagnostics must not classify their empty local gauges."""
+        _ss.is_leader = False
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_last_progress = None
+        observed = mocker.patch(
+            "app.main.observe_background_leader_health",
+            new=AsyncMock(
+                return_value={
+                    "status": "ok",
+                    "authority": "background_leader_advisory_lock",
+                    "cycle_age_seconds": None,
+                    "cycle_age_kind": "not_observable_cross_process",
+                    "heartbeat_age_seconds": 4.0,
+                    "progress_age_seconds": 4.0,
+                    "stale_after_seconds": 90.0,
+                    "leader_pid": 123,
+                    "reason": "background leader keepalive is fresh",
+                }
+            ),
+        )
+
+        resp = await client.get("/api/debug/orchestrator")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["orchestrator_alive"] is True
+        assert body["orchestrator_hung"] is False
+        assert body["orchestrator_progress_age_seconds"] == 4.0
+        assert body["orchestrator_cycle_age_seconds"] is None
+        assert body["orchestrator_authority"] == "background_leader_advisory_lock"
+        observed.assert_awaited_once()
+
     async def test_detailed_slow_but_progressing_is_not_down(
         self, client, restore_orch_state
     ):
@@ -592,6 +632,40 @@ class TestAuthedOrchestratorHealth:
         resp = await client.get("/api/health/detailed")
         assert resp.status_code == 200
         assert resp.json()["components"]["orchestrator"]["status"] == "down"
+
+    async def test_detailed_api_role_uses_worker_lock_heartbeat(
+        self, client, restore_orch_state, mocker
+    ):
+        """Split API processes must not classify their empty local gauges."""
+        _ss.is_leader = False
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_last_progress = None
+        observed = mocker.patch(
+            "app.main.observe_background_leader_health",
+            new=AsyncMock(
+                return_value={
+                    "status": "ok",
+                    "authority": "background_leader_advisory_lock",
+                    "cycle_age_seconds": None,
+                    "cycle_age_kind": "not_observable_cross_process",
+                    "heartbeat_age_seconds": 4.0,
+                    "progress_age_seconds": 4.0,
+                    "stale_after_seconds": 90.0,
+                    "leader_pid": 123,
+                    "reason": "background leader keepalive is fresh",
+                }
+            ),
+        )
+
+        resp = await client.get("/api/health/detailed")
+
+        assert resp.status_code == 200
+        orch = resp.json()["components"]["orchestrator"]
+        assert orch["status"] == "ok"
+        assert orch["authority"] == "background_leader_advisory_lock"
+        assert orch["heartbeat_age_seconds"] == 4.0
+        assert orch["cycle_age_seconds"] is None
+        observed.assert_awaited_once()
 
 
 class TestHardWatchdogDecision:

@@ -27,7 +27,6 @@ from app.database import AsyncSessionLocal
 from app.context_bounds import bound_review_history
 from app.models import (
     TASK_ORIGINATION_REMEDIATION,
-    TASK_ORIGINATION_SMOKETEST,
     Task,
     TaskHistory,
     Project,
@@ -82,6 +81,10 @@ from app.rollup_locking import _lock_original_task, _OriginalTaskLockTimeout
 from app.notification_dispatch import (
     is_residual_remediation_task,
     post_remediation_result_message,
+)
+from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    automatic_task_creation_parent_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -502,7 +505,7 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     ``docs/concurrency.md`` for the full canonical-order argument.
     """
     result = await session.execute(
-        select(Project.id)
+        select(Project.id, Project.paused, Project.archived)
         .where(Project.id == project_id)
         # SQLAlchemy renders key_share=True (without read=True) as
         # ``FOR NO KEY UPDATE`` on PostgreSQL: strategic spawners still
@@ -510,9 +513,17 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
         # conversation sends can take KEY SHARE without convoying.
         .with_for_update(skip_locked=True, key_share=True)
     )
-    if result.first() is None:
+    project_row = result.first()
+    if project_row is None:
         # Row missing or held — fail safe. The other holder will spawn (or
         # already has); our caller will skip and re-evaluate next cycle.
+        return True
+    if bool(project_row.paused) or bool(project_row.archived):
+        # This helper is the Project-before-child admission point shared by the
+        # design-doc and strategic-review spawners.  Treat the universal pause
+        # (and archive) authority exactly like an active strategic task: no
+        # automatic child may be authored, including a Phase 1 -> Phase 2
+        # continuation that would otherwise sit latent until resume.
         return True
     # Phase B4 (H-P6): we only need first_payload.type per row to filter, so
     # drop status_log/plan_output JSONB. Loading payloads keeps first_payload
@@ -3625,7 +3636,9 @@ async def _process_post_commit(
                         return {"status": "accepted"}
                     if (
                         not reviewed_head_sha
+                        or not reviewed_base_sha
                         or reviewed_head_sha != _live_approve_target["head_sha"]
+                        or reviewed_base_sha != _live_approve_target["base_sha"]
                     ):
                         task.status = TaskStatus.COMPLETED
                         task.latest_status_message = (
@@ -3647,6 +3660,7 @@ async def _process_post_commit(
                         task.context = {
                             **(task.context or {}),
                             "_review_stale_head": True,
+                            "_review_stale_target": True,
                         }
                         flag_modified(task, "context")
                         session.add(task)
@@ -4143,7 +4157,9 @@ async def _process_post_commit(
                         live_base_sha = str(pr_data.get("base", {}).get("sha", ""))
                         approve_target_is_stale = (
                             not reviewed_head_sha
+                            or not reviewed_base_sha
                             or reviewed_head_sha != head_sha
+                            or reviewed_base_sha != live_base_sha
                         )
                         if approve_target_is_stale:
                             # Do not let an APPROVE issued for a different
@@ -4156,6 +4172,7 @@ async def _process_post_commit(
                                 task.context = {
                                     **(task.context or {}),
                                     "_review_stale_head": True,
+                                    "_review_stale_target": True,
                                 }
                                 flag_modified(task, "context")
                                 task.status = TaskStatus.COMPLETED
@@ -4202,7 +4219,10 @@ async def _process_post_commit(
                                     )
                             await session.commit()
                             return {"status": "accepted"}
-                        if reviewed_head_sha == head_sha:
+                        if (
+                            reviewed_head_sha == head_sha
+                            and reviewed_base_sha == live_base_sha
+                        ):
                             _record_structured_review_result(
                                 {
                                     "project_id": str(task.project_id),
@@ -4989,90 +5009,18 @@ async def _process_post_commit(
                                             and base_branch == _orig_promotion_target
                                             and _runtime_config.get("smoketest_enabled")
                                         ):
-                                            try:
-                                                type_model = (
-                                                    _runtime_config.get(
-                                                        "task_type_models", {}
-                                                    ).get("smoketest")
-                                                    or None
-                                                )
-                                                type_effort = (
-                                                    _runtime_config.get(
-                                                        "task_type_efforts", {}
-                                                    ).get("smoketest")
-                                                    or None
-                                                )
-                                                health_check_urls = (
-                                                    _runtime_config.get(
-                                                        "health_check_urls"
-                                                    )
-                                                    or []
-                                                )
-                                                _smoketest_payload = validate_internal_payload(
-                                                    {
-                                                        "type": "smoketest",
-                                                        "base_branch": base_branch,
-                                                        **(
-                                                            {"model": type_model}
-                                                            if type_model
-                                                            else {}
-                                                        ),
-                                                        **(
-                                                            {"effort": type_effort}
-                                                            if type_effort
-                                                            else {}
-                                                        ),
-                                                        **(
-                                                            {
-                                                                "health_check_urls": health_check_urls
-                                                            }
-                                                            if health_check_urls
-                                                            else {}
-                                                        ),
-                                                    },
-                                                    "task_lifecycle:smoketest",
-                                                )
-                                                smoketest_task = Task(
-                                                    project_id=task.project_id,
-                                                    title=f"Smoketest after rollup merge to {base_branch}",
-                                                    description=f"Post-merge health checks for {owner}/{repo}@{base_branch}",
-                                                    payloads=[_smoketest_payload],
-                                                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                                                    status=TaskStatus.QUEUED,
-                                                    created_by="ORCHESTRATOR",
-                                                    origination=TASK_ORIGINATION_SMOKETEST,
-                                                )
-                                                session.add(smoketest_task)
-                                                await session.commit()
-                                                await session.refresh(smoketest_task)
-                                                history = TaskHistory(
-                                                    task_id=smoketest_task.id,
-                                                    action="SPAWNED",
-                                                    details={
-                                                        "spawned_by": "POST_ROLLUP_MERGE",
-                                                        "base_branch": base_branch,
-                                                    },
-                                                )
-                                                session.add(history)
-                                                await session.commit()
-                                                await broadcast_to_project(
-                                                    str(task.project_id),
-                                                    "task_updated",
-                                                    {
-                                                        "task_id": str(
-                                                            smoketest_task.id
-                                                        ),
-                                                        "status": TaskStatus.QUEUED,
-                                                    },
-                                                )
-                                                logger.info(
-                                                    f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after rollup merge to {base_branch}"
-                                                )
-                                            except Exception as e:
-                                                logger.warning(
-                                                    f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}",
-                                                    exc_info=True,
-                                                )
+                                            from app.admin_task_approvals import (
+                                                _maybe_spawn_rollup_smoketest,
+                                            )
+
+                                            await _maybe_spawn_rollup_smoketest(
+                                                orig,
+                                                owner,
+                                                repo,
+                                                base_branch,
+                                                session,
+                                                spawned_by="POST_ROLLUP_MERGE",
+                                            )
                                         # Back-merge: when a HOTFIX merges to the
                                         # promotion target, open a promotion_target ->
                                         # integration_branch PR so branches don't diverge.
@@ -5133,11 +5081,51 @@ async def _process_post_commit(
                                         # Spawn security rescan if merged task's parent was a security_audit
                                         if orig.parent_task_id:
                                             try:
-                                                audit_parent = await session.get(
-                                                    Task, orig.parent_task_id
-                                                )
+                                                _rescan_project_id = orig.project_id
+                                                _audit_parent_id = orig.parent_task_id
+                                                # The merge-success path currently
+                                                # holds ``orig`` Task-only. Persist
+                                                # its terminal bookkeeping, release
+                                                # that lock, then reacquire Project
+                                                # -> audit parent before any child
+                                                # query or rescan INSERT.
+                                                await session.commit()
+                                                async with automatic_task_creation_parent_lock(
+                                                    session,
+                                                    _rescan_project_id,
+                                                    _audit_parent_id,
+                                                    skip_locked=False,
+                                                ) as (
+                                                    _rescan_admission,
+                                                    _rescan_project,
+                                                    audit_parent,
+                                                ):
+                                                    if (
+                                                        _rescan_project is None
+                                                        or audit_parent is None
+                                                    ):
+                                                        raise RuntimeError(
+                                                            "security rescan admission could not lock project/parent"
+                                                        )
                                                 if (
-                                                    audit_parent
+                                                    _rescan_admission
+                                                    != AUTOMATIC_TASK_CREATION_ALLOWED
+                                                ):
+                                                    audit_parent.context = {
+                                                        **(audit_parent.context or {}),
+                                                        "automatic_rescan_creation_suppressed": _rescan_admission,
+                                                    }
+                                                    session.add(audit_parent)
+                                                    await session.commit()
+                                                    logger.info(
+                                                        "[SECURITY RESCAN] Suppressed rescan for audit %s: %s",
+                                                        _audit_parent_id,
+                                                        _rescan_admission,
+                                                    )
+                                                if (
+                                                    _rescan_admission
+                                                    == AUTOMATIC_TASK_CREATION_ALLOWED
+                                                    and audit_parent
                                                     and audit_parent.first_payload.get(
                                                         "type"
                                                     )
@@ -5216,7 +5204,7 @@ async def _process_post_commit(
                                                             "task_lifecycle:security_audit",
                                                         )
                                                         rescan_task = Task(
-                                                            project_id=orig.project_id,
+                                                            project_id=_rescan_project_id,
                                                             title=f"Security rescan: verify {audit_title} fixes",
                                                             description=f"Verify that security fixes merged in PR #{pr_number} addressed reported vulnerabilities.",
                                                             payloads=[_rescan_payload],
@@ -5246,7 +5234,7 @@ async def _process_post_commit(
                                                         session.add(history)
                                                         await session.commit()
                                                         await broadcast_to_project(
-                                                            str(orig.project_id),
+                                                            str(_rescan_project_id),
                                                             "task_updated",
                                                             {
                                                                 "task_id": str(

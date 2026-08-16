@@ -5344,17 +5344,11 @@ async def agent_heartbeat(
         # BLOCKED_PRECONDITION path, which releases the account slot, retires the
         # warm-pool member and deletes the VM the agent is still running on.
         # Overwrite: the latest gate run is the authoritative verdict.
-        from app.task_blocked import (  # noqa: PLC0415
-            PUBLICATION_GATE_RECEIPT_KEY,
-            sanitize_publication_gate_receipt,
+        from app.task_blocked import (
+            record_publication_gate_receipt,
         )
 
-        _receipt = sanitize_publication_gate_receipt(req.publication_gate_receipt)
-        if _receipt is not None:
-            ctx = dict(task.context or {})
-            if ctx.get(PUBLICATION_GATE_RECEIPT_KEY) != _receipt:
-                ctx[PUBLICATION_GATE_RECEIPT_KEY] = _receipt
-                task.context = ctx
+        record_publication_gate_receipt(task, req.publication_gate_receipt)
 
     # Persist prompt fingerprint on the dedicated column. Mirror to context only
     # when needed for older readers / backfills, so repeated heartbeats stay
@@ -5747,6 +5741,25 @@ async def spawn_subtask(
             "task_ids": [],
             "requires_approval": False,
         }
+
+    # Agent tool calls are automatic child publication, not an operator's
+    # direct manual Task launch.  Lock Project before any review/fix admission
+    # can lock same-PR Task rows, and retain that authority through the single
+    # transaction that inserts every requested child.
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    creation_admission = await acquire_automatic_task_creation_authority(
+        session, parent_task.project_id
+    )
+    if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Automatic subtask creation is held: {creation_admission}",
+        )
 
     # Strip orchestrator-internal keys before merging into the new task's
     # context. An agent JWT-holder MUST NOT be able to forge a warm-VM pin

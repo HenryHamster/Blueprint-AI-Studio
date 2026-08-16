@@ -498,6 +498,41 @@ _checkpoint_terminal_work() {
 `;
 }
 
+/**
+ * Validate the task-bound negative runtime receipt minted by generated ./check.
+ *
+ * Both terminal helpers consume this exact block.  Keeping the byte/shape/frame
+ * checks shared prevents ./blocked from becoming a weaker text-inference path:
+ * only the exact regular-file receipt can mint execution_capability authority.
+ */
+function executionCapabilityReceiptShell(cfg: CodeChangeHelperConfig): string {
+  return `
+# A generated ./check owns this task-bound negative receipt. It is removed at
+# the start of every later check and every task attempt, so only the latest
+# local verification run can establish runtime-unavailable authority. Reject
+# links, oversized content, and every non-exact frame.
+_CAPABILITY_FRAME="[check] required backend verification state=runtime_unavailable — PostgreSQL runtime unavailable"
+_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${cfg.taskId}"
+_CAPABILITY_EXPECTED="backend_verification:runtime_unavailable:v1:$TASK"
+_CAPABILITY_RECEIPT_VALID=0
+if [ -f "$_CAPABILITY_RECEIPT" ] && [ ! -L "$_CAPABILITY_RECEIPT" ]; then
+  _CAPABILITY_RECEIPT_BYTES=$(wc -c <"$_CAPABILITY_RECEIPT" 2>/dev/null || printf 0)
+  case "$_CAPABILITY_RECEIPT_BYTES" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$_CAPABILITY_RECEIPT_BYTES" -le 256 ] \\
+        && printf '%s\n' "$_CAPABILITY_EXPECTED" | cmp -s - "$_CAPABILITY_RECEIPT"; then
+        _CAPABILITY_RECEIPT_VALID=1
+      fi
+      ;;
+  esac
+fi
+if [ "$_CAPABILITY_RECEIPT_VALID" = "1" ]; then
+  REASON="$_CAPABILITY_FRAME"
+fi
+`;
+}
+
 function writeFailHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   // Explicit failure signal — Claude calls this when it determines the task
@@ -508,6 +543,7 @@ function writeFailHelper(cfg: CodeChangeHelperConfig): void {
   const jsonFieldFn = jsonFieldShellFn();
   const jsonStrFn = jsonStrShellFn();
   const terminalCheckpointFn = terminalCheckpointShellFn(cfg);
+  const capabilityReceiptFn = executionCapabilityReceiptShell(cfg);
   const script = `#!/bin/bash
 # ./fail "reason" — mark task FAILED with an operator-readable reason.
 # Use when the task can't be completed cleanly: scope is wrong, blocker
@@ -544,29 +580,7 @@ _checkpoint_terminal_work || {
   exit 1
 }
 
-# A generated ./check owns this task-bound negative receipt. It is removed at
-# the start of every later check and every task attempt, so only the latest
-# local verification run can upgrade a generic ./fail into an infrastructure
-# failure. Reject links, oversized content, and every non-exact frame.
-_CAPABILITY_FRAME="[check] required backend verification state=runtime_unavailable — PostgreSQL runtime unavailable"
-_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${cfg.taskId}"
-_CAPABILITY_EXPECTED="backend_verification:runtime_unavailable:v1:$TASK"
-_CAPABILITY_RECEIPT_VALID=0
-if [ -f "$_CAPABILITY_RECEIPT" ] && [ ! -L "$_CAPABILITY_RECEIPT" ]; then
-  _CAPABILITY_RECEIPT_BYTES=$(wc -c <"$_CAPABILITY_RECEIPT" 2>/dev/null || printf 0)
-  case "$_CAPABILITY_RECEIPT_BYTES" in
-    ''|*[!0-9]*) ;;
-    *)
-      if [ "$_CAPABILITY_RECEIPT_BYTES" -le 256 ] \
-        && printf '%s\n' "$_CAPABILITY_EXPECTED" | cmp -s - "$_CAPABILITY_RECEIPT"; then
-        _CAPABILITY_RECEIPT_VALID=1
-      fi
-      ;;
-  esac
-fi
-if [ "$_CAPABILITY_RECEIPT_VALID" = "1" ]; then
-  REASON="$_CAPABILITY_FRAME"
-fi
+${capabilityReceiptFn}
 
 PAYLOAD=$(printf '{"task_id":%s,"status":"FAILED","artifact_type":"ERROR_LOG","logs":%s,"failure_category":"agent_self_failed"}' \\
   "$(_json_str "$TASK")" "$(_json_str "$REASON")")
@@ -620,6 +634,7 @@ function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
   const jsonFieldFn = jsonFieldShellFn();
   const jsonStrFn = jsonStrShellFn();
   const terminalCheckpointFn = terminalCheckpointShellFn(cfg);
+  const capabilityReceiptFn = executionCapabilityReceiptShell(cfg);
   const script = `#!/bin/bash
 # ./blocked "<reason>" — mark task BLOCKED_PRECONDITION (no retry burn).
 #
@@ -705,6 +720,8 @@ _checkpoint_terminal_work || {
   exit 1
 }
 
+${capabilityReceiptFn}
+
 # "BLOCKER:" prefix is the canonical orchestrator-side signal for the
 # BLOCKED_PRECONDITION class (see backend/app/failure_classification.py).
 # We send both the explicit failure_category AND the prefixed reason so
@@ -715,7 +732,13 @@ _checkpoint_terminal_work || {
 # class); _json_str escapes each field into a JSON string literal. blocked_need
 # is included only when a --needs-* flag supplied both kind and ref, preserving
 # the previous conditional-object shape.
-if [ -n "$NEED_KIND" ] && [ -n "$NEED_REF" ]; then
+if [ "$_CAPABILITY_RECEIPT_VALID" = "1" ]; then
+  # Runtime authority is identical to ./fail: the exact frame/category pair is
+  # required by AgentStatusPayload and routes through server-owned capability
+  # learning. A free-form blocked need cannot override this stronger receipt.
+  PAYLOAD=$(printf '{"task_id":%s,"status":"FAILED","artifact_type":"ERROR_LOG","logs":%s,"failure_category":"agent_self_failed","execution_capability":"backend_verification"}' \\
+    "$(_json_str "$TASK")" "$(_json_str "$REASON")")
+elif [ -n "$NEED_KIND" ] && [ -n "$NEED_REF" ]; then
   PAYLOAD=$(printf '{"task_id":%s,"status":"FAILED","artifact_type":"ERROR_LOG","logs":%s,"failure_category":"BLOCKED_PRECONDITION","blocked_need":{"kind":%s,"ref":%s}}' \\
     "$(_json_str "$TASK")" "$(_json_str "BLOCKER: $REASON")" "$(_json_str "$NEED_KIND")" "$(_json_str "$NEED_REF")")
 else

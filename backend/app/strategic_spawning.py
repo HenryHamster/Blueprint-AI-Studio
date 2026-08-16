@@ -4247,6 +4247,32 @@ async def _spawn_design_doc_update(
         await session.rollback()
         return False
 
+    # ``apply_spawn_budget_guard`` classifies cadence/recovery callers as
+    # automatic; the directions endpoint deliberately leaves it false for an
+    # explicit operator-triggered cycle.  Linearize automatic creation against
+    # pause/archive before _has_active_strategic_task takes any Task locks, and
+    # keep the Project lock transaction-scoped through the Task INSERT below.
+    if apply_spawn_budget_guard:
+        from app.task_locking import (
+            AUTOMATIC_TASK_CREATION_ALLOWED,
+            acquire_automatic_task_creation_authority,
+        )
+
+        automatic_admission = await acquire_automatic_task_creation_authority(
+            session,
+            project.id,
+            skip_locked=True,
+        )
+        if automatic_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            await session.rollback()
+            logger.info(
+                "[STRATEGIC] Automatic design-doc spawn suppressed for project "
+                "%s (%s)",
+                project.id,
+                automatic_admission,
+            )
+            return False
+
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
         logger.warning(
@@ -4823,6 +4849,24 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
         return None
     head_sha = gate.get("head_sha")
     if not isinstance(head_sha, str) or not head_sha:
+        return None
+
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    admission = await acquire_automatic_task_creation_authority(
+        session, project.id, skip_locked=True
+    )
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[COMPLIANCE_CAP_BUMP] automatic remediation suppressed for "
+            "project=%s, head_sha=%s (%s)",
+            project.id,
+            head_sha,
+            admission,
+        )
         return None
 
     active_statuses = {
@@ -5506,6 +5550,7 @@ async def _finalize_strategic_review_spawn(
     effort_reason: str | None = None,
     expected_legacy_generation: int | None = None,
     cadence_accepted_count: object | None = None,
+    automatic_creation: bool = True,
 ) -> bool:
     """Guarded INSERT/commit tail for the cadence spawn path.
 
@@ -5531,6 +5576,31 @@ async def _finalize_strategic_review_spawn(
     """
     from app.autonomous_research import _try_research_spawn_advisory_lock
     from app.task_lifecycle import _has_active_strategic_task
+
+    # Payload construction can commit and release every earlier lock.  Re-take
+    # the canonical Project authority at the short finalization seam, before
+    # the advisory/active-task/cycle locks, and retain it through INSERT.  The
+    # manual Workday/directions paths pass automatic_creation=False explicitly.
+    if automatic_creation:
+        from app.task_locking import (
+            AUTOMATIC_TASK_CREATION_ALLOWED,
+            acquire_automatic_task_creation_authority,
+        )
+
+        automatic_admission = await acquire_automatic_task_creation_authority(
+            session,
+            project_id,
+            skip_locked=True,
+        )
+        if automatic_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            await session.rollback()
+            logger.info(
+                "[STRATEGIC] Automatic strategic-review spawn suppressed for "
+                "project %s (%s)",
+                project_id,
+                automatic_admission,
+            )
+            return False
 
     if expected_legacy_generation is not None:
         try:
@@ -6193,6 +6263,7 @@ async def _spawn_strategic_review(
             effort_reason=_res_effort_reason,
             expected_legacy_generation=expected_legacy_generation,
             cadence_accepted_count=cadence_accepted_count,
+            automatic_creation=apply_spawn_budget_guard,
         )
 
     # Build direction stats with rich data (pure over ``project.directions``).
@@ -8498,6 +8569,7 @@ async def _spawn_strategic_review(
         effort_reason=_effort_reason,
         expected_legacy_generation=expected_legacy_generation,
         cadence_accepted_count=cadence_accepted_count,
+        automatic_creation=apply_spawn_budget_guard,
     )
 
 

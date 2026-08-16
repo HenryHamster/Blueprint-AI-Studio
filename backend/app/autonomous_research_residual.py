@@ -285,6 +285,28 @@ async def _spawn_residual_fingerprint_remediation(
 
             begin_deferred_external_notifications(session)
 
+    # Auto-recovery above may commit and release the caller's prior authority.
+    # Re-enter the canonical Project fence before any case-row lock or Task
+    # publication and keep it through the spawn commit.  This lane is autonomy-
+    # owned, so disabling autonomy is authoritative alongside pause/archive.
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    creation_admission = await acquire_automatic_task_creation_authority(
+        session,
+        project.id,
+        require_autonomous_enabled=True,
+    )
+    if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[AUTO REMEDIATION] Automatic residual creation held for project %s: %s",
+            project.id,
+            creation_admission,
+        )
+        return 0
+
     # Project-wide concurrency cap. Count case rows currently in the
     # in-flight REMEDIATING state — independent of the CI auto-fix
     # quota since that lives on project.design_doc._auto_remediation.
@@ -681,6 +703,27 @@ async def _spawn_viewport_regression_remediation(
             from app.notification_dispatch import begin_deferred_external_notifications
 
             begin_deferred_external_notifications(session)
+
+    # The recovery branch above can commit independently.  Re-lock Project at
+    # the actual publication boundary before any residual-case row lock or Task
+    # INSERT, and require this autonomy-owned lane to remain enabled.
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    creation_admission = await acquire_automatic_task_creation_authority(
+        session,
+        project.id,
+        require_autonomous_enabled=True,
+    )
+    if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[VIEWPORT REMEDIATION] Automatic residual creation held for project %s: %s",
+            project.id,
+            creation_admission,
+        )
+        return 0
 
     # Project-wide concurrency cap (shared with CODE_ERROR lane; both write to the
     # same ResidualRemediationCase table so REMEDIATING rows from either lane count).

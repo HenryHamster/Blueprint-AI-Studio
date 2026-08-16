@@ -91,6 +91,28 @@ class TestGetAllProjects:
         assert "my_role" in item
 
     @pytest.mark.asyncio
+    async def test_legacy_deploying_status_is_not_project_operational_state(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="Long-lived Project")
+        project.status = ProjectStatus.DEPLOYING
+        db_session.add(project)
+        await db_session.commit()
+
+        listed = await client.get("/api/admin/projects")
+        item = next(
+            p for p in listed.json()["items"] if p["id"] == str(project.id)
+        )
+        assert item["status"] == ProjectStatus.DEPLOYING
+        assert item["status_semantics"] == "legacy_finite_lifecycle"
+        assert item["operational_state"] == "active"
+
+        detail = await client.get(f"/api/admin/projects/{project.id}")
+        summary = await client.get(f"/api/admin/projects/{project.id}/summary")
+        assert detail.json()["operational_state"] == "active"
+        assert summary.json()["operational_state"] == "active"
+
+    @pytest.mark.asyncio
     async def test_excludes_other_users_projects(self, client: AsyncClient, db_session):
         """Projects the user has no membership in are excluded."""
         other = Project(name="Other Project", user_id="other-owner")

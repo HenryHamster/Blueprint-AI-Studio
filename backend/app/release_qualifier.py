@@ -157,6 +157,7 @@ from app.release_qualifier_audit import (
     snapshot_stranded_approved_prs,
     required_children_terminal as _required_children_terminal,
 )
+from app.release_task_admission import finalize_admitted, start_block
 from app.ci_resolution import (
     _CI_GREEN,
     _CI_NO_CHECKS,
@@ -2724,35 +2725,11 @@ async def run_qualification(
             )
             return {**_reuse_result, "reused_audit": True}
 
-    # 4. Take the ReleaseVersion row lock (audit C3).  The strategic
-    #    qualify_request path and the admin POST /qualify endpoint can both
-    #    reach here concurrently; without serializing them they each pass the
-    #    in-flight guard and spawn duplicate expensive children, and the
-    #    later last_qualification write clobbers the earlier one.  FOR UPDATE
-    #    mirrors maybe_finalize_qualification's pattern — held across the
-    #    in-flight check, the spawns, and the last_qualification write.  The
-    #    second caller blocks here until the first commits, then sees the
-    #    pending record and short-circuits at the in-flight guard below.
-    #
-    #    ``populate_existing=True`` (+ an explicit ``expire`` for callers that
-    #    pre-loaded the row) is the correctness linchpin: when ``version`` was
-    #    already cached in this session's identity map — notably the strategic
-    #    ``qualify_request`` path, which loads the open version via
-    #    ``current_open_version(session, ...)`` and may then hold a copy that
-    #    PRE-DATES a ``promote()`` committed in another session — a bare
-    #    ``with_for_update()`` SELECT acquires the DB lock but returns that SAME
-    #    cached instance WITHOUT refreshing its attributes, so the under-lock
-    #    guards below (phase / active attempt / managed promotion / cached verdict)
-    #    would read STALE ``last_qualification``.  That is how a re-qualify slips
-    #    past the managed-promotion guard while a promotion PR is genuinely open
-    #    in ``promotion_check_wait`` and spawns a redundant audit + merge-grade.
-    #    Forcing the loaded row to overwrite the cached attributes makes the
-    #    under-lock guards authoritative regardless of caller staleness (mirrors
-    #    the ``populate_existing`` pattern the managed-check-wait reconciler
-    #    helpers already use).  ``populate_existing`` overwrites the attributes of
-    #    an instance already present in the identity map, so it is sufficient on
-    #    its own — ``version`` is not mutated before this point, so no dirty write
-    #    is lost.
+    # 4. Project -> ReleaseVersion serialization prevents duplicate children;
+    #    populate_existing also defeats a caller's stale cached version row.
+    admission_block = await start_block(session, project_id, version.version_number)
+    if admission_block is not None:
+        return admission_block
     locked_version = (
         (
             await session.execute(
@@ -10347,6 +10324,7 @@ async def _finalize_locked_version(
     peek_qual = peek.last_qualification or {}
     if peek_qual.get("status") != "pending":
         return None
+    peek_project_id = peek.project_id
     expected_attempt_uuid = _coerce_qualification_attempt_id(expected_attempt_id)
     active_attempt_uuid = _coerce_qualification_attempt_id(
         peek_qual.get("qualification_attempt_id")
@@ -10439,6 +10417,10 @@ async def _finalize_locked_version(
         # rollback the later FOR UPDATE/commit surfaces as PendingRollbackError
         # and the sweep misclassifies the qualification as a finalizer crash.
         await session.rollback()
+
+    # Fence Project before Version; closed spawners still permit reconciliation.
+    if not await finalize_admitted(session, peek_project_id):
+        return None
 
     # Expire the peek instance so the FOR UPDATE select below forces a fresh
     # read from the DB (mirrors _relock_version_for_promotion_write pattern —

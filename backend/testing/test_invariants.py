@@ -13102,7 +13102,7 @@ class TestProblemModelWritePathInvariants:
     # When changing a file, update these line numbers.
     _SAFE_SITES: dict[tuple[str, int], str] = {
         # task_locking.py: project.problem_model write-back inside with_problem_model_locked
-        ("task_locking.py", 1135): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
+        ("task_locking.py", 1291): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
         # lifecycle.py: sanitize_problem_model_raw -> startup healing write-back
         ("lifecycle.py", 505): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
@@ -13110,21 +13110,21 @@ class TestProblemModelWritePathInvariants:
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
         ("direction_lifecycle.py", 874): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5411): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 5426): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5448): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 5463): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 7131): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 7146): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
         ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
         ("reaper_sweeps.py", 1381): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
-        ("routers/admin_projects.py", 857): "validated pydantic model_dump",
+        ("routers/admin_projects.py", 874): "validated pydantic model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1270): "current_model pydantic model_dump",
+        ("routers/admin_projects.py", 1287): "current_model pydantic model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1382): "current_model pydantic model_dump",
+        ("routers/admin_projects.py", 1399): "current_model pydantic model_dump",
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
@@ -13840,11 +13840,11 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     fake_python = tmp_path / "probe-python"
     fake_python.write_text(
         "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$ROSTER_PROBE_LOG\"\n"
         "case \"$*\" in\n"
         "  *\"import fastapi\"*) exit 0 ;;\n"
         "  *\"sys.version_info\"*) printf '%s\\n' '3.11'; exit 0 ;;\n"
-        "esac\n"
-        "printf '%s\\n' \"$*\" >> \"$ROSTER_PROBE_LOG\"\n",
+        "esac\n",
         encoding="utf-8",
     )
     fake_python.chmod(0o755)

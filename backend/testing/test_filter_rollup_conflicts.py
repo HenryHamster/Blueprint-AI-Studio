@@ -221,6 +221,95 @@ class TestRollupFilterSiblingExemption:
         )
         assert result == [sibling.id]
 
+    @pytest.mark.asyncio
+    async def test_foreign_child_link_cannot_manufacture_rollup_reservation(
+        self, db_session
+    ):
+        """A child/project mismatch is not rollup authority in either project."""
+
+        broadcast_fn = AsyncMock()
+        local = await _mk_project(db_session, "Local Rollup Parent")
+        foreign = await _mk_project(db_session, "Foreign Linked Child")
+        local_parent = await _mk_task(
+            db_session,
+            local.id,
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "research"}],
+        )
+        files = ["backend/app/a.py", "backend/app/b.py"]
+        await _mk_task(
+            db_session,
+            foreign.id,
+            status=TaskStatus.COMPLETED,
+            parent_task_id=local_parent.id,
+            payloads=[{"type": "refactor"}],
+            context={"scope": "large", "related_files": files},
+            title="inconsistent foreign child",
+        )
+        candidate = await _mk_task(
+            db_session,
+            foreign.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+            context={"related_files": files},
+        )
+
+        result = await filter_rollup_conflicts(
+            [candidate.id], [candidate], db_session, broadcast_fn
+        )
+
+        assert result == [candidate.id]
+        broadcast_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_foreign_parent_link_does_not_grant_sibling_exemption(
+        self, db_session
+    ):
+        """Sibling exemption requires the candidate and parent project to match."""
+
+        broadcast_fn = AsyncMock()
+        local = await _mk_project(db_session, "Foreign Parent Project")
+        foreign = await _mk_project(db_session, "Real Rollup Project")
+        foreign_linked_parent = await _mk_task(
+            db_session,
+            local.id,
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "research"}],
+        )
+        real_parent = await _mk_task(
+            db_session,
+            foreign.id,
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "research"}],
+        )
+        files = ["backend/app/a.py", "backend/app/b.py"]
+        await _mk_task(
+            db_session,
+            foreign.id,
+            status=TaskStatus.COMPLETED,
+            parent_task_id=real_parent.id,
+            payloads=[{"type": "refactor"}],
+            context={"scope": "large", "related_files": files},
+            title="real foreign rollup child",
+        )
+        candidate = await _mk_task(
+            db_session,
+            foreign.id,
+            status=TaskStatus.QUEUED,
+            parent_task_id=foreign_linked_parent.id,
+            payloads=[{"type": "create"}],
+            context={"related_files": files},
+        )
+
+        result = await filter_rollup_conflicts(
+            [candidate.id], [candidate], db_session, broadcast_fn
+        )
+
+        assert result == []
+        assert "overlaps pending rollup" in (
+            candidate.latest_status_message or ""
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BLOCKED deferral durability — pending-rollup caller family

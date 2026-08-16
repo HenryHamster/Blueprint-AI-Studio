@@ -247,6 +247,25 @@ async def spawn_bootstrap_task(
     first-bootstrap strategic gate semantics for brand-new projects) and does
     NOT arm the automatic-recovery backoff loop.
     """
+    # First-cycle bootstrap is an onboarding side effect and recovery_sweep is
+    # autonomous; both are automatic work and therefore honor the universal
+    # Project.pause/archive fence. Explicit operator retry/refresh remains a
+    # direct human action and deliberately retains its existing semantics.
+    if is_first_bootstrap or automatic_recovery:
+        from app.task_locking import (
+            AUTOMATIC_TASK_CREATION_ALLOWED,
+            acquire_automatic_task_creation_authority,
+        )
+
+        creation_admission = await acquire_automatic_task_creation_authority(
+            session, project.id
+        )
+        if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            return BootstrapSpawnResult(
+                outcome="not_eligible",
+                reason=f"automatic_task_creation:{creation_admission}",
+            )
+
     build_cfg = dict(project.build_config or {})
     is_refresh = spawn_reason == REFRESH_SPAWN_REASON
     build_config_changed = False

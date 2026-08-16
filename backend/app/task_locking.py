@@ -57,6 +57,39 @@ logger = logging.getLogger(__name__)
 # architectural content alone.
 DESIGN_DOC_MAX_BYTES = 500_000
 
+# Automatic task admission decisions.  Keep these strings stable: callers use
+# them for status/telemetry without importing a second policy enum.
+AUTOMATIC_TASK_CREATION_ALLOWED = "allowed"
+AUTOMATIC_TASK_CREATION_PROJECT_PAUSED = "project_paused"
+AUTOMATIC_TASK_CREATION_PROJECT_ARCHIVED = "project_archived"
+AUTOMATIC_TASK_CREATION_AUTONOMY_DISABLED = "autonomy_disabled"
+AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE = "project_unavailable"
+
+
+def automatic_task_creation_decision(
+    project: Project | None,
+    *,
+    require_autonomous_enabled: bool = False,
+) -> str:
+    """Return automatic-task admission from an already locked Project.
+
+    This is the policy half of :func:`acquire_automatic_task_creation_authority`.
+    Completion pipelines that already hold the canonical Project -> Task lock
+    must use this function instead of trying to re-lock Project behind Task.
+    The caller is responsible for keeping the Project lock through every Task
+    INSERT admitted by the returned decision.
+    """
+
+    if project is None:
+        return AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE
+    if project.archived:
+        return AUTOMATIC_TASK_CREATION_PROJECT_ARCHIVED
+    if project.paused:
+        return AUTOMATIC_TASK_CREATION_PROJECT_PAUSED
+    if require_autonomous_enabled and not project.autonomous_enabled:
+        return AUTOMATIC_TASK_CREATION_AUTONOMY_DISABLED
+    return AUTOMATIC_TASK_CREATION_ALLOWED
+
 
 class DesignDocSizeLimitExceeded(Exception):
     """Raised by with_design_doc_locked when a write would grow the agent-owned
@@ -540,6 +573,129 @@ async def project_lock(
         # See ``_undo_projection_downgrade`` — a projection lock must not leave
         # the shared instance less loaded than it found it.
         _undo_projection_downgrade(project)
+
+
+async def acquire_automatic_task_creation_authority(
+    session: AsyncSession,
+    project_id,
+    *,
+    skip_locked: bool = True,
+    timeout: float = 30.0,
+    require_autonomous_enabled: bool = False,
+) -> str:
+    """Linearize an automatic Task INSERT against project pause/archive.
+
+    ``Project.paused`` is the universal no-new-work authority.  Dispatch-side
+    filtering alone is insufficient: an automatic continuation can otherwise
+    insert latent QUEUED rows while paused and release them as a burst on
+    resume.  This helper takes the canonical Project ``FOR NO KEY UPDATE`` lock
+    and returns a stable decision while leaving that lock held until the
+    surrounding transaction commits or rolls back.  A concurrent pause write
+    and a task insert therefore have one deterministic order:
+
+    * pause wins the Project lock -> this admission fails closed;
+    * admission wins -> its INSERT commits before the pause can become visible.
+
+    Call this **before any child-row lock or mutation** in an automatic spawn
+    transaction (Project -> child is the canonical lock order), and keep the
+    transaction open through the Task INSERT.  Project-row contention and a
+    missing project both fail closed as ``project_unavailable``; a later sweep
+    may retry after contention clears.  Callers whose work is specifically
+    autonomy-owned may set ``require_autonomous_enabled=True`` to linearize that
+    policy check under the same Project lock.  Manual, explicitly user-authored
+    task creation must not call this helper merely to bypass pause semantics.
+    """
+
+    # ``load_only`` is intentionally cheap, but an ORM projection introduced
+    # into a previously-cold identity map can poison a later ``session.get``:
+    # it returns the same underloaded Project and a synchronous full-field read
+    # raises MissingGreenlet.  Remember whether the caller already owned this
+    # identity.  After the decision, a clean projection introduced solely by
+    # this helper can be detached without releasing the transaction-scoped DB
+    # row lock.  Preloaded identities stay attached and project_lock's
+    # _undo_projection_downgrade restores their prior loader state.
+    sync_session = session.sync_session
+    project_id_text = str(project_id)
+    project_preloaded = any(
+        isinstance(candidate, Project)
+        and str(candidate.__dict__.get("id")) == project_id_text
+        for candidate in (*sync_session.identity_map.values(), *sync_session.new)
+    )
+    decision = AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE
+    async with project_lock(
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        timeout=timeout,
+        load_columns=[
+            Project.id,
+            Project.paused,
+            Project.archived,
+            *([Project.autonomous_enabled] if require_autonomous_enabled else []),
+        ],
+    ) as project_authority:
+        decision = automatic_task_creation_decision(
+            project_authority,
+            require_autonomous_enabled=require_autonomous_enabled,
+        )
+    if (
+        project_authority is not None
+        and not project_preloaded
+        and sa_inspect(project_authority).persistent
+        and not sa_inspect(project_authority).modified
+    ):
+        session.expunge(project_authority)
+    return decision
+
+
+@asynccontextmanager
+async def automatic_task_creation_parent_lock(
+    session: AsyncSession,
+    project_id,
+    task_id,
+    *,
+    skip_locked: bool = True,
+    timeout: float = 30.0,
+    require_autonomous_enabled: bool = False,
+) -> AsyncIterator[tuple[str, Project | None, Task | None]]:
+    """Lock Project -> parent Task and return one automatic-spawn decision.
+
+    Use this boundary after any commit/rollback or unlocked external-I/O window
+    invalidated a completion pipeline's original locks.  Pause/archive is read
+    while Project is locked, then the parent Task is locked regardless of the
+    decision so a denied spawn can still reconcile its parent terminally.  Both
+    locks remain transaction-scoped, so callers must keep the transaction open
+    through child INSERTs (normally committing inside the context).  Project or
+    Task contention/missing rows fail closed as ``project_unavailable``.
+
+    The full Project row is intentionally loaded.  Callers commonly need branch
+    configuration after a prior commit, and returning a projected identity would
+    poison a later ``session.get(Project, ...)`` with MissingGreenlet.
+    """
+
+    async with project_lock(
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        timeout=timeout,
+    ) as project:
+        decision = automatic_task_creation_decision(
+            project,
+            require_autonomous_enabled=require_autonomous_enabled,
+        )
+        if project is None:
+            yield decision, None, None
+            return
+        async with task_lock(
+            session,
+            task_id,
+            skip_locked=skip_locked,
+            timeout=timeout,
+        ) as task:
+            if task is None:
+                yield AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE, project, None
+                return
+            yield decision, project, task
 
 
 @asynccontextmanager

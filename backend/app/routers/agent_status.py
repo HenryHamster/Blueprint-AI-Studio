@@ -112,10 +112,15 @@ from app.resident_retry_binding import (
 from app.runner_decline import (
     DECLINE_ESCALATION_THRESHOLD,
     maybe_create_decline_alert,
-    record_runner_decline,
+    record_deterministic_runner_decline,
 )
 from app.execution_capability_requirements import (
     persist_learned_execution_capabilities,
+)
+from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE,
+    automatic_task_creation_decision,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,6 +131,47 @@ router = APIRouter()
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
 _recorded_task_entries: dict[str, tuple] = {}
 _AGENT_STATUS_TERMINAL_STATUSES = TASK_AGENT_STATUS_IDEMPOTENT_STATUSES
+
+
+def _agent_status_needs_project_authority(
+    task: Task | None, payload: AgentStatusPayload
+) -> bool:
+    """Whether this status transaction can enter an automatic-spawn path.
+
+    Resident updates keep their existing Project ownership fence.  Outside that
+    lane, only FAILED or DEBUG_RESULT payloads can reach a Task constructor.
+    Ordinary IN_PROGRESS heartbeats therefore remain Task-local and concurrent.
+    """
+
+    return bool(
+        task is not None
+        and (
+            (task.context or {}).get("_resident_session") is True
+            or payload.status == TaskStatus.FAILED
+            or payload.artifact_type == ArtifactType.DEBUG_RESULT
+        )
+    )
+
+
+async def _lock_agent_status_project_authority(
+    session: AsyncSession,
+    task: Task | None,
+    payload: AgentStatusPayload,
+) -> Project | None:
+    """Lock Project only for resident/spawn-capable status transactions."""
+
+    if not _agent_status_needs_project_authority(task, payload):
+        return None
+    return (
+        await session.execute(
+            select(Project)
+            .where(Project.id == task.project_id)
+            # FOR NO KEY UPDATE: serializes pause/archive without blocking the
+            # FK key-share lock taken by child Task INSERTs.
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
 
 
 async def _get_authoritative_llm_account_identity(
@@ -1196,6 +1242,7 @@ async def update_agent_status(
     #   - the lock holder (post-commit) commits before its long GitHub calls
     #     (early-commit pattern at line ~1635), so the contention window is
     #     bounded to the few-ms early-commit phase, not the full post-commit
+    locked_task_project: Project | None = None
     locked_resident_project: Project | None = None
     resident_task = (
         await session.execute(
@@ -1205,28 +1252,26 @@ async def update_agent_status(
             )
         )
     ).scalars().first()
-    if (
+    _is_resident_status = bool(
         resident_task is not None
         and (resident_task.context or {}).get("_resident_session") is True
-    ):
-        # Resident terminal updates share the same authority boundary as
-        # heartbeats and strategic mutations. Lock Project before Task so a
-        # displaced process cannot race the winner's shared Task outcome.
+    )
+    if _agent_status_needs_project_authority(resident_task, payload):
+        # Resident updates and spawn-capable terminal/debug payloads lock Project
+        # before Task. Ordinary IN_PROGRESS heartbeats deliberately stay on the
+        # Task-only fast path so unrelated project tasks remain concurrent.
         # Missing incarnation is the deterministic legacy identity, not an
         # opt-out: an old Agent must be fenced after a new process takes over.
-        locked_resident_project = (
-            await session.execute(
-                select(Project)
-                .where(Project.id == resident_task.project_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
+        locked_task_project = await _lock_agent_status_project_authority(
+            session, resident_task, payload
+        )
+        if _is_resident_status:
+            locked_resident_project = locked_task_project
     stmt = select(Task).where(
         Task.id == payload.task_id,
         Task.vm_instance_id == token.get("vm_instance_id"),
     )
-    stmt = stmt.with_for_update(skip_locked=locked_resident_project is None)
+    stmt = stmt.with_for_update(skip_locked=locked_task_project is None)
     stmt = stmt.execution_options(populate_existing=True)
     result = await session.execute(stmt)
     task = result.scalars().first()
@@ -2140,9 +2185,13 @@ async def update_agent_status(
             session.add(task)
 
     # 3b+3c. Smoketest / debug spawn blocks — extracted to agent_status_spawn.py
-    await maybe_spawn_smoketest_fix(task, payload, session, _task_id_str)
+    await maybe_spawn_smoketest_fix(
+        task, payload, session, _task_id_str, locked_project=locked_task_project
+    )
 
-    await maybe_spawn_debug_create(task, payload, session, _task_id_str)
+    await maybe_spawn_debug_create(
+        task, payload, session, _task_id_str, locked_project=locked_task_project
+    )
 
     # 4. External VM Termination
     # If the task is finished or failed, immediately kill the VM to save costs
@@ -2291,7 +2340,8 @@ async def update_agent_status(
                             "runner:"
                         )
                         if _blocked_runner_id:
-                            record_runner_decline(
+                            await record_deterministic_runner_decline(
+                                session,
                                 task,
                                 _blocked_runner_id,
                                 reason=(
@@ -2302,7 +2352,6 @@ async def update_agent_status(
                                     (task.context or {}).get("runner_hostname") or ""
                                 )
                                 or None,
-                                same_runner_retryable=False,
                             )
                     if _blk_acct_id and not (task.context or {}).get("_slot_released"):
                         await release_max_plan_account(
@@ -3675,12 +3724,14 @@ async def update_agent_status(
             reset_task_for_fresh_attempt(task)
             _runtime_decline_total = 0
             if _runtime_decline_runner_id is not None:
-                _, _runtime_decline_total = record_runner_decline(
-                    task,
-                    _runtime_decline_runner_id,
-                    reason=_runtime_decline_reason or "runtime_unavailable",
-                    hostname=_runtime_decline_hostname,
-                    same_runner_retryable=False,
+                _, _runtime_decline_total = (
+                    await record_deterministic_runner_decline(
+                        session,
+                        task,
+                        _runtime_decline_runner_id,
+                        reason=_runtime_decline_reason or "runtime_unavailable",
+                        hostname=_runtime_decline_hostname,
+                    )
                 )
                 task.latest_status_message = (
                     "Runtime-incompatible runner "
@@ -4247,7 +4298,7 @@ async def update_agent_status(
             )
             < _shared_state.USER_DEBUG_MAX_PER_HOUR
         )
-        should_auto_debug = (
+        _auto_debug_candidate = (
             # Live kill-switch: lets an operator pause the debug->fix spawn
             # chain (e.g. while a misclassification storm labels infra deaths
             # CODE_ERROR and every phantom failure amplifies into a debug VM
@@ -4271,8 +4322,29 @@ async def update_agent_status(
                 in ("ORCHESTRATOR", "USER", "ADMIN")  # Include user-submitted tasks
             )
         )
+        _auto_debug_admission = (
+            AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE
+            if _attrs_may_be_expired
+            else automatic_task_creation_decision(locked_task_project)
+        )
+        should_auto_debug = bool(
+            _auto_debug_candidate
+            and _auto_debug_admission == AUTOMATIC_TASK_CREATION_ALLOWED
+        )
+        if _auto_debug_candidate and not should_auto_debug:
+            task.context = {
+                **(task.context or {}),
+                "automatic_debug_creation_suppressed": _auto_debug_admission,
+            }
+            flag_modified(task, "context")
+            session.add(task)
+            logger.info(
+                "[DEBUG] Suppressed automatic debug task for %s: %s",
+                _task_id_str,
+                _auto_debug_admission,
+            )
         if should_auto_debug:
-            _auto_debug_project = await session.get(Project, task.project_id)
+            _auto_debug_project = locked_task_project
             base_branch = failed_task_payload.get(
                 "base_branch"
             ) or _get_project_integration_branch(_auto_debug_project)

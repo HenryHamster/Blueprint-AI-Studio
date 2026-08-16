@@ -404,6 +404,40 @@ def mark_landed_on_integration(
         if isinstance(review_loop, dict):
             review_loop.pop(UNVERIFIED_MERGE_REASON_KEY, None)
     task.context = ctx
+    # A definitive landing supersedes an older agent's failed-only current gate
+    # projection without deleting the diagnostic receipt.  New agents report
+    # passing gates directly; legacy failures move into bounded history here.
+    from app.task_blocked import supersede_failed_publication_gate_receipt_on_landing
+
+    supersede_failed_publication_gate_receipt_on_landing(task)
+
+    # Standalone author tasks intentionally become COMPLETED at PR-open while a
+    # review task owns merge.  Converge that read model when the canonical
+    # integration writer observes the landing; otherwise completed tasks keep
+    # saying "review pending" forever even though pr_merged is already true.
+    payload = task.first_payload or {}
+    pr_number = payload.get("pr_number")
+    if (
+        task.status == TaskStatus.COMPLETED
+        and pr_number is not None
+        and payload.get("type") not in {"review", "fix", "verify_tests"}
+    ):
+        if project is not None:
+            from app.shared_state import get_project_integration_branch
+
+            branch = get_project_integration_branch(project)
+            if had_non_merge_unblock:
+                task.latest_status_message = (
+                    f"Work from PR #{pr_number} landed via rollup into {branch}"
+                )
+            else:
+                task.latest_status_message = f"PR #{pr_number} merged into {branch}"
+        elif had_non_merge_unblock:
+            task.latest_status_message = (
+                f"Work from PR #{pr_number} landed via rollup into integration"
+            )
+        else:
+            task.latest_status_message = f"PR #{pr_number} merged into integration"
     try:
         from app.acceptance_gate import record_code_acceptance_verdict
 

@@ -383,6 +383,30 @@ async def test_post_commit_materialization_must_settle_before_review(db_session)
 
 
 @pytest.mark.asyncio
+async def test_paused_project_authors_no_latent_discovery_review(db_session):
+    project, cycle, _ = await _cycle_with_source(db_session)
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+
+    result = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+
+    assert result.spawned is False
+    assert result.reason == "project_paused"
+    await db_session.flush()
+    await db_session.refresh(cycle)
+    assert cycle.state == "review_pending"
+    cycle_tasks = (
+        await db_session.execute(
+            select(Task).where(Task.discovery_cycle_id == cycle.id)
+        )
+    ).scalars().all()
+    assert all(
+        task.first_payload.get("type") != "discovery_review" for task in cycle_tasks
+    )
+
+
+@pytest.mark.asyncio
 async def test_missing_delivery_receipt_stays_evidence_pending_without_agent_cost(
     db_session,
 ):

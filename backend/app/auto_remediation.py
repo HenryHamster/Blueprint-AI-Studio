@@ -649,6 +649,29 @@ async def _handle_main_branch_ci_failure_inner(
     }
     if _ci_failure_selectors:
         task_payload["ci_failure_selectors"] = _ci_failure_selectors
+
+    # The webhook may spend time on GitHub and diagnostic lookups above.  Take
+    # the canonical Project authority only at the publication edge, then retain
+    # it through the Task INSERT and commit so pause/archive cannot race a
+    # latent remediation into the queue.
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    creation_admission = await acquire_automatic_task_creation_authority(
+        session, project_id
+    )
+    if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[AUTO-REMEDIATION] Automatic task creation held for %s@%s: %s",
+            head_branch,
+            head_sha[:8],
+            creation_admission,
+        )
+        await session.rollback()
+        return
+
     task = Task(
         project_id=project_id,
         title=f"Auto-fix: CI failure on {head_branch}",

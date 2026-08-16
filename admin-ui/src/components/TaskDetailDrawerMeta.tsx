@@ -42,6 +42,14 @@ function formatCreatedBy(value: string): string {
   return value;
 }
 
+function formatOrigination(value: string): string {
+  return value
+    .toLowerCase()
+    .split('_')
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
 export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { task: Task; tasks?: Task[]; gcpProjectId?: string; onNavigateToTask?: (taskId: string) => void }) {
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const attemptNumber = task.attempt_number ?? ((task.attempt_count ?? 0) + 1);
@@ -85,6 +93,9 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       <DetailRow label="Task ID"><CopyableId value={task.id} /></DetailRow>
       {task.created_by && (
         <DetailRow label="Created By"><span className="text-sm">{formatCreatedBy(task.created_by)}</span></DetailRow>
+      )}
+      {task.origination && (
+        <DetailRow label="Work Source"><span className="text-sm">{formatOrigination(task.origination)}</span></DetailRow>
       )}
       {task.parent_task_id && (
         <DetailRow label="Parent Task">

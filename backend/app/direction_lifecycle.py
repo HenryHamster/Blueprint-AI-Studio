@@ -2045,57 +2045,70 @@ async def _process_direction_lifecycle_locked(
                     )
                 # Spawn one memo task to capture this signal as a citable artifact.
                 # The flag already gates first-detection only so no dedup query needed.
-                try:
-                    from app.plan_completion import TASK_PRIORITY_MAP
-                    from app.task_completion import _apply_synthesized_memo
+                from app.task_locking import (
+                    AUTOMATIC_TASK_CREATION_ALLOWED,
+                    automatic_task_creation_decision,
+                )
 
-                    _scaffolding_topic = (d.get("text") or "")[
-                        :120
-                    ] or f"Direction {did}"
-                    _scaffolding_payload = validate_internal_payload(
-                        {
-                            "type": "memo",
-                            "topic": f"Outcome-less scaffolding: {_scaffolding_topic}",
-                            "reasoning_kind": "outcome_scaffolding",
-                            "direction_id": did,
-                            "scaffolding_evidence": scaffolding_ev,
-                        },
-                        "direction_lifecycle:memo:outcome_scaffolding",
-                    )
-                    _scaffolding_memo = Task(
-                        project_id=project.id,
-                        title=f"Memo: outcome-less scaffolding — {_scaffolding_topic[:80]}",
-                        description="Reasoning memo for outcome-less scaffolding detection",
-                        payloads=[_scaffolding_payload],
-                        context={
-                            "memo_reasoning_kind": "outcome_scaffolding",
-                            "memo_source_direction_id": did,
-                            "outcome_scaffolding_evidence": scaffolding_ev,
-                        },
-                        status=TaskStatus.QUEUED,
-                        created_by="ORCHESTRATOR",
-                        origination=TASK_ORIGINATION_RESEARCH,
-                        priority=TASK_PRIORITY_MAP.get("low", 0),
-                    )
-                    session.add(_scaffolding_memo)
-                    _synth_memo = _synthesize_outcome_scaffolding_memo(
-                        did, _scaffolding_topic, scaffolding_ev
-                    )
-                    _apply_synthesized_memo(_scaffolding_memo, _synth_memo, session)
+                creation_admission = automatic_task_creation_decision(project)
+                if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
                     logger.info(
-                        "[AUTONOMOUS] Spawned outcome-scaffolding memo task %s for direction %s",
-                        _scaffolding_memo.id,
+                        "[AUTONOMOUS] Outcome-scaffolding memo held for direction %s: %s",
                         did,
+                        creation_admission,
                     )
-                except Exception:  # noqa: BLE001
-                    try:  # noqa: SIM105
-                        _scaffolding_memo.status = TaskStatus.FAILED
-                    except Exception:  # noqa: BLE001, S110
-                        pass
-                    logger.warning(
-                        f"[AUTONOMOUS] Failed to spawn scaffolding memo for direction {did}",
-                        exc_info=True,
-                    )
+                else:
+                    try:
+                        from app.plan_completion import TASK_PRIORITY_MAP
+                        from app.task_completion import _apply_synthesized_memo
+
+                        _scaffolding_topic = (d.get("text") or "")[
+                            :120
+                        ] or f"Direction {did}"
+                        _scaffolding_payload = validate_internal_payload(
+                            {
+                                "type": "memo",
+                                "topic": f"Outcome-less scaffolding: {_scaffolding_topic}",
+                                "reasoning_kind": "outcome_scaffolding",
+                                "direction_id": did,
+                                "scaffolding_evidence": scaffolding_ev,
+                            },
+                            "direction_lifecycle:memo:outcome_scaffolding",
+                        )
+                        _scaffolding_memo = Task(
+                            project_id=project.id,
+                            title=f"Memo: outcome-less scaffolding — {_scaffolding_topic[:80]}",
+                            description="Reasoning memo for outcome-less scaffolding detection",
+                            payloads=[_scaffolding_payload],
+                            context={
+                                "memo_reasoning_kind": "outcome_scaffolding",
+                                "memo_source_direction_id": did,
+                                "outcome_scaffolding_evidence": scaffolding_ev,
+                            },
+                            status=TaskStatus.QUEUED,
+                            created_by="ORCHESTRATOR",
+                            origination=TASK_ORIGINATION_RESEARCH,
+                            priority=TASK_PRIORITY_MAP.get("low", 0),
+                        )
+                        session.add(_scaffolding_memo)
+                        _synth_memo = _synthesize_outcome_scaffolding_memo(
+                            did, _scaffolding_topic, scaffolding_ev
+                        )
+                        _apply_synthesized_memo(_scaffolding_memo, _synth_memo, session)
+                        logger.info(
+                            "[AUTONOMOUS] Spawned outcome-scaffolding memo task %s for direction %s",
+                            _scaffolding_memo.id,
+                            did,
+                        )
+                    except Exception:  # noqa: BLE001
+                        try:  # noqa: SIM105
+                            _scaffolding_memo.status = TaskStatus.FAILED
+                        except Exception:  # noqa: BLE001, S110
+                            pass
+                        logger.warning(
+                            f"[AUTONOMOUS] Failed to spawn scaffolding memo for direction {did}",
+                            exc_info=True,
+                        )
             else:
                 # Keep the evidence fresh while the flag remains set.
                 d["outcome_scaffolding_evidence"] = scaffolding_ev

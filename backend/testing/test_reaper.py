@@ -9687,9 +9687,47 @@ async def _blocked_task(db, project, **kwargs):
     return t
 
 
+def _verified_runner_snapshot(project_id, *, runner_id=None):
+    from app.runner_eligibility import RunnerDispatchSnapshot
+
+    return RunnerDispatchSnapshot(
+        id=runner_id or _uuid_mod.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "agent_available": True,
+            "max_concurrent": 2,
+            "project_verification": {
+                "version": 1,
+                "ready": True,
+                "boundary": {"class": "agent", "backend": "bwrap"},
+                "probes": {
+                    "ruff": {"ok": True, "exit_code": 0},
+                    "docker_postgres": {"ok": True, "exit_code": 0},
+                },
+            },
+        },
+        hostname="verified-runner",
+    )
+
+
+def _learned_backend_verification_context(**extra):
+    from app.execution_capability_requirements import (
+        CAPABILITY_BACKEND_VERIFICATION,
+        persist_learned_execution_capabilities,
+    )
+
+    context, _ = persist_learned_execution_capabilities(
+        extra,
+        {CAPABILITY_BACKEND_VERIFICATION},
+        observed_at=_utcnow(),
+    )
+    return context
+
+
 @pytest.mark.asyncio
 async def test_unblock_sweep_requeues_conflict_blocker(reaper_db, mocker):
-    """A due BLOCKED task with no dependency edge is optimistically requeued."""
+    """A named file conflict requeues only after the named writer is gone."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     t = await _blocked_task(
@@ -9717,6 +9755,91 @@ async def test_unblock_sweep_requeues_conflict_blocker(reaper_db, mocker):
     assert "blocker" not in ctx
     assert "failure_class" not in ctx
     assert "failure_category" not in ctx
+    # BLOCKED -> QUEUED is a real execution boundary: the old attempt is immutable
+    # and the fresh ordinal advances even when the old row had no token telemetry.
+    assert len(t.attempt_history or []) == 1
+    assert t.attempt_history[-1]["status"] == "BLOCKED"
+    from app.models import get_task_lifetime_attempt_ordinal
+
+    assert get_task_lifetime_attempt_ordinal(t) == 2
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_holds_unchanged_named_file_conflict(reaper_db, mocker):
+    """Elapsed time cannot requeue while the exact named file is still owned."""
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    writer = Task(
+        project_id=project.id,
+        title="active writer",
+        description="x",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="test-user",
+        requires_approval=False,
+        payloads=[{"type": "fix"}],
+        context={"related_files": ["a.py"]},
+        status_log=[],
+    )
+    reaper_db.add(writer)
+    await reaper_db.commit()
+    blocked = await _blocked_task(
+        reaper_db,
+        project,
+        depends_on=[],
+        context={
+            "related_files": ["a.py"],
+            "_precondition_defer": {
+                "key": "file conflict on a.py",
+                "count": 3,
+                "files": ["a.py"],
+            },
+        },
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    assert requeued == 0
+    await reaper_db.refresh(blocked)
+    assert blocked.status == TaskStatus.BLOCKED
+    assert not (blocked.attempt_history or [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["autonomous_enabled", "paused"])
+async def test_unblock_sweep_respects_project_stop_and_drain_controls(
+    reaper_db, mocker, control
+):
+    """Existing project controls fence BLOCKED resurrection and attempt burn."""
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    if control == "autonomous_enabled":
+        project.autonomous_enabled = False
+    else:
+        project.paused = True
+    reaper_db.add(project)
+    await reaper_db.commit()
+    blocked = await _blocked_task(
+        reaper_db,
+        project,
+        depends_on=[],
+        context={
+            "related_files": ["a.py"],
+            "_precondition_defer": {
+                "key": "file conflict on a.py",
+                "count": 3,
+                "files": ["a.py"],
+            },
+        },
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    assert requeued == 0
+    await reaper_db.refresh(blocked)
+    assert blocked.status == TaskStatus.BLOCKED
+    assert not (blocked.attempt_history or [])
 
 
 @pytest.mark.asyncio
@@ -10024,14 +10147,10 @@ async def test_unblock_sweep_does_not_broadcast_on_commit_failure(reaper_db, moc
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_optimistically_retries_agent_precondition_without_dep_edge(
+async def test_unblock_sweep_does_not_retry_unnamed_agent_precondition_without_dep_edge(
     reaper_db, mocker
 ):
-    """A generic agent BLOCKER: with no dependency edge is OFTEN a transient infra
-    failure (orchestrator ./pr open 5xx, push stale-lease). The sweep now
-    optimistically requeues it a bounded number of times so a passing blip
-    auto-recovers instead of wedging its rollup parent until an operator
-    intervenes (incident 2026-06-04, tasks 87ddb2a4/18c8c195)."""
+    """Free text and elapsed time are not retry authority."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
@@ -10053,20 +10172,18 @@ async def test_unblock_sweep_optimistically_retries_agent_precondition_without_d
 
     requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
 
-    assert requeued == 1
+    assert requeued == 0
     await reaper_db.refresh(t)
-    assert t.status == TaskStatus.QUEUED
-    # First optimistic retry consumed; budget survives the requeue so re-blocks
-    # keep counting toward the cap.
-    assert t.context.get("_blocked_optimistic_retries") == 1
-    assert "optimistic" in (t.latest_status_message or "").lower()
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_optimistic_retries") is None
+    assert t.recheck_after is not None and t.recheck_after > now
 
 
 @pytest.mark.asyncio
 async def test_unblock_sweep_requeues_legacy_viewport_capability_sentinel(
     reaper_db, mocker
 ):
-    """The retired VM gate must not park a task for operator escalation."""
+    """The advisory migration clears exactly once per server policy receipt."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
@@ -10094,6 +10211,37 @@ async def test_unblock_sweep_requeues_legacy_viewport_capability_sentinel(
     await reaper_db.refresh(t)
     assert t.status == TaskStatus.QUEUED
     assert t.context.get("_blocked_optimistic_retries") is None
+    assert len(t.attempt_history or []) == 1
+    assert t.context.get("_blocked_retry_precondition_receipt") == {
+        "authority": "server_advisory_policy_v1",
+        "kind": "legacy_viewport_advisory",
+        "policy": "viewport_capture_ci_advisory_v1",
+    }
+
+    # An old runner emits the same retired sentinel again. The stable policy
+    # receipt survives the fresh-attempt transition, so no second attempt burns.
+    from app.task_blocked import enter_blocked_state
+
+    enter_blocked_state(
+        t,
+        waiting_on="precondition",
+        reason="VIEWPORT_GATE_INFRA_UNAVAILABLE: Chromium bootstrap failed",
+        source="agent",
+        blocker_kind="precondition",
+        recheck_in_seconds=None,
+        now=now + timedelta(seconds=1),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    second_requeue = await sweep_unblock_blocked_tasks(
+        reaper_db, now + timedelta(seconds=2)
+    )
+
+    assert second_requeue == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert len(t.attempt_history or []) == 1
 
 
 @pytest.mark.asyncio
@@ -10275,12 +10423,19 @@ async def test_unblock_sweep_escalates_past_deadline_despite_brief_pause(
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_first_retry_needs_no_prior_evidence(reaper_db, mocker):
-    """The first optimistic retry (optimistic_used == 0) requires no prior evidence
-    and stamps _blocked_last_retry_at on the requeued task."""
+async def test_unblock_sweep_first_capability_epoch_banks_and_advances_attempt(
+    reaper_db, mocker
+):
+    """A trusted changed capability authority admits exactly one fresh attempt."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
+    runner = _verified_runner_snapshot(project.id)
+    mocker.patch(
+        "app.orchestrator_runner_dispatch._load_active_runners_cache",
+        new_callable=AsyncMock,
+        return_value={project.id: [runner]},
+    )
     t = await _blocked_task(
         reaper_db,
         project,
@@ -10288,14 +10443,17 @@ async def test_unblock_sweep_first_retry_needs_no_prior_evidence(reaper_db, mock
         blocked_reason="BLOCKER: ./pr open returned HTTP 500",
         depends_on=[],
         blocked_at=now - timedelta(minutes=5),
-        context={
-            "blocker": {
+        context=_learned_backend_verification_context(
+            blocker={
                 "source": "agent",
                 "waiting_on": "precondition",
-                "reason": "BLOCKER: ./pr open returned HTTP 500",
+                "reason": "runtime unavailable",
             }
-        },
+        ),
         recheck_after=now - timedelta(minutes=1),
+        vm_provisioned_at=now - timedelta(minutes=3),
+        vm_stopped_at=now - timedelta(minutes=1),
+        api_call_summary={"total_input_tokens": 100, "total_output_tokens": 20},
     )
 
     requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
@@ -10304,8 +10462,16 @@ async def test_unblock_sweep_first_retry_needs_no_prior_evidence(reaper_db, mock
     await reaper_db.refresh(t)
     assert t.status == TaskStatus.QUEUED
     assert t.context.get("_blocked_optimistic_retries") == 1
-    # Evidence timestamp is stamped so subsequent retries can gate on it.
     assert t.context.get("_blocked_last_retry_at") is not None
+    receipt = t.context.get("_blocked_retry_precondition_receipt")
+    assert receipt["runner_id"] == str(runner.id)
+    assert receipt["kind"] == "execution_capability"
+    assert len(t.attempt_history or []) == 1
+    assert t.attempt_history[-1]["attempt_ordinal"] == 1
+    assert t.attempt_history[-1]["llm_input_tokens"] == 100
+    from app.models import get_task_lifetime_attempt_ordinal
+
+    assert get_task_lifetime_attempt_ordinal(t) == 2
     assert "optimistic" in (t.latest_status_message or "").lower()
 
 
@@ -10316,6 +10482,12 @@ async def test_unblock_sweep_retry_gate_holds_when_no_evidence(reaper_db, mocker
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
+    runner = _verified_runner_snapshot(project.id)
+    mocker.patch(
+        "app.orchestrator_runner_dispatch._load_active_runners_cache",
+        new_callable=AsyncMock,
+        return_value={project.id: [runner]},
+    )
     last_retry_at = now - timedelta(seconds=30)
     t = await _blocked_task(
         reaper_db,
@@ -10325,15 +10497,15 @@ async def test_unblock_sweep_retry_gate_holds_when_no_evidence(reaper_db, mocker
         depends_on=[],
         # blocked_at is BEFORE last_retry_at: no new VM run has happened since retry 1.
         blocked_at=now - timedelta(seconds=60),
-        context={
-            "blocker": {
+        context=_learned_backend_verification_context(
+            blocker={
                 "source": "agent",
                 "waiting_on": "precondition",
                 "reason": "BLOCKER: backend/app/foo.py does not exist on main",
             },
-            "_blocked_optimistic_retries": 1,
-            "_blocked_last_retry_at": last_retry_at.isoformat(),
-        },
+            _blocked_optimistic_retries=1,
+            _blocked_last_retry_at=last_retry_at.isoformat(),
+        ),
         recheck_after=now - timedelta(minutes=1),
     )
 
@@ -10358,14 +10530,20 @@ async def test_unblock_sweep_retry_gate_holds_for_missing_or_malformed_evidence(
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
-    context = {
+    runner = _verified_runner_snapshot(project.id)
+    mocker.patch(
+        "app.orchestrator_runner_dispatch._load_active_runners_cache",
+        new_callable=AsyncMock,
+        return_value={project.id: [runner]},
+    )
+    context = _learned_backend_verification_context(**{
         "blocker": {
             "source": "agent",
             "waiting_on": "precondition",
             "reason": "BLOCKER: backend/app/foo.py does not exist on main",
         },
         "_blocked_optimistic_retries": 1,
-    }
+    })
     if last_retry_at is not None:
         context["_blocked_last_retry_at"] = last_retry_at
     t = await _blocked_task(
@@ -10390,13 +10568,76 @@ async def test_unblock_sweep_retry_gate_holds_for_missing_or_malformed_evidence(
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_retry_gate_allows_when_task_reblocked(reaper_db, mocker):
-    """Retry 2 is allowed when blocked_at is more recent than the last retry
-    timestamp, proving the previous retry ran a VM that then re-blocked."""
+async def test_unblock_sweep_holds_after_reblock_on_same_capability_epoch(
+    reaper_db, mocker
+):
+    """A real prior run does not permit another retry on the same runner proof."""
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    runner = _verified_runner_snapshot(project.id)
+    mocker.patch(
+        "app.orchestrator_runner_dispatch._load_active_runners_cache",
+        new_callable=AsyncMock,
+        return_value={project.id: [runner]},
+    )
+    last_retry_at = now - timedelta(minutes=2)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: runtime still unavailable",
+        depends_on=[],
+        blocked_at=now - timedelta(minutes=1),
+        context=_learned_backend_verification_context(
+            blocker={"source": "agent", "waiting_on": "precondition"},
+            _blocked_optimistic_retries=1,
+            _blocked_last_retry_at=last_retry_at.isoformat(),
+        ),
+        recheck_after=now - timedelta(seconds=1),
+    )
+    from app.blocked_task_unblock_sweeps import (
+        _BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY,
+        _execution_capability_retry_receipt,
+    )
+
+    receipt = await _execution_capability_retry_receipt(t, reaper_db)
+    context = dict(t.context or {})
+    context[_BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY] = receipt
+    t.context = context
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_optimistic_retries") == 1
+    assert not (t.attempt_history or [])
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_retry_gate_allows_changed_capability_after_reblock(
+    reaper_db, mocker
+):
+    """Retry 2 needs both a completed prior run and a distinct capability epoch."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
     last_retry_at = now - timedelta(seconds=60)
+    previous_runner = _verified_runner_snapshot(project.id)
+    replacement_runner = _verified_runner_snapshot(project.id)
+    fleet = [previous_runner]
+
+    async def _active_runners(_session):
+        return {project.id: list(fleet)}
+
+    mocker.patch(
+        "app.orchestrator_runner_dispatch._load_active_runners_cache",
+        side_effect=_active_runners,
+    )
     t = await _blocked_task(
         reaper_db,
         project,
@@ -10405,17 +10646,33 @@ async def test_unblock_sweep_retry_gate_allows_when_task_reblocked(reaper_db, mo
         depends_on=[],
         # blocked_at is AFTER last_retry_at: the previous retry actually ran a VM.
         blocked_at=now - timedelta(seconds=30),
-        context={
-            "blocker": {
+        context=_learned_backend_verification_context(
+            blocker={
                 "source": "agent",
                 "waiting_on": "precondition",
                 "reason": "BLOCKER: backend/app/foo.py does not exist on main",
             },
-            "_blocked_optimistic_retries": 1,
-            "_blocked_last_retry_at": last_retry_at.isoformat(),
-        },
+            _blocked_optimistic_retries=1,
+            _blocked_last_retry_at=last_retry_at.isoformat(),
+        ),
         recheck_after=now - timedelta(minutes=1),
+        vm_provisioned_at=now - timedelta(seconds=50),
+        vm_stopped_at=now - timedelta(seconds=30),
     )
+
+    from app.blocked_task_unblock_sweeps import (
+        _BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY,
+        _execution_capability_retry_receipt,
+    )
+
+    prior_receipt = await _execution_capability_retry_receipt(t, reaper_db)
+    assert prior_receipt is not None
+    context = dict(t.context or {})
+    context[_BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY] = prior_receipt
+    t.context = context
+    reaper_db.add(t)
+    await reaper_db.commit()
+    fleet[:] = [replacement_runner]
 
     requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
 
@@ -10423,9 +10680,14 @@ async def test_unblock_sweep_retry_gate_allows_when_task_reblocked(reaper_db, mo
     await reaper_db.refresh(t)
     assert t.status == TaskStatus.QUEUED
     assert t.context.get("_blocked_optimistic_retries") == 2
-    # Evidence timestamp updated to this retry's timestamp.
     assert t.context.get("_blocked_last_retry_at") is not None
     assert t.context.get("_blocked_last_retry_at") != last_retry_at.isoformat()
+    assert (
+        t.context["_blocked_retry_precondition_receipt"]["runner_id"]
+        == str(replacement_runner.id)
+    )
+    assert len(t.attempt_history or []) == 1
+    assert t.attempt_history[-1]["attempt_ordinal"] == 1
     assert "optimistic" in (t.latest_status_message or "").lower()
 
 
@@ -10688,12 +10950,11 @@ async def test_unblock_sweep_resolves_pr_need_to_owning_task(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_unresolvable_capability_need_falls_through_to_retry(
+async def test_unblock_sweep_unresolved_capability_need_stays_blocked_without_provider(
     reaper_db, mocker
 ):
     """A {kind:'capability'} need with NO conservative candidate match does NOT
-    wire an edge — it falls through to the existing optimistic-retry path
-    unchanged (the edge-resolution must never invent a false dependency)."""
+    wire an edge or authorize a blind retry."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
@@ -10730,13 +10991,12 @@ async def test_unblock_sweep_unresolvable_capability_need_falls_through_to_retry
 
     requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
 
-    assert requeued == 1
+    assert requeued == 0
     await reaper_db.refresh(t)
-    assert t.status == TaskStatus.QUEUED
-    # No edge wired; the optimistic-retry path handled it instead.
+    assert t.status == TaskStatus.BLOCKED
     assert not (t.depends_on or [])
-    assert t.context.get("_blocked_optimistic_retries") == 1
-    assert "optimistic" in (t.latest_status_message or "").lower()
+    assert t.context.get("_blocked_optimistic_retries") is None
+    assert t.recheck_after is not None and t.recheck_after > now
 
 
 @pytest.mark.asyncio
@@ -10931,15 +11191,12 @@ async def test_unblock_sweep_does_not_treat_ghost_merge_as_completed_foundation(
     await sweep_unblock_blocked_tasks(reaper_db, now)
 
     await reaper_db.refresh(t)
-    # NOT resolved as a satisfied completed foundation: no edge wired, and the
-    # resume message is the optimistic-retry one, never "completed work".
+    # NOT resolved as a satisfied completed foundation: no edge wired and no
+    # blind retry is admitted for the unchanged missing provider.
     assert not (t.depends_on or [])
     assert "completed work" not in (t.latest_status_message or "").lower()
-    # Fell through to the bounded optimistic-retry path (re-dispatch the agent so
-    # it re-blocks if the foundation still isn't shipped), NOT a completed-work
-    # resolution that would proceed as if the dependency were already built.
-    assert t.context.get("_blocked_optimistic_retries") == 1
-    assert "optimistic" in (t.latest_status_message or "").lower()
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_optimistic_retries") is None
 
 
 @pytest.mark.asyncio
@@ -13194,9 +13451,10 @@ async def test_park_horizon_is_never_silent_invariant(reaper_db, mocker):
     tracked operator escalation alert has been emitted — a park is never silent.
 
     Runs the unblock sweep over a mixed population (one past-deadline blocker that
-    must escalate+park, one under-budget agent blocker that must requeue and never
-    park) and asserts that EVERY task left parked at the horizon carries the
-    ``_blocked_escalated`` flag AND has a matching ERROR escalation alert. This
+    must escalate+park, one free-form agent blocker that must remain held until a
+    named precondition changes) and asserts that EVERY task left parked at the
+    horizon carries the ``_blocked_escalated`` flag AND has a matching ERROR
+    escalation alert. This
     guards the observability of parked blockers (compute_parked_blocker_summary
     keys off the same flag): a park without an alert would be an uncounted,
     invisible permanently-stuck task.
@@ -13217,8 +13475,9 @@ async def test_park_horizon_is_never_silent_invariant(reaper_db, mocker):
         blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
         recheck_after=now - timedelta(minutes=1),
     )
-    # (b) Fresh, under-budget agent blocker → optimistically requeued, never parked.
-    requeuable = await _blocked_task(
+    # (b) A free-form agent blocker has no server-verifiable changed precondition,
+    # so it remains blocked without consuming another execution episode.
+    held = await _blocked_task(
         reaper_db,
         project,
         depends_on=[],
@@ -13248,7 +13507,7 @@ async def test_park_horizon_is_never_silent_invariant(reaper_db, mocker):
         .all()
     )
 
-    # Exactly the escalated task is parked, and the requeued one is not.
+    # Exactly the escalated task is parked; the receipt-less blocker is held locally.
     assert {str(r.id) for r in parked_rows} == {str(escalated.id)}
 
     # The core invariant: every parked task is escalation-flagged AND alerted.
@@ -13269,11 +13528,12 @@ async def test_park_horizon_is_never_silent_invariant(reaper_db, mocker):
         assert len(alerts) == 1, "a park must be preceded by an escalation alert"
         assert "permanently blocked" in alerts[0].title
 
-    # The under-budget blocker requeued instead of parking — no silent park, no alert.
-    await reaper_db.refresh(requeuable)
-    assert requeuable.status == TaskStatus.QUEUED
+    # The receipt-less blocker neither retries nor silently parks, and emits no alert.
+    await reaper_db.refresh(held)
+    assert held.status == TaskStatus.BLOCKED
+    assert held.recheck_after is None or held.recheck_after < park_floor
     no_alerts = (
-        (await reaper_db.execute(_select(Alert).where(Alert.task_id == requeuable.id)))
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == held.id)))
         .scalars()
         .all()
     )
@@ -13492,11 +13752,10 @@ async def test_parked_blocker_stays_parked_when_need_unsatisfiable(reaper_db, mo
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_preserves_first_blocked_on_optimistic_requeue(
+async def test_unblock_sweep_cleared_conflict_starts_fresh_block_episode(
     reaper_db, mocker
 ):
-    """A conflict blocker (no dep edge) keeps its _blocked_first_at onset stamp
-    across an optimistic requeue, so dispatch can re-block from the true onset."""
+    """A conflict with no remaining writer is a genuine clear, not a retry."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     onset = (_utcnow() - timedelta(hours=5)).isoformat()
@@ -13512,8 +13771,8 @@ async def test_unblock_sweep_preserves_first_blocked_on_optimistic_requeue(
     assert requeued == 1
     await reaper_db.refresh(t)
     assert t.status == TaskStatus.QUEUED
-    # Onset stamp survives the optimistic requeue (no dependency edge).
-    assert t.context.get("_blocked_first_at", {}).get("at") == onset
+    assert "_blocked_first_at" not in (t.context or {})
+    assert len(t.attempt_history or []) == 1
 
 
 @pytest.mark.asyncio
@@ -13584,7 +13843,19 @@ async def test_unblock_sweep_conflict_blocker_with_stale_satisfied_dep_escalates
         context={},
         status_log=[],
     )
+    writer = Task(
+        project_id=project.id,
+        title="active writer",
+        description="x",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "fix"}],
+        context={"related_files": ["a.py"]},
+        status_log=[],
+    )
     reaper_db.add(dep)
+    reaper_db.add(writer)
     await reaper_db.commit()
     await reaper_db.refresh(dep)
     now = _utcnow()
@@ -13622,12 +13893,10 @@ async def test_unblock_sweep_conflict_blocker_with_stale_satisfied_dep_escalates
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_conflict_blocker_with_stale_dep_preserves_first_blocked(
+async def test_unblock_sweep_unchanged_conflict_with_stale_dep_stays_blocked(
     reaper_db, mocker
 ):
-    """A conflict blocker with a stale satisfied dep that is NOT yet past the
-    deadline requeues optimistically AND preserves its first-blocked onset stamp,
-    so the next block episode keeps counting toward the deadline."""
+    """A satisfied stale edge cannot override an unchanged named conflict."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     dep = Task(
@@ -13641,7 +13910,19 @@ async def test_unblock_sweep_conflict_blocker_with_stale_dep_preserves_first_blo
         context={},
         status_log=[],
     )
+    writer = Task(
+        project_id=project.id,
+        title="active writer",
+        description="x",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "fix"}],
+        context={"related_files": ["a.py"]},
+        status_log=[],
+    )
     reaper_db.add(dep)
+    reaper_db.add(writer)
     await reaper_db.commit()
     await reaper_db.refresh(dep)
     now = _utcnow()
@@ -13661,24 +13942,19 @@ async def test_unblock_sweep_conflict_blocker_with_stale_dep_preserves_first_blo
         reaper_db, now, verify_pr_merged=verify
     )
 
-    assert requeued == 1
+    assert requeued == 0
     await reaper_db.refresh(t)
-    assert t.status == TaskStatus.QUEUED
-    # Onset survives the optimistic requeue even though a stale dep edge lingers.
+    assert t.status == TaskStatus.BLOCKED
     assert t.context.get("_blocked_first_at", {}).get("at") == onset
     assert t.context.get("_blocked_escalated") is None
+    assert not (t.attempt_history or [])
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_conflict_requeue_preserves_defer_counter(
+async def test_unblock_sweep_cleared_conflict_resets_defer_counter(
     reaper_db, mocker
 ):
-    """Optimistic conflict requeue must NOT wipe _precondition_defer.
-
-    A task that has been deferred N times on the same file-conflict blocker
-    must keep its counter across BLOCKED→QUEUED episodes so dispatch can
-    accumulate toward the escalation threshold instead of cycling forever.
-    """
+    """A named conflict that disappeared starts a clean block episode."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     blocker_key = "file conflict on src/foo.py"
@@ -13700,14 +13976,9 @@ async def test_unblock_sweep_conflict_requeue_preserves_defer_counter(
     await reaper_db.refresh(t)
     assert t.status == TaskStatus.QUEUED
     ctx = t.context or {}
-    # Defer counter and escalation stamp must survive the optimistic requeue.
-    defer = ctx.get("_precondition_defer")
-    assert defer is not None, (
-        "_precondition_defer must not be wiped on optimistic requeue"
-    )
-    assert defer.get("key") == blocker_key
-    assert defer.get("count") == 3
-    assert ctx.get("_precondition_escalated_key") == blocker_key
+    assert "_precondition_defer" not in ctx
+    assert "_precondition_escalated_key" not in ctx
+    assert len(t.attempt_history or []) == 1
 
 
 @pytest.mark.asyncio
@@ -16120,6 +16391,54 @@ async def test_landing_event_resumes_blocked_dependent_immediately(reaper_db, mo
     await reaper_db.refresh(dependent)
     assert dependent.status == TaskStatus.QUEUED
     assert "blocker" not in (dependent.context or {})
+    assert len(dependent.attempt_history or []) == 1
+
+
+@pytest.mark.asyncio
+async def test_event_driven_unblock_respects_project_drain_fence(reaper_db, mocker):
+    """A landing event cannot resurrect BLOCKED work while the project drains."""
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    foundation = Task(
+        project_id=project.id,
+        title="build auth layer",
+        description="x",
+        status=TaskStatus.COMPLETED,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"pr_merged": True, "provides_capability": "auth-layer"},
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    dependent = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs auth layer",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth-layer",
+                "need": {"kind": "capability", "ref": "auth-layer"},
+            }
+        },
+        recheck_after=_utcnow() + timedelta(hours=1),
+    )
+    project.paused = True
+    reaper_db.add(project)
+    await reaper_db.commit()
+
+    resumed = await event_driven_unblock_dependents(foundation, reaper_db)
+
+    assert resumed == 0
+    await reaper_db.refresh(dependent)
+    assert dependent.status == TaskStatus.BLOCKED
+    assert not (dependent.attempt_history or [])
 
 
 @pytest.mark.asyncio

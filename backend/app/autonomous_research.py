@@ -70,6 +70,8 @@ from app.research_cycle_cadence import (
 from app.research_finding_policy import NON_SPAWNING_FINDING_TYPES
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    acquire_automatic_task_creation_authority,
     acquire_direction_research_spawn_lock,
     with_vision_locked,
 )
@@ -431,7 +433,11 @@ async def _undirected_research_recently_active(project_id, session) -> bool:
     return recent > 0
 
 
-async def _cycle_blocked_direction_keys(session, project_id) -> set[str]:
+async def _cycle_blocked_direction_keys(
+    session,
+    project_id,
+    directions: list[dict] | None = None,
+) -> set[str]:
     """Direction keys whose live discovery cycle cannot admit a new research root.
 
     Mirrors the admission predicate in ``ensure_discovery_cycle_for_research``:
@@ -440,31 +446,23 @@ async def _cycle_blocked_direction_keys(session, project_id) -> set[str]:
     consumes a ``max_parallel`` slot (head-of-line blocking every other
     eligible direction when the cap is low).
     """
-    from app.models import DiscoveryCycle
+    from app.discovery_admission import (
+        direction_discovery_admission_decision,
+        load_latest_direction_discovery_cycles,
+    )
 
+    cycles = await load_latest_direction_discovery_cycles(session, project_id)
+    direction_by_key = {
+        str(direction.get("id")): direction
+        for direction in (directions or [])
+        if direction.get("id")
+    }
     return {
         key
-        for key, state, source_id in (
-            await session.execute(
-                select(
-                    DiscoveryCycle.direction_key,
-                    DiscoveryCycle.state,
-                    DiscoveryCycle.source_research_task_id,
-                ).where(
-                    DiscoveryCycle.project_id == project_id,
-                    DiscoveryCycle.state.in_(
-                        [
-                            "open",
-                            "admission_closed",
-                            "review_pending",
-                            "reviewing",
-                            "review_blocked",
-                        ]
-                    ),
-                )
-            )
-        ).all()
-        if state != "open" or source_id is not None
+        for key, cycle in cycles.items()
+        if not direction_discovery_admission_decision(
+            direction_by_key.get(key, {"id": key}), cycle
+        ).can_admit_root
     }
 
 
@@ -1558,14 +1556,29 @@ async def _spawn_research_task_inner(
         # max_parallel candidate slots only to be skipped at spawn admission.
         # With a low cap the same blocked direction then head-of-line blocks
         # every other eligible direction on every sweep, so exclude them here.
-        cycle_blocked_keys = await _cycle_blocked_direction_keys(session, project.id)
+        from app.discovery_admission import (
+            load_direction_discovery_admission_decisions,
+        )
+
+        discovery_admission = await load_direction_discovery_admission_decisions(
+            session,
+            project.id,
+            list(project.directions or []),
+        )
+        cycle_blocked_keys = {
+            key
+            for key, admission in discovery_admission.items()
+            if not admission.can_admit_root
+        }
         for d in sorted_eligible:
             did = d.get("id")
             if did in cycle_blocked_keys:
+                admission = discovery_admission[did]
                 logger.info(
-                    "[AUTONOMOUS] skipped direction %s: live discovery cycle "
-                    "cannot admit a new research root",
+                    "[AUTONOMOUS] skipped direction %s: %s; next action: %s",
                     did,
+                    admission.reason,
+                    admission.next_action,
                 )
                 continue
             if is_pause_mode(d):
@@ -2541,6 +2554,23 @@ async def _spawn_research_task_inner(
         # Fall through to the normal commit so any pending session state from
         # this cycle (e.g. an anomaly-adjustment Alert added above) still lands.
         directions_to_spawn = []
+
+    # All candidate/policy preparation above is read-only.  Linearize the
+    # actual automatic admissions with operator pause now, before taking any
+    # direction/discovery child lock and keep the Project lock through the
+    # batched Task INSERT commit below.
+    admission_project_id = project.id
+    admission = await acquire_automatic_task_creation_authority(
+        session, admission_project_id, skip_locked=True
+    )
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        await session.rollback()
+        logger.info(
+            "[AUTONOMOUS] Research admission closed for project %s (%s)",
+            admission_project_id,
+            admission,
+        )
+        return 0
 
     spawned_tasks = []
     for chosen_direction in directions_to_spawn:
@@ -3595,6 +3625,23 @@ async def _spawn_periodic_task(
         f"periodic task spawn (type={task_type})",
         expected_legacy_generation=expected_legacy_generation,
     ):
+        return
+
+    # The circuit-breaker path above may commit policy transitions.  Acquire
+    # the universal Project pause/archive authority after it and before the
+    # first Task child query so the schedule check -> INSERT window is fenced.
+    admission_project_id = project.id
+    admission = await acquire_automatic_task_creation_authority(
+        session, admission_project_id, skip_locked=True
+    )
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        await session.rollback()
+        logger.info(
+            "[AUTONOMOUS] Periodic admission closed for project %s type=%s (%s)",
+            admission_project_id,
+            task_type,
+            admission,
+        )
         return
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(

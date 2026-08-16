@@ -44,7 +44,7 @@ from app.json_extract import (
     _extract_last_json_array,
     scan_balanced_json_objects,
 )
-from app.models import Task, TaskStatus
+from app.models import Project, Task, TaskStatus
 from app.task_capabilities import get_task_capability
 
 logger = logging.getLogger(__name__)
@@ -1367,6 +1367,7 @@ async def spawn_forward_quality_grader(
     question: str | None = None,
     adversarial_mode: bool = False,
     finding_hashes: list[str] | None = None,
+    locked_project: Project | None = None,
 ) -> Task | None:
     """Spawn an independent grader task for ``source_task`` and park the source.
 
@@ -1397,6 +1398,53 @@ async def spawn_forward_quality_grader(
         ):
             # Already graded, or a grader is already in flight — never double-spawn.
             return None
+
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        automatic_task_creation_decision,
+        automatic_task_creation_parent_lock,
+    )
+
+    if locked_project is None:
+        # Callers after an intermediate commit have no valid completion locks;
+        # reacquire the canonical pair and recurse while the context keeps both
+        # locks through the atomic sidecar/source commit. Callers that retained
+        # Project -> Task pass locked_project and use the pure decision below.
+        async with automatic_task_creation_parent_lock(
+            session,
+            source_task.project_id,
+            source_task.id,
+        ) as (creation_admission, fresh_project, fresh_source):
+            if (
+                creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED
+                or fresh_project is None
+                or fresh_source is None
+            ):
+                logger.info(
+                    "[EVAL] Forward-quality grader held for source %s: %s",
+                    source_task.id,
+                    creation_admission,
+                )
+                return None
+            return await spawn_forward_quality_grader(
+                fresh_source,
+                artifact_text,
+                session,
+                rubric=rubric,
+                question=question,
+                adversarial_mode=adversarial_mode,
+                finding_hashes=finding_hashes,
+                locked_project=fresh_project,
+            )
+
+    creation_admission = automatic_task_creation_decision(locked_project)
+    if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[EVAL] Forward-quality grader held for source %s: %s",
+            source_task.id,
+            creation_admission,
+        )
+        return None
 
     task_type = _task_type_of(source_task)
     if adversarial_mode:
@@ -1699,6 +1747,7 @@ async def spawn_finding_challenge(
     *,
     question: str | None = None,
     finding_hash: str | None = None,
+    locked_project: Project | None = None,
 ) -> Task | None:
     """Spawn a single read-only challenge side-car and park the source EVALUATING.
 
@@ -1726,6 +1775,49 @@ async def spawn_finding_challenge(
     ):
         # Already challenged, or a challenge is already in flight — never
         # double-spawn (mirrors spawn_forward_quality_grader's single-shot guard).
+        return None
+
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        automatic_task_creation_decision,
+        automatic_task_creation_parent_lock,
+    )
+
+    if locked_project is None:
+        async with automatic_task_creation_parent_lock(
+            session,
+            source_task.project_id,
+            source_task.id,
+        ) as (creation_admission, fresh_project, fresh_source):
+            if (
+                creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED
+                or fresh_project is None
+                or fresh_source is None
+            ):
+                logger.info(
+                    "[CHALLENGE] Finding challenge held for source %s: %s",
+                    source_task.id,
+                    creation_admission,
+                )
+                return None
+            return await spawn_finding_challenge(
+                fresh_source,
+                finding,
+                boundary,
+                first_verdict,
+                session,
+                question=question,
+                finding_hash=finding_hash,
+                locked_project=fresh_project,
+            )
+
+    creation_admission = automatic_task_creation_decision(locked_project)
+    if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[CHALLENGE] Finding challenge held for source %s: %s",
+            source_task.id,
+            creation_admission,
+        )
         return None
 
     prompt = build_finding_challenge_prompt(

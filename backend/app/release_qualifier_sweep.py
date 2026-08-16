@@ -460,6 +460,7 @@ _DRIFT_SENTINEL_RERUN_BUDGET = 1
 # no-run path.
 _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY = "_drift_sentinel_cancelled_redispatch"
 _DRIFT_SENTINEL_CANCELLED_REDISPATCH_COOLDOWN_SECONDS = 30 * 60
+_DRIFT_SENTINEL_TERMINAL_DISPATCH_KEY = "_drift_sentinel_terminal_dispatch"
 
 
 def _drift_sentinel_cancelled_redispatch_due(
@@ -495,23 +496,18 @@ async def _check_full_suite_drift_sentinel(
     *,
     session_factory=None,
 ) -> bool:
-    """Dispatch and evaluate the standing full-suite CI sentinel on automain.
+    """Evaluate full-suite CI on automain and dispatch only when no run exists.
 
-    Resolves the integration-branch HEAD and dispatches a ci.yml full-matrix
-    run if none exists for that SHA.  A concluded-red run raises a deduplicated
-    Alert (keyed on project+SHA so repeated sweeps do not double-alert) and
-    spawns harvest remediation via the same path used by the promotion-failed
-    re-driver.
-
-    Canonical and ON by default: every open version fires the sentinel
-    regardless of phase, so full-suite CI drift is caught before it accumulates
-    across targeted-CI merges.  The only opt-out is an explicit
-    ``build_config.full_suite_drift_sentinel_enabled: False`` (temporary
-    rollback path).
-    Best-effort: any exception is swallowed and logged.  Returns True when a
-    dispatch or alert/harvest occurred.
+    Terminal dispatch receipts suppress the exact authority tuple after the
+    read-only lookup. Red runs alert and enter harvest remediation. Canonical
+    unless explicitly disabled; best-effort and non-raising.
     """
     from app import release_qualifier
+    from app.project_telemetry import read_telemetry, upsert_telemetry
+    from app.promotion_ci_dispatch import (
+        terminal_promotion_ci_dispatch_receipt,
+        terminal_promotion_ci_dispatch_receipt_active,
+    )
     from app.release_readiness import compute_promotion_ci_green_gate
     from app.release_reconciliation import _harvest_promotion_ci_failures
 
@@ -531,10 +527,11 @@ async def _check_full_suite_drift_sentinel(
             ):
                 return False
 
+            # Read-only first, even with a prior terminal dispatch receipt.
             gate = await compute_promotion_ci_green_gate(
                 session,
                 version.project_id,
-                dispatch=True,
+                dispatch=False,
                 # A cancelled run must surface as its own state, not collapse into
                 # an immediate re-dispatch — otherwise the ci.yml concurrency
                 # policy's cancel-in-progress on the integration branch drives a
@@ -543,6 +540,74 @@ async def _check_full_suite_drift_sentinel(
             )
             gate_state = gate.get("gate_state")
             head_sha = gate.get("head_sha") or ""
+
+            async def _persist_terminal_dispatch_receipt(
+                dispatched_gate: dict,
+            ) -> bool:
+                """Persist every terminal dispatch outcome through one seam."""
+
+                receipt = terminal_promotion_ci_dispatch_receipt(dispatched_gate)
+                if receipt is None:
+                    return False
+                await upsert_telemetry(
+                    session,
+                    version.project_id,
+                    _DRIFT_SENTINEL_TERMINAL_DISPATCH_KEY,
+                    receipt,
+                )
+                await session.commit()
+                return True
+
+            integration_branch, _ = release_qualifier._lts_branch_names(project)
+            expected_suppression_key = (
+                f"{project.github_owner or ''}/{project.github_repo or ''}:"
+                f"ci.yml:{integration_branch}:{head_sha}"
+            )
+            if gate_state in {"no_signal", "cancelled"}:
+                prior_dispatch = (
+                    await read_telemetry(
+                        session,
+                        version.project_id,
+                        _DRIFT_SENTINEL_TERMINAL_DISPATCH_KEY,
+                    )
+                    or {}
+                )
+                if (
+                    terminal_promotion_ci_dispatch_receipt_active(prior_dispatch)
+                    and prior_dispatch.get("kind") == "promotion_ci_dispatch"
+                    and prior_dispatch.get("retryable") is False
+                    and prior_dispatch.get("workflow_file") == "ci.yml"
+                    and prior_dispatch.get("ref") == integration_branch
+                    and prior_dispatch.get("head_sha") == head_sha
+                    and prior_dispatch.get("suppression_key")
+                    == expected_suppression_key
+                ):
+                    gate = {
+                        **gate,
+                        "gate_state": "dispatch_rejected",
+                        "dispatch_outcome": prior_dispatch.get("outcome"),
+                        "dispatch_retryable": False,
+                        "dispatch_suppression_key": expected_suppression_key,
+                        "reason": (
+                            "ci.yml dispatch was already terminally rejected for "
+                            "this repository/ref/HEAD authority tuple"
+                        ),
+                    }
+                    gate_state = "dispatch_rejected"
+
+            if gate_state == "no_signal":
+                if gate.get("gate_state") == "no_signal":
+                    # No authoritative run and no exact same-head terminal
+                    # receipt: the current candidate may attempt one dispatch.
+                    gate = await compute_promotion_ci_green_gate(
+                        session,
+                        version.project_id,
+                        dispatch=True,
+                        dispatch_on_cancelled=False,
+                    )
+                    await _persist_terminal_dispatch_receipt(gate)
+                gate_state = gate.get("gate_state")
+                head_sha = gate.get("head_sha") or head_sha
 
             if gate_state == "dispatched":
                 logger.info(
@@ -591,6 +656,7 @@ async def _check_full_suite_drift_sentinel(
                         dispatch=True,
                         dispatch_on_cancelled=True,
                     )
+                    await _persist_terminal_dispatch_receipt(gate)
                     gate_state = gate.get("gate_state")
                     head_sha = gate.get("head_sha") or ""
                     if gate_state == "dispatched":
@@ -683,14 +749,18 @@ async def _check_full_suite_drift_sentinel(
                         )
                     return True
 
-            if gate_state == "unavailable":
+            if gate_state in ("unavailable", "dispatch_rejected"):
                 # The gate could not resolve creds / HEAD / API.  This is
                 # self-healing on the next sweep, but must not remain invisible
                 # while full-suite CI drift accumulates.  Keep one active alert
                 # per project so every new automain merge does not create a new
                 # operator incident for the same unresolved integration signal.
                 reason = str(gate.get("reason") or "unknown reason")
-                dedupe_key = f"drift_sentinel:unavailable:{version.project_id}"
+                dedupe_key = (
+                    f"drift_sentinel:dispatch_rejected:{version.project_id}:{head_sha}"
+                    if gate_state == "dispatch_rejected"
+                    else f"drift_sentinel:unavailable:{version.project_id}"
+                )
                 head_label = head_sha[:8] if head_sha else "?"
                 head_detail = head_sha[:12] if head_sha else "?"
                 title = (
@@ -735,7 +805,7 @@ async def _check_full_suite_drift_sentinel(
                         head_sha[:8] if head_sha else "?",
                         reason,
                     )
-                else:
+                elif gate_state == "unavailable":
                     existing.severity = AlertSeverity.WARNING
                     existing.title = title
                     existing.message = message
@@ -1106,59 +1176,13 @@ async def _fire_auto_triggered_qualification(
     session_factory=None,
     pre_sweep_status: str | None = None,
 ) -> bool:
-    """Execute the qualification-trigger resolver's fire decision for one version.
+    """Resolve and execute one sanctioned automatic qualification decision.
 
-    ``qualification_triggers.resolve_qualification_trigger`` is the pure decision
-    module that maps an open version's state to fire/hold, but until now nothing
-    EXECUTED it: the only production consumers were read surfaces (strategic fetch,
-    admin lifecycle), the ``auto_qualification_triggers`` knob defaulted to
-    ``observe``, and ``run_qualification`` refused any non-explicit fresh
-    qualification (``explicit_request=False`` ⇒ ``{"status":
-    "explicit_request_required"}``).  The result was a trigger engine that decided
-    "armed" forever without ever spawning a qualification.  This helper is the
-    sweep's executor for that decision: it fires ``run_qualification`` through the
-    sweep's OWN sanctioned path (``auto_trigger=True``), which the ownership guard
-    admits as a distinct source — never by claiming ``explicit_request``.
-
-    For each open, stabilize-phase version it mirrors the read surface's resolver
-    inputs (candidate-fully-met from the ledger, requalification readiness, and a
-    best-effort automain HEAD/CI state for the advanced-candidate legs), then:
-
-      * knob == "off"       — no-op (never even resolves).
-      * knob == "observe"   — resolve and LOG a would-fire decision, but do not run.
-      * knob == "on" + fire — call ``run_qualification(..., auto_trigger=True)``.
-      * fire == False       — hold; nothing to do this cycle.
-
-    Guardrails (mirroring the qualify_request path so the auto-trigger can never
-    bypass the CI-compliance guardrail or race a bespoke re-driver):
-
-      * A durable ``qualify_request_blocked`` marker with blocker ``ci_compliance``
-        is skipped — ``_recheck_ci_compliance_blocked_version`` owns that loop and
-        must be the one to clear it.
-      * The STORED ci-compliance gate record is checked (fail-open: no record ⇒ not
-        blocked) using the same cheap, no-GitHub-scan read the error/infra re-drivers
-        use — a fresh ``ensure_current_ci_compliance`` scan stays the strategic
-        qualify_request path's job.
-      * Verdict re-drives are NOT auto-trigger work: ``error`` / ``infra_failure``
-        are owned by the dedicated re-drivers above (which re-enter
-        ``run_qualification`` with a bounded attempt cap), and
-        ``rubric_changed`` / ``rubric_provenance_unknown`` are owned by the
-        dedicated rubric re-driver above (``_redrive_rubric_changed_qualification``)
-        — auto-firing them here would bypass its re-drive cap.  And
-        ``deferred_unsynced`` / ``promotion_failed`` / ``not_promoted`` with any
-        blocker other than the acceptance grade are Strategic qualify_request
-        decisions — the existing contract forbids the scheduler from starting a
-        new review on those.  The resolver surfaces them to Strategic; the sweep
-        only fires the initial start and attempt-scoped recovery.
-      * ``pre_sweep_status`` — when provided, a version whose qualification
-        status differs from that snapshot is deferred.  An earlier sweep leg
-        (finalize, promotion_pending_timeout / managed-check-wait reconcile)
-        just wrote this cycle's outcome; those transitions re-arm the trigger
-        on the NEXT cycle, and firing now would race the fresh state.
-
-    Best-effort like every other sweep leg: any exception is swallowed and logged so
-    one version can never wedge the sweep.  Returns True only when a qualification
-    was actually started (``run_qualification`` returned ``{"status": "spawned"}``).
+    The resolver always runs before executor-ownership and CI-compliance gates.
+    The sweep owns initial, dry-run-advance, and not_promoted candidate-advance
+    triggers; dedicated bounded re-drivers retain every other trigger family.
+    ``pre_sweep_status`` defers a state changed by an earlier leg until the next
+    cycle. Returns True only when ``run_qualification`` reports ``spawned``.
     """
     from app import release_qualifier
     from app.qualification_triggers import resolve_qualification_trigger
@@ -1181,13 +1205,7 @@ async def _fire_auto_triggered_qualification(
             else {}
         )
         status = qual.get("status")
-        # Defer when an earlier sweep leg transitioned this version THIS cycle
-        # (finalize, the promotion_pending_timeout / managed-check-wait
-        # reconciles).  Those transitions settle to a fire-eligible state but
-        # document a deliberate "re-arm next cycle" — firing now would race the
-        # just-written outcome (and, on the error path, overwrite its error
-        # detail).  A version whose status is unchanged since the sweep started
-        # is a settled state the resolver may fire on.
+        # Do not race an outcome written by an earlier leg in this cycle.
         if pre_sweep_status is not None and status != pre_sweep_status:
             logger.info(
                 "[RELEASE_QUALIFIER] sweep: auto-trigger deferring version %s — "
@@ -1197,46 +1215,8 @@ async def _fire_auto_triggered_qualification(
                 status,
             )
             return False
-        # Verdict re-drives the scheduler must NOT execute.  ``error`` /
-        # ``infra_failure`` / ``rubric_changed`` / ``rubric_provenance_unknown``
-        # are owned by the dedicated re-drivers above (which re-enter
-        # ``run_qualification`` with a bounded attempt cap); the rest are
-        # Strategic delivery decisions — the existing contract is explicit that the
-        # sweep must leave them for Strategic to re-issue ("Resolved findings do
-        # not authorize the scheduler to start a new review", "A cleared deferral
-        # remains a Strategic delivery decision, not sweep work", "Green CI is
-        # evidence for Strategic, not scheduler qualification authority").  The
-        # resolver surfaces these to Strategic via the read surfaces; the sweep's
-        # auto-trigger authority is the INITIAL start (status None) plus
-        # attempt-scoped recovery (dry-run advance, and the acceptance-grade
-        # ``criterion_coverage_incomplete`` re-grade).
-        if status in (
-            "error",
-            "infra_failure",
-            "deferred_unsynced",
-            "promotion_failed",
-            "rubric_changed",
-            "rubric_provenance_unknown",
-        ):
-            return False
-        if status == "not_promoted" and qual.get("blocker") != "criterion_coverage_incomplete":
-            return False
-        # A CI-compliance deferral is durable and owned by the recheck loop above.
-        blocked = qual.get("qualify_request_blocked")
-        if isinstance(blocked, dict) and blocked.get("blocker") == "ci_compliance":
-            return False
         project = await fire_session.get(Project, version.project_id)
         if project is None:
-            return False
-        from app.strategic_spawning import ci_compliance_qualify_gate
-
-        if ci_compliance_qualify_gate(project).get("blocked"):
-            logger.info(
-                "[RELEASE_QUALIFIER] sweep: deferring auto-trigger for v%d — "
-                "stored CI-compliance record shows the integration HEAD breaches "
-                "the guardrails",
-                version.version_number,
-            )
             return False
         try:
             from app import category_verdict_ledger as _cvl
@@ -1322,6 +1302,38 @@ async def _fire_auto_triggered_qualification(
                 version_id,
                 decision.trigger,
                 decision.reason,
+            )
+            return False
+
+        # Raw status/blocker skips previously hid candidate_advanced for
+        # non-coverage blockers. Apply executor ownership only after resolution.
+        if decision.trigger not in {
+            "coverage_complete",
+            "candidate_advanced",
+            "post_dry_run_advance",
+        }:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: resolver armed version %s with "
+                "trigger=%s, but that trigger is owned by its dedicated re-driver",
+                version_id,
+                decision.trigger,
+            )
+            return False
+
+        # A CI-compliance deferral is durable and owned by the recheck loop above.
+        # These execution guards deliberately run AFTER trigger resolution so
+        # they cannot erase candidate invalidation from the decision surface.
+        blocked = qual.get("qualify_request_blocked")
+        if isinstance(blocked, dict) and blocked.get("blocker") == "ci_compliance":
+            return False
+        from app.strategic_spawning import ci_compliance_qualify_gate
+
+        if ci_compliance_qualify_gate(project).get("blocked"):
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: deferring auto-trigger for v%d — "
+                "stored CI-compliance record shows the integration HEAD breaches "
+                "the guardrails",
+                version.version_number,
             )
             return False
         result = await release_qualifier.run_qualification(

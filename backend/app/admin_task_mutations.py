@@ -759,6 +759,7 @@ async def _apply_status_mutation(
                     task,
                     session,
                     operator_retry_guidance=requeue_guidance,
+                    automatic_creation=False,
                 )
             except HTTPException:
                 raise

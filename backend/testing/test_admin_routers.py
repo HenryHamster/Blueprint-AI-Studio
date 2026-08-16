@@ -4080,7 +4080,11 @@ class TestMaybeSpawnSmoketestFix:
             "app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock
         ):
             await maybe_spawn_smoketest_fix(
-                smoketest_task, payload, db_session, str(smoketest_task.id)
+                smoketest_task,
+                payload,
+                db_session,
+                str(smoketest_task.id),
+                locked_project=project,
             )
             await db_session.commit()
 
@@ -4146,7 +4150,11 @@ class TestMaybeSpawnSmoketestFix:
             "app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock
         ):
             await maybe_spawn_smoketest_fix(
-                smoketest_task, payload, db_session, str(smoketest_task.id)
+                smoketest_task,
+                payload,
+                db_session,
+                str(smoketest_task.id),
+                locked_project=project,
             )
             await db_session.commit()
 
@@ -4187,7 +4195,11 @@ class TestMaybeSpawnSmoketestFix:
             "app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock
         ):
             await maybe_spawn_smoketest_fix(
-                smoketest_task, payload, db_session, str(smoketest_task.id)
+                smoketest_task,
+                payload,
+                db_session,
+                str(smoketest_task.id),
+                locked_project=project,
             )
             await db_session.commit()
 
@@ -4232,7 +4244,11 @@ class TestMaybeSpawnDebugCreate:
             "app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock
         ):
             await maybe_spawn_debug_create(
-                debug_task, payload, db_session, str(debug_task.id)
+                debug_task,
+                payload,
+                db_session,
+                str(debug_task.id),
+                locked_project=project,
             )
             await db_session.commit()
 
@@ -4271,7 +4287,11 @@ class TestMaybeSpawnDebugCreate:
             "app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock
         ):
             await maybe_spawn_debug_create(
-                debug_task, payload, db_session, str(debug_task.id)
+                debug_task,
+                payload,
+                db_session,
+                str(debug_task.id),
+                locked_project=project,
             )
             await db_session.commit()
 
@@ -4332,7 +4352,11 @@ class TestMaybeSpawnDebugCreate:
             "app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock
         ):
             await maybe_spawn_debug_create(
-                debug_task, payload, db_session, str(debug_task.id)
+                debug_task,
+                payload,
+                db_session,
+                str(debug_task.id),
+                locked_project=project,
             )
             await db_session.commit()
 
@@ -4919,9 +4943,12 @@ class TestModifyTaskApplySeam:
             current_parent,
             current_session,
             operator_retry_guidance=None,
+            *,
+            automatic_creation=True,
         ):
             observed["context"] = dict(current_parent.context or {})
             observed["operator_retry_guidance"] = operator_retry_guidance
+            observed["automatic_creation"] = automatic_creation
             current_parent.status = TaskStatus.EVALUATING
             current_session.add(current_parent)
             return 0
@@ -4985,6 +5012,7 @@ class TestModifyTaskApplySeam:
             "publication_generation": "atomic-child-publication",
             "research_findings_finalized": True,
         }
+        assert observed["automatic_creation"] is False
 
         async with _Session() as verify_session:
             persisted_parent = await verify_session.get(Task, parent.id)
@@ -6631,9 +6659,12 @@ class TestBulkRetrySessionFactory:
             current_parent,
             current_session,
             operator_retry_guidance=None,
+            *,
+            automatic_creation=True,
         ):
             observed["context"] = dict(current_parent.context or {})
             observed["operator_retry_guidance"] = operator_retry_guidance
+            observed["automatic_creation"] = automatic_creation
             current_parent.status = TaskStatus.EVALUATING
             current_session.add(current_parent)
             return 0
@@ -6661,6 +6692,7 @@ class TestBulkRetrySessionFactory:
             "publication_generation": "atomic-child-publication",
             "research_findings_finalized": True,
         }
+        assert observed["automatic_creation"] is False
 
         async with _Session() as verify_session:
             persisted_parent = await verify_session.get(Task, parent.id)

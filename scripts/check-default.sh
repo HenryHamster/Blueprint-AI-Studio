@@ -20,7 +20,8 @@ WORKSPACE="${WORKSPACE:-/tmp/workspace}"
 _VERIFY_TASK_ID="${TASK_ID:-local-developer}"
 _VERIFY_RECEIPT="/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"
 _VERIFY_HARNESS_RECEIPT="/tmp/backend_verification_harness_${_VERIFY_TASK_ID}.json"
-if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT"; then
+_VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${_VERIFY_TASK_ID}"
+if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT"; then
   echo "[check] unable to remove prior verification receipt(s) — refusing to run" >&2
   exit 1
 fi
@@ -434,16 +435,7 @@ if touches "backend/"; then
             rm -f "$_verification_capability_tmp" "$_VERIFY_CAPABILITY_RECEIPT"
             FAILED+=("$_VERIFICATION_DIR verification: capability receipt")
           fi
-          if [ "$WITH_TESTS" = "1" ]; then
-            # The PR test gate already records this as an explicit
-            # GATE-ENVIRONMENT limitation; do not turn missing PostgreSQL into
-            # a source verdict when focused faithful evidence exists and CI
-            # owns the authoritative DB-backed run.
-            _gate_env_marker="/tmp/check_gate_env_${_VERIFY_TASK_ID}.txt"
-            printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: required verification skipped — PostgreSQL runtime unavailable; CI is authoritative" >> "$_gate_env_marker"
-          else
-            FAILED+=("$_VERIFICATION_DIR verification: runtime_unavailable")
-          fi
+          FAILED+=("$_VERIFICATION_DIR verification: runtime_unavailable")
         fi
       fi
       if [ -n "${_verification_postgres_flag:-}" ]; then

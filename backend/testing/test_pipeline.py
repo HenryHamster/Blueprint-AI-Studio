@@ -1527,7 +1527,9 @@ async def test_rollup_retries_failed_children_before_partial_rollup(rollup_db, m
 
     await _check_and_trigger_rollup(failed, rollup_db)
 
-    mock_requeue.assert_called_once_with(parent, rollup_db)
+    mock_requeue.assert_called_once_with(
+        parent, rollup_db, automatic_creation_admission="allowed"
+    )
     # Parent should still be EVALUATING — mock _requeue_parent_task didn't change it
     await rollup_db.refresh(parent)
     assert parent.status == TaskStatus.EVALUATING
@@ -1579,7 +1581,9 @@ async def test_rollup_retries_all_failed_children(rollup_db, mocker):
 
     await _check_and_trigger_rollup(failed1, rollup_db)
 
-    mock_requeue.assert_called_once_with(parent, rollup_db)
+    mock_requeue.assert_called_once_with(
+        parent, rollup_db, automatic_creation_admission="allowed"
+    )
 
 
 @pytest.mark.asyncio
@@ -1633,7 +1637,9 @@ async def test_rollup_not_blocked_by_stale_review_task(rollup_db, mocker):
     await _check_and_trigger_rollup(failed, rollup_db)
 
     # Stale review must not block rollup — retry path should have been taken.
-    mock_requeue.assert_called_once_with(parent, rollup_db)
+    mock_requeue.assert_called_once_with(
+        parent, rollup_db, automatic_creation_admission="allowed"
+    )
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,7 @@ from app.review_pipeline import (
     _spawn_pipeline_task,
     MAX_REVIEW_FIX_ITERATIONS,
     PIPELINE_TASK_STALE_MINUTES,
+    REVIEW_LOOP_ABANDON_CANDIDATE_KEY,
     SPAWN_REASON_KEY,
     SPAWN_REASON_DEFERRED,
     SPAWN_REASON_DEDUP,
@@ -121,6 +122,52 @@ def _patch_exact_pr_execution_target(
         "app.github.create_pr_comment", new=AsyncMock(return_value={"id": 1})
     )
     return live_pr
+
+
+async def _seed_actioned_review_generations(
+    session,
+    *,
+    project_id,
+    original_task_id,
+    pr_number: int,
+    branch: str,
+    count: int,
+) -> list[Task]:
+    """Persist exact, distinct patch generations consumed by one PR chain."""
+    generations: list[Task] = []
+    for index in range(count):
+        target = {
+            "project_id": str(project_id),
+            "pr_number": pr_number,
+            "base_sha": f"cap-base-{pr_number}-{index}",
+            "head_sha": f"cap-head-{pr_number}-{index}",
+        }
+        generation = Task(
+            project_id=project_id,
+            title=f"Actioned fix generation {index + 1} for PR #{pr_number}",
+            payloads=[
+                {
+                    "type": "fix",
+                    "pr_number": pr_number,
+                    "branch": branch,
+                    "base_branch": "main",
+                    "original_task_id": str(original_task_id),
+                }
+            ],
+            context={
+                "review_loop": {
+                    "iteration": (index + 1) * 2,
+                    "original_task_id": str(original_task_id),
+                    "fix_target": target,
+                }
+            },
+            vm_instance_id=f"agent-vm-cap-generation-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+        )
+        session.add(generation)
+        generations.append(generation)
+    await session.commit()
+    return generations
 
 
 async def _claim(client: AsyncClient, task: Task) -> None:
@@ -1095,10 +1142,10 @@ async def test_review_approve_does_not_spawn_fix(
 
 
 @pytest.mark.asyncio
-async def test_cached_approve_with_base_drift_stays_admitted(
+async def test_cached_approve_with_base_drift_respawns_exact_target_review(
     client: AsyncClient, db_session, mocker
 ):
-    """A base-only advance does not discard a cached head-bound APPROVE."""
+    """A base-only advance invalidates APPROVE and requires an exact-pair review."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
@@ -1170,11 +1217,16 @@ async def test_cached_approve_with_base_drift_stays_admitted(
     )
 
     await db_session.refresh(review_task)
-    assert review_task.status == TaskStatus.EVALUATING
-    assert review_task.latest_status_message == (
-        "Review approved, waiting for CI on PR #110..."
+    assert review_task.status == TaskStatus.COMPLETED
+    assert "Stale/unproven approval discarded" in (
+        review_task.latest_status_message or ""
     )
-    assert _review_loop(review_task).get("review_approved") is True
+    assert "respawning exact-target review" in (
+        review_task.latest_status_message or ""
+    )
+    assert (review_task.context or {}).get("_review_stale_target") is True
+    assert (review_task.context or {}).get("_review_stale_head") is True
+    assert _review_loop(review_task).get("review_approved") is not True
     result = await db_session.execute(
         select(Task).where(
             Task.project_id == project.id,
@@ -1182,14 +1234,20 @@ async def test_cached_approve_with_base_drift_stays_admitted(
         )
     )
     children = result.scalars().all()
-    assert not [task for task in children if _task_type(task) in {"fix", "review"}]
+    fresh_reviews = [task for task in children if _task_type(task) == "review"]
+    assert len(fresh_reviews) == 1
+    assert not [task for task in children if _task_type(task) == "fix"]
     merge_mock.assert_not_awaited()
-    assert _review_loop(review_task).get("review_target") == {
+    fresh_loop = _review_loop(fresh_reviews[0])
+    assert fresh_loop.get("review_target") == {
         "project_id": str(project.id),
         "pr_number": 110,
         "base_sha": "live-base",
         "head_sha": "same-head",
     }
+    assert not fresh_loop.get("delta_base_sha"), (
+        "Base drift requires a full exact-target review, not an empty head delta"
+    )
 
 
 @pytest.mark.asyncio
@@ -1524,21 +1582,18 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     client: AsyncClient, db_session, mocker
 ):
     """
-    When a review task reaches the per-chain iteration cap, _spawn_pipeline_task
-    must return None (no fix task spawned) and set requires_approval=True on the
-    original task.
+    When a chain reaches its actioned-generation cap, _spawn_pipeline_task must
+    create no fix and park the original for explicit operator disposition.
 
-    Setup: scope='small' → cap=10.  Place the review task at iteration=10 so the
-    next spawned task would be iteration=11 (> cap), triggering the per-chain cap.
-    Keep completed pipeline tasks at 1 (just this review itself after it finishes)
-    so the global cap (pr_iterations >= cap) does not fire first.
+    The carried ``review_loop.iteration`` is presentation metadata, not cap
+    authority. Nine exact prior patch generations plus this exact
+    REQUEST_CHANGES result consume the small-scope cap of ten.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch(
-        "app.review_loop_convergence._pr_is_preservable_on_cap",
-        return_value=False,
+    close_pr_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock
     )
     _patch_exact_pr_execution_target(
         mocker,
@@ -1559,16 +1614,23 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
         title="Implement cap-tested feature",
         payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
         vm_instance_id="agent-vm-cap-orig-001",
-        status=TaskStatus.COMPLETED,
+        status=TaskStatus.EVALUATING,
         context={"scope": "small"},
     )
     db_session.add(original_task)
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # Review task at iteration=10 (the 10th review in the chain).
-    # scope='small' → _max_review_iterations returns 10.
-    # Attempting to spawn next task → iteration=11 > 10 → per-chain cap fires.
+    prior_generations = await _seed_actioned_review_generations(
+        db_session,
+        project_id=project.id,
+        original_task_id=original_task.id,
+        pr_number=88,
+        branch="blueprint/task-cap0001",
+        count=9,
+    )
+
+    # Carried iteration remains high to prove it is not itself the cap unit.
     review_task = Task(
         project_id=project.id,
         title="Review PR #88",
@@ -1628,7 +1690,13 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     result = await db_session.execute(
         select(Task).where(
             Task.project_id == project.id,
-            Task.id.notin_([original_task.id, review_task.id]),
+            Task.id.notin_(
+                [
+                    original_task.id,
+                    review_task.id,
+                    *(task.id for task in prior_generations),
+                ]
+            ),
         )
     )
     new_tasks = result.scalars().all()
@@ -1643,6 +1711,14 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     assert original_task.requires_approval is True, (
         "Per-chain iteration cap must set requires_approval=True on the original task"
     )
+    assert original_task.status == TaskStatus.EVALUATING
+    marker = (original_task.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    assert marker is not None
+    assert marker["status"] == "abandon_candidate"
+    assert marker["reason"] == "review_cap"
+    assert marker["actioned_generations"] == 10
+    assert marker["threshold"] == 10
+    close_pr_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1653,15 +1729,14 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     When fix_reason='ci_failure' is stored in the review_loop context,
     _max_review_iterations returns 8 (lower than the default 10-16).
 
-    A review task at iteration=8 with fix_reason='ci_failure' should trigger
-    the per-chain cap when attempting to spawn iteration=9, because 9 > 8.
+    Seven prior exact patch generations plus the current exact review consume
+    the lower cap of eight. The carried iteration alone is not cap authority.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch(
-        "app.review_loop_convergence._pr_is_preservable_on_cap",
-        return_value=False,
+    close_pr_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock
     )
     _patch_exact_pr_execution_target(
         mocker,
@@ -1681,15 +1756,23 @@ async def test_review_fix_cap_ci_failure_lower_limit(
         title="Create CI-tested feature",
         payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
         vm_instance_id="agent-vm-ci-orig-001",
-        status=TaskStatus.COMPLETED,
+        status=TaskStatus.EVALUATING,
     )
     db_session.add(original_task)
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # Review task at iteration=8 with fix_reason='ci_failure'.
-    # _max_review_iterations returns 8 for ci_failure.
-    # Attempting to spawn next task → iteration=9 > 8 → per-chain cap fires.
+    prior_generations = await _seed_actioned_review_generations(
+        db_session,
+        project_id=project.id,
+        original_task_id=original_task.id,
+        pr_number=55,
+        branch="blueprint/task-ci0001",
+        count=7,
+    )
+
+    # Keep the carried display iteration at the legacy boundary while the exact
+    # seeded/current receipts independently prove eight actioned generations.
     review_task = Task(
         project_id=project.id,
         title="Review PR #55 (ci failure context)",
@@ -1750,7 +1833,13 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     result = await db_session.execute(
         select(Task).where(
             Task.project_id == project.id,
-            Task.id.notin_([original_task.id, review_task.id]),
+            Task.id.notin_(
+                [
+                    original_task.id,
+                    review_task.id,
+                    *(task.id for task in prior_generations),
+                ]
+            ),
         )
     )
     new_tasks = result.scalars().all()
@@ -1766,6 +1855,14 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     assert original_task.requires_approval is True, (
         "ci_failure iteration cap must set requires_approval=True on the original task"
     )
+    assert original_task.status == TaskStatus.EVALUATING
+    marker = (original_task.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    assert marker is not None
+    assert marker["status"] == "abandon_candidate"
+    assert marker["reason"] == "review_cap"
+    assert marker["actioned_generations"] == 8
+    assert marker["threshold"] == 8
+    close_pr_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1773,17 +1870,14 @@ async def test_review_fix_cap_sets_status_message(
     client: AsyncClient, db_session, mocker
 ):
     """
-    When the per-chain iteration cap is hit, the original task's
-    latest_status_message must describe the cap event — specifically, it must
-    mention 'iteration' and 'manual review' so operators know why the pipeline
-    stalled.
+    A numerical cap transfers the still-open PR to explicit operator
+    disposition and surfaces the exact actioned-generation stop.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch(
-        "app.review_loop_convergence._pr_is_preservable_on_cap",
-        return_value=False,
+    close_pr_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock
     )
     _patch_exact_pr_execution_target(
         mocker,
@@ -1803,14 +1897,24 @@ async def test_review_fix_cap_sets_status_message(
         title="Feature with status message check",
         payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
         vm_instance_id="agent-vm-msg-orig-001",
-        status=TaskStatus.COMPLETED,
+        status=TaskStatus.EVALUATING,
         context={"scope": "small"},
     )
     db_session.add(original_task)
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # scope='small' → cap=10; iteration=10 → next would be 11 > 10 → per-chain cap fires
+    await _seed_actioned_review_generations(
+        db_session,
+        project_id=project.id,
+        original_task_id=original_task.id,
+        pr_number=73,
+        branch="blueprint/task-msg0001",
+        count=9,
+    )
+
+    # Keep the legacy iteration metadata high; the ten exact receipts above are
+    # the independent authority that exhausts the small-scope cap.
     review_task = Task(
         project_id=project.id,
         title="Review PR #73",
@@ -1864,11 +1968,20 @@ async def test_review_fix_cap_sets_status_message(
         logs="Review: more changes needed",
     )
 
-    # An unpreservable PR is closed and surfaced for manual review.
+    # The cap has no authority to reject or close the PR.
     await db_session.refresh(original_task)
     msg = original_task.latest_status_message or ""
-    assert "reached limit" in msg.lower(), msg
-    assert "auto-closed" in msg.lower() and "manual review required" in msg.lower(), msg
+    assert "parked for operator disposition" in msg.lower(), msg
+    assert "10 actioned generation" in msg.lower(), msg
+    assert "automatic fix spawning stopped" in msg.lower(), msg
+    marker = (original_task.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    assert marker is not None
+    assert marker["status"] == "abandon_candidate"
+    assert marker["reason"] == "review_cap"
+    assert marker["actioned_generations"] == 10
+    assert marker["threshold"] == 10
+    assert original_task.status == TaskStatus.EVALUATING
+    close_pr_mock.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

@@ -171,6 +171,17 @@ async def _ensure_memory_job_task(
     double-dispatching it.
     """
 
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    admission = await acquire_automatic_task_creation_authority(
+        session, job.project_id, skip_locked=True
+    )
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        return None
+
     key = _memory_task_idempotency_key(job.id)
     existing = await session.scalar(
         select(Task)

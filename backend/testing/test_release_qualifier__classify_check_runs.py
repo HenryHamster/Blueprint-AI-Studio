@@ -6996,9 +6996,8 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
 ):
     """The agent qualification read surfaces ``qualification_trigger_state`` and
     explains BOTH an armed trigger (stabilize phase, no prior attempt) and a
-    held trigger (a not_promoted/criterion_coverage verdict whose sha-keyed
-    acceptance ledger is not yet fully met) with the correct machine-readable
-    reason.
+    held trigger whose evaluated candidate cannot be compared to the current
+    automain identity, with the correct machine-readable reason.
 
     Exercises the production read-surface wiring in
     ``routers/agent_strategic_fetch.py`` (which threads the shared
@@ -7055,11 +7054,10 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     assert armed["decision"]["fire"] is True
     assert armed["decision"]["blocking"] == []
 
-    # HELD: a not_promoted verdict whose only blocker was criterion coverage
-    # holds until the sha-keyed acceptance ledger reports the candidate fully
-    # met. With an active criterion that has no ledger verdict for the candidate
-    # sha, is_candidate_fully_met is False → the redrive leg holds
-    # (reason=criterion_not_met).
+    # HELD: the stored verdict identifies a candidate, but this test environment
+    # cannot resolve the current automain SHA. The redrive classifier therefore
+    # fails closed before consulting mutable criterion state because it cannot
+    # prove that automain advanced past the evaluated candidate.
     await _add_version_criterion(
         db_session,
         project,
@@ -7087,11 +7085,12 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
         "count": 0,
         "cap": _MAX_ERROR_REDRIVE_ATTEMPTS,
     }
-    assert blocked["decision"]["reason"] == "criterion_not_met"
+    assert blocked["decision"]["reason"] == "candidate_identity_unavailable"
     assert blocked["decision"]["fire"] is False
     assert any(
-        "ledger" in b.lower() for b in blocked["decision"]["blocking"]
-    ), f"expected ledger message in blocking list: {blocked['decision']['blocking']}"
+        "automain" in b.lower() and "advanced" in b.lower()
+        for b in blocked["decision"]["blocking"]
+    ), f"expected candidate identity message: {blocked['decision']['blocking']}"
 
 
 @pytest.mark.asyncio

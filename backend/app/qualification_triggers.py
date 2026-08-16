@@ -8,10 +8,9 @@ dict for use in the admin lifecycle endpoint, strategic payload, and attention s
 The resolver implements the ordered rule table from the design doc (efbe4182):
 
     T0 hold      — phase/in-flight/promotion guards
-    T1 initial fire — first-ever (unconditional), or not_promoted whose only
-                      blocker was the acceptance grade, once EITHER the ledger
-                      reports the candidate fully met OR the candidate advanced
-                      (new work to re-grade).  No pre-qualification coverage gate.
+    T1 initial fire — first-ever (unconditional), or any not_promoted verdict
+                      whose evaluated candidate was superseded by automain.
+                      Candidate identity, not the stale blocker, owns re-entry.
     T2 rubric_redrive — frozen rubric changed or could not be reconstructed
     T3 error_redrive — transient/non-transient error under attempt cap
     T3b infra_failure_redrive — transient infrastructure failure under per-candidate
@@ -69,7 +68,7 @@ class TriggerDecision:
         Which rule matched: "none" when fire=False.  One of
         "none", "coverage_complete", "rubric_redrive", "error_redrive",
         "infra_failure_redrive", "deferred_unsynced_redrive",
-        "post_dry_run_advance", "blockers_cleared".
+        "candidate_advanced", "post_dry_run_advance", "blockers_cleared".
     reason:
         Machine-readable code for the decision (e.g. "ci_red", "in_flight",
         "wrong_phase", "criterion_not_met", "error_attempt_cap",
@@ -149,8 +148,9 @@ def resolve_qualification_trigger(
         iff there is at least one ACTIVE acceptance category, every one is
         ``met``, and no residual gap — an empty (never-authored or fully
         retracted) rubric is NOT fully met.  Used ONLY to gate the
-        ``not_promoted``/``criterion_coverage_incomplete`` redrive leg — the
-        initial/error T1 fire does not depend on it.
+        Legacy ledger signal retained for read-surface compatibility. A
+        ``not_promoted`` verdict is immutable for its evaluated SHA, so this
+        signal no longer authorizes a same-candidate re-grade.
     requalification_ready:
         True when all gating not_promoted findings are ledger-resolved/stale;
         False or None when not.
@@ -206,7 +206,6 @@ def resolve_qualification_trigger(
     # unconditionally; a version sitting at ``error`` falls through to the T2
     # redrive path (which keeps the transient/readiness distinction and the
     # attempt cap — bounding a persistently-failing candidate).
-    _T1_NOT_PROMOTED_BLOCKERS = {"criterion_coverage_incomplete"}
     if status is None:
         return TriggerDecision(
             fire=True,
@@ -214,76 +213,46 @@ def resolve_qualification_trigger(
             reason="armed",
             blocking=[],
         )
-    # T1 redrive leg — a ``not_promoted`` version whose ONLY blocker was the
-    # acceptance grade.  Two DISTINCT things can unblock it, and the ledger
-    # verdict alone covers only the first:
-    #
-    #   (a) the ledger now reports the candidate fully met — e.g. a criterion was
-    #       retracted/superseded (it leaves the ACTIVE set, so the remaining
-    #       categories are all ``met``), or a re-grade flipped the last category.
-    #
-    #   (b) the CANDIDATE ADVANCED — new work landed since the not-met grade.
-    #       This leg is load-bearing: ``CategoryVerdict`` rows are SHA-KEYED and
-    #       nothing ever re-grades a PAST candidate, so the verdict for the
-    #       already-graded sha is frozen at not-met forever.  T4 excludes this
-    #       blocker and T3 only handles ``dry_run`` — so without (b) a version
-    #       that graded not-met could NEVER re-qualify, and only a re-qualification
-    #       can produce the verdict that would clear it.  That is a PERMANENT
-    #       wedge (and the exact circularity the coverage gate died of).
-    #
-    # Firing on (b) is bounded by the SAME guards the other redrive legs use —
-    # CI must not be definitively red, and gating audit findings must not be
-    # unresolved — and by the fact that only a genuinely NEW candidate re-fires.
-    # A re-grade of the SAME sha is suppressed: it carries no new information and
-    # would spin (there is no cooldown in the sweep to catch it).
-    if status == "not_promoted" and blocker in _T1_NOT_PROMOTED_BLOCKERS:
-        if is_candidate_fully_met:
+    # T1 candidate invalidation. A not_promoted record is a verdict about exactly
+    # ``candidate_sha``. Its blocker/findings/ledger rows cannot veto evaluation of
+    # a DIFFERENT automain SHA; doing so carries stale candidate authority forward
+    # and permanently wedges blockers such as prior_operator_authorship_nonzero.
+    # Conversely, no mutable readiness/ledger signal may re-grade the SAME SHA:
+    # that has no new information and the sweep would churn forever.
+    if status == "not_promoted":
+        if not candidate_sha or not automain_sha:
             return TriggerDecision(
-                fire=True,
-                trigger="coverage_complete",
-                reason="armed",
-                blocking=[],
+                fire=False,
+                trigger="none",
+                reason="candidate_identity_unavailable",
+                blocking=[
+                    "cannot prove that automain advanced past the evaluated candidate"
+                ],
             )
-        candidate_superseded = (
-            automain_sha is not None
-            and candidate_sha is not None
-            and automain_sha != candidate_sha
-        )
-        if candidate_superseded:
-            if automain_ci_state == _CI_RED:
-                return TriggerDecision(
-                    fire=False,
-                    trigger="none",
-                    reason="ci_red",
-                    blocking=[
-                        "new work landed since the not-met acceptance grade but "
-                        "CI for the new SHA is red — suppressing auto-fire"
-                    ],
-                )
-            if requalification_ready is False:
-                return TriggerDecision(
-                    fire=False,
-                    trigger="none",
-                    reason="findings_unresolved",
-                    blocking=[
-                        "new work landed since the not-met acceptance grade but "
-                        "gating findings are not yet resolved"
-                    ],
-                )
+        if automain_sha == candidate_sha:
             return TriggerDecision(
-                fire=True,
-                trigger="candidate_advanced",
-                reason="armed",
-                blocking=[],
+                fire=False,
+                trigger="none",
+                reason="same_candidate",
+                blocking=[
+                    "not_promoted already evaluated the current automain SHA"
+                ],
+            )
+        if automain_ci_state == _CI_RED:
+            return TriggerDecision(
+                fire=False,
+                trigger="none",
+                reason="ci_red",
+                blocking=[
+                    "automain advanced past the not_promoted candidate but CI "
+                    "for the new SHA is red — suppressing auto-fire"
+                ],
             )
         return TriggerDecision(
-            fire=False,
-            trigger="none",
-            reason="criterion_not_met",
-            blocking=[
-                "acceptance criteria not yet met for this candidate per the "
-                "category verdict ledger — awaiting new work to re-grade"
-            ],
+            fire=True,
+            trigger="candidate_advanced",
+            reason="armed",
+            blocking=[],
         )
 
     # T2 — rubric_redrive: these attempt-scoped outcomes prove no mutable
@@ -398,24 +367,8 @@ def resolve_qualification_trigger(
             blocking=[],
         )
 
-    # T5 — blockers_cleared: existing re-drive conditions surfaced through the
-    # same decision shape for observability.  These mirror the existing bespoke
-    # redrive functions and will remain as separate paths until Phase 1 folding.
-    if status == "not_promoted" and blocker not in _T1_NOT_PROMOTED_BLOCKERS:
-        if requalification_ready is True:
-            return TriggerDecision(
-                fire=True,
-                trigger="blockers_cleared",
-                reason="armed",
-                blocking=[],
-            )
-        return TriggerDecision(
-            fire=False,
-            trigger="none",
-            reason="findings_unresolved",
-            blocking=["gating findings not yet resolved — requalification not ready"],
-        )
-
+    # T5 — blockers_cleared: promotion failure remains a remediation-owned
+    # re-drive. not_promoted is handled above solely by candidate identity.
     if status == "promotion_failed":
         if requalification_ready is True:
             return TriggerDecision(
@@ -553,7 +506,8 @@ def explain_qualification_trigger(
         # A not-met grade is frozen against its candidate sha — the realistic
         # unblock is new work landing (which re-grades), not the stale verdict
         # spontaneously flipping.
-        "criterion_not_met": "new_candidate_commit",
+        "candidate_identity_unavailable": "candidate_identity_available",
+        "same_candidate": "new_candidate_commit",
         "error_attempt_cap": "operator_or_strategist_only",
         "infra_failure_attempt_cap": "operator_or_strategist_only",
         "rubric_redrive_cap": "operator_or_strategist_only",

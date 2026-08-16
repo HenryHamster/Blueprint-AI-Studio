@@ -4918,6 +4918,16 @@ async def test_sweep_error_redrive_accumulates_attempts_until_capped(
     # the count attributable to the re-drive path alone.
     project.build_config = {"full_suite_drift_sentinel_enabled": False}
     db_session.add(project)
+    # The automatic-trigger executor is a separate per-sweep observer: it
+    # resolves the audited-surface HEAD and promotion-CI HEAD before the pure
+    # resolver routes status=error back to this dedicated re-driver.  Disable
+    # that executor here, just as the drift sentinel is disabled above, so the
+    # GitHub mock count measures error re-drive attempts rather than unrelated
+    # read-only sweep observations.
+    mocker.patch(
+        "app.runtime_config_state.get_auto_qualification_triggers_mode",
+        return_value="off",
+    )
     attempt_id = uuid.uuid4()
     version.last_qualification = {
         "status": "error",
@@ -6623,7 +6633,7 @@ async def test_redrive_infra_failure_backoff_resets_on_engine_sha_change(
 async def test_sweep_leaves_resolved_blocker_stale_verdict_for_strategic(
     db_session, mocker
 ):
-    """Resolved findings do not authorize the scheduler to start a new review."""
+    """A new candidate re-enters qualification without reviving old findings."""
     from app.release_readiness import apply_finding_resolution
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -6668,11 +6678,15 @@ async def test_sweep_leaves_resolved_blocker_stale_verdict_for_strategic(
     )
     await db_session.commit()
 
-    # The sweep return counts FINALIZED versions only — a re-drive spawn is
-    # deliberately not a finalization; the spawn itself is asserted below.
+    # Candidate identity changed, so the stale not_promoted verdict cannot
+    # suppress a new qualification decision.  This fixture's project has
+    # promotion disabled, therefore the fresh decision stops at that explicit
+    # external boundary without reviving the resolved finding or spawning an
+    # audit task.
     assert count == 0
     await db_session.refresh(version)
-    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["status"] == "external_blocker"
+    assert version.last_qualification["blocker"] == "promotion_disabled"
     assert await _audit_tasks(db_session, project.id) == []
 
 

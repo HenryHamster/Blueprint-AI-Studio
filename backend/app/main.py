@@ -115,7 +115,13 @@ from app.shared_state import limiter
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app import orchestrator as _orch
-from app.lifecycle import lifespan
+from app.lifecycle import (
+    _BACKGROUND_LOCK_CLASSID,
+    _BACKGROUND_LOCK_OBJID,
+    _LEADER_STALE_REAP_SECONDS,
+    lifespan,
+)
+from app.orchestrator_health_authority import observe_background_leader_health
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -1193,21 +1199,40 @@ async def debug_orchestrator(
             ],
         }
 
-    # Liveness is judged by the in-cycle progress *heartbeat* (the shared
-    # evaluate_orchestrator_liveness verdict, same as /health and the watchdog),
-    # NOT by full-cycle-completion age. A slow-but-progressing cycle is alive and
-    # not hung; only a worker with no heartbeat past ORCHESTRATOR_HANG_SECONDS (or
-    # a first cycle that started but never heartbeat) is wedged. `ago` /
-    # last_cycle_seconds_ago is preserved purely as an informational slow-cycle
-    # signal. See incident 2026-05-28 / orchestrator-operator-health-split.
-    liveness = _orch.evaluate_orchestrator_liveness(_utcnow())
+    # Liveness is judged by the in-cycle progress *heartbeat* on the leader
+    # process.  Split API processes have no local orchestrator gauges, so they
+    # must read the worker's advisory-lock keepalive instead of projecting their
+    # necessarily-empty module globals as a stopped orchestrator.
+    if _shared_state.is_leader:
+        liveness = _orch.evaluate_orchestrator_liveness(_utcnow())
+        orchestrator_alive = liveness.alive
+        orchestrator_hung = liveness.stalled
+        orchestrator_progress_age = liveness.progress_age
+        orchestrator_liveness_reason = liveness.reason
+        orchestrator_authority = "local_orchestrator_progress"
+    else:
+        observed = await observe_background_leader_health(
+            session,
+            lock_classid=_BACKGROUND_LOCK_CLASSID,
+            lock_objid=_BACKGROUND_LOCK_OBJID,
+            stale_after_seconds=_LEADER_STALE_REAP_SECONDS,
+        )
+        heartbeat_age = observed.get("heartbeat_age_seconds")
+        orchestrator_alive = observed.get("status") == "ok"
+        orchestrator_hung = (
+            observed.get("status") == "down" and heartbeat_age is not None
+        )
+        orchestrator_progress_age = observed.get("progress_age_seconds")
+        orchestrator_liveness_reason = observed.get("reason") or ""
+        orchestrator_authority = observed.get("authority")
 
     return {
-        "orchestrator_alive": liveness.alive,
-        "orchestrator_hung": liveness.stalled,
-        "orchestrator_progress_age_seconds": liveness.progress_age,
+        "orchestrator_alive": orchestrator_alive,
+        "orchestrator_hung": orchestrator_hung,
+        "orchestrator_progress_age_seconds": orchestrator_progress_age,
         "orchestrator_cycle_age_seconds": ago,
-        "orchestrator_liveness_reason": liveness.reason,
+        "orchestrator_liveness_reason": orchestrator_liveness_reason,
+        "orchestrator_authority": orchestrator_authority,
         "last_cycle_seconds_ago": ago,
         "queued_tasks": queued,
         "active_tasks": active,
@@ -1298,17 +1323,37 @@ async def health_detailed(
     #   down      -> genuinely wedged: no heartbeat past ORCHESTRATOR_HANG_SECONDS,
     #                or a first cycle that started but never made progress.
     # cycle_age is preserved as the informational slow-cycle marker.
-    liveness = _orch.evaluate_orchestrator_liveness(_utcnow())
-    cycle_age: float | None = None
-    if _orch._orchestrator_last_cycle:
-        cycle_age = (_utcnow() - _orch._orchestrator_last_cycle).total_seconds()
-    slow_cycle = cycle_age is not None and cycle_age >= 120
-    if liveness.healthy:
-        orch_status = "degraded" if slow_cycle else "ok"
-    elif liveness.stalled or not liveness.alive:
-        orch_status = "down"
+    if _shared_state.is_leader:
+        liveness = _orch.evaluate_orchestrator_liveness(_utcnow())
+        cycle_age: float | None = None
+        if _orch._orchestrator_last_cycle:
+            cycle_age = (_utcnow() - _orch._orchestrator_last_cycle).total_seconds()
+        slow_cycle = cycle_age is not None and cycle_age >= 120
+        if liveness.healthy:
+            orch_status = "degraded" if slow_cycle else "ok"
+        elif liveness.stalled or not liveness.alive:
+            orch_status = "down"
+        else:
+            orch_status = "degraded"
+        orch_health = {
+            "status": orch_status,
+            "authority": "local_orchestrator_progress",
+            "cycle_age_seconds": cycle_age,
+            "cycle_age_kind": "completed_cycle",
+            "heartbeat_age_seconds": liveness.progress_age,
+            "progress_age_seconds": liveness.progress_age,
+            "stale_after_seconds": _orch.ORCHESTRATOR_HANG_SECONDS,
+        }
     else:
-        orch_status = "degraded"
+        # The API role does not run the orchestrator, so its module-local gauges
+        # are necessarily empty. The worker's advisory-lock connection is the
+        # canonical cross-process heartbeat and is refreshed every keepalive.
+        orch_health = await observe_background_leader_health(
+            session,
+            lock_classid=_BACKGROUND_LOCK_CLASSID,
+            lock_objid=_BACKGROUND_LOCK_OBJID,
+            stale_after_seconds=_LEADER_STALE_REAP_SECONDS,
+        )
     try:
         queued = (
             await session.execute(
@@ -1331,9 +1376,7 @@ async def health_detailed(
     except Exception:
         queued = active = 0
     components["orchestrator"] = {
-        "status": orch_status,
-        "cycle_age_seconds": cycle_age,
-        "progress_age_seconds": liveness.progress_age,
+        **orch_health,
         "queued_tasks": queued,
         "active_tasks": active,
     }
