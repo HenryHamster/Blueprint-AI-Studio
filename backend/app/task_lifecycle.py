@@ -1418,6 +1418,7 @@ async def _process_post_commit(
     payload: AgentStatusPayload,
     _session_factory=None,
     _expected_childless_recovery_token: str | None = None,
+    _expected_research_spawn_recovery_token: str | None = None,
     _expected_post_commit_claim_token: str | None = None,
     _expected_post_commit_status: TaskStatus | None = None,
 ) -> dict:
@@ -1621,6 +1622,55 @@ async def _process_post_commit(
                     str(task_id)[:8],
                 )
                 return {"status": "accepted", "recovery_skipped": True}
+
+        # Sidecar-resumed research has no agent-status write-ahead marker.  Its
+        # dedicated marker-less recovery lease is exact-attempt authority only:
+        # revalidate the server-owned token, attempt identity, persisted routing
+        # input, terminal/progress state, and project pause boundary while the
+        # canonical Project -> Task locks are held.  A stale lease can never
+        # revive a cancelled/requeued attempt or create work while paused.
+        if _expected_research_spawn_recovery_token is not None:
+            from app.findings_index import FINALIZED_RESEARCH_FINDINGS_KEY
+            from app.recovery_research_spawn_pending import (
+                RESEARCH_SPAWN_RECOVERY_KEY,
+                research_spawn_recovery_attempt_identity,
+            )
+
+            recovery_meta = dict(
+                (task.context or {}).get(RESEARCH_SPAWN_RECOVERY_KEY) or {}
+            )
+            project_paused = bool(
+                locked_project is None
+                or locked_project.paused
+                or locked_project.archived
+            )
+            claim_is_current = bool(
+                recovery_meta.get("claim_token")
+                == _expected_research_spawn_recovery_token
+                and recovery_meta.get("attempt_identity")
+                == research_spawn_recovery_attempt_identity(task)
+                and task.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING)
+                and not task.archived
+                and not task.post_commit_pending
+                and (task.first_payload or {}).get("type") == "research"
+                and (task.context or {}).get("_research_spawn_pending") is True
+                and (task.context or {}).get(FINALIZED_RESEARCH_FINDINGS_KEY)
+                is not True
+                and isinstance(task.plan_output, list)
+            )
+            if project_paused or not claim_is_current:
+                reason = "project_paused" if project_paused else "stale_claim"
+                logger.info(
+                    "[POST_COMMIT SWEEP] Skipping marker-less research "
+                    "recovery for task %s (%s)",
+                    str(task_id)[:8],
+                    reason,
+                )
+                return {
+                    "status": "accepted",
+                    "recovery_skipped": True,
+                    "recovery_reason": reason,
+                }
 
         # Marker-based recovery claims are leases too. Revalidate the exact
         # claim while holding canonical Project -> Task locks immediately
@@ -5536,6 +5586,7 @@ async def _process_post_commit(
                 _peek_task_type=_peek_task_type,
                 _expected_post_commit_claim_token=_expected_post_commit_claim_token,
                 _expected_childless_recovery_token=_expected_childless_recovery_token,
+                _expected_research_spawn_recovery_token=_expected_research_spawn_recovery_token,
                 refetch=_rollback_and_refetch_task,
             )
             if _dispatch_response is not None:

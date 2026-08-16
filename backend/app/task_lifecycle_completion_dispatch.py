@@ -13,9 +13,10 @@ Free-variable set (per the design doc's live-in analysis): ``task``,
 ``task_type``, ``task_id``, ``payload``, ``session``, ``locked_project``,
 ``preallocated_strategic_message_sequences``, ``_peek_capability``,
 ``_peek_task_type``, ``_expected_post_commit_claim_token``,
-``_expected_childless_recovery_token``, and the ``_rollback_and_refetch_task``
-closure (passed in as ``refetch`` — it closes over ``session``/``task_id``
-only, so it is trivially passable).
+``_expected_childless_recovery_token``,
+``_expected_research_spawn_recovery_token``, and the
+``_rollback_and_refetch_task`` closure (passed in as ``refetch`` — it closes
+over ``session``/``task_id`` only, so it is trivially passable).
 
 Unlike Stage T, this is NOT the last stage — the terminal tail always runs
 after it (on the non-early-return path). So this stage returns
@@ -100,6 +101,7 @@ async def run_completion_dispatch(
     _expected_post_commit_claim_token: str | None,
     _expected_childless_recovery_token: str | None,
     refetch: Callable[[], Awaitable[Task | None]],
+    _expected_research_spawn_recovery_token: str | None = None,
 ) -> tuple[Task, dict | None]:
     """Dispatch to the registry-bound completion handler and recover on failure.
 
@@ -296,6 +298,44 @@ async def run_completion_dispatch(
             # and terminalization. Preserve EVALUATING and propagate the
             # handler error so that loop can record this exact claim's
             # failure without re-running the agent or failing early.
+            raise
+        if _expected_research_spawn_recovery_token is not None:
+            from app.findings_index import FINALIZED_RESEARCH_FINDINGS_KEY
+            from app.recovery_research_spawn_pending import (
+                RESEARCH_SPAWN_RECOVERY_KEY,
+                research_spawn_recovery_attempt_identity,
+            )
+
+            recovery_meta = dict(
+                (task.context or {}).get(RESEARCH_SPAWN_RECOVERY_KEY) or {}
+            )
+            claim_is_current = bool(
+                task.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING)
+                and not task.archived
+                and not task.post_commit_pending
+                and (task.context or {}).get("_research_spawn_pending") is True
+                and (task.context or {}).get(FINALIZED_RESEARCH_FINDINGS_KEY)
+                is not True
+                and recovery_meta.get("claim_token")
+                == _expected_research_spawn_recovery_token
+                and recovery_meta.get("attempt_identity")
+                == research_spawn_recovery_attempt_identity(task)
+            )
+            if not claim_is_current:
+                logger.info(
+                    "[POST_COMMIT SWEEP] Marker-less research recovery claim "
+                    "for task %s lost authority during completion handler; "
+                    "preserving the newer lifecycle state",
+                    str(task_id)[:8],
+                )
+                return task, {
+                    "status": "accepted",
+                    "recovery_skipped": True,
+                    "recovery_reason": "stale_claim",
+                }
+            # This sweep owns the exact-attempt lease and retry budget.  Keep
+            # the source on the same lineage and let it record this failure;
+            # generic handler recovery must never queue a fresh research agent.
             raise
         # Detect transient errors (GitHub API, DB, network) and requeue instead
         # of FAILED.

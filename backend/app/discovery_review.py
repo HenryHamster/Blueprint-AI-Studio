@@ -45,6 +45,7 @@ from app.discovery_review_packet import (
     build_discovery_review_packet as _build_review_packet,
 )
 from app.direction_priority import direction_task_priority
+from app.findings_index import FINALIZED_RESEARCH_FINDINGS_KEY
 from app.models import (
     DiscoveryCycle,
     Project,
@@ -433,10 +434,12 @@ async def _cycle_is_quiescent(
         return False, "source_research_task_missing"
     source = (
         await session.execute(
-            select(Task).where(
+            select(Task)
+            .where(
                 Task.id == cycle.source_research_task_id,
                 Task.project_id == cycle.project_id,
             )
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if source is None:
@@ -445,6 +448,11 @@ async def _cycle_is_quiescent(
         return False, "source_research_task_missing"
     if source.status not in _SOURCE_TERMINAL_STATUSES:
         return False, "source_research_task_active"
+    if (
+        source.status == TaskStatus.COMPLETED
+        and (source.context or {}).get(FINALIZED_RESEARCH_FINDINGS_KEY) is not True
+    ):
+        return False, "source_research_findings_pending"
     if source.post_commit_pending:
         return False, "source_research_post_commit_pending"
     active = (
@@ -1644,13 +1652,20 @@ async def complete_discovery_review(
         quiescent, quiescence_reason = await _cycle_is_quiescent(
             session, cycle, now=now
         )
-        if not quiescent:
+        invalidation_reason = quiescence_reason if not quiescent else None
+        if invalidation_reason is None:
+            _, current_packet_checksum, _, _, _, _ = await _build_review_packet(
+                session, cycle, now=now
+            )
+            if payload.get("packet_checksum") != current_packet_checksum:
+                invalidation_reason = "review_packet_stale"
+        if invalidation_reason is not None:
             stale_review_task_id = cycle.review_task_id
             cycle.state = "review_pending"
             cycle.review_task_id = None
             cycle.review_result = {
                 "status": "REVIEW_PACKET_INVALIDATED",
-                "reason": quiescence_reason,
+                "reason": invalidation_reason,
                 "stale_review_task_id": str(stale_review_task_id),
             }
             cycle.revision = int(cycle.revision or 0) + 1
@@ -1663,10 +1678,10 @@ async def complete_discovery_review(
                 event_type="discovery.review_packet_invalidated",
                 summary=(
                     f"Discovery decision packet invalidated for {cycle.direction_key}: "
-                    f"{quiescence_reason}"
+                    f"{invalidation_reason}"
                 ),
                 extra={
-                    "reason": quiescence_reason,
+                    "reason": invalidation_reason,
                     "policy_status": "REVIEW_PACKET_INVALIDATED",
                 },
             )

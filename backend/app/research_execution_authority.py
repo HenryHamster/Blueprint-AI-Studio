@@ -42,6 +42,7 @@ RESEARCH_SERVER_OWNED_CONTEXT_KEYS: frozenset[str] = frozenset(
         "research_output_contract_version",
         "research_findings_finalized",
         "_research_spawn_pending",
+        "_research_spawn_recovery",
         "prior_deferred_findings",
         "deferred_findings",
         "deferred_finding_consumption_acks",
@@ -69,6 +70,7 @@ RESEARCH_FRESH_ATTEMPT_CONTEXT_KEYS: frozenset[str] = frozenset(
         "research_output_contract_version",
         "research_findings_finalized",
         "_research_spawn_pending",
+        "_research_spawn_recovery",
     }
 )
 

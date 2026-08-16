@@ -183,12 +183,11 @@ async def _sweep_post_commit_pending():
             if cancelled_pending:
                 await session.commit()
 
-            if not tasks:
-                return
-
-            logger.info(
-                f"[POST_COMMIT SWEEP] Found {len(tasks)} task(s) with post_commit_pending"
-            )
+            if tasks:
+                logger.info(
+                    f"[POST_COMMIT SWEEP] Found {len(tasks)} task(s) with "
+                    "post_commit_pending"
+                )
 
             for task in tasks:
                 # C3 heartbeat: _process_post_commit per task is heavy
@@ -639,6 +638,23 @@ async def _sweep_post_commit_pending():
         logger.error(
             f"[POST_COMMIT SWEEP] Marker-less childless-EVALUATING recovery "
             f"failed: {e}",
+            exc_info=True,
+        )
+
+    # Sidecar-resumed research can strand after its durable spawn-pending write
+    # without ever receiving the agent-status write-ahead marker.  Recover the
+    # exact persisted attempt only; the focused module owns its lease, pause
+    # fence, retry ledger, and synthetic payload construction.
+    try:
+        from app.recovery_research_spawn_pending import (
+            _sweep_markerless_research_spawn_pending,
+        )
+
+        await _sweep_markerless_research_spawn_pending()
+    except Exception as e:
+        logger.error(
+            "[POST_COMMIT SWEEP] Marker-less research-spawn recovery failed: "
+            f"{e}",
             exc_info=True,
         )
 
