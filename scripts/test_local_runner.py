@@ -77,6 +77,13 @@ def _bwrap_caps(gpu_indices=()):
     )
 
 
+def _bounded_bwrap_caps(gpu_indices=()):
+    """A bwrap host with a proven aggregate agent MemoryMax scope."""
+    return iso.replace(
+        _bwrap_caps(gpu_indices), systemd_run_path="/usr/bin/systemd-run"
+    )
+
+
 def _docker_caps(gpu_indices=()):
     """A host with usable docker (and optionally GPUs), no bwrap."""
     return iso.Capabilities(
@@ -309,7 +316,7 @@ class TestVerificationToolchainRecovery(unittest.TestCase):
             self.assertTrue(local_runner._spawn_agent_task(
                 task_id="recovered-task", task_type="fix", agent_token="token",
                 vm_instance_id="runner", orchestrator_url="https://api",
-                workspace="/tmp/ws", caps=_bwrap_caps(),
+                workspace="/tmp/ws", caps=_bounded_bwrap_caps(),
                 agent_binary=["node", "/agent/dist/index.js"], agent_image=None,
                 active_tasks={}, agent_started_at={}, agent_teardown={},
                 lock=threading.Lock(),
@@ -3320,6 +3327,37 @@ class TestRunComputeJob(unittest.TestCase):
         base.update(kwargs)
         return base
 
+    def test_compute_memory_limit_is_canonical_or_ignored_before_planning(self):
+        for raw, expected in (("4g", str(4 * 1024**3)), ("1e3", None)):
+            with self.subTest(raw=raw):
+                captured = {}
+
+                def fake_plan(**kwargs):
+                    captured.update(kwargs)
+                    return iso.ExecutionPlan.decline("test stop")
+
+                with patch.dict(
+                    os.environ,
+                    {"BLUEPRINT_RUNNER_MEM_LIMIT": raw},
+                    clear=False,
+                ), patch.object(
+                    local_runner.iso,
+                    "plan_compute_execution",
+                    side_effect=fake_plan,
+                ), patch.object(
+                    local_runner, "_report_compute_job", return_value=False
+                ):
+                    local_runner._run_compute_job(
+                        self._make_job(),
+                        "https://api.example.com",
+                        "tok",
+                        {"test-job-001"},
+                        threading.Lock(),
+                        capabilities=_bwrap_caps(),
+                    )
+
+                self.assertEqual(captured["mem_limit"], expected)
+
     def test_compute_job_releases_shared_capacity_on_exit(self):
         reports = []
 
@@ -4594,9 +4632,8 @@ class TestGpuDetection(unittest.TestCase):
         self.assertIsNone(posted_bodies[0]["supported_agent_task_types"])
 
     def test_bwrap_and_docker_available_declares_no_restriction(self):
-        """bwrap takes precedence: a box that can run the FULL agent slice on the
-        host toolchain declares no restriction even when docker is ALSO usable —
-        the docker-only self-restriction only fires when bwrap is unavailable.
+        """A hybrid box declares no restriction because bounded bwrap covers the
+        full slice, while backend observability preserves Docker image opt-in.
         """
         posted_bodies = []
 
@@ -4610,6 +4647,7 @@ class TestGpuDetection(unittest.TestCase):
             unshare_path="/usr/bin/unshare",
             userns_ok=True,
             docker_usable=True,
+            systemd_run_path="/usr/bin/systemd-run",
         )
         active_tasks: dict = {}
         lock = threading.Lock()
@@ -4631,6 +4669,9 @@ class TestGpuDetection(unittest.TestCase):
 
         self.assertEqual(len(posted_bodies), 1)
         self.assertIsNone(posted_bodies[0]["supported_agent_task_types"])
+        self.assertEqual(
+            posted_bodies[0]["agent_backend"], iso.BACKEND_DOCKER
+        )
 
 
 # ── Docker login helper ───────────────────────────────────────────────────────
@@ -7037,6 +7078,10 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
     def _spawn(self, *, backend, container_name, agent_image, agent_binary, caps,
                task_type="research", llm_env=None, project_id="project-123",
                resident_session=False, checkout_sha=None):
+        if backend == iso.BACKEND_BWRAP and not caps.systemd_run_path:
+            caps = iso.replace(
+                caps, systemd_run_path="/usr/bin/systemd-run"
+            )
         active_tasks: dict = {}
         agent_started_at: dict = {}
         agent_teardown: dict = {}
@@ -7244,6 +7289,105 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
         _, pkw = r["plan"].call_args
         self.assertIsNone(pkw["agent_image"])
         self.assertEqual(pkw["injected_env"]["PROJECT_ID"], "project-123")
+
+    def test_bwrap_spawn_cap_is_unconditional_when_admission_disabled(self):
+        caps = iso.replace(
+            _bwrap_caps(), systemd_run_path="/usr/bin/systemd-run"
+        )
+        fake_proc = MagicMock()
+        fake_proc.pid = 4321
+        fake_proc.stdout = io.BytesIO(b"")
+        plan = iso.ExecutionPlan(
+            backend=iso.BACKEND_BWRAP,
+            argv=["/usr/bin/bwrap", "--", "node", "/agent/dist/index.js"],
+            env={"AGENT_SECRET_TOKEN": "s"},
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+                "BLUEPRINT_RUNNER_RESOURCE_ADMISSION": "0",
+            },
+            clear=False,
+        ), patch.object(
+            local_runner.iso, "decide_agent_backend", return_value=iso.BACKEND_BWRAP
+        ), patch.object(
+            local_runner.iso, "plan_agent_execution", return_value=plan
+        ), patch.object(
+            local_runner.subprocess, "Popen", return_value=fake_proc
+        ) as popen:
+            spawned = local_runner._spawn_agent_task(
+                task_id="task-oom",
+                task_type="create",
+                agent_token="agent-tok",
+                vm_instance_id="runner:local",
+                orchestrator_url="https://api.example.com",
+                workspace="/tmp/ws",
+                caps=caps,
+                agent_binary=["node", "/agent/dist/index.js"],
+                agent_image=None,
+                active_tasks={},
+                agent_started_at={},
+                agent_teardown={},
+                lock=threading.Lock(),
+                mem_limit="8g",
+            )
+            admission_enabled = local_runner._ResourceLedger(
+                "/tmp", agent_memory_limit_bytes=8 * 1024**3
+            ).enabled
+
+        self.assertTrue(spawned)
+        self.assertFalse(admission_enabled)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], "/usr/bin/systemd-run")
+        self.assertIn(f"MemoryMax={8 * 1024**3}", argv)
+        self.assertIn("/usr/bin/bwrap", argv)
+        self.assertIn("--unsetenv", argv)
+        self.assertIn("XDG_RUNTIME_DIR", argv)
+        self.assertIn("DBUS_SESSION_BUS_ADDRESS", argv)
+        self.assertLess(argv.index("XDG_RUNTIME_DIR"), argv.index("--"))
+        self.assertLess(argv.index("DBUS_SESSION_BUS_ADDRESS"), argv.index("--"))
+        outer_env = popen.call_args.kwargs["env"]
+        self.assertEqual(outer_env["XDG_RUNTIME_DIR"], "/run/user/1000")
+        self.assertEqual(
+            outer_env["DBUS_SESSION_BUS_ADDRESS"],
+            "unix:path=/run/user/1000/bus",
+        )
+        self.assertNotIn("XDG_RUNTIME_DIR", plan.env)
+        self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", plan.env)
+
+    def test_bwrap_without_user_scope_declines_before_plan_or_spawn(self):
+        caps = iso.replace(_bwrap_caps(), systemd_run_path=None)
+        reasons: list[str] = []
+
+        with patch.object(
+            local_runner.iso, "decide_agent_backend", return_value=iso.BACKEND_BWRAP
+        ), patch.object(
+            local_runner.iso, "plan_agent_execution"
+        ) as planner, patch.object(local_runner.subprocess, "Popen") as popen:
+            spawned = local_runner._spawn_agent_task(
+                task_id="task-no-user-bus",
+                task_type="create",
+                agent_token="agent-tok",
+                vm_instance_id="runner:local",
+                orchestrator_url="https://api.example.com",
+                workspace="/tmp/ws",
+                caps=caps,
+                agent_binary=["node", "/agent/dist/index.js"],
+                agent_image=None,
+                active_tasks={},
+                agent_started_at={},
+                agent_teardown={},
+                lock=threading.Lock(),
+                mem_limit="8g",
+                decline_reason_out=reasons,
+            )
+
+        self.assertFalse(spawned)
+        self.assertIn("aggregate memory scope unavailable", reasons[0])
+        planner.assert_not_called()
+        popen.assert_not_called()
 
     def test_agent_source_sha_passed_from_explicit_agent_checkout(self):
         """A bwrap runner resolves identity from the explicit agent entry, not
@@ -7514,7 +7658,7 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
 
     # ---- relaxed advertisement (heartbeat agent_available) -------------------
 
-    def _heartbeat_agent_available(self, *, caps, agent_image):
+    def _heartbeat_agent_body(self, *, caps, agent_image):
         posted = []
 
         def fake_post(url, token, body, **kwargs):
@@ -7533,10 +7677,15 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
             local_runner._heartbeat_loop(
                 "https://api", "tok", {}, threading.Lock(),
                 {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
-                agent_sandbox_ok=caps.bwrap_ok,
+                agent_sandbox_ok=local_runner._bwrap_agent_boundary_available(caps),
                 caps=caps, agent_image=agent_image,
             )
-        return posted[0]["agent_available"]
+        return posted[0]
+
+    def _heartbeat_agent_available(self, *, caps, agent_image):
+        return self._heartbeat_agent_body(
+            caps=caps, agent_image=agent_image
+        )["agent_available"]
 
     def test_advertises_agent_on_docker_image_without_bwrap(self):
         self.assertTrue(
@@ -7549,6 +7698,30 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
         # Regression guard: docker-usable but no image → NOT claimable (unchanged).
         self.assertFalse(
             self._heartbeat_agent_available(caps=_docker_caps(), agent_image=None)
+        )
+
+    def test_unbounded_bwrap_is_not_advertised_without_docker(self):
+        body = self._heartbeat_agent_body(
+            caps=iso.replace(_bwrap_caps(), systemd_run_path=None),
+            agent_image=None,
+        )
+        self.assertFalse(body["agent_available"])
+        self.assertEqual(body["agent_backend"], iso.DECLINE)
+        self.assertIsNone(body["supported_agent_task_types"])
+        self.assertEqual(body["compute_backend"], iso.BACKEND_BWRAP)
+
+    def test_unbounded_bwrap_with_docker_advertises_only_safe_slice(self):
+        caps = iso.replace(
+            _bwrap_caps(), systemd_run_path=None, docker_usable=True
+        )
+        body = self._heartbeat_agent_body(
+            caps=caps, agent_image="registry/agent:prod"
+        )
+        self.assertTrue(body["agent_available"])
+        self.assertEqual(body["agent_backend"], iso.BACKEND_DOCKER)
+        self.assertEqual(
+            body["supported_agent_task_types"],
+            sorted(iso.AGENT_DOCKER_TYPES),
         )
 
     def test_spawn_writes_agent_output_to_per_task_log_file(self):
@@ -7589,7 +7762,7 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
                         vm_instance_id="vm",
                         orchestrator_url="https://api",
                         workspace="/tmp/ws",
-                        caps=_bwrap_caps(),
+                        caps=_bounded_bwrap_caps(),
                         agent_binary="/usr/bin/node",
                         agent_image=None,
                         active_tasks=active_tasks,
@@ -8835,7 +9008,7 @@ class TestStatusJson(unittest.TestCase):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock,
                     {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
-                    caps=_bwrap_caps(),
+                    caps=_bounded_bwrap_caps(),
                 )
         finally:
             local_runner._shutdown_event.clear()
@@ -10394,6 +10567,71 @@ class PreflightSupervisorReportTests(_LocalRunnerTestCase):
         self.assertIn("blueprint-runner.service", out)
 
 
+class BoundedAgentPreflightTests(_LocalRunnerTestCase):
+    def _run_preflight(self, caps, *, agent_image=None):
+        output = io.StringIO()
+        with patch.object(
+            local_runner,
+            "_post",
+            return_value=(200, {"ok": True}),
+        ), patch.object(
+            local_runner, "_workspace_writable", return_value=True
+        ), patch.object(
+            local_runner, "_check_provider_credentials", return_value=[]
+        ), patch.object(
+            local_runner,
+            "_detect_supervisor_state",
+            return_value={
+                "supervisor": None,
+                "supervised": False,
+                "evidence": "test",
+                "detail": "test",
+            },
+        ), contextlib.redirect_stdout(output):
+            result = local_runner._preflight(
+                "https://api.example.com",
+                "tok",
+                ["node", "/agent/dist/index.js"],
+                caps,
+                _gpu_state(()),
+                2,
+                2,
+                agent_image=agent_image,
+            )
+        return result, output.getvalue()
+
+    def test_no_scope_means_no_bwrap_agent_claim(self):
+        caps = iso.replace(_bwrap_caps(), systemd_run_path=None)
+        result, output = self._run_preflight(caps)
+
+        self.assertFalse(result["claimable"][iso.CLASS_AGENT])
+        self.assertTrue(result["claimable"][iso.CLASS_COMPUTE])
+        self.assertFalse(result["_heartbeat_body"]["agent_available"])
+        self.assertEqual(
+            result["_heartbeat_body"]["agent_backend"], iso.DECLINE
+        )
+        self.assertEqual(
+            result["_heartbeat_body"]["compute_backend"], iso.BACKEND_BWRAP
+        )
+        self.assertIn("aggregate memory scope unavailable", output)
+
+    def test_no_scope_with_docker_declares_exact_read_only_slice(self):
+        caps = iso.replace(
+            _bwrap_caps(), systemd_run_path=None, docker_usable=True
+        )
+        result, _output = self._run_preflight(
+            caps, agent_image="registry/agent:prod"
+        )
+
+        self.assertTrue(result["claimable"][iso.CLASS_AGENT])
+        heartbeat = result["_heartbeat_body"]
+        self.assertEqual(heartbeat["agent_backend"], iso.BACKEND_DOCKER)
+        self.assertEqual(
+            heartbeat["supported_agent_task_types"],
+            sorted(iso.AGENT_DOCKER_TYPES),
+        )
+
+
 class GpuSandboxSmokeTests(_LocalRunnerTestCase):
     """FINDING 6: the preflight GPU smoke must probe against a LIVE workspace.
 
@@ -11322,6 +11560,92 @@ class TestSharedResourceAdmission(unittest.TestCase):
             )
             self.assertEqual(ledger.reserved_cpu_cores, 0.0)
             self.assertIsNone(ledger.try_reserve("agent:a", "agent"))
+
+    def test_default_agent_cap_supports_suite_independent_of_live_concurrency(self):
+        gib = 1024 ** 3
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            local_runner, "_memory_total_bytes", return_value=16 * gib
+        ):
+            limit, limit_bytes = local_runner._effective_agent_memory_limit()
+        self.assertEqual(limit, str(8 * gib))
+        self.assertEqual(limit_bytes, 8 * gib)
+
+    def test_eight_gib_host_derives_cap_that_actual_ledger_admits(self):
+        gib = 1024 ** 3
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            local_runner, "_memory_total_bytes", return_value=8 * gib
+        ), patch.object(
+            local_runner, "_memory_free_bytes", return_value=8 * gib
+        ), patch.object(
+            local_runner.os, "cpu_count", return_value=8
+        ):
+            limit, limit_bytes = local_runner._effective_agent_memory_limit()
+            ledger = local_runner._ResourceLedger(
+                "/tmp", enabled=True, agent_memory_limit_bytes=limit_bytes
+            )
+            first_reason = ledger.try_reserve("agent:first", "agent")
+            second_reason = ledger.try_reserve("agent:second", "agent")
+
+        self.assertEqual(limit, str(6 * gib))
+        self.assertEqual(limit_bytes, 6 * gib)
+        self.assertGreaterEqual(limit_bytes, 4 * gib)
+        self.assertIsNone(first_reason)
+        self.assertEqual(second_reason, "memory_reservation")
+
+    def test_host_below_minimum_agent_budget_is_not_admitted(self):
+        gib = 1024 ** 3
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            local_runner, "_memory_total_bytes", return_value=3 * gib
+        ), patch.object(
+            local_runner, "_memory_free_bytes", return_value=3 * gib
+        ), patch.object(
+            local_runner.os, "cpu_count", return_value=8
+        ):
+            limit, limit_bytes = local_runner._effective_agent_memory_limit()
+            ledger = local_runner._ResourceLedger(
+                "/tmp", enabled=True, agent_memory_limit_bytes=limit_bytes
+            )
+            reason = ledger.try_reserve("agent:too-small", "agent")
+
+        self.assertEqual(limit, str(2 * gib))
+        self.assertEqual(reason, "memory_reservation")
+
+    def test_agent_admission_reserves_at_least_the_enforced_cap(self):
+        gib = 1024 ** 3
+        with patch.dict(
+            os.environ,
+            {"BLUEPRINT_RUNNER_AGENT_MEMORY_RESERVATION_BYTES": str(2 * gib)},
+            clear=True,
+        ):
+            ledger = local_runner._ResourceLedger(
+                "/tmp", enabled=True, agent_memory_limit_bytes=8 * gib
+            )
+        self.assertEqual(ledger.request_for("agent").memory_bytes, 8 * gib)
+
+    def test_explicit_agent_cap_is_not_silently_reduced(self):
+        gib = 1024 ** 3
+        with patch.dict(
+            os.environ,
+            {"BLUEPRINT_RUNNER_MEM_LIMIT": "12g"},
+            clear=True,
+        ):
+            limit, limit_bytes = local_runner._effective_agent_memory_limit()
+        self.assertEqual(limit, str(12 * gib))
+        self.assertEqual(limit_bytes, 12 * gib)
+
+    def test_invalid_or_nonfinite_agent_caps_fall_back_without_crashing(self):
+        gib = 1024 ** 3
+        for invalid in ("1e3", "inf", "1e999", str(1 << 64)):
+            with self.subTest(invalid=invalid), patch.dict(
+                os.environ,
+                {"BLUEPRINT_RUNNER_MEM_LIMIT": invalid},
+                clear=True,
+            ), patch.object(
+                local_runner, "_memory_total_bytes", return_value=16 * gib
+            ):
+                limit, limit_bytes = local_runner._effective_agent_memory_limit()
+            self.assertEqual(limit, str(8 * gib))
+            self.assertEqual(limit_bytes, 8 * gib)
 
     def test_malformed_compute_response_releases_capacity_and_claim_reservation(self):
         ledger = local_runner._ResourceLedger("/tmp", enabled=False)

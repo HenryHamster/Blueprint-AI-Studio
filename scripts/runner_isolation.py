@@ -35,6 +35,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -50,6 +51,10 @@ BACKEND_PODMAN = "podman"
 BACKEND_APPTAINER = "apptainer"
 BACKEND_ENROOT = "enroot"
 DECLINE = "declined"
+
+# Trusted host context used only by the outer ``systemd-run --user`` client.
+# The bwrap child explicitly removes these before starting the untrusted agent.
+SYSTEMD_USER_BUS_ENV_KEYS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
 # Fixed in-sandbox mount points. Binding the per-task work dir at a stable path
 # (instead of echoing the host path) decouples the sandbox from host layout and
@@ -571,14 +576,63 @@ def refresh_container_gpu_passthrough(caps: Capabilities) -> Capabilities:
 
 
 def probe_systemd_run() -> str | None:
-    """Return the systemd-run path if a user scope can plausibly be created."""
+    """Return ``systemd-run`` only after a bounded user-scope probe succeeds.
+
+    A system service can see the binary while lacking a user manager/bus. Merely
+    finding the executable would make every capped bwrap launch start a wrapper
+    that immediately exits without ever running the task. A plain scope probe is
+    also insufficient: the manager may reject the ``MemoryMax`` property or fail
+    to attach it to the effective cgroup. Run a tiny process in the exact bounded
+    scope shape and have that process verify its own cgroup limit.
+    """
     path = _which("systemd-run")
     if not path:
         return None
-    # A user manager must be reachable for --user scopes. Best-effort: presence of
-    # XDG_RUNTIME_DIR with a systemd bus is the common signal; we still return the
-    # path and let the resource-cap wrapper degrade gracefully if the scope fails.
-    return path
+    probe_limit = 64 * 1024 * 1024
+    # The probe runs under cgroup v2, which is the hierarchy where systemd's
+    # MemoryMax authority is meaningful for the descendant-tree boundary. Keep
+    # this a short Python one-liner so no generated shell/quoting layer is involved.
+    verify_limit = (
+        "import pathlib;"
+        "lines=pathlib.Path('/proc/self/cgroup').read_text().splitlines();"
+        "entry=next((x for x in lines if x.startswith('0::')),None);"
+        "rel=entry.split('::',1)[1].lstrip('/') if entry else None;"
+        "p=pathlib.Path('/sys/fs/cgroup') / rel / 'memory.max' if rel is not None else None;"
+        f"raise SystemExit(0 if p and p.read_text().strip()=='{probe_limit}' else 1)"
+    )
+    try:
+        result = subprocess.run(
+            [
+                path,
+                "--user",
+                "--scope",
+                "--collect",
+                "--quiet",
+                "--unit",
+                f"bp-cap-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}",
+                "-p",
+                f"MemoryMax={probe_limit}",
+                sys.executable,
+                "-c",
+                verify_limit,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=systemd_user_bus_env(os.environ),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return path if result.returncode == 0 else None
+
+
+def systemd_user_bus_env(source_env) -> dict[str, str]:
+    """Return the minimal trusted env needed by a user-manager client."""
+    return {
+        key: value
+        for key in SYSTEMD_USER_BUS_ENV_KEYS
+        if isinstance((value := source_env.get(key)), str) and value
+    }
 
 
 def detect_gpus() -> tuple[tuple[int, ...], tuple[str, ...]]:
@@ -1835,18 +1889,32 @@ def _parse_mem_bytes(value: str | None) -> int | None:
     if not value:
         return None
     text = str(value).strip().lower()
-    mult = 1
-    if text.endswith(("k", "kb")):
-        mult, text = 1024, text.rstrip("kb")
-    elif text.endswith(("m", "mb")):
-        mult, text = 1024**2, text.rstrip("mb")
-    elif text.endswith(("g", "gb")):
-        mult, text = 1024**3, text.rstrip("gb")
-    elif text.endswith("b"):
-        text = text.rstrip("b")
+    # Keep the accepted grammar deliberately narrower than float(): values such
+    # as ``1e3``/``inf`` are not valid systemd/Docker size strings. Callers pass
+    # the canonical decimal byte count produced from this parser to both runtimes.
+    match = re.fullmatch(
+        r"(?P<number>(?:\d+(?:\.\d*)?|\.\d+))(?P<suffix>k|kb|m|mb|g|gb|b)?",
+        text,
+    )
+    if match is None:
+        return None
+    multiplier = {
+        None: 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+    }[match.group("suffix")]
     try:
-        return int(float(text) * mult)
-    except ValueError:
+        parsed = float(match.group("number")) * multiplier
+        if not (0 < parsed <= (1 << 63) - 1):
+            return None
+        parsed_bytes = int(parsed)
+        return parsed_bytes if parsed_bytes > 0 else None
+    except (OverflowError, ValueError):
         return None
 
 
@@ -2096,6 +2164,7 @@ def plan_agent_execution(
     agent_image: str | None = None,
     per_task_creds: dict[str, str] | None = None,
     verification_toolchain: VerificationToolchain | None = None,
+    mem_limit: str | None = None,
 ) -> ExecutionPlan:
     """Build the isolation plan for an agent task, or DECLINE (fail-closed).
 
@@ -2174,6 +2243,7 @@ def plan_agent_execution(
             binds=[],                # NO host /workspace bind — the container owns it
             env_keys=sorted(forwarded),
             cwd=None,                # honor the image WORKDIR
+            mem_limit=mem_limit,
             runtime=BACKEND_DOCKER,
         )
         # docker CLIENT env: minimal trusted vars to FIND + configure the runtime,

@@ -58,7 +58,7 @@ Optional environment variables:
                                       for compatibility troubleshooting.
     BLUEPRINT_RUNNER_AGENT_CPU_RESERVATION_CORES / _MEMORY_RESERVATION_BYTES
                                       Per-agent reservation before claiming work (defaults:
-                                      1 core, 2 GiB).
+                                      1 core and the enforced agent memory cap).
     BLUEPRINT_RUNNER_COMPUTE_CPU_RESERVATION_CORES / _MEMORY_RESERVATION_BYTES
                                       Per-compute-job reservation (defaults: 2 cores, 4 GiB).
     BLUEPRINT_RUNNER_RESERVED_CPU_CORES / _RESERVED_MEMORY_BYTES
@@ -75,8 +75,11 @@ Optional environment variables:
                                       Set this to a pullable project/private image with
                                       nvidia-smi when Docker Hub is unavailable; default
                                       is nvidia/cuda:12.6.3-base-ubuntu24.04.
-    BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
-    BLUEPRINT_RUNNER_MEM_LIMIT        Best-effort memory cap per task (e.g. 8g)
+    BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per compute task
+    BLUEPRINT_RUNNER_MEM_LIMIT        Agent descendant/container memory cap and
+                                      explicit compute cap (e.g. 8g). Invalid
+                                      values fall back to a host-safe agent default
+                                      and are ignored for compute.
     BLUEPRINT_RUNNER_CLI_MAINTENANCE  Host CLI self-maintenance (default: 1;
                                       set 0/false/no/off to disable).
     BLUEPRINT_RUNNER_CLI_DIR          Blueprint-managed CLI release root
@@ -1734,6 +1737,39 @@ def _docker_agent_possible(caps: "iso.Capabilities", agent_image: str | None) ->
     return bool(agent_image) and bool(caps.docker_usable)
 
 
+def _bwrap_agent_boundary_available(caps: "iso.Capabilities") -> bool:
+    """Whether bwrap agent work has a proven descendant-wide memory boundary.
+
+    ``RLIMIT_AS`` applies independently to each process, so it cannot contain an
+    agent that fans out into several Node/Vitest children. Agent bwrap work is
+    claimable only when capability detection proved a user ``MemoryMax`` scope.
+    Compute keeps its existing resource handling; this gate is specific to the
+    incident-prone agent process tree.
+    """
+    return bool(caps.bwrap_ok and caps.systemd_run_path)
+
+
+def _advertised_agent_backend(
+    caps: "iso.Capabilities",
+    *,
+    agent_binary_present: bool,
+    agent_image: str | None,
+    bwrap_agent_ok: bool,
+    docker_agent_ok: bool,
+) -> str:
+    """Select the normal backend while fencing any unbounded advertised leg."""
+    backend = iso.decide_agent_backend(
+        caps,
+        agent_binary_present=agent_binary_present,
+        agent_image=agent_image,
+    )
+    if backend == iso.BACKEND_BWRAP and not bwrap_agent_ok:
+        return iso.BACKEND_DOCKER if docker_agent_ok else iso.DECLINE
+    if backend == iso.BACKEND_DOCKER and not docker_agent_ok:
+        return iso.BACKEND_BWRAP if bwrap_agent_ok else iso.DECLINE
+    return backend
+
+
 def _agent_image_present(agent_image: str) -> bool:
     """Whether ``docker image inspect <agent_image>`` succeeds (image locally present).
 
@@ -1886,6 +1922,49 @@ def _memory_total_bytes() -> int | None:
     return None
 
 
+def _effective_agent_memory_limit() -> tuple[str, int]:
+    """Return the enforced per-agent memory cap and its byte value.
+
+    ``BLUEPRINT_RUNNER_MEM_LIMIT`` remains the operator authority when set. Its
+    validated value is canonicalized to decimal bytes for both systemd and
+    Docker. Without an explicit value, prefer 8 GiB (headroom for the supported
+    JS suites) but fit it below the host/control-plane memory floors so an 8 GiB
+    runner can admit one task. Admission reserves this exact value; a live
+    concurrency change therefore cannot make the cap and reservation diverge.
+    """
+    configured = os.environ.get("BLUEPRINT_RUNNER_MEM_LIMIT", "").strip()
+    if configured:
+        configured_bytes = iso._parse_mem_bytes(configured)
+        if configured_bytes is not None and configured_bytes > 0:
+            return str(configured_bytes), configured_bytes
+        print(
+            "[runner] WARNING: invalid BLUEPRINT_RUNNER_MEM_LIMIT="
+            f"{configured!r}; using the safe agent default.",
+            flush=True,
+        )
+
+    gib = 1024 * 1024 * 1024
+    preferred = 8 * gib
+    total_memory = _memory_total_bytes()
+    if total_memory is None:
+        effective = preferred
+    else:
+        host_reserve = _env_int(
+            "BLUEPRINT_RUNNER_RESERVED_MEMORY_BYTES", gib, minimum=0
+        )
+        min_free = _env_int(
+            "BLUEPRINT_RUNNER_MIN_FREE_MEMORY_BYTES", gib, minimum=0
+        )
+        # Never manufacture a token cap (for example one byte) that admission
+        # could accept but the supported runtime cannot use. Two GiB is the
+        # historical minimum agent reservation; below that safe host budget the
+        # ledger rejects the workload instead of claim/OOM-looping it.
+        minimum_viable = 2 * gib
+        safe_host_budget = total_memory - host_reserve - min_free
+        effective = min(preferred, max(minimum_viable, safe_host_budget))
+    return str(effective), effective
+
+
 def _env_enabled(name: str, default: bool = True) -> bool:
     """Parse a conventional boolean env var without making startup fragile."""
     raw = os.environ.get(name)
@@ -1924,17 +2003,41 @@ class _ResourceLedger:
         reserved_cpu_cores: float | None = None,
         reserved_memory_bytes: int | None = None,
         min_free_memory_bytes: int | None = None,
+        agent_memory_limit_bytes: int | None = None,
     ) -> None:
         self.workspace_root = workspace_root
         self.enabled = (
             _env_enabled("BLUEPRINT_RUNNER_RESOURCE_ADMISSION", True)
             if enabled is None else enabled
         )
-        self.agent = agent or _ResourceRequest(
-            cpu_cores=_env_float("BLUEPRINT_RUNNER_AGENT_CPU_RESERVATION_CORES", 1.0, minimum=0.0),
-            memory_bytes=_env_int("BLUEPRINT_RUNNER_AGENT_MEMORY_RESERVATION_BYTES", 2 * self._GIB, minimum=0),
-            disk_bytes=_env_int("BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES", 0, minimum=0),
-        )
+        if agent is not None:
+            self.agent = agent
+        else:
+            default_agent_memory = (
+                max(1, int(agent_memory_limit_bytes))
+                if agent_memory_limit_bytes is not None
+                else 2 * self._GIB
+            )
+            reserved_agent_memory = _env_int(
+                "BLUEPRINT_RUNNER_AGENT_MEMORY_RESERVATION_BYTES",
+                default_agent_memory,
+                minimum=0,
+            )
+            if agent_memory_limit_bytes is not None:
+                reserved_agent_memory = max(
+                    reserved_agent_memory, int(agent_memory_limit_bytes)
+                )
+            self.agent = _ResourceRequest(
+                cpu_cores=_env_float(
+                    "BLUEPRINT_RUNNER_AGENT_CPU_RESERVATION_CORES",
+                    1.0,
+                    minimum=0.0,
+                ),
+                memory_bytes=reserved_agent_memory,
+                disk_bytes=_env_int(
+                    "BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES", 0, minimum=0
+                ),
+            )
         self.compute = compute or _ResourceRequest(
             cpu_cores=_env_float("BLUEPRINT_RUNNER_COMPUTE_CPU_RESERVATION_CORES", 2.0, minimum=0.0),
             memory_bytes=_env_int("BLUEPRINT_RUNNER_COMPUTE_MEMORY_RESERVATION_BYTES", 4 * self._GIB, minimum=0),
@@ -1979,6 +2082,16 @@ class _ResourceLedger:
         if (
             total_memory is not None
             and reserved_memory + request.memory_bytes + self.reserved_memory_bytes > total_memory
+        ):
+            return "memory_reservation"
+        if (
+            request is self.agent
+            and total_memory is not None
+            and reserved_memory
+            + request.memory_bytes
+            + self.reserved_memory_bytes
+            + self.min_free_memory_bytes
+            > total_memory
         ):
             return "memory_reservation"
         free_memory = _memory_free_bytes()
@@ -4368,9 +4481,12 @@ def _heartbeat_loop(
             # which case these serialize as null (the schema tolerates them absent).
             if caps is not None:
                 isolation_backends = iso.capabilities_inventory(caps)
-                agent_backend = iso.decide_agent_backend(
-                    caps, agent_binary_present=agent_binary_present,
+                agent_backend = _advertised_agent_backend(
+                    caps,
+                    agent_binary_present=agent_binary_present,
                     agent_image=agent_image,
+                    bwrap_agent_ok=bwrap_agent_ok,
+                    docker_agent_ok=docker_agent_ok,
                 )
                 compute_backend = iso.decide_compute_backend(
                     caps, has_image=agent_image is not None
@@ -6507,7 +6623,14 @@ def _run_compute_job(
 
     caps = capabilities if capabilities is not None else _get_capabilities()
     cpu_limit = os.environ.get("BLUEPRINT_RUNNER_CPU_LIMIT") or None
-    mem_limit = os.environ.get("BLUEPRINT_RUNNER_MEM_LIMIT") or None
+    raw_mem_limit = os.environ.get("BLUEPRINT_RUNNER_MEM_LIMIT") or None
+    parsed_mem_limit = iso._parse_mem_bytes(raw_mem_limit)
+    mem_limit = str(parsed_mem_limit) if parsed_mem_limit is not None else None
+    if raw_mem_limit and mem_limit is None:
+        print(
+            f"[compute] ignoring invalid BLUEPRINT_RUNNER_MEM_LIMIT={raw_mem_limit!r}",
+            flush=True,
+        )
     has_image = bool(container_image)
 
     tmpdir: str | None = None
@@ -8029,10 +8152,11 @@ def _preflight(
     # A docker+image box claims (read-only) agent work even without bwrap; the
     # host agent binary is carried by the image, so claimable_classes (which only
     # knows about the bwrap path) under-reports it. Relax it here.
-    bwrap_agent = claimable[iso.CLASS_AGENT]
+    bwrap_agent = (
+        claimable[iso.CLASS_AGENT] and _bwrap_agent_boundary_available(caps)
+    )
     docker_agent = _docker_agent_possible(caps, agent_image)
-    if docker_agent:
-        claimable = {**claimable, iso.CLASS_AGENT: True}
+    claimable = {**claimable, iso.CLASS_AGENT: bwrap_agent or docker_agent}
     # Runner-DECLARED agent capability floor (mirrors the heartbeat loop): a
     # docker-ONLY box (docker+image, no bwrap agent path) can run only the read-only
     # agent slice, so it declares that slice for the orchestrator to intersect with
@@ -8042,7 +8166,17 @@ def _preflight(
         if (docker_agent and not bwrap_agent)
         else None
     )
-    agent_reason = iso.agent_decline_reason(caps, agent_binary is not None)
+    if (
+        caps.bwrap_ok
+        and agent_binary is not None
+        and not _bwrap_agent_boundary_available(caps)
+        and not docker_agent
+    ):
+        agent_reason = (
+            "bwrap aggregate memory scope unavailable and docker agent unavailable"
+        )
+    else:
+        agent_reason = iso.agent_decline_reason(caps, agent_binary is not None)
     compute_reason = None
     if not claimable[iso.CLASS_COMPUTE]:
         compute_reason = "no bwrap sandbox and no usable container runtime"
@@ -8071,9 +8205,12 @@ def _preflight(
         # populates the fleet view the same way the running heartbeat does.
         "isolation_backends": iso.capabilities_inventory(caps),
         "container_gpu_passthrough": caps.container_gpu_passthrough,
-        "agent_backend": iso.decide_agent_backend(
-            caps, agent_binary_present=agent_binary is not None,
+        "agent_backend": _advertised_agent_backend(
+            caps,
+            agent_binary_present=agent_binary is not None,
             agent_image=agent_image,
+            bwrap_agent_ok=bwrap_agent,
+            docker_agent_ok=docker_agent,
         ),
         "compute_backend": iso.decide_compute_backend(
             caps, has_image=agent_image is not None
@@ -8147,9 +8284,9 @@ def _preflight(
         flush=True,
     )
     caps_state = (
-        f"{caps.systemd_run_path} (resource caps available)"
+        f"{caps.systemd_run_path} (bounded agent scopes available)"
         if caps.systemd_run_path
-        else "none (resource caps best-effort via rlimit only)"
+        else "none (bwrap agent work disabled; no aggregate descendant cap)"
     )
     print(f"    resource cap : {caps_state}", flush=True)
 
@@ -8208,7 +8345,7 @@ def _preflight(
 
     print("  task classes:", flush=True)
     if claimable[iso.CLASS_AGENT]:
-        if caps.bwrap_ok:
+        if bwrap_agent:
             agent_via = "bwrap" + (f" + docker image {agent_image}" if docker_agent else "")
         else:
             agent_via = f"docker image {agent_image} (read-only types)"
@@ -8234,7 +8371,7 @@ def _preflight(
     # on this host but node dependencies were never installed (tsx not found).
     # The docker agent backend carries the runtime in the image, so host deps
     # are irrelevant there — only warn for the bwrap path.
-    if caps.bwrap_ok and _agent_deps_missing():
+    if bwrap_agent and _agent_deps_missing():
         print(
             "    agent deps  : MISSING — run `cd agent && npm install` (or re-run\n"
             "                  `blueprint-runner install`, which now bootstraps them).",
@@ -8475,6 +8612,7 @@ def _spawn_agent_task(
     llm_files: list[dict[str, str]] | None = None,
     decline_reason_out: list[str] | None = None,
     verification_toolchain: "iso.VerificationToolchain | None" = None,
+    mem_limit: str | None = None,
 ) -> bool:
     """Plan (fail-closed) + spawn one claimed agent task; record it for reaping.
 
@@ -8510,10 +8648,23 @@ def _spawn_agent_task(
             decline_reason_out.append(reason)
         return False
 
+    if mem_limit is None:
+        mem_limit, _mem_limit_bytes = _effective_agent_memory_limit()
+    else:
+        _mem_limit_bytes = iso._parse_mem_bytes(mem_limit)
+        if _mem_limit_bytes is None:
+            return _decline("invalid agent memory limit")
+        mem_limit = str(_mem_limit_bytes)
+
     if backend == iso.DECLINE:
         # No isolation boundary for THIS task type on this host (fail-closed).
         return _decline(
             iso.agent_decline_reason(caps, present) or "no agent sandbox"
+        )
+    if backend == iso.BACKEND_BWRAP and not _bwrap_agent_boundary_available(caps):
+        return _decline(
+            "bwrap aggregate memory scope unavailable; refusing an unbounded "
+            "agent process tree"
         )
     # The bwrap backend needs the HOST agent dist; the docker backend carries the
     # agent in the image, so a missing host binary is only fatal off the docker path.
@@ -8624,9 +8775,26 @@ def _spawn_agent_task(
         task_type=task_type,
         agent_image=plan_image,
         verification_toolchain=verification_toolchain or _current_verification_toolchain(),
+        mem_limit=mem_limit,
     )
     if plan.declined:
         return _decline(plan.decline_reason or "sandbox plan declined")
+
+    scope_prefix: list[str] = []
+    if plan.backend == iso.BACKEND_BWRAP:
+        safe_task = "".join(
+            ch if ch.isalnum() or ch in "-_" else "-" for ch in task_id
+        )[:24]
+        scope_prefix = iso.build_resource_scope_prefix(
+            caps,
+            cpu_limit=None,
+            mem_limit=mem_limit,
+            scope_name=f"bp-agent-{safe_task}-{secrets.token_hex(4)}",
+        )
+        if not scope_prefix:
+            return _decline(
+                "failed to build the required aggregate bwrap memory scope"
+            )
 
     # Write the supervisor marker now that the plan is accepted: it must exist
     # BEFORE the agent starts so its boot-mode decision is deterministic. The
@@ -8665,11 +8833,33 @@ def _spawn_agent_task(
             flush=True,
         )
 
-    popen_kwargs: dict = {"env": plan.env, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+    # Docker carries its limit in `docker run`. Host-backed agents move into a
+    # transient user scope so MemoryMax contains the complete bwrap/Vitest
+    # descendant tree without making a child OOM an OOM event for the runner
+    # service itself. The outer systemd client receives the same minimal trusted
+    # user-bus context as the startup probe; bwrap strips those variables before
+    # the untrusted agent starts. An unbounded bwrap path was rejected above.
+    plan_argv = list(plan.argv)
+    process_env = dict(plan.env)
+    if plan.backend == iso.BACKEND_BWRAP:
+        for key in iso.SYSTEMD_USER_BUS_ENV_KEYS:
+            process_env.pop(key, None)
+        process_env.update(iso.systemd_user_bus_env(os.environ))
+        unset_bus_env: list[str] = []
+        for key in iso.SYSTEMD_USER_BUS_ENV_KEYS:
+            unset_bus_env += ["--unsetenv", key]
+        plan_argv = [plan_argv[0], *unset_bus_env, *plan_argv[1:]]
+    run_argv = [*scope_prefix, *plan_argv]
+
+    popen_kwargs: dict = {
+        "env": process_env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+    }
     if hasattr(os, "setsid"):
         popen_kwargs["start_new_session"] = True
     try:
-        proc = subprocess.Popen(plan.argv, **popen_kwargs)
+        proc = subprocess.Popen(run_argv, **popen_kwargs)
     except Exception as exc:
         if _log_file_handle is not None:
             try:
@@ -8942,7 +9132,15 @@ def main() -> None:
         )
 
     gpu_state = _make_gpu_state(caps)
-    resource_ledger = _ResourceLedger(_workspace_root())
+    agent_mem_limit, agent_mem_limit_bytes = _effective_agent_memory_limit()
+    resource_ledger = _ResourceLedger(
+        _workspace_root(), agent_memory_limit_bytes=agent_mem_limit_bytes
+    )
+    print(
+        "[runner] agent process boundary: "
+        f"memory={agent_mem_limit} bytes_reserved={resource_ledger.agent.memory_bytes}",
+        flush=True,
+    )
 
     # Best-effort startup sweep of any stray tagged containers from a prior crash.
     iso.sweep_stale_containers(caps)
@@ -9084,7 +9282,8 @@ def main() -> None:
             gpu_capabilities,
             active_compute_jobs,
             compute_lock,
-            caps.bwrap_ok,  # agent_sandbox_ok — gates the bwrap advertisement leg
+            _bwrap_agent_boundary_available(caps),
+            # agent_sandbox_ok — bwrap plus a proven aggregate MemoryMax scope
         ),
         kwargs={
             "telemetry": telemetry,
@@ -9143,9 +9342,12 @@ def main() -> None:
     next_task_url = f"{orchestrator_url}/api/runner/next-task"
     min_free_disk = _min_free_disk_bytes()
 
-    # An agent sandbox exists iff bwrap can be built OR a docker+image backend is
-    # available. When agent_image is None this is exactly caps.bwrap_ok (unchanged).
-    agent_sandbox_ok = caps.bwrap_ok or _docker_agent_possible(caps, agent_image)
+    # Agent work additionally needs a descendant-wide memory boundary. Docker's
+    # container limit provides one; bwrap is enabled only after the bounded
+    # user-scope probe succeeds. Never claim and then discover this after dispatch.
+    agent_sandbox_ok = _bwrap_agent_boundary_available(
+        caps
+    ) or _docker_agent_possible(caps, agent_image)
 
     # Last-resort teardown: a crashed runner never runs the per-task cleanup
     # (agent exit) nor the stale sweep (the reap loop died), so every workspace
@@ -9452,6 +9654,7 @@ def main() -> None:
                 llm_env=llm_env,
                 llm_files=llm_files,
                 decline_reason_out=decline_reason,
+                mem_limit=agent_mem_limit,
             )
             if not spawned:
                 # DECLINE / spawn failure — the reaper never sees this task, so the
