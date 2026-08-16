@@ -1183,14 +1183,11 @@ async def sweep_unblock_blocked_tasks(
 
         verify_pr_merged = _verify_pr_merged
 
-    # Requeue is new execution, not passive maintenance.  Respect the existing
-    # project stop/drain controls at selection time: ``autonomous_enabled=False``
-    # stops autonomous resurrection, while ``paused=True`` drains in-flight work
-    # without manufacturing fresh QUEUED attempts.  No parallel retry switch is
-    # introduced; resuming either existing control makes these rows immediately
-    # eligible on the next sweep.
-    retry_enabled_project_ids = select(Project.id).where(
-        Project.autonomous_enabled.is_(True),
+    # Requeue resumes an existing task graph; it does not create a new autonomous
+    # root.  Match normal dispatch authority: a held autonomy flag stops new root
+    # spawning, while ``paused=True`` drains existing work and must also fence
+    # BLOCKED-task recovery.  Archived projects remain permanently ineligible.
+    resumable_project_ids = select(Project.id).where(
         Project.paused.is_(False),
         Project.archived.is_(False),
     )
@@ -1206,7 +1203,7 @@ async def sweep_unblock_blocked_tasks(
         select(Task.id)
         .where(
             Task.status == TaskStatus.BLOCKED,
-            Task.project_id.in_(retry_enabled_project_ids),
+            Task.project_id.in_(resumable_project_ids),
             (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
         )
         .order_by(Task.recheck_after.asc().nullsfirst())
@@ -1234,7 +1231,7 @@ async def sweep_unblock_blocked_tasks(
         select(Task.id)
         .where(
             Task.status == TaskStatus.BLOCKED,
-            Task.project_id.in_(retry_enabled_project_ids),
+            Task.project_id.in_(resumable_project_ids),
             or_(*gate_text_predicates),
         )
         .order_by(Task.blocked_at.asc().nullsfirst())
@@ -1348,7 +1345,7 @@ async def sweep_unblock_blocked_tasks(
         task_filters = [
             Task.id == task_id,
             Task.status == TaskStatus.BLOCKED,
-            Task.project_id.in_(retry_enabled_project_ids),
+            Task.project_id.in_(resumable_project_ids),
         ]
         if task_id not in gate_id_set:
             task_filters.append(
@@ -1835,13 +1832,14 @@ async def _event_driven_unblock_project(
 
     # Event-driven resolution is DB-local and bounded.  Acquire the operator
     # authority row before any dependent Task row so this fast path follows the
-    # same Project -> Task order as every canonical cross-table transition.
+    # same Project -> Task order as every canonical cross-table transition.  A
+    # held autonomy flag prevents new roots, not recovery within an existing
+    # lineage; pause/archive remain the execution fences.
     project_authority = (
         await session.execute(
             select(Project)
             .where(
                 Project.id == project_id,
-                Project.autonomous_enabled.is_(True),
                 Project.paused.is_(False),
                 Project.archived.is_(False),
             )
@@ -1860,7 +1858,6 @@ async def _event_driven_unblock_project(
             Task.project_id == project_id,
             Task.project_id.in_(
                 select(Project.id).where(
-                    Project.autonomous_enabled.is_(True),
                     Project.paused.is_(False),
                     Project.archived.is_(False),
                 )

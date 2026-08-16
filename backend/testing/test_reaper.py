@@ -9806,18 +9806,12 @@ async def test_unblock_sweep_holds_unchanged_named_file_conflict(reaper_db, mock
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("control", ["autonomous_enabled", "paused"])
-async def test_unblock_sweep_respects_project_stop_and_drain_controls(
-    reaper_db, mocker, control
-):
-    """Existing project controls fence BLOCKED resurrection and attempt burn."""
+async def test_unblock_sweep_respects_project_pause_control(reaper_db, mocker):
+    """Project pause fences BLOCKED resurrection and attempt burn."""
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
-    if control == "autonomous_enabled":
-        project.autonomous_enabled = False
-    else:
-        project.paused = True
+    project.paused = True
     reaper_db.add(project)
     await reaper_db.commit()
     blocked = await _blocked_task(
@@ -16343,7 +16337,8 @@ from app.reaper_sweeps import event_driven_unblock_dependents  # noqa: E402
 async def test_landing_event_resumes_blocked_dependent_immediately(reaper_db, mocker):
     """A BLOCKED dependent whose capability need is satisfied by a just-landed
     foundation is immediately resumed to QUEUED by event_driven_unblock_dependents
-    — without waiting for the next periodic sweep."""
+    — without waiting for the next periodic sweep, even while new autonomous root
+    spawning is disabled."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
@@ -16382,6 +16377,9 @@ async def test_landing_event_resumes_blocked_dependent_immediately(reaper_db, mo
         },
         recheck_after=now + timedelta(hours=1),  # not yet due for the sweep
     )
+    project.autonomous_enabled = False
+    reaper_db.add(project)
+    await reaper_db.commit()
 
     # The periodic sweep would NOT pick this up (recheck_after is in the future).
     # The event-driven path must resume it immediately.

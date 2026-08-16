@@ -60,8 +60,7 @@ async def relock_blocked_retry_mutation_authority(session, task: Task) -> Task |
             await session.rollback()
             return None
         if (
-            not project.autonomous_enabled
-            or project.paused
+            project.paused
             or project.archived
             or locked_task.status != TaskStatus.BLOCKED
             or _blocked_retry_mutation_snapshot(locked_task) != expected
