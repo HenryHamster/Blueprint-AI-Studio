@@ -1610,11 +1610,15 @@ class TestHostLoadThrottle(unittest.TestCase):
 
     def setUp(self):
         local_runner._shutdown_event.clear()
-        local_runner._update_in_progress.clear()
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
 
     def tearDown(self):
         local_runner._shutdown_event.clear()
-        local_runner._update_in_progress.clear()
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
 
     def _make_compute_deps(self):
         active_jobs: set = set()
@@ -6055,17 +6059,64 @@ class TestCleanSourceSha(_LocalRunnerTestCase):
             self.assertIsNone(local_runner._clean_source_sha("v1.2.3-5-g4f5a6b7"))
 
 
+class TestClaimUpdateGate(unittest.TestCase):
+    """Agent and compute claim handoffs are atomic with update drain."""
+
+    def setUp(self):
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
+
+    def tearDown(self):
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
+
+    def test_agent_and_compute_handoffs_block_update_until_owned(self):
+        self.assertTrue(local_runner._begin_claim())  # agent claim POST
+        self.assertTrue(local_runner._begin_claim())  # compute claim POST
+        self.assertEqual(local_runner._begin_update_drain(), 2)
+        self.assertFalse(local_runner._begin_claim())
+
+        local_runner._end_claim()
+        local_runner._end_claim()
+        self.assertEqual(local_runner._begin_update_drain(), 0)
+
+    def test_concurrent_update_closes_gate_before_next_claim(self):
+        claim_started = threading.Event()
+        release_claim = threading.Event()
+
+        def in_flight_claim():
+            self.assertTrue(local_runner._begin_claim())
+            claim_started.set()
+            release_claim.wait(timeout=1)
+            local_runner._end_claim()
+
+        thread = threading.Thread(target=in_flight_claim)
+        thread.start()
+        self.assertTrue(claim_started.wait(timeout=1))
+        self.assertEqual(local_runner._begin_update_drain(), 1)
+        self.assertFalse(local_runner._begin_claim())
+        release_claim.set()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+
+
 class TestHeartbeatVersionHintWarning(unittest.TestCase):
     """Heartbeat response includes version_hint; runner warns when its own version
     does not match the orchestrator's hint."""
 
     def setUp(self):
         local_runner._shutdown_event.clear()
-        local_runner._update_in_progress.clear()
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
 
     def tearDown(self):
         local_runner._shutdown_event.clear()
-        local_runner._update_in_progress.clear()
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
 
     def test_version_hint_mismatch_logs_warning(self):
         """When version_hint differs and tasks are executing, a warning is printed."""
@@ -6079,7 +6130,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
                 "enrolled_max_concurrent": 2,
-                "version_hint": "v99-abcdef01",
+                "version_hint": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
             }
 
         def fake_print(*args, **kwargs):
@@ -6095,6 +6146,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version", return_value="v1-oldversion"), \
+                 patch.object(local_runner, "_checkout_source_sha", return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary", return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
@@ -6122,7 +6174,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
                 "enrolled_max_concurrent": 2,
-                "version_hint": "v1-current",
+                "version_hint": "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
             }
 
         def fake_print(*args, **kwargs):
@@ -6136,6 +6188,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version", return_value="v1-current"), \
+                 patch.object(local_runner, "_checkout_source_sha", return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary", return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
@@ -6149,7 +6202,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         self.assertFalse(warning_lines, "No version-mismatch warning expected when versions match")
 
     def test_version_hint_match_sha_based(self):
-        """SHA-based comparison: runner SHA matches orchestrator SHA prefix — no warning."""
+        """Only exact full-SHA equality is treated as current."""
         output_lines = []
 
         def fake_post(url, token, body, **kwargs):
@@ -6158,8 +6211,6 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
                 "enrolled_max_concurrent": 2,
-                # Orchestrator sends a full 40-char SHA that starts with the
-                # runner's abbreviated SHA (4f5a6b7).
                 "version_hint": "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
             }
 
@@ -6175,6 +6226,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
                               return_value="v1.2.3-5-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary", return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
@@ -6187,7 +6240,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         warning_lines = [line for line in output_lines if "WARNING" in line and "version" in line.lower()]
         self.assertFalse(
             warning_lines,
-            "No warning expected when runner SHA matches orchestrator SHA prefix",
+            "No warning expected when exact runner and orchestrator SHAs match",
         )
 
     def test_version_hint_mismatch_sha_based(self):
@@ -6221,6 +6274,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
                               return_value="v1.2.3-5-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary", return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
@@ -6264,7 +6319,11 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                  patch.object(local_runner, "_runner_version",
                               side_effect=[
                                   "v25-1-g4f5a6b7",
-                                  "v25-1-g4f5a6b7",
+                                  "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+                              ]), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              side_effect=[
+                                  "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
                                   "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
                               ]), \
                  patch.object(local_runner, "_locate_agent_binary",
@@ -6293,13 +6352,16 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             combined,
             "Expected auto-update message when runner is idle and version differs",
         )
-        update_mock.assert_called_once_with(restart_service=False)
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit="a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        )
         report_mock.assert_called_once()
         self.assertEqual(report_mock.call_args.kwargs["status"], "success")
         reexec_mock.assert_called_once()
 
-    def test_detached_newer_checkout_skips_auto_update(self):
-        """An ancestry-converged detached checkout must not invoke its updater."""
+    def test_divergent_checkout_uses_exact_update_without_ancestry_shortcut(self):
+        """A mismatched exact SHA always uses the detached exact updater."""
         output_lines = []
 
         def fake_post(url, token, body, **kwargs):
@@ -6317,7 +6379,13 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         local_runner._shutdown_event.clear()
         try:
             with patch.object(local_runner, "_post", fake_post), \
-                 patch.object(local_runner, "_runner_version", return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_runner_version",
+                              side_effect=["v25-1-g4f5a6b7", "target"]), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              side_effect=[
+                                  "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+                                  "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+                              ]), \
                  patch.object(local_runner, "_locate_agent_binary", return_value=None), \
                  patch.object(local_runner, "_write_status_json"), \
                  patch.object(local_runner, "_node_runtime_ok", return_value=False), \
@@ -6338,15 +6406,14 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         finally:
             local_runner._shutdown_event.clear()
 
-        update_mock.assert_not_called()
-        contains_mock.assert_called_once_with(
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit="a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
         )
+        contains_mock.assert_not_called()
         report_mock.assert_called_once()
         self.assertEqual(report_mock.call_args.kwargs["status"], "success")
-        reexec_mock.assert_not_called()
-        self.assertFalse(local_runner._update_in_progress.is_set())
-        self.assertIn("continuing without an update", " ".join(output_lines))
+        reexec_mock.assert_called_once()
 
     def test_non_sha_version_hint_cannot_take_ancestry_shortcut(self):
         """Git revision expressions are not trusted as commit identities."""
@@ -6356,10 +6423,13 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             return 200, {"ok": True, "version_hint": "HEAD"}
 
         local_runner._shutdown_event.clear()
+        local_runner._update_in_progress.set()
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
                               return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=None), \
                  patch.object(local_runner, "_write_status_json"), \
@@ -6386,9 +6456,9 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             local_runner._shutdown_event.clear()
 
         contains_mock.assert_not_called()
-        update_mock.assert_called_once_with(restart_service=False)
+        update_mock.assert_not_called()
         reexec_mock.assert_not_called()
-        self.assertTrue(local_runner._update_in_progress.is_set())
+        self.assertFalse(local_runner._update_in_progress.is_set())
 
     def test_moved_checkout_cannot_converge_running_process(self):
         """A newer disk HEAD cannot make already-running older code current."""
@@ -6404,58 +6474,11 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                  patch.object(local_runner, "_runner_version",
                               side_effect=["v25-1-g4f5a6b7",
                                            "v25-2-g8f9a0b1"]), \
-                 patch.object(local_runner, "_locate_agent_binary",
-                              return_value=None), \
-                 patch.object(local_runner, "_write_status_json"), \
-                 patch.object(local_runner, "_node_runtime_ok",
-                              return_value=False), \
-                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
-                 patch.object(local_runner, "_memory_free_bytes",
-                              return_value=None), \
-                 patch.object(local_runner, "_disk_free_bytes",
-                              return_value=None), \
-                 patch.object(local_runner, "_container_image_store",
-                              return_value=None), \
-                 patch.object(local_runner.br, "do_update",
-                              return_value=1) as update_mock, \
-                 patch.object(local_runner.br, "checkout_contains_commit",
-                              return_value=True) as contains_mock, \
-                 patch.object(local_runner.br, "report_update_result"), \
-                 patch.object(local_runner, "_reexec_after_update") as reexec_mock:
-                local_runner._heartbeat_loop(
-                    "https://api", "tok", {}, threading.Lock(),
-                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
-                )
-        finally:
-            local_runner._shutdown_event.clear()
-
-        contains_mock.assert_not_called()
-        update_mock.assert_called_once_with(restart_service=False)
-        reexec_mock.assert_not_called()
-        self.assertTrue(local_runner._update_in_progress.is_set())
-
-    def test_accepted_ancestor_hint_is_suppressed_until_hint_changes(self):
-        """The same older hint is suppressed; a changed hint is evaluated afresh."""
-        hints = [
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-            "b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-        ]
-        calls = 0
-
-        def fake_post(url, token, body, **kwargs):
-            nonlocal calls
-            hint = hints[calls]
-            calls += 1
-            if calls == len(hints):
-                local_runner._shutdown_event.set()
-            return 200, {"ok": True, "version_hint": hint}
-
-        local_runner._shutdown_event.clear()
-        try:
-            with patch.object(local_runner, "_post", fake_post), \
-                 patch.object(local_runner, "_runner_version",
-                              return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              side_effect=[
+                                  "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+                                  "8f9a0b1d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+                              ]), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=None), \
                  patch.object(local_runner, "_write_status_json"), \
@@ -6472,6 +6495,65 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                               return_value=0) as update_mock, \
                  patch.object(local_runner.br, "checkout_contains_commit",
                               return_value=True) as contains_mock, \
+                 patch.object(local_runner.br,
+                              "report_update_result") as report_mock, \
+                 patch.object(local_runner, "_reexec_after_update") as reexec_mock:
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        contains_mock.assert_not_called()
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit=hint,
+        )
+        self.assertEqual(report_mock.call_args.kwargs["status"], "failure")
+        reexec_mock.assert_not_called()
+        self.assertTrue(local_runner._update_in_progress.is_set())
+
+    def test_withdrawn_hint_releases_failed_update_drain(self):
+        """A stale exact hint cannot leave capacity drained after withdrawal."""
+        hints = [
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            "HEAD",
+            None,
+        ]
+        calls = 0
+        draining_reports = []
+
+        def fake_post(url, token, body, **kwargs):
+            nonlocal calls
+            draining_reports.append(body["update_draining"])
+            hint = hints[calls]
+            calls += 1
+            if calls == len(hints):
+                local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": hint}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=1) as update_mock, \
                  patch.object(local_runner.br, "report_update_result"), \
                  patch.object(local_runner, "_reexec_after_update") as reexec_mock, \
                  patch("time.sleep", return_value=None):
@@ -6483,13 +6565,167 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             local_runner._shutdown_event.clear()
 
         self.assertEqual(calls, 3)
-        update_mock.assert_not_called()
-        self.assertEqual(contains_mock.call_count, 2)
-        self.assertEqual(
-            [call.args[0] for call in contains_mock.call_args_list],
-            [hints[0], hints[2]],
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit=hints[0],
         )
+        self.assertEqual(draining_reports, [False, True, False])
         reexec_mock.assert_not_called()
+        self.assertFalse(local_runner._update_in_progress.is_set())
+
+    def test_exact_hint_updates_when_display_probe_is_unknown(self):
+        """Unknown local identity is stale, never a reason to ignore authority."""
+        hint = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": hint}
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value=None), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value=hint) as source_mock, \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=1) as update_mock, \
+                 patch.object(local_runner.br, "report_update_result"), \
+                 patch.object(local_runner, "_reexec_after_update"):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        source_mock.assert_not_called()
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit=hint,
+        )
+        self.assertTrue(local_runner._update_in_progress.is_set())
+
+    def test_dirty_checkout_at_target_sha_still_drains_and_updates(self):
+        """Matching HEAD cannot authorize uncommitted executing code."""
+        hint = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": hint}
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v25-1-ga1b2c3d-dirty"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value=hint) as source_mock, \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=1) as update_mock, \
+                 patch.object(local_runner.br, "report_update_result"), \
+                 patch.object(local_runner, "_reexec_after_update"):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        source_mock.assert_not_called()
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit=hint,
+        )
+        self.assertTrue(local_runner._update_in_progress.is_set())
+
+    def test_failed_reexec_keeps_immutable_source_stale_and_retries(self):
+        """Disk convergence cannot make old in-memory code resume claims."""
+        hint = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        post_count = 0
+        monotonic_value = 0.0
+
+        def fake_post(url, token, body, **kwargs):
+            nonlocal post_count
+            post_count += 1
+            if post_count == 2:
+                local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": hint}
+
+        def advancing_monotonic():
+            nonlocal monotonic_value
+            monotonic_value += 61.0
+            return monotonic_value
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              side_effect=["old", "target", "target"]), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              side_effect=[
+                                  "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+                                  hint,
+                                  hint,
+                              ]), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=0) as update_mock, \
+                 patch.object(local_runner.br,
+                              "report_update_result") as report_mock, \
+                 patch.object(local_runner, "_reexec_after_update",
+                              side_effect=[False, True]) as reexec_mock, \
+                 patch("time.monotonic", side_effect=advancing_monotonic), \
+                 patch("time.sleep", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(update_mock.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["target_commit"] for call in update_mock.call_args_list],
+            [hint, hint],
+        )
+        self.assertEqual(reexec_mock.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["status"] for call in report_mock.call_args_list],
+            ["success", "failure", "success"],
+        )
+        self.assertTrue(local_runner._update_in_progress.is_set())
 
     def test_failed_auto_update_stays_drained_and_reports_failure(self):
         """A failed update cannot silently resume claims on the old process."""
@@ -6508,6 +6744,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
                               return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=None), \
                  patch.object(local_runner, "_write_status_json"), \
@@ -6530,7 +6768,10 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         finally:
             local_runner._shutdown_event.clear()
 
-        update_mock.assert_called_once_with(restart_service=False)
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit="a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        )
         self.assertEqual(report_mock.call_args.kwargs["status"], "failure")
         reexec_mock.assert_not_called()
         self.assertTrue(local_runner._update_in_progress.is_set())
@@ -6545,7 +6786,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
                 "enrolled_max_concurrent": 2,
-                "version_hint": "v99-abcdef01",
+                "version_hint": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
             }
 
         def fake_print(*args, **kwargs):
@@ -6562,6 +6803,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
                               return_value="v1-oldversion"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
@@ -6626,13 +6869,12 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 self.assertIsNone(local_runner._actionable_version_hint(value))
 
     def test_real_version_hints_remain_actionable(self):
-        """SHA and legacy release hints still participate in stale detection."""
-        for value in (
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-            "v99-abcdef01",
-        ):
+        """Only an exact lowercase full SHA can authorize checkout mutation."""
+        exact = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        self.assertEqual(local_runner._actionable_version_hint(exact), exact)
+        for value in ("v99-abcdef01", "a1b2c3d", exact.upper(), "HEAD"):
             with self.subTest(value=value):
-                self.assertEqual(local_runner._actionable_version_hint(value), value)
+                self.assertIsNone(local_runner._actionable_version_hint(value))
 
 
 class TestHeartbeatJitterAndNetworkFailureEscalation(unittest.TestCase):
@@ -10080,7 +10322,19 @@ class SelfUpdateSurvivalTests(_LocalRunnerTestCase):
         ), \
              patch.object(local_runner.os, "execv") as execv, \
              patch.object(local_runner.os, "_exit") as exit_:
-            local_runner._reexec_after_update()
+            self.assertTrue(local_runner._reexec_after_update())
+        execv.assert_called_once()
+        exit_.assert_not_called()
+
+    def test_unsupervised_reexec_failure_keeps_process_alive(self):
+        with _fake_host(
+            pid1="systemd",
+            cgroup=SupervisorDetectionTests.SESSION_CGROUP,
+        ), \
+             patch.object(local_runner.os, "execv",
+                          side_effect=OSError("exec failed")) as execv, \
+             patch.object(local_runner.os, "_exit") as exit_:
+            self.assertFalse(local_runner._reexec_after_update())
         execv.assert_called_once()
         exit_.assert_not_called()
 

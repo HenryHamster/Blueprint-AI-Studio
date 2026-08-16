@@ -733,15 +733,16 @@ def _detect_process_supervisor() -> str | None:
     return state["supervisor"] if state.get("supervised") else None
 
 
-def _reexec_after_update() -> None:
-    """Replace the current process with the updated runner, or exit for restart.
+def _reexec_after_update() -> bool:
+    """Replace the process with updated code; return False if re-exec fails.
 
     Called after a successful auto-update. If a process supervisor is present,
     ``os._exit(0)`` (the supervisor restarts the fresh binary). If NONE is
     detected (manual tmux/nohup launch), ``os.execv`` re-execs in place so the
-    updated code takes over WITHOUT relying on an external restarter — the fix
-    for the silent post-update death. Any failure in the re-exec path falls back
-    to ``os._exit(0)`` so we never leave a hung, half-updated process.
+    updated code takes over WITHOUT relying on an external restarter. An
+    unsupervised exec failure keeps the old process alive so it can remain
+    drained, report failure, and retry; exiting there would silently lose the
+    runner entirely.
     """
     supervisor = None
     try:
@@ -755,6 +756,7 @@ def _reexec_after_update() -> None:
             flush=True,
         )
         os._exit(0)
+        return True  # pragma: no cover - os._exit never returns.
     # No supervisor: re-exec in place so the update is not silently lost.
     print(
         "[runner] auto-update complete — NO process supervisor detected "
@@ -765,12 +767,14 @@ def _reexec_after_update() -> None:
     )
     try:
         os.execv(sys.executable, [sys.executable] + sys.argv)
-    except Exception as exc:  # pragma: no cover - defensive fallback
+        return True  # pragma: no cover - execv only returns in tests.
+    except Exception as exc:
         print(
-            f"[runner] re-exec failed ({exc!r}) — exiting for restart instead.",
+            f"[runner] re-exec failed ({exc!r}) — keeping the old process "
+            "alive and drained for retry.",
             flush=True,
         )
-        os._exit(0)
+        return False
 
 
 # ── Credential persistence ────────────────────────────────────────────────────
@@ -1686,20 +1690,17 @@ def _clean_source_sha(version_str: str | None) -> str | None:
 
 
 def _actionable_version_hint(value: object) -> str | None:
-    """Return a deploy identity only when the server supplied a real hint.
+    """Return only an exact commit identity suitable for checkout mutation.
 
-    Local and development orchestrators can legitimately lack ``DEPLOY_SHA``
-    metadata and historically expose the sentinel ``"unknown"``. Treating that
-    sentinel as a commit makes every healthy runner drain and retry updates
-    forever, even when it is already on the newest checkout.
+    Legacy display versions, short SHAs, refs, and development sentinels remain
+    non-actionable. They cannot safely select a Git object and therefore must
+    never drain capacity or reach the updater.
     """
 
     if not isinstance(value, str):
         return None
     hint = value.strip()
-    if not hint or hint.lower() in {"unknown", "local-dev"}:
-        return None
-    return hint
+    return hint if re.fullmatch(r"[0-9a-f]{40}", hint) else None
 
 
 def _node_runtime_ok() -> bool:
@@ -3332,6 +3333,40 @@ _shutdown_event = threading.Event()
 # Separate from _shutdown_event — used during auto-update so background
 # threads (reaper, compute poller, main loop) are NOT signaled to exit.
 _update_in_progress = threading.Event()
+_claim_gate_lock = threading.Lock()
+_claims_in_flight = 0
+
+
+def _begin_claim() -> bool:
+    """Atomically enter the pre-claim handoff unless an update owns the gate."""
+    global _claims_in_flight
+    with _claim_gate_lock:
+        if _update_in_progress.is_set():
+            return False
+        _claims_in_flight += 1
+        return True
+
+
+def _end_claim() -> None:
+    """Release a pre-claim handoff after durable worker ownership is visible."""
+    global _claims_in_flight
+    with _claim_gate_lock:
+        if _claims_in_flight <= 0:
+            raise RuntimeError("runner claim gate counter underflow")
+        _claims_in_flight -= 1
+
+
+def _begin_update_drain() -> int:
+    """Atomically stop new claims and return handoffs already in flight."""
+    with _claim_gate_lock:
+        _update_in_progress.set()
+        return _claims_in_flight
+
+
+def _clear_update_drain() -> None:
+    """Release only the version-update-owned claim drain."""
+    with _claim_gate_lock:
+        _update_in_progress.clear()
 
 
 def _handle_signal(signum, frame):  # noqa: ARG001
@@ -4204,16 +4239,14 @@ def _heartbeat_loop(
     # describe shell-out) and send it on every heartbeat so the fleet view can show
     # which build each device runs. Best-effort: None when git/the repo is absent.
     version = _runner_version()
+    # Freeze a clean exact source identity for the life of this process.
+    # Unknown or dirty startup state is stale against any trusted exact hint;
+    # the raw live checkout SHA is used only as post-update disk proof below.
     checkout_sha = _clean_source_sha(version)
     consecutive_401 = 0
     consecutive_network_failures = 0
     next_auto_update_attempt_at = 0.0
     last_auto_update_failure: tuple[str, str | None] | None = None
-    # A deployment can legitimately advertise an older commit while this
-    # checkout already contains it. Remember that accepted ancestry relation so
-    # an update no-op does not re-exec the same newer checkout every heartbeat.
-    # A changed hint is evaluated afresh.
-    accepted_ancestor_version_hint: str | None = None
     # Whether ANY heartbeat has ever authenticated (200/204). A token that has
     # never authenticated and gets a 401 is definitively bad (wrong/revoked, or a
     # deleted runner) — the daemon fast-fails on that first 401 rather than
@@ -4532,56 +4565,25 @@ def _heartbeat_loop(
                     version_hint = _actionable_version_hint(
                         resp_body.get("version_hint")
                     )
-                    if version_hint and version:
-                        runner_sha = _describe_sha(version)
-                        if version_hint == accepted_ancestor_version_hint:
-                            stale = False
-                        elif runner_sha:
-                            stale = not version_hint.startswith(runner_sha)
-                        else:
-                            stale = version_hint not in version
-                        # A detached deployment checkout may already be newer
-                        # than the orchestrator's advertised commit. Prove that
-                        # relation before invoking do_update(): detached
-                        # checkouts intentionally have no upstream, so the
-                        # updater cannot be the prerequisite for this proof.
-                        ancestry_shortcut_eligible = (
-                            isinstance(version_hint, str)
-                            and re.fullmatch(r"[0-9a-f]{40}", version_hint) is not None
-                            # Bind the disk ancestry proof to the commit whose
-                            # code this process actually loaded. An operator or
-                            # deployment may move HEAD before restarting us.
-                            and _runner_version() == version
-                        )
-                        if (
-                            stale
-                            and ancestry_shortcut_eligible
-                            and br.checkout_contains_commit(version_hint)
-                        ):
-                            br.report_update_result(
-                                orchestrator_url,
-                                token,
-                                status="success",
-                                old_version=version,
-                                new_version=version,
-                            )
-                            accepted_ancestor_version_hint = version_hint
-                            last_auto_update_failure = None
-                            next_auto_update_attempt_at = 0.0
-                            _update_in_progress.clear()
-                            stale = False
-                            print(
-                                "[runner] checkout is newer than the "
-                                "orchestrator version hint and already "
-                                "contains it — continuing without an update.",
-                                flush=True,
-                            )
+                    if version_hint is None:
+                        # Version drain state is owned by the current
+                        # server-authoritative exact hint. If that authority is
+                        # withdrawn or becomes non-actionable, do not leave the
+                        # runner permanently drained by an older response.
+                        last_auto_update_failure = None
+                        next_auto_update_attempt_at = 0.0
+                        _clear_update_drain()
+                    else:
+                        # Bind staleness to the commit this process loaded at
+                        # startup, not a checkout another process may move on
+                        # disk before this daemon has re-execed.
+                        stale = checkout_sha != version_hint
                         if stale:
                             # Enter drain mode immediately. Both agent and
                             # compute pollers stop NEW claims while existing
                             # work finishes, guaranteeing a long-lived resident
                             # cannot starve a runner rollout forever.
-                            _update_in_progress.set()
+                            claims_in_flight = _begin_update_drain()
                             # Check if runner is completely idle before attempting
                             # auto-update (no active tasks and no compute jobs).
                             with lock:
@@ -4595,6 +4597,7 @@ def _heartbeat_loop(
                             if (
                                 not has_tasks
                                 and not has_compute
+                                and claims_in_flight == 0
                                 and time.monotonic() >= next_auto_update_attempt_at
                             ):
                                 print(
@@ -4604,20 +4607,15 @@ def _heartbeat_loop(
                                     flush=True,
                                 )
                                 try:
-                                    result = br.do_update(restart_service=False)
+                                    result = br.do_update(
+                                        restart_service=False,
+                                        target_commit=version_hint,
+                                    )
                                 except Exception:
                                     raise
                                 if result == 0:
                                     refreshed_version = _runner_version()
-                                    refreshed_sha = _describe_sha(refreshed_version)
-                                    refreshed_matches_exactly = (
-                                        bool(refreshed_sha)
-                                        and version_hint.startswith(refreshed_sha)
-                                    ) or (
-                                        bool(refreshed_version)
-                                        and version_hint in refreshed_version
-                                    )
-                                    if refreshed_matches_exactly:
+                                    if _checkout_source_sha() == version_hint:
                                         br.report_update_result(
                                             orchestrator_url,
                                             token,
@@ -4629,28 +4627,28 @@ def _heartbeat_loop(
                                         # replace this process after convergence
                                         # instead of trusting an unverified
                                         # external service restart.
-                                        _reexec_after_update()
-                                    elif br.checkout_contains_commit(version_hint):
-                                        br.report_update_result(
-                                            orchestrator_url,
-                                            token,
-                                            status="success",
-                                            old_version=version,
-                                            new_version=refreshed_version,
-                                        )
-                                        accepted_ancestor_version_hint = version_hint
-                                        version = refreshed_version or version
-                                        last_auto_update_failure = None
-                                        next_auto_update_attempt_at = 0.0
-                                        _update_in_progress.clear()
-                                        print(
-                                            "[runner] checkout is newer than the "
-                                            "orchestrator version hint and already "
-                                            "contains it — continuing without "
-                                            "re-exec; this hint will not trigger "
-                                            "another update.",
-                                            flush=True,
-                                        )
+                                        if not _reexec_after_update():
+                                            failure = (
+                                                version_hint,
+                                                refreshed_version,
+                                            )
+                                            br.report_update_result(
+                                                orchestrator_url,
+                                                token,
+                                                status="failure",
+                                                old_version=version,
+                                                new_version=refreshed_version,
+                                            )
+                                            last_auto_update_failure = failure
+                                            next_auto_update_attempt_at = (
+                                                time.monotonic() + 60.0
+                                            )
+                                            print(
+                                                "[runner] exact update reached disk "
+                                                "but re-exec failed — remaining "
+                                                "drained and retrying in 60 seconds.",
+                                                flush=True,
+                                            )
                                     else:
                                         failure = (version_hint, refreshed_version)
                                         if last_auto_update_failure != failure:
@@ -4692,20 +4690,19 @@ def _heartbeat_loop(
                                         "and retrying in 60 seconds.",
                                         flush=True,
                                     )
-                            elif has_tasks or has_compute:
+                            elif has_tasks or has_compute or claims_in_flight:
                                 print(
                                     f"[runner] WARNING: runner version {version!r} "
                                     f"does not match orchestrator version hint "
                                     f"{version_hint!r} — draining new claims; "
-                                    "auto-update will start when current work finishes.",
+                                    "auto-update will start when current work and "
+                                    "claim handoffs finish.",
                                     flush=True,
                                 )
                         else:
-                            if version_hint != accepted_ancestor_version_hint:
-                                accepted_ancestor_version_hint = None
                             last_auto_update_failure = None
                             next_auto_update_attempt_at = 0.0
-                            _update_in_progress.clear()
+                            _clear_update_drain()
                 _write_status_json(
                     runner_id=hostname,
                     last_heartbeat_status="ok",
@@ -7301,6 +7298,7 @@ def _compute_poll_loop(
         reservation_key: str | None = None
         durable_reservation_key: str | None = None
         claimed_job_id: str | None = None
+        claim_gate_entered = False
         try:
             if _update_in_progress.is_set():
                 time.sleep(poll_interval)
@@ -7425,6 +7423,16 @@ def _compute_poll_loop(
                     )
                     time.sleep(poll_interval)
                     continue
+
+            if not _begin_claim():
+                if resource_ledger is not None:
+                    resource_ledger.release(reservation_key)
+                reservation_key = None
+                _release_capacity(capacity)
+                capacity_acquired = False
+                time.sleep(poll_interval)
+                continue
+            claim_gate_entered = True
 
             try:
                 resp = _post(url, token, {}, return_headers=True)
@@ -7568,6 +7576,9 @@ def _compute_poll_loop(
                 _release_capacity(capacity)
             print(f"[compute] poll loop error (continuing): {exc}", flush=True)
             time.sleep(5)
+        finally:
+            if claim_gate_entered:
+                _end_claim()
 
 
 # ── Preflight + main ──────────────────────────────────────────────────────────
@@ -9149,6 +9160,7 @@ def main() -> None:
     while not _shutdown_event.is_set():
         reservation_key: str | None = None
         task_reservation_key: str | None = None
+        claim_gate_entered = False
         try:
             _supervise_threads(background_threads)
 
@@ -9235,6 +9247,14 @@ def main() -> None:
                 )
                 time.sleep(poll_interval)
                 continue
+
+            if not _begin_claim():
+                resource_ledger.release(reservation_key)
+                reservation_key = None
+                _release_capacity(agent_capacity)
+                time.sleep(poll_interval)
+                continue
+            claim_gate_entered = True
 
             try:
                 resp = _post(next_task_url, token, {}, return_headers=True)
@@ -9457,6 +9477,9 @@ def main() -> None:
                 resource_ledger.release(task_reservation_key)
             print(f"[runner] agent poll loop error (continuing): {exc}", flush=True)
             time.sleep(5)
+        finally:
+            if claim_gate_entered:
+                _end_claim()
 
     # Drain active compute jobs first — daemon threads would be killed on
     # process exit, so give them a chance to report their final status.
