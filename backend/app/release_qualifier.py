@@ -36,6 +36,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, release_version
+from app import release_qualification_deferral as qualification_deferral
+from app import release_task_admission
 from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import (
     ADMIN_CANCEL,
@@ -90,6 +92,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.task_locking import AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE
 from app.release_policy_projection import (
     promotion_policy_projection,
     qualification_attempt_policy_projection,  # noqa: F401 — re-exported for callers/tests
@@ -157,7 +160,6 @@ from app.release_qualifier_audit import (
     snapshot_stranded_approved_prs,
     required_children_terminal as _required_children_terminal,
 )
-from app.release_task_admission import finalize_admitted, start_block
 from app.ci_resolution import (
     _CI_GREEN,
     _CI_NO_CHECKS,
@@ -2727,7 +2729,9 @@ async def run_qualification(
 
     # 4. Project -> ReleaseVersion serialization prevents duplicate children;
     #    populate_existing also defeats a caller's stale cached version row.
-    admission_block = await start_block(session, project_id, version.version_number)
+    admission_block = await release_task_admission.start_block(
+        session, project_id, version.version_number
+    )
     if admission_block is not None:
         return admission_block
     locked_version = (
@@ -9804,6 +9808,15 @@ async def _finalize_in_dedicated_session(
                 timeout_now,
                 expected_attempt_id=expected_attempt_id,
             )
+        except release_task_admission.ReleaseTaskAdmissionClosed as exc:
+            await session.rollback()
+            result = await qualification_deferral.persist_finalization_deferred(
+                session,
+                version_id,
+                exc.project_id,
+                exc.reason,
+                expected_attempt_id=expected_attempt_id,
+            )
         except Exception:
             # Roll back this dedicated session's partial work before unwinding.
             # In production each dedicated session is independent and the
@@ -10271,10 +10284,19 @@ def _qualification_timeout_age_seconds(
     if deploy_state is not None:
         from app import pause_clock  # noqa: PLC0415 — local import avoids load cycle
 
-        return pause_clock.active_elapsed_seconds(
+        elapsed = pause_clock.active_elapsed_seconds(
             deploy_state, timeout_clock, qual.get("pause_baseline")
         )
-    return (timeout_now - timeout_clock).total_seconds()
+    else:
+        elapsed = (timeout_now - timeout_clock).total_seconds()
+    return max(
+        0.0,
+        elapsed
+        - qualification_deferral.deferred_timeout_seconds(
+            qual, now=timeout_now, deploy_state=deploy_state
+        ),
+    )
+
 
 async def _finalize_locked_version(
     session: AsyncSession,
@@ -10290,21 +10312,11 @@ async def _finalize_locked_version(
     reads as a flat sequence.  Commits the dedicated session on every path that
     actually wrote something; returns ``None`` for the read-only no-op paths.
 
-    Lock-window fix (SITE B): the three GitHub-bound finalize gates
-    (_resolve_ci_at_finalize, _resolve_migration_identity_at_finalize,
-    _resolve_migration_apply_at_finalize) issue GitHub API calls that can take
-    10-120 s under rate-limit/retry.  Running them UNDER the ReleaseVersion
-    FOR UPDATE lock caused 22 s+ ShareLock waits on every concurrent qualifier
-    finalize / reconcile call.  Fix: non-locking peek to read the immutable
-    candidate_sha, run the three gates pre-lock, THEN acquire FOR UPDATE for
-    the decision write only — mirroring the _relock_version_for_promotion_write
-    pattern already used on the promote sub-path.
+    GitHub-bound gates run from a non-locking candidate peek; only the decision
+    write holds ``ReleaseVersion FOR UPDATE``.  This avoids long ShareLock waits
+    while their rate-limit/retry I/O is in flight.
     """
-    # ── Pre-lock peek: read stable fields for the GitHub-bound gate calls ──
-    # A non-locking read suffices here: candidate_sha is immutable once set and
-    # the status/qual-status checks below are re-verified authoritatively under
-    # the FOR UPDATE lock that follows.  This peek exists ONLY to obtain the
-    # candidate_sha so the three gates can run before the lock is held.
+    # Peek the immutable candidate; all guards are re-verified under lock.
     peek: release_version.ReleaseVersion | None = (
         (
             await session.execute(
@@ -10316,9 +10328,7 @@ async def _finalize_locked_version(
         .scalars()
         .first()
     )
-    # Fast-path skip for the two cheapest no-ops (status / qual-status).
-    # These are re-checked under the lock below — this only avoids the
-    # expensive gate calls when clearly not warranted.
+    # Cheap no-op fast path before the external gates.
     if peek is None or peek.status != "open":
         return None
     peek_qual = peek.last_qualification or {}
@@ -10361,22 +10371,18 @@ async def _finalize_locked_version(
         pre_timeout_age_seconds is not None
         and pre_timeout_age_seconds > _MAX_QUALIFICATION_DURATION_SECONDS
     )
+    early_admission = await release_task_admission.peek_release_task_admission(
+        session, peek_project_id
+    )
 
-    # ── Run the three GitHub-bound gates BEFORE acquiring the FOR UPDATE ──
-    # Guard: only run when all required children are already terminal according
-    # to the non-locking peek.
-    # Without this guard the gates ran speculatively on every qualifier child
-    # completion (Nx amplification) and on every reaper sweep iteration for
-    # versions whose children were still running — a DB/GitHub load regression.
-    #
-    # When _pre_gates is None (children not yet terminal, timeout already
-    # expired, or a readiness race),
-    # _finalize_qualification will either be skipped entirely (Path 2 returns
-    # early) or run with _pre_gates=None and call the gates itself under the
-    # lock — acceptable because that path is rare (race between sibling
-    # completion and this check) and the reaper sweep is infrequent.
+    # Run external gates only for an admitted, terminal-child unlocked peek.
+    # A rare readiness race resolves the gates later under the decision lock.
     _pre_gates: dict[str, Any] | None = None
-    if not pre_timeout_expired and await _required_children_terminal(session, peek):
+    if (
+        early_admission == release_task_admission.AUTOMATIC_TASK_CREATION_ALLOWED
+        and not pre_timeout_expired
+        and await _required_children_terminal(session, peek)
+    ):
         # All three are pinned to the immutable candidate_sha and are read-only
         # against GitHub; their results are valid for the entire finalize attempt.
         pre_ci_green, pre_ci_resolution = await _resolve_ci_at_finalize(
@@ -10411,21 +10417,17 @@ async def _finalize_locked_version(
             _pre_gates["ci_required"] = _ci_required_for_finalize(
                 _pre_proj_for_ci_gate, pre_ci_resolution
             )
-        # The pre-lock phase is read-only and intentionally best-effort. Some
-        # helpers fail closed by swallowing exceptions, but a swallowed DBAPI
-        # error still leaves the SQLAlchemy transaction aborted; without this
-        # rollback the later FOR UPDATE/commit surfaces as PendingRollbackError
-        # and the sweep misclassifies the qualification as a finalizer crash.
+        # Clear any failed-closed DBAPI transaction before taking row locks.
         await session.rollback()
 
-    # Fence Project before Version; closed spawners still permit reconciliation.
-    if not await finalize_admitted(session, peek_project_id):
+    # Project contention fails closed for a later sweep, never crash budget.
+    admission_decision = await release_task_admission.finalize_admission_decision(
+        session, peek_project_id, skip_locked=True
+    )
+    if admission_decision == AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE:
         return None
 
-    # Expire the peek instance so the FOR UPDATE select below forces a fresh
-    # read from the DB (mirrors _relock_version_for_promotion_write pattern —
-    # populate_existing=True alone is not reliable on async sessions per
-    # concern C1 in release_promotion.py).
+    # Force a fresh authoritative read under the Version lock.
     session.expire(peek)
 
     # ── Acquire the FOR UPDATE lock — decision write only ──
@@ -10465,17 +10467,34 @@ async def _finalize_locked_version(
 
     qual = version.last_qualification or {}
     if qual.get("status") != "pending":
-        # Not yet started, or already finalized (possibly by the call that held
-        # this lock just before us) — idempotent no-op.  For the non-promote
-        # outcomes (dry_run / not_promoted) this guard fully serializes
-        # concurrent finalize calls: the loser blocked on the row lock and sees
-        # the winner's non-pending status here.  It does NOT cover an
-        # overlapping promote — promote() commits with the status still
-        # "pending", so a concurrent caller can pass this guard mid-promotion;
-        # the promote path is instead serialized by the idempotency checks +
-        # the status!="open" re-check in _record_promotion_{success,failure}
-        # (see this module's _finalize_locked_version docstring).
+        # Idempotent no-op after a lock-serialized non-promote finalization.
+        # Overlapping promotion is fenced by its receipt/status re-checks.
         return None
+
+    locked_attempt_uuid = _coerce_qualification_attempt_id(
+        qual.get("qualification_attempt_id")
+    ) or _coerce_qualification_attempt_id(version.active_qualification_attempt_id)
+    if not qualification_deferral.finalization_snapshot_is_current(
+        expected_attempt_uuid, active_attempt_uuid, peek_candidate_sha,
+        locked_attempt_uuid, qual.get("candidate_sha"), _pre_gates is not None
+    ):
+        return None
+
+    _deploy_state_locked = await session.get(
+        DeploymentState, 1, populate_existing=True
+    )
+    deferred, resumed_from_admission_deferral, children_terminal_after_deferral = (
+        await qualification_deferral.prepare_finalization_admission(
+            session,
+            version,
+            admission_decision,
+            _required_children_terminal,
+            _deploy_state_locked,
+        )
+    )
+    if deferred is not None:
+        return deferred
+    qual = version.last_qualification or {}
 
     # --- Path 1: age-bound qualification timeout (reaper sweep only) --------
     # Checked first and child-state-independent (audit H2).
@@ -10488,10 +10507,6 @@ async def _finalize_locked_version(
         # lifecycle alert) handles the case where the PR is genuinely stuck.
         if qual.get("promotion_pending"):
             return None
-        # Re-read the deploy state under the lock: the pre-lock read may have
-        # been expired by the intervening best-effort rollback, and touching an
-        # expired attribute on an async session raises MissingGreenlet.
-        _deploy_state_locked = await session.get(DeploymentState, 1)
         age_seconds = _qualification_timeout_age_seconds(
             version,
             qual,
@@ -10513,7 +10528,13 @@ async def _finalize_locked_version(
             }
 
     # --- Path 2: all required children terminal -----------------------------
-    if not await _required_children_terminal(session, version):
+    if children_terminal_after_deferral is None:
+        children_terminal_after_deferral = await _required_children_terminal(
+            session, version
+        )
+    if not children_terminal_after_deferral:
+        if resumed_from_admission_deferral:
+            await session.commit()
         return None
 
     # Finalize on the dedicated session.  _finalize_qualification may call

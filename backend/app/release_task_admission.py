@@ -8,19 +8,41 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models import Project
 from app.task_locking import (
     AUTOMATIC_TASK_CREATION_ALLOWED,
-    AUTOMATIC_TASK_CREATION_PROJECT_ARCHIVED,
     AUTOMATIC_TASK_CREATION_PROJECT_PAUSED,
-    AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE,
+    automatic_task_creation_decision,
     project_lock,
 )
 
 logger = logging.getLogger(__name__)
 
 
+class ReleaseTaskAdmissionClosed(RuntimeError):
+    """Typed control-flow signal for a denied qualifier child spawn.
+
+    Callers that own a durable parent state can distinguish an expected
+    pause/archive/contention denial from an actual finalizer crash without
+    parsing an exception string.  It remains a ``RuntimeError`` subclass for
+    compatibility with direct spawner callers that historically treated a
+    closed admission fence as a runtime failure.
+    """
+
+    def __init__(self, project_id: uuid.UUID, reason: str) -> None:
+        self.project_id = project_id
+        self.reason = reason
+        super().__init__(
+            "automatic qualifier task admission is closed "
+            f"for project {project_id} ({reason})"
+        )
+
+
 async def _acquire_release_task_creation_authority(
-    session: AsyncSession, project_id: uuid.UUID
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    skip_locked: bool = True,
 ) -> str:
     """Lock and retain a fully loaded Project for qualifier continuations.
 
@@ -31,14 +53,8 @@ async def _acquire_release_task_creation_authority(
     the Project -> child lock order.
     """
 
-    async with project_lock(session, project_id, skip_locked=True) as project:
-        if project is None:
-            return AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE
-        if project.archived:
-            return AUTOMATIC_TASK_CREATION_PROJECT_ARCHIVED
-        if project.paused:
-            return AUTOMATIC_TASK_CREATION_PROJECT_PAUSED
-        return AUTOMATIC_TASK_CREATION_ALLOWED
+    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+        return automatic_task_creation_decision(project)
 
 
 async def require_release_task_admission(
@@ -48,10 +64,16 @@ async def require_release_task_admission(
 
     decision = await _acquire_release_task_creation_authority(session, project_id)
     if decision != AUTOMATIC_TASK_CREATION_ALLOWED:
-        raise RuntimeError(
-            "automatic qualifier task admission is closed "
-            f"for project {project_id} ({decision})"
-        )
+        raise ReleaseTaskAdmissionClosed(project_id, decision)
+
+
+async def peek_release_task_admission(
+    session: AsyncSession, project_id: uuid.UUID
+) -> str:
+    """Read admission without a lock to skip external finalize gates when closed."""
+
+    project = await session.get(Project, project_id, populate_existing=True)
+    return automatic_task_creation_decision(project)
 
 
 async def start_block(
@@ -71,23 +93,28 @@ async def start_block(
     )
     return {
         "status": "project_paused"
-        if decision == "project_paused"
+        if decision == AUTOMATIC_TASK_CREATION_PROJECT_PAUSED
         else "task_admission_deferred",
         "admission_reason": decision,
     }
 
 
-async def finalize_admitted(
-    session: AsyncSession, project_id: uuid.UUID
-) -> bool:
-    """Fence Project before Version while allowing terminal reconciliation.
+async def finalize_admission_decision(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    skip_locked: bool = True,
+) -> str:
+    """Fence Project before Version and return the qualifier admission decision.
 
-    Finalization reads the complete Project policy after taking this fence.  A
-    projected ``load_only`` lock would leave that same identity-mapped Project
-    underloaded; a later synchronous policy attribute access can then attempt
-    async lazy I/O and raise ``MissingGreenlet``.  Load the full row here while
-    preserving the canonical Project -> ReleaseVersion lock order.
+    Finalization may need to create any of several continuation children after
+    it inspects terminal evidence.  It therefore uses the exact same
+    pause/archive/unavailable authority as the spawners themselves.  The full
+    row remains loaded so later synchronous policy reads cannot attempt async
+    lazy I/O, and the transaction-scoped Project lock preserves the canonical
+    Project -> ReleaseVersion order through the decision write.
     """
 
-    async with project_lock(session, project_id, skip_locked=True) as project:
-        return project is not None
+    return await _acquire_release_task_creation_authority(
+        session, project_id, skip_locked=skip_locked
+    )

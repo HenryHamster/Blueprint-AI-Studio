@@ -18,6 +18,81 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+async def lock_project_for_onboarding_proof(
+    project: Any,
+    session: Any,
+) -> Any | None:
+    """Fresh-read ``Project`` authority before a build-config proof stamp.
+
+    Onboarding milestones are written from automatic completion/landing paths,
+    several of which spend seconds in GitHub I/O before reaching the stamp.  A
+    whole-JSONB write from the Project snapshot loaded before that I/O can
+    silently overwrite an operator edit made in the meantime -- including the
+    automatic Strategic lane switch.  Re-enter the canonical Project row
+    boundary immediately before stamping and retain its transaction lock until
+    the caller commits.
+
+    The helper is deliberately non-blocking.  Some landing callers already own
+    a Task row; waiting for Project there would invert the canonical
+    Project-before-Task order.  Contention therefore skips this best-effort
+    observability stamp, while the next qualifying event can retry it.  Plain
+    object/session doubles keep the historical unit-test seam.
+    """
+
+    if project is None or session is None:
+        return None
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    if not isinstance(session, AsyncSession):
+        return project
+
+    from app.models import Project
+    from sqlalchemy import inspect as sa_inspect
+    from sqlmodel import select
+
+    project_id = getattr(project, "id", None)
+    if project_id is None:
+        return None
+    if sa_inspect(project).attrs.build_config.history.has_changes():
+        # populate_existing would otherwise discard an intentional pending
+        # build_config mutation. No current caller reaches this branch; keep it
+        # fail-closed for future call sites and require their own authoritative
+        # key-wise merge before they opt into this best-effort stamp.
+        logger.warning(
+            "[ONBOARDING_PROOF] Deferred proof stamp for project %s -- "
+            "caller already has a dirty build_config",
+            project_id,
+        )
+        return None
+    # The landing transaction can have a dirty Task or an unrelated dirty
+    # Project scalar. Never let SQLAlchemy autoflush either one *before* the
+    # Project lock: that would turn this non-blocking Project-after-Task seam
+    # into an implicit blocking UPDATE. Also do not select the Project ORM
+    # entity with populate_existing here: SQLAlchemy can discard unrelated
+    # dirty Project fields even when load_only projects id/build_config. A
+    # column-only read takes the same canonical FOR NO KEY UPDATE row authority
+    # without refreshing any ORM state; we then replace only the clean, stale
+    # build_config attribute with the locked current snapshot.
+    with session.no_autoflush:
+        locked_row = (
+            await session.execute(
+                select(Project.id, Project.build_config)
+                .where(Project.id == project_id)
+                .with_for_update(skip_locked=True, key_share=True)
+            )
+        ).first()
+    if locked_row is None:
+        logger.info(
+            "[ONBOARDING_PROOF] Deferred proof stamp for project %s -- "
+            "Project row is missing or contended",
+            project_id,
+        )
+        return None
+    project.build_config = dict(locked_row[1] or {})
+    return project
+
+
 def _stamp_build_config_key_once(
     project: Any,
     session: Any,

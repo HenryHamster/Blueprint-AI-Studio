@@ -1915,6 +1915,29 @@ async def test_self_orig_merge_sets_pr_merged_without_lock_conflict(db_session, 
     merge (prod 2026-06-01..06-07, 144 drops).
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.landed_signal import (
+        corroborate_and_apply_merged_landed_signal as _real_landing,
+    )
+
+    landing_session_owns_orig: list[bool] = []
+
+    async def _guard_landing_session(orig, orig_project, landing_session, **kwargs):
+        """Fail fast instead of waiting on a cross-session Project row lock."""
+        from sqlalchemy import inspect as sa_inspect
+
+        owns_orig = (
+            sa_inspect(orig).session is landing_session.sync_session
+            and sa_inspect(orig_project).session is landing_session.sync_session
+        )
+        landing_session_owns_orig.append(owns_orig)
+        if not owns_orig:
+            return False
+        return await _real_landing(orig, orig_project, landing_session, **kwargs)
+
+    mocker.patch(
+        "app.landed_signal.corroborate_and_apply_merged_landed_signal",
+        new=_guard_landing_session,
+    )
 
     mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
@@ -1945,6 +1968,10 @@ async def test_self_orig_merge_sets_pr_merged_without_lock_conflict(db_session, 
     )
 
     assert result is True
+    assert landing_session_owns_orig == [True], (
+        "landing corroboration must use the dedicated session that owns the "
+        "original task and project"
+    )
 
     # Both the terminal status AND the orig-side flag must be durable. Read
     # back from the DB: the orig write runs in its own AsyncSessionLocal

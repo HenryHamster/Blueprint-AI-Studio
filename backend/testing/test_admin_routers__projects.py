@@ -1152,18 +1152,24 @@ class TestUpdateProjectOwnerOnlyFields:
         assert resp.json()["name"] == "Renamed by member"
 
     @pytest.mark.asyncio
-    async def test_owner_can_update_build_config_env_vars(
+    async def test_owner_can_update_operator_build_config(
         self, client: AsyncClient, db_session
     ):
-        """Project owner can update build_config including env_vars."""
+        """Project owner can update build_config operator controls."""
         project = await _make_project(db_session)
         resp = await client.patch(
             f"/api/admin/projects/{project.id}",
-            json={"build_config": {"env_vars": {"TOKEN": "secret"}}},
+            json={
+                "build_config": {
+                    "env_vars": {"TOKEN": "secret"},
+                    "automatic_strategic_cycles_enabled": False,
+                }
+            },
         )
         assert resp.status_code == 200
         bc = resp.json().get("build_config") or {}
         assert bc.get("env_vars", {}).get("TOKEN") == "secret"
+        assert bc.get("automatic_strategic_cycles_enabled") is False
 
     @pytest.mark.asyncio
     async def test_detect_build_config_requires_owner_for_env_vars_persistence(
@@ -1226,6 +1232,7 @@ class TestUpdateProjectOwnerOnlyFields:
             "env_vars": {"TOKEN": "secret"},
             "enable_parallel_review": True,
             "enable_parallel_fix": False,
+            "automatic_strategic_cycles_enabled": False,
             "task_branch_namespace": "agents",
             "task_branch_prefix": "bot/",
             "pr_title_prefix": "[bot] ",
@@ -1256,6 +1263,7 @@ class TestUpdateProjectOwnerOnlyFields:
         assert build_config.get("env_vars", {}).get("TOKEN") == "secret"
         assert build_config.get("enable_parallel_review") is True
         assert build_config.get("enable_parallel_fix") is False
+        assert build_config.get("automatic_strategic_cycles_enabled") is False
         assert build_config.get("task_branch_namespace") == "agents"
         assert build_config.get("task_branch_prefix") == "bot/"
         assert build_config.get("pr_title_prefix") == "[bot] "
@@ -1392,6 +1400,7 @@ class TestApplyOperatorBuildConfigOverrides:
             "env_vars": {"TOKEN": "secret"},
             "enable_parallel_review": True,
             "enable_parallel_fix": False,
+            "automatic_strategic_cycles_enabled": False,
             "task_branch_namespace": "agents",
             "task_branch_prefix": "bot/",
             "pr_title_prefix": "[bot] ",
@@ -1412,6 +1421,7 @@ class TestApplyOperatorBuildConfigOverrides:
         assert merged["env_vars"] == {"TOKEN": "secret"}
         assert merged["enable_parallel_review"] is True
         assert merged["enable_parallel_fix"] is False
+        assert merged["automatic_strategic_cycles_enabled"] is False
         assert merged["task_branch_namespace"] == "agents"
         assert merged["task_branch_prefix"] == "bot/"
         assert merged["pr_title_prefix"] == "[bot] "
@@ -1543,6 +1553,17 @@ class TestApplyOperatorBuildConfigOverrides:
         )
         # Default is None (legacy stored configs validate unchanged).
         assert BuildConfigSchema().has_ci is None
+
+    def test_automatic_strategic_cycles_flag_round_trips_with_default_enabled(self):
+        """The operator-owned lane switch is strict bool, default-on, and an
+        explicit False survives BuildConfig serialization."""
+        from app.schemas import BuildConfig as BuildConfigSchema
+
+        assert BuildConfigSchema().automatic_strategic_cycles_enabled is True
+        dumped = BuildConfigSchema(
+            automatic_strategic_cycles_enabled=False
+        ).model_dump(exclude_none=True)
+        assert dumped["automatic_strategic_cycles_enabled"] is False
 
     def test_falsey_git_identity_not_preserved(self):
         """git_user_* use a truthy check, so empty values do not override."""

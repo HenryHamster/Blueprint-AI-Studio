@@ -23,7 +23,7 @@ from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from app import release_version
+from app import release_qualification_deferral, release_version
 from app.database import AsyncSessionLocal
 from app.models import (
     Alert,
@@ -1577,7 +1577,11 @@ async def sweep_stuck_qualifications(
                     version_id,
                 )
             continue
-        if result is not None:
+        if (
+            result is not None
+            and result.get("status")
+            != release_qualification_deferral.QUALIFICATION_FINALIZATION_DEFERRED
+        ):
             finalized += 1
 
     if finalized:

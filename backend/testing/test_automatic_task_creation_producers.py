@@ -18,13 +18,16 @@ from app.task_locking import AUTOMATIC_TASK_CREATION_PROJECT_PAUSED
 
 
 @pytest.mark.asyncio
-async def test_automatic_design_doc_spawn_stops_at_paused_authority(mocker):
+async def test_automatic_design_doc_spawn_stops_at_cached_lane_disable(mocker):
     authority = mocker.patch(
-        "app.task_locking.acquire_automatic_task_creation_authority",
+        "app.strategic_cycle_admission.acquire_automatic_strategic_cycle_creation_authority",
         new=AsyncMock(return_value=AUTOMATIC_TASK_CREATION_PROJECT_PAUSED),
     )
     session = SimpleNamespace(rollback=AsyncMock())
-    project = SimpleNamespace(id=uuid.uuid4())
+    project = SimpleNamespace(
+        id=uuid.uuid4(),
+        build_config={"automatic_strategic_cycles_enabled": False},
+    )
 
     spawned = await _spawn_design_doc_update(
         project,
@@ -34,14 +37,14 @@ async def test_automatic_design_doc_spawn_stops_at_paused_authority(mocker):
     )
 
     assert spawned is False
-    authority.assert_awaited_once_with(session, project.id, skip_locked=True)
-    session.rollback.assert_awaited_once()
+    authority.assert_not_awaited()
+    session.rollback.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_manual_design_doc_path_does_not_use_automatic_authority(mocker):
     authority = mocker.patch(
-        "app.task_locking.acquire_automatic_task_creation_authority",
+        "app.strategic_cycle_admission.acquire_automatic_strategic_cycle_creation_authority",
         new=AsyncMock(side_effect=AssertionError("manual path used automatic authority")),
     )
     mocker.patch(
@@ -81,7 +84,7 @@ def _strategic_finalize_kwargs(project_id):
 @pytest.mark.asyncio
 async def test_automatic_strategic_finalize_rechecks_pause_after_payload_build(mocker):
     authority = mocker.patch(
-        "app.task_locking.acquire_automatic_task_creation_authority",
+        "app.strategic_cycle_admission.acquire_automatic_strategic_cycle_creation_authority",
         new=AsyncMock(return_value=AUTOMATIC_TASK_CREATION_PROJECT_PAUSED),
     )
     session = SimpleNamespace(rollback=AsyncMock())
@@ -101,7 +104,7 @@ async def test_automatic_strategic_finalize_rechecks_pause_after_payload_build(m
 @pytest.mark.asyncio
 async def test_manual_strategic_finalize_preserves_explicit_path(mocker):
     authority = mocker.patch(
-        "app.task_locking.acquire_automatic_task_creation_authority",
+        "app.strategic_cycle_admission.acquire_automatic_strategic_cycle_creation_authority",
         new=AsyncMock(side_effect=AssertionError("manual path used automatic authority")),
     )
     mocker.patch(
@@ -137,6 +140,10 @@ async def test_repo_bootstrap_fences_automatic_but_not_operator_retry(mocker):
         integration_branch="automain",
         build_config={"repo_is_empty": False},
     )
+    operator_lock = mocker.patch(
+        "app.task_locking.lock_project_or_429",
+        new=AsyncMock(return_value=project),
+    )
     empty_result = MagicMock()
     empty_result.first.return_value = None
     session = SimpleNamespace(
@@ -161,6 +168,7 @@ async def test_repo_bootstrap_fences_automatic_but_not_operator_retry(mocker):
     assert explicit.outcome == "spawned"
     assert session.add.call_count == 3  # Project state + Task + TaskHistory
     authority.assert_awaited_once()
+    operator_lock.assert_awaited_once_with(session, project.id)
 
 
 @pytest.mark.asyncio

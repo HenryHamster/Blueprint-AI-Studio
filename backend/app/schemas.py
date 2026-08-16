@@ -1270,6 +1270,12 @@ class BuildConfig(BaseModel):
     detected_at: str | None = None
     enable_parallel_review: bool = False
     enable_parallel_fix: bool = False
+    # Project-owned admission switch for Strategic work originated by the
+    # autonomous research loop.  Tactical direction research remains governed
+    # by ``Project.autonomous_enabled`` and is intentionally unaffected when
+    # this is False.  Explicit/manual Strategic surfaces also bypass this flag.
+    # Default True preserves every existing project's historical behavior.
+    automatic_strategic_cycles_enabled: bool = True
     # Per-project branch and PR metadata — must be preserved through
     # detect/save/patch round-trips so project-specific branch naming and
     # PR title prefixes survive schema validation.

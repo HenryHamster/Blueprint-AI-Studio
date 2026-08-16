@@ -829,7 +829,7 @@ async def _attempt_merge_with_retry_and_escalation(
                             _orig_landed_on_integration = await corroborate_and_apply_merged_landed_signal(
                                 orig,
                                 orig_project,
-                                session,
+                                _orig_session,
                                 base_branch=ci_base,
                                 hotfix_lane=bool(
                                     (orig.first_payload or {}).get("hotfix")
@@ -985,15 +985,24 @@ async def _attempt_merge_with_retry_and_escalation(
         # and the fall-open reason is recorded honestly. Best-effort and
         # idempotent; never gates the merge.
         try:
-            from app.onboarding_proof import stamp_first_merge_gate_verdict
+            from app.onboarding_proof import (
+                lock_project_for_onboarding_proof,
+                stamp_first_merge_gate_verdict,
+            )
 
-            stamp_first_merge_gate_verdict(
+            _proof_project = await lock_project_for_onboarding_proof(
                 _merge_project,
                 session,
-                executed_real_tests=_unverified_reason is None,
-                unverified_reason=_unverified_reason,
-                when=_utcnow(),
             )
+            if _proof_project is not None:
+                _merge_project = _proof_project
+                stamp_first_merge_gate_verdict(
+                    _merge_project,
+                    session,
+                    executed_real_tests=_unverified_reason is None,
+                    unverified_reason=_unverified_reason,
+                    when=_utcnow(),
+                )
         except Exception:  # observability stamp never blocks the merge
             logger.warning(
                 "[CI] onboarding first-merge-gate-verdict stamp failed",

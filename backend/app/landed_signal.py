@@ -521,6 +521,7 @@ def apply_merged_landed_signal(
     hotfix_lane: bool,
     non_merge_reason: str | None = None,
     merge_commit_sha: str | None = None,
+    onboarding_proof_authorized: bool = True,
 ) -> bool:
     """Guarded write path for a merged PR.
 
@@ -586,30 +587,32 @@ def apply_merged_landed_signal(
         # already records the capability proof, so it mirrors that pattern
         # exactly — no session parameter, the caller's session already tracks
         # ``project``. Best-effort and idempotent; never undoes a real merge.
-        try:
-            from app.onboarding_proof import stamp_first_pr_merged
+        if onboarding_proof_authorized:
+            try:
+                from app.onboarding_proof import stamp_first_pr_merged
 
-            stamp_first_pr_merged(project)
-        except Exception:  # noqa: BLE001 — observability stamp must never undo a real merge
-            logger.warning(
-                "[LANDED] onboarding first-pr-merged stamp failed for task %s",
-                getattr(task, "id", None),
-                exc_info=True,
-            )
+                stamp_first_pr_merged(project)
+            except Exception:  # noqa: BLE001 — observability stamp must never undo a real merge
+                logger.warning(
+                    "[LANDED] onboarding first-pr-merged stamp failed for task %s",
+                    getattr(task, "id", None),
+                    exc_info=True,
+                )
         # Onboarding-proof: record the first autonomous code improvement
         # (create/fix/refactor) that landed on an external (non-self-repo)
         # project. Makes the g-generality direction retirement condition
         # machine-checkable. Same pattern: best-effort, idempotent.
-        try:
-            from app.onboarding_proof import stamp_first_autonomous_improvement
+        if onboarding_proof_authorized:
+            try:
+                from app.onboarding_proof import stamp_first_autonomous_improvement
 
-            stamp_first_autonomous_improvement(task, project)
-        except Exception:  # noqa: BLE001 — stamp must never undo a real merge
-            logger.warning(
-                "[LANDED] first-autonomous-improvement stamp failed for task %s",
-                getattr(task, "id", None),
-                exc_info=True,
-            )
+                stamp_first_autonomous_improvement(task, project)
+            except Exception:  # noqa: BLE001 — stamp must never undo a real merge
+                logger.warning(
+                    "[LANDED] first-autonomous-improvement stamp failed for task %s",
+                    getattr(task, "id", None),
+                    exc_info=True,
+                )
     elif non_merge_reason:
         mark_unblocked_non_merge(task, reason=non_merge_reason)
     return landed_on_integration
@@ -813,13 +816,23 @@ async def corroborate_and_apply_merged_landed_signal(
         merge_commit_sha=merge_commit_sha,
         github_credentials=github_credentials,
     )
+    # The corroboration above can spend seconds in GitHub I/O.  Fresh-read the
+    # Project under its canonical row authority only at this final write seam,
+    # so the onboarding build_config stamps below cannot restore a stale value
+    # over an operator edit made during that I/O.  This path can already own a
+    # Task lock, so contention skips only the best-effort proof stamps instead
+    # of waiting in reverse lock order.
+    from app.onboarding_proof import lock_project_for_onboarding_proof
+
+    proof_project = await lock_project_for_onboarding_proof(project, session)
     landed = apply_merged_landed_signal(
         task,
-        project,
+        proof_project or project,
         base_branch=base_branch,
         hotfix_lane=hotfix_lane,
         non_merge_reason=non_merge_reason,
         merge_commit_sha=merge_commit_sha,
+        onboarding_proof_authorized=proof_project is not None,
     )
     if landed:
         try:

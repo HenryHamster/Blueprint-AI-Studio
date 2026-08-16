@@ -1203,6 +1203,62 @@ async def test_strategic_debug_recent_cycles_from_table(client, db_session):
     assert last["directions_created"] == 2
 
 
+@pytest.mark.asyncio
+async def test_strategic_debug_surfaces_automatic_cycle_lane_disabled(
+    client, db_session
+):
+    """Strategic debug explains the automatic-lane hold while leaving manual
+    Strategic availability explicit."""
+    from testing.factories import make_membership
+
+    project = await _make_project(db_session, name="Strategic lane disabled")
+    project.build_config = {"automatic_strategic_cycles_enabled": False}
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-debug")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["automatic_strategic_cycles_enabled"] is False
+    guard = next(
+        item
+        for item in data["blocking_guards"]
+        if item["guard"] == "automatic_strategic_cycles_disabled"
+    )
+    assert "explicit/manual Strategic launches remain available" in guard["reason"]
+    assert data["phase"] == 3
+
+
+@pytest.mark.asyncio
+async def test_strategic_debug_reports_evaluating_task_as_active(client, db_session):
+    """Debug truth matches the admission guard while a cycle awaits children."""
+    from testing.factories import make_membership
+
+    project = await _make_project(db_session, name="Strategic evaluating debug")
+    task = Task(
+        project_id=project.id,
+        title="Evaluating Strategic cycle",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add_all([make_membership(project.id), task])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-debug")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["phase"] == 2
+    assert data["active_task"] == {
+        "id": str(task.id),
+        "phase": "strategic_review",
+        "status": TaskStatus.EVALUATING.value,
+        "started_at": None,
+    }
+
+
 # --- integrity conflict counts -----------------------------------------------
 
 

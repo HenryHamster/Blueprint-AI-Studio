@@ -4247,29 +4247,16 @@ async def _spawn_design_doc_update(
         await session.rollback()
         return False
 
-    # ``apply_spawn_budget_guard`` classifies cadence/recovery callers as
-    # automatic; the directions endpoint deliberately leaves it false for an
-    # explicit operator-triggered cycle.  Linearize automatic creation against
-    # pause/archive before _has_active_strategic_task takes any Task locks, and
-    # keep the Project lock transaction-scoped through the Task INSERT below.
     if apply_spawn_budget_guard:
-        from app.task_locking import (
-            AUTOMATIC_TASK_CREATION_ALLOWED,
-            acquire_automatic_task_creation_authority,
-        )
+        # Cheap advisory fast-path only. The authoritative re-read still occurs
+        # under Project lock at the INSERT seam below, closing stale-true races.
+        from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
 
-        automatic_admission = await acquire_automatic_task_creation_authority(
-            session,
-            project.id,
-            skip_locked=True,
-        )
-        if automatic_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
-            await session.rollback()
+        if not automatic_strategic_cycles_enabled(project):
             logger.info(
                 "[STRATEGIC] Automatic design-doc spawn suppressed for project "
-                "%s (%s)",
+                "%s (automatic_strategic_cycles_disabled)",
                 project.id,
-                automatic_admission,
             )
             return False
 
@@ -4439,6 +4426,45 @@ async def _spawn_design_doc_update(
         steering_excerpt = strategic_refresh_excerpt(project.vision)
         if steering_excerpt:
             task_context["steering_excerpt"] = steering_excerpt
+    # Payload assembly above may hold external I/O open for seconds.  Acquire
+    # automatic Strategic authority only at the short finalization seam, re-read
+    # the dedicated lane flag under the current Project lock, and retain that
+    # lock through INSERT/commit.  Manual directions calls deliberately leave
+    # ``apply_spawn_budget_guard`` false and remain unaffected.
+    if apply_spawn_budget_guard:
+        from app.strategic_cycle_admission import (
+            acquire_automatic_strategic_cycle_creation_authority,
+        )
+        from app.task_locking import AUTOMATIC_TASK_CREATION_ALLOWED
+
+        automatic_admission = (
+            await acquire_automatic_strategic_cycle_creation_authority(
+                session,
+                project.id,
+                skip_locked=True,
+            )
+        )
+        if automatic_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            await session.rollback()
+            logger.info(
+                "[STRATEGIC] Automatic design-doc spawn suppressed for project "
+                "%s (%s)",
+                project.id,
+                automatic_admission,
+            )
+            return False
+        # The unlocked head check can become stale during payload construction.
+        # Re-arm it after Project authority so Project -> Task lock ordering and
+        # the check -> INSERT window are both deterministic.
+        if await _has_active_strategic_task(project.id, session):
+            await session.rollback()
+            logger.info(
+                "[STRATEGIC] Automatic design-doc spawn suppressed for project "
+                "%s (strategic task appeared during payload construction)",
+                project.id,
+            )
+            return False
+
     try:
         await lock_and_validate_legacy_authority(
             session,
@@ -5551,6 +5577,7 @@ async def _finalize_strategic_review_spawn(
     expected_legacy_generation: int | None = None,
     cadence_accepted_count: object | None = None,
     automatic_creation: bool = True,
+    suppression_reason_out: dict[str, str] | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail for the cadence spawn path.
 
@@ -5578,21 +5605,25 @@ async def _finalize_strategic_review_spawn(
     from app.task_lifecycle import _has_active_strategic_task
 
     # Payload construction can commit and release every earlier lock.  Re-take
-    # the canonical Project authority at the short finalization seam, before
-    # the advisory/active-task/cycle locks, and retain it through INSERT.  The
-    # manual Workday/directions paths pass automatic_creation=False explicitly.
+    # the canonical Project authority at the short finalization seam, re-read
+    # the automatic Strategic lane flag, and retain the lock through INSERT.
+    # Manual Workday/directions/Resident paths pass automatic_creation=False.
     if automatic_creation:
-        from app.task_locking import (
-            AUTOMATIC_TASK_CREATION_ALLOWED,
-            acquire_automatic_task_creation_authority,
+        from app.strategic_cycle_admission import (
+            acquire_automatic_strategic_cycle_creation_authority,
         )
+        from app.task_locking import AUTOMATIC_TASK_CREATION_ALLOWED
 
-        automatic_admission = await acquire_automatic_task_creation_authority(
-            session,
-            project_id,
-            skip_locked=True,
+        automatic_admission = (
+            await acquire_automatic_strategic_cycle_creation_authority(
+                session,
+                project_id,
+                skip_locked=True,
+            )
         )
         if automatic_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            if suppression_reason_out is not None:
+                suppression_reason_out["reason"] = automatic_admission
             await session.rollback()
             logger.info(
                 "[STRATEGIC] Automatic strategic-review spawn suppressed for "
@@ -5806,6 +5837,7 @@ async def _spawn_strategic_review(
     apply_spawn_budget_guard: bool = False,
     expected_legacy_generation: int | None = None,
     cadence_accepted_count: object | None = None,
+    suppression_reason_out: dict[str, str] | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -5864,6 +5896,9 @@ async def _spawn_strategic_review(
     """
     from app.task_lifecycle import _has_active_strategic_task
 
+    if suppression_reason_out is not None:
+        suppression_reason_out.clear()
+
     try:
         if expected_legacy_generation is None and not resident_minimal:
             expected_legacy_generation = await lock_and_validate_legacy_authority(
@@ -5876,6 +5911,28 @@ async def _spawn_strategic_review(
 
     if extra_payload and not resident_minimal:
         raise ValueError("extra_payload is reserved for resident_minimal strategic spawns")
+
+    if apply_spawn_budget_guard:
+        # Avoid the expensive Strategic payload build when the caller's loaded
+        # snapshot is already disabled. The finalizer still performs the
+        # authoritative locked re-read so stale-true snapshots cannot insert.
+        from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
+
+        if not automatic_strategic_cycles_enabled(project):
+            if suppression_reason_out is not None:
+                from app.strategic_cycle_admission import (
+                    AUTOMATIC_STRATEGIC_CYCLES_DISABLED,
+                )
+
+                suppression_reason_out["reason"] = (
+                    AUTOMATIC_STRATEGIC_CYCLES_DISABLED
+                )
+            logger.info(
+                "[STRATEGIC] Automatic strategic-review spawn suppressed for "
+                "project %s (automatic_strategic_cycles_disabled)",
+                project.id,
+            )
+            return False
 
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
@@ -6264,6 +6321,7 @@ async def _spawn_strategic_review(
             expected_legacy_generation=expected_legacy_generation,
             cadence_accepted_count=cadence_accepted_count,
             automatic_creation=apply_spawn_budget_guard,
+            suppression_reason_out=suppression_reason_out,
         )
 
     # Build direction stats with rich data (pure over ``project.directions``).
@@ -8570,6 +8628,7 @@ async def _spawn_strategic_review(
         expected_legacy_generation=expected_legacy_generation,
         cadence_accepted_count=cadence_accepted_count,
         automatic_creation=apply_spawn_budget_guard,
+        suppression_reason_out=suppression_reason_out,
     )
 
 

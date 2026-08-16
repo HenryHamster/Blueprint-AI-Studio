@@ -578,6 +578,39 @@ class TestAutonomyDebug:
     """Tests for GET /api/admin/projects/{project_id}/autonomy-debug."""
 
     @pytest.mark.asyncio
+    async def test_strategic_lane_flag_is_informational_for_tactical_autonomy(
+        self, client: AsyncClient, db_session
+    ):
+        """Turning off automatic Strategic cycles must not add a tactical
+        ``spawn_blocked`` guard to the autonomy projection."""
+        project = await _make_project(db_session, name="Tactical debug isolation")
+
+        enabled_resp = await client.get(
+            f"/api/admin/projects/{project.id}/autonomy-debug"
+        )
+        assert enabled_resp.status_code == 200, enabled_resp.text
+        enabled = enabled_resp.json()
+        assert enabled["automatic_strategic_cycles_enabled"] is True
+
+        project.build_config = {"automatic_strategic_cycles_enabled": False}
+        db_session.add(project)
+        await db_session.commit()
+
+        disabled_resp = await client.get(
+            f"/api/admin/projects/{project.id}/autonomy-debug"
+        )
+        assert disabled_resp.status_code == 200, disabled_resp.text
+        disabled = disabled_resp.json()
+        assert disabled["automatic_strategic_cycles_enabled"] is False
+        assert disabled["spawn_blocked"] == enabled["spawn_blocked"]
+        assert {guard["guard"] for guard in disabled["blocking_guards"]} == {
+            guard["guard"] for guard in enabled["blocking_guards"]
+        }
+        assert "automatic_strategic_cycles_disabled" not in {
+            guard["guard"] for guard in disabled["blocking_guards"]
+        }
+
+    @pytest.mark.asyncio
     async def test_rate_limit_counts_only_research_tasks(
         self, client: AsyncClient, db_session
     ):

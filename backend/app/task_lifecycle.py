@@ -1953,12 +1953,29 @@ async def _process_post_commit(
                 # This is the caller that records the freshly-opened PR and has
                 # both the Project ORM object and the async session in scope (the
                 # low-level create_pull_request helper has neither). Best-effort
-                # and idempotent; the staged mutation persists via the routing
-                # commits below. Never gates the PR-routing path.
+                # and idempotent; the short fresh-read mutation commits before
+                # routing begins. Never gates the PR-routing path.
                 try:
-                    from app.onboarding_proof import stamp_first_pr_opened
+                    from app.onboarding_proof import (
+                        lock_project_for_onboarding_proof,
+                        stamp_first_pr_opened,
+                    )
 
-                    stamp_first_pr_opened(_project, session, when=_utcnow())
+                    _proof_project = await lock_project_for_onboarding_proof(
+                        _project,
+                        session,
+                    )
+                    if _proof_project is not None:
+                        stamp_first_pr_opened(
+                            _proof_project,
+                            session,
+                            when=_utcnow(),
+                        )
+                        # No routing mutations have been staged since the
+                        # entry commit above. Release this Project lock now so
+                        # it never spans the slow review/merge GitHub calls.
+                        await session.commit()
+                        _project = _proof_project
                 except Exception:  # observability stamp never blocks PR routing
                     logger.warning(
                         "[POST_COMMIT] onboarding first-pr-opened stamp failed",

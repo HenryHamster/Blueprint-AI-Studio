@@ -16,6 +16,10 @@ import logging
 import time
 from typing import Any, Dict, List
 
+from app.strategic_cycle_admission import (
+    AUTOMATIC_STRATEGIC_CYCLES_ENABLED_BUILD_CONFIG_KEY,
+)
+
 logger = logging.getLogger(__name__)
 
 # In-memory per-project cooldown for expensive tree-walk re-detections.
@@ -63,7 +67,8 @@ def apply_operator_build_config_overrides(
     - ``env_vars``, reviewer/parallelism toggles, branch namespace/prefixes,
       ``pr_title_prefix``, staging/stale branch prefix lists,
       ``protected_branches``, ``enable_self_improvement``, ``alert_domains``,
-      ``requires_ci_checks`` and the per-project parallelism caps
+      ``requires_ci_checks``, ``automatic_strategic_cycles_enabled`` and the
+      per-project parallelism caps
       (``max_parallel_research``, ``max_total_research``,
       ``max_autonomous_tasks_per_hour``) — preserved whenever the key is
       present in ``existing`` (including empty-list/falsey values), so
@@ -81,6 +86,14 @@ def apply_operator_build_config_overrides(
         detected["enable_parallel_review"] = existing["enable_parallel_review"]
     if "enable_parallel_fix" in existing:
         detected["enable_parallel_fix"] = existing["enable_parallel_fix"]
+    # This controls an operator-owned autonomous authoring lane and cannot be
+    # recovered from repository contents. Preserve an explicit False just as
+    # carefully as True so re-detection cannot reopen Strategic cycles during a
+    # bounded tactical canary.
+    if AUTOMATIC_STRATEGIC_CYCLES_ENABLED_BUILD_CONFIG_KEY in existing:
+        detected[AUTOMATIC_STRATEGIC_CYCLES_ENABLED_BUILD_CONFIG_KEY] = existing[
+            AUTOMATIC_STRATEGIC_CYCLES_ENABLED_BUILD_CONFIG_KEY
+        ]
     # Per-project branch/PR naming overrides are user-set and not detectable
     # from repo contents; preserve them across re-detect so operators do not
     # lose deliberate customization.
@@ -205,6 +218,52 @@ def apply_operator_build_config_overrides(
     return detected
 
 
+async def _lock_project_build_config_for_write(project, session):
+    """Return a freshly reloaded Project while retaining its row lock.
+
+    Detection intentionally runs before this seam because GitHub tree walks can
+    take seconds. Writers call it only for the final JSONB read/modify/write.
+    ``project_lock`` uses ``populate_existing`` and ``FOR NO KEY UPDATE``; the
+    returned identity therefore contains the current ``build_config`` and its
+    transaction-scoped lock remains held until the caller commits or rolls back.
+
+    Background reconciliation fails closed on contention rather than waiting
+    behind an operator edit. A later bounded retry can repeat detection, while
+    the operator-owned value cannot be overwritten from a stale pre-I/O read.
+    """
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    # The production dependency and every runtime caller supply AsyncSession.
+    # A small set of pure policy/unit tests intentionally use lightweight
+    # session doubles to exercise cooldown and merge behavior without a DB; keep
+    # those tests at the pure seam while PostgreSQL integration tests below this
+    # module prove the real row serialization.
+    if not isinstance(session, AsyncSession):
+        return project
+
+    from app.models import Project
+    from app.task_locking import project_lock
+
+    project_id = getattr(project, "id", None)
+    if project_id is None:
+        return None
+    async with project_lock(
+        session,
+        project_id,
+        skip_locked=True,
+        load_columns=[Project.id, Project.build_config],
+    ) as locked_project:
+        if locked_project is None:
+            logger.info(
+                "[BUILD_CONFIG] Skipping stale config write for project %s — "
+                "Project row is contended",
+                project_id,
+            )
+            return None
+        return locked_project
+
+
 async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> bool:
     """Auto-refresh a project's ``build_config`` once its repo gains structure.
 
@@ -288,6 +347,11 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
         if not detected:
             return False
 
+        locked_project = await _lock_project_build_config_for_write(project, session)
+        if locked_project is None:
+            return False
+        project = locked_project
+        existing = project.build_config or {}
         detected = apply_operator_build_config_overrides(detected, existing)
 
         try:
@@ -416,6 +480,11 @@ async def maybe_correct_stale_repo_empty_signal(project, session, *, ref=None) -
         ):
             return False
 
+        locked_project = await _lock_project_build_config_for_write(project, session)
+        if locked_project is None:
+            return False
+        project = locked_project
+        existing = project.build_config or {}
         detected = apply_operator_build_config_overrides(detected, existing)
 
         try:
@@ -530,6 +599,11 @@ async def maybe_correct_stale_commitless_repo_signal(
             "source_file_count": 0,
             "has_ci": False,
         }
+        locked_project = await _lock_project_build_config_for_write(project, session)
+        if locked_project is None:
+            return False
+        project = locked_project
+        existing = project.build_config or {}
         updated = apply_operator_build_config_overrides(empty_fields, existing)
         project.build_config = updated
         flag_modified(project, "build_config")
@@ -640,9 +714,9 @@ async def maybe_redetect_missing_test_command(project, session, *, ref=None) -> 
         if not detected:
             return False
 
-        detected = apply_operator_build_config_overrides(detected, existing)
-
-        # Only persist when re-detection actually found a test command.
+        # Avoid taking a Project write lock when detection produced nothing to
+        # persist. The initial config was already confirmed test-less above;
+        # a concurrent operator write can only make this no-op safer.
         class _Stub:
             pass
 
@@ -650,6 +724,13 @@ async def maybe_redetect_missing_test_command(project, session, *, ref=None) -> 
         _stub.build_config = detected
         if not ci_resolution.has_detectable_tests(_stub):
             return False
+
+        locked_project = await _lock_project_build_config_for_write(project, session)
+        if locked_project is None:
+            return False
+        project = locked_project
+        existing = project.build_config or {}
+        detected = apply_operator_build_config_overrides(detected, existing)
 
         try:
             validated = BuildConfigSchema(**detected)
@@ -742,13 +823,16 @@ async def maybe_redetect_ci_presence(project, session, *, ref=None) -> bool:
         if not detected:
             return False
 
-        detected = apply_operator_build_config_overrides(detected, existing)
-
-        # Only persist when detection produced a DEFINITIVE has_ci. A still
-        # incomplete read (has_ci None) must not overwrite the stored config —
-        # the strand keeps polling rather than recording a guessed value.
+        # A still-incomplete detector result has no write to serialize.
         if detected.get("has_ci") is None:
             return False
+
+        locked_project = await _lock_project_build_config_for_write(project, session)
+        if locked_project is None:
+            return False
+        project = locked_project
+        existing = project.build_config or {}
+        detected = apply_operator_build_config_overrides(detected, existing)
 
         try:
             validated = BuildConfigSchema(**detected)
@@ -871,6 +955,11 @@ async def maybe_redetect_on_emptiness_disagreement(
         if not detected:
             return False
 
+        locked_project = await _lock_project_build_config_for_write(project, session)
+        if locked_project is None:
+            return False
+        project = locked_project
+        existing = project.build_config or {}
         detected = apply_operator_build_config_overrides(detected, existing)
 
         try:
@@ -945,12 +1034,28 @@ async def persist_discovered_build_commands(
     try:
         if not discovered_directories:
             return False
+        if (project.build_config or {}).get("directories"):
+            return False
+        if not any(
+            isinstance(raw, dict)
+            and raw.get("executed_successfully")
+            and any(
+                str(raw.get(field) or "").strip()
+                for field in ("lint_cmd", "build_cmd", "test_cmd", "install_cmd")
+            )
+            for raw in discovered_directories[:_MAX_DISCOVERED_ENTRIES]
+        ):
+            return False
 
         from pydantic import ValidationError
         from sqlalchemy.orm.attributes import flag_modified
 
         from app.schemas import BuildConfig as BuildConfigSchema
 
+        locked_project = await _lock_project_build_config_for_write(project, session)
+        if locked_project is None:
+            return False
+        project = locked_project
         existing = dict(project.build_config or {})
         directories = [dict(d) for d in (existing.get("directories") or [])]
 
@@ -1072,12 +1177,22 @@ async def persist_recovered_test_command(
     try:
         if not recovered_directories:
             return False
+        if not any(
+            isinstance(recovered, dict)
+            and str(recovered.get("test_cmd") or "").strip()
+            for recovered in recovered_directories
+        ):
+            return False
 
         from pydantic import ValidationError
         from sqlalchemy.orm.attributes import flag_modified
 
         from app.schemas import BuildConfig as BuildConfigSchema
 
+        locked_project = await _lock_project_build_config_for_write(project, session)
+        if locked_project is None:
+            return False
+        project = locked_project
         existing = dict(project.build_config or {})
         directories = [dict(d) for d in (existing.get("directories") or [])]
         index_by_path = {

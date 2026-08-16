@@ -1511,6 +1511,84 @@ async def test_strategic_cadence_uses_monotonic_accepted_cycle_receipt(
     assert design_doc_update.await_count == 0
 
 
+@pytest.mark.asyncio
+async def test_disabled_automatic_strategic_lane_still_spawns_one_tactical_root(
+    db_session, mocker
+):
+    """A due cadence and pending retry cannot leak into a tactical canary.
+
+    Exercise the production autonomous scheduler with both Strategic entry
+    conditions armed.  The project-owned flag suppresses both calls without
+    consuming their durable markers, while the eligible direction still gets
+    exactly one autonomous research root.
+    """
+    strategic_review = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    design_doc_update = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch.dict(
+        _shared_state.runtime_config,
+        {
+            "directed_research_cooldown_minutes": 0,
+            "strategic_max_interval_minutes": 0,
+            "strategic_spawn_cooldown_minutes": 0,
+            "undirected_research_frequency": 0,
+        },
+    )
+
+    pending_retry = {
+        "cycle_id": "sc-disabled-retry",
+        "attempt_count": 0,
+        "failed_at": _utcnow().isoformat(),
+    }
+    project = Project(
+        name="Tactical canary lane isolation",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        build_config={"automatic_strategic_cycles_enabled": False},
+        directions=[_active_direction("d-tactical-canary", "Tactical canary")],
+        vision={
+            "purpose": "test",
+            "_research_spawn_count": 2,
+            "_strategic_frequency_override": 2,
+            "_pending_strategic_review": pending_retry,
+        },
+        design_doc={"systems/api": {"id": "api", "status": "working"}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    tactical_roots = [
+        task for task in tasks if task.first_payload.get("type") == "research"
+    ]
+    assert len(tactical_roots) == 1
+    assert tactical_roots[0].first_payload["current_direction_id"] == (
+        "d-tactical-canary"
+    )
+    strategic_review.assert_not_awaited()
+    design_doc_update.assert_not_awaited()
+
+    await db_session.refresh(project)
+    assert project.vision["_pending_strategic_review"] == pending_retry
+    assert "_strategic_last_accepted_research_count" not in project.vision
+
+
 def test_strategic_cadence_receipt_does_not_consume_concurrent_completion():
     """A completion arriving during spawn remains owed to the next cadence."""
     from app.research_cycle_cadence import (
@@ -18978,6 +19056,107 @@ async def test_pending_sr_skip_falls_through_to_tactical(db_session, mocker):
     assert marker.get("first_attempted_at") is not None, (
         "first_attempted_at must be stamped on first skip so the age window arms"
     )
+
+
+@pytest.mark.asyncio
+async def test_pending_sr_inflight_lane_disable_preserves_budget_then_retries(
+    db_session, mocker
+):
+    """A final-seam lane hold is not a failed retry and survives to re-enable."""
+    from app.strategic_cycle_admission import (
+        AUTOMATIC_STRATEGIC_CYCLES_DISABLED,
+    )
+
+    _shared_state.runtime_config["pending_sr_max_attempts"] = 3
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    first_attempted = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    expected_marker = {
+        "design_doc_task_id": str(uuid.uuid4()),
+        "failed_at": first_attempted,
+        "error": "retry owed",
+        "cycle_id": "cyc-inflight-disable-001",
+        "operator_steered": False,
+        "steering_excerpt": None,
+        "attempt_count": 2,
+        "first_attempted_at": first_attempted,
+    }
+    project = Project(
+        name="Pending SR in-flight lane disable",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        build_config={"automatic_strategic_cycles_enabled": True},
+        directions=[
+            {
+                **_active_direction("d-psr-disable1", "Pending SR direction"),
+                "refractory_until": future,
+            }
+        ],
+        vision={
+            "purpose": "test",
+            "_pending_strategic_review": dict(expected_marker),
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    project_id = project.id
+
+    spawn_outcomes: list[bool] = []
+
+    async def _controlled_spawn(
+        spawn_project,
+        spawn_session,
+        *,
+        suppression_reason_out=None,
+        **_kwargs,
+    ):
+        if not spawn_outcomes:
+            # The caller already owns the Project row through this transaction.
+            # A second session cannot represent a final-seam suppression here: it
+            # waits on that row lock forever and leaves the spawned coroutine alive
+            # after pytest-timeout tears down ``db_session``.  Model the spawner's
+            # authoritative re-read result in the owning session, then return the
+            # same suppression receipt the real finalizer emits.
+            assert spawn_project.id == project_id
+            assert spawn_session is db_session
+            spawn_project.build_config = {
+                **(spawn_project.build_config or {}),
+                "automatic_strategic_cycles_enabled": False,
+            }
+            spawn_session.add(spawn_project)
+            await spawn_session.commit()
+            assert suppression_reason_out is not None
+            suppression_reason_out["reason"] = AUTOMATIC_STRATEGIC_CYCLES_DISABLED
+            spawn_outcomes.append(False)
+            return False
+        spawn_outcomes.append(True)
+        return True
+
+    spawn_sr_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(side_effect=_controlled_spawn),
+    )
+
+    try:
+        await _spawn_research_task(project, db_session)
+        await db_session.refresh(project)
+        assert project.build_config["automatic_strategic_cycles_enabled"] is False
+        assert project.vision["_pending_strategic_review"] == expected_marker
+
+        project.build_config = {
+            **(project.build_config or {}),
+            "automatic_strategic_cycles_enabled": True,
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+        await db_session.refresh(project)
+        assert (project.vision or {}).get("_pending_strategic_review") is None
+        assert spawn_outcomes == [False, True]
+        assert spawn_sr_mock.await_count == 2
+    finally:
+        _shared_state.runtime_config.pop("pending_sr_max_attempts", None)
 
 
 @pytest.mark.asyncio

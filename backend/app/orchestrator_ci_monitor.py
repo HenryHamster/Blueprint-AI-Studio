@@ -261,12 +261,20 @@ async def _apply_ci_merged_landed_signal(
         or (ci_task.context or {}).get("hotfix")
         or review_loop.get("hotfix")
     )
+    # GitHub corroboration above intentionally runs without a Project row
+    # lock. Re-enter the short Project write boundary only now so the sync
+    # landing helper's onboarding build_config stamps cannot overwrite a
+    # concurrent operator lane edit from the stale pre-I/O snapshot.
+    from app.onboarding_proof import lock_project_for_onboarding_proof
+
+    proof_project = await lock_project_for_onboarding_proof(project, session)
     landed = apply_merged_landed_signal(
         ci_task,
-        project,
+        proof_project or project,
         base_branch=base_branch,
         hotfix_lane=hotfix_lane,
         merge_commit_sha=merge_commit_sha,
+        onboarding_proof_authorized=proof_project is not None,
     )
     if landed:
         try:

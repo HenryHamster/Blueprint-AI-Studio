@@ -13120,11 +13120,20 @@ class TestProblemModelWritePathInvariants:
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
         ("reaper_sweeps.py", 1381): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
-        ("routers/admin_projects.py", 874): "validated pydantic model_dump",
+        (
+            "routers/admin_projects.py",
+            878,
+        ): "apply_user_intent_patch(sanitize_problem_model_raw(...)) validated model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1287): "current_model pydantic model_dump",
+        (
+            "routers/admin_projects.py",
+            1296,
+        ): "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1399): "current_model pydantic model_dump",
+        (
+            "routers/admin_projects.py",
+            1408,
+        ): "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)

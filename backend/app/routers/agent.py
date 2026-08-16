@@ -6192,6 +6192,17 @@ async def agent_write_back_build_config_commands(
         raise HTTPException(status_code=403, detail="Task does not belong to project")
 
     from app.build_config_detection import _normalize_dir_path
+    from app.task_locking import lock_project_or_429
+
+    # The authenticated task/project checks above intentionally use cheap
+    # unlocked reads. Re-enter the canonical Project row boundary only at this
+    # final JSONB merge seam, forcing populate_existing before copying the
+    # config and retaining the lock through commit. Otherwise an agent that
+    # loaded the Project just before an operator disabled automatic Strategic
+    # cycles could commit its stale whole-config snapshot just after the PATCH
+    # and silently reopen that lane. Request-side contention remains the
+    # established retryable 429 contract; no stale write is allowed through.
+    project = await lock_project_or_429(session, project_id)
 
     existing = dict(project.build_config or {})
     directories = [dict(d) for d in (existing.get("directories") or [])]

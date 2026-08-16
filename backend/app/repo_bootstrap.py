@@ -100,7 +100,7 @@ def _empty_repo_build_config_fields() -> dict:
 async def _self_heal_undetermined_emptiness(
     project: Project,
     build_cfg: dict,
-    session: AsyncSession,
+    _session: AsyncSession,
 ) -> Literal["empty", "non_empty", "undetermined"]:
     """Resolve an undetermined durable ``repo_is_empty`` against the live repo.
 
@@ -169,9 +169,6 @@ async def _self_heal_undetermined_emptiness(
             # also a lifecycle record: retain durable bootstrap/recovery and
             # command-writeback evidence the detector cannot derive.
             build_cfg.update(detected)
-            project.build_config = build_cfg
-            flag_modified(project, "build_config")
-            session.add(project)
             return "empty" if build_cfg["repo_is_empty"] else "non_empty"
 
         # Commitless: seed the trunk so `--branch <trunk>` clones stop dying,
@@ -182,9 +179,6 @@ async def _self_heal_undetermined_emptiness(
         )
         await ensure_repo_initialized(token, owner, repo, default_branch)
         build_cfg.update(_empty_repo_build_config_fields())
-        project.build_config = build_cfg
-        flag_modified(project, "build_config")
-        session.add(project)
         return "empty"
     except Exception:  # noqa: BLE001 — best-effort: any failure leaves the signal undetermined
         logger.warning(
@@ -247,16 +241,15 @@ async def spawn_bootstrap_task(
     first-bootstrap strategic gate semantics for brand-new projects) and does
     NOT arm the automatic-recovery backoff loop.
     """
-    # First-cycle bootstrap is an onboarding side effect and recovery_sweep is
-    # autonomous; both are automatic work and therefore honor the universal
-    # Project.pause/archive fence. Explicit operator retry/refresh remains a
-    # direct human action and deliberately retains its existing semantics.
-    if is_first_bootstrap or automatic_recovery:
+    automatic_creation = is_first_bootstrap or automatic_recovery
+    if automatic_creation:
         from app.task_locking import (
             AUTOMATIC_TASK_CREATION_ALLOWED,
             acquire_automatic_task_creation_authority,
         )
 
+        # Pause/archive is authoritative before any repository-side self-heal,
+        # and this transaction lock is retained through the Task/config write.
         creation_admission = await acquire_automatic_task_creation_authority(
             session, project.id
         )
@@ -265,10 +258,16 @@ async def spawn_bootstrap_task(
                 outcome="not_eligible",
                 reason=f"automatic_task_creation:{creation_admission}",
             )
+        await session.refresh(project)
+    else:
+        # Explicit retry/refresh remains allowed while paused, but it still
+        # serializes its whole-JSON write against concurrent operator patches.
+        from app.task_locking import lock_project_or_429
+
+        project = await lock_project_or_429(session, project.id)
 
     build_cfg = dict(project.build_config or {})
     is_refresh = spawn_reason == REFRESH_SPAWN_REASON
-    build_config_changed = False
 
     if project_is_deploy_repo(project):
         return BootstrapSpawnResult(
@@ -285,10 +284,21 @@ async def spawn_bootstrap_task(
     # count and proceeds only when that count exceeds the greenfield threshold.
     # A no-token / GitHub-error/incomplete detection leaves the signal
     # undetermined and falls through to the prior behavior, so nothing regresses.
+    config_before_self_heal = dict(build_cfg)
     if build_cfg.get("repo_is_empty") is None:
-        config_before_self_heal = dict(build_cfg)
         await _self_heal_undetermined_emptiness(project, build_cfg, session)
-        build_config_changed = build_cfg != config_before_self_heal
+    build_config_changed = build_cfg != config_before_self_heal
+    if build_config_changed:
+        project.build_config = build_cfg
+        flag_modified(project, "build_config")
+        session.add(project)
+
+    if project_is_deploy_repo(project):
+        return BootstrapSpawnResult(
+            outcome="not_eligible",
+            reason="self_repo",
+            build_config_changed=build_config_changed,
+        )
 
     if build_cfg.get("repo_is_empty"):
         return BootstrapSpawnResult(

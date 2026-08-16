@@ -605,12 +605,15 @@ async def update_project(
             detail="Only project owners may change build_config, autonomous_enabled, design_doc, or vision.",
         )
 
-    # Lock the project row whenever directions, design_doc, or vision are
-    # being overwritten so concurrent agent writers cannot silently clobber.
+    # Lock the project row whenever a full-blob field is being updated so
+    # concurrent agent/detection writers cannot silently clobber operator
+    # intent. Build-config redetection performs its external GitHub I/O first,
+    # then takes this same lock and re-reads the current JSONB before merging.
     needs_lock = (
         payload.directions is not None
         or payload.design_doc is not None
         or payload.vision is not None
+        or payload.build_config is not None
         or payload.approval_gate_config is not None
         or payload.problem_model_patch is not None
     )
@@ -622,6 +625,7 @@ async def update_project(
                 ("directions", payload.directions),
                 ("design_doc", payload.design_doc),
                 ("vision", payload.vision),
+                ("build_config", payload.build_config),
                 ("approval_gate_config", payload.approval_gate_config),
                 ("problem_model", payload.problem_model_patch),
             )
@@ -934,6 +938,11 @@ async def detect_project_build_config(
         ref=project.integration_branch,
     )
 
+    # Detection performs external GitHub I/O without holding a database row.
+    # Re-enter the same Project serialization boundary used by build_config
+    # PATCH and background re-detection, forcing populate_existing before the
+    # operator-owned merge so a concurrent lane disable cannot be overwritten.
+    project = await lock_project_or_429(session, project.id)
     detected = apply_operator_build_config_overrides(
         detected, project.build_config or {}
     )
