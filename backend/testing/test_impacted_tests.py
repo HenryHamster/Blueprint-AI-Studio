@@ -69,6 +69,134 @@ def test_backend_verification_reports_runtime_unavailable_separately():
     }
 
 
+@pytest.mark.parametrize("exit_code", [1, 2, 3, 4, 5, 137, -15])
+def test_backend_verification_nonzero_clean_report_is_execution_failure(exit_code):
+    current = impacted_tests.JUnitReport(
+        test_routes={"backend/testing/test_x.py::test_passes"}
+    )
+    baseline = impacted_tests.JUnitReport(
+        test_routes={"backend/testing/test_x.py::test_passes"}
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=exit_code,
+        current_failures={},
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome == {
+        "state": "execution_failure",
+        "blocking": True,
+        "new_failures": {},
+    }
+
+
+def test_backend_verification_zero_exit_with_failures_is_execution_failure():
+    failures = {"backend/testing/test_x.py::test_fails::failure": "boom"}
+    current = impacted_tests.JUnitReport(
+        failures=failures,
+        test_routes={"backend/testing/test_x.py::test_fails"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_failures=failures,
+        current_report=current,
+        baseline_report=impacted_tests.JUnitReport(),
+    )
+
+    assert outcome == {
+        "state": "execution_failure",
+        "blocking": True,
+        "new_failures": {},
+    }
+
+
+@pytest.mark.parametrize("exit_code", [2, 3, 4, 5, 137, -15])
+def test_backend_verification_abnormal_exit_cannot_suppress_matching_failure(
+    exit_code,
+):
+    failures = {"backend/testing/test_x.py::test_fails::failure": "boom"}
+    report = impacted_tests.JUnitReport(
+        failures=failures,
+        test_routes={"backend/testing/test_x.py::test_fails"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=exit_code,
+        current_failures=failures,
+        current_report=report,
+        baseline_report=report,
+    )
+
+    assert outcome == {
+        "state": "execution_failure",
+        "blocking": True,
+        "new_failures": {},
+    }
+
+
+def test_backend_verification_exit_one_matching_failure_is_preexisting():
+    failures = {"backend/testing/test_x.py::test_fails::failure": "boom"}
+    report = impacted_tests.JUnitReport(
+        failures=failures,
+        test_routes={"backend/testing/test_x.py::test_fails"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=failures,
+        current_report=report,
+        baseline_report=report,
+    )
+
+    assert outcome["state"] == "preexisting_test_failure"
+    assert outcome["blocking"] is False
+    assert outcome["new_failures"] == {}
+
+
+def test_backend_verification_exit_one_new_failure_remains_blocking():
+    failures = {"backend/testing/test_x.py::test_fails::failure": "boom"}
+    current = impacted_tests.JUnitReport(
+        failures=failures,
+        test_routes={"backend/testing/test_x.py::test_fails"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=failures,
+        current_report=current,
+        baseline_report=impacted_tests.JUnitReport(),
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == failures
+
+
+def test_backend_verification_clean_exit_and_report_pass():
+    report = impacted_tests.JUnitReport(
+        test_routes={"backend/testing/test_x.py::test_passes"}
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_failures={},
+        current_report=report,
+        baseline_report=report,
+    )
+
+    assert outcome["state"] == "passed"
+    assert outcome["blocking"] is False
+
+
 def test_backend_verification_junit_parser_preserves_route_keyed_detail(tmp_path):
     report = tmp_path / "junit.xml"
     report.write_text(

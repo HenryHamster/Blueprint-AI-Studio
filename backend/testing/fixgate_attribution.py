@@ -252,6 +252,13 @@ def attribute_failure_maps(
     )
 
 
+def is_attributable_pytest_result(exit_code: int, report: JUnitReport) -> bool:
+    """Return whether pytest's exit code and JUnit failures agree."""
+
+    has_failures = bool(report.failures)
+    return (exit_code == 0 and not has_failures) or (exit_code == 1 and has_failures)
+
+
 def classify_verification(
     *,
     runtime_available: bool,
@@ -267,20 +274,22 @@ def classify_verification(
 
     if not runtime_available:
         return {"state": "runtime_unavailable", "blocking": True, "new_failures": {}}
-    if baseline_failures is None and baseline_report is None:
-        if current_exit_code == 0:
-            return {"state": "passed", "blocking": False, "new_failures": {}}
-        if not current_failures:
-            return {"state": "execution_failure", "blocking": True, "new_failures": {}}
-        return {
-            "state": "attribution_unavailable",
-            "blocking": True,
-            "new_failures": current_failures,
-        }
 
     current_report = current_report or _report_from_failures(
         current_failures, tree_root=current_root
     )
+    if not is_attributable_pytest_result(current_exit_code, current_report):
+        return {"state": "execution_failure", "blocking": True, "new_failures": {}}
+
+    if baseline_failures is None and baseline_report is None:
+        if current_exit_code == 0:
+            return {"state": "passed", "blocking": False, "new_failures": {}}
+        return {
+            "state": "attribution_unavailable",
+            "blocking": True,
+            "new_failures": current_report.failures,
+        }
+
     baseline_report = baseline_report or _report_from_failures(
         baseline_failures or {}, tree_root=baseline_root
     )
@@ -354,6 +363,7 @@ __all__ = [
     "attribute_reports",
     "classify_verification",
     "extract_base",
+    "is_attributable_pytest_result",
     "parse_junit_failures",
     "parse_junit_report",
 ]

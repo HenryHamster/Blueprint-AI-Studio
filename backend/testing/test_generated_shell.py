@@ -2089,7 +2089,13 @@ class TestProjectVerificationRuntimeContract:
         assert 'USE_TEST_POSTGRES:-' in harness
         assert 'testing/test_*.py|testing/test_*.py::*' in harness
         assert 'verification_selector_count" -le 8' in harness
+        assert (
+            'VERIFICATION_HOST_JUNIT="$VERIFICATION_OUTPUT_DIR/'
+            '${VERIFICATION_JUNIT_NAME:-junit.xml}"'
+        ) in harness
         assert '--junitxml="$verification_junit"' in harness
+        assert '"$VERIFICATION_HOST_JUNIT" "$verification_tmp" "$@"' in harness
+        assert '"$VERIFICATION_OUTPUT_DIR/junit.xml" "$verification_tmp" "$@"' not in harness
         assert "tests>0 and skipped<tests and failures==0" in harness
         assert '"postgres_sidecar":True' in harness
         assert "--sandbox-postgres" in harness

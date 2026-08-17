@@ -17,8 +17,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-import backend_verification_guard
-import static_release_guard
+import backend_verification_guard  # noqa: E402
+import static_release_guard  # noqa: E402
 
 
 def test_static_guard_base_unpack_uses_data_filter() -> None:
@@ -120,6 +120,296 @@ def _git(repo: Path, *args: str) -> None:
         capture_output=True,
         text=True,
     )
+
+
+_CLEAN_VERIFICATION_JUNIT = (
+    '<testsuite tests="1" failures="0">'
+    '<testcase classname="testing.test_x" name="test_passes" />'
+    "</testsuite>"
+)
+_FAILING_VERIFICATION_JUNIT = (
+    '<testsuite tests="1" failures="1">'
+    '<testcase classname="testing.test_x" name="test_fails">'
+    '<failure message="boom">boom</failure>'
+    "</testcase></testsuite>"
+)
+
+
+def _run_backend_guard_with_baseline(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    current_junit_text: str,
+    current_exit_code: int,
+    baseline_junit_text: str,
+    baseline_exit_code: int,
+) -> dict[str, object]:
+    repo = tmp_path / "repo"
+    base_tree = tmp_path / "base"
+    harness = base_tree / "scripts" / "test-backend.sh"
+    route_helper = base_tree / "scripts" / "backend-test-route.sh"
+    selector = base_tree / "backend" / "testing" / "test_x.py"
+    repo.mkdir()
+    current_selector = repo / "backend" / "testing" / "test_x.py"
+    current_selector.parent.mkdir(parents=True)
+    current_selector.write_text("def test_passes(): assert True\n", encoding="utf-8")
+    harness.parent.mkdir(parents=True)
+    selector.parent.mkdir(parents=True)
+    harness.write_text(
+        "cat > \"$BLUEPRINT_VERIFICATION_JUNIT\" <<'XML'\n"
+        f"{baseline_junit_text}\n"
+        "XML\n"
+        f"exit {baseline_exit_code}\n",
+        encoding="utf-8",
+    )
+    route_helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    selector.write_text("def test_passes(): assert True\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        backend_verification_guard, "_base_ref", lambda _repo, _base: "automain"
+    )
+
+    def extract_base(_repo: Path, _ref: str, destination: Path) -> None:
+        shutil.copytree(base_tree, destination, dirs_exist_ok=True)
+
+    monkeypatch.setattr(backend_verification_guard, "_extract_base", extract_base)
+
+    current_junit = tmp_path / "current.xml"
+    current_junit.write_text(current_junit_text, encoding="utf-8")
+    exit_code = backend_verification_guard.main(
+        [
+            "--base=automain",
+            f"--repo-root={repo}",
+            f"--current-junit={current_junit}",
+            f"--current-exit-code={current_exit_code}",
+            "--route=--sandbox-postgres",
+            "--harness=scripts/test-backend.sh",
+            "testing/test_x.py",
+        ]
+    )
+
+    assert exit_code == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_backend_guard_blocks_clean_junit_after_nonzero_current_exit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-JUnit current harness failure can never be attributed away."""
+
+    outcome = _run_backend_guard_with_baseline(
+        tmp_path,
+        capsys,
+        monkeypatch,
+        current_junit_text=_CLEAN_VERIFICATION_JUNIT,
+        current_exit_code=1,
+        baseline_junit_text=_CLEAN_VERIFICATION_JUNIT,
+        baseline_exit_code=0,
+    )
+
+    assert outcome["state"] == "execution_failure"
+    assert outcome["blocking"] is True
+    assert outcome["current_exit_code"] == 1
+    assert outcome["current_failures"] == {}
+    assert outcome["baseline_selectors"] == ["testing/test_x.py"]
+
+
+@pytest.mark.parametrize(
+    ("baseline_junit_text", "baseline_exit_code"),
+    [
+        (_CLEAN_VERIFICATION_JUNIT, 1),
+        (_FAILING_VERIFICATION_JUNIT, 0),
+        (_FAILING_VERIFICATION_JUNIT, 2),
+        (_CLEAN_VERIFICATION_JUNIT, 137),
+    ],
+)
+def test_backend_guard_rejects_invalid_baseline_exit_report_pair(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    baseline_junit_text: str,
+    baseline_exit_code: int,
+) -> None:
+    outcome = _run_backend_guard_with_baseline(
+        tmp_path,
+        capsys,
+        monkeypatch,
+        current_junit_text=_CLEAN_VERIFICATION_JUNIT,
+        current_exit_code=0,
+        baseline_junit_text=baseline_junit_text,
+        baseline_exit_code=baseline_exit_code,
+    )
+
+    assert outcome["state"] == "baseline_unavailable"
+    assert outcome["blocking"] is True
+    assert outcome["base_exit_code"] == baseline_exit_code
+    assert "exit code/JUnit pair is not attributable" in outcome["error"]
+
+
+def test_backend_guard_accepts_exit_one_matching_baseline_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = _run_backend_guard_with_baseline(
+        tmp_path,
+        capsys,
+        monkeypatch,
+        current_junit_text=_FAILING_VERIFICATION_JUNIT,
+        current_exit_code=1,
+        baseline_junit_text=_FAILING_VERIFICATION_JUNIT,
+        baseline_exit_code=1,
+    )
+
+    assert outcome["state"] == "preexisting_test_failure"
+    assert outcome["blocking"] is False
+    assert outcome["new_failures"] == {}
+
+
+def _prepare_backend_verification_docker_harness(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a tiny checkout plus a Docker argv-preserving test double."""
+
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "backend" / "testing").mkdir(parents=True)
+    for relative in ("test-backend.sh", "backend-test-route.sh"):
+        destination = repo / "scripts" / relative
+        destination.write_text(
+            (REPO_ROOT / "scripts" / relative).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        os.chmod(destination, 0o755)
+    (repo / "backend" / "requirements.txt").write_text("pytest\n", encoding="utf-8")
+    (repo / "backend" / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (repo / "backend" / "testing" / "test_x.py").write_text(
+        "def test_passes():\n    assert True\n", encoding="utf-8"
+    )
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    docker.write_text(
+        r'''#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  info|pull|tag|network|rm) exit 0 ;;
+  image) exit 0 ;;
+  exec)
+    for arg in "$@"; do
+      if [ "$arg" = "psql" ]; then printf '1\n'; break; fi
+    done
+    exit 0
+    ;;
+  run)
+    shift
+    detached=0
+    image_seen=0
+    output_root=""
+    command=()
+    while [ "$#" -gt 0 ]; do
+      arg="$1"
+      shift
+      case "$arg" in
+        -d) detached=1 ;;
+        --rm) ;;
+        -v)
+          mount="$1"
+          shift
+          case "$mount" in
+            *:/verification-output) output_root="${mount%:/verification-output}" ;;
+          esac
+          ;;
+        -e|--name|--network) shift ;;
+        *)
+          if [ "$image_seen" -eq 0 ]; then
+            image_seen=1
+          else
+            command+=("$arg")
+          fi
+          ;;
+      esac
+    done
+    [ "$detached" -eq 0 ] || exit 0
+    junit=""
+    for arg in "${command[@]}"; do
+      case "$arg" in --junitxml=*) junit="${arg#*=}" ;; esac
+    done
+    [ -n "$junit" ] || exit 0
+    [ -n "$output_root" ] || {
+      echo "verification output mount missing" >&2
+      exit 40
+    }
+    case "$junit" in
+      /verification-output/*) junit_name="${junit#/verification-output/}" ;;
+      *) echo "unmapped JUnit path: $junit" >&2; exit 41 ;;
+    esac
+    printf '%s\n' "$output_root" > "$FAKE_DOCKER_VERIFICATION_MOUNT_LOG"
+    cat > "$output_root/$junit_name" <<'XML'
+<testsuite tests="1" failures="0" errors="0" skipped="0"><testcase classname="testing.test_x" name="test_passes" /></testsuite>
+XML
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    os.chmod(docker, 0o755)
+    return repo, fake_bin
+
+
+@pytest.mark.parametrize("path_kind", ["relative", "whitespace"])
+def test_backend_verification_docker_preserves_configured_junit_path(
+    tmp_path: Path, path_kind: str
+) -> None:
+    """Docker writes the configured filename into the exact canonical host dir."""
+
+    repo, fake_bin = _prepare_backend_verification_docker_harness(tmp_path)
+    if path_kind == "relative":
+        configured = Path("relative-results") / "selected-current.xml"
+        expected = repo / "backend" / configured
+    else:
+        expected = tmp_path / "results with spaces" / "selected-current.xml"
+        configured = expected
+    expected.parent.mkdir(parents=True)
+    receipt = tmp_path / f"{path_kind}-receipt.json"
+    mount_log = tmp_path / f"{path_kind}-mount.log"
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(repo / "scripts" / "test-backend.sh"),
+            "--postgres",
+            "testing/test_x.py",
+        ],
+        cwd=repo,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "BLUEPRINT_VERIFICATION_JUNIT": str(configured),
+            "BLUEPRINT_VERIFICATION_RESULT_FILE": str(receipt),
+            "FAKE_DOCKER_VERIFICATION_MOUNT_LOG": str(mount_log),
+            "TESTMON_NO_FETCH": "1",
+            "USE_TEST_POSTGRES": "true",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert expected.is_file(), output
+    assert mount_log.read_text(encoding="utf-8").strip() == str(
+        expected.parent.resolve()
+    )
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["selectors"] == ["testing/test_x.py"]
+    assert payload["tests"] == 1
+    assert payload["failures"] == 0
 
 
 def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
@@ -253,6 +543,7 @@ case "${1:-}" in
     repo_root=""
     output_root=""
     junit=""
+    guard_selectors=""
     image_seen=0
     command=()
     i=2
@@ -272,7 +563,10 @@ case "${1:-}" in
         -e)
           i=$((i + 1))
           value="${!i}"
-          case "$value" in BLUEPRINT_STATIC_GUARD_JUNIT=*) junit="${value#*=}" ;; esac
+          case "$value" in
+            BLUEPRINT_STATIC_GUARD_JUNIT=*) junit="${value#*=}" ;;
+            BLUEPRINT_STATIC_GUARD_SELECTORS=*) guard_selectors="${value#*=}" ;;
+          esac
           ;;
         *)
           if [ "$image_seen" -eq 0 ]; then
@@ -289,6 +583,10 @@ case "${1:-}" in
       [ "$arg" = "pytest" ] && is_pytest=1
     done
     if [ "$is_pytest" -eq 0 ]; then exit 0; fi
+    selector_enabled() {
+      [ -z "$guard_selectors" ] && return 0
+      printf '%s' "$guard_selectors" | base64 -d 2>/dev/null | grep -Fxq -- "$1"
+    }
     if [ -n "${STATIC_GUARD_CALL_LOG:-}" ]; then
       selectors=""
       pytest_seen=0
@@ -358,9 +656,34 @@ preexisting at $repo_root/backend/testing/test_existing.py</failure></testcase>"
     collect_module="<testcase classname=\"\" name=\"testing.test_collect_boom\"><error message=\"collection failure\">ImportError at $repo_root/backend/testing/test_collect_boom.py</error></testcase>"
     collect_opaque="<testcase classname=\"\" name=\"conftest\"><error message=\"collection failure\">conftest import failure</error></testcase>"
     new_roster="<testcase classname=\"...repo.scripts.test_new_roster\" name=\"test_newly_introduced\"><failure message=\"newly introduced\">newly introduced</failure></testcase>"
+    selected_pre_backend=""
+    selected_pre_scripts=""
+    selected_collect_module=""
+    selected_collect_opaque=""
+    selected_failure_count=0
+    if selector_enabled "testing/test_existing.py"; then
+      selected_pre_backend="$pre_backend"
+      selected_failure_count=$((selected_failure_count + 1))
+    fi
+    if selector_enabled "scripts/test_preexisting_roster.py"; then
+      selected_pre_scripts="$pre_scripts"
+      selected_failure_count=$((selected_failure_count + 1))
+    fi
+    if selector_enabled "testing/test_collect_boom.py"; then
+      selected_collect_module="$collect_module"
+    fi
+    # The opaque collection failure has no file selector. It is visible only
+    # to a genuinely full corpus run, exactly like the production fallback.
+    if [ -z "$guard_selectors" ]; then
+      selected_collect_opaque="$collect_opaque"
+    fi
     if [ "$state" = "collect_base" ]; then
+      selected_collect_count=0
+      [ -n "$selected_collect_module" ] && selected_collect_count=$((selected_collect_count + 1))
+      [ -n "$selected_collect_opaque" ] && selected_collect_count=$((selected_collect_count + 1))
+      selected_tests=$((selected_failure_count + selected_collect_count))
       cat >"$report" <<XML
-<testsuite tests="3" failures="3">$pre_backend$collect_module$collect_opaque</testsuite>
+<testsuite tests="$selected_tests" failures="$selected_tests">$selected_pre_backend$selected_pre_scripts$selected_collect_module$selected_collect_opaque</testsuite>
 XML
       exit 1
     fi
@@ -383,11 +706,39 @@ XML
       exit 1
     fi
     if [ "$state" = "preexisting" ]; then
+      if [ "$selected_failure_count" -eq 0 ]; then
+        cat >"$report" <<'XML'
+<testsuite tests="1" failures="0"><testcase classname="guard" name="clean" /></testsuite>
+XML
+        exit 0
+      fi
       cat >"$report" <<XML
-<testsuite tests="2" failures="2">$pre_backend$pre_scripts</testsuite>
+<testsuite tests="$selected_failure_count" failures="$selected_failure_count">$selected_pre_backend$selected_pre_scripts</testsuite>
 XML
       exit 1
     fi
+    if [ "$state" = "partial_preexisting" ]; then
+      cat >"$report" <<XML
+<testsuite tests="1" failures="1">$pre_backend</testsuite>
+XML
+      exit 1
+    fi
+    if [ "$state" = "partial_skipped" ]; then
+      pre_scripts_skipped="<testcase classname=\"...repo.scripts.test_preexisting_roster\" name=\"test_roster_preexisting\"><skipped message=\"harness selection\" /></testcase>"
+      cat >"$report" <<XML
+<testsuite tests="2" failures="1" skipped="1">$pre_backend$pre_scripts_skipped</testsuite>
+XML
+      exit 1
+    fi
+    case "$state" in
+      preexisting_exit_*)
+        abnormal_exit="${state#preexisting_exit_}"
+        cat >"$report" <<XML
+<testsuite tests="$selected_failure_count" failures="$selected_failure_count">$selected_pre_backend$selected_pre_scripts</testsuite>
+XML
+        exit "$abnormal_exit"
+        ;;
+    esac
     if [ "$state" = "new_node" ]; then
       # The new failure is a node that does not exist in the base tree, inside a
       # roster file that does.
@@ -494,6 +845,262 @@ def test_identical_failure_with_tree_specific_path_is_preexisting(tmp_path: Path
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert "no new failures vs base" in output
+
+
+@pytest.mark.parametrize("abnormal_exit", [0, 2, 3, 4, 5, 137])
+@pytest.mark.parametrize("invalid_side", ["current", "baseline"])
+def test_static_guard_rejects_invalid_exit_junit_pair_before_attribution(
+    tmp_path: Path, abnormal_exit: int, invalid_side: str
+) -> None:
+    """An incomplete current or baseline run cannot subtract matching failures."""
+
+    invalid_state = f"preexisting_exit_{abnormal_exit}"
+    current_state = invalid_state if invalid_side == "current" else "preexisting"
+    base_state = invalid_state if invalid_side == "baseline" else "preexisting"
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path, current_state, base_state=base_state
+    )
+
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id=f"task-invalid-{invalid_side}-{abnormal_exit}",
+    )
+
+    output = result.stdout + result.stderr
+    expected_authority = (
+        "execution_failure" if invalid_side == "current" else "baseline_unavailable"
+    )
+    assert result.returncode != 0, output
+    assert expected_authority in output
+    assert "pytest exit code/JUnit pair is not attributable" in output
+    assert "no new failures vs base" not in output
+    assert "[static guard] PASS" not in output
+
+
+@pytest.mark.parametrize(
+    ("current_state", "base_state"),
+    [("clean", "clean"), ("preexisting", "preexisting")],
+)
+def test_static_guard_accepts_legitimate_clean_and_exit_one_pairs(
+    tmp_path: Path, current_state: str, base_state: str
+) -> None:
+    """Exit zero/clean and exit one/failing remain valid attribution evidence."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path, current_state, base_state=base_state
+    )
+
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id=f"task-valid-{current_state}",
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "execution_failure" not in output
+    assert "baseline_unavailable" not in output
+    assert "[static guard] PASS" in output
+
+
+def test_changed_harness_clean_current_rejects_invalid_full_baseline_pair(
+    tmp_path: Path,
+) -> None:
+    """The clean-current harness audit validates its full baseline authority."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path,
+        "clean",
+        base_state="preexisting_exit_2",
+    )
+    harness = repo / "scripts" / "test-backend.sh"
+    harness.write_text(harness.read_text() + "\n# current harness changed\n")
+
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id="task-clean-current-invalid-baseline",
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "baseline_unavailable" in output
+    assert "pytest exit code/JUnit pair is not attributable" in output
+    assert "no new failures vs base" not in output
+    assert "[static guard] PASS" not in output
+
+
+def test_changed_harness_invocation_cannot_hide_base_corpus_failure(
+    tmp_path: Path,
+) -> None:
+    """Invocation weakening outside the roster fingerprint remains blocking."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path,
+        "clean",
+        base_state="preexisting",
+    )
+    harness = repo / "scripts" / "test-backend.sh"
+    original = harness.read_text(encoding="utf-8")
+    invocation = (
+        '  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest \\\n'
+    )
+    weakened = (
+        "  # WEAKENED_HARNESS: invocation-only selection change\n"
+        '  _run python3 -m pytest "${STANDALONE_ARGS[0]}" -v --noconftest \\\n'
+    )
+    assert invocation in original
+    harness.write_text(original.replace(invocation, weakened, 1), encoding="utf-8")
+
+    base_harness = tmp_path / "base-test-backend.sh"
+    base_harness.write_text(
+        subprocess.run(
+            ["git", "show", "automain:scripts/test-backend.sh"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout,
+        encoding="utf-8",
+    )
+    assert not static_release_guard._static_roster_changed(base_harness, harness)
+
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id="task-invocation-weakening",
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "changed static test harness made base corpus failure(s) disappear" in output
+    assert "[static guard] PASS" not in output
+
+
+@pytest.mark.parametrize(
+    ("current_state", "expected_reason"),
+    [
+        ("partial_preexisting", "failure(s) disappear"),
+        ("partial_skipped", "failure(s) become skipped"),
+    ],
+)
+def test_changed_harness_partial_invocation_cannot_hide_base_corpus_failure(
+    tmp_path: Path,
+    current_state: str,
+    expected_reason: str,
+) -> None:
+    """A retained old failure cannot conceal another omitted baseline failure."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path,
+        current_state,
+        base_state="preexisting",
+    )
+    harness = repo / "scripts" / "test-backend.sh"
+    original = harness.read_text(encoding="utf-8")
+    invocation = (
+        '  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest \\\n'
+    )
+    weakened = (
+        "  # PARTIAL_SELECTION_CHANGE: invocation-only weakening\n"
+        '  _run python3 -m pytest "${STANDALONE_ARGS[@]:0:1}" -v --noconftest \\\n'
+    )
+    assert invocation in original
+    harness.write_text(original.replace(invocation, weakened, 1), encoding="utf-8")
+
+    base_harness = tmp_path / "base-test-backend.sh"
+    base_harness.write_text(
+        subprocess.run(
+            ["git", "show", "automain:scripts/test-backend.sh"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout,
+        encoding="utf-8",
+    )
+    assert not static_release_guard._static_roster_changed(base_harness, harness)
+
+    call_log = tmp_path / f"partial-{current_state}-calls.log"
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id=f"task-partial-invocation-weakening-{current_state}",
+        call_log=call_log,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert expected_reason in output
+    assert "[static guard] PASS" not in output
+    calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
+    assert len(calls) == 2
+    # A is the surviving backend failure; B is the hidden scripts failure.
+    # The fake Docker exposes A+B when the guard leaves the base run unscoped;
+    # those fixture paths are not literal members of the production static
+    # roster.  Prove the untouched base harness ran its broader roster instead
+    # of inheriting the candidate's one-selector weakening.
+    current = [arg for arg in calls[0].split() if not arg.startswith("-")]
+    baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
+    assert len(current) == 1, current
+    assert set(current) < set(baseline), baseline
+
+
+def test_unchanged_harness_clean_current_keeps_lazy_base_control(
+    tmp_path: Path,
+) -> None:
+    """A clean current corpus does not charge an unexecuted unchanged baseline."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path,
+        "clean",
+        base_state="preexisting",
+    )
+    call_log = tmp_path / "unchanged-harness-calls.log"
+
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id="task-unchanged-harness-control",
+        call_log=call_log,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert len(call_log.read_text(encoding="utf-8").splitlines()) == 1
+    assert "<harness>" not in output
+    assert "[static guard] PASS" in output
+
+
+def test_unchanged_harness_failing_current_keeps_scoped_baseline_control(
+    tmp_path: Path,
+) -> None:
+    """Only an unchanged harness may scope base work to surviving failure A."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path,
+        "partial_preexisting",
+        base_state="preexisting",
+    )
+    call_log = tmp_path / "unchanged-failing-harness-calls.log"
+
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id="task-unchanged-failing-harness-control",
+        call_log=call_log,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
+    assert len(calls) == 2
+    baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
+    assert baseline == ["testing/test_existing.py"], baseline
+    assert "/repo/scripts/test_preexisting_roster.py" not in calls[1]
+    assert "no new failures vs base" in output
+    assert "[static guard] PASS" in output
 
 
 @pytest.mark.parametrize(

@@ -24,6 +24,7 @@ from testing.fixgate_attribution import (  # noqa: E402
     JUnitReport,
     classify_verification,
     extract_base,
+    is_attributable_pytest_result,
     parse_junit_report,
 )
 
@@ -123,6 +124,20 @@ def main(argv: list[str] | None = None) -> int:
                                 "state": "baseline_unavailable",
                                 "blocking": True,
                                 "error": str(exc),
+                                "base_exit_code": result.returncode,
+                            }
+                        )
+                    )
+                    return 0
+                if not is_attributable_pytest_result(
+                    result.returncode, baseline_report
+                ):
+                    print(
+                        json.dumps(
+                            {
+                                "state": "baseline_unavailable",
+                                "blocking": True,
+                                "error": "baseline pytest exit code/JUnit pair is not attributable",
                                 "base_exit_code": result.returncode,
                             }
                         )

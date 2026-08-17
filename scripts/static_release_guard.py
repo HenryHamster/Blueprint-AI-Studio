@@ -23,6 +23,7 @@ from testing.fixgate_attribution import (  # noqa: E402
     JUnitReport,
     attribute_reports,
     extract_base,
+    is_attributable_pytest_result,
     parse_junit_report,
 )
 
@@ -75,6 +76,26 @@ _extract_base = extract_base
 
 def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, check=False)
+
+
+def _pytest_result_is_authoritative(
+    result: subprocess.CompletedProcess[str],
+    report: JUnitReport,
+    *,
+    authority: str,
+) -> bool:
+    """Reject an exit/JUnit pair that cannot authorize differential attribution."""
+
+    if is_attributable_pytest_result(result.returncode, report):
+        return True
+    print(
+        f"[static guard] ERROR: {authority} \u2014 pytest exit code/JUnit pair "
+        f"is not attributable (exit {result.returncode})",
+        file=sys.stderr,
+    )
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return False
 
 
 def _junit_failures(
@@ -298,14 +319,20 @@ def main(argv: list[str] | None = None) -> int:
         else:
             current_failures = current_report.failures
             new_failures: dict[str, str] = {}
-            if not current_failures:
-                # A harness/import failure has no testcase identity. It is still a
-                # real failure, and must not be converted into a green result.
-                if current_result.returncode != 0:
-                    new_failures = {"<harness>": current_result.stderr or current_result.stdout}
-                elif harness_changed:
-                    # A changed harness is checked against the base roster, but a
-                    # normal test removal or rename is not itself a finding.
+            corpus_authoritative = _pytest_result_is_authoritative(
+                current_result,
+                current_report,
+                authority="execution_failure",
+            )
+            if not corpus_authoritative:
+                failures.append("standalone static corpus execution_failure")
+            elif not current_failures:
+                # A changed harness is checked against the base corpus, but a
+                # normal clean candidate does not need differential subtraction.
+                if harness_changed:
+                    # The partial roster fingerprint only sharpens the finding's
+                    # diagnostic. It can never authorize a clean current report
+                    # when the unchanged base harness still exposes failures.
                     base_result = _run_static_corpus(base_root, base_junit)
                     try:
                         baseline_report = parse_junit_report(
@@ -319,15 +346,33 @@ def main(argv: list[str] | None = None) -> int:
                         print(base_result.stdout, end="")
                         print(base_result.stderr, end="", file=sys.stderr)
                         failures.append("standalone static corpus attribution")
+                        corpus_authoritative = False
                     else:
-                        if roster_changed and baseline_report.failures:
+                        if not _pytest_result_is_authoritative(
+                            base_result,
+                            baseline_report,
+                            authority="baseline_unavailable",
+                        ):
+                            failures.append("standalone static corpus baseline_unavailable")
+                            corpus_authoritative = False
+                        elif baseline_report.failures:
+                            if roster_changed:
+                                reason = "changed static test roster"
+                            else:
+                                reason = "changed static test harness"
                             new_failures["<harness>"] = (
-                                "changed static test roster made base corpus "
-                                "failure(s) disappear"
+                                f"{reason} made base corpus failure(s) disappear"
                             )
             else:
                 selectors, unresolved = _failed_selectors(current_junit, tree_root=repo)
-                if unresolved:
+                if harness_changed:
+                    # A changed harness can hide a baseline failure outside the
+                    # files that still fail in the current tree.  A baseline
+                    # scoped to those surviving failures cannot distinguish
+                    # current A from baseline A+B, so only the full base corpus
+                    # is authoritative for harness-change attribution.
+                    base_selectors = None
+                elif unresolved:
                     # At least one current failure has no derivable selector
                     # (e.g. a collection error, which pytest reports with an
                     # empty classname). A scoped baseline cannot cover it, so
@@ -388,28 +433,47 @@ def main(argv: list[str] | None = None) -> int:
                             print(current_result.stderr, end="", file=sys.stderr)
                             failures.append("standalone static corpus attribution")
                             baseline_report = None
+                            corpus_authoritative = False
                     if baseline_report is not None:
-                        attributed = attribute_reports(current_report, baseline_report)
-                        new_failures = attributed.new_failures
-                        if harness_changed and roster_changed and baseline_report.failures:
-                            new_failures["<harness>"] = (
-                                "changed static test roster made base corpus "
-                                "failure(s) disappear"
-                            )
-                        if attributed.suppressed_failures:
-                            suppressed = {
-                                key: {
-                                    "detail": detail,
-                                    "reason": "same route/test/failure kind failed on baseline",
+                        if base_result is not None and not _pytest_result_is_authoritative(
+                            base_result,
+                            baseline_report,
+                            authority="baseline_unavailable",
+                        ):
+                            failures.append("standalone static corpus baseline_unavailable")
+                            corpus_authoritative = False
+                        else:
+                            attributed = attribute_reports(current_report, baseline_report)
+                            new_failures = attributed.new_failures
+                            hidden_by_harness: list[str] = []
+                            if harness_changed and attributed.disappeared_failures:
+                                hidden_by_harness.append("disappear")
+                            if harness_changed and attributed.skipped_failures:
+                                hidden_by_harness.append("become skipped")
+                            if hidden_by_harness:
+                                new_failures["<harness>"] = (
+                                    "changed static test harness made base corpus "
+                                    f"failure(s) {' or '.join(hidden_by_harness)}"
+                                )
+                            elif harness_changed and roster_changed and baseline_report.failures:
+                                new_failures["<harness>"] = (
+                                    "changed static test roster made base corpus "
+                                    "failure(s) disappear"
+                                )
+                            if attributed.suppressed_failures:
+                                suppressed = {
+                                    key: {
+                                        "detail": detail,
+                                        "reason": "same route/test/failure kind failed on baseline",
+                                    }
+                                    for key, detail in attributed.suppressed_failures.items()
                                 }
-                                for key, detail in attributed.suppressed_failures.items()
-                            }
-                            print(
-                                "[static guard] suppressed baseline failures: "
-                                f"{json.dumps(suppressed, sort_keys=True)}"
-                            )
+                                print(
+                                    "[static guard] suppressed baseline failures: "
+                                    f"{json.dumps(suppressed, sort_keys=True)}"
+                                )
 
-            if new_failures:
+            if corpus_authoritative and new_failures:
                 try:
                     attributed = _attributed_findings(
                         new_failures, task_id=task_id, source="standalone static corpus"
@@ -423,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(current_result.stdout, end="")
                 print(current_result.stderr, end="", file=sys.stderr)
                 failures.append("standalone static corpus")
-            else:
+            elif corpus_authoritative:
                 print("[static guard] standalone static corpus OK (no new failures vs base)")
 
     if failures:
