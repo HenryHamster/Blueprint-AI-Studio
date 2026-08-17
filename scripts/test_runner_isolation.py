@@ -683,6 +683,28 @@ class TestEnvAllowlist(unittest.TestCase):
         for key in policy:
             self.assertNotIn(key, untrusted)
 
+    def test_backend_verification_runtime_is_validated_toolchain_only(self):
+        runtime = {
+            "BLUEPRINT_SANDBOX_PYTHON": "/opt/verified/bin/python",
+            "BLUEPRINT_SANDBOX_PG_BINDIR": "/opt/verified/pg/bin",
+        }
+        untrusted = iso.build_agent_env(
+            {},
+            {key: f"/credential/{key}" for key in runtime},
+            [],
+            per_task_creds={key: f"/vended/{key}" for key in runtime},
+        )
+        for key in runtime:
+            self.assertNotIn(key, untrusted)
+
+        trusted = iso.build_agent_env(
+            {},
+            {},
+            [],
+            verification_env=runtime,
+        )
+        self.assertEqual({key: trusted[key] for key in runtime}, runtime)
+
 
 # ── bwrap argv builder ────────────────────────────────────────────────────────
 

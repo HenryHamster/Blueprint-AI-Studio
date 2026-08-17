@@ -211,6 +211,14 @@ _AGENT_IDENTITY_ENV_KEYS: frozenset[str] = frozenset(
         # source_env — deliberately NOT in AGENT_ENV_ALLOWLIST) so a docker
         # agent image's baked marker stays authoritative.
         "AGENT_SOURCE_SHA",
+    }
+)
+# Backend-verification routes are derived only from a locally validated
+# verification toolchain. They are deliberately separate from generic injected
+# identity/credential values so an absent toolchain fails closed instead of a
+# server credential envelope fabricating one.
+_AGENT_VERIFICATION_ENV_KEYS: frozenset[str] = frozenset(
+    {
         "BLUEPRINT_SANDBOX_PYTHON",
         "BLUEPRINT_SANDBOX_PG_BINDIR",
     }
@@ -1351,6 +1359,7 @@ def build_agent_env(
     injected: dict[str, str],
     tool_dirs: list[str] | None = None,
     per_task_creds: dict[str, str] | None = None,
+    verification_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Build an agent task's env from the ALLOWLIST only — never a copy.
 
@@ -1366,6 +1375,9 @@ def build_agent_env(
     are intentionally *not* in ``AGENT_ENV_ALLOWLIST``, so they can arrive only
     in ``per_task_creds`` and never flow from a long-lived runner environment.
     Both injected and vended values are filtered through fixed allowlists.
+    ``verification_env`` is a distinct runner-only channel populated from a
+    locally validated verification toolchain; generic credentials cannot
+    author its interpreter or PostgreSQL paths.
     """
     env: dict[str, str] = {}
     for key in AGENT_ENV_ALLOWLIST:
@@ -1387,6 +1399,16 @@ def build_agent_env(
             and value
         }
     )
+    if verification_env:
+        env.update(
+            {
+                key: value
+                for key, value in verification_env.items()
+                if key in _AGENT_VERIFICATION_ENV_KEYS
+                and isinstance(value, str)
+                and value
+            }
+        )
     if per_task_creds:
         for key, val in per_task_creds.items():
             if (
@@ -2318,8 +2340,10 @@ def plan_agent_execution(
     verification_injected: dict[str, str] = {}
     if verification_toolchain is not None:
         tool_dirs += [verification_toolchain.postgres_bindir]
-        verification_injected = {"BLUEPRINT_SANDBOX_PYTHON": verification_toolchain.python_path,
-                                 "BLUEPRINT_SANDBOX_PG_BINDIR": verification_toolchain.postgres_bindir}
+        verification_injected = {
+            "BLUEPRINT_SANDBOX_PYTHON": verification_toolchain.python_path,
+            "BLUEPRINT_SANDBOX_PG_BINDIR": verification_toolchain.postgres_bindir,
+        }
     tool_dirs += provider_tool_dirs
     tool_dirs += tool_dirs_for(tools)
 
@@ -2331,10 +2355,10 @@ def plan_agent_execution(
             # mountpoint itself: rm -rf on the mountpoint returns EBUSY.
             "AGENT_WORKSPACE": SANDBOX_WORKSPACE + "/agent",
             "HOME": SANDBOX_HOME,
-            **verification_injected,
         },
         tool_dirs,
         per_task_creds=per_task_creds,
+        verification_env=verification_injected,
     )
 
     argv = build_bwrap_argv(

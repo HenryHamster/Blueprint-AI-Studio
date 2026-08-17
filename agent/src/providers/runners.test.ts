@@ -172,7 +172,7 @@ describe('provider CLI test-worker policy', () => {
   } as const;
 
   afterEach(() => {
-    for (const key of Object.keys(workerPolicy)) delete process.env[key];
+    for (const key of Object.keys(workerPolicy)) Reflect.deleteProperty(process.env, key);
   });
 
   it('passes the runner-authored limits into model-issued shell commands', async () => {
@@ -183,10 +183,62 @@ describe('provider CLI test-worker policy', () => {
 
     const options = vi.mocked(spawn).mock.calls[0]?.[2];
     expect(options).toBeDefined();
-    const spawnedEnv = options?.env as NodeJS.ProcessEnv;
+    const spawnedEnv = options.env as NodeJS.ProcessEnv;
     for (const [key, value] of Object.entries(workerPolicy)) {
       expect(spawnedEnv[key]).toBe(value);
     }
+  });
+});
+
+describe('provider CLI backend-verification runtime', () => {
+  const verificationRuntime = {
+    BLUEPRINT_SANDBOX_PYTHON: '/opt/blueprint-backend-venv/bin/python',
+    BLUEPRINT_SANDBOX_PG_BINDIR: '/opt/blueprint-backend-venv/pg/bin',
+  } as const;
+
+  afterEach(() => {
+    for (const key of Object.keys(verificationRuntime)) Reflect.deleteProperty(process.env, key);
+    delete process.env.BLUEPRINT_SANDBOX_UNTRUSTED;
+    delete process.env.LLM_CLI_TRANSLATION;
+    refreshRuntimeState();
+  });
+
+  it('passes only the runner-authored PostgreSQL route into model-issued shell commands', async () => {
+    Object.assign(process.env, verificationRuntime, {
+      BLUEPRINT_SANDBOX_UNTRUSTED: 'must-not-cross-provider-boundary',
+    });
+    emitStream([JSON.stringify({ type: 'result', result: 'ok' })]);
+
+    await runProviderAgent('prompt', null, { value: '' });
+
+    const spawnCalls = vi.mocked(spawn).mock.calls;
+    const options = spawnCalls[spawnCalls.length - 1]?.[2];
+    expect(options).toBeDefined();
+    const spawnedEnv = options.env as NodeJS.ProcessEnv;
+    expect(spawnedEnv).toMatchObject(verificationRuntime);
+    expect(spawnedEnv.BLUEPRINT_SANDBOX_UNTRUSTED).toBeUndefined();
+  });
+
+  it('does not let a CLI translation synthesize runner-authored runtime paths', async () => {
+    process.env.LLM_CLI_TRANSLATION = JSON.stringify({
+      env: {
+        BLUEPRINT_SANDBOX_PYTHON: '/untrusted/python',
+        BLUEPRINT_SANDBOX_PG_BINDIR: '/untrusted/pg/bin',
+        TRANSLATED_SAFE_VALUE: 'preserved',
+      },
+    });
+    refreshRuntimeState();
+    emitStream([JSON.stringify({ type: 'result', result: 'ok' })]);
+
+    await runProviderAgent('prompt', null, { value: '' });
+
+    const spawnCalls = vi.mocked(spawn).mock.calls;
+    const options = spawnCalls[spawnCalls.length - 1]?.[2];
+    expect(options).toBeDefined();
+    const spawnedEnv = options.env as NodeJS.ProcessEnv;
+    expect(spawnedEnv.BLUEPRINT_SANDBOX_PYTHON).toBeUndefined();
+    expect(spawnedEnv.BLUEPRINT_SANDBOX_PG_BINDIR).toBeUndefined();
+    expect(spawnedEnv.TRANSLATED_SAFE_VALUE).toBe('preserved');
   });
 });
 
@@ -209,6 +261,8 @@ describe('isolated receipt-only runner contract', () => {
         env: {
           HOME: '/ambient-home', PATH: '/bin', AGENT_API_TOKEN: 'must-not-leak',
           ANTHROPIC_API_KEY: 'provider-only', GITHUB_TOKEN: 'must-not-leak',
+          BLUEPRINT_SANDBOX_PYTHON: '/opt/blueprint-backend-venv/bin/python',
+          BLUEPRINT_SANDBOX_PG_BINDIR: '/opt/blueprint-backend-venv/pg/bin',
         },
         outputMode: 'claude-stream-json' as const,
         timeoutMs: 600_000,
