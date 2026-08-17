@@ -217,10 +217,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="automain")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--size-only",
         action="store_true",
         help="run the always-on module-size check without the standalone corpus",
+    )
+    mode_group.add_argument(
+        "--corpus-only",
+        action="store_true",
+        help="run the attributed standalone corpus without the module-size check",
     )
     args = parser.parse_args(argv)
     repo = args.repo_root.resolve()
@@ -253,25 +259,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[static guard] ERROR: {exc}", file=sys.stderr)
             return 2
 
-        size_result = _run_size_guard(repo, base_root)
-        if size_result.returncode != 0:
-            print("[static guard] module size guard FAILED")
-            try:
-                size_findings = _attributed_findings(
-                    {"<module-size-guard>": size_result.stdout + size_result.stderr},
-                    task_id=task_id,
-                    source="module size guard",
-                )
-            except RuntimeError as exc:
-                print(f"[static guard] ERROR: {exc}", file=sys.stderr)
-                failures.append("module size guard attribution")
-            else:
-                print(f"[static guard] findings: {json.dumps(size_findings)}")
-            print(size_result.stdout, end="")
-            print(size_result.stderr, end="", file=sys.stderr)
-            failures.append("module size guard")
+        if args.corpus_only:
+            print("[static guard] module size guard SKIPPED (--corpus-only)")
         else:
-            print("[static guard] module size guard OK")
+            size_result = _run_size_guard(repo, base_root)
+            if size_result.returncode != 0:
+                print("[static guard] module size guard FAILED")
+                try:
+                    size_findings = _attributed_findings(
+                        {"<module-size-guard>": size_result.stdout + size_result.stderr},
+                        task_id=task_id,
+                        source="module size guard",
+                    )
+                except RuntimeError as exc:
+                    print(f"[static guard] ERROR: {exc}", file=sys.stderr)
+                    failures.append("module size guard attribution")
+                else:
+                    print(f"[static guard] findings: {json.dumps(size_findings)}")
+                print(size_result.stdout, end="")
+                print(size_result.stderr, end="", file=sys.stderr)
+                failures.append("module size guard")
+            else:
+                print("[static guard] module size guard OK")
 
         if args.size_only:
             if failures:

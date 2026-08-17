@@ -44,11 +44,6 @@ for arg in "$@"; do
   esac
 done
 
-# Fresh GATE-ENVIRONMENT marker per run: cleared here, re-written by the
-# config-driven pytest gate below only if this environment still cannot run
-# the suite faithfully. ./pr surfaces it after a passing `./check test`.
-rm -f /tmp/check_gate_env_local-developer.txt
-
 # Determine changed paths: committed since base + uncommitted. The base diff
 # FAILS CLOSED when it cannot be computed — an empty CHANGED must only ever
 # mean "the diff was computed and genuinely no files changed", never "we
@@ -225,7 +220,7 @@ if touches "admin-ui/"; then
   # full vite bundle runs in CI after ./pr open.
   run "admin-ui typecheck" bash -c 'cd "admin-ui" && npm run typecheck'
   if [ "$WITH_TESTS" = "1" ]; then
-    run "admin-ui vitest" bash -c 'set -o pipefail; cd admin-ui && npx vitest run 2>&1 | tail -80'
+    run "admin-ui vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
   fi
 fi
 
@@ -246,7 +241,7 @@ if touches "agent/"; then
   fi
   run "agent build" bash -c 'cd "agent" && npm run build'
   if [ "$WITH_TESTS" = "1" ]; then
-    run "agent vitest" bash -c 'set -o pipefail; cd agent && npx vitest run 2>&1 | tail -80'
+    run "agent vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite agent --base "$BASE" --repo-root "$WORKSPACE"
   fi
 fi
 
@@ -264,68 +259,6 @@ if touches "backend/"; then
       echo "[check] no changed Python files in backend, skipping lint"
     fi
   fi
-  if [ "$WITH_TESTS" = "1" ]; then
-    # Honest pytest gate: prefer the sanctioned Docker harness; if only an
-    # unfaithful SQLite fallback is available, emit GATE-ENVIRONMENT instead
-    # of blocking on pre-existing environment-only failures. CI remains the
-    # authoritative Postgres run either way.
-    _GATE_MODE="bare"
-    _PG_ENV_OK=0
-    case "${DATABASE_URL:-}" in
-      postgresql*) [ "$(printf '%s' "${USE_TEST_POSTGRES:-}" | tr '[:upper:]' '[:lower:]')" = "true" ] && _PG_ENV_OK=1 ;;
-    esac
-    if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-      _AVAIL_MB=$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 99999)
-      if [ -n "${ALLOW_LOW_MEM:-}" ]; then
-        # Explicit opt-in: force the full sanctioned harness regardless of memory.
-        _GATE_MODE="harness"
-      elif grep -qs -- '--standalone' scripts/test-backend.sh; then
-        # Default on the agent VM: the local gate is a SMOKE CHECK; the full
-        # Docker/Postgres suite is CI's job (and OOMs the 8 GB agent VM, exit
-        # 137). When the harness offers its sanctioned standalone partial, always
-        # prefer it — do NOT run the full suite just because memory happens to be
-        # free at gate-start (the old "_AVAIL_MB >= 4096 -> full" rule fired the
-        # full suite on exactly the VMs too small to survive it).
-        _GATE_MODE="harness-standalone"
-      elif [ "${_AVAIL_MB:-99999}" -ge 4096 ]; then
-        # Harness has no standalone mode — only then run the full harness, and
-        # only with memory headroom for it.
-        _GATE_MODE="harness"
-      fi
-    elif [ -f scripts/test-backend.sh ] && grep -qs -- '--standalone' scripts/test-backend.sh && grep -qs -- '--no-postgres' scripts/test-backend.sh && ! command -v docker >/dev/null 2>&1; then
-      # Docker binary absent AND harness supports --standalone --no-postgres: run
-      # the no-DB invariant + manifest suites directly. When docker binary is
-      # present but the daemon is unavailable (docker info exits 1 — handled above),
-      # the harness still detects the binary and tries to build/pull, so we must
-      # not enter this path in that case. Without docker at all, the harness falls
-      # through to direct pytest which does not need a daemon.
-      _GATE_MODE="harness-standalone"
-    fi
-    if [ "$_GATE_MODE" = "bare" ] && [ "$_PG_ENV_OK" = "0" ] && grep -qs USE_TEST_POSTGRES "backend/conftest.py" "backend"/*/conftest.py; then
-      # The suite selects Postgres-vs-SQLite from env, the Postgres test env
-      # is absent, and the sanctioned harness cannot run here — a bare run
-      # would be the unfaithful SQLite fallback.
-      _GATE_MODE="gate-env"
-    fi
-    case "$_GATE_MODE" in
-      harness)
-        run "backend test (sanctioned harness)" bash -c 'set -o pipefail; bash scripts/test-backend.sh 2>&1 | tail -200' ;;
-      harness-standalone)
-        echo "[check] note: local gate is a smoke check — full Docker/Postgres suite runs in CI; running the harness standalone mode"
-        run "backend test (harness standalone)" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200' ;;
-      bare)
-        run "backend test" bash -c 'cd "backend" && pytest' ;;
-      gate-env)
-        echo "[check] GATE-ENVIRONMENT: backend test gate cannot run faithfully on this VM."
-        echo "[check]   A bare pytest here would select the in-memory SQLite fallback (no Postgres test env, no Docker for the sanctioned harness), where pre-existing Postgres-only tests fail regardless of your diff."
-        echo "[check]   Skipping the unfaithful run instead of blocking on an environment artifact. This is NOT a verdict on your change:"
-        echo "[check]   - Validate the diff where the suite CAN faithfully run (the project's Docker/Postgres harness, or targeted single-file runs) and record that evidence in the PR body."
-        echo "[check]   - CI runs the authoritative Postgres suite on the PR after ./pr open."
-        echo "[check]   - If you have NO faithful test evidence for a test-relevant change, call ./blocked \"<reason>\" --needs-capability \"postgres test environment\" instead of shipping blind."
-        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env; a bare run would be an unfaithful SQLite fallback" >> /tmp/check_gate_env_local-developer.txt ;;
-    esac
-  fi
-
   if [ -n "$(printf '%s\n' "$CHANGED" | while IFS= read -r f; do case "$f" in backend/*.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]; then
     # required backend-authoring verification. No skip can mint this receipt.
     _VERIFICATION_ROUTE_HELPER_OK=0

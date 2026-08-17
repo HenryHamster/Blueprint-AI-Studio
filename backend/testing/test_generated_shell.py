@@ -2178,6 +2178,19 @@ class TestProjectVerificationRuntimeContract:
                 f"shared backend route contract missing {required}"
             )
         assert "backend_test_sandbox_available" in helper
+        # The tracked developer fallback uses the same attributed static guard
+        # for the standalone corpus. It must not retain a second raw pytest
+        # decision ladder that can skip the corpus without recording a failure.
+        assert 'run "static release guards (task diff)" python3 scripts/static_release_guard.py' in tracked
+        for forbidden in (
+            "_GATE_MODE",
+            "GATE-ENVIRONMENT",
+            "check_gate_env_local-developer",
+            'run "backend test (harness standalone)"',
+        ):
+            assert forbidden not in tracked, (
+                f"tracked developer check retains retired pytest waiver token {forbidden}"
+            )
 
 
 def _extract_default_backend_verification() -> str:

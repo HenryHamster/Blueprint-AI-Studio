@@ -8,6 +8,7 @@ Run with: pytest testing/test_invariants.py -v --noconftest
 """
 
 import ast
+import json
 import io
 import os
 import re
@@ -6093,17 +6094,32 @@ def _missing_cap_message(offenders: list, section: str) -> str:
         f"  - {rel} has {count} lines (threshold: {_COVERAGE_THRESHOLD})"
         for rel, count in offenders
     )
+    offender_marker = "BLUEPRINT_OFFENDERS: " + json.dumps(
+        sorted(rel for rel, _count in offenders), separators=(",", ":")
+    )
     return (
         f"{len(offenders)} source file(s) exceed {_COVERAGE_THRESHOLD} lines "
         f"with NO cap entry under '{section}' in "
         f"backend/testing/module_size_limits.json:\n\n"
         f"{lines}\n\n"
+        f"{offender_marker}\n\n"
         f"A large file with no cap is invisible to the size guardrails and can\n"
         f"grow without limit. Add an entry for each file above under the\n"
         f"'{section}' section, set to its current line count plus modest\n"
         f"headroom (e.g. current + 100). This is a reviewed config edit, not a\n"
         f"refactor — do NOT extract or restructure the source in this PR."
     )
+
+
+def test_missing_cap_message_emits_deterministic_offender_marker():
+    message = _missing_cap_message(
+        [("z.py", 1702), ("a.py", 1601)],
+        "backend",
+    )
+
+    assert 'BLUEPRINT_OFFENDERS: ["a.py","z.py"]' in message
+    assert "z.py has 1702 lines" in message
+    assert "a.py has 1601 lines" in message
 
 def _scan_uncapped(root: str, section: dict, suffixes: tuple, is_excluded) -> list:
     """Walk ``root`` collecting (tree_relative_path, line_count) for every file

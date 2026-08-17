@@ -435,6 +435,10 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
         tmp_path / "backend" / "testing" / "check_size_limits.py",
     )
     shutil.copy2(
+        REPO_ROOT / "backend" / "testing" / "fixgate_attribution.py",
+        tmp_path / "backend" / "testing" / "fixgate_attribution.py",
+    )
+    shutil.copy2(
         REPO_ROOT / "backend" / "app" / "size_limit_policy.py",
         tmp_path / "backend" / "app" / "size_limit_policy.py",
     )
@@ -496,6 +500,10 @@ def _prepare_docker_attribution_repo(
     shutil.copy2(
         REPO_ROOT / "backend" / "testing" / "check_size_limits.py",
         tmp_path / "backend" / "testing" / "check_size_limits.py",
+    )
+    shutil.copy2(
+        REPO_ROOT / "backend" / "testing" / "fixgate_attribution.py",
+        tmp_path / "backend" / "testing" / "fixgate_attribution.py",
     )
     (tmp_path / "backend" / "requirements.txt").write_text("pytest\n")
     (tmp_path / "backend" / "Dockerfile").write_text("FROM scratch\n")
@@ -1137,6 +1145,36 @@ def test_baseline_corpus_is_lazy_after_current_tree_result(
     output = result.stdout + result.stderr
     assert result.returncode == expected_returncode, output
     assert len(call_log.read_text().splitlines()) == expected_corpus_runs
+
+
+def test_corpus_only_skips_module_size_guard(tmp_path: Path) -> None:
+    """The generated backend lane can reuse attribution without size checks."""
+    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "clean")
+    result = subprocess.run(
+        [
+            "python3",
+            "scripts/static_release_guard.py",
+            "--base",
+            "automain",
+            "--repo-root",
+            str(repo),
+            "--corpus-only",
+        ],
+        cwd=repo,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TASK_ID": "task-corpus-only-123",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "module size guard SKIPPED (--corpus-only)" in output
+    assert "standalone static corpus OK" in output
 
 
 def test_changed_harness_cannot_hide_a_base_corpus_failure(tmp_path: Path) -> None:

@@ -8,6 +8,7 @@ only known checkout- and runtime-specific noise is normalized.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -43,6 +44,7 @@ class JUnitReport:
     test_routes: set[str] = field(default_factory=set)
     skipped_routes: set[str] = field(default_factory=set)
     selectors: dict[str, str] = field(default_factory=dict)
+    offender_sets: dict[str, frozenset[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,28 @@ def _normalize_failure_detail(detail: str, *, tree_root: Path | None) -> str:
         normalized,
     )
     return re.sub(r"(object at )0x[0-9a-fA-F]+", r"\1<address>", normalized)
+
+
+_OFFENDER_SET_RE = re.compile(
+    r"(?m)^[ \t]*BLUEPRINT_OFFENDERS:[ \t]*(\[[^\r\n]*\])[ \t]*$"
+)
+
+
+def _extract_offender_set(detail: str) -> frozenset[str] | None:
+    """Read the canonical offender marker, rejecting malformed diagnostics."""
+
+    match = _OFFENDER_SET_RE.search(detail)
+    if match is None:
+        return None
+    try:
+        values = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        return None
+    if len(values) != len(set(values)):
+        return None
+    return frozenset(values)
 
 
 def _resolve_route(
@@ -150,10 +174,14 @@ def parse_junit_report(
         if detail_node is None:
             continue
         identity = FailureIdentity(route=route, testcase=testcase, kind=kind)
-        parsed.failures[identity.key] = _normalize_failure_detail(
+        detail = _normalize_failure_detail(
             (detail_node.text or detail_node.attrib.get("message", "")).strip(),
             tree_root=root_path,
         )
+        parsed.failures[identity.key] = detail
+        offender_set = _extract_offender_set(detail)
+        if offender_set is not None:
+            parsed.offender_sets[identity.key] = offender_set
         if source is not None:
             suffix = f"::{testcase}" if testcase else ""
             source_path = Path(source)
@@ -186,17 +214,30 @@ def _test_key(failure_key: str) -> str:
     return parts[0] if len(parts) == 2 and parts[1] in {"failure", "error"} else failure_key
 
 
+def _report_offender_set(report: JUnitReport, key: str) -> frozenset[str] | None:
+    """Return explicit or embedded offender identity for compatibility callers."""
+
+    if key in report.offender_sets:
+        return report.offender_sets[key]
+    return _extract_offender_set(report.failures.get(key, ""))
+
+
 def attribute_reports(current: JUnitReport, baseline: JUnitReport) -> Attribution:
     """Compare reports by route/test/kind and normalized failure detail."""
 
     current_keys = set(current.failures)
     baseline_keys = set(baseline.failures)
     shared = current_keys & baseline_keys
-    suppressed = {
-        key: current.failures[key]
-        for key in sorted(shared)
-        if current.failures[key] == baseline.failures[key]
-    }
+    suppressed = {}
+    for key in sorted(shared):
+        current_offenders = _report_offender_set(current, key)
+        baseline_offenders = _report_offender_set(baseline, key)
+        if current_offenders is not None and baseline_offenders is not None:
+            is_preexisting = current_offenders <= baseline_offenders
+        else:
+            is_preexisting = current.failures[key] == baseline.failures[key]
+        if is_preexisting:
+            suppressed[key] = current.failures[key]
     new = {
         key: current.failures[key] for key in sorted(current_keys - baseline_keys)
     }

@@ -13,6 +13,7 @@ import os
 import pytest
 
 from testing import impacted_tests
+from testing.fixgate_attribution import parse_junit_report
 
 
 def _write(root: str, rel: str, content: str = "") -> None:
@@ -219,6 +220,22 @@ def test_backend_verification_junit_parser_preserves_route_keyed_detail(tmp_path
     ) == {}
 
 
+def test_junit_parser_extracts_offender_set_marker(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        '<testsuite><testcase classname="testing.test_x" name="test_old">'
+        '<failure>counts\nBLUEPRINT_OFFENDERS: ["app/a.py", "app/b.py"]</failure>'
+        "</testcase></testsuite>",
+        encoding="utf-8",
+    )
+
+    parsed = parse_junit_report(report)
+
+    assert parsed.offender_sets == {
+        "testing.test_x::test_old::failure": frozenset({"app/a.py", "app/b.py"})
+    }
+
+
 def test_backend_verification_treats_changed_failure_detail_as_new():
     current = {"backend/testing/test_x.py::test_old::failure": "line 99: changed"}
     baseline = {"backend/testing/test_x.py::test_old::failure": "line 12: old"}
@@ -234,6 +251,58 @@ def test_backend_verification_treats_changed_failure_detail_as_new():
     assert outcome["blocking"] is True
     assert outcome["new_failures"] == current
     assert outcome["suppressed_failures"] == {}
+
+
+def test_offender_set_subset_is_attributed_to_baseline():
+    """Changing diagnostics or removing an old offender stays pre-existing."""
+    key = "backend/testing/test_invariants.py::test_backend::failure"
+    current = impacted_tests.JUnitReport(
+        failures={key: 'current counts\nBLUEPRINT_OFFENDERS: ["app/a.py"]'},
+        test_routes={"backend/testing/test_invariants.py::test_backend"},
+    )
+    baseline = impacted_tests.JUnitReport(
+        failures={
+            key: 'baseline counts\nBLUEPRINT_OFFENDERS: ["app/a.py", "app/old.py"]'
+        },
+        test_routes={"backend/testing/test_invariants.py::test_backend"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=current.failures,
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome["state"] == "preexisting_test_failure"
+    assert outcome["blocking"] is False
+    assert outcome["new_failures"] == {}
+    assert outcome["suppressed_failures"][key]["detail"] == current.failures[key]
+
+
+def test_offender_set_new_path_remains_blocking():
+    key = "backend/testing/test_invariants.py::test_backend::failure"
+    current = impacted_tests.JUnitReport(
+        failures={key: 'current\nBLUEPRINT_OFFENDERS: ["app/a.py", "app/new.py"]'},
+        test_routes={"backend/testing/test_invariants.py::test_backend"},
+    )
+    baseline = impacted_tests.JUnitReport(
+        failures={key: 'baseline\nBLUEPRINT_OFFENDERS: ["app/a.py"]'},
+        test_routes={"backend/testing/test_invariants.py::test_backend"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=current.failures,
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == {key: current.failures[key]}
 
 
 def test_backend_verification_keeps_diff_introduced_route_blocking():

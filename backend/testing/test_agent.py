@@ -25063,6 +25063,21 @@ async def test_deploy_state_broadcast_matches_polled_payload(
             now - timedelta(minutes=2),
         ]
     )
+    # Both delivery paths intentionally call the same payload builder, but they
+    # do so at different wall-clock instants.  Pin the builder's clock (and own
+    # the monitoring-window fixture state) so this contract test compares the
+    # HTTP and WebSocket serialization rather than flaking when the two calls
+    # straddle an integer-second boundary.
+    payload_now = _utcnow()
+    shared_state.deploy_monitoring.update(
+        {
+            "window_start": payload_now - timedelta(seconds=20),
+            "window_duration": 900,
+            "extended_window": 1800,
+            "is_extended": False,
+        }
+    )
+    mocker.patch("app.admin._utcnow", return_value=payload_now)
     broadcast_mock = AsyncMock()
     mocker.patch("app.deploy_health.manager.broadcast_to_all", new=broadcast_mock)
 

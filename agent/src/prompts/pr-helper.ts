@@ -264,6 +264,22 @@ GATE_SECTION=""
 GATE_COMMAND="./check"
 GATE_ELAPSED_SECONDS=0
 GATE_DEADLINE_EXTENDED=false
+_VERIFY_TASK_ID="\${TASK_ID:-${cfg.taskId}}"
+_VERIFY_RECEIPT="/tmp/project_verification_receipt_\${_VERIFY_TASK_ID}.json"
+SUPPRESSED_BASELINE_SECTION=""
+
+# A successful backend verification can rely on failures inherited from the
+# base branch. Surface those exact structured failure identities in the PR
+# body so a passing publication remains honest and reviewable. The receipt is
+# optional for stacks without targeted backend verification; malformed or
+# unavailable receipts must not change the publication verdict.
+render_suppressed_baseline_section() {
+  local receipt_file="$1"
+  if [ ! -s "$receipt_file" ] || ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  python3 -c 'import json,sys; payload=json.load(open(sys.argv[1],encoding="utf-8")); pytest=payload.get("pytest"); d=pytest.get("suppressed_failures") if isinstance(pytest,dict) and "suppressed_failures" in pytest else payload.get("suppressed_failures"); lines=["### Suppressed baseline failures"]+["- {}{}{}: {}".format(chr(96),k,chr(96),v.get("detail","") if isinstance(v,dict) else v) for k,v in sorted(d.items())] if isinstance(d,dict) and d else []; print("\\n".join(lines),end="") if lines else None' "$receipt_file" 2>/dev/null || true
+}
 
 write_gate_receipt() {
   local status="$1"
@@ -274,15 +290,32 @@ write_gate_receipt() {
   recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf '{"status":"%s","command":"%s","timeout_seconds":%s,"hard_timeout_seconds":%s,"elapsed_seconds":%s,"deadline_extended":%s,"exit_code":%s,"authoritative_ci_required":%s,"recorded_at":"%s"}\n' \
     "$status" "$GATE_COMMAND" "$GATE_TIMEOUT_SECONDS" "$GATE_HARD_TIMEOUT_SECONDS" "$GATE_ELAPSED_SECONDS" "$GATE_DEADLINE_EXTENDED" "$exit_code" "$fallback" "$recorded_at" > "$GATE_RECEIPT_FILE"
-  GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
-    '<!-- blueprint:local-gate -->' \
-    '### Local publication gate' \
-    "- Status: $status" \
-    "- Command: $GATE_COMMAND" \
-    "- Deadlines: soft \${GATE_TIMEOUT_SECONDS}s; hard \${GATE_HARD_TIMEOUT_SECONDS}s (absolute ceiling 1800s)" \
-    "- Elapsed: \${GATE_ELAPSED_SECONDS}s; soft deadline extended: $GATE_DEADLINE_EXTENDED" \
-    "- Exit code: $exit_code; authoritative CI required: $fallback" \
-    '<!-- /blueprint:local-gate -->')
+  SUPPRESSED_BASELINE_SECTION=""
+  case "$status" in
+    passed*) SUPPRESSED_BASELINE_SECTION=$(render_suppressed_baseline_section "$_VERIFY_RECEIPT") ;;
+  esac
+  if [ -n "$SUPPRESSED_BASELINE_SECTION" ]; then
+    GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+      '<!-- blueprint:local-gate -->' \
+      '### Local publication gate' \
+      "- Status: $status" \
+      "- Command: $GATE_COMMAND" \
+      "- Deadlines: soft \${GATE_TIMEOUT_SECONDS}s; hard \${GATE_HARD_TIMEOUT_SECONDS}s (absolute ceiling 1800s)" \
+      "- Elapsed: \${GATE_ELAPSED_SECONDS}s; soft deadline extended: $GATE_DEADLINE_EXTENDED" \
+      "- Exit code: $exit_code; authoritative CI required: $fallback" \
+      "$SUPPRESSED_BASELINE_SECTION" \
+      '<!-- /blueprint:local-gate -->')
+  else
+    GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+      '<!-- blueprint:local-gate -->' \
+      '### Local publication gate' \
+      "- Status: $status" \
+      "- Command: $GATE_COMMAND" \
+      "- Deadlines: soft \${GATE_TIMEOUT_SECONDS}s; hard \${GATE_HARD_TIMEOUT_SECONDS}s (absolute ceiling 1800s)" \
+      "- Elapsed: \${GATE_ELAPSED_SECONDS}s; soft deadline extended: $GATE_DEADLINE_EXTENDED" \
+      "- Exit code: $exit_code; authoritative CI required: $fallback" \
+      '<!-- /blueprint:local-gate -->')
+  fi
 }
 
 # A blocked gate normally exits before any PR body exists, so the bounded

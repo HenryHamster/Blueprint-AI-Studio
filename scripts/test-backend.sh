@@ -126,6 +126,7 @@ VERIFICATION_OUTPUT_DIR_OWNED=0
 VERIFICATION_HOST_JUNIT=""
 DOCKER_ARGS=()
 PYTHON_REWRITE_ENABLED=0
+ALEMBIC="alembic"
 cleanup() {
   [ -n "$PG_CONTAINER" ] && docker rm -f "$PG_CONTAINER" &>/dev/null || true
   [ -n "$PG_NETWORK" ] && docker network rm "$PG_NETWORK" &>/dev/null || true
@@ -249,6 +250,10 @@ else
       fi
     fi
   fi
+fi
+
+if [ "$PYTHON_REWRITE_ENABLED" = "1" ]; then
+  ALEMBIC="$(dirname "$PYTHON")/alembic"
 fi
 
 # --- Docker Hub rate-limit resilience --------------------------------------
@@ -648,7 +653,7 @@ if [ "$USE_POSTGRES" = "1" ]; then
     verify_required_postgres_extensions docker exec "$PG_CONTAINER" psql -U test -d test_blueprint
   fi
   echo "=== Running alembic migrations ==="
-  _run python3 -m alembic upgrade head
+  _run "$ALEMBIC" upgrade head
 fi
 
 echo "=== Verify app imports ==="

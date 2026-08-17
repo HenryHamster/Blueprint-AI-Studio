@@ -370,8 +370,8 @@ def test_load_config_missing_raises_library_error(monkeypatch, tmp_path, capsys)
     assert "no Blueprint API config found" in capsys.readouterr().err
 
 
-def test_check_test_delegates_to_standalone_harness():
-    """The tracked developer fallback keeps ./check test's standalone gate."""
+def test_check_test_delegates_to_attributed_static_release_guard():
+    """The developer fallback runs the attributed static guard for ./check test."""
     check_path = os.path.join(REPO_ROOT, "check")
     with open(check_path) as f:
         wrapper = f.read()
@@ -379,9 +379,14 @@ def test_check_test_delegates_to_standalone_harness():
     default_path = os.path.join(REPO_ROOT, "scripts", "check-default.sh")
     with open(default_path) as f:
         default_gate = f.read()
-    assert "scripts/test-backend.sh" in default_gate
-    assert "--standalone" in default_gate
-    assert "--no-postgres" in default_gate
+    assert 'if [ "$WITH_TESTS" = "1" ]; then' in default_gate
+    assert (
+        'run "static release guards (task diff)" python3 '
+        'scripts/static_release_guard.py --base "$BASE" --repo-root "$PWD"'
+        in default_gate
+    )
+    assert "static release guard helper is missing — refusing to skip the gate" in default_gate
+    assert "bash scripts/test-backend.sh --standalone --no-postgres" not in default_gate
 
 
 def test_blueprint_wrapper_shell_syntax():
