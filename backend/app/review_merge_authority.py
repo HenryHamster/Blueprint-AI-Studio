@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -41,6 +41,15 @@ class MergeAuthorityDecision:
     checked_base_sha: str
     review_loop: dict
 
+
+class MergeSubmissionIndeterminate(RuntimeError):
+    """A durable submission-start exists but GitHub acceptance is unresolved."""
+
+
+class MergePreSubmissionRefused(RuntimeError):
+    """An exact pre-PUT gate closed the intent and requires fresh approval."""
+
+
 async def enforce_merge_authority(
     task: Task,
     session: AsyncSession,
@@ -57,6 +66,9 @@ async def enforce_merge_authority(
     checked_base_sha: str | None = None,
     precomputed_review_target: dict[str, str | int] | None = None,
     explicit_review_override: bool = False,
+    pre_lock_authority: Callable[[AsyncSession], Awaitable[bool]] | None = None,
+    source_authority: Callable[[AsyncSession], Awaitable[Task | None]] | None = None,
+    approval_protocol_owned: bool = False,
 ) -> MergeAuthorityDecision:
     """Return exact checked-head merge authority or fail closed in-place.
 
@@ -72,9 +84,7 @@ async def enforce_merge_authority(
         or ci_loop.get("head_sha")
         or ""
     )
-    expected_base = str(
-        checked_base_sha or ci_loop.get("ci_checked_base_sha") or ""
-    )
+    expected_base = str(checked_base_sha or ci_loop.get("ci_checked_base_sha") or "")
 
     if not expected_head:
         ci_loop["ci_passed"] = False
@@ -94,14 +104,18 @@ async def enforce_merge_authority(
         project_id=project_id,
         pr_number=pr_number,
     )
-    precomputed_head = str(
-        (precomputed_review_target or {}).get("head_sha") or ""
-    )
-    precomputed_base = str(
-        (precomputed_review_target or {}).get("base_sha") or ""
-    )
+    precomputed_head = str((precomputed_review_target or {}).get("head_sha") or "")
+    precomputed_base = str((precomputed_review_target or {}).get("base_sha") or "")
     if not expected_base and precomputed_is_valid and precomputed_head == expected_head:
         expected_base = precomputed_base
+
+    # A durable approval submission binds project branch/repository policy.  Its
+    # second gate locks and validates Project before acquiring the base/PR
+    # advisory locks, preserving the global Project -> base -> PR -> Task order.
+    if pre_lock_authority is not None and not await pre_lock_authority(session):
+        return MergeAuthorityDecision(
+            False, expected_head, expected_base, dict(ci_loop)
+        )
 
     # Serialize only final merge submissions to this base, then share the
     # project-scoped PR admission lock with every fix writer. The live GET must
@@ -118,6 +132,19 @@ async def enforce_merge_authority(
             base_branch=base_branch,
             pr_number=pr_number,
         )
+    if source_authority is not None:
+        # Approval callers released their decision Task lock before credential,
+        # migration, and live-target I/O. Reacquire the exact row only after the
+        # canonical base -> PR locks, and reject a replaced decision before any
+        # caller snapshot is staged or flushed.
+        with session.no_autoflush:
+            authoritative_task = await source_authority(session)
+        if authoritative_task is None:
+            return MergeAuthorityDecision(
+                False, expected_head, expected_base, dict(ci_loop)
+            )
+        task = authoritative_task
+        ci_loop = dict((task.context or {}).get("review_loop") or {})
     # ``ci_loop`` is the caller's exact backend-built proof.  Stage it only
     # after the shared base -> PR locks: lifecycle deliberately keeps this
     # proof local while it performs pre-merge reads so an ORM autoflush cannot
@@ -154,6 +181,11 @@ async def enforce_merge_authority(
         return MergeAuthorityDecision(False, expected_head, expected_base, ci_loop)
     task = locked_task
     ci_loop = dict((task.context or {}).get("review_loop") or {})
+    if not approval_protocol_owned:
+        from app.admin_approval_merge_recovery import approval_merge_in_flight
+
+        if await approval_merge_in_flight(task, session):
+            return MergeAuthorityDecision(False, expected_head, expected_base, ci_loop)
     # Caller snapshots are advisory unless explicitly supplied as the checked
     # result.  Rebuild implicit expectations from the row read *inside* the
     # admission locks so a concurrent revocation/CI advance cannot be lost to
@@ -343,14 +375,16 @@ async def enforce_merge_authority(
     bypass_target = ci_loop.get("review_target")
     bypass_is_exact = bool(
         explicit_review_override
-        or (_review_not_required(ci_loop)
-        and review_target_matches_merge_identity(
-            bypass_target,
-            project_id=project_id,
-            pr_number=pr_number,
+        or (
+            _review_not_required(ci_loop)
+            and review_target_matches_merge_identity(
+                bypass_target,
+                project_id=project_id,
+                pr_number=pr_number,
+            )
+            and str((bypass_target or {}).get("head_sha") or "") == expected_head
+            and str((bypass_target or {}).get("base_sha") or "") == expected_base
         )
-        and str((bypass_target or {}).get("head_sha") or "") == expected_head
-        and str((bypass_target or {}).get("base_sha") or "") == expected_base)
     )
     if not bypass_is_exact:
         ci_loop.pop("review_not_required", None)
@@ -388,8 +422,26 @@ async def attempt_merge_with_authority(
     checked_base_sha: str | None,
     retry_nonterminal: bool = False,
     explicit_review_override: bool = False,
+    source_authority: Callable[[AsyncSession], Awaitable[Task | None]] | None = None,
+    submission_start: Callable[
+        [AsyncSession, MergeAuthorityDecision],
+        Awaitable[Any | None],
+    ]
+    | None = None,
+    submission_receipt: Callable[
+        [AsyncSession, MergeAuthorityDecision, dict, str], Awaitable[None]
+    ]
+    | None = None,
 ) -> tuple[MergeAuthorityDecision, dict | None]:
-    """Freshly authorize each expected-head merge PUT and release its PR lock."""
+    """Freshly authorize each expected-head merge PUT and release its PR lock.
+
+    Approval callers optionally linearize a durable ambiguous submission before
+    the socket write.  Only the process that wins that transition receives a
+    one-shot authority callback; it then reruns the final live-target/fix gate.
+    Restarted callers never enter this function for an ambiguous intent.
+    """
+    merge_project_id = str(task.project_id)
+    merge_task_id = task.id
     for attempt in range(4 if retry_nonterminal else 1):
         if attempt:
             await asyncio.sleep(5 * (3 ** (attempt - 1)))
@@ -409,28 +461,343 @@ async def attempt_merge_with_authority(
             # A cached caller snapshot must never stand in for the final GET.
             precomputed_review_target=None,
             explicit_review_override=explicit_review_override,
+            source_authority=source_authority,
+            approval_protocol_owned=submission_start is not None,
         )
         ci_loop = decision.review_loop
         if not decision.allowed:
+            if submission_start is not None:
+                # Exact-CAS the known-unsent intent closed.  The callback raises
+                # MergePreSubmissionRefused after installing the independent
+                # hold; a lost/replaced CAS is indeterminate, never a silent hold.
+                closed_authority = await submission_start(session, decision)
+                if closed_authority is not None:
+                    await closed_authority.abort_before_send(
+                        session, "the first final merge-safety gate refused"
+                    )
+                raise MergeSubmissionIndeterminate(
+                    "pre-submission denial could not close the exact merge intent"
+                )
             await session.commit()
             return decision, None
+        if submission_start is not None:
+            started_authority = await submission_start(session, decision)
+            if started_authority is None:
+                return MergeAuthorityDecision(
+                    False,
+                    decision.checked_head_sha,
+                    decision.checked_base_sha,
+                    decision.review_loop,
+                ), None
+            task = await session.get(Task, merge_task_id, populate_existing=True)
+            if task is None:
+                abort_before_send = getattr(
+                    started_authority, "abort_before_send", None
+                )
+                if abort_before_send is not None:
+                    closed = await abort_before_send(
+                        session, "the approval source disappeared before transport"
+                    )
+                    if closed:
+                        raise MergePreSubmissionRefused(
+                            "the approval source disappeared before transport"
+                        )
+                raise MergeSubmissionIndeterminate(
+                    "approval source loss could not close the exact merge intent"
+                )
+            # The durable transition committed and released the first admission
+            # locks. Reacquire base -> PR -> Task and repeat the final GitHub
+            # target plus active-fix checks before this process's single PUT.
+            decision = await enforce_merge_authority(
+                task,
+                session,
+                gh_token=gh_token,
+                owner=owner,
+                repo=repo,
+                ci_loop=ci_loop,
+                pr_number=pr_number,
+                branch=branch,
+                base_branch=base_branch,
+                original_task_id=original_task_id,
+                checked_head_sha=checked_head_sha,
+                checked_base_sha=checked_base_sha,
+                precomputed_review_target=None,
+                explicit_review_override=explicit_review_override,
+                pre_lock_authority=getattr(
+                    started_authority, "project_authority", None
+                ),
+                source_authority=getattr(
+                    started_authority, "source_authority", started_authority
+                ),
+                approval_protocol_owned=True,
+            )
+            ci_loop = decision.review_loop
+            if not decision.allowed:
+                abort_before_send = getattr(
+                    started_authority, "abort_before_send", None
+                )
+                if abort_before_send is not None:
+                    closed = await abort_before_send(
+                        session, "the second final merge-safety gate refused"
+                    )
+                else:
+                    await session.commit()
+                    closed = False
+                if closed:
+                    raise MergePreSubmissionRefused(
+                        "the second final merge-safety gate refused"
+                    )
+                raise MergeSubmissionIndeterminate(
+                    "pre-submission denial lost its exact terminalization CAS"
+                )
+            acquire_send_lease = getattr(
+                started_authority, "acquire_send_lease", None
+            )
+            send_token = (
+                await acquire_send_lease(session)
+                if acquire_send_lease is not None
+                else None
+            )
+            if not send_token:
+                closed = await started_authority.abort_before_send(
+                    session, "send-lease authority changed before transport"
+                )
+                if closed:
+                    raise MergePreSubmissionRefused(
+                        "send-lease authority changed before transport"
+                    )
+                raise MergeSubmissionIndeterminate(
+                    "send-lease CAS was lost to reconciliation or replacement"
+                )
+            # The lease transition commits the exact Project/base/PR/Task gate,
+            # releasing every database lock.  A last GET plus the sole guarded
+            # PUT now run without blocking unrelated Project/Task writers.
+            try:
+                final_target = await _fetch_live_review_target(
+                    gh_token,
+                    owner,
+                    repo,
+                    pr_number,
+                    project_id=merge_project_id,
+                )
+            except Exception as exc:
+                closed = await started_authority.close_without_merge(
+                    session,
+                    "known_not_sent",
+                    "the final live pull-request target could not be read",
+                    send_token,
+                )
+                if closed:
+                    raise MergePreSubmissionRefused(
+                        "the final live pull-request target could not be read"
+                    ) from exc
+                raise MergeSubmissionIndeterminate(
+                    "final target lookup lost its exact send authority"
+                ) from exc
+            if not (
+                str(final_target.get("head_sha") or "")
+                == decision.checked_head_sha
+                and str(final_target.get("base_sha") or "")
+                == decision.checked_base_sha
+                and str(final_target.get("head_ref") or "") == str(branch)
+                and str(final_target.get("base_ref") or "") == str(base_branch)
+                and _live_target_is_merge_submission_safe(
+                    final_target, base_branch=base_branch
+                )
+            ):
+                closed = await started_authority.close_without_merge(
+                    session,
+                    "unsent_aborted",
+                    "the final live pull-request target changed before transport",
+                    send_token,
+                )
+                if closed:
+                    raise MergePreSubmissionRefused(
+                        "the final live pull-request target changed before transport"
+                    )
+                raise MergeSubmissionIndeterminate(
+                    "final target denial lost its exact send authority"
+                )
+            # Project/Task rows stayed available throughout the final GET. Now
+            # exact-CAS the same token against fresh config/promotion authority,
+            # renew its bounded PUT window, and release those rows again before
+            # the sole transport attempt.
+            try:
+                send_authority_is_current = await started_authority.validate_send_lease(
+                    session, send_token
+                )
+            except Exception as exc:
+                await session.rollback()
+                raise MergeSubmissionIndeterminate(
+                    "send-lease authority could not be revalidated before transport"
+                ) from exc
+            if not send_authority_is_current:
+                closed = await started_authority.close_without_merge(
+                    session,
+                    "unsent_aborted",
+                    "project config or promotion authority changed during final target lookup",
+                    send_token,
+                )
+                if closed:
+                    raise MergePreSubmissionRefused(
+                        "project config or promotion authority changed during final target lookup"
+                    )
+                raise MergeSubmissionIndeterminate(
+                    "post-target validation lost its exact send authority"
+                )
+        else:
+            started_authority = None
+            send_token = None
         merge_error: Exception | None = None
+        result: dict = {}
+        submission_head_sha = decision.checked_head_sha
+        submission_base_sha = decision.checked_base_sha
         try:
-            result = await merge_call(decision.checked_head_sha)
-        except Exception as exc:  # noqa: PERF203
+            result = await merge_call(submission_head_sha)
+        except Exception as exc:  # noqa: BLE001
             merge_error = exc
-        finally:
-            # Release the submission locks only after the exact-head PUT has
-            # returned.  The transport-level ``merged`` receipt deliberately
-            # does NOT stamp ``context.pr_merged`` here: that field is the
-            # semantic rollup-unblock / integration-landing signal, and only
-            # the branch-aware caller can classify an intermediate staging,
-            # integration, or promotion-target landing correctly.
+        if submission_start is None:
+            # Autonomous lanes retain their admission locks through transport;
+            # approval lanes released them at the durable lease CAS above.
             await session.commit()
         if merge_error is not None:
+            if submission_start is not None:
+                if getattr(merge_error, "merge_not_attempted", False):
+                    closed = await started_authority.close_without_merge(
+                        session,
+                        "known_not_sent",
+                        "GitHub rate limiting refused the request before merge execution",
+                        send_token,
+                    )
+                    if not closed:
+                        raise MergeSubmissionIndeterminate(
+                            "known-not-sent outcome lost its exact lease CAS"
+                        ) from merge_error
+                    raise merge_error
+                await started_authority.release_for_reconciliation(
+                    session, send_token
+                )
+                raise MergeSubmissionIndeterminate(
+                    "merge submission may have been accepted; reconciliation required"
+                ) from merge_error
             if attempt >= (3 if retry_nonterminal else 0):
                 raise merge_error
             continue
+        if (
+            submission_start is not None
+            and result.get("merged") is not True
+            and result.get("conflict") is True
+        ):
+            closed = await started_authority.close_without_merge(
+                session,
+                "submission_rejected",
+                "GitHub definitively rejected the merge request as conflicting",
+                send_token,
+            )
+            if not closed:
+                raise MergeSubmissionIndeterminate(
+                    "conflict outcome lost its exact lease CAS"
+                )
+            return decision, result
+        if submission_start is not None and result.get("merged") is not True:
+            # GitHub's 405 conflates already-merged with rejected. Disambiguate
+            # outside all DB locks; an exact merged observation becomes the
+            # objective receipt, while an exact open/closed unmerged target is a
+            # terminal rejection. Unknown identity stays ambiguous.
+            try:
+                observed_target = await _fetch_live_review_target(
+                    gh_token,
+                    owner,
+                    repo,
+                    pr_number,
+                    project_id=merge_project_id,
+                )
+            except Exception as exc:
+                await started_authority.release_for_reconciliation(
+                    session, send_token
+                )
+                raise MergeSubmissionIndeterminate(
+                    "non-merge response could not be reconciled"
+                ) from exc
+            observed_identity_exact = bool(
+                str(observed_target.get("head_sha") or "") == submission_head_sha
+                and str(observed_target.get("head_ref") or "") == str(branch)
+                and str(observed_target.get("base_ref") or "") == str(base_branch)
+            )
+            if observed_target.get("merged") is True and observed_identity_exact:
+                result = {
+                    "merged": True,
+                    "sha": str(observed_target.get("merge_commit_sha") or ""),
+                    "message": "exact merged PR observed after non-merge response",
+                    "observed_merged": True,
+                }
+            elif (
+                observed_identity_exact
+                and observed_target.get("merged") is False
+                and str(observed_target.get("state") or "").lower()
+                in {"open", "closed"}
+            ):
+                closed = await started_authority.close_without_merge(
+                    session,
+                    "submission_rejected",
+                    "GitHub confirmed the exact pull request remained unmerged",
+                    send_token,
+                )
+                if not closed:
+                    raise MergeSubmissionIndeterminate(
+                        "non-merge terminalization lost its exact lease CAS"
+                    )
+                return decision, result
+            else:
+                await started_authority.release_for_reconciliation(
+                    session, send_token
+                )
+                raise MergeSubmissionIndeterminate(
+                    "non-merge response remains ambiguous for the bound target"
+                )
+        if submission_start is not None and result.get("merged") is True:
+            merge_sha = str(result.get("sha") or result.get("merge_commit_sha") or "")
+            if not merge_sha:
+                await started_authority.release_for_reconciliation(
+                    session, send_token
+                )
+                raise MergeSubmissionIndeterminate(
+                    "merge response omitted its immutable merge commit"
+                )
+            # The base/PR/Task locks are released before this immutable proof GET.
+            # A response loss or proof outage leaves the durable ledger ambiguous;
+            # recovery performs GET-only reconciliation and never replays PUT.
+            from app.ci_merge_helpers import (
+                _merge_commit_parent_matches_checked_base,
+            )
+
+            try:
+                base_parent_verified = await _merge_commit_parent_matches_checked_base(
+                    gh_token,
+                    owner,
+                    repo,
+                    merge_sha,
+                    submission_base_sha,
+                    project_id=merge_project_id,
+                )
+                result = {
+                    **result,
+                    "checked_base_parent_verified": base_parent_verified,
+                }
+                if submission_receipt is not None:
+                    await submission_receipt(session, decision, result, send_token)
+            except Exception as exc:
+                await session.rollback()
+                await started_authority.release_for_reconciliation(
+                    session, send_token
+                )
+                raise MergeSubmissionIndeterminate(
+                    "merge was acknowledged but its exact durable proof needs reconciliation"
+                ) from exc
+        if submission_start is not None and result.get("merged") is not True:
+            raise MergeSubmissionIndeterminate(
+                "merge response was not objective proof; reconciliation required"
+            )
         if (
             result.get("merged")
             or result.get("conflict")

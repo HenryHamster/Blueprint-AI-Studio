@@ -36,6 +36,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.admin_approval_authority import (
+    APPROVAL_FOLLOWUP_CLAIM_KEY,
+    APPROVAL_HOLD_PROVENANCE_KEY,
+    approval_hold_provenance,
+    establish_independent_approval_hold,
+)
 from app.branch_resolution import classify_rollup_merge_outcome
 from app.context_bounds import bound_review_history
 from app.landed_signal import corroborate_and_apply_merged_landed_signal
@@ -55,6 +61,23 @@ from app.module_finding_chain import find_and_mark_chain_escalation
 from app.rollup_locking import _OriginalTaskLockTimeout, _lock_original_task
 
 logger = logging.getLogger(__name__)
+
+
+def _establish_request_changes_hold(task: Task, *, reason: str) -> None:
+    context = dict(task.context or {})
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    if (
+        task.requires_approval is True
+        and isinstance(provenance, dict)
+        and provenance.get("owner") == "review_request_changes"
+        and provenance.get("reason") == reason
+        and not context.get(APPROVAL_FOLLOWUP_CLAIM_KEY)
+        and approval_hold_provenance(task).get("review_wait_hold") is None
+    ):
+        return
+    establish_independent_approval_hold(
+        task, reason=reason, owner="review_request_changes"
+    )
 
 
 async def run_request_changes(
@@ -348,7 +371,9 @@ async def run_request_changes(
     # operator attention rather than expanding to an unpinned review.
     if not head_sha or not base_sha:
         task.status = TaskStatus.COMPLETED
-        task.requires_approval = True
+        _establish_request_changes_hold(
+            task, reason="review_target_unavailable"
+        )
         task.latest_status_message = (
             f"Review changes for PR #{pr_number} withheld: could not "
             "prove the live immutable review target"
@@ -532,7 +557,9 @@ async def run_request_changes(
             ) from _revoke_lock_err
 
         if _orig is None:
-            task.requires_approval = True
+            _establish_request_changes_hold(
+                task, reason="originating_task_missing"
+            )
             task.latest_status_message = (
                 f"Review blocked PR #{pr_number}, but its originating "
                 "task is missing; fix withheld for manual recovery"
@@ -745,6 +772,7 @@ async def run_request_changes(
         fix_prompt_text = (
             f"{fix_all_occurrences_directive()}{fix_prompt_text}"
         )
+    review_task_id = task.id
     fix_task, _ = await _spawn_pipeline_task(
         task,
         "fix",
@@ -772,6 +800,54 @@ async def run_request_changes(
             f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}"
         )
     else:
+        # The chain original may own a durable human-merge intent even though
+        # this REQUEST_CHANGES completion runs on its review child.  The
+        # canonical spawner suppresses code publication under the PR lock; do
+        # not reinterpret that source-neutral outcome as an iteration cap or
+        # dirty the now-expired review-task snapshot after its rollback.
+        if original_task_id:
+            from app.admin_approval_authority import approval_merge_in_flight
+
+            spawn_return_transaction_active = session.in_transaction()
+            try:
+                merge_source_id = uuid.UUID(str(original_task_id))
+            except (TypeError, ValueError, AttributeError):
+                merge_source_id = None
+            with session.no_autoflush:
+                merge_source = (
+                    await session.get(Task, merge_source_id, populate_existing=True)
+                    if merge_source_id is not None
+                    else None
+                )
+            if merge_source is not None and await approval_merge_in_flight(
+                merge_source, session
+            ):
+                await session.rollback()
+                logger.info(
+                    "[REVIEW PIPELINE] Fix for PR #%s deferred while exact "
+                    "human-merge intent reconciles",
+                    pr_number,
+                )
+                return True, {
+                    "status": "accepted",
+                    "reason": "approval_merge_reconciliation_wait",
+                }
+            if not spawn_return_transaction_active:
+                # A source-neutral suppression or lock-timeout rollback expires
+                # the review child.  If the outcome was unrelated to a merge
+                # intent, continue only from a fresh identity before applying
+                # the ordinary cap/stuck disposition below.
+                refreshed_review_task = await session.get(
+                    Task, review_task_id, populate_existing=True
+                )
+                if refreshed_review_task is None:
+                    await session.rollback()
+                    return True, {
+                        "status": "accepted",
+                        "reason": "review_source_disappeared",
+                    }
+                task = refreshed_review_task
+
         # Surface the REAL refusal reason, not a blanket "cap
         # reached" (lineage d3c12745 / PR #16759: 13 tasks said
         # "iteration cap reached" when the truth was
@@ -782,7 +858,9 @@ async def run_request_changes(
             f"Fix not spawned for PR #{pr_number} — "
             f"{_fix_refusal_label}"
         )
-        task.requires_approval = True
+        _establish_request_changes_hold(
+            task, reason="review_fix_spawn_refused"
+        )
         session.add(task)
         cap_alert_title = (
             f"PR #{pr_number} stalled — {_fix_refusal_label}"

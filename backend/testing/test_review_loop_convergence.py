@@ -11,6 +11,7 @@ These import the handler directly from ``app.review_loop_convergence`` (rather
 than the ``app.review_pipeline`` re-export) so the module owns its own tests.
 """
 
+import copy
 import uuid
 from unittest.mock import AsyncMock
 
@@ -18,6 +19,7 @@ import pytest
 
 from sqlalchemy import select
 
+from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.models import Alert, Project, Task, TaskStatus
 from testing.factories import make_project, make_task
 
@@ -692,6 +694,8 @@ async def test_cap_preserves_backmerge_resolver_pr(db_session, mocker):
         "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
     )
 
+    from app.admin_approval_authority import APPROVAL_FOLLOWUP_CLAIM_KEY
+    from app.closed_pr_reconciliation import REVIEW_WAIT_APPROVAL_HOLD_KEY
     from app.review_loop_convergence import _handle_cap_exhaustion
 
     project = await _make_db_project(db_session)
@@ -701,12 +705,28 @@ async def test_cap_preserves_backmerge_resolver_pr(db_session, mocker):
         payloads=[
             {"type": "create", "prompt": "resolve sync", "base_branch": "automain"}
         ],
+        requires_approval=True,
         context={
             "backmerge_conflict": True,
             "backmerge_pr_number": 710,
+            "_approval_set_at": "2026-08-17T01:00:00+00:00",
+            "_approval_hold_episode": "old-operator-episode",
+            APPROVAL_FOLLOWUP_CLAIM_KEY: {
+                "token": "interrupted-old-operator-followup",
+                "state": "pending",
+                "status": TaskStatus.EVALUATING.value,
+            },
             # Genuine non-convergence: latest round has outstanding changes.
             "review_loop": {
                 "pr_number": 710,
+                REVIEW_WAIT_APPROVAL_HOLD_KEY: {
+                    "owner": "ci_review_wait_backstop",
+                    "project_id": str(project.id),
+                    "pr_number": 710,
+                    "head_sha": "old-head",
+                    "base_sha": "old-base",
+                    "set_at": "2026-08-17T01:00:00+00:00",
+                },
                 "review_history": [
                     {"verdict": "CHANGES_REQUESTED", "issues": ["x"]},
                 ],
@@ -736,6 +756,16 @@ async def test_cap_preserves_backmerge_resolver_pr(db_session, mocker):
     ), "Preservable back-merge resolver PR must be tagged for hand-merge"
     assert (orig.context or {}).get("pr_preserved_for_handmerge") is True
     assert orig.requires_approval is True, "Preserved PR must be flagged for operator"
+    refreshed_context = dict(orig.context or {})
+    refreshed_loop = dict(refreshed_context.get("review_loop") or {})
+    assert APPROVAL_FOLLOWUP_CLAIM_KEY not in refreshed_context
+    assert REVIEW_WAIT_APPROVAL_HOLD_KEY not in refreshed_loop
+    assert refreshed_context["_approval_set_at"] != "2026-08-17T01:00:00+00:00"
+    assert refreshed_context["_approval_hold_episode"] != "old-operator-episode"
+    assert (
+        refreshed_context["approval_hold_reason"]
+        == "review_cap_preserved_for_handmerge"
+    )
     assert (orig.context or {}).get("failure_category") != "CODE_ERROR", (
         "Preserving salvageable back-merge work must NOT record CODE_ERROR"
     )
@@ -899,6 +929,189 @@ async def test_supersession_churn_hold_is_clearable(db_session):
     assert outcome["kind"] == "supersession_churn_halt"
     assert outcome["resolved"] is True
     assert outcome["resolved_by"] == "review_approve_pr_9179"
+
+
+@pytest.mark.asyncio
+async def test_clear_escalation_gate_preserves_newer_independent_hold(db_session):
+    """A stale escalation breadcrumb cannot consume a later approval episode."""
+
+    if resolve_dialect_name(db_session) != "postgresql":
+        pytest.skip("independent-session approval race requires PostgreSQL")
+
+    from app.admin_approval_authority import establish_independent_approval_hold
+    from app.review_loop_convergence import (
+        _set_review_loop_terminal_outcome,
+        clear_review_escalation_approval_gate,
+    )
+
+    project = await _make_db_project(db_session)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        context={},
+        payloads=[{"type": "research", "prompt": "approval episode race"}],
+    )
+    establish_independent_approval_hold(
+        task,
+        reason="stuck",
+        owner="review_pipeline",
+    )
+    _set_review_loop_terminal_outcome(
+        task,
+        kind="stuck",
+        reason="stuck",
+        pr_number=9179,
+        iterations=4,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    task_id = task.id
+
+    async with AsyncSessionLocal() as winner:
+        fresh = (
+            (
+                await winner.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        establish_independent_approval_hold(
+            fresh,
+            reason="manual branch-safety hold",
+            owner="operator",
+        )
+        fresh.latest_status_message = "Operator owns this hold"
+        winner.add(fresh)
+        await winner.commit()
+
+    async with AsyncSessionLocal() as closer:
+        fresh = (
+            (
+                await closer.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        before_context = copy.deepcopy(fresh.context)
+        assert not clear_review_escalation_approval_gate(
+            fresh,
+            resolved_by="review_approve_pr_9179",
+        )
+        assert fresh.requires_approval is True
+        assert fresh.latest_status_message == "Operator owns this hold"
+        assert fresh.context == before_context
+
+
+@pytest.mark.asyncio
+async def test_clear_matching_escalation_gate_removes_exact_hold_metadata(db_session):
+    """A matching escalation episode is fully consumed, not left inheritable."""
+
+    if resolve_dialect_name(db_session) != "postgresql":
+        pytest.skip("approval provenance assertion requires PostgreSQL")
+
+    from app.admin_approval_authority import (
+        APPROVAL_FOLLOWUP_CLAIM_KEY,
+        APPROVAL_HOLD_EPISODE_KEY,
+        APPROVAL_HOLD_PROVENANCE_KEY,
+        establish_independent_approval_hold,
+    )
+    from app.review_loop_convergence import (
+        _set_review_loop_terminal_outcome,
+        clear_review_escalation_approval_gate,
+    )
+
+    project = await _make_db_project(db_session)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        context={},
+        payloads=[{"type": "research", "prompt": "matching escalation"}],
+    )
+    establish_independent_approval_hold(
+        task,
+        reason="repeat_fingerprint_halt",
+        owner="review_pipeline",
+    )
+    _set_review_loop_terminal_outcome(
+        task,
+        kind="repeat_fingerprint_halt",
+        reason="repeat-fingerprint",
+        pr_number=9180,
+        iterations=2,
+    )
+    task.context = {
+        **(task.context or {}),
+        APPROVAL_FOLLOWUP_CLAIM_KEY: {"token": "obsolete-claim"},
+    }
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert clear_review_escalation_approval_gate(
+        task,
+        resolved_by="review_approve_pr_9180",
+    )
+    assert task.requires_approval is False
+    assert "approval_hold_reason" not in task.context
+    assert "_approval_set_at" not in task.context
+    assert APPROVAL_HOLD_EPISODE_KEY not in task.context
+    assert APPROVAL_HOLD_PROVENANCE_KEY not in task.context
+    assert APPROVAL_FOLLOWUP_CLAIM_KEY not in task.context
+
+
+def test_terminal_breadcrumb_never_adopts_a_preexisting_independent_hold():
+    """Gates-off escalation bookkeeping cannot claim an unrelated TRUE hold."""
+
+    from app.admin_approval_authority import establish_independent_approval_hold
+    from app.review_loop_convergence import (
+        _set_review_loop_terminal_outcome,
+        clear_review_escalation_approval_gate,
+    )
+
+    task = make_task(
+        status=TaskStatus.EVALUATING,
+        context={},
+        payloads=[{"type": "research", "prompt": "independent policy hold"}],
+    )
+    establish_independent_approval_hold(
+        task,
+        reason="manual security hold",
+        owner="operator",
+    )
+    before_context = copy.deepcopy(task.context)
+    _set_review_loop_terminal_outcome(
+        task,
+        kind="stuck",
+        reason="stuck",
+        pr_number=9181,
+        iterations=4,
+    )
+
+    assert "approval_hold_episode" not in task.context[
+        "review_loop_terminal_outcome"
+    ]
+    assert not clear_review_escalation_approval_gate(
+        task,
+        resolved_by="review_approve_pr_9181",
+    )
+    assert task.requires_approval is True
+    for key in (
+        "approval_hold_reason",
+        "_approval_set_at",
+        "_approval_hold_episode",
+        "_approval_hold_provenance",
+    ):
+        assert task.context[key] == before_context[key]
 
 
 @pytest.mark.asyncio

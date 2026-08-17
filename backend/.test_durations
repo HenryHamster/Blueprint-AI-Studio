@@ -2506,7 +2506,6 @@
   "testing/test_ci_completion.py::test_orphan_review_wait_respawns_review": 0.28217825800038554,
   "testing/test_ci_completion.py::test_precomputed_migration_guard_skips_inline_enforce_call": 0.3507022750000033,
   "testing/test_ci_completion.py::test_record_merge_error_occurrence_counts_distinct_prs": 0.10308241599886969,
-  "testing/test_ci_completion.py::test_review_wait_accelerated_deferred_retry": 0.31198721999862755,
   "testing/test_ci_completion.py::test_review_wait_auto_respawn_disabled": 0.302228515999559,
   "testing/test_ci_completion.py::test_review_wait_backstop_does_not_refire": 0.2426891560007789,
   "testing/test_ci_completion.py::test_review_wait_backstop_fires_after_timeout": 0.29291348500100867,

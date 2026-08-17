@@ -550,6 +550,8 @@ def test_attempt_reset_preserves_chain_metadata_only():
     stale.update(
         {
             "review_history": [{"verdict": "APPROVE"}],
+            "review_wait_approval_hold": {"owner": "ci_review_wait_backstop"},
+            "review_wait_spawn_claim": {"token": "superseded-attempt"},
             "_ci_backstop_first_defer_at": "old",
             "future_unknown_attempt_latch": True,
             "issue_ledger": {

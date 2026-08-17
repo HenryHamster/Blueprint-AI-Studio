@@ -2918,6 +2918,8 @@ async def test_ci_passed_legacy_verdict_requires_exact_review(db_session, mocker
         "base_sha": base_sha,
         "head_sha": head_sha,
         "base_ref": "",
+        "head_ref": "",
+        "merge_commit_sha": "",
         "state": "open",
         "merged": False,
         "draft": False,

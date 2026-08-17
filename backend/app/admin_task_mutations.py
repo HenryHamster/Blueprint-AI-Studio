@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import uuid
 from datetime import timedelta
 from typing import Any, Dict, List
@@ -48,6 +49,8 @@ logger = logging.getLogger(__name__)
 
 _APPROVAL_HELPERS = frozenset(
     {
+        "decide_operator_approval",
+        "execute_approval_followup",
         "_apply_approval_mutation",
         "_handle_rollup_pr_approval",
         "_maybe_spawn_rollup_smoketest",
@@ -119,7 +122,7 @@ def _mark_admin_cancelled(
     task.context = ctx
 
 
-async def _refresh_direction_outcomes_for_task(task: Task) -> None:
+async def _refresh_direction_outcomes_for_task(task: Task) -> bool:
     """Re-run the research-history merge recompute for *task* on a fresh session.
 
     The admin merge paths persist a task's landed signal on the request session;
@@ -138,13 +141,19 @@ async def _refresh_direction_outcomes_for_task(task: Task) -> None:
         async with AsyncSessionLocal() as _dir_session:
             _dir_task = await _dir_session.get(Task, task.id)
             if _dir_task is not None:
-                await refresh_direction_outcomes_after_merge(_dir_task, _dir_session)
+                return bool(
+                    await refresh_direction_outcomes_after_merge(
+                        _dir_task, _dir_session
+                    )
+                )
+        return True
     except Exception as _dir_exc:  # noqa: BLE001 — best-effort; must not break PATCH
         logger.warning(
             "[ADMIN] direction-outcome refresh failed for merged task %s: %r",
             getattr(task, "id", None),
             _dir_exc,
         )
+        return False
 
 
 def _promotion_target_merge_allowed(task: Task, target_branch: str) -> bool:
@@ -227,7 +236,13 @@ async def _block_admin_merge_for_branch_safety(
     """Keep the task approval-gated and persist a branch-safety alert."""
     if project is not None:
         _signal_blocking_project_branch_configuration(project, issue_code, detail)
-    task.requires_approval = True
+    from app.admin_approval_authority import establish_independent_approval_hold
+
+    establish_independent_approval_hold(
+        task,
+        reason=f"branch safety: {issue_code}",
+        owner="admin_branch_safety",
+    )
     task.latest_status_message = detail[:500]
     session.add(task)
     await session.commit()
@@ -573,6 +588,19 @@ async def _apply_status_mutation(
 
     if new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED):
         task.requires_approval = False
+        from app.admin_approval_authority import (
+            approval_hold_provenance,
+            consume_approval_hold_metadata,
+            revoke_operator_approval_followup,
+        )
+        from app.closed_pr_reconciliation import revoke_review_wait_approval_hold
+
+        revoke_review_wait_approval_hold(task)
+        revoke_operator_approval_followup(task)
+        consume_approval_hold_metadata(
+            task,
+            expected_episode=approval_hold_provenance(task),
+        )
 
     if new_status == TaskStatus.CANCELLED:
         from app.task_lifecycle import close_orphan_pr_if_any
@@ -651,6 +679,12 @@ async def _apply_status_mutation(
             if child.vm_provisioned_at:
                 child.vm_stopped_at = _utcnow()
             child.requires_approval = False
+            revoke_review_wait_approval_hold(child)
+            revoke_operator_approval_followup(child)
+            consume_approval_hold_metadata(
+                child,
+                expected_episode=approval_hold_provenance(child),
+            )
             _mark_admin_cancelled(
                 child,
                 cancelled_by_task_id=cancellation_source_id,
@@ -1095,6 +1129,8 @@ async def _commit_and_broadcast(
     payload: Dict[str, Any],
     session: AsyncSession,
     changes: Dict[str, Any],
+    *,
+    modified_by: str = "USER",
 ) -> None:
     """Save changes, append history, delete old VM, and trigger rollup checks."""
     if not changes:
@@ -1118,7 +1154,7 @@ async def _commit_and_broadcast(
     history = TaskHistory(
         task_id=task.id,
         action="MODIFIED",
-        details={"changes": changes, "modified_by": "USER"},
+        details={"changes": changes, "modified_by": modified_by},
     )
     session.add(history)
     await session.commit()
@@ -1379,10 +1415,33 @@ async def modify_task_apply(
         await _apply_status_mutation(
             task, payload, background_tasks, session, force_kill, changes
         )
-    await __getattr__("_apply_approval_mutation")(task, payload, session, changes)
     await _apply_simple_mutations(task, payload, session, changes)
     await _apply_depends_on_mutation(task, payload, session, changes)
-    await _commit_and_broadcast(task, payload, session, changes)
+    if "requires_approval" in payload:
+        # Preserve the established status-first semantics, but make the two
+        # authorities honest: status/simple changes commit with their own audit
+        # before approval fresh-locks the post-status row. Approval follow-up is
+        # a third phase and cannot roll either durable decision back.
+        nonapproval_payload = {
+            key: value for key, value in payload.items() if key != "requires_approval"
+        }
+        await _commit_and_broadcast(
+            task, nonapproval_payload, session, changes
+        )
+        mutation_module = sys.modules[__name__]
+        task, approval_decision, _approval_changes = await getattr(
+            mutation_module, "decide_operator_approval"
+        )(
+            task.id,
+            bool(payload["requires_approval"]),
+            session,
+            modified_by="USER",
+        )
+        task, _followup_changes = await getattr(
+            mutation_module, "execute_approval_followup"
+        )(approval_decision, session)
+    else:
+        await _commit_and_broadcast(task, payload, session, changes)
 
     return {
         "id": str(task.id),

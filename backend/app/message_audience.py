@@ -157,6 +157,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "task.failed": OPERATOR_FYI,
     "task.blocked": OPERATOR_FYI,
     "approval.needed": OPERATOR_ACTION_NEEDED,
+    "approval.merge_checked_base_mismatch": OPERATOR_ACTION_NEEDED,
     "cost.ceiling_reached": OPERATOR_ACTION_NEEDED,
     "cost.spend_hold": OPERATOR_ACTION_NEEDED,
     "capacity.quota_exhausted": OPERATOR_ACTION_NEEDED,

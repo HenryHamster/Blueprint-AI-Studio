@@ -3,45 +3,261 @@
 This module owns the approval-specific mutation cohort extracted from
 ``admin_task_mutations``.  The latter re-exports these helpers so existing
 imports remain stable while this module provides one implementation.
+
+The public helper names here are also intentional compatibility seams.  Tests,
+operator routes, and the mutation facade monkeypatch these names directly, so
+the large GitHub and smoketest handlers live behind thin lazy wrappers instead
+of being imported eagerly.  Keeping the wrappers canonical avoids a second
+implementation while preventing an import cycle among the approval facade, the
+mutation facade, and the downstream handler leaf.  Authority decisions and
+fresh-row finalization remain in this module because they define the shared
+transaction boundary used by every downstream approval kind.
+Downstream effects therefore remain replaceable without moving claim authority.
 """
 
 from __future__ import annotations
 
 import logging
-import uuid
 from typing import Any, Dict
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.admin_approval_authority import (
+    APPROVAL_FOLLOWUP_CLAIM_KEY as APPROVAL_FOLLOWUP_CLAIM_KEY,
+    ApprovalDecision,
+    approval_child_spawn_publication,
+    consume_approval_followup_after_dedup,
+    approval_claim_state,
+    _claim_matches_authoritative_task,
+    _claim_matches_task,
+    _restore_refused_approval,
+    approval_followup_authority,
+    approval_review_spawn_claim_target,
+    decide_operator_approval,
+    establish_independent_approval_hold,
+)
 from app.branch_resolution import (
     InvalidProjectBranchConfiguration,
-    classify_rollup_merge_outcome,
-    merged_pr_counts_as_integration_landing,
+    _signal_blocking_project_branch_configuration,
 )
 from app.models import (
-    TASK_ORIGINATION_SMOKETEST,
     Artifact,
     ArtifactType,
     Project,
     Task,
     TaskHistory,
     TaskStatus,
-    _utcnow,
 )
-from app.payload_schemas import validate_internal_payload
 from app.shared_state import (
     get_project_integration_branch,
     get_project_task_branch_namespace,
     resolve_task_branch as _resolve_task_branch,
 )
 from app.task_locking import (
-    AUTOMATIC_TASK_CREATION_ALLOWED,
-    automatic_task_creation_parent_lock,
+    lock_project_then_task,
 )
+from app.review_merge_authority import MergeSubmissionIndeterminate
 
 logger = logging.getLogger("app.admin_task_mutations")
+
+
+class ApprovalFollowupRefused(Exception):
+    """A pre-submission safety verdict awaiting fresh claim authority."""
+
+    def __init__(self, detail: str, *, issue_code: str | None = None) -> None:
+        self.detail = detail
+        self.issue_code = issue_code
+        super().__init__(detail)
+
+
+async def _refuse_approval_or_legacy(
+    task: Task,
+    project: Project | None,
+    session: AsyncSession,
+    detail: str,
+    *,
+    issue_code: str,
+    approval_decision: ApprovalDecision | None,
+) -> None:
+    if approval_decision is not None:
+        raise ApprovalFollowupRefused(detail, issue_code=issue_code)
+    await _mutation_facade()._block_admin_merge_for_branch_safety(
+        task, project, session, detail, issue_code=issue_code
+    )
+    raise HTTPException(status_code=409, detail=detail)
+
+
+async def _persist_approval_refusal(
+    decision: ApprovalDecision,
+    session: AsyncSession,
+    refusal: ApprovalFollowupRefused,
+) -> bool:
+    """Re-arm only the still-current claim under Project -> Task authority."""
+
+    project_id = decision.project_id
+    task_id = decision.task_id
+    await session.rollback()
+    await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .execution_options(populate_existing=True)
+    )
+    async with lock_project_then_task(
+        session,
+        project_id,
+        task_id,
+        skip_locked=False,
+    ) as (project, task):
+        if (
+            project is None
+            or task is None
+            or not await _claim_matches_authoritative_task(
+                task,
+                decision,
+                session,
+                allowed_states=frozenset({"pending"}),
+            )
+        ):
+            await session.rollback()
+            return False
+        if refusal.issue_code:
+            _signal_blocking_project_branch_configuration(
+                project, refusal.issue_code, refusal.detail
+            )
+        establish_independent_approval_hold(
+            task,
+            reason=refusal.detail,
+            owner="approval_followup_refused",
+        )
+        task.latest_status_message = refusal.detail[:500]
+        session.add(project)
+        session.add(task)
+        session.add(
+            TaskHistory(
+                task_id=task.id,
+                action="MODIFIED",
+                details={
+                    "changes": {
+                        "approval_followup_pending": False,
+                        "approval_refused": refusal.issue_code or "merge_not_completed",
+                    },
+                    "modified_by": decision.modified_by,
+                    "approval_decision_token": (decision.claim or {}).get("token"),
+                },
+            )
+        )
+        await session.commit()
+        return True
+
+
+async def _finalize_approval_merge(
+    decision: ApprovalDecision,
+    session: AsyncSession,
+    changes: Dict[str, Any],
+) -> Task | None:
+    """Canonical facade seam for lock-safe merge-fact finalization."""
+
+    from app.admin_approval_merge_finalization import finalize_approval_merge
+
+    return await finalize_approval_merge(decision, session, changes)
+
+
+async def execute_approval_followup(
+    decision: ApprovalDecision,
+    session: AsyncSession,
+) -> tuple[Task, Dict[str, Any]]:
+    """Run downstream work only while the committed receipt remains current."""
+
+    task_id = decision.task_id
+    task = await session.get(Task, task_id, populate_existing=True)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not decision.merge_recovery and (
+        not decision.should_follow_up or not _claim_matches_task(task, decision)
+    ):
+        # Close the read transaction without expiring every prefetched object in
+        # bulk callers. No source mutation is pending on this path.
+        await session.commit()
+        return task, {}
+
+    changes: Dict[str, Any] = {}
+    context = dict(task.context or {})
+    try:
+        if decision.merge_recovery:
+            if not decision.post_effects_only:
+                from app.admin_approval_authority import (
+                    reconcile_approval_merge_ledger,
+                )
+
+                await reconcile_approval_merge_ledger(decision, session)
+                await _finalize_approval_merge(decision, session, changes)
+        elif approval_claim_state(task, decision) == "merge_submitted":
+            await _finalize_approval_merge(decision, session, changes)
+        elif decision.rollup and decision.pr_number is not None:
+            await _handle_rollup_pr_approval(
+                task,
+                context,
+                decision.pr_number,
+                session,
+                changes,
+                approval_decision=decision,
+            )
+        else:
+            await _handle_task_pr_approval(
+                task,
+                context,
+                {},
+                session,
+                changes,
+                approval_decision=decision,
+            )
+    except ApprovalFollowupRefused as refusal:
+        await _persist_approval_refusal(decision, session, refusal)
+        raise HTTPException(status_code=409, detail=refusal.detail) from refusal
+    except MergeSubmissionIndeterminate as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Merge submission is indeterminate; Blueprint will only "
+                "reconcile the exact PR and will not replay the PUT"
+            ),
+        ) from exc
+    except HTTPException as exc:
+        await session.rollback()
+        await _restore_refused_approval(decision, session, detail=str(exc.detail))
+        raise
+
+    try:
+        await _run_approval_merge_post_effects(decision, session)
+    except Exception:
+        # Objective merge/finalization is already committed.  Post-effects are
+        # ledger-marked and retried by a duplicate approval request.
+        logger.exception(
+            "[ADMIN] Approval merge post-effects deferred for task %s",
+            task_id,
+        )
+    if session.in_transaction():
+        # Every authoritative result is committed at its own fresh boundary.
+        # Anything left here belongs to a pre-I/O identity and is non-authority.
+        await session.rollback()
+    final_task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == task_id)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if final_task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    await session.commit()
+    return final_task, changes
 
 
 def _mutation_facade():
@@ -50,44 +266,34 @@ def _mutation_facade():
 
     return facade
 
+
+async def _run_approval_merge_post_effects(
+    decision: ApprovalDecision,
+    session: AsyncSession,
+) -> None:
+    from app.admin_approval_followup_handlers import run_approval_merge_post_effects
+
+    await run_approval_merge_post_effects(decision, session)
+
+
 async def _apply_approval_mutation(
     task: Task,
     payload: Dict[str, Any],
     session: AsyncSession,
     changes: Dict[str, Any],
 ) -> None:
-    """Handle requires_approval toggle and downstream approval flows."""
+    """Compatibility wrapper around the canonical two-phase boundary."""
     if "requires_approval" not in payload:
         return
-
-    was_blocked = task.requires_approval
-    task.requires_approval = bool(payload["requires_approval"])
-    changes["requires_approval"] = task.requires_approval
-
-    if was_blocked and not task.requires_approval:
-        logger.info(
-            f"[ADMIN] Task {task.id} manually approved (was blocked: {task.latest_status_message or 'unknown reason'})"
-        )
-        # Allow compute_experiment launch to proceed: check_compute_spend_approval
-        # gates on spend_approval_cleared_at being non-None. Set it here so that
-        # clearing requires_approval via PATCH actually unblocks job launch.
-        if task.spend_approval_cleared_at is None:
-            task.spend_approval_cleared_at = _utcnow()
-
-    if not (
-        was_blocked
-        and not task.requires_approval
-        and task.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING)
-    ):
-        return
-
-    ctx = task.context or {}
-    rollup_pr_number = ctx.get("rollup_pr_number")
-
-    if rollup_pr_number:
-        await _handle_rollup_pr_approval(task, ctx, rollup_pr_number, session, changes)
-    else:
-        await _handle_task_pr_approval(task, ctx, payload, session, changes)
+    _, decision, decision_changes = await decide_operator_approval(
+        task.id,
+        bool(payload["requires_approval"]),
+        session,
+        modified_by="USER",
+    )
+    changes.update(decision_changes)
+    _, followup_changes = await execute_approval_followup(decision, session)
+    changes.update(followup_changes)
 
 
 async def _handle_rollup_pr_approval(
@@ -96,202 +302,20 @@ async def _handle_rollup_pr_approval(
     rollup_pr_number: int,
     session: AsyncSession,
     changes: Dict[str, Any],
+    *,
+    approval_decision: ApprovalDecision,
 ) -> None:
     """Merge the rollup PR and optionally spawn a smoketest on human approval."""
-    _project = await session.get(Project, task.project_id)
-    try:
-        base_branch = (task.first_payload).get(
-            "base_branch"
-        ) or get_project_integration_branch(_project)
-    # Defense-in-depth: the resolver currently fails SAFE and does not raise.
-    # This guard exists so a future re-introduction of a raising resolver path
-    # refuses the merge cleanly instead of 500ing after the row is committed.
-    except InvalidProjectBranchConfiguration as exc:
-        await _mutation_facade()._block_admin_merge_for_branch_safety(
-            task,
-            _project,
-            session,
-            f"Approved rollup merge refused: {exc.detail}",
-            issue_code="admin_rollup_integration_branch_invalid",
-        )
-        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    from app.admin_approval_followup_handlers import handle_rollup_pr_approval
 
-    from app.shared_state import (
-        get_project_promotion_target as _get_project_promotion_target,
+    await handle_rollup_pr_approval(
+        task,
+        ctx,
+        rollup_pr_number,
+        session,
+        changes,
+        approval_decision=approval_decision,
     )
-
-    _promotion_target = _get_project_promotion_target(_project)
-    # A human has explicitly approved this rollup merge, so we do NOT refuse a
-    # landing on the promotion target here (PR #7064 superseded the earlier
-    # hard-refuse of PR #6995 for the human-approval lane). Instead the merge
-    # proceeds and classify_rollup_merge_outcome below decides the outcome:
-    # a landing on a distinct promotion target raises the out-of-band alert and
-    # leaves pr_merged unset so the rollup stays unqualified, rather than
-    # dead-ending the operator's explicit approval with a 409. The autonomous
-    # rollup path (rollup_management) still HOLDS such landings for human
-    # approval first; this handler IS that approval.
-
-    try:
-        from app.routers.agent import get_github_token_for_task
-        from app.shared_state import runtime_config as _runtime_config
-        from app.rollup_management import _cleanup_branches
-        from app.github import merge_pull_request, create_pr_comment
-
-        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-
-        # Pre-merge Alembic dual-head guard. The operator-approved rollup PR
-        # combines several child PRs and is exactly the multi-migration vector
-        # this guard was built for; the autonomous rollup path guards this, the
-        # human-approval path must too. On a block-or-defer verdict, refuse the
-        # merge with a 409 (mirroring the branch-safety refusal) rather than
-        # silently wedging the integration branch.
-        from app.rollup_migration_validation import enforce_premerge_migration_guard
-
-        _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
-            gh_token,
-            owner,
-            repo,
-            rollup_pr_number,
-            base_branch,
-            promotion_target=_promotion_target,
-        )
-        if not _ok_to_merge:
-            detail = (
-                f"Approved rollup merge refused: Alembic combined-chain guard "
-                f"blocked PR #{rollup_pr_number} — {_hold_reason}"
-            )
-            await _mutation_facade()._block_admin_merge_for_branch_safety(
-                task,
-                _project,
-                session,
-                detail,
-                issue_code="admin_rollup_alembic_dual_head",
-            )
-            raise HTTPException(status_code=409, detail=detail)
-
-        async def _submit_human_rollup_merge(expected_head_sha: str) -> dict:
-            return await merge_pull_request(
-                gh_token,
-                owner,
-                repo,
-                rollup_pr_number,
-                project_id=str(task.project_id),
-                expected_head_sha=expected_head_sha,
-                allow_changes_requested=True,
-            )
-
-        from app.review_policy_merge import attempt_explicit_human_merge
-
-        _merge_authority, merge_result = await attempt_explicit_human_merge(
-            task,
-            session,
-            merge_call=_submit_human_rollup_merge,
-            gh_token=gh_token,
-            owner=owner,
-            repo=repo,
-            pr_number=rollup_pr_number,
-            branch=str(
-                ctx.get("plan_branch")
-                or ctx.get("research_branch")
-                or (task.first_payload).get("branch")
-                or ""
-            ),
-            base_branch=base_branch,
-        )
-        if merge_result is None:
-            merge_result = {
-                "merged": False,
-                "message": "held because a same-PR code fix is active",
-            }
-        if merge_result.get("merged"):
-            _project = await session.get(Project, task.project_id)
-            base_branch = (task.first_payload).get(
-                "base_branch"
-            ) or get_project_integration_branch(_project)
-            (
-                record_pr_merged,
-                terminal_rollup_merge,
-                landed_branch,
-            ) = await classify_rollup_merge_outcome(
-                task,
-                _project,
-                session,
-                pr_number=rollup_pr_number,
-                merged_base_branch=base_branch,
-                source="admin_task_mutations.rollup_pr_approval",
-            )
-            task.status = (
-                TaskStatus.COMPLETED if terminal_rollup_merge else TaskStatus.EVALUATING
-            )
-            # The hotfix lane is intentionally allowed to merge to the promotion
-            # target (see _promotion_target_merge_allowed). When it does, the
-            # work never landed on the integration branch, so record_pr_merged
-            # is False — but it must still unblock the rollup as a
-            # merge-equivalent non-landing. Preserve that hotfix unblock here so
-            # the hotfix path stamps pr_merged=True / landed_on_integration=False
-            # while the non-hotfix promotion-target landing stays unqualified
-            # (pr_merged unset).
-            task.context = await _mutation_facade()._merge_context_with_hotfix_non_landing(
-                task,
-                _project,
-                session,
-                base_context=ctx,
-                landed_branch=landed_branch,
-                record_pr_merged=record_pr_merged,
-                preserve_hotfix_non_landing=True,
-                merge_commit_sha=merge_result.get("sha"),
-            )
-            if terminal_rollup_merge:
-                task.latest_status_message = (
-                    f"Human-approved merge of rollup PR #{rollup_pr_number}"
-                )
-            else:
-                task.latest_status_message = (
-                    f"Human-approved merge of rollup PR #{rollup_pr_number} "
-                    f"into {landed_branch}; awaiting downstream landing"
-                )
-            await create_pr_comment(
-                gh_token,
-                owner,
-                repo,
-                rollup_pr_number,
-                "**Blueprint Review Pipeline**: Human-approved rollup merge.",
-            )
-            changes["merged_pr"] = rollup_pr_number
-            logger.info(
-                f"[ADMIN] Human-approved rollup merge of PR #{rollup_pr_number}"
-            )
-            session.add(task)
-            await session.commit()
-            # Heal this task's direction research-history merge counts now that the
-            # human-approved landing is committed. The terminal recompute on the
-            # task-completion path never re-fires for an admin merge, so prs_merged
-            # would otherwise stay stale-low. No-op unless the task carries
-            # direction/research lineage; runs on a fresh session (the directions
-            # lock + commit must not piggyback the request session mid-mutation).
-            if record_pr_merged:
-                await _mutation_facade()._refresh_direction_outcomes_for_task(task)
-            await _cleanup_branches(task, session)
-            if base_branch == _promotion_target and _runtime_config.get(
-                "smoketest_enabled"
-            ):
-                await _mutation_facade()._maybe_spawn_rollup_smoketest(
-                    task, owner, repo, base_branch, session
-                )
-        else:
-            changes["merge_error"] = merge_result.get("message", "unknown")
-            task.latest_status_message = f"Approved but rollup merge failed: {merge_result.get('message', 'unknown')}"
-            logger.error(
-                f"[ADMIN] Approved rollup merge of PR #{rollup_pr_number} failed: {merge_result.get('message')}"
-            )
-    except HTTPException:
-        # Branch-safety / dual-head refusals must surface as a conflict to the
-        # operator, not be swallowed into a "merge failed" status message.
-        raise
-    except Exception as e:
-        changes["merge_error"] = str(e)[:200]
-        task.latest_status_message = f"Approved but rollup merge failed: {str(e)[:200]}"
-        logger.error(f"[ADMIN] Approved rollup merge failed: {e}", exc_info=True)
 
 
 async def _maybe_spawn_rollup_smoketest(
@@ -302,99 +326,18 @@ async def _maybe_spawn_rollup_smoketest(
     session: AsyncSession,
     *,
     spawned_by: str = "ADMIN_ROLLUP_MERGE",
-) -> None:
+) -> bool:
     """Spawn a smoketest task after a human-approved rollup merge."""
-    from app.shared_state import runtime_config as _runtime_config
+    from app.admin_approval_followup_handlers import maybe_spawn_rollup_smoketest
 
-    try:
-        _project_id = task.project_id
-        _parent_task_id = task.id
-        async with automatic_task_creation_parent_lock(
-            session,
-            _project_id,
-            _parent_task_id,
-            skip_locked=False,
-        ) as (_admission, _project, _parent_task):
-            if _project is None or _parent_task is None:
-                raise RuntimeError(
-                    "rollup smoketest admission could not lock project/parent"
-                )
-            task = _parent_task
-        if _admission != AUTOMATIC_TASK_CREATION_ALLOWED:
-            task.context = {
-                **(task.context or {}),
-                "automatic_smoketest_creation_suppressed": _admission,
-            }
-            session.add(task)
-            await session.commit()
-            logger.info(
-                "[SMOKETEST] Suppressed post-rollup smoketest for task %s: %s",
-                _parent_task_id,
-                _admission,
-            )
-            return
-
-        type_model = (
-            _runtime_config.get("task_type_models", {}).get("smoketest") or None
-        )
-        type_effort = (
-            _runtime_config.get("task_type_efforts", {}).get("smoketest") or None
-        )
-        health_check_urls = _runtime_config.get("health_check_urls") or []
-        smoketest_task = Task(
-            project_id=task.project_id,
-            title=f"Smoketest after rollup merge to {base_branch}",
-            description=f"Post-merge health checks for {owner}/{repo}@{base_branch}",
-            payloads=[
-                validate_internal_payload(
-                    {
-                        "type": "smoketest",
-                        "base_branch": base_branch,
-                        **({"model": type_model} if type_model else {}),
-                        **({"effort": type_effort} if type_effort else {}),
-                        **(
-                            {"health_check_urls": health_check_urls}
-                            if health_check_urls
-                            else {}
-                        ),
-                    },
-                    "admin:rollup_smoketest",
-                )
-            ],
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-            status=TaskStatus.QUEUED,
-            created_by="ORCHESTRATOR",
-            origination=TASK_ORIGINATION_SMOKETEST,
-        )
-        session.add(smoketest_task)
-        await session.commit()
-        await session.refresh(smoketest_task)
-        history = TaskHistory(
-            task_id=smoketest_task.id,
-            action="SPAWNED",
-            details={
-                "spawned_by": spawned_by,
-                "base_branch": base_branch,
-            },
-        )
-        session.add(history)
-        await session.commit()
-        await _mutation_facade().broadcast_to_project(
-            str(task.project_id),
-            "task_updated",
-            {
-                "task_id": str(smoketest_task.id),
-                "status": TaskStatus.QUEUED,
-            },
-        )
-        logger.info(
-            f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after admin rollup merge to {base_branch}"
-        )
-    except Exception as e:
-        logger.warning(
-            f"[SMOKETEST] Failed to spawn smoketest after admin rollup merge: {e}",
-            exc_info=True,
-        )
+    return await maybe_spawn_rollup_smoketest(
+        task,
+        owner,
+        repo,
+        base_branch,
+        session,
+        spawned_by=spawned_by,
+    )
 
 
 async def _handle_task_pr_approval(
@@ -403,6 +346,8 @@ async def _handle_task_pr_approval(
     payload: Dict[str, Any],
     session: AsyncSession,
     changes: Dict[str, Any],
+    *,
+    approval_decision: ApprovalDecision,
 ) -> None:
     """Handle approval for a regular task PR (critical-file merge or review spawn)."""
     artifact = (
@@ -432,14 +377,14 @@ async def _handle_task_pr_approval(
     # This guard exists so a future re-introduction of a raising resolver path
     # refuses the merge cleanly instead of 500ing after the row is committed.
     except InvalidProjectBranchConfiguration as exc:
-        await _mutation_facade()._block_admin_merge_for_branch_safety(
+        await _refuse_approval_or_legacy(
             task,
             _project,
             session,
             f"Approved merge refused: {exc.detail}",
             issue_code="admin_task_integration_branch_invalid",
+            approval_decision=approval_decision,
         )
-        raise HTTPException(status_code=409, detail=exc.detail) from exc
     from app.shared_state import (
         get_project_promotion_target as _get_project_promotion_target,
     )
@@ -459,20 +404,35 @@ async def _handle_task_pr_approval(
             "project's promotion target. Configure a distinct integration branch "
             "before landing fleet work."
         )
-        await _mutation_facade()._block_admin_merge_for_branch_safety(
+        await _refuse_approval_or_legacy(
             task,
             _project,
             session,
             detail,
             issue_code="admin_task_target_matches_promotion_target",
+            approval_decision=approval_decision,
         )
-        raise HTTPException(status_code=409, detail=detail)
 
     if ctx.get("touched_critical"):
-        await _merge_critical_pr(task, ctx, pr_number, branch, session, changes)
+        await _merge_critical_pr(
+            task,
+            ctx,
+            pr_number,
+            branch,
+            session,
+            changes,
+            approval_decision=approval_decision,
+        )
     else:
         await _spawn_review_for_approved_task(
-            task, task_payload, pr_number, branch, base_branch, session, changes
+            task,
+            task_payload,
+            pr_number,
+            branch,
+            base_branch,
+            session,
+            changes,
+            approval_decision=approval_decision,
         )
 
     if "status" in payload and TaskStatus(payload["status"]) == TaskStatus.QUEUED:
@@ -487,137 +447,21 @@ async def _merge_critical_pr(
     branch: str,
     session: AsyncSession,
     changes: Dict[str, Any],
+    *,
+    approval_decision: ApprovalDecision,
 ) -> None:
     """Merge a security-critical-file PR on human approval."""
-    try:
-        from app.routers.agent import get_github_token_for_task
-        from app.github import merge_pull_request, create_pr_comment, delete_branch
+    from app.admin_approval_followup_handlers import merge_critical_pr
 
-        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-        _project = await session.get(Project, task.project_id)
-        base_branch = (task.first_payload).get(
-            "base_branch"
-        ) or get_project_integration_branch(_project)
-
-        # Pre-merge Alembic dual-head guard. A critical-file PR landing on the
-        # integration branch is the same dual-head vector as a normal task PR;
-        # validate the combined chain before merging and refuse with a 409 on a
-        # block-or-defer verdict rather than wedging the branch.
-        from app.rollup_migration_validation import enforce_premerge_migration_guard
-        from app.shared_state import (
-            get_project_promotion_target as _get_project_promotion_target,
-        )
-
-        _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
-            gh_token,
-            owner,
-            repo,
-            pr_number,
-            base_branch,
-            promotion_target=_get_project_promotion_target(_project),
-        )
-        if not _ok_to_merge:
-            detail = (
-                f"Approved merge refused: Alembic combined-chain guard blocked "
-                f"PR #{pr_number} — {_hold_reason}"
-            )
-            await _mutation_facade()._block_admin_merge_for_branch_safety(
-                task,
-                _project,
-                session,
-                detail,
-                issue_code="admin_critical_alembic_dual_head",
-            )
-            raise HTTPException(status_code=409, detail=detail)
-
-        async def _submit_human_critical_merge(expected_head_sha: str) -> dict:
-            return await merge_pull_request(
-                gh_token,
-                owner,
-                repo,
-                pr_number,
-                project_id=str(task.project_id),
-                expected_head_sha=expected_head_sha,
-                allow_changes_requested=True,
-            )
-
-        from app.review_policy_merge import attempt_explicit_human_merge
-
-        _merge_authority, merge_result = await attempt_explicit_human_merge(
-            task,
-            session,
-            merge_call=_submit_human_critical_merge,
-            gh_token=gh_token,
-            owner=owner,
-            repo=repo,
-            pr_number=pr_number,
-            branch=branch,
-            base_branch=base_branch,
-        )
-        if merge_result is None:
-            merge_result = {
-                "merged": False,
-                "message": "held because a same-PR code fix is active",
-            }
-        if merge_result.get("merged"):
-            record_pr_merged = await merged_pr_counts_as_integration_landing(
-                task,
-                _project,
-                session,
-                pr_number=pr_number,
-                merged_base_branch=base_branch,
-                source="admin_task_mutations.critical_pr_approval",
-            )
-            task.status = TaskStatus.COMPLETED
-            task.context = await _mutation_facade()._merge_context_with_hotfix_non_landing(
-                task,
-                _project,
-                session,
-                base_context=ctx,
-                landed_branch=base_branch,
-                record_pr_merged=record_pr_merged,
-                merge_commit_sha=merge_result.get("sha"),
-            )
-            task.latest_status_message = f"Human-approved merge of PR #{pr_number}"
-            await create_pr_comment(
-                gh_token,
-                owner,
-                repo,
-                pr_number,
-                "**Blueprint Review Pipeline**: Human-approved merge (security-critical files).",
-            )
-            try:
-                await delete_branch(gh_token, owner, repo, branch)
-            except Exception:
-                logger.exception(
-                    f"[ADMIN] Failed to delete branch {branch} after merge"
-                )
-            changes["merged_pr"] = pr_number
-            # Heal this task's direction research-history merge counts after the
-            # shared session commits in _commit_and_broadcast. _merge_critical_pr
-            # defers its commit there, so the refresh (which queries committed
-            # child rows) must run post-commit — flag it for the caller.
-            if record_pr_merged:
-                changes["_refresh_direction_after_merge"] = True
-            logger.info(
-                f"[ADMIN] Human-approved merge of PR #{pr_number} (critical files)"
-            )
-        else:
-            changes["merge_error"] = merge_result.get("message", "unknown")
-            task.latest_status_message = (
-                f"Approved but merge failed: {merge_result.get('message', 'unknown')}"
-            )
-            logger.error(
-                f"[ADMIN] Approved merge of PR #{pr_number} failed: {merge_result.get('message')}"
-            )
-    except HTTPException:
-        # Branch-safety / dual-head refusals must surface as a conflict to the
-        # operator, not be swallowed into a "merge failed" status message.
-        raise
-    except Exception as e:
-        changes["merge_error"] = str(e)[:200]
-        task.latest_status_message = f"Approved but merge failed: {str(e)[:200]}"
-        logger.error(f"[ADMIN] Approved merge failed: {e}", exc_info=True)
+    await merge_critical_pr(
+        task,
+        ctx,
+        pr_number,
+        branch,
+        session,
+        changes,
+        approval_decision=approval_decision,
+    )
 
 
 def _record_failure_result(task: Task, failure_class: str) -> None:
@@ -652,11 +496,29 @@ async def _spawn_review_for_approved_task(
     base_branch: str,
     session: AsyncSession,
     changes: Dict[str, Any],
+    *,
+    approval_decision: ApprovalDecision,
 ) -> None:
     """Spawn a review task for a security-scan-approved task."""
     from app.review_pipeline import _spawn_pipeline_task
 
     original_prompt = task_payload.get("prompt", task.description or "")
+    review_target = approval_review_spawn_claim_target(approval_decision)
+    if review_target is None:
+        raise ApprovalFollowupRefused(
+            "Approved review spawn refused: exact project/PR/base/head target "
+            "is unavailable"
+        )
+    authority_state = {"granted": False}
+    source_authority = approval_followup_authority(approval_decision)
+
+    async def _tracked_source_authority(
+        authority_session: AsyncSession,
+    ) -> Task | None:
+        authoritative_task = await source_authority(authority_session)
+        authority_state["granted"] = authoritative_task is not None
+        return authoritative_task
+
     review_task, _was_created = await _spawn_pipeline_task(
         task,
         "review",
@@ -666,22 +528,22 @@ async def _spawn_review_for_approved_task(
         base_branch,
         original_prompt=original_prompt,
         original_task_id=str(task.id),
+        review_target=review_target,
+        source_spawn_authority=_tracked_source_authority,
+        source_spawn_publication=approval_child_spawn_publication(approval_decision),
     )
     if review_task:
+        if not _was_created and not await consume_approval_followup_after_dedup(
+            approval_decision, review_task.id, session
+        ):
+            return
         changes["spawned_review"] = str(review_task.id)
+    elif not authority_state["granted"]:
+        # Project/PR contention or a newer hold/replacement won before the final
+        # Task authority callback. Never write the pre-I/O ORM identity back.
+        await session.rollback()
+        return
     else:
-        task.requires_approval = True
-        task.status = TaskStatus.FAILED
-        if task.vm_provisioned_at:
-            task.vm_stopped_at = _utcnow()
-        task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
-        from app.failure_classification import persist_failure_category
-
-        persist_failure_category(task, "AGENT_TIMEOUT")
-        _record_failure_result(task, "AGENT_TIMEOUT")
-        session.add(task)
-        await session.commit()
-        raise HTTPException(
-            status_code=422,
-            detail="Iteration cap reached — cannot spawn follow-on task. Archive this task or reset iteration count.",
+        raise ApprovalFollowupRefused(
+            "Iteration cap reached — no follow-on task spawned"
         )

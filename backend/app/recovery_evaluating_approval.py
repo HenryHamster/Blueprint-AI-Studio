@@ -36,6 +36,12 @@ import logging
 from datetime import datetime
 
 from app import services
+from app.admin_approval_authority import (
+    approval_hold_provenance,
+    consume_approval_hold_metadata,
+    revoke_operator_approval_followup,
+)
+from app.closed_pr_reconciliation import revoke_review_wait_approval_hold
 from app.models import TaskStatus
 from app.spawn_calibration import SPEND_BUDGET_APPROVAL_HOLD_REASON
 from app.recovery_evaluating_helpers import (
@@ -154,7 +160,16 @@ async def _handle_approval_gate_timeout(
             # classify_failure / _maybe_create_failure_alert — it
             # must not be counted as a task failure.
             task.requires_approval = False
-            task.context = {**ctx, "spend_approval_declined": True}
+            revoke_review_wait_approval_hold(task)
+            revoke_operator_approval_followup(task)
+            consume_approval_hold_metadata(
+                task,
+                expected_episode=approval_hold_provenance(task),
+            )
+            task.context = {
+                **(task.context or {}),
+                "spend_approval_declined": True,
+            }
             flag_modified(task, "context")
             session.add(task)
             await session.commit()
@@ -251,7 +266,15 @@ async def _handle_approval_gate_timeout(
                 _merged_proj = await session.get(Project, task.project_id)
                 # Clear the approval hold — the work landed; this is terminal.
                 task.requires_approval = False
-                _merged_ctx = _clear_rollup_transient_state({**ctx})
+                revoke_review_wait_approval_hold(task)
+                revoke_operator_approval_followup(task)
+                consume_approval_hold_metadata(
+                    task,
+                    expected_episode=approval_hold_provenance(task),
+                )
+                _merged_ctx = _clear_rollup_transient_state(
+                    {**(task.context or {})}
+                )
                 _merged_ctx["rollup_pr_number"] = int(_merged_pr_num)
                 task.context = _merged_ctx
                 await _apply_rollup_merge_classification(

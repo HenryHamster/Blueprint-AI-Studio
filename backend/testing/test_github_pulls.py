@@ -41,6 +41,44 @@ class HtmlBodyResponse(MockResponse):
         raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("merged_payload", "expected_merged"),
+    [
+        ({"merged": True}, True),
+        ({"merged": False}, False),
+        ({}, None),
+        ({"merged": "false"}, None),
+    ],
+)
+async def test_fetch_live_review_target_preserves_merged_tristate(
+    mocker, merged_payload, expected_merged
+):
+    from app.ci_merge_helpers import _fetch_live_review_target
+
+    get_pull_request = mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                **merged_payload,
+                "state": "open",
+                "base": {"ref": "automain", "sha": "base-42"},
+                "head": {
+                    "ref": "blueprint/operator-approval",
+                    "sha": "head-42",
+                },
+            }
+        ),
+    )
+
+    target = await _fetch_live_review_target(
+        "token", "owner", "repo", 42, project_id="project-42"
+    )
+
+    assert target["merged"] is expected_merged
+    get_pull_request.assert_awaited_once()
+
+
 def _rate_limited_response(reset_in_s: int = 300) -> MockResponse:
     """A synthetic 403 mirroring the local limiter's short-circuit response."""
     return MockResponse(
@@ -290,6 +328,24 @@ async def test_merge_pr_forwards_expected_head_sha_as_merge_guard(mocker):
 
 
 @pytest.mark.asyncio
+async def test_merge_pr_put_disables_transport_retries(mocker):
+    """An approval PUT can be ambiguous; the transport must never replay it."""
+
+    from app import github_pulls
+
+    request = mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=MockResponse(409, {"message": "conflict"})),
+    )
+
+    await github_pulls.merge_pull_request(
+        "t", "o", "r", 42, allow_changes_requested=True
+    )
+
+    assert request.await_args.kwargs["max_retries"] == 1
+
+
+@pytest.mark.asyncio
 async def test_merge_pr_html_5xx_body_does_not_raise_jsondecodeerror(mocker):
     """An HTML 5xx body must surface as a normal HTTPException, NOT a raw
     JSONDecodeError.
@@ -422,8 +478,8 @@ def test_changes_requested_override_is_limited_to_explicit_operator_lanes():
                 )
 
     assert overrides == {
-        ("admin_task_approvals.py", "_submit_human_rollup_merge"),
-        ("admin_task_approvals.py", "_submit_human_critical_merge"),
+        ("admin_approval_followup_handlers.py", "_submit_human_rollup_merge"),
+        ("admin_approval_followup_handlers.py", "_submit_human_critical_merge"),
     }
 
 @pytest.mark.asyncio

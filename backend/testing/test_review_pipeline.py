@@ -26,7 +26,9 @@ from app.review_pipeline import (
     MAX_REVIEW_HISTORY_FEEDBACK_CHARS,
     PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
     PIPELINE_TASK_STALE_MINUTES,
+    SPAWN_REASON_ADMISSION_PAUSED,
     SPAWN_REASON_BLOCKED_REPEAT,
+    SPAWN_REASON_CONTENDED,
     SPAWN_REASON_DEFERRED,
     SPAWN_REASON_KEY,
     SPAWN_REASON_PERSISTENT_CONFLICT,
@@ -81,6 +83,263 @@ def _review_target(project_id, pr_number: int, base_sha: str, head_sha: str) -> 
         "base_sha": base_sha,
         "head_sha": head_sha,
     }
+
+
+@pytest.mark.asyncio
+async def test_source_spawn_authority_loss_prevents_canonical_child(
+    db_session, mocker
+):
+    """A revoked released-source claim stops before source-derived spawn work."""
+    project = await _make_db_project(db_session)
+    project_id = project.id
+    source = make_task(
+        project_id=project_id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "branch": "feat/revoked"}],
+        context={
+            "review_loop": {
+                "iteration": 0,
+                "pr_number": 705,
+                "branch": "feat/revoked",
+                "base_branch": "main",
+            }
+        },
+    )
+    await _persist(db_session, source)
+    source_id = source.id
+    authority = AsyncMock(return_value=None)
+    repository_scope = mocker.patch(
+        "app.review_repository_scope.repository_project_ids",
+        new_callable=AsyncMock,
+    )
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        705,
+        "feat/revoked",
+        "main",
+        original_task_id=str(source_id),
+        review_target=_review_target(project_id, 705, "base", "head"),
+        source_spawn_authority=authority,
+    )
+
+    assert spawned is None and created is False
+    authority.assert_awaited_once_with(db_session)
+    repository_scope.assert_not_awaited()
+    rows = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.id for row in rows] == [source_id]
+
+
+@pytest.mark.asyncio
+async def test_source_spawn_authority_is_acquired_before_source_derivation(
+    db_session, mocker
+):
+    """The canonical spawner owns the fresh Task row before reading its chain."""
+    project = await _make_db_project(db_session)
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "branch": "feat/authority"}],
+        context={
+            "review_loop": {
+                "iteration": 0,
+                "pr_number": 706,
+                "branch": "feat/authority",
+                "base_branch": "main",
+            }
+        },
+    )
+    await _persist(db_session, source)
+    authority_acquired = False
+
+    async def _authority(authority_session):
+        nonlocal authority_acquired
+        authoritative = (
+            (
+                await authority_session.execute(
+                    select(Task)
+                    .where(Task.id == source.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        authority_acquired = True
+        return authoritative
+
+    async def _repository_scope(_session, _project_id):
+        assert authority_acquired is True
+        return [project.id]
+
+    mocker.patch(
+        "app.review_repository_scope.repository_project_ids",
+        new=AsyncMock(side_effect=_repository_scope),
+    )
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        706,
+        "feat/authority",
+        "main",
+        original_task_id=str(source.id),
+        review_target=_review_target(project.id, 706, "base", "head"),
+        source_spawn_authority=_authority,
+    )
+
+    assert authority_acquired is True
+    assert created is True and spawned is not None
+    assert spawned.first_payload.get("type") == "review"
+    assert (spawned.context or {})["review_loop"]["review_target"] == (
+        _review_target(project.id, 706, "base", "head")
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_authority_pause_defers_then_resume_creates(
+    db_session, mocker
+):
+    """Project admission DEFERRED is retryable under the same exact source."""
+    project = await _make_db_project(db_session)
+    project.paused = True
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "branch": "feat/pause-resume"}],
+        context={
+            "review_loop": {
+                "iteration": 0,
+                "pr_number": 707,
+                "branch": "feat/pause-resume",
+                "base_branch": "main",
+            }
+        },
+    )
+    db_session.add(project)
+    await _persist(db_session, source)
+
+    async def _authority(authority_session):
+        return (
+            (
+                await authority_session.execute(
+                    select(Task)
+                    .where(Task.id == source.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .one()
+        )
+
+    target = _review_target(project.id, 707, "base", "head")
+    deferred, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        707,
+        "feat/pause-resume",
+        "main",
+        original_task_id=str(source.id),
+        review_target=target,
+        source_spawn_authority=_authority,
+    )
+    assert deferred is None and created is False
+    assert (
+        source.context or {}
+    ).get(SPAWN_REASON_KEY) == SPAWN_REASON_ADMISSION_PAUSED
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id, populate_existing=True)
+    project.paused = False
+    db_session.add(project)
+    await db_session.commit()
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        707,
+        "feat/pause-resume",
+        "main",
+        original_task_id=str(source.id),
+        review_target=target,
+        source_spawn_authority=_authority,
+    )
+    assert created is True and spawned is not None
+    assert (spawned.context or {})["review_loop"]["review_target"] == target
+
+
+@pytest.mark.asyncio
+async def test_source_authority_project_lock_contention_has_short_retry_reason(
+    db_session, mocker
+):
+    """An existing active Project hidden by SKIP LOCKED is not a pause."""
+    from app.task_locking import AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE
+
+    project = await _make_db_project(db_session)
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "branch": "feat/project-contention"}],
+        context={
+            "review_loop": {
+                "iteration": 0,
+                "pr_number": 708,
+                "branch": "feat/project-contention",
+                "base_branch": "main",
+            }
+        },
+    )
+    await _persist(db_session, source)
+    mocker.patch(
+        "app.task_locking.acquire_automatic_task_creation_authority",
+        new=AsyncMock(return_value=AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE),
+    )
+
+    async def _authority(authority_session):
+        return (
+            (
+                await authority_session.execute(
+                    select(Task)
+                    .where(Task.id == source.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .one()
+        )
+
+    deferred, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        708,
+        "feat/project-contention",
+        "main",
+        original_task_id=str(source.id),
+        review_target=_review_target(project.id, 708, "base", "head"),
+        source_spawn_authority=_authority,
+    )
+
+    assert deferred is None and created is False
+    assert (source.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_CONTENDED
 
 
 @pytest.mark.asyncio
@@ -3412,7 +3671,18 @@ async def test_stuck_cycle_detected_at_50pct_blocks_spawn(db_session, mocker):
         project_id=project.id,
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+        context={
+            "_approval_set_at": "old-review-wait-timer",
+            "_operator_approval_followup_claim": {"token": "old-operator-claim"},
+            "review_loop": {
+                "review_wait_approval_hold": {
+                    "owner": "ci_review_wait_backstop",
+                    "set_at": "old-review-wait-timer",
+                }
+            },
+        },
     )
+    original_task.requires_approval = True
     db_session.add(original_task)
     await db_session.commit()
     await db_session.refresh(original_task)
@@ -3478,6 +3748,16 @@ async def test_stuck_cycle_detected_at_50pct_blocks_spawn(db_session, mocker):
     assert "stuck" in (original_task.latest_status_message or "").lower(), (
         f"Status message should mention stuck cycle: {original_task.latest_status_message!r}"
     )
+    original_context = original_task.context or {}
+    assert "review_wait_approval_hold" not in (
+        original_context.get("review_loop") or {}
+    )
+    assert "_operator_approval_followup_claim" not in original_context
+    assert original_context.get("approval_hold_reason") == "stuck"
+    assert original_context.get("_approval_set_at") != "old-review-wait-timer"
+    assert (original_context.get("_approval_hold_provenance") or {}).get(
+        "owner"
+    ) == "review_pipeline"
 
 
 @pytest.mark.asyncio
@@ -9667,15 +9947,20 @@ class TestFailureFingerprint:
         assert all(c in "0123456789abcdef" for c in fp)
 
 
+@pytest.mark.parametrize("alert_outcome", ["dedup", "error"])
 @pytest.mark.asyncio
 async def test_repeat_fingerprint_halts_chain_and_classifies_blocked(
-    db_session, mocker
+    db_session, mocker, alert_outcome
 ):
     """Two same-type FAILED tasks in the same chain with identical failure
     fingerprints → next spawn returns (None, False), the most-recent FAILED
     is reclassified as BLOCKED_PRECONDITION, the chain's original task is
     marked requires_approval=True, ProjectMessage posted to strategic."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    alert = AsyncMock(return_value=None)
+    if alert_outcome == "error":
+        alert.side_effect = RuntimeError("synthetic alert outage")
+    mocker.patch("app.alert_dispatch._maybe_create_escalation_alert", new=alert)
 
     project = await _make_db_project(db_session)
     original_task = make_task(
@@ -9686,6 +9971,8 @@ async def test_repeat_fingerprint_halts_chain_and_classifies_blocked(
     db_session.add(original_task)
     await db_session.commit()
     await db_session.refresh(original_task)
+    project_id = project.id
+    original_task_id = original_task.id
 
     common_failure = "[wrapper] ./check failed: error while loading shared libraries: libatk-1.0.so.0"
 
@@ -9733,6 +10020,8 @@ async def test_repeat_fingerprint_halts_chain_and_classifies_blocked(
         latest_status_message=f"[2026-05-06T09:42:08] iter=3 vm=agent-vm-bbb222 {common_failure}",
     )
     await _persist(db_session, earlier_fix, most_recent_fix)
+    earlier_fix_id = earlier_fix.id
+    most_recent_fix_id = most_recent_fix.id
 
     # Source is most_recent_fix being handed off (FAILED here, but the halt
     # fires regardless of source.status — see also EVALUATING test below).
@@ -9743,57 +10032,62 @@ async def test_repeat_fingerprint_halts_chain_and_classifies_blocked(
         pr_number=901,
         branch="fix/901",
         base_branch="main",
-        original_task_id=str(original_task.id),
+        original_task_id=str(original_task_id),
     )
 
     assert result is None
     assert was_created is False
 
-    # Persist before refreshing: the halt path leaves the reclassification and
-    # the spawn-reason marker pending for the rollup caller's final commit
-    # (per the _spawn_pipeline_task contract); under real ORM expiry a refresh
-    # without this commit would discard the pending writes.
-    await db_session.commit()
+    # The wrapper rolls back all uncommitted helper bookkeeping before it
+    # reselects the source. Terminal repeat-fingerprint evidence must therefore
+    # be self-committed before the best-effort alert helper can dedup or raise.
+    await db_session.rollback()
 
-    # most_recent_fix gets reclassified.
-    await db_session.refresh(most_recent_fix)
-    ctx = most_recent_fix.context or {}
-    assert ctx.get("failure_category") == "BLOCKED_PRECONDITION"
-    assert ctx.get("blocked_repeat_fingerprint")
-    assert ctx.get("blocked_repeat_prior_task_id") == str(earlier_fix.id)
-    msg = (most_recent_fix.latest_status_message or "").lstrip().lower()
-    assert msg.startswith("blocker:")
-
-    # source_task gets the spawn-reason marker.
-    ctx_src = most_recent_fix.context or {}
-    assert ctx_src.get(SPAWN_REASON_KEY) == SPAWN_REASON_BLOCKED_REPEAT
-
-    # Original task gets requires_approval=True (mirrors stuck-cycle).
-    await db_session.refresh(original_task)
-    assert original_task.requires_approval is True
-    assert "repeat-fingerprint" in (original_task.latest_status_message or "").lower()
-
-    # ProjectMessage posted to strategic so it can decide the next move.
+    from app.database import AsyncSessionLocal
     from app.models import MessageType, ProjectMessage
 
-    pms = (
-        (
-            await db_session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.message_type == MessageType.BLOCKER,
+    async with AsyncSessionLocal() as verifying_session:
+        persisted_recent = await verifying_session.get(Task, most_recent_fix_id)
+        persisted_original = await verifying_session.get(Task, original_task_id)
+        assert persisted_recent is not None
+        assert persisted_original is not None
+
+        # most_recent_fix gets reclassified durably. The source spawn reason is
+        # intentionally return-only bookkeeping and was rolled back above.
+        ctx = persisted_recent.context or {}
+        assert ctx.get("failure_category") == "BLOCKED_PRECONDITION"
+        assert ctx.get("blocked_repeat_fingerprint")
+        assert ctx.get("blocked_repeat_prior_task_id") == str(earlier_fix_id)
+        assert SPAWN_REASON_KEY not in ctx
+        msg = (persisted_recent.latest_status_message or "").lstrip().lower()
+        assert msg.startswith("blocker:")
+
+        # Original task gets requires_approval=True (mirrors stuck-cycle).
+        assert persisted_original.requires_approval is True
+        assert "repeat-fingerprint" in (
+            persisted_original.latest_status_message or ""
+        ).lower()
+
+        # ProjectMessage posted to strategic so it can decide the next move.
+        pms = (
+            (
+                await verifying_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.message_type == MessageType.BLOCKER,
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
     assert len(pms) == 1
     assert pms[0].from_type == "system"
     assert pms[0].context.get("trigger") == "repeat_fingerprint_halt"
     assert pms[0].context.get("pr_number") == 901
-    assert pms[0].context.get("source_task_id") == str(most_recent_fix.id)
-    assert pms[0].context.get("prior_task_id") == str(earlier_fix.id)
+    assert pms[0].context.get("source_task_id") == str(most_recent_fix_id)
+    assert pms[0].context.get("prior_task_id") == str(earlier_fix_id)
+    alert.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 from sqlalchemy import func
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -682,6 +682,11 @@ SPAWN_REASON_ALREADY_MERGED = "already_merged"
 # log accurately (a closed-unmerged PR is NOT the same as a mid-flight merge).
 SPAWN_REASON_PR_CLOSED_UNMERGED = "pr_closed_unmerged"
 SPAWN_REASON_DEFERRED = "deferred_cross_type"
+SPAWN_REASON_ADMISSION_PAUSED = "deferred_admission_paused"
+# A row/advisory-lock peer temporarily prevented exact authority. Unlike a
+# paused/archived/missing project, this must preserve an already-elapsed
+# review-wait backstop and retry on the short scheduler interval.
+SPAWN_REASON_CONTENDED = "spawn_authority_contended"
 SPAWN_REASON_CAP = "cap_exhausted"
 SPAWN_REASON_STUCK = "stuck_cycle"
 # Early non-convergence escalation: the review-fix loop is whittling/drifting
@@ -812,7 +817,13 @@ async def _halt_for_cross_episode_abandon_candidate(
     target_ctx = dict(target.context or {})
     target_ctx[REVIEW_LOOP_ABANDON_CANDIDATE_KEY] = marker
     target.context = target_ctx
-    target.requires_approval = True
+    from app.admin_approval_authority import establish_independent_approval_hold
+
+    establish_independent_approval_hold(
+        target,
+        reason="cross_episode_abandon_candidate",
+        owner="review_pipeline",
+    )
     candidate_reason = str(candidate.get("reason") or "abandon_candidate")
     candidate_detail = str(candidate.get("detail") or "").strip()
     target.latest_status_message = (
@@ -1952,6 +1963,10 @@ async def _spawn_pipeline_task(
     fix_target: dict[str, str | int] | None = None,
     suppress_warm_handoff: bool = False,
     attempt: int = 0,
+    source_spawn_authority: Callable[[AsyncSession], Awaitable[Task | None]]
+    | None = None,
+    source_spawn_publication: Callable[[Task, AsyncSession], Awaitable[None]]
+    | None = None,
 ) -> tuple[Task | None, bool]:
     """Spawn a review or fix task as part of the automated review pipeline.
 
@@ -1987,6 +2002,7 @@ async def _spawn_pipeline_task(
     # review/fix on the same PR/chain. Lock is held until commit/rollback.
     from app.task_locking import (  # local import to keep top of file lean
         AUTOMATIC_TASK_CREATION_ALLOWED,
+        AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE,
         acquire_automatic_task_creation_authority,
         acquire_pr_spawn_lock,
     )
@@ -1998,7 +2014,31 @@ async def _spawn_pipeline_task(
     admission = await acquire_automatic_task_creation_authority(
         session, source_task.project_id, skip_locked=True
     )
-    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+    admission_contended = False
+    if (
+        source_spawn_authority is not None
+        and admission == AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE
+    ):
+        # ``project_unavailable`` intentionally conflates a missing Project with
+        # SKIP LOCKED contention. A plain MVCC read does not wait on the row lock
+        # and lets this backstop distinguish a true unavailable fence (clock may
+        # pause/reset) from harmless contention (short retry, elapsed preserved).
+        from app.models import Project as _AdmissionProject
+
+        admission_contended = (
+            (
+                await session.execute(
+                    select(_AdmissionProject.id).where(
+                        _AdmissionProject.id == source_task.project_id
+                    )
+                )
+            ).scalar_one_or_none()
+            is not None
+        )
+    if (
+        admission != AUTOMATIC_TASK_CREATION_ALLOWED
+        and source_spawn_authority is None
+    ):
         source_task.latest_status_message = (
             f"{task_type.title()} spawn deferred for PR #{pr_number} — "
             f"automatic task admission is closed ({admission})"
@@ -2029,6 +2069,11 @@ async def _spawn_pipeline_task(
             f"the per-PR spawn lock (a peer spawner holds it) — deferring to the "
             f"next sweep: {str(_spawn_lock_exc)[:200]}"
         )
+        # A caller-provided authority was never acquired, so this transaction
+        # has no right to rewrite the released source row.  Its caller treats
+        # this source-neutral suppression as a transient deferral.
+        if source_spawn_authority is not None:
+            return (None, False)
         # The rollback expired every loaded instance (even under
         # expire_on_commit=False), so re-fetch the source by id before touching
         # it — mirrors the INSERT-side lock-timeout handler.
@@ -2054,6 +2099,99 @@ async def _spawn_pipeline_task(
             _set_spawn_reason(_reloaded_source, SPAWN_REASON_DEFERRED)
             session.add(_reloaded_source)
             await session.commit()
+        return (None, False)
+
+    # Canonical lock order for a source row released by the caller is
+    # Project -> PR -> Task.  Acquire and validate the exact source attempt now,
+    # before any source-derived decision or committing early return.  The Task
+    # lock remains held through the eventual child INSERT commit, so a concurrent
+    # approval, replacement, or archive either wins before this check (and
+    # suppresses the spawn) or waits until the child is authoritative.
+    if source_spawn_authority is not None:
+        authoritative_source = await source_spawn_authority(session)
+        if authoritative_source is None:
+            await session.rollback()
+            return (None, False)
+        source_task = authoritative_source
+    elif task_type == "fix":
+        # A human-approval merge may have reached its durable pre-PUT boundary
+        # after this caller loaded ``source_task``.  Re-read code-writing
+        # admissions under the already-held canonical Project -> PR -> Task
+        # order; reviews are read-only reconciliation and remain unaffected.
+        authoritative_source = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(Task.id == source_task_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if authoritative_source is None:
+            await session.rollback()
+            return (None, False)
+        source_task = authoritative_source
+
+    if task_type == "fix":
+        from app.admin_approval_authority import approval_merge_in_flight
+
+        merge_fence_task = source_task
+        merge_fence_task_id = str(
+            original_task_id
+            or source_task.first_payload.get("original_task_id")
+            or ""
+        )
+        if merge_fence_task_id and merge_fence_task_id != str(source_task.id):
+            try:
+                merge_fence_uuid = uuid.UUID(merge_fence_task_id)
+            except (TypeError, ValueError, AttributeError):
+                merge_fence_uuid = None
+            if merge_fence_uuid is not None:
+                # The per-PR admission lock already serializes this publication
+                # against merge submission.  A fresh MVCC read of the chain
+                # original is therefore enough to see any intent that could
+                # possibly have reached SUBMISSION_STARTED; a not_sent intent
+                # committed just after this read still cannot pass its PR gate
+                # until this child transaction releases it.
+                merge_fence_task = (
+                    (
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id == merge_fence_uuid)
+                            .execution_options(populate_existing=True)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if merge_fence_task is None:
+                    await session.rollback()
+                    return (None, False)
+
+        if await approval_merge_in_flight(merge_fence_task, session):
+            # ``ambiguous`` means the GitHub merge PUT may already have been
+            # accepted.  Suppress source-neutrally: the durable ledger, not a
+            # spawn-reason/status rewrite, owns convergence from this point.
+            await session.rollback()
+            return (None, False)
+
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        source_task.latest_status_message = (
+            f"{task_type.title()} spawn deferred for PR #{pr_number} — "
+            f"automatic task admission is closed ({admission})"
+        )
+        _set_spawn_reason(
+            source_task,
+            (
+                SPAWN_REASON_CONTENDED
+                if admission_contended
+                else SPAWN_REASON_ADMISSION_PAUSED
+            ),
+        )
+        session.add(source_task)
         return (None, False)
 
     from app.review_repository_scope import repository_project_ids
@@ -2109,9 +2247,11 @@ async def _spawn_pipeline_task(
 
     # Guard: don't spawn if PR is already merged (check both original and source).
     orig_task: Task | None = None
+    _orig_pr_already_merged = False
     try:
         orig_task = await session.get(Task, uuid.UUID(resolved_original_id))
         if orig_task and (orig_task.context or {}).get("pr_merged"):
+            _orig_pr_already_merged = True
             logger.info(
                 f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (original task {resolved_original_id[:8]})"
             )
@@ -2149,8 +2289,18 @@ async def _spawn_pipeline_task(
                 logger.debug(
                     "[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True
                 )
+            # Callback callers release their outer source lock before entering
+            # this helper. Persist the authoritative terminal effects while the
+            # exact source authority acquired above is still held; the caller's
+            # stale-state cleanup must never roll back completion/lane retirement.
+            await session.commit()
             return (None, False)
     except Exception:  # noqa: BLE001
+        if _orig_pr_already_merged:
+            # A matched terminal guard owns real completion/lane mutations.
+            # Commit failure must propagate to the caller's retry boundary; it
+            # is not a best-effort inability to inspect ``pr_merged``.
+            raise
         logger.debug(
             f"[PIPELINE] Could not verify pr_merged for original task {resolved_original_id[:8]}: skipping check"
         )
@@ -2169,6 +2319,7 @@ async def _spawn_pipeline_task(
             logger.debug(
                 "[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True
             )
+        await session.commit()
         return (None, False)
 
     # Guard: don't spawn if PR was closed without merge.
@@ -2194,6 +2345,7 @@ async def _spawn_pipeline_task(
                 "[PIPELINE] retire_chain_lane (pr_closed_unmerged) failed (non-critical)",
                 exc_info=True,
             )
+        await session.commit()
         return (None, False)
 
     # A convergence/cap stop hands the PR to the existing operator-disposition
@@ -2641,7 +2793,15 @@ async def _spawn_pipeline_task(
             if churn_last:
                 detail += f" Last superseded task: {churn_last}."
         if _runtime_config.get("require_approval_gates", True):
-            orig_task.requires_approval = True
+            from app.admin_approval_authority import (
+                establish_independent_approval_hold,
+            )
+
+            establish_independent_approval_hold(
+                orig_task,
+                reason="supersession_churn_halt",
+                owner="review_pipeline",
+            )
         orig_task.latest_status_message = (
             f"Review/fix supersession churn on PR #{pr_number}: "
             f"{supersede_churn_count} consecutive superseded task(s); "
@@ -2724,6 +2884,13 @@ async def _spawn_pipeline_task(
                 f"[PIPELINE] Cancelled in-flight {_inflight_type} task {_inflight.id} "
                 f"for PR #{pr_number} (churn halt)"
             )
+        # Commit every source/original/cancellation mutation, including the
+        # terminal spawn reason, exactly once while Project -> PR -> Task
+        # authority is still held. The alert helper below commits independently;
+        # no source ORM identity may be dirtied after that release point.
+        _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
+        session.add(source_task)
+        await session.commit()
         try:
             await _maybe_create_escalation_alert(
                 orig_task,
@@ -2759,9 +2926,6 @@ async def _spawn_pipeline_task(
             )
         except Exception as _ne:  # noqa: BLE001
             logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}")
-        _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
-        session.add(source_task)
-        await session.commit()
         # Delete VMs for all cancelled tasks after commit
         for vm_id, reason in vms_to_delete:
             await vm_lifecycle._ensure_vm_deleted(
@@ -3043,6 +3207,7 @@ async def _spawn_pipeline_task(
                         f"both failed with fp={fp_b} — halting spawn"
                         f"{' (already classified, skipping reclassify)' if already_halted else ', reclassifying most-recent as BLOCKED_PRECONDITION'}."
                     )
+                    _orig = None
                     if not already_halted:
                         # Reclassify b (the most recent FAILED) so its row stops
                         # contributing to CODE_ERROR cap pressure and so any
@@ -3064,7 +3229,6 @@ async def _spawn_pipeline_task(
                         session.add(b)
                         # Surface to operator/strategic via requires_approval
                         # on the chain's original task — mirrors stuck-cycle.
-                        _orig = None
                         try:
                             _orig = await session.get(
                                 Task, uuid.UUID(resolved_original_id)
@@ -3079,7 +3243,15 @@ async def _spawn_pipeline_task(
                                 # parent. The BLOCKER status message is informational
                                 # and set regardless.
                                 if _runtime_config.get("require_approval_gates", True):
-                                    _orig.requires_approval = True
+                                    from app.admin_approval_authority import (
+                                        establish_independent_approval_hold,
+                                    )
+
+                                    establish_independent_approval_hold(
+                                        _orig,
+                                        reason="repeat_fingerprint_halt",
+                                        owner="review_pipeline",
+                                    )
                                 _orig.latest_status_message = (
                                     f"Repeat-fingerprint halt on PR #{pr_number}: last "
                                     f"two {src_payload_type} attempts failed identically "
@@ -3115,6 +3287,15 @@ async def _spawn_pipeline_task(
                                 f"message for PR #{pr_number}: {_msg_err}",
                                 exc_info=True,
                             )
+                        # The alert helper is best-effort and may either
+                        # deduplicate without committing or raise before it
+                        # writes. Persist the authoritative terminal outcome,
+                        # failed-row classification, BLOCKER message, and
+                        # approval gate as one transaction before entering that
+                        # advisory boundary. The source spawn reason below is
+                        # deliberately return-only bookkeeping for the wrapper.
+                        await session.commit()
+
                         # Durable operator Alert — fires regardless of approval
                         # gates (mirrors the stuck-cycle path). Deduplicated by
                         # (task_id, title) so re-entry does not spam the banner.
@@ -3948,7 +4129,15 @@ async def _spawn_pipeline_task(
                     # approval-gate when require_approval_gates is on; with gates off
                     # the rollup respawn-cap terminalization converges the parent.
                     if _runtime_config.get("require_approval_gates", True):
-                        stuck_orig.requires_approval = True
+                        from app.admin_approval_authority import (
+                            establish_independent_approval_hold,
+                        )
+
+                        establish_independent_approval_hold(
+                            stuck_orig,
+                            reason="standoff" if is_standoff else "stuck",
+                            owner="review_pipeline",
+                        )
                     stuck_orig.latest_status_message = (
                         f"Review-fix cycle appears stuck — same issues repeated across "
                         f"{iteration} iterations. Manual review required."
@@ -4712,7 +4901,30 @@ async def _spawn_pipeline_task(
         if orig_task is not None and orig_task.id != source_task.id:
             revoke_review_authority_for_active_fix(orig_task, new_task.id)
             session.add(orig_task)
+    # Some callers must mutate the exact source attempt only when a fresh child
+    # is actually publishable.  Source authority is acquired much earlier so
+    # every guard reads a fresh, locked row, but mutating there would let a
+    # canonical early-return commit release an approval gate without a child.
+    # Run the caller's publication mutation at the sole child/history commit
+    # boundary instead.  The Project -> PR -> Task locks acquired above are
+    # still held, and any exception rolls the source mutation, child, and
+    # SPAWNED history back together.
+    if source_spawn_publication is not None:
+        await source_spawn_publication(source_task, session)
     session.add(new_task)
+    # The child row and its SPAWNED audit record are one publication unit.
+    # A second commit here used to leave a dispatchable child without history
+    # when refresh/history construction failed after the INSERT committed.
+    history = TaskHistory(
+        task_id=new_task.id,
+        action="SPAWNED",
+        details={
+            "spawned_by": "REVIEW_PIPELINE",
+            "type": task_type,
+            "pr_number": pr_number,
+        },
+    )
+    session.add(history)
     if lane_fix_to_activate is not None:
         await activate_lane_for_fix(
             session,
@@ -4762,7 +4974,11 @@ async def _spawn_pipeline_task(
             f"[PIPELINE] Concurrent {task_type} spawn for PR #{pr_number} "
             f"hit idempotency key; using existing task {existing.id}"
         )
-        reloaded_source = await session.get(Task, source_task_id)
+        reloaded_source = (
+            await session.get(Task, source_task_id)
+            if source_spawn_authority is None
+            else None
+        )
         if reloaded_source is not None:
             reloaded_source.latest_status_message = (
                 f"{task_type.title()} skipped for PR #{pr_number} — "
@@ -4813,7 +5029,11 @@ async def _spawn_pipeline_task(
             f"timeout on commit — deferring to the next sweep: "
             f"{str(_spawn_db_exc)[:200]}"
         )
-        reloaded_source = await session.get(Task, source_task_id)
+        reloaded_source = (
+            await session.get(Task, source_task_id)
+            if source_spawn_authority is None
+            else None
+        )
         if reloaded_source is not None:
             reloaded_source.latest_status_message = (
                 f"{task_type.title()} deferred for PR #{pr_number} — "
@@ -4824,25 +5044,18 @@ async def _spawn_pipeline_task(
         return (None, False)
     await session.refresh(new_task)
 
-    history = TaskHistory(
-        task_id=new_task.id,
-        action="SPAWNED",
-        details={
-            "spawned_by": "REVIEW_PIPELINE",
-            "type": task_type,
-            "pr_number": pr_number,
-        },
-    )
-    session.add(history)
-    await session.commit()
-
     await broadcast_to_project(
         str(source_task.project_id),
         "task_updated",
         {"task_id": str(new_task.id), "status": TaskStatus.QUEUED},
     )
-    _set_spawn_reason(source_task, SPAWN_REASON_SPAWNED)
-    session.add(source_task)
+    # The authoritative source lock ended with the child INSERT commit.  A
+    # concurrent replacement may own the row now, so callback callers must not
+    # stage a post-commit context write from their former identity.  They already
+    # receive ``was_created=True`` as the canonical outcome.
+    if source_spawn_authority is None:
+        _set_spawn_reason(source_task, SPAWN_REASON_SPAWNED)
+        session.add(source_task)
 
     # C2 lock-window fix: emit the deferred scope-overflow PR signal AFTER the
     # spawn commit above released the per-PR advisory lock (helper does the

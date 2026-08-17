@@ -1885,3 +1885,77 @@ class TestCommitFlowSafetyRegressionCheck:
                 )
 
 
+class TestApprovalHoldProvenance:
+    """Every new TRUE hold must replace any older approval owner."""
+
+    def test_independent_true_writes_use_canonical_provenance_helper(self):
+        class _TrueWriteVisitor(ast.NodeVisitor):
+            def __init__(self, path: Path, source_lines: list[str]) -> None:
+                self.path = path
+                self.source_lines = source_lines
+                self.functions: list[str] = []
+                self.violations: list[str] = []
+
+            def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
+                self.functions.append(node.name)
+                self.generic_visit(node)
+                self.functions.pop()
+
+            visit_FunctionDef = _visit_function
+            visit_AsyncFunctionDef = _visit_function
+
+            @staticmethod
+            def _may_assign_true(value: ast.expr) -> bool:
+                if isinstance(value, ast.Constant):
+                    return value.value is True
+                return bool(
+                    isinstance(value, ast.IfExp)
+                    and (
+                        _TrueWriteVisitor._may_assign_true(value.body)
+                        or _TrueWriteVisitor._may_assign_true(value.orelse)
+                    )
+                )
+
+            def visit_Assign(self, node: ast.Assign) -> None:
+                targets = [
+                    target
+                    for target in node.targets
+                    if isinstance(target, ast.Attribute)
+                    and target.attr == "requires_approval"
+                ]
+                if targets and self._may_assign_true(node.value):
+                    function = self.functions[-1] if self.functions else "<module>"
+                    line = self.source_lines[node.lineno - 1]
+                    canonical_authority = bool(
+                        self.path.name == "admin_approval_authority.py"
+                        and (
+                            function == "establish_independent_approval_hold"
+                            or "approval-provenance: operator-followup-claim" in line
+                        )
+                    )
+                    review_wait_owner = bool(
+                        self.path.name == "ci_completion.py"
+                        and "approval-provenance: review-wait-owner" in line
+                    )
+                    if not canonical_authority and not review_wait_owner:
+                        self.violations.append(
+                            f"{self.path.name}:{node.lineno}::{function}"
+                        )
+                self.generic_visit(node)
+
+        violations: list[str] = []
+        for path in sorted(_PRODUCTION_APP_DIR.rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            visitor = _TrueWriteVisitor(path, source.splitlines())
+            visitor.visit(ast.parse(source, filename=str(path)))
+            violations.extend(visitor.violations)
+
+        assert not violations, (
+            "Independent requires_approval=True writes can inherit an older "
+            "review-wait timer or operator claim. Route each through "
+            "establish_independent_approval_hold; only the exact review-wait "
+            "owner marker and canonical operator authority may write TRUE "
+            "directly:\n" + "\n".join(f"  - {item}" for item in violations)
+        )
+
+

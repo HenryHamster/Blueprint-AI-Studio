@@ -32,7 +32,7 @@ TASK_SITE_MANIFEST: dict[TaskSite, tuple[str, tuple[AuthorityProof, ...]]] = {
     ("admin", "create_compute_experiment_task", 1): MANUAL,
     ("admin", "create_task_manually", 1): MANUAL,
     ("admin", "rerun_compute_experiment", 1): MANUAL,
-    ("admin_task_approvals", "_maybe_spawn_rollup_smoketest", 1): _auto(("admin_task_approvals", "_maybe_spawn_rollup_smoketest", "automatic_task_creation_parent_lock")),
+    ("admin_approval_followup_handlers", "maybe_spawn_rollup_smoketest", 1): _auto(("admin_approval_followup_handlers", "maybe_spawn_rollup_smoketest", "automatic_task_creation_parent_lock")),
     ("agent_status_spawn", "maybe_spawn_debug_create", 1): _auto(("agent_status_spawn", "maybe_spawn_debug_create", "automatic_task_creation_decision"), ("routers.agent_status", "update_agent_status", "_lock_agent_status_project_authority")),
     ("agent_status_spawn", "maybe_spawn_smoketest_fix", 1): _auto(("agent_status_spawn", "maybe_spawn_smoketest_fix", "automatic_task_creation_decision"), ("routers.agent_status", "update_agent_status", "_lock_agent_status_project_authority")),
     ("agent_status_spawn", "maybe_spawn_smoketest_fix", 2): _auto(("agent_status_spawn", "maybe_spawn_smoketest_fix", "automatic_task_creation_parent_lock"), ("routers.agent_status", "update_agent_status", "_lock_agent_status_project_authority")),

@@ -2743,7 +2743,7 @@ async def _update_direction_research_outcomes(
 
 async def refresh_direction_outcomes_after_merge(
     task: Task, session: AsyncSession
-) -> None:
+) -> bool:
     """Re-run the research-history outcome recompute after a task's PR merges.
 
     The terminal-status path (``task_lifecycle``) computes a research cycle's
@@ -2769,7 +2769,8 @@ async def refresh_direction_outcomes_after_merge(
     import logging
 
     if task.project_id is None:
-        return
+        return True
+    succeeded = True
     ctx = task.context or {}
     direction_id = ctx.get("direction_id")
     research_task_id = ctx.get("research_task_id")
@@ -2787,6 +2788,7 @@ async def refresh_direction_outcomes_after_merge(
                 task.project_id, str(direction_id), str(research_task_id), session
             )
         except Exception as exc:  # noqa: BLE001 — best-effort; must not break merge finalize
+            succeeded = False
             logging.getLogger(__name__).warning(
                 "[DIRECTION] post-merge outcome refresh failed for task %s: %r",
                 _task_id_str,
@@ -2807,6 +2809,7 @@ async def refresh_direction_outcomes_after_merge(
 
         await record_task_merge_evidence(session, task, task.project_id)
     except Exception as exc:  # noqa: BLE001
+        succeeded = False
         logging.getLogger(__name__).warning(
             "[DIRECTION] criterion evidence recording failed for task %s: %r",
             _task_id_str,
@@ -2814,6 +2817,7 @@ async def refresh_direction_outcomes_after_merge(
         )
         with contextlib.suppress(Exception):
             await session.rollback()
+    return succeeded
 
 
 async def discount_stranded_pr_from_direction_credit(

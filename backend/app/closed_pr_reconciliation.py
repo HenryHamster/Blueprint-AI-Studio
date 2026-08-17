@@ -16,6 +16,47 @@ logger = logging.getLogger("blueprint")
 
 _REPLACEMENT_PUBLICATION_GRACE_SECONDS = 15 * 60
 _REPLACEMENT_WAIT_KEY = "closed_pr_replacement_wait_started"
+_REPLACEMENT_RETRY_INTERVAL_SECONDS = 120
+
+# ``requires_approval`` is shared by several independent safety gates.  The
+# review-wait backstop may release only the hold it created for one immutable PR
+# attempt, so it records an exact, timer-bound ownership marker beside that
+# attempt's review-loop state.
+REVIEW_WAIT_APPROVAL_HOLD_KEY = "review_wait_approval_hold"
+REVIEW_WAIT_APPROVAL_HOLD_OWNER = "ci_review_wait_backstop"
+
+
+def revoke_review_wait_approval_hold(task: Task) -> bool:
+    """Remove automatic hold provenance without disturbing an independent timer.
+
+    Approval releases and explicit operator holds both end ownership by the
+    review-wait backstop.  The timer is removed only when it is the timer named
+    by that marker; a later spend/manual hold may have installed a new one.
+    """
+
+    context = dict(task.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    marker = review_loop.pop(REVIEW_WAIT_APPROVAL_HOLD_KEY, None)
+    if not isinstance(marker, dict):
+        return False
+    if context.get("_approval_set_at") == marker.get("set_at"):
+        context.pop("_approval_set_at", None)
+    task.context = {**context, "review_loop": review_loop}
+    flag_modified(task, "context")
+    return True
+
+
+def _stamp_replacement_retry_backoff(review_loop: dict) -> None:
+    """Throttle unchanged closed-PR lookup/grace retries without losing state."""
+
+    try:
+        current_interval = int(review_loop.get("ci_poll_interval", 30) or 30)
+    except (TypeError, ValueError):
+        current_interval = 30
+    review_loop["ci_last_polled"] = _utcnow().isoformat()
+    review_loop["ci_poll_interval"] = max(
+        current_interval, _REPLACEMENT_RETRY_INTERVAL_SECONDS
+    )
 
 # These fields describe evidence, latches, or retry budgets for one concrete
 # pull-request attempt. A replacement PR may reuse the same branch while
@@ -73,9 +114,12 @@ _REPLACEMENT_ATTEMPT_KEYS = frozenset(
         "review_recovery_at",
         "review_recovery_attempted",
         "review_wait_escalated",
+        REVIEW_WAIT_APPROVAL_HOLD_KEY,
         "review_wait_respawn_count",
         "review_wait_respawn_task_id",
         "review_wait_respawned",
+        "review_wait_deferred_at",
+        "review_wait_spawn_claim",
         "review_wait_started",
         "test_coverage_result",
         "unverified_merge_reason",
@@ -128,6 +172,99 @@ def reset_pr_attempt_state(review_loop: dict | None) -> dict:
     return {key: loop[key] for key in _PR_CHAIN_STATE_KEYS if key in loop}
 
 
+def _owns_superseded_review_wait_approval_hold(
+    task: Task,
+    review_loop: dict,
+    *,
+    pr_number: int,
+    pr_data: dict,
+) -> bool:
+    """Whether the current gate is exactly the old PR attempt's backstop hold."""
+
+    closed_head_sha = str(((pr_data.get("head") or {}).get("sha")) or "")
+    closed_base_sha = str(((pr_data.get("base") or {}).get("sha")) or "")
+    return owns_review_wait_approval_hold(
+        task,
+        review_loop,
+        pr_number=pr_number,
+        head_sha=closed_head_sha,
+        base_sha=closed_base_sha,
+    )
+
+
+def owns_review_wait_approval_hold(
+    task: Task,
+    review_loop: dict,
+    *,
+    pr_number: int,
+    head_sha: str,
+    base_sha: str,
+) -> bool:
+    """Whether only this exact review-wait backstop owns the approval gate."""
+
+    if task.requires_approval is not True:
+        return False
+    marker = review_loop.get(REVIEW_WAIT_APPROVAL_HOLD_KEY)
+    if not isinstance(marker, dict):
+        return False
+    set_at = marker.get("set_at")
+    context = dict(task.context or {})
+    if not head_sha or not base_sha or not isinstance(set_at, str):
+        return False
+    # The timer equality makes ownership exclusive: if a later hold replaced
+    # the approval episode, replacement reconciliation leaves it untouched.
+    if context.get("_approval_set_at") != set_at:
+        return False
+    # Spend, critical-file, and other explicitly-labelled holds always outrank
+    # this marker even if they arrived while the backstop flag was already true.
+    if context.get("approval_hold_reason") or context.get("touched_critical"):
+        return False
+    terminal_outcome = context.get("review_loop_terminal_outcome")
+    if isinstance(terminal_outcome, dict) and terminal_outcome.get("resolved") is not True:
+        return False
+    try:
+        marker_pr = int(marker.get("pr_number"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        marker.get("owner") == REVIEW_WAIT_APPROVAL_HOLD_OWNER
+        and str(marker.get("project_id") or "") == str(task.project_id)
+        and marker_pr == int(pr_number)
+        and str(marker.get("base_sha") or "") == str(base_sha)
+        and str(marker.get("head_sha") or "") == str(head_sha)
+    )
+
+
+async def lookup_closed_pr_replacement(
+    *,
+    project_id: str,
+    closed_head: str,
+    closed_base: str,
+    github_token: str,
+    github_owner: str,
+    github_repo: str,
+) -> dict:
+    """Perform the replacement GitHub lookup without any ORM row lock."""
+
+    from app.github import get_open_pull_request_for_head_branch
+
+    try:
+        replacement_pr = await get_open_pull_request_for_head_branch(
+            github_token,
+            github_owner,
+            github_repo,
+            closed_head,
+            closed_base,
+            project_id=project_id,
+        )
+    except HTTPException as exc:
+        return {"status": "error", "detail": str(exc.detail)}
+    except Exception as exc:  # noqa: BLE001 - retry receipt is fail-closed
+        return {
+            "status": "error",
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
+    return {"status": "ok", "replacement_pr": replacement_pr}
 
 
 async def reconcile_closed_pr_replacement(
@@ -137,9 +274,7 @@ async def reconcile_closed_pr_replacement(
     review_loop: dict,
     pr_number: int,
     pr_data: dict,
-    github_token: str,
-    github_owner: str,
-    github_repo: str,
+    replacement_lookup: dict | None,
 ) -> bool:
     """Rebind ``task`` to its unique open same-head/base replacement.
 
@@ -154,20 +289,11 @@ async def reconcile_closed_pr_replacement(
     if not closed_head or not closed_base:
         return False
 
-    # Import lazily to preserve the existing test/runtime patch point.
-    from app.github import get_open_pull_request_for_head_branch
-
-    try:
-        replacement_pr = await get_open_pull_request_for_head_branch(
-            github_token,
-            github_owner,
-            github_repo,
-            closed_head,
-            closed_base,
-            project_id=str(task.project_id),
-        )
-    except HTTPException as exc:
+    if replacement_lookup is None:
+        return False
+    if replacement_lookup.get("status") == "error":
         review_loop["polls_since_pr_fetch"] = 999
+        _stamp_replacement_retry_backoff(review_loop)
         task.latest_status_message = (
             f"PR #{pr_number} closed; replacement lookup "
             "unavailable — retrying before terminalizing"
@@ -179,9 +305,11 @@ async def reconcile_closed_pr_replacement(
         logger.warning(
             "[CI] replacement lookup for closed PR #%s failed: %s",
             pr_number,
-            exc,
+            replacement_lookup.get("detail") or "unknown GitHub error",
         )
         return True
+
+    replacement_pr = replacement_lookup.get("replacement_pr")
 
     replacement_number = (
         (replacement_pr or {}).get("number")
@@ -208,6 +336,7 @@ async def reconcile_closed_pr_replacement(
         if elapsed < _REPLACEMENT_PUBLICATION_GRACE_SECONDS:
             review_loop[_REPLACEMENT_WAIT_KEY] = started.isoformat()
             review_loop["polls_since_pr_fetch"] = 999
+            _stamp_replacement_retry_backoff(review_loop)
             remaining = int(_REPLACEMENT_PUBLICATION_GRACE_SECONDS - elapsed)
             task.latest_status_message = (
                 f"PR #{pr_number} closed; waiting for replacement publication "
@@ -228,6 +357,12 @@ async def reconcile_closed_pr_replacement(
     replacement_base = (
         (replacement_pr.get("base") or {}).get("ref") or ""
     ) or closed_base
+    release_owned_review_wait_hold = _owns_superseded_review_wait_approval_hold(
+        task,
+        review_loop,
+        pr_number=pr_number,
+        pr_data=pr_data,
+    )
     chain_loop = reset_pr_attempt_state(review_loop)
     review_loop.clear()
     review_loop.update(chain_loop)
@@ -245,8 +380,16 @@ async def reconcile_closed_pr_replacement(
     review_loop["polls_since_pr_fetch"] = 999
     review_loop.pop(_REPLACEMENT_WAIT_KEY, None)
 
-
     rebound_context = {**(task.context or {}), "review_loop": review_loop}
+    from app.admin_approval_authority import APPROVAL_FOLLOWUP_CLAIM_KEY
+
+    # Any operator follow-up receipt is bound to the superseded PR/base/head.
+    # Revoke it, but never infer that the human approval hold itself is safe to
+    # clear; only the exact backstop-owned marker below may release the flag.
+    rebound_context.pop(APPROVAL_FOLLOWUP_CLAIM_KEY, None)
+    if release_owned_review_wait_hold:
+        task.requires_approval = False
+        rebound_context.pop("_approval_set_at", None)
     # This legacy parent-level verdict is also PR-scoped. Leaving it behind
     # lets rollup convergence treat the replacement as already approved.
     rebound_context.pop("blueprint_review_verdict", None)

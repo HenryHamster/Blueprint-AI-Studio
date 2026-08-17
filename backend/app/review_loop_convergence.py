@@ -245,6 +245,28 @@ class _PreservabilityUnavailable(Exception):
 _REVIEW_LOOP_TERMINAL_OUTCOME_KEY = "review_loop_terminal_outcome"
 
 
+def _approval_hold_episode_identity(task: Task) -> dict[str, object] | None:
+    """Return the non-recursive identity of the current approval episode."""
+
+    from app.admin_approval_authority import (
+        APPROVAL_HOLD_EPISODE_KEY,
+        APPROVAL_HOLD_PROVENANCE_KEY,
+    )
+
+    context = dict(task.context or {})
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    episode = context.get(APPROVAL_HOLD_EPISODE_KEY)
+    set_at = context.get("_approval_set_at")
+    if not episode or not set_at or not isinstance(provenance, dict):
+        return None
+    return {
+        "episode": episode,
+        "set_at": set_at,
+        "reason": context.get("approval_hold_reason"),
+        "provenance": dict(provenance),
+    }
+
+
 def _set_review_loop_terminal_outcome(
     task: Task,
     *,
@@ -274,6 +296,27 @@ def _set_review_loop_terminal_outcome(
     if detail is not None:
         terminal_outcome["detail"] = detail
     terminal_outcome["recorded_at"] = _utcnow().isoformat()
+    if task.requires_approval:
+        # Bind a resolvable escalation breadcrumb to the exact approval episode
+        # it created.  The boolean latch can remain TRUE across a later manual
+        # or policy hold, so the breadcrumb alone is never release authority.
+        hold_episode = _approval_hold_episode_identity(task)
+        hold_owner = (
+            (hold_episode.get("provenance") or {}).get("owner")
+            if isinstance(hold_episode, dict)
+            else None
+        )
+        hold_reason = (
+            (hold_episode.get("provenance") or {}).get("reason")
+            if isinstance(hold_episode, dict)
+            else None
+        )
+        if (
+            hold_episode is not None
+            and hold_owner == "review_pipeline"
+            and hold_reason == kind
+        ):
+            terminal_outcome["approval_hold_episode"] = hold_episode
     ctx[_REVIEW_LOOP_TERMINAL_OUTCOME_KEY] = terminal_outcome
     task.context = ctx
     flag_modified(task, "context")
@@ -371,10 +414,44 @@ def clear_review_escalation_approval_gate(orig: Task, *, resolved_by: str) -> bo
     outcome = ctx.get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY) or {}
     if outcome.get("kind") not in _RESOLVABLE_ESCALATION_GATE_KINDS:
         return False
+    from app.admin_approval_authority import (
+        APPROVAL_HOLD_EPISODE_KEY,
+        APPROVAL_HOLD_PROVENANCE_KEY,
+        revoke_operator_approval_followup,
+    )
+
+    expected_hold = outcome.get("approval_hold_episode")
+    current_hold = _approval_hold_episode_identity(orig)
+    if isinstance(expected_hold, dict):
+        if current_hold != expected_hold:
+            return False
+    else:
+        # Rolling compatibility for old escalation rows: they remain clearable
+        # only while no newer-code approval episode exists and no independent
+        # reason displaced the old breadcrumb.  Once provenance exists, fail
+        # closed because an unbound legacy breadcrumb cannot name that episode.
+        if current_hold is not None or ctx.get(APPROVAL_HOLD_PROVENANCE_KEY):
+            return False
+        legacy_reason = ctx.get("approval_hold_reason")
+        if legacy_reason not in (
+            None,
+            outcome.get("kind"),
+            outcome.get("reason"),
+        ):
+            return False
     orig.requires_approval = False
-    # Drop the timer baseline too — a later, unrelated hold must start fresh,
-    # not inherit this hold's elapsed time.
+    from app.closed_pr_reconciliation import revoke_review_wait_approval_hold
+
+    revoke_review_wait_approval_hold(orig)
+    revoke_operator_approval_followup(orig)
+    ctx = dict(orig.context or {})
+    # Consume every piece of metadata owned by this exact episode. A later,
+    # unrelated hold must neither inherit the elapsed timer nor be mistaken for
+    # this escalation on a subsequent convergence pass.
     ctx.pop("_approval_set_at", None)
+    ctx.pop("approval_hold_reason", None)
+    ctx.pop(APPROVAL_HOLD_EPISODE_KEY, None)
+    ctx.pop(APPROVAL_HOLD_PROVENANCE_KEY, None)
     ctx[_REVIEW_LOOP_TERMINAL_OUTCOME_KEY] = {
         **outcome,
         "resolved": True,
@@ -1295,7 +1372,15 @@ async def _handle_cap_exhaustion(
                 f"(APPROVED_CAP_PR_CLOSED, no CODE_ERROR, no PR close)"
             )
             orig.status = TaskStatus.FAILED
-            orig.requires_approval = True
+            from app.admin_approval_authority import (
+                establish_independent_approval_hold,
+            )
+
+            establish_independent_approval_hold(
+                orig,
+                reason="approved_cap_pr_preserved_for_handmerge",
+                owner="review_loop_convergence",
+            )
             orig.latest_status_message = (
                 f"Review-fix cap reached ({iterations} iterations, {cap_label}) "
                 f"after approval — PR #{pr_number} LEFT OPEN with mergeable work; "
@@ -1507,7 +1592,13 @@ async def _handle_cap_exhaustion(
         # Always flag requires_approval here regardless of the global gate — the
         # whole point of preservation is to route this to a human; without the
         # flag the open PR would dangle with no owner.
-        orig.requires_approval = True
+        from app.admin_approval_authority import establish_independent_approval_hold
+
+        establish_independent_approval_hold(
+            orig,
+            reason="review_cap_preserved_for_handmerge",
+            owner="review_loop_convergence",
+        )
         orig.latest_status_message = (
             f"Review-fix cap reached ({iterations} iterations, {cap_label}) — "
             f"PR #{pr_number} LEFT OPEN with mergeable work; manual hand-merge "
@@ -1618,7 +1709,13 @@ async def _handle_cap_exhaustion(
     # services.py's 2h approval-gate timeout then FAILs the otherwise-healthy parent,
     # discarding its already-merged siblings.
     if _runtime_config.get("require_approval_gates", True):
-        orig.requires_approval = True
+        from app.admin_approval_authority import establish_independent_approval_hold
+
+        establish_independent_approval_hold(
+            orig,
+            reason="review_cap_exhausted",
+            owner="review_loop_convergence",
+        )
     orig.latest_status_message = (
         f"Review-fix cycle reached limit ({iterations} iterations, {cap_label}) — "
         f"PR #{pr_number} auto-closed, manual review required"

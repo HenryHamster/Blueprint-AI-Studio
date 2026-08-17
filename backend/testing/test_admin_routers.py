@@ -142,6 +142,7 @@ def _patch_explicit_merge_target(
         "base_sha": f"base-{pr_number}",
         "head_sha": f"head-{pr_number}",
         "base_ref": base_ref,
+        "head_ref": f"operator-approved/{pr_number}",
         "state": "open",
         "merged": False,
         "draft": False,
@@ -157,6 +158,56 @@ def _patch_explicit_merge_target(
             new_callable=AsyncMock,
             return_value=dict(target),
         )
+    mocker.patch(
+        "app.ci_merge_helpers._merge_commit_parent_matches_checked_base",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch(
+        "app.github.get_issue_comments",
+        new_callable=AsyncMock,
+        return_value=[],
+    )
+
+
+async def _execute_exact_operator_approval(
+    task: Task,
+    session,
+    *,
+    pr_number: int,
+    base_branch: str,
+    head_sha: str,
+    base_sha: str,
+) -> tuple[Task, dict]:
+    """Exercise the public durable approval boundary, never a bare handler."""
+
+    from app.admin_approval_authority import decide_operator_approval
+    from app.admin_task_approvals import execute_approval_followup
+
+    context = dict(task.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    review_loop.update(
+        {
+            "pr_number": pr_number,
+            "base_branch": base_branch,
+            "ci_checked_head_sha": head_sha,
+            "ci_checked_base_sha": base_sha,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+        }
+    )
+    context["review_loop"] = review_loop
+    task.context = context
+    task.requires_approval = True
+    session.add(task)
+    await session.commit()
+    _, decision, _ = await decide_operator_approval(
+        task.id,
+        False,
+        session,
+        modified_by="TEST",
+    )
+    return await execute_approval_followup(decision, session)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5401,8 +5452,6 @@ class TestModifyTaskApplySeam:
         self, db_session, mocker
     ):
         """Human-approved rollup merges to promotion_target stay unqualified."""
-        from app.admin_task_mutations import _handle_rollup_pr_approval
-
         project = await _make_project(db_session)
         project.integration_branch = "automain"
         project.promotion_target = "release/main"
@@ -5414,7 +5463,12 @@ class TestModifyTaskApplySeam:
             project_id=project.id,
             title="Rollup approval task",
             payloads=[
-                {"type": "research", "prompt": "rollup", "base_branch": "release/main"}
+                {
+                    "type": "research",
+                    "prompt": "rollup",
+                    "branch": "operator-approved/321",
+                    "base_branch": "release/main",
+                }
             ],
             status=TaskStatus.EVALUATING,
             context={"rollup_pr_number": 321},
@@ -5435,7 +5489,7 @@ class TestModifyTaskApplySeam:
         mocker.patch(
             "app.github.merge_pull_request",
             new_callable=AsyncMock,
-            return_value={"merged": True},
+            return_value={"merged": True, "sha": "merge-321"},
         )
         mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
         mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
@@ -5446,9 +5500,13 @@ class TestModifyTaskApplySeam:
             base_ref="release/main",
         )
 
-        changes: dict = {}
-        await _handle_rollup_pr_approval(
-            task, task.context or {}, 321, db_session, changes
+        task, changes = await _execute_exact_operator_approval(
+            task,
+            db_session,
+            pr_number=321,
+            base_branch="release/main",
+            head_sha="head-321",
+            base_sha="base-321",
         )
         await db_session.refresh(task)
 
@@ -5495,8 +5553,6 @@ class TestModifyTaskApplySeam:
         self, db_session, mocker
     ):
         """Human-approved custom staged rollup roots must await downstream landing."""
-        from app.admin_task_mutations import _handle_rollup_pr_approval
-
         project = await _make_project(db_session)
         project.integration_branch = "automain"
         project.promotion_target = "release/main"
@@ -5512,6 +5568,7 @@ class TestModifyTaskApplySeam:
                 {
                     "type": "research",
                     "prompt": "rollup",
+                    "branch": "operator-approved/654",
                     "base_branch": "release/candidate-1",
                 }
             ],
@@ -5534,7 +5591,7 @@ class TestModifyTaskApplySeam:
         mocker.patch(
             "app.github.merge_pull_request",
             new_callable=AsyncMock,
-            return_value={"merged": True},
+            return_value={"merged": True, "sha": "merge-654"},
         )
         mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
         mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
@@ -5545,9 +5602,13 @@ class TestModifyTaskApplySeam:
             base_ref="release/candidate-1",
         )
 
-        changes: dict = {}
-        await _handle_rollup_pr_approval(
-            task, task.context or {}, 654, db_session, changes
+        task, changes = await _execute_exact_operator_approval(
+            task,
+            db_session,
+            pr_number=654,
+            base_branch="release/candidate-1",
+            head_sha="head-654",
+            base_sha="base-654",
         )
         await db_session.refresh(task)
 
@@ -5562,8 +5623,6 @@ class TestModifyTaskApplySeam:
     ):
         """Operator-approved rollup with a colliding migration → 409, no merge."""
         from fastapi import HTTPException
-
-        from app.admin_task_mutations import _handle_rollup_pr_approval
 
         project = await _make_project(db_session)
         project.integration_branch = "automain"
@@ -5625,17 +5684,20 @@ class TestModifyTaskApplySeam:
         )
         mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
 
-        changes: dict = {}
         with pytest.raises(HTTPException) as exc_info:
-            await _handle_rollup_pr_approval(
-                task, task.context or {}, 777, db_session, changes
+            await _execute_exact_operator_approval(
+                task,
+                db_session,
+                pr_number=777,
+                base_branch="automain",
+                head_sha="head-777",
+                base_sha="base-777",
             )
         assert exc_info.value.status_code == 409
         assert "0002" in str(exc_info.value.detail)
         merge_mock.assert_not_called()
         await db_session.refresh(task)
         assert task.requires_approval is True
-        assert "merged_pr" not in changes
 
     @pytest.mark.asyncio
     async def test_rollup_approval_blocks_cross_branch_deployed_id_reuse(
@@ -5647,8 +5709,6 @@ class TestModifyTaskApplySeam:
         branch does not yet have that revision id.
         """
         from fastapi import HTTPException
-
-        from app.admin_task_mutations import _handle_rollup_pr_approval
 
         project = await _make_project(db_session)
         project.integration_branch = "automain"
@@ -5718,17 +5778,20 @@ class TestModifyTaskApplySeam:
         )
         mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
 
-        changes: dict = {}
         with pytest.raises(HTTPException) as exc_info:
-            await _handle_rollup_pr_approval(
-                task, task.context or {}, 888, db_session, changes
+            await _execute_exact_operator_approval(
+                task,
+                db_session,
+                pr_number=888,
+                base_branch="automain",
+                head_sha="head-888",
+                base_sha="base-888",
             )
         assert exc_info.value.status_code == 409
         assert "0309" in str(exc_info.value.detail)
         merge_mock.assert_not_called()
         await db_session.refresh(task)
         assert task.requires_approval is True
-        assert "merged_pr" not in changes
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6303,12 +6366,24 @@ class TestBulkApprove:
                 {
                     "type": "research",
                     "prompt": "danger",
+                    "branch": "operator-approved/456",
                     "base_branch": "release/candidate-1",
                 }
             ],
             status=TaskStatus.EVALUATING,
             requires_approval=True,
-            context={"rollup_pr_number": 456, "touched_critical": True},
+            context={
+                "rollup_pr_number": 456,
+                "touched_critical": True,
+                "review_loop": {
+                    "pr_number": 456,
+                    "base_branch": "release/candidate-1",
+                    "ci_checked_head_sha": "head-456",
+                    "ci_checked_base_sha": "base-456",
+                    "head_sha": "head-456",
+                    "base_sha": "base-456",
+                },
+            },
         )
         db_session.add(task)
         await db_session.commit()
@@ -6326,7 +6401,7 @@ class TestBulkApprove:
         mocker.patch(
             "app.github.merge_pull_request",
             new_callable=AsyncMock,
-            return_value={"merged": True},
+            return_value={"merged": True, "sha": "merge-456"},
         )
         mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
         mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
@@ -6343,8 +6418,10 @@ class TestBulkApprove:
         )
 
         assert resp.status_code == 200
+        body = resp.json()
+        assert body["error_count"] == 0, body
         await db_session.refresh(task)
-        assert task.requires_approval is False
+        assert task.requires_approval is False, task.context
         assert task.status == TaskStatus.EVALUATING
         assert (task.context or {}).get("pr_merged") is None
         assert "awaiting downstream landing" in (task.latest_status_message or "")

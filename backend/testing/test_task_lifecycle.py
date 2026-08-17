@@ -8927,6 +8927,16 @@ async def test_large_scope_intermediate_still_spawns_review(tl_db, mocker):
         return_value=("gh-token", "owner", "repo"),
     )
     mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value=_open_pull_request(
+            head_sha="review-head-88",
+            head_ref="blueprint/task-abc",
+            base_sha="staging-base-88",
+            base_ref="research/cycle-1",
+        ),
+    )
+    mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
         return_value={
@@ -8942,9 +8952,11 @@ async def test_large_scope_intermediate_still_spawns_review(tl_db, mocker):
         return_value=[{"filename": "README.md", "status": "modified"}],
     )
     review_spawns = []
+    review_spawn_kwargs = []
 
     async def _capture_spawn(src_task, ptype, *a, **kw):
         review_spawns.append(ptype)
+        review_spawn_kwargs.append(kw)
         mock_task = mocker.MagicMock()
         mock_task.id = uuid.uuid4()
         mock_task.first_payload = {"type": "review"}
@@ -8966,6 +8978,14 @@ async def test_large_scope_intermediate_still_spawns_review(tl_db, mocker):
     assert "review" in review_spawns, (
         "large-scope intermediate (rollup-chain) task must still spawn a review"
     )
+    assert review_spawn_kwargs[0]["review_target"] == {
+        "project_id": str(project.id),
+        "pr_number": 88,
+        "base_sha": "staging-base-88",
+        "head_sha": "review-head-88",
+    }
+    assert callable(review_spawn_kwargs[0]["source_spawn_authority"])
+    assert callable(review_spawn_kwargs[0]["source_spawn_publication"])
 
 
 # ── _resolve_fallback_verdict — structured/anchored verdict parsing ────────────

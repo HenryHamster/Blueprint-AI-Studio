@@ -171,18 +171,67 @@ async def _fetch_live_review_target(
         pr_number,
         project_id=project_id or None,
     )
+    raw_merged = pr_data.get("merged")
     return {
         "project_id": project_id,
         "pr_number": int(pr_number),
         "base_sha": str((pr_data.get("base") or {}).get("sha") or ""),
         "head_sha": str((pr_data.get("head") or {}).get("sha") or ""),
+        "head_ref": str((pr_data.get("head") or {}).get("ref") or ""),
         "base_ref": str((pr_data.get("base") or {}).get("ref") or ""),
         "state": str(pr_data.get("state") or ""),
-        "merged": pr_data.get("merged") is True,
+        # Preserve GitHub's boolean proof as a tri-state. Missing or malformed
+        # data is unknown, not objective evidence that the PR is unmerged.
+        "merged": raw_merged if isinstance(raw_merged, bool) else None,
         "draft": pr_data.get("draft") is True,
         "mergeable": pr_data.get("mergeable"),
         "mergeable_state": str(pr_data.get("mergeable_state") or ""),
+        "merge_commit_sha": str(pr_data.get("merge_commit_sha") or ""),
     }
+
+
+async def _merge_commit_parent_matches_checked_base(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    merge_commit_sha: str,
+    checked_base_sha: str,
+    *,
+    project_id: str,
+) -> bool:
+    """Prove a squash merge was created from the intent's checked base.
+
+    A merged PR's live ``base.sha`` is ambient and can advance after landing.
+    The immutable squash commit's first parent is the stable pre-merge base
+    identity needed to reconcile a response-lost PUT without weakening the
+    exact base+head intent.
+    """
+
+    if not merge_commit_sha or not checked_base_sha:
+        return False
+    from app.github import _github_request
+
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/commits/{merge_commit_sha}",
+        headers,
+        project_id=project_id,
+        consumer="approval_merge_reconciliation",
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            "merge commit parent proof unavailable: "
+            f"GitHub returned HTTP {response.status_code}"
+        )
+    parents = response.json().get("parents") or []
+    return bool(
+        parents and str((parents[0] or {}).get("sha") or "") == str(checked_base_sha)
+    )
 
 
 def _live_target_is_merge_submission_safe(
@@ -218,9 +267,8 @@ def _review_approved(review_loop: dict) -> bool:
     ``verdict == "APPROVE"`` value is not merge authority: it has neither an
     authoritative blocker ledger nor immutable target provenance.
     """
-    return (
-        review_loop.get("review_approved") is True
-        or _review_not_required(review_loop)
+    return review_loop.get("review_approved") is True or _review_not_required(
+        review_loop
     )
 
 
@@ -244,9 +292,7 @@ def revoke_review_authority_for_active_fix(
         context_snapshot if context_snapshot is not None else (task.context or {})
     )
     loop = dict(
-        review_loop
-        if review_loop is not None
-        else (context.get("review_loop") or {})
+        review_loop if review_loop is not None else (context.get("review_loop") or {})
     )
     loop["review_approved"] = False
     loop["ci_passed"] = False

@@ -18,6 +18,7 @@ durable review history (or an explicit no-review policy marker) is required.
 """
 
 import asyncio  # noqa: F401  # test mock target (app.ci_completion.asyncio.sleep)
+import copy
 import contextlib
 import logging
 import uuid
@@ -27,6 +28,12 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.admin_approval_authority import (
+    APPROVAL_FOLLOWUP_CLAIM_KEY,
+    APPROVAL_HOLD_PROVENANCE_KEY,
+    approval_hold_provenance,
+    establish_independent_approval_hold,
+)
 # Merge-helper layer (scope-aware retry-cap policy, merge-error normalization,
 # the one-time merge summary, and the lock-window snapshot/relock idiom) lives
 # in the ci_merge_helpers sibling. Re-export every public name so existing
@@ -59,6 +66,23 @@ logger = logging.getLogger(__name__)
 # Configured as a module constant so it's trivially overridable for testing;
 # set to 0 to disable the general rerun gate entirely.
 _CI_RERUN_BUDGET = 1
+
+
+def _establish_ci_approval_hold(task: Task, *, reason: str) -> None:
+    context = dict(task.context or {})
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    if (
+        task.requires_approval is True
+        and isinstance(provenance, dict)
+        and provenance.get("owner") == "ci_completion"
+        and provenance.get("reason") == reason
+        and not context.get(APPROVAL_FOLLOWUP_CLAIM_KEY)
+        and approval_hold_provenance(task).get("review_wait_hold") is None
+    ):
+        return
+    establish_independent_approval_hold(
+        task, reason=reason, owner="ci_completion"
+    )
 
 
 async def _auto_resolve_audit_findings_on_merge(
@@ -377,7 +401,7 @@ async def _attempt_merge_with_retry_and_escalation(
         _gates_on = _rt_cfg.get("require_approval_gates", True)
         if _sc_verdict == "hold":
             if _gates_on:
-                task.requires_approval = True
+                _establish_ci_approval_hold(task, reason="merge_size_cap")
             task.latest_status_message = (
                 f"Merge held — size-cap: {_sc_reason}"
             )[:500]
@@ -1511,7 +1535,7 @@ async def _attempt_merge_with_retry_and_escalation(
                 f"{merge_msg[:200]} — requires manual intervention"
             )
             if _gates_on:
-                task.requires_approval = True
+                _establish_ci_approval_hold(task, reason="merge_rule_blocked")
             ci_loop["merge_rule_blocked"] = True
             task.context = {**(task.context or {}), "review_loop": ci_loop}
             session.add(task)
@@ -1519,7 +1543,9 @@ async def _attempt_merge_with_retry_and_escalation(
                 try:
                     orig = await session.get(Task, uuid.UUID(ci_orig_id))
                     if orig:
-                        orig.requires_approval = True
+                        _establish_ci_approval_hold(
+                            orig, reason="merge_rule_blocked"
+                        )
                         session.add(orig)
                 except Exception as e:
                     logger.warning(
@@ -1758,7 +1784,9 @@ async def _attempt_merge_with_retry_and_escalation(
                 _gates_on = _rt_cfg.get("require_approval_gates", True)
                 task.status = TaskStatus.FAILED
                 if _gates_on:
-                    task.requires_approval = True
+                    _establish_ci_approval_hold(
+                        task, reason="merge_retry_exhausted"
+                    )
                 _early_exit = (
                     _repeated_identical or _deterministic
                 ) and _merge_failures < _hard_cap
@@ -1790,7 +1818,9 @@ async def _attempt_merge_with_retry_and_escalation(
                     try:
                         orig = await session.get(Task, uuid.UUID(ci_orig_id))
                         if orig:
-                            orig.requires_approval = True
+                            _establish_ci_approval_hold(
+                                orig, reason="merge_retry_exhausted"
+                            )
                             session.add(orig)
                     except Exception as e:
                         logger.warning(
@@ -1860,6 +1890,292 @@ async def _attempt_merge_with_retry_and_escalation(
             f"[CI] PR #{ci_pr_number} merge recheck failed — will retry ({source})"
         )
     return False
+
+
+_REVIEW_WAIT_SPAWN_CLAIM_KEY = "review_wait_spawn_claim"
+
+
+def _owns_review_wait_spawn_claim(
+    task: Task,
+    claim: dict[str, object],
+) -> bool:
+    """Validate one revocable, exact PR-attempt spawn claim on a fresh row."""
+
+    context = dict(task.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    try:
+        current_pr_number = effective_pr_number(task)
+        claimed_pr_number = int(claim.get("pr_number") or 0)
+    except (TypeError, ValueError):
+        return False
+    from app.review_wait_spawn_authority import (
+        review_wait_spawn_claim_gate_is_current,
+    )
+
+    return bool(
+        task.status == TaskStatus.EVALUATING
+        and task.archived is not True
+        and review_wait_spawn_claim_gate_is_current(
+            task,
+            claim,
+            review_loop=review_loop,
+        )
+        and str(task.project_id) == str(claim.get("project_id") or "")
+        and current_pr_number == claimed_pr_number
+        and review_loop.get(_REVIEW_WAIT_SPAWN_CLAIM_KEY) == claim
+        and review_loop.get("review_wait_started")
+        == claim.get("review_wait_started")
+        and str(review_loop.get("ci_checked_head_sha") or "")
+        == str(claim.get("head_sha") or "")
+        and str(review_loop.get("ci_checked_base_sha") or "")
+        == str(claim.get("base_sha") or "")
+        and review_loop.get("ci_passed") is True
+        and not _review_approved(review_loop)
+        and (
+            not review_loop.get("review_wait_escalated")
+            or claim.get("review_wait_approval_hold") is not None
+        )
+        and context.get("approval_hold_reason")
+        == claim.get("approval_hold_reason")
+        and context.get("_approval_set_at") == claim.get("approval_set_at")
+        and context.get("touched_critical") == claim.get("touched_critical")
+    )
+
+
+async def _reconcile_review_wait_backstop_spawn(
+    *,
+    task: Task,
+    session: AsyncSession,
+    pr_number: int,
+    branch: str,
+    base_branch: str,
+    original_prompt: str,
+    original_task_id: str,
+    review_target: dict[str, str | int],
+    review_wait_started: str,
+) -> tuple[Task | None, str, str | None]:
+    """Run the canonical review spawn outside the CI task's caller lock.
+
+    ``_spawn_pipeline_task`` owns commits/rollbacks on several paths.  Persist
+    the current wait snapshot and release the caller lock first, then relock and
+    validate that the same immutable PR attempt still owns the row before the
+    caller records any outcome. The returned task is locked unless the outcome
+    is ``stale`` (whose transaction is released here).
+    """
+
+    from app.review_pipeline import (
+        SPAWN_REASON_ADMISSION_PAUSED,
+        SPAWN_REASON_ALREADY_MERGED,
+        SPAWN_REASON_CONTENDED,
+        SPAWN_REASON_DEDUP,
+        SPAWN_REASON_DEFERRED,
+        SPAWN_REASON_KEY,
+        _PIPELINE_ACTIVE_STATUSES,
+        _spawn_pipeline_task,
+    )
+    from app.review_wait_spawn_authority import (
+        release_completed_review_wait_gate_owned_by_spawn_claim,
+        release_review_wait_gate_owned_by_spawn_claim,
+    )
+
+    source_task_id = task.id
+    source_context = dict(task.context or {})
+    source_review_loop = dict(source_context.get("review_loop") or {})
+    from app.closed_pr_reconciliation import REVIEW_WAIT_APPROVAL_HOLD_KEY
+
+    spawn_claim: dict[str, object] = {
+        "token": str(uuid.uuid4()),
+        "project_id": str(task.project_id),
+        "pr_number": int(pr_number),
+        "base_sha": str(review_target["base_sha"]),
+        "head_sha": str(review_target["head_sha"]),
+        "review_wait_started": review_wait_started,
+        "approval_set_at": source_context.get("_approval_set_at"),
+        "approval_hold_reason": source_context.get("approval_hold_reason"),
+        # Legacy rows may store a boolean rather than a file list. Preserve the
+        # exact JSON shape so the claim remains both compatible and revocable.
+        "touched_critical": copy.deepcopy(source_context.get("touched_critical")),
+        REVIEW_WAIT_APPROVAL_HOLD_KEY: copy.deepcopy(
+            source_review_loop.get(REVIEW_WAIT_APPROVAL_HOLD_KEY)
+        ),
+    }
+    # Persist a revocable, attempt-scoped claim before releasing the source row.
+    # Replacement reset clears unknown attempt fields by default; a peer
+    # backstop overwrites the token. Either action invalidates this spawner.
+    claimed_context = source_context
+    claimed_context.pop(SPAWN_REASON_KEY, None)
+    claimed_loop = dict(claimed_context.get("review_loop") or {})
+    claimed_loop[_REVIEW_WAIT_SPAWN_CLAIM_KEY] = spawn_claim
+    # If cleanup itself finds a peer lock, this committed claim still leaves the
+    # scheduler on a short retry rather than the parked-review 120s+ ramp.
+    claimed_loop["ci_poll_interval"] = 30
+    task.context = {
+        **claimed_context,
+        "review_loop": claimed_loop,
+    }
+    flag_modified(task, "context")
+    session.add(task)
+    await session.commit()
+
+    spawned_task_id = None
+    was_created = False
+    spawn_failed = False
+    observed_spawn_reason = None
+    authority_state = {"granted": False, "source_task": None}
+
+    async def _acquire_exact_source_authority(
+        authority_session: AsyncSession,
+    ) -> Task | None:
+        authoritative_task = (
+            (
+                await authority_session.execute(
+                    select(Task)
+                    .where(Task.id == source_task_id)
+                    .with_for_update(skip_locked=True)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if authoritative_task is None or not _owns_review_wait_spawn_claim(
+            authoritative_task, spawn_claim
+        ):
+            return None
+        authority_state["granted"] = True
+        authority_state["source_task"] = authoritative_task
+        return authoritative_task
+
+    try:
+        spawned_task, was_created = await _spawn_pipeline_task(
+            task,
+            "review",
+            session,
+            pr_number,
+            branch,
+            base_branch,
+            original_prompt=original_prompt,
+            original_task_id=original_task_id,
+            review_target=review_target,
+            source_spawn_authority=_acquire_exact_source_authority,
+        )
+        spawned_task_id = getattr(spawned_task, "id", None)
+        # Some canonical terminal branches commit their alert/escalation work,
+        # release Project/PR/Task authority, and only then annotate the old
+        # source ORM identity with a spawn reason. A replacement/approval may
+        # win that released window. Capture the return metadata without
+        # triggering a lazy load, then roll back every uncommitted return-path
+        # annotation so no post-commit stale state can flush over that peer.
+        returned_source = authority_state.get("source_task") or task
+        returned_context = returned_source.__dict__.get("context")
+        if isinstance(returned_context, dict):
+            observed_spawn_reason = returned_context.get(SPAWN_REASON_KEY)
+        # The canonical spawner commits every authoritative child/escalation
+        # action itself. Its uncommitted return state is source bookkeeping only
+        # (DEDUP/DEFERRED/terminal reason), which this wrapper captured above and
+        # must never commit from a released identity.
+        session.expire(returned_source)
+        await session.rollback()
+    except Exception as exc:  # noqa: BLE001 - transient retry is fail-closed
+        spawn_failed = True
+        await session.rollback()
+        logger.warning(
+            "[CI] PR #%s review-wait canonical spawn failed; deferring safely: %s",
+            pr_number,
+            exc,
+            exc_info=True,
+        )
+
+    fresh_task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == source_task_id)
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if fresh_task is None:
+        await session.rollback()
+        return (None, "stale", None)
+
+    if not _owns_review_wait_spawn_claim(fresh_task, spawn_claim):
+        # Preserve any peer state; consume the exact gate only when canonical
+        # already-merged completion committed while holding this same claim.
+        fresh_context = dict(fresh_task.context or {})
+        fresh_loop = dict(fresh_context.get("review_loop") or {})
+        if fresh_loop.get(_REVIEW_WAIT_SPAWN_CLAIM_KEY) == spawn_claim:
+            if observed_spawn_reason == SPAWN_REASON_ALREADY_MERGED:
+                release_completed_review_wait_gate_owned_by_spawn_claim(fresh_task, spawn_claim)
+                fresh_context = dict(fresh_task.context or {})
+                fresh_loop = dict(fresh_context.get("review_loop") or {})
+            fresh_loop.pop(_REVIEW_WAIT_SPAWN_CLAIM_KEY, None)
+            fresh_task.context = {**fresh_context, "review_loop": fresh_loop}
+            flag_modified(fresh_task, "context")
+            session.add(fresh_task)
+        await session.commit()
+        return (None, "stale", None)
+
+    fresh_loop = dict((fresh_task.context or {}).get("review_loop") or {})
+    fresh_loop.pop(_REVIEW_WAIT_SPAWN_CLAIM_KEY, None)
+    fresh_task.context = {
+        **(fresh_task.context or {}),
+        "review_loop": fresh_loop,
+    }
+    flag_modified(fresh_task, "context")
+    session.add(fresh_task)
+
+    if spawn_failed or not authority_state["granted"]:
+        return (fresh_task, "retry", None)
+
+    if was_created and spawned_task_id is not None:
+        release_review_wait_gate_owned_by_spawn_claim(fresh_task, spawn_claim)
+        return (fresh_task, "created", str(spawned_task_id))
+    if not was_created and spawned_task_id is not None:
+        candidate = None
+        if spawned_task_id is not None:
+            candidate = await session.get(
+                Task, spawned_task_id, populate_existing=True
+            )
+        candidate_loop = (
+            dict((candidate.context or {}).get("review_loop") or {})
+            if candidate is not None
+            else {}
+        )
+        exact_live_review = (
+            candidate is not None
+            and candidate.project_id == fresh_task.project_id
+            and candidate.archived is not True
+            and candidate.status in _PIPELINE_ACTIVE_STATUSES
+            and candidate.first_payload.get("type") == "review"
+            and candidate_loop.get("review_target") == review_target
+        )
+        if exact_live_review:
+            release_review_wait_gate_owned_by_spawn_claim(fresh_task, spawn_claim)
+            return (fresh_task, "dedup", str(candidate.id))
+        return (fresh_task, "invalid_dedup", None)
+    spawn_reason = observed_spawn_reason
+    if spawn_reason == SPAWN_REASON_ALREADY_MERGED:
+        release_review_wait_gate_owned_by_spawn_claim(fresh_task, spawn_claim)
+        return (fresh_task, "already_merged", None)
+    if spawn_reason == SPAWN_REASON_DEFERRED:
+        return (fresh_task, "deferred", None)
+    if spawn_reason == SPAWN_REASON_ADMISSION_PAUSED:
+        return (fresh_task, "paused", None)
+    if spawn_reason == SPAWN_REASON_CONTENDED:
+        return (fresh_task, "retry", None)
+    # A source-neutral suppression before authority (for example PR-lock
+    # contention) is always transient. Only a canonical reason written while
+    # the exact source lock was held may close the autonomous retry path.
+    if authority_state["granted"] and spawn_reason not in (
+        None,
+        SPAWN_REASON_DEDUP,
+    ):
+        return (fresh_task, "terminal", None)
+    return (fresh_task, "retry", None)
 
 
 async def handle_ci_completion(
@@ -1963,6 +2279,9 @@ async def handle_ci_completion(
         # Record the CI gate signal. JSONB columns don't track in-place dict
         # mutations — flag_modified ensures the change is flushed to disk.
         ci_loop["ci_passed"] = True
+        # Legacy fix-completion code used this marker to request a pre-backstop
+        # review retry. That path is intentionally retired: exact review
+        # reconciliation begins only at the 60-minute backstop.
         _checked_head_sha = str(
             checked_head_sha
             or ci_loop.get("ci_checked_head_sha")
@@ -2005,6 +2324,7 @@ async def handle_ci_completion(
             # Review hasn't approved yet — leave parked, just persist the signal.
             # The review task's APPROVE handler will write review_approved on the
             # parent and trigger the gate when it runs.
+            _review_wait_entry_status = task.latest_status_message
             task.latest_status_message = (
                 f"CI passed on PR #{ci_pr_number} — waiting for review approval"
             )
@@ -2030,86 +2350,21 @@ async def handle_ci_completion(
                 # in an earlier episode does not permanently exhaust the budget.
                 if ci_loop.get("ci_fix_spawned"):
                     ci_loop.pop("review_wait_respawn_count", None)
+                    ci_loop.pop("review_wait_deferred_at", None)
 
-            # Accelerated retry for deferred review spawns (Fix 1b): if
-            # a fix task's completion handler failed with a transient lock-
-            # contention deferral, it wrote ``review_spawn_deferred_at``
-            # on this CI task's review_loop. Attempt the review spawn
-            # immediately instead of waiting for the 60-minute backstop.
-            # Runs independently of whether review_wait_started was just
-            # set or is from a prior episode — each deferred marker fires
-            # the accelerated retry at most once (cleared after attempt).
-            _deferred_at = ci_loop.get("review_spawn_deferred_at")
-            if _deferred_at and not ci_loop.get("review_wait_escalated"):
-                try:
-                    from datetime import datetime as _ddt
-
-                    _dd = _ddt.fromisoformat(_deferred_at)
-                    if (_utcnow() - _dd).total_seconds() < 120:
-                        _orig_prompt = ci_payload.get("prompt", "") or (
-                            task.description or ""
-                        )
-                        _fr, _created = await _spawn_pipeline_task(
-                            task,
-                            "review",
-                            session,
-                            ci_pr_number,
-                            ci_branch,
-                            ci_base,
-                            original_prompt=_orig_prompt,
-                            original_task_id=ci_orig_id,
-                        )
-                        if _created and _fr is not None:
-                            ci_loop["review_wait_respawned"] = True
-                            ci_loop["review_wait_respawn_task_id"] = (
-                                str(_fr.id)
-                            )
-                            ci_loop["review_wait_respawn_count"] = 1
-                            # Clear the deferral marker so the normal
-                            # backstop does not re-enter this path.
-                            ci_loop.pop("review_spawn_deferred_at", None)
-                            task.latest_status_message = (
-                                f"CI passed on PR #{ci_pr_number} — "
-                                f"deferred review spawn retried: "
-                                f"task {_fr.id}"
-                            )
-                            _bcast_status = TaskStatus.EVALUATING
-                            logger.info(
-                                "[CI] PR #%s accelerated deferred retry — "
-                                "spawned review %s",
-                                ci_pr_number,
-                                _fr.id,
-                            )
-                        else:
-                            # Accelerated retry also failed — clear the
-                            # flag so the normal backstop handles it
-                            # without re-entering this path every ~30s.
-                            ci_loop.pop("review_spawn_deferred_at", None)
-                            logger.warning(
-                                "[CI] PR #%s accelerated deferred retry "
-                                "failed — falling back to normal backstop",
-                                ci_pr_number,
-                            )
-                except Exception as _acc_exc:
-                    logger.warning(
-                        "[CI] PR #%s accelerated deferred retry error: %s",
-                        ci_pr_number,
-                        _acc_exc,
-                    )
-            # Orphan-review backstop: if a review task died without setting
-            # review_approved, the PR parks here indefinitely. Rather than
-            # gate a mergeable PR on a human immediately, RESPAWN a fresh
-            # review task first so good PRs keep flowing autonomously; only
-            # fall back to requires_approval (+ operator alert) once respawn
-            # is suppressed (cap/merged/closed) or we've already respawned the
-            # configured number of times. ``task.context`` is snapshotted now,
-            # while ``task`` is still fresh: ``_spawn_pipeline_task`` can roll
-            # back the session and expire ``task`` (#6754 family), so the
-            # commit tail below must not re-read ``task.context``/``task.status``.
+            # Orphan-review backstop: after 60 minutes, reconcile through the
+            # canonical exact-target spawner. The spawner can commit/rollback,
+            # so the helper below first releases this caller's row lock, then
+            # relocks and revalidates the immutable PR attempt before recording
+            # CREATED/DEDUP/DEFERRED. No first-green spawn occurs here.
             _REVIEW_WAIT_TIMEOUT_MIN = 60
+            _REVIEW_WAIT_DEFER_GRACE_S = 5 * 60
             _park_ctx_snapshot = dict(task.context or {})
             _rw_started = ci_loop.get("review_wait_started")
-            if _rw_started and not ci_loop.get("review_wait_escalated"):
+            if _rw_started and (
+                not ci_loop.get("review_wait_escalated")
+                or task.requires_approval is True
+            ):
                 try:
                     from datetime import datetime
 
@@ -2119,6 +2374,8 @@ async def handle_ci_completion(
                     _rw_age_s = (_utcnow() - _rw_dt).total_seconds()
                     if _rw_age_s > _REVIEW_WAIT_TIMEOUT_MIN * 60:
                         _respawned = False
+                        _respawn_outcome = "terminal"
+                        _respawn_task_id = None
                         _auto_respawn = _rt_cfg.get("review_wait_auto_respawn", True)
                         _respawn_count = int(
                             ci_loop.get("review_wait_respawn_count", 0) or 0
@@ -2168,56 +2425,292 @@ async def handle_ci_completion(
                                         _respawn_count,
                                     )
 
-                        if _auto_respawn and _respawn_count < _respawn_cap:
+                        # Exact authority comes only from this CI observation's
+                        # head+base pair. Never combine a webhook head with a
+                        # base cached by an earlier poll (or vice versa).
+                        _current_head_sha = str(checked_head_sha or "")
+                        _current_base_sha = str(checked_base_sha or "")
+                        _review_target = (
+                            {
+                                "project_id": str(task.project_id),
+                                "pr_number": int(ci_pr_number),
+                                "base_sha": _current_base_sha,
+                                "head_sha": _current_head_sha,
+                            }
+                            if task.project_id
+                            and ci_pr_number
+                            and _current_head_sha
+                            and _current_base_sha
+                            else None
+                        )
+
+                        # A manual, spend, security, or other independent hold
+                        # already owns the operator-facing reason on this row.
+                        # The review-wait backstop may observe the CI signal, but
+                        # it cannot replace that hold, latch its own escalation,
+                        # or consume its alert budget. An exact backstop-owned
+                        # marker is the only approval episode this path may resume.
+                        _independent_approval_hold = False
+                        _exact_review_wait_hold = False
+                        if task.requires_approval is True:
+                            from app.closed_pr_reconciliation import (
+                                owns_review_wait_approval_hold,
+                            )
+
+                            _exact_review_wait_hold = bool(
+                                _review_target is not None
+                                and owns_review_wait_approval_hold(
+                                    task,
+                                    ci_loop,
+                                    pr_number=ci_pr_number,
+                                    head_sha=str(_review_target["head_sha"]),
+                                    base_sha=str(_review_target["base_sha"]),
+                                )
+                            )
+                            _independent_approval_hold = not _exact_review_wait_hold
+
+                        if _independent_approval_hold:
+                            _respawn_outcome = "held"
+                        elif (
+                            (
+                                _auto_respawn
+                                and _respawn_count < _respawn_cap
+                            )
+                            or (
+                                _exact_review_wait_hold
+                                and (task.context or {}).get("pr_merged") is True
+                            )
+                        ) and _review_target is not None:
                             _orig_prompt = ci_payload.get("prompt", "") or (
                                 task.description or ""
                             )
-                            new_review, _created = await _spawn_pipeline_task(
-                                task,
-                                "review",
-                                session,
-                                ci_pr_number,
-                                ci_branch,
-                                ci_base,
+                            task.context = {
+                                **_park_ctx_snapshot,
+                                "review_loop": ci_loop,
+                            }
+                            flag_modified(task, "context")
+                            (
+                                _fresh_task,
+                                _respawn_outcome,
+                                _respawn_task_id,
+                            ) = await _reconcile_review_wait_backstop_spawn(
+                                task=task,
+                                session=session,
+                                pr_number=ci_pr_number,
+                                branch=ci_branch,
+                                base_branch=ci_base,
                                 original_prompt=_orig_prompt,
                                 original_task_id=ci_orig_id,
+                                review_target=_review_target,
+                                review_wait_started=_rw_started,
                             )
-                            if _created and new_review is not None:
+                            if _respawn_outcome == "stale":
+                                # Replacement/review completion won the unlocked
+                                # window and is already committed. Never rewrite
+                                # it from this stale handler.
+                                return True
+                            if _fresh_task is not None:
+                                task = _fresh_task
+                                ci_loop = dict(
+                                    (task.context or {}).get("review_loop") or {}
+                                )
+                                _park_ctx_snapshot = dict(task.context or {})
+                        if _respawn_outcome in ("created", "dedup"):
                                 _respawned = True
                                 ci_loop["review_wait_respawned"] = True
-                                ci_loop["review_wait_respawn_task_id"] = str(
-                                    new_review.id
+                                ci_loop["review_wait_respawn_task_id"] = (
+                                    _respawn_task_id
                                 )
+                                # A canonical exact DEDUP consumes the same
+                                # timeout budget as a newly created review. It
+                                # grants that live row one full follow-up window,
+                                # but cannot reset the 60-minute clock forever
+                                # when the row remains BLOCKED/PARKED.
                                 ci_loop["review_wait_respawn_count"] = (
                                     _respawn_count + 1
+                                )
+                                # An exact live review is authority to WAIT only.
+                                # Merge remains closed until its lifecycle writes
+                                # an authoritative APPROVE receipt.
+                                ci_loop["authoritative_review_required"] = True
+                                ci_loop["authoritative_review_task_id"] = (
+                                    _respawn_task_id
+                                )
+                                ci_loop["authoritative_review_target"] = dict(
+                                    _review_target
                                 )
                                 # Reset the window so the replacement review
                                 # task gets a full timeout before escalation.
                                 ci_loop["review_wait_started"] = (
                                     _utcnow().isoformat()
                                 )
+                                ci_loop.pop("review_wait_deferred_at", None)
+                                ci_loop["ci_poll_interval"] = 120
+                                ci_loop.pop("review_wait_escalated", None)
                                 task.latest_status_message = (
                                     f"CI passed on PR #{ci_pr_number} but review "
                                     f"approval never arrived after "
-                                    f"{_REVIEW_WAIT_TIMEOUT_MIN}min — respawned "
-                                    f"review task {new_review.id}"
+                                    f"{_REVIEW_WAIT_TIMEOUT_MIN}min — "
+                                    f"{_respawn_outcome} exact review task "
+                                    f"{_respawn_task_id}"
                                 )
                                 _bcast_status = TaskStatus.EVALUATING
                                 logger.warning(
-                                    "[CI] PR #%s review-wait orphan respawn fired "
-                                    "for task %s (%.0f min elapsed) — spawned "
-                                    "review %s (respawn #%d)",
+                                    "[CI] PR #%s review-wait backstop reconciled "
+                                    "task %s (%.0f min elapsed) — %s exact review "
+                                    "%s",
                                     ci_pr_number,
                                     task.id,
                                     _rw_age_s / 60,
-                                    new_review.id,
-                                    _respawn_count + 1,
+                                    _respawn_outcome,
+                                    _respawn_task_id,
                                 )
-                        if not _respawned:
+                        elif _exact_review_wait_hold and _respawn_outcome == "terminal":
+                            _respawn_outcome = "held"
+                        elif _respawn_outcome == "held":
+                            pass
+                        elif _review_target is None:
+                            # A webhook-only head (or any incomplete snapshot)
+                            # cannot safely identify a review target. Preserve
+                            # the elapsed backstop and let a complete poll retry;
+                            # do not turn missing provenance into a human gate.
+                            _respawn_outcome = "retry"
+                            ci_loop["polls_since_pr_fetch"] = 999
+
+                        if _respawn_outcome == "deferred":
+                            _deferred_now = _utcnow()
+                            _deferred_started = ci_loop.get("review_wait_deferred_at")
+                            try:
+                                _deferred_age_s = (
+                                    (_deferred_now - datetime.fromisoformat(_deferred_started))
+                                    .total_seconds()
+                                    if _deferred_started
+                                    else 0
+                                )
+                            except (TypeError, ValueError):
+                                _deferred_age_s = 0
+                                _deferred_started = None
+                            if _deferred_started is None:
+                                ci_loop["review_wait_deferred_at"] = (
+                                    _deferred_now.isoformat()
+                                )
+                            elif _deferred_age_s >= _REVIEW_WAIT_DEFER_GRACE_S:
+                                # Cross-type/mid-retry work is a bounded defer,
+                                # not authority to restart the 60-minute wait
+                                # forever. Escalation below preserves review/
+                                # merge closure for the still-stalled attempt.
+                                _respawn_outcome = "terminal"
+
+                        if _respawn_outcome == "retry":
+                            _retry_at = _utcnow().isoformat()
+                            # Transient lock/error/incomplete-snapshot outcomes
+                            # preserve the elapsed 60-minute episode. A short
+                            # poll retries as soon as exact authority is available.
+                            ci_loop["ci_last_polled"] = _retry_at
+                            ci_loop["ci_poll_interval"] = 30
+                            ci_loop.pop("review_wait_escalated", None)
+                            task.latest_status_message = (
+                                f"CI passed on PR #{ci_pr_number}; exact review "
+                                "reconciliation is temporarily unavailable — "
+                                "retrying shortly"
+                            )
+                            logger.info(
+                                "[CI] PR #%s review-wait reconciliation retry for "
+                                "task %s; preserved elapsed backstop clock",
+                                ci_pr_number,
+                                task.id,
+                            )
+                        elif _respawn_outcome == "paused":
+                            _retry_at = _utcnow().isoformat()
+                            ci_loop["review_wait_started"] = _retry_at
+                            ci_loop.pop("review_wait_deferred_at", None)
+                            ci_loop["ci_last_polled"] = _retry_at
+                            ci_loop["ci_poll_interval"] = 30
+                            ci_loop.pop("review_wait_escalated", None)
+                            task.latest_status_message = (
+                                f"CI passed on PR #{ci_pr_number}; review spawn "
+                                "paused by current project admission state — "
+                                "backstop clock paused for retry"
+                            )
+                            logger.info(
+                                "[CI] PR #%s review-wait spawn paused for task "
+                                "%s; paused backstop clock without escalation",
+                                ci_pr_number,
+                                task.id,
+                            )
+                        elif _respawn_outcome == "deferred":
+                            _retry_at = _utcnow().isoformat()
+                            ci_loop["ci_last_polled"] = _retry_at
+                            ci_loop["ci_poll_interval"] = 30
+                            ci_loop.pop("review_wait_escalated", None)
+                            task.latest_status_message = (
+                                f"CI passed on PR #{ci_pr_number}; review spawn "
+                                "deferred by active cross-type work — retrying "
+                                "within the bounded defer grace"
+                            )
+                            logger.info(
+                                "[CI] PR #%s review-wait spawn deferred for task "
+                                "%s; preserved elapsed backstop clock",
+                                ci_pr_number,
+                                task.id,
+                            )
+                        elif _respawn_outcome == "already_merged":
+                            # The canonical spawner proved the exact PR was
+                            # already merged. Rollup parents intentionally remain
+                            # EVALUATING for rollup convergence, but this CI wait
+                            # is finished and must never become a manual gate.
+                            ci_loop["ci_waiting"] = False
+                            ci_loop.pop("review_wait_started", None)
+                            ci_loop.pop("review_wait_deferred_at", None)
+                            ci_loop.pop("review_wait_escalated", None)
+                            logger.info(
+                                "[CI] PR #%s review-wait backstop observed an "
+                                "already-merged rollup for task %s; leaving "
+                                "terminal classification to rollup convergence",
+                                ci_pr_number,
+                                task.id,
+                            )
+                        elif _respawn_outcome == "held":
+                            # Preserve the independent hold's exact provenance,
+                            # timer, and operator-visible reason. With no
+                            # review_wait_escalated latch, an explicit release
+                            # naturally re-enters this aged backstop next poll.
+                            ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                            ci_loop["ci_poll_interval"] = 120
+                            task.latest_status_message = _review_wait_entry_status
+                            logger.info(
+                                "[CI] PR #%s review-wait backstop deferred for "
+                                "task %s because an independent approval hold "
+                                "owns the row",
+                                ci_pr_number,
+                                task.id,
+                            )
+                        elif not _respawned:
                             # Respawn disabled, suppressed, or cap reached —
                             # gate on a human so the PR isn't stranded silently.
+                            # Claim ownership only when this backstop transitions
+                            # an otherwise-open approval gate.
+                            from app.closed_pr_reconciliation import (
+                                REVIEW_WAIT_APPROVAL_HOLD_KEY,
+                                REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+                            )
+
                             ci_loop["review_wait_escalated"] = True
-                            task.requires_approval = True
+                            ci_loop.pop("review_wait_deferred_at", None)
+                            if task.requires_approval is not True:
+                                _approval_set_at = _utcnow().isoformat()
+                                task.requires_approval = True  # approval-provenance: review-wait-owner
+                                ci_loop[REVIEW_WAIT_APPROVAL_HOLD_KEY] = {
+                                    "owner": REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+                                    "project_id": str(task.project_id),
+                                    "pr_number": int(ci_pr_number),
+                                    "base_sha": _review_target["base_sha"],
+                                    "head_sha": _review_target["head_sha"],
+                                    "set_at": _approval_set_at,
+                                }
+                                _park_ctx_snapshot["_approval_set_at"] = (
+                                    _approval_set_at
+                                )
                             task.latest_status_message = (
                                 f"CI passed on PR #{ci_pr_number} but review "
                                 f"approval never arrived after "
@@ -2240,8 +2733,8 @@ async def handle_ci_completion(
                             )
                 except (ValueError, TypeError):
                     pass
-            # Re-merge onto the pre-spawn snapshot: a respawn may have expired
-            # ``task``, so do not re-read ``task.context`` here.
+            # Re-merge only onto the original locked snapshot or the fresh
+            # relocked snapshot returned by the canonical backstop helper.
             task.context = {**_park_ctx_snapshot, "review_loop": ci_loop}
             flag_modified(task, "context")
             session.add(task)

@@ -176,7 +176,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/routers/projects.py",
     ),
     "legacy_compatibility": (
-        "backend/app/admin_task_approvals.py",
+        "backend/app/admin_approval_followup_handlers.py",
         "backend/app/admin_task_mutations.py",
         "backend/app/agent_status_spawn.py",
         "backend/app/routers/agent_strategic_messages.py",
@@ -214,6 +214,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/recovery_evaluating_strand.py",
         "backend/app/recovery_post_commit_orphans.py",
         "backend/app/research_direction_state.py",
+        "backend/app/review_approval_gate_publication.py",
         "backend/app/strategic_completion.py",
         "backend/app/review_pipeline.py",
         "backend/app/review_request_changes.py",

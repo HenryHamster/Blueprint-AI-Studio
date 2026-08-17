@@ -18,6 +18,7 @@ keeps working for existing callers and tests.
 
 from __future__ import annotations
 
+import copy
 import logging
 import uuid
 from datetime import datetime
@@ -28,7 +29,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 import app.shared_state as _shared_state
-from app.closed_pr_reconciliation import reconcile_closed_pr_replacement
+from app.admin_approval_authority import (
+    APPROVAL_FOLLOWUP_CLAIM_KEY,
+    APPROVAL_HOLD_PROVENANCE_KEY,
+    establish_independent_approval_hold,
+)
+from app.closed_pr_reconciliation import (
+    REVIEW_WAIT_APPROVAL_HOLD_KEY,
+    lookup_closed_pr_replacement,
+    owns_review_wait_approval_hold,
+    reconcile_closed_pr_replacement,
+)
 from app.database import resolve_dialect_name
 from app.dep_lifecycle import _mark_unblocked_dependents
 from app.models import Project, Task, TaskStatus
@@ -47,13 +58,28 @@ logger = logging.getLogger("blueprint")
 # detected=false verdict (a suite that ran and found nothing) is NOT a crash and
 # never retries — it falls open immediately, as before.
 _VERIFY_TESTS_MAX_RETRIES = 1
-
 # No-CI merge gate: how many consecutive cycles the verify_tests spawn may be
 # deferred (i.e. _spawn_pipeline_task returns None due to resource pressure)
 # before the parent task is escalated to FAILED + operator review.  A single
 # transient deferral is expected during resource pressure, but a persistent
 # deferral across 5 cycles means the PR is stranded with no self-recovery path.
 _VERIFY_TESTS_SPAWN_DEFERRAL_CAP = 5
+
+
+def _establish_monitor_approval_hold(task: Task, *, reason: str) -> None:
+    owner = "orchestrator_ci_monitor"
+    context = dict(task.context or {})
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    if (
+        task.requires_approval is True
+        and isinstance(provenance, dict)
+        and provenance.get("owner") == owner
+        and provenance.get("reason") == reason
+        and not context.get(APPROVAL_FOLLOWUP_CLAIM_KEY)
+        and not (context.get("review_loop") or {}).get(REVIEW_WAIT_APPROVAL_HOLD_KEY)
+    ):
+        return
+    establish_independent_approval_hold(task, reason=reason, owner=owner)
 
 
 def _ci_result_from_resolved_pr_ci_status(resolved: dict) -> dict | None:
@@ -114,19 +140,61 @@ def _capture_ci_polling_snapshot(task: Task) -> dict:
       - ``status``: the most load-bearing; if a peer transitioned the
         task out of EVALUATING (e.g. to COMPLETED on PR merge or FAILED
         on PR delete), we must not re-apply CI-polling mutations on top.
-      - ``review_loop.{pr_number, ci_passed, review_approved, iteration}``:
-        if any of these moved, the review pipeline advanced under us.
+      - exact PR attempt coordinates and review-wait approval provenance: if
+        PR/base/head, approval timer/marker/reason, archive state, or review
+        authority moved, the unlocked GitHub result no longer owns the row.
 
     Heartbeat-only updates touch none of these.
     """
     rl = (task.context or {}).get("review_loop") or {}
+    context = dict(task.context or {})
+    marker = rl.get(REVIEW_WAIT_APPROVAL_HOLD_KEY)
+    from app.ci_merge_helpers import effective_pr_number
+
     return {
         "status": task.status,
-        "pr_number": rl.get("pr_number"),
+        "archived": task.archived,
+        "project_id": str(task.project_id),
+        "requires_approval": task.requires_approval,
+        "ci_waiting": rl.get("ci_waiting"),
+        "pr_number": effective_pr_number(task),
         "ci_passed": rl.get("ci_passed"),
         "review_approved": rl.get("review_approved"),
         "iteration": rl.get("iteration"),
+        "branch": rl.get("branch"),
+        "base_branch": rl.get("base_branch"),
+        "ci_checked_head_sha": rl.get("ci_checked_head_sha"),
+        "ci_checked_base_sha": rl.get("ci_checked_base_sha"),
+        "review_wait_started": rl.get("review_wait_started"),
+        "review_wait_approval_hold": (
+            dict(marker) if isinstance(marker, dict) else marker
+        ),
+        "approval_set_at": context.get("_approval_set_at"),
+        "approval_hold_reason": context.get("approval_hold_reason"),
+        # This is historically either a list of paths or a boolean. Deep-copy
+        # the JSON value instead of coercing it through tuple(), which raises on
+        # the supported boolean shape and would also change equality semantics.
+        "touched_critical": copy.deepcopy(context.get("touched_critical")),
     }
+
+
+def _review_wait_approval_gate_owned(task: Task, review_loop: dict) -> bool:
+    """Recompute exact backstop ownership from one freshly locked task row."""
+
+    from app.ci_merge_helpers import effective_pr_number
+
+    pr_number = effective_pr_number(task)
+    head_sha = str(review_loop.get("ci_checked_head_sha") or "")
+    base_sha = str(review_loop.get("ci_checked_base_sha") or "")
+    if not pr_number or not head_sha or not base_sha:
+        return False
+    return owns_review_wait_approval_hold(
+        task,
+        review_loop,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
 
 
 def _ci_waiting_sql_filter(session):
@@ -307,6 +375,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
     from app.alert_dispatch import _maybe_create_failure_alert
     from app.rollup_management import _verify_pr_merged
     from app.review_pipeline import _spawn_pipeline_task
+    from app.rollup_state import _is_rollup_parent_awaiting_merge
     from app.broadcast import broadcast_to_project
     from app.routers.agent import get_github_token_for_task
     # Imported at function entry (not module level) to avoid a load-time cycle:
@@ -408,6 +477,77 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
         _preloaded_projects[snapshot.id] = snapshot
         return snapshot
 
+    async def _persist_unlocked_io_backoff(
+        *,
+        task_id: uuid.UUID,
+        expected_snapshot: dict,
+        reason: str,
+        status_message: str,
+        require_owned_review_wait_gate: bool = False,
+        increment_pr_fetch_failures: bool = False,
+    ) -> bool:
+        """Apply retry throttle only if the exact unlocked-I/O owner survives."""
+
+        try:
+            await session.rollback()
+        except Exception:
+            logger.debug("[CI] Pre-backoff rollback raised for task %s", task_id)
+        locked_task = await _lock_task_for_mutation(
+            session,
+            task_id,
+            allowed_statuses=(TaskStatus.EVALUATING,),
+            reason=reason,
+            expected_snapshot=expected_snapshot,
+            snapshot_fn=_capture_ci_polling_snapshot,
+        )
+        if locked_task is None:
+            return False
+        # ``_lock_task_for_mutation`` returned the row under the mutation lock,
+        # but make the post-rollback identity refresh explicit as well.  Besides
+        # documenting that none of the unlocked-I/O snapshot may leak through,
+        # this keeps rollback-safety auditing local to this helper.
+        await session.refresh(locked_task)
+        locked_loop = dict(
+            (locked_task.context or {}).get("review_loop", {}) or {}
+        )
+        gate_enabled = _runtime_config.get("require_approval_gates", True)
+        owns_review_wait_gate = bool(
+            gate_enabled
+            and locked_task.requires_approval
+            and _review_wait_approval_gate_owned(locked_task, locked_loop)
+        )
+        if require_owned_review_wait_gate and not owns_review_wait_gate:
+            await session.rollback()
+            return False
+        if gate_enabled and locked_task.requires_approval and not owns_review_wait_gate:
+            await session.rollback()
+            return False
+
+        try:
+            current_interval = int(locked_loop.get("ci_poll_interval", 30) or 30)
+        except (TypeError, ValueError):
+            current_interval = 30
+        if increment_pr_fetch_failures:
+            locked_loop["pr_fetch_failures"] = int(
+                locked_loop.get("pr_fetch_failures", 0) or 0
+            ) + 1
+            next_interval = min(max(current_interval * 2, 120), 300)
+        else:
+            next_interval = max(current_interval, 120)
+        locked_loop["ci_last_polled"] = _utcnow().isoformat()
+        locked_loop["ci_poll_interval"] = next_interval
+        locked_task.latest_status_message = status_message[:500]
+        locked_task.context = {
+            **(locked_task.context or {}),
+            "review_loop": locked_loop,
+        }
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(locked_task, "context")
+        session.add(locked_task)
+        await session.commit()
+        return True
+
     for ci_task_id in ci_waiting_task_ids:
         # Heartbeat per task: this loop is O(EVALUATING backlog) and
         # is the dominant contributor to cycle wall-time. Marking
@@ -443,12 +583,20 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
         # The merge resumes once the operator clears the flag. With gates OFF
         # the flag is
         # advisory only, so do not skip. This is the orchestrator-side
-        # half of the merge-call invariant.
-        if ci_task.requires_approval and _runtime_config.get(
+        # half of the merge-call invariant. The one exception below is an exact
+        # review-wait-owned marker: it may inspect PR state only to reconcile a
+        # closed replacement, and is stopped before every merge/CI path.
+        _approval_gate_enabled = _runtime_config.get(
             "require_approval_gates", True
-        ):
-            await session.rollback()
-            continue
+        )
+        _review_wait_owned_gate = False
+        if ci_task.requires_approval and _approval_gate_enabled:
+            _review_wait_owned_gate = _review_wait_approval_gate_owned(
+                ci_task, ci_loop
+            )
+            if not _review_wait_owned_gate:
+                await session.rollback()
+                continue
         # PR-identity split-brain fix: resolve via the canonical
         # accessor (review_loop.pr_number OR context.rollup_pr_number),
         # the SAME fallback the recovery sweeps use — a rollup whose
@@ -460,7 +608,6 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
         if not ci_pr_number:
             await session.rollback()
             continue
-
         # Ensure ci_wait_started AND pr_number are always co-present:
         # some paths arm ci_waiting without ci_wait_started (silently
         # disables the timeout), and when the number came from the
@@ -503,6 +650,18 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
             ci_loop = dict(
                 (ci_task.context or {}).get("review_loop", {}) or {}
             )
+            _review_wait_owned_gate = bool(
+                _approval_gate_enabled
+                and ci_task.requires_approval
+                and _review_wait_approval_gate_owned(ci_task, ci_loop)
+            )
+            if (
+                _approval_gate_enabled
+                and ci_task.requires_approval
+                and not _review_wait_owned_gate
+            ):
+                await session.rollback()
+                continue
 
         # Exponential backoff: skip if not enough time has elapsed since last poll.
         # Webhooks handle the fast path — polling is a fallback.
@@ -519,6 +678,8 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
             except (ValueError, TypeError):
                 pass
 
+        _unlocked_credential_result_pending = False
+        ci_pre_token_snapshot = None
         try:
             # Timeout: if CI has been pending too long, proceed to merge anyway
             # Use ci_wait_started if available, otherwise fall back to started_at/created_at
@@ -534,7 +695,8 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
             if started is None:
                 started = ci_task.started_at or ci_task.created_at
             if (
-                started
+                not _review_wait_owned_gate
+                and started
                 and (_utcnow() - started).total_seconds()
                 > CI_WAIT_TIMEOUT_MINUTES * 60
                 and not ci_loop.get("escalated")
@@ -582,13 +744,67 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                 ci_loop = dict(
                     (ci_task.context or {}).get("review_loop", {}) or {}
                 )
+                _review_wait_owned_gate = bool(
+                    _approval_gate_enabled
+                    and ci_task.requires_approval
+                    and _review_wait_approval_gate_owned(ci_task, ci_loop)
+                )
+                if (
+                    _approval_gate_enabled
+                    and ci_task.requires_approval
+                    and not _review_wait_owned_gate
+                ):
+                    await session.rollback()
+                    continue
                 # Fall through — continue polling CI even after escalation
 
-            (
-                ci_gh_token,
-                ci_owner,
-                ci_repo,
-            ) = await get_github_token_for_task(ci_task.id, session)
+            if _review_wait_owned_gate:
+                # This exceptional approval-bypass path may cold-mint through
+                # GitHub or read Secret Manager. Release the Task lock first,
+                # then reacquire and validate the exact approval/PR snapshot.
+                ci_pre_token_snapshot = _capture_ci_polling_snapshot(ci_task)
+                _unlocked_credential_result_pending = True
+                await session.commit()
+                (
+                    ci_gh_token,
+                    ci_owner,
+                    ci_repo,
+                ) = await get_github_token_for_task(
+                    ci_task_id,
+                    session,
+                    release_dedicated_session_before_io=True,
+                )
+                # A warm cache return may not release the resolver's dedicated
+                # read transaction. End it before the authoritative lock.
+                await session.rollback()
+                ci_task = await _lock_task_for_mutation(
+                    session,
+                    ci_task_id,
+                    allowed_statuses=(TaskStatus.EVALUATING,),
+                    reason="CI polling after credential resolution",
+                    expected_snapshot=ci_pre_token_snapshot,
+                    snapshot_fn=_capture_ci_polling_snapshot,
+                )
+                if ci_task is None:
+                    continue
+                ci_loop = dict(
+                    (ci_task.context or {}).get("review_loop", {}) or {}
+                )
+                _review_wait_owned_gate = bool(
+                    _approval_gate_enabled
+                    and ci_task.requires_approval
+                    and _review_wait_approval_gate_owned(ci_task, ci_loop)
+                )
+                if not _review_wait_owned_gate:
+                    await session.rollback()
+                    continue
+                _unlocked_credential_result_pending = False
+            else:
+                (
+                    ci_gh_token,
+                    ci_owner,
+                    ci_repo,
+                ) = await get_github_token_for_task(ci_task.id, session)
 
             # Use cached head SHA when available to skip the PR fetch (saves 1 API call per poll).
             # Re-fetch PR every 5th poll to detect force-pushes and merge state changes.
@@ -596,8 +812,16 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
             polls_since_fetch = (
                 ci_loop.get("polls_since_pr_fetch", 5) + 1
             )  # default 5 to force first fetch
-            need_pr_fetch = not cached_head_sha or polls_since_fetch >= 5
+            # A backstop-owned gate may proceed only far enough to discover a
+            # closed PR and run exact replacement reconciliation. Force that
+            # authoritative fetch; open PRs remain approval-gated below.
+            need_pr_fetch = (
+                _review_wait_owned_gate
+                or not cached_head_sha
+                or polls_since_fetch >= 5
+            )
             pr_data = None
+            replacement_lookup = None
 
             if not need_pr_fetch:
                 # Fast path: skip PR fetch, use cached SHA, just check CI
@@ -617,6 +841,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                 # R5-W2-A: content snapshot, not updated_at —
                 # heartbeat onupdate would false-defer every poll.
                 ci_pre_pr_snapshot = _capture_ci_polling_snapshot(ci_task)
+                ci_project_id = str(ci_task.project_id)
                 await session.commit()
                 try:
                     pr_data = await get_pull_request(
@@ -637,6 +862,33 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     ci_loop = dict(
                         (ci_task.context or {}).get("review_loop", {}) or {}
                     )
+                    _review_wait_owned_gate = bool(
+                        _approval_gate_enabled
+                        and ci_task.requires_approval
+                        and _review_wait_approval_gate_owned(ci_task, ci_loop)
+                    )
+                    if _approval_gate_enabled and ci_task.requires_approval:
+                        if not _review_wait_owned_gate:
+                            await session.rollback()
+                            continue
+                        # Owned approval is a narrow replacement-only bypass.
+                        # A failed primary PR read, including 404/410, cannot
+                        # prove a closed replacement and therefore must not
+                        # terminalize or otherwise reinterpret the hold.
+                        ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                        ci_loop["ci_poll_interval"] = max(
+                            ci_loop.get("ci_poll_interval", 30), 120
+                        )
+                        ci_task.context = {
+                            **(ci_task.context or {}),
+                            "review_loop": ci_loop,
+                        }
+                        from sqlalchemy.orm.attributes import flag_modified
+
+                        flag_modified(ci_task, "context")
+                        session.add(ci_task)
+                        await session.commit()
+                        continue
                     if exc.status_code in (404, 410):
                         _pr_gone_msg = f"PR #{ci_pr_number} no longer exists (deleted or repo archived)"
                         logger.exception(
@@ -715,10 +967,58 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     session.add(ci_task)
                     await session.commit()
                     continue
+                except Exception as exc:  # noqa: BLE001 - transient GitHub I/O
+                    # Preserve the ordinary deleted-PR terminal path for custom
+                    # provider exceptions that expose ``status_code=404`` but do
+                    # not subclass FastAPI's HTTPException. The owned review-wait
+                    # bypass remains fail-closed and throttled because it may use
+                    # GitHub only to prove an exact closed replacement.
+                    if (
+                        getattr(exc, "status_code", None) == 404
+                        and not _review_wait_owned_gate
+                    ):
+                        raise
+                    await _persist_unlocked_io_backoff(
+                        task_id=ci_task_id,
+                        expected_snapshot=ci_pre_pr_snapshot,
+                        reason="CI polling after non-HTTP PR fetch error",
+                        status_message=(
+                            f"PR #{ci_pr_number} lookup unavailable "
+                            f"({type(exc).__name__}) — retrying with backoff"
+                        ),
+                        increment_pr_fetch_failures=True,
+                    )
+                    logger.warning(
+                        "[CI] Non-HTTP error fetching PR #%s for task %s; "
+                        "snapshot-safe backoff applied: %s",
+                        ci_pr_number,
+                        ci_task_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    continue
 
                 if not pr_data:
                     await session.rollback()
                     continue
+
+                if (
+                    pr_data.get("state") == "closed"
+                    and not pr_data.get("merged")
+                ):
+                    closed_head = (pr_data.get("head") or {}).get("ref") or ""
+                    closed_base = (
+                        (pr_data.get("base") or {}).get("ref") or ""
+                    ) or ci_pre_pr_snapshot.get("base_branch") or ""
+                    if closed_head and closed_base:
+                        replacement_lookup = await lookup_closed_pr_replacement(
+                            project_id=ci_project_id,
+                            closed_head=closed_head,
+                            closed_base=closed_base,
+                            github_token=ci_gh_token,
+                            github_owner=ci_owner,
+                            github_repo=ci_repo,
+                        )
 
                 # Re-acquire lock after successful PR fetch.
                 ci_task = await _lock_task_for_mutation(
@@ -734,11 +1034,110 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                 ci_loop = dict(
                     (ci_task.context or {}).get("review_loop", {}) or {}
                 )
+                _review_wait_owned_gate = bool(
+                    _approval_gate_enabled
+                    and ci_task.requires_approval
+                    and _review_wait_approval_gate_owned(ci_task, ci_loop)
+                )
+                if (
+                    _approval_gate_enabled
+                    and ci_task.requires_approval
+                    and not _review_wait_owned_gate
+                ):
+                    await session.rollback()
+                    continue
 
                 if ci_loop.get("pr_fetch_failures"):
                     ci_loop["pr_fetch_failures"] = 0
 
             pr_state = pr_data.get("state", "open")
+            if _review_wait_owned_gate:
+                # A closed-unmerged PR may only run replacement reconciliation.
+                # Open waits respawn; merged waits consume only their exact gate.
+                if (
+                    pr_state == "closed"
+                    and not pr_data.get("merged")
+                    and await reconcile_closed_pr_replacement(
+                        task=ci_task,
+                        session=session,
+                        review_loop=ci_loop,
+                        pr_number=ci_pr_number,
+                        pr_data=pr_data,
+                        replacement_lookup=replacement_lookup,
+                    )
+                ):
+                    continue
+                _owned_head_sha = str(
+                    (pr_data.get("head") or {}).get("sha") or ""
+                )
+                _owned_base_sha = str(
+                    (pr_data.get("base") or {}).get("sha") or ""
+                )
+                from app.ci_merge_helpers import _review_approved
+                _exact_owned_review_wait = bool(
+                    ci_loop.get("ci_passed") is True
+                    and ci_loop.get("review_wait_started")
+                    and owns_review_wait_approval_hold(
+                        ci_task,
+                        ci_loop,
+                        pr_number=ci_pr_number,
+                        head_sha=_owned_head_sha,
+                        base_sha=_owned_base_sha,
+                    )
+                )
+                if _exact_owned_review_wait and pr_data.get("merged") is True:
+                    from app.review_wait_spawn_authority import release_review_wait_gate_owned_by_live_target
+                    if not release_review_wait_gate_owned_by_live_target(
+                        ci_task, pr_number=ci_pr_number, head_sha=_owned_head_sha, base_sha=_owned_base_sha
+                    ):
+                        await session.rollback()
+                        continue
+                    ci_loop = dict((ci_task.context or {}).get("review_loop") or {})
+                    session.add(ci_task)
+                    if _is_rollup_parent_awaiting_merge(ci_task.context):
+                        await session.commit()
+                        continue
+                    _review_wait_owned_gate = False
+                elif (
+                    _exact_owned_review_wait
+                    and pr_state == "open"
+                    and not _review_approved(ci_loop)
+                ):
+                    from app.ci_completion import handle_ci_completion
+                    await handle_ci_completion(
+                        ci_task,
+                        {
+                            "status": "completed",
+                            "conclusion": "success",
+                            "details": [],
+                            "failed_logs": "",
+                        },
+                        ci_gh_token,
+                        ci_owner,
+                        ci_repo,
+                        session,
+                        source="poll",
+                        checked_head_sha=_owned_head_sha,
+                        checked_base_sha=_owned_base_sha,
+                    )
+                    continue
+                if _review_wait_owned_gate:
+                    from sqlalchemy.orm.attributes import flag_modified
+                    ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                    ci_loop["polls_since_pr_fetch"] = 0
+                    if pr_state == "closed" and not pr_data.get("merged"):
+                        ci_task.latest_status_message = (
+                            f"PR #{ci_pr_number} is closed with no authoritative "
+                            "replacement yet; retaining review-wait approval gate"
+                        )
+                    ci_task.context = {
+                        **(ci_task.context or {}),
+                        "review_loop": ci_loop,
+                    }
+                    flag_modified(ci_task, "context")
+                    session.add(ci_task)
+                    await session.commit()
+                    continue
 
             # Check if PR was already merged (prevents double merge).
             # If we self-closed for a mergeability reset and reopen failed,
@@ -820,7 +1219,9 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         if _runtime_config.get(
                             "require_approval_gates", True
                         ):
-                            ci_task.requires_approval = True
+                            _establish_monitor_approval_hold(
+                                ci_task, reason="pr_reopen_attempts_exhausted"
+                            )
                         ci_task.latest_status_message = (
                             f"PR #{ci_pr_number} reopen failed {_reopen_attempts} times — "
                             f"manual intervention required"
@@ -879,9 +1280,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         review_loop=ci_loop,
                         pr_number=ci_pr_number,
                         pr_data=pr_data,
-                        github_token=ci_gh_token,
-                        github_owner=ci_owner,
-                        github_repo=ci_repo,
+                        replacement_lookup=replacement_lookup,
                     )
                 ):
                     continue
@@ -1065,7 +1464,10 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                             if _runtime_config.get(
                                 "require_approval_gates", True
                             ):
-                                ci_task.requires_approval = True
+                                _establish_monitor_approval_hold(
+                                    ci_task,
+                                    reason="mergeability_reopen_attempts_exhausted",
+                                )
                             ci_task.latest_status_message = (
                                 f"PR #{ci_pr_number} mergeability stuck after {_reopen_tries} "
                                 f"close/reopen attempts — manual intervention required"
@@ -1568,10 +1970,6 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     (ci_task.context or {}).get("review_loop", {}) or {}
                 )
                 if fix_task:
-                    from app.rollup_state import (
-                        _is_rollup_parent_awaiting_merge,
-                    )
-
                     ci_loop_ctx = dict(ci_loop)
                     ci_loop_ctx["ci_waiting"] = False
                     ci_loop_ctx["conflict_fix_spawned"] = str(fix_task.id)
@@ -1620,7 +2018,9 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         if _runtime_config.get(
                             "require_approval_gates", True
                         ):
-                            ci_task.requires_approval = True
+                            _establish_monitor_approval_hold(
+                                ci_task, reason="merge_conflict_fix_exhausted"
+                            )
                         ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix iterations exhausted, requires manual intervention"
                         logger.warning(
                             f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — marking FAILED (requires_approval)"
@@ -2096,7 +2496,10 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                             if _runtime_config.get(
                                 "require_approval_gates", True
                             ):
-                                ci_task.requires_approval = True
+                                _establish_monitor_approval_hold(
+                                    ci_task,
+                                    reason="verify_tests_spawn_deferrals_exhausted",
+                                )
                             ci_task.latest_status_message = (
                                 f"No CI on PR #{ci_pr_number} — verify_tests "
                                 f"spawn deferred {_spawn_deferrals} consecutive "
@@ -3043,6 +3446,22 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
             logger.exception(
                 f"[CI] Error checking CI for task {ci_task_id}"
             )
+            if _unlocked_credential_result_pending:
+                # Credential I/O was authorized only by the pre-release exact
+                # snapshot. Back off only if the same owned gate still survives;
+                # replacement/manual/spend/critical peers remain authoritative.
+                if ci_pre_token_snapshot is not None:
+                    await _persist_unlocked_io_backoff(
+                        task_id=ci_task_id,
+                        expected_snapshot=ci_pre_token_snapshot,
+                        reason="CI polling after credential resolution error",
+                        status_message=(
+                            f"GitHub credentials unavailable for PR #{ci_pr_number} "
+                            "— retrying with backoff"
+                        ),
+                        require_owned_review_wait_gate=True,
+                    )
+                continue
             try:
                 # Re-fetch ci_task fresh inside the recovery: if the
                 # outer exception was a connection-class failure, the
@@ -3070,6 +3489,16 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     logger.warning(
                         f"[CI] Skipping error recovery for task {ci_task_id}: row not lockable"
                     )
+                    continue
+                if (
+                    _runtime_config.get("require_approval_gates", True)
+                    and ci_task.requires_approval
+                ):
+                    # Error recovery is not part of the exact closed-replacement
+                    # bypass. This also keeps custom/non-HTTP 404 paths from
+                    # terminalizing a row whose approval ownership changed while
+                    # GitHub I/O was in flight.
+                    await session.rollback()
                     continue
                 status_code = getattr(e, "status_code", None)
                 if status_code == 404:
