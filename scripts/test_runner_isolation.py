@@ -655,6 +655,34 @@ class TestEnvAllowlist(unittest.TestCase):
             {"AGENT_SOURCE_SHA": "9" * 40}, {}, [],
         ))
 
+    def test_vitest_worker_policy_is_injected_only(self):
+        policy = {
+            "VITEST_MIN_THREADS": "1",
+            "VITEST_MAX_THREADS": "4",
+            "VITEST_MIN_FORKS": "1",
+            "VITEST_MAX_FORKS": "4",
+            "VITEST_MIN_WORKERS": "1",
+            "VITEST_MAX_WORKERS": "4",
+        }
+        env = iso.build_agent_env(
+            {key: "99" for key in policy},
+            policy,
+            [],
+            per_task_creds={key: "99" for key in policy},
+        )
+        self.assertEqual({key: env[key] for key in policy}, policy)
+
+        # Neither a long-lived host environment nor a credential envelope can
+        # author these execution-policy values without the runner injection.
+        untrusted = iso.build_agent_env(
+            {key: "99" for key in policy},
+            {},
+            [],
+            per_task_creds={key: "99" for key in policy},
+        )
+        for key in policy:
+            self.assertNotIn(key, untrusted)
+
 
 # ── bwrap argv builder ────────────────────────────────────────────────────────
 

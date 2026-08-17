@@ -1965,6 +1965,30 @@ def _effective_agent_memory_limit() -> tuple[str, int]:
     return str(effective), effective
 
 
+def _agent_vitest_worker_env(memory_limit_bytes: int) -> dict[str, str]:
+    """Bound Vitest file workers to the enforced aggregate agent memory cap.
+
+    Agent and admin-ui currently span Vitest v2 and v4.  The two releases use
+    different environment-variable names, so publish both contracts.  One
+    worker per 2 GiB leaves room for the agent, npm, kernel/page tables, and the
+    test coordinator; four workers is the supported throughput ceiling even on
+    larger hosts.  The aggregate cgroup remains the final fail-closed boundary.
+    """
+    gib = 1024 * 1024 * 1024
+    workers = max(1, min(4, max(0, int(memory_limit_bytes)) // (2 * gib)))
+    value = str(workers)
+    return {
+        # Vitest <= 2 pool-specific controls.
+        "VITEST_MIN_THREADS": "1",
+        "VITEST_MAX_THREADS": value,
+        "VITEST_MIN_FORKS": "1",
+        "VITEST_MAX_FORKS": value,
+        # Vitest >= 4 unified worker controls.
+        "VITEST_MIN_WORKERS": "1",
+        "VITEST_MAX_WORKERS": value,
+    }
+
+
 def _env_enabled(name: str, default: bool = True) -> bool:
     """Parse a conventional boolean env var without making startup fragile."""
     raw = os.environ.get(name)
@@ -8734,6 +8758,11 @@ def _spawn_agent_task(
     }
     if effective_llm_env:
         injected_env.update(effective_llm_env)
+    # Provider credential material is untrusted for execution-policy knobs.
+    # Apply the task memory-derived worker ceiling after it so every bare
+    # `npx vitest run` inside this agent process tree is bounded on both the
+    # repository's Vitest v2 and v4 packages.
+    injected_env.update(_agent_vitest_worker_env(_mem_limit_bytes))
     # Task identity is authoritative and must not be overridden by provider
     # credential material returned in credentials.env.
     injected_env["BLUEPRINT_PRE_CLAIM_TASK_TYPE"] = task_type
@@ -9138,7 +9167,9 @@ def main() -> None:
     )
     print(
         "[runner] agent process boundary: "
-        f"memory={agent_mem_limit} bytes_reserved={resource_ledger.agent.memory_bytes}",
+        f"memory={agent_mem_limit} bytes_reserved={resource_ledger.agent.memory_bytes} "
+        "vitest_workers="
+        f"{_agent_vitest_worker_env(agent_mem_limit_bytes)['VITEST_MAX_WORKERS']}",
         flush=True,
     )
 

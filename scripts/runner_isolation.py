@@ -215,8 +215,25 @@ _AGENT_IDENTITY_ENV_KEYS: frozenset[str] = frozenset(
         "BLUEPRINT_SANDBOX_PG_BINDIR",
     }
 )
+# Runner-authored execution policy.  These keys are deliberately injected-only:
+# host configuration and server-vended credential envelopes cannot raise the
+# memory-derived worker ceiling chosen by local_runner.
+_AGENT_EXECUTION_POLICY_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "VITEST_MIN_THREADS",
+        "VITEST_MAX_THREADS",
+        "VITEST_MIN_FORKS",
+        "VITEST_MAX_FORKS",
+        "VITEST_MIN_WORKERS",
+        "VITEST_MAX_WORKERS",
+    }
+)
 _AGENT_INJECTED_ENV_ALLOWLIST: frozenset[str] = frozenset(
-    (*AGENT_ENV_ALLOWLIST, *_AGENT_IDENTITY_ENV_KEYS)
+    (
+        *AGENT_ENV_ALLOWLIST,
+        *_AGENT_IDENTITY_ENV_KEYS,
+        *_AGENT_EXECUTION_POLICY_ENV_KEYS,
+    )
 )
 
 # Host env a COMPUTE job may inherit. Deliberately EXCLUDES all provider creds —

@@ -7215,6 +7215,34 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
             "strategic_review",
         )
 
+    def test_agent_memory_cap_authoritatively_bounds_vitest_workers(self):
+        with patch.object(
+            local_runner,
+            "_effective_agent_memory_limit",
+            return_value=(str(8 * 1024**3), 8 * 1024**3),
+        ):
+            r = self._spawn(
+                backend=iso.BACKEND_BWRAP,
+                container_name=None,
+                agent_image=None,
+                agent_binary=["node", "/agent/dist/index.js"],
+                caps=_bwrap_caps(),
+                llm_env={
+                    "VITEST_MAX_THREADS": "99",
+                    "VITEST_MAX_FORKS": "99",
+                    "VITEST_MAX_WORKERS": "99",
+                },
+            )
+
+        _, pkw = r["plan"].call_args
+        injected = pkw["injected_env"]
+        self.assertEqual(injected["VITEST_MIN_THREADS"], "1")
+        self.assertEqual(injected["VITEST_MAX_THREADS"], "4")
+        self.assertEqual(injected["VITEST_MIN_FORKS"], "1")
+        self.assertEqual(injected["VITEST_MAX_FORKS"], "4")
+        self.assertEqual(injected["VITEST_MIN_WORKERS"], "1")
+        self.assertEqual(injected["VITEST_MAX_WORKERS"], "4")
+
     def test_only_server_resident_marker_enables_pre_claim_resident_identity(self):
         r = self._spawn(
             backend=iso.BACKEND_BWRAP,
@@ -11569,6 +11597,24 @@ class TestSharedResourceAdmission(unittest.TestCase):
             limit, limit_bytes = local_runner._effective_agent_memory_limit()
         self.assertEqual(limit, str(8 * gib))
         self.assertEqual(limit_bytes, 8 * gib)
+
+    def test_vitest_worker_limit_scales_with_enforced_agent_memory(self):
+        gib = 1024 ** 3
+        for memory_bytes, expected in (
+            (2 * gib, "1"),
+            (4 * gib, "2"),
+            (6 * gib, "3"),
+            (8 * gib, "4"),
+            (16 * gib, "4"),
+        ):
+            with self.subTest(memory_bytes=memory_bytes):
+                env = local_runner._agent_vitest_worker_env(memory_bytes)
+                self.assertEqual(env["VITEST_MAX_THREADS"], expected)
+                self.assertEqual(env["VITEST_MAX_FORKS"], expected)
+                self.assertEqual(env["VITEST_MAX_WORKERS"], expected)
+                self.assertEqual(env["VITEST_MIN_THREADS"], "1")
+                self.assertEqual(env["VITEST_MIN_FORKS"], "1")
+                self.assertEqual(env["VITEST_MIN_WORKERS"], "1")
 
     def test_eight_gib_host_derives_cap_that_actual_ledger_admits(self):
         gib = 1024 ** 3

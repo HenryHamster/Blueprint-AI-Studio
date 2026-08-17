@@ -878,6 +878,16 @@ function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, stri
     'GOOGLE_GENAI_USE_VERTEXAI',
     'ORCHESTRATOR_URL',
     'TASK_ID',
+    // Runner-authored test execution policy. Shell tools are children of the
+    // provider CLI, not of the agent coordinator directly, so these must cross
+    // this deliberately narrow environment boundary to constrain bare Vitest
+    // invocations issued by Codex/Claude/Gemini.
+    'VITEST_MIN_THREADS',
+    'VITEST_MAX_THREADS',
+    'VITEST_MIN_FORKS',
+    'VITEST_MAX_FORKS',
+    'VITEST_MIN_WORKERS',
+    'VITEST_MAX_WORKERS',
   ]) {
     const v = process.env[key];
     if (v !== undefined) env[key] = v;

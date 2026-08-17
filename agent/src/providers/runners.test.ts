@@ -161,6 +161,35 @@ beforeEach(() => {
   __setCommandExistsOverrideForSmoke(() => true);
 });
 
+describe('provider CLI test-worker policy', () => {
+  const workerPolicy = {
+    VITEST_MIN_THREADS: '1',
+    VITEST_MAX_THREADS: '4',
+    VITEST_MIN_FORKS: '1',
+    VITEST_MAX_FORKS: '4',
+    VITEST_MIN_WORKERS: '1',
+    VITEST_MAX_WORKERS: '4',
+  } as const;
+
+  afterEach(() => {
+    for (const key of Object.keys(workerPolicy)) delete process.env[key];
+  });
+
+  it('passes the runner-authored limits into model-issued shell commands', async () => {
+    Object.assign(process.env, workerPolicy);
+    emitStream([JSON.stringify({ type: 'result', result: 'ok' })]);
+
+    await runProviderAgent('prompt', null, { value: '' });
+
+    const options = vi.mocked(spawn).mock.calls[0]?.[2];
+    expect(options).toBeDefined();
+    const spawnedEnv = options?.env as NodeJS.ProcessEnv;
+    for (const [key, value] of Object.entries(workerPolicy)) {
+      expect(spawnedEnv[key]).toBe(value);
+    }
+  });
+});
+
 describe('isolated receipt-only runner contract', () => {
   it('uses a fresh cwd/env and proves no built-in or MCP tool surface', () => {
     const runner = {
