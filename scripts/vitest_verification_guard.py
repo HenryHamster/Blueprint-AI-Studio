@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
 from testing.fixgate_attribution import (  # noqa: E402
+    JUnitReport,
     classify_verification,
     extract_base,
     parse_junit_report,
@@ -25,11 +26,23 @@ from testing.fixgate_attribution import (  # noqa: E402
 class Suite:
     directory: str
     install_directory: str
+    test_file_prefixes: tuple[str, ...]
+    test_file_suffixes: tuple[str, ...]
 
 
 SUITES = {
-    "agent": Suite(directory="agent", install_directory="agent"),
-    "admin-ui": Suite(directory="admin-ui", install_directory="."),
+    "agent": Suite(
+        directory="agent",
+        install_directory="agent",
+        test_file_prefixes=("src/",),
+        test_file_suffixes=(".test.ts",),
+    ),
+    "admin-ui": Suite(
+        directory="admin-ui",
+        install_directory=".",
+        test_file_prefixes=("src/", "eslint-rules/"),
+        test_file_suffixes=(".test.ts", ".test.tsx", ".test.js"),
+    ),
 }
 
 _EXECUTION_REPORT_ROUTE = "blueprint.vitest.execution"
@@ -54,23 +67,87 @@ def _base_ref(repo: Path, base: str) -> str:
     raise RuntimeError(f"cannot resolve base ref origin/{base} or {base}")
 
 
+def _changed_files(repo: Path, base_ref: str) -> list[str]:
+    """Return committed, working-tree, and untracked paths in the task diff."""
+
+    commands = (
+        ("diff", "--name-only", f"{base_ref}...HEAD"),
+        ("diff", "--name-only", "HEAD"),
+        ("ls-files", "--others", "--exclude-standard"),
+    )
+    changed: set[str] = set()
+    for command in commands:
+        result = _git(repo, *command)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"cannot compute changed files with git {' '.join(command)}"
+            )
+        changed.update(path for path in result.stdout.splitlines() if path)
+    return sorted(changed)
+
+
+def _is_suite_test_file(path: str, suite: Suite) -> bool:
+    """Return whether a repo-relative path belongs to this suite's Vitest roster."""
+
+    normalized = path.replace("\\", "/").strip("/")
+    prefix = f"{suite.directory}/"
+    if not normalized.startswith(prefix):
+        return False
+    relative = normalized[len(prefix) :]
+    return any(relative.startswith(directory) for directory in suite.test_file_prefixes) and any(
+        relative.endswith(suffix) for suffix in suite.test_file_suffixes
+    )
+
+
+def _changed_test_files(repo: Path, base_ref: str, suite: Suite) -> list[str]:
+    """Return changed repo-relative test files selected by this suite's config."""
+
+    return [path for path in _changed_files(repo, base_ref) if _is_suite_test_file(path, suite)]
+
+
+def _base_file_selectors(
+    paths: list[str], suite: Suite, base_root: Path
+) -> list[str]:
+    """Return suite-relative selectors for changed or failed files present in base."""
+
+    selectors: set[str] = set()
+    prefix = f"{suite.directory}/"
+    for path in paths:
+        normalized = path.replace("\\", "/").strip("/")
+        if not normalized.startswith(prefix):
+            normalized = f"{prefix}{normalized}"
+        if not _is_suite_test_file(normalized, suite):
+            continue
+        relative = normalized[len(prefix) :]
+        if (base_root / normalized).is_file():
+            selectors.add(relative)
+    return sorted(selectors)
+
+
 def _tail(output: str, *, lines: int = 80) -> str:
     return "\n".join(output.splitlines()[-lines:])
 
 
 def _run_vitest(
-    root: Path, suite: Suite, report: Path, execution_report: Path
+    root: Path,
+    suite: Suite,
+    report: Path,
+    execution_report: Path,
+    selectors: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    command = ["npx", "vitest", "run"]
+    if selectors:
+        command.extend(selectors)
+    command.extend(
         [
-            "npx",
-            "vitest",
-            "run",
             "--reporter=default",
             "--reporter=junit",
             f"--reporter={REPO_ROOT / 'scripts' / 'vitest_execution_reporter.mjs'}",
             f"--outputFile.junit={report}",
-        ],
+        ]
+    )
+    return subprocess.run(
+        command,
         cwd=root / suite.directory,
         env={
             **os.environ,
@@ -160,13 +237,23 @@ def main(argv: list[str] | None = None) -> int:
                 current_failure_count=len(current_report.failures),
             )
 
-        # A clean current run needs no differential attribution. Avoid the
-        # expensive base archive, dependency install, and second Vitest run.
-        if (
+        current_is_clean = (
             current.returncode == 0
             and not current_report.failures
             and not current_execution_error
-        ):
+        )
+        try:
+            base_ref = _base_ref(repo, args.base)
+            changed_test_files = (
+                _changed_test_files(repo, base_ref, suite) if current_is_clean else []
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            return _blocking("baseline_unavailable", error=str(exc))
+
+        # A clean current run with no changed test file cannot have made a
+        # baseline failure disappear or become skipped. Keep this cheap path,
+        # but only after proving the suite's test-file diff is empty.
+        if current_is_clean and not changed_test_files:
             outcome = classify_verification(
                 runtime_available=True,
                 current_exit_code=current.returncode,
@@ -181,38 +268,72 @@ def main(argv: list[str] | None = None) -> int:
         try:
             base_root = temp / "base"
             base_root.mkdir()
-            base_ref = _base_ref(repo, args.base)
             extract_base(repo, base_ref, base_root)
-            install = _install_base(base_root, suite)
-            _print_result(f"{args.suite} baseline install", install)
-            if install.returncode != 0:
-                return _blocking("baseline_unavailable", base_install_exit_code=install.returncode)
+            if current_is_clean:
+                base_selectors = _base_file_selectors(
+                    changed_test_files, suite, base_root
+                )
+            else:
+                failed_file_paths = [
+                    selector.split("::", 1)[0]
+                    for selector in current_report.selectors.values()
+                ]
+                base_selectors = (
+                    _base_file_selectors(failed_file_paths, suite, base_root)
+                    if current_report.selectors
+                    else None
+                )
             baseline_junit = temp / "baseline.xml"
             baseline_execution_junit = temp / "baseline-execution.xml"
-            baseline = _run_vitest(
-                base_root, suite, baseline_junit, baseline_execution_junit
-            )
-            _print_result(f"{args.suite} baseline", baseline)
-            baseline_report = parse_junit_report(
-                baseline_junit, tree_root=base_root, label="baseline"
-            )
-            baseline_execution_error = _execution_errors(
-                parse_junit_report(
-                    baseline_execution_junit,
-                    tree_root=base_root,
-                    label="baseline execution",
+            if base_selectors is not None and not base_selectors:
+                # Every changed test file is new in the candidate tree. There
+                # is no base-side test to execute, so an empty report is the
+                # complete baseline evidence and npm ci is unnecessary.
+                print(
+                    "[vitest-verification] baseline skipped: no changed suite test files exist in base"
                 )
-            )
-            if baseline_execution_error:
-                return _blocking("baseline_execution_failure", base_exit_code=baseline.returncode)
-            if not _valid_exit_report_pair(
-                baseline.returncode, baseline_report.failures
-            ):
-                return _blocking(
-                    "baseline_unavailable",
-                    base_exit_code=baseline.returncode,
-                    base_failure_count=len(baseline_report.failures),
+                baseline_report = JUnitReport()
+                baseline_execution_error = False
+            else:
+                install = _install_base(base_root, suite)
+                _print_result(f"{args.suite} baseline install", install)
+                if install.returncode != 0:
+                    return _blocking(
+                        "baseline_unavailable", base_install_exit_code=install.returncode
+                    )
+                if base_selectors is None:
+                    baseline = _run_vitest(
+                        base_root, suite, baseline_junit, baseline_execution_junit
+                    )
+                else:
+                    baseline = _run_vitest(
+                        base_root,
+                        suite,
+                        baseline_junit,
+                        baseline_execution_junit,
+                        selectors=base_selectors,
+                    )
+                _print_result(f"{args.suite} baseline", baseline)
+                baseline_report = parse_junit_report(
+                    baseline_junit, tree_root=base_root, label="baseline"
                 )
+                baseline_execution_error = _execution_errors(
+                    parse_junit_report(
+                        baseline_execution_junit,
+                        tree_root=base_root,
+                        label="baseline execution",
+                    )
+                )
+                if baseline_execution_error:
+                    return _blocking("baseline_execution_failure", base_exit_code=baseline.returncode)
+                if not _valid_exit_report_pair(
+                    baseline.returncode, baseline_report.failures
+                ):
+                    return _blocking(
+                        "baseline_unavailable",
+                        base_exit_code=baseline.returncode,
+                        base_failure_count=len(baseline_report.failures),
+                    )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             return _blocking("baseline_unavailable", error=str(exc))
 

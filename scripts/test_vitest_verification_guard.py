@@ -130,7 +130,7 @@ def test_guard_clean_current_skips_every_baseline_step(
     capsys: pytest.CaptureFixture[str],
     suite: str,
 ) -> None:
-    """A fully clean current run never resolves, extracts, installs, or runs base."""
+    """A clean run with no changed suite test file keeps the cheap skip."""
 
     runs: list[Path] = []
 
@@ -145,7 +145,8 @@ def test_guard_clean_current_skips_every_baseline_step(
         pytest.fail("clean current run must not prepare or execute a baseline")
 
     monkeypatch.setattr(guard, "_run_vitest", fake_run)
-    monkeypatch.setattr(guard, "_base_ref", unexpected_baseline)
+    monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_changed_test_files", lambda *_: [])
     monkeypatch.setattr(guard, "extract_base", unexpected_baseline)
     monkeypatch.setattr(guard, "_install_base", unexpected_baseline)
     monkeypatch.setattr(
@@ -161,6 +162,232 @@ def test_guard_clean_current_skips_every_baseline_step(
     assert guard.main(["--suite", suite, "--repo-root", str(tmp_path)]) == 0
     assert runs == [tmp_path]
     assert "PASS state=passed" in capsys.readouterr().out
+
+
+def _set_up_clean_changed_test_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    suite_name: str,
+    baseline_report: JUnitReport,
+    *,
+    current_report: JUnitReport | None = None,
+) -> list[tuple[Path, list[str] | None]]:
+    """Stub the two Vitest runs while preserving selector and attribution logic."""
+
+    suite = guard.SUITES[suite_name]
+    calls: list[tuple[Path, list[str] | None]] = []
+    current_report = current_report or JUnitReport(
+        test_routes={"src/example.test.ts::passes"}
+    )
+
+    def fake_run(
+        root: Path,
+        _: guard.Suite,
+        report: Path,
+        __: Path,
+        selectors: list[str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((root, selectors))
+        exit_code = 0 if report.name == "current.xml" else 1
+        return subprocess.CompletedProcess([], exit_code, stdout="", stderr="")
+
+    def fake_extract(_: Path, __: str, destination: Path) -> None:
+        test_file = destination / suite.directory / "src" / "example.test.ts"
+        test_file.parent.mkdir(parents=True)
+        test_file.touch()
+
+    monkeypatch.setattr(guard, "_run_vitest", fake_run)
+    monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(
+        guard,
+        "_changed_test_files",
+        lambda *_: [f"{suite.directory}/src/example.test.ts"],
+    )
+    monkeypatch.setattr(guard, "extract_base", fake_extract)
+    monkeypatch.setattr(guard, "_install_base", lambda *_: subprocess.CompletedProcess([], 0))
+
+    def fake_report(path: Path, **_: object) -> JUnitReport:
+        if path.name.endswith("execution.xml"):
+            return _clean_execution_report()
+        return current_report if path.name == "current.xml" else baseline_report
+
+    monkeypatch.setattr(guard, "parse_junit_report", fake_report)
+    return calls
+
+
+@pytest.mark.parametrize("suite", ["agent", "admin-ui"])
+def test_guard_blocks_a_vanished_baseline_failure_when_a_suite_test_file_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    suite: str,
+) -> None:
+    """A clean current run cannot erase a failing changed base test."""
+
+    baseline = _named_failure_report("inherited failure")
+    calls = _set_up_clean_changed_test_run(monkeypatch, tmp_path, suite, baseline)
+
+    assert guard.main(["--suite", suite, "--repo-root", str(tmp_path)]) == 1
+    assert calls[0] == (tmp_path, None)
+    assert calls[1][1] == ["src/example.test.ts"]
+    assert "FAILED state=baseline_failure_disappeared" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("suite", ["agent", "admin-ui"])
+def test_guard_blocks_a_skipped_baseline_failure_when_a_suite_test_file_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    suite: str,
+) -> None:
+    """A clean current run cannot skip a failing changed base test."""
+
+    route = "src/example.test.ts::fails"
+    baseline = _named_failure_report("inherited failure")
+    current = JUnitReport(test_routes={route}, skipped_routes={route})
+    calls = _set_up_clean_changed_test_run(
+        monkeypatch, tmp_path, suite, baseline, current_report=current
+    )
+
+    assert guard.main(["--suite", suite, "--repo-root", str(tmp_path)]) == 1
+    assert calls[1][1] == ["src/example.test.ts"]
+    assert "FAILED state=baseline_failure_skipped" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("suite", ["agent", "admin-ui"])
+def test_guard_clean_current_with_only_non_test_changes_skips_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    suite: str,
+) -> None:
+    """A source-only suite diff cannot make a baseline test disappear."""
+
+    runs: list[Path] = []
+
+    def fake_run(
+        root: Path, _: guard.Suite, __: Path, ___: Path
+    ) -> subprocess.CompletedProcess[str]:
+        runs.append(root)
+        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(guard, "_run_vitest", fake_run)
+    monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(
+        guard,
+        "_changed_files",
+        lambda *_: [f"{suite}/src/example.ts", f"{suite}/README.md"],
+    )
+    monkeypatch.setattr(
+        guard,
+        "parse_junit_report",
+        lambda path, **_: _clean_execution_report()
+        if path.name.endswith("execution.xml")
+        else JUnitReport(test_routes={"src/example.test.ts::passes"}),
+    )
+
+    assert guard.main(["--suite", suite, "--repo-root", str(tmp_path)]) == 0
+    assert runs == [tmp_path]
+    assert "PASS state=passed" in capsys.readouterr().out
+
+
+def test_guard_clean_new_suite_test_without_base_counterpart_uses_empty_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A newly added test has no base selector and needs no base install."""
+
+    runs: list[Path] = []
+
+    def fake_run(
+        root: Path, _: guard.Suite, __: Path, ___: Path
+    ) -> subprocess.CompletedProcess[str]:
+        runs.append(root)
+        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    def unexpected_install(*_: object, **__: object) -> None:
+        pytest.fail("a new-only test file must not install base dependencies")
+
+    monkeypatch.setattr(guard, "_run_vitest", fake_run)
+    monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(
+        guard,
+        "_changed_test_files",
+        lambda *_: ["agent/src/new.test.ts"],
+    )
+    monkeypatch.setattr(guard, "extract_base", lambda *_: None)
+    monkeypatch.setattr(guard, "_install_base", unexpected_install)
+    monkeypatch.setattr(
+        guard,
+        "parse_junit_report",
+        lambda path, **_: _clean_execution_report()
+        if path.name.endswith("execution.xml")
+        else JUnitReport(test_routes={"src/new.test.ts::passes"}),
+    )
+
+    assert guard.main(["--suite", "agent", "--repo-root", str(tmp_path)]) == 0
+    assert runs == [tmp_path]
+    assert "PASS state=passed" in capsys.readouterr().out
+
+
+def test_changed_suite_test_files_union_all_diff_sources_and_filter_rosters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Committed, working-tree, and untracked paths all feed suite filtering."""
+
+    def fake_git(_: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ("diff", "--name-only") and args[2].endswith("...HEAD"):
+            output = "agent/src/committed.test.ts\nadmin-ui/src/admin.test.tsx\n"
+        elif args[:2] == ("diff", "--name-only"):
+            output = "agent/src/working.test.ts\nagent/src/working.ts\n"
+        else:
+            output = "agent/src/untracked.test.ts\nagent/src/ignored.test.js\n"
+        return subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(guard, "_git", fake_git)
+
+    assert guard._changed_test_files(
+        tmp_path, "origin/automain", guard.SUITES["agent"]
+    ) == [
+        "agent/src/committed.test.ts",
+        "agent/src/untracked.test.ts",
+        "agent/src/working.test.ts",
+    ]
+    assert guard._changed_test_files(
+        tmp_path, "origin/automain", guard.SUITES["admin-ui"]
+    ) == ["admin-ui/src/admin.test.tsx"]
+
+
+def test_run_vitest_passes_base_file_selectors_to_vitest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The base arm scopes Vitest by file without changing its reporters."""
+
+    captured: dict[str, object] = {}
+
+    def fake_subprocess_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_subprocess_run)
+    report = tmp_path / "baseline.xml"
+    execution_report = tmp_path / "baseline-execution.xml"
+
+    guard._run_vitest(
+        tmp_path,
+        guard.SUITES["agent"],
+        report,
+        execution_report,
+        selectors=["src/example.test.ts"],
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[:4] == ["npx", "vitest", "run", "src/example.test.ts"]
+    assert f"--outputFile.junit={report}" in command
+    assert captured["cwd"] == tmp_path / "agent"
 
 
 @pytest.mark.parametrize(
