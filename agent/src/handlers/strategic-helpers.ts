@@ -77,11 +77,10 @@ function renderStrategicSchemaCase(): string {
       example: input.example ?? {},
       notes: input.notes ?? [],
     });
-    // JSON.stringify produces no single quotes for our checked-in contracts;
-    // shellEscape is still used so a future description/example cannot turn
-    // the generated help into executable shell.
-    const quoted = schema.replace(/'/g, "'\\\"'\\\"'");
-    return `  ${entry.alias}) printf '%s\\n' '${quoted}' ;;`;
+    // Contract text may contain single quotes (e.g. possessives in notes);
+    // shellSingleQuote keeps the printf argument a single inert string so no
+    // contract content can turn the generated help into executable shell.
+    return `  ${entry.alias}) printf '%s\\n' ${shellSingleQuote(schema)} ;;`;
   }).join('\n');
 }
 
