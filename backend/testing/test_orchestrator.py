@@ -5954,6 +5954,127 @@ class TestProjectConcurrencyCap(_OrchDispatchCycleHarness):
         )
 
     @pytest.mark.asyncio
+    async def test_resident_session_excluded_from_project_task_cap(
+        self, orch_cap_db, mocker
+    ):
+        """Same starvation class as the VM-slot fix, one level up: a resident
+        session (``context["_resident_session"] is True``) must not count
+        toward the per-project task cap (``max_concurrent_tasks_by_project``)
+        either. A project at cap=2 with one resident-session active task
+        (excluded) and one normal active task (counted, so the real active
+        count is 1 < cap 2) still dispatches its QUEUED candidate — the
+        resident session must not occupy a "slot" here any more than it does
+        for the VM-slot cap fixed above.
+        """
+        from sqlmodel import select as _select
+        from app.max_plan_pool import LLMSelectionResult
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-sonnet-4-6",
+                quality_tier=None,
+                account={
+                    "id": "acct-cap-test-resident",
+                    "name": "Cap Test Resident Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        import app.orchestrator as _orch_module
+
+        # 2 global slots; only the 1 normal active task counts against them
+        # (the resident session is excluded from the GCE budget too — see
+        # _gce_active_count) so 1 free slot remains for the queued candidate.
+        _orch_module._runtime_config["max_concurrent_vms"] = 2
+        _orch_module._runtime_config["warm_pool_enabled"] = False
+
+        project_id = None
+        queued_id = None
+
+        async with orch_cap_db() as session:
+            project = make_project(name="ResidentCapProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+            project_id = project.id
+
+            # Resident-session task: active, but must NOT count toward the cap.
+            resident_active = make_task(
+                project_id=project.id,
+                status=TaskStatus.IN_PROGRESS,
+                payloads=[{"type": "strategic_review", "prompt": "resident"}],
+                context={"_resident_session": True},
+            )
+            # One ordinary active task — DOES count toward the cap.
+            normal_active = make_task(
+                project_id=project.id,
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id="vm-already-running",
+                payloads=[{"type": "create", "prompt": "active work"}],
+            )
+            # QUEUED candidate — must dispatch: real active count (1) < cap (2).
+            queued = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "create", "prompt": "should dispatch"}],
+                context={},
+            )
+            session.add(resident_active)
+            session.add(normal_active)
+            session.add(queued)
+            await session.commit()
+            await session.refresh(queued)
+            queued_id = queued.id
+
+        # Configure the per-project task cap at 2.
+        _orch_module._runtime_config["max_concurrent_tasks_by_project"] = {
+            str(project_id): 2,
+        }
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_tasks_by_project", None)
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_cap_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == queued_id)))
+                .scalars()
+                .first()
+            )
+
+        assert row is not None
+        assert row.status == TaskStatus.PROVISIONING, (
+            "Resident-session task must not count toward "
+            f"max_concurrent_tasks_by_project — queued candidate should have "
+            f"dispatched, got {row.status}"
+        )
+
+    @pytest.mark.asyncio
     async def test_unset_cap_leaves_dispatch_unchanged(self, orch_cap_db, mocker):
         """When no per-project cap is configured the dispatch result is identical
         to today's behavior: every eligible QUEUED task may dispatch normally."""
@@ -10074,6 +10195,196 @@ class TestWarmVMSkipProvision:
             assert capped_row.status == TaskStatus.QUEUED
             assert "project VM capacity" in (capped_row.latest_status_message or "")
             assert open_row.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_resident_session_task_excluded_from_project_vm_cap(
+        self, orch_warm_db, mocker
+    ):
+        """VM-slot self-starvation regression guard: a strategic resident
+        session (``context["_resident_session"] is True``) runs on the local
+        hamsterwheel runner, consumes zero VM slots, and is effectively
+        unbounded in duration. It must NOT count toward the project's VM cap
+        (``resource_envelope.max_concurrent_vms``) — before this fix it did,
+        so a single long-running resident session filled the cap and starved
+        every other queued task in the project (observed in production: 6
+        queued tasks starved, including the strategist's own diagnostic
+        task). Same shape as test_project_vm_cap_defers_only_capped_project
+        but the active task is flagged as a resident session; the sibling
+        QUEUED task must dispatch anyway."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 2
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Resident Session Project",
+                    user_id=_TEST_USER,
+                    build_config={"resource_envelope": {"max_concurrent_vms": 1}},
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                now = self._naive_utcnow()
+                # Long-running resident session — occupies IN_PROGRESS but is
+                # flagged, so it must be excluded from the project's VM-slot
+                # accounting.
+                session.add(
+                    make_task(
+                        project_id=project.id,
+                        status=TaskStatus.IN_PROGRESS,
+                        payloads=[
+                            {"type": "strategic_review", "prompt": "resident"}
+                        ],
+                        context={"_resident_session": True},
+                        created_at=now - timedelta(minutes=10),
+                    )
+                )
+                queued = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "should dispatch"}],
+                    context={},
+                    created_at=now - timedelta(minutes=5),
+                )
+                session.add(queued)
+                await session.commit()
+                await session.refresh(queued)
+                queued_id = queued.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == queued_id)))
+                .scalars()
+                .one()
+            )
+            assert row.status == TaskStatus.PROVISIONING, (
+                "Resident-session task must not count toward the project VM "
+                f"cap — queued sibling should have dispatched, got {row.status} "
+                f"(message={row.latest_status_message!r})"
+            )
+
+    @pytest.mark.asyncio
+    async def test_normal_active_task_still_counts_toward_project_vm_cap(
+        self, orch_warm_db, mocker
+    ):
+        """Regression guard for the resident-session VM-cap exclusion: an
+        ordinary active task (no ``_resident_session`` flag) must still count
+        toward the project's VM cap — the exclusion must be narrowly scoped
+        to resident sessions, not accidentally widened to every active task.
+        Identical setup to
+        test_resident_session_task_excluded_from_project_vm_cap except the
+        active task carries a plain context; the sibling QUEUED task must
+        stay QUEUED, deferred by the still-enforced cap."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 2
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Normal Active Task Project",
+                    user_id=_TEST_USER,
+                    build_config={"resource_envelope": {"max_concurrent_vms": 1}},
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                now = self._naive_utcnow()
+                # Ordinary active task — no resident-session flag — must
+                # still fill the project's VM cap.
+                session.add(
+                    make_task(
+                        project_id=project.id,
+                        status=TaskStatus.IN_PROGRESS,
+                        payloads=[{"type": "fix", "prompt": "active"}],
+                        context={},
+                        created_at=now - timedelta(minutes=10),
+                    )
+                )
+                queued = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "should stay queued"}],
+                    context={},
+                    created_at=now - timedelta(minutes=5),
+                )
+                session.add(queued)
+                await session.commit()
+                await session.refresh(queued)
+                queued_id = queued.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == queued_id)))
+                .scalars()
+                .one()
+            )
+            assert row.status == TaskStatus.QUEUED, (
+                "A normal active task must still count toward the project VM "
+                f"cap — queued sibling should have stayed QUEUED, got {row.status}"
+            )
+            assert "project VM capacity" in (row.latest_status_message or "")
 
     @pytest.mark.asyncio
     async def test_project_spend_ceiling_defers_dispatch(self, orch_warm_db, mocker):
