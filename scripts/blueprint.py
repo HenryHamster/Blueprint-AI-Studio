@@ -1981,6 +1981,36 @@ def _render_zones(data: dict) -> None:
 
 
 def _system_autonomy(args: argparse.Namespace) -> None:
+    enable = getattr(args, "enable", False)
+    disable = getattr(args, "disable", False)
+    if enable or disable:
+        if enable and disable:
+            print("ERROR: --enable and --disable are mutually exclusive.",
+                  file=sys.stderr)
+            sys.exit(1)
+        cfg = load_config()
+        if cfg.get("read_only"):
+            print(
+                "ERROR: toggling autonomy is a mutating action but the resolved "
+                "config is read-only (agent-JWT fallback). Provide an admin API "
+                "key (BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        pid = get_project_id(getattr(args, "project_id", None))
+        target = bool(enable)
+        if not _confirm(
+            f"Set autonomous_enabled={target} on project {pid}?",
+            getattr(args, "yes", False),
+        ):
+            print("Aborted.")
+            return
+        result = api("PATCH", f"/api/admin/projects/{pid}",
+                     {"autonomous_enabled": target})
+        _emit(args, result, lambda r: print(
+            f"autonomous_enabled={r.get('autonomous_enabled', target)} "
+            f"on project {pid}"))
+        return
     data, err = _safe_read("/api/admin/autonomous-status")
     result = {"projects": (data or {}).get("projects", []), "error": err}
     _emit(args, result, _render_autonomy)
@@ -2127,6 +2157,8 @@ def cmd_directions(args: argparse.Namespace) -> None:
         _directions_cancel(args)
     elif sub == "unhold":
         _directions_unhold(args)
+    elif sub == "resolve-discovery":
+        _directions_resolve_discovery(args)
     else:
         _directions_list(args)
 
@@ -2529,6 +2561,77 @@ def _directions_unhold(args: argparse.Namespace) -> None:
     _emit(args, result, lambda r: print(
         f"Unheld {did} (was_held={was_held})"
         if was_held else f"Direction {did} was not held (idempotent)"
+    ))
+
+
+_NEXT_BET_FIELDS = {
+    "mode": "bet_mode",
+    "claim": "bet_claim",
+    "decision_question": "bet_question",
+    "success_evidence": "bet_success",
+    "retirement_condition": "bet_retirement",
+}
+
+
+def _directions_resolve_discovery(args: argparse.Namespace) -> None:
+    """Resolve an ask_operator/reviewed discovery cycle from the CLI."""
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'resolve-discovery' is a mutating action but the resolved "
+            "config is read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    pid = get_project_id(getattr(args, "project_id", None))
+    d = _resolve_direction(args, args.direction_id)
+    did = d["id"]
+    action = args.action
+    bet_values = {key: getattr(args, attr, None)
+                  for key, attr in _NEXT_BET_FIELDS.items()}
+    provided = [k for k, v in bet_values.items() if v]
+    if action == "continue":
+        missing = [k for k, v in bet_values.items() if not v]
+        if missing:
+            print(
+                "ERROR: continue requires the full next-bet contract; missing: "
+                + ", ".join(f"--{_NEXT_BET_FIELDS[k].replace('_', '-')}"
+                            for k in missing),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        next_bet = bet_values
+    else:
+        if provided:
+            print(f"ERROR: {action} must not include next-bet fields.",
+                  file=sys.stderr)
+            sys.exit(1)
+        next_bet = None
+    payload = {
+        "cycle_id": args.cycle_id,
+        "cycle_revision": args.cycle_revision,
+        "action": action,
+    }
+    if next_bet is not None:
+        payload["next_bet"] = next_bet
+    if getattr(args, "note", None):
+        payload["note"] = args.note
+    if not _confirm(
+        f"Resolve discovery cycle {args.cycle_id} on {did} with '{action}'?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+    result = api(
+        "POST",
+        f"/api/admin/projects/{pid}/directions/{did}/discovery-resolution",
+        payload,
+    )
+    _emit(args, result, lambda r: print(
+        f"Resolved cycle {args.cycle_id} on {did}: action={action}"
+        + (f", successor cycle {r.get('next_cycle_id')}"
+           if r.get("next_cycle_id") else "")
     ))
 
 
@@ -6320,8 +6423,15 @@ def build_parser() -> argparse.ArgumentParser:
                                           help="Restart orchestrator background loops (confirms).")
     p_sys_restart.add_argument("--yes", action="store_true", help="Skip confirmation.")
     system_sub.add_parser("zones", parents=[common], help="Show zone health.")
-    system_sub.add_parser("autonomy", parents=[common],
-                          help="Show autonomous research state per project.")
+    p_sys_autonomy = system_sub.add_parser(
+        "autonomy", parents=[common],
+        help="Show autonomous research state per project, or toggle it "
+             "for the selected project with --enable/--disable.")
+    p_sys_autonomy.add_argument("--enable", action="store_true",
+                                help="Set autonomous_enabled=true on the selected project (confirms).")
+    p_sys_autonomy.add_argument("--disable", action="store_true",
+                                help="Set autonomous_enabled=false on the selected project (confirms).")
+    p_sys_autonomy.add_argument("--yes", action="store_true", help="Skip confirmation.")
 
     # monitor
     p_monitor = sub.add_parser(
@@ -6420,6 +6530,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_dirs_unhold.add_argument("direction_id", help="Direction id or prefix.")
     p_dirs_unhold.add_argument("--yes", action="store_true",
                                help="Skip the confirmation prompt.")
+
+    p_dirs_resolve = dirs_sub.add_parser(
+        "resolve-discovery", parents=[common],
+        help="Resolve an ask_operator discovery cycle: continue with a "
+             "bounded next bet, park, or close (confirms before posting).")
+    p_dirs_resolve.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_resolve.add_argument("--cycle-id", required=True,
+                                help="Discovery cycle UUID (from tasks autonomy-debug).")
+    p_dirs_resolve.add_argument("--cycle-revision", type=int, required=True,
+                                help="Current cycle revision (optimistic-lock token).")
+    p_dirs_resolve.add_argument("--action", required=True,
+                                choices=["continue", "park", "close"],
+                                help="Operator disposition for the cycle.")
+    p_dirs_resolve.add_argument("--bet-mode",
+                                choices=["research", "measure", "build"],
+                                help="continue only: next bet mode.")
+    p_dirs_resolve.add_argument("--bet-claim",
+                                help="continue only: the claim the bet tests.")
+    p_dirs_resolve.add_argument("--bet-question",
+                                help="continue only: the decision question.")
+    p_dirs_resolve.add_argument("--bet-success",
+                                help="continue only: observable success evidence.")
+    p_dirs_resolve.add_argument("--bet-retirement",
+                                help="continue only: retirement condition.")
+    p_dirs_resolve.add_argument("--note", help="Optional operator note (2000 chars max).")
+    p_dirs_resolve.add_argument("--yes", action="store_true",
+                                help="Skip the confirmation prompt.")
 
     p_dirs_retarget = dirs_sub.add_parser("retarget", parents=[common],
                                           help="Retarget a staged direction.")
@@ -7286,10 +7423,20 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
 
 def _gh(*gh_args: str) -> str:
-    """Run gh and return stdout, mapping failure to APIError for main()."""
-    proc = subprocess.run(
-        ["gh", *gh_args], capture_output=True, text=True, check=False
-    )
+    """Run gh and return stdout, mapping failure to APIError for main().
+
+    gh emits UTF-8 regardless of platform; without an explicit encoding,
+    Windows decodes with cp1252 and a multi-byte response byte kills the
+    subprocess reader thread, silently yielding stdout=None on rc=0.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", *gh_args], capture_output=True, check=False,
+            encoding="utf-8", errors="replace", timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"ERROR: gh {' '.join(gh_args[:3])}... timed out after 120s")
+        raise APIError("gh command timed out")
     if proc.returncode != 0:
         print(f"ERROR: gh {' '.join(gh_args[:3])}... failed: {proc.stderr.strip()[:400]}")
         raise APIError(proc.stderr.strip()[:400])
