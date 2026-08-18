@@ -29,6 +29,8 @@ def test_manifest_declares_pinned_receipt_toolchain_and_pg_trgm():
         "mypy": "1.20.2",
         "pytest": "7.4.4",
         "pgserver-search": "0.1.6",
+        "alembic": "1.18.5",
+        "sqlalchemy": "2.0.51",
     }
     assert "pg_trgm" in manifest["postgres"]["required_extensions"]
     assert all(re.match(r"^backend/alembic/versions/\d+_.+\.py$", path)
@@ -64,4 +66,4 @@ def test_provisioner_rejects_an_incomplete_manifest_loudly(tmp_path):
     )
     assert result.returncode == 2
     assert "VERIFICATION_TOOLCHAIN_INVALID" in result.stderr
-    assert "ruff, mypy, pytest, and pgserver-search must be pinned" in result.stderr
+    assert "ruff, mypy, pytest, pgserver-search, and alembic must be pinned" in result.stderr

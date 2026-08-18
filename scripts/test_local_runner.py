@@ -161,6 +161,13 @@ class TestVerificationToolchain(unittest.TestCase):
             (venv / "bin").mkdir(parents=True)
             (venv / "bin" / "python").touch()
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if len(argv) == 2 and argv[1] == "--version":
+            # Console-script execution check (pytest/ruff/mypy/alembic --version)
+            # run by absolute path against whatever venv the caller resolved —
+            # the regression trap for a staged-refresh rename leaving a dead
+            # shebang behind. The mock doesn't create these files on disk, so
+            # this only proves the orchestration invokes them by absolute path.
+            return subprocess.CompletedProcess(argv, 0, "1.0.0\n", "")
         if len(argv) > 2 and argv[1] == "-c":
             venv = Path(argv[0]).parent.parent
             bindir = venv / "lib" / "pgserver" / "bin"
@@ -249,6 +256,81 @@ class TestVerificationToolchain(unittest.TestCase):
                  ):
                 self.assertIsNone(local_runner._bootstrap_verification_toolchain())
             self.assertEqual(sentinel.read_text(), "preserve me")
+
+    def test_relink_console_script_shebangs_repairs_dead_staging_path(self):
+        """Regression test for the shebang bug: pip bakes the venv it was built
+        at into every console script's shebang; a plain os.replace() of a
+        staged venv onto its final path leaves those shebangs pointing at a
+        now-deleted directory. Only symlinked interpreters (python3 -> system
+        python) and binary entry points (no ``#!``) survive untouched; text
+        console scripts must be rewritten to the final path in place."""
+        with tempfile.TemporaryDirectory() as root:
+            old_venv = Path(root, "stage", "venv")
+            new_venv = Path(root, "venv")
+            (old_venv / "bin").mkdir(parents=True)
+            (new_venv / "bin").mkdir(parents=True)
+
+            console_script = new_venv / "bin" / "pytest"
+            console_script.write_text(
+                f"#!{old_venv}/bin/python3\n"
+                "# -*- coding: utf-8 -*-\nimport sys\nfrom pytest import console_main\n"
+                "sys.exit(console_main())\n"
+            )
+            console_script.chmod(0o755)
+
+            binary_entry_point = new_venv / "bin" / "ruff"
+            binary_entry_point.write_bytes(b"\x7fELF" + b"\x00" * 12)
+            binary_entry_point.chmod(0o755)
+
+            real_interpreter = old_venv / "bin" / "python3.11"
+            real_interpreter.touch()
+            python_symlink = new_venv / "bin" / "python3"
+            os.symlink(str(real_interpreter), str(python_symlink))
+
+            local_runner._relink_console_script_shebangs(str(old_venv), str(new_venv))
+
+            rewritten_lines = console_script.read_text().splitlines()
+            self.assertEqual(rewritten_lines[0], f"#!{new_venv}/bin/python3")
+            self.assertIn("sys.exit(console_main())", rewritten_lines)
+            self.assertEqual(binary_entry_point.read_bytes(), b"\x7fELF" + b"\x00" * 12)
+            self.assertTrue(python_symlink.is_symlink())
+            self.assertEqual(os.readlink(str(python_symlink)), str(real_interpreter))
+            self.assertTrue(os.access(str(console_script), os.X_OK))
+
+    def test_full_refresh_relinks_console_scripts_to_final_path(self):
+        """End-to-end: after a real staged-refresh (provision at a temp
+        ``.refresh-*`` path, then atomic move onto ``root/venv``), a console
+        script written by the (mocked) provisioner must be executable by its
+        FINAL absolute path — not just importable via ``python -m``."""
+        with tempfile.TemporaryDirectory() as root:
+            sources = self._sources(root)
+
+            def provisioner_with_console_script(argv, **kwargs):
+                if argv[0] == "bash" and "--verify" not in argv:
+                    venv = Path(argv[-1])
+                    (venv / "bin").mkdir(parents=True)
+                    (venv / "bin" / "python").touch()
+                    pytest_script = venv / "bin" / "pytest"
+                    pytest_script.write_text(
+                        f"#!{venv}/bin/python3\nimport sys\n"
+                        "from pytest import console_main\nsys.exit(console_main())\n"
+                    )
+                    pytest_script.chmod(0o755)
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return self._successful_provisioner(argv, **kwargs)
+
+            with patch.object(local_runner, "_verification_toolchain_root", return_value=root), \
+                 patch.object(local_runner, "_verification_toolchain_sources", return_value=sources), \
+                 patch.object(local_runner.subprocess, "run", side_effect=provisioner_with_console_script):
+                toolchain = local_runner._bootstrap_verification_toolchain()
+
+            final_venv = Path(root, "venv")
+            self.assertEqual(toolchain.python_path, str(final_venv / "bin" / "python"))
+            final_pytest = final_venv / "bin" / "pytest"
+            self.assertTrue(final_pytest.exists())
+            shebang = final_pytest.read_text().splitlines()[0]
+            self.assertEqual(shebang, f"#!{final_venv}/bin/python3")
+            self.assertNotIn(".refresh-", shebang)
 
 
 class TestVerificationToolchainRecovery(unittest.TestCase):

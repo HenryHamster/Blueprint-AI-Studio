@@ -4,7 +4,9 @@
     "ruff": "0.12.9",
     "mypy": "1.20.2",
     "pytest": "7.4.4",
-    "pgserver-search": "0.1.6"
+    "pgserver-search": "0.1.6",
+    "alembic": "1.18.5",
+    "sqlalchemy": "2.0.51"
   },
   "postgres": {
     "required_extensions": {
