@@ -8016,11 +8016,17 @@ class TestCloseOrphanPrIfAny:
         assert close_mock.await_args.args[3] == 5983
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("payload_type", ["review"])
+    @pytest.mark.parametrize("payload_type", ["review", "fix"])
     async def test_review_cancel_does_not_close_reviewed_pr(
         self, tl_db, mocker, payload_type
     ):
-        """A reviewer references the implementation PR but never owns it."""
+        """A reviewer references the implementation PR but never owns it.
+
+        Fix tasks likewise: they push commits onto the PR's existing branch
+        and record it in review_loop.pr_number, but never open a PR of their
+        own. Regression for PR #17395 (2026-08-17): admin-cancelling a fix
+        child closed the rollup PR it was pointed at, stranding the parent.
+        """
         from app import task_lifecycle as tl
 
         session, _ = tl_db
