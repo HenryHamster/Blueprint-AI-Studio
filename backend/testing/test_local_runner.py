@@ -12806,7 +12806,12 @@ def test_local_runner_receipt_requires_bootstrapped_toolchain_and_probe_legs():
     scripts_dir = next(path for path in script_candidates if path.is_dir())
     sys.path.insert(0, str(scripts_dir))
     import local_runner as runner
-    import runner_isolation as isolation
+
+    # Patch on the exact module object local_runner consults (runner.iso), not a
+    # fresh `import runner_isolation`: if an earlier test dropped runner_isolation
+    # from sys.modules, a re-import here would create a different module object
+    # and every patch.object below would be inert against runner's cached binding.
+    isolation = runner.iso
 
     unavailable = runner._earn_project_verification(
         isolation.Capabilities(), None, None, None
@@ -12822,7 +12827,11 @@ def test_local_runner_receipt_requires_bootstrapped_toolchain_and_probe_legs():
         ready = runner._earn_project_verification(
             isolation.Capabilities(), ["node", "/agent/index.js"], None, toolchain
         )
-    assert ready["ready"] is True
+    assert ready["ready"] is True, {
+        "ready": ready,
+        "runner_iso_is_patched_module": runner.iso is isolation,
+        "sys_modules_local_runner_is_runner": sys.modules.get("local_runner") is runner,
+    }
 @pytest.mark.asyncio
 async def test_capability_proof_trial_skipped_suite_records_nothing(db_session):
     """A green-but-all-skipped (non-verifying) trial records no proof."""
