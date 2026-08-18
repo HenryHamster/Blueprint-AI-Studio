@@ -500,6 +500,7 @@ HELP_INVOCATIONS = [
     ["directions", "activate"],
     ["directions", "cancel"],
     ["directions", "resolve-discovery"],
+    ["directions", "show-discovery"],
     ["logs"],
     ["logs", "errors"],
     ["logs", "tail"],
@@ -1316,6 +1317,41 @@ def mock_api(monkeypatch):
         if "/discovery-resolution" in path and method == "POST":
             return {"status": "resolved", "action": (body or {}).get("action"),
                     "next_cycle_id": "cycle-next-01"}
+        if "/discovery-cycles" in path and method == "GET":
+            return {
+                "cycles": [
+                    {
+                        "id": "cycle-blocked-01",
+                        "state": "review_blocked",
+                        "revision": 3,
+                        "generation": 5,
+                        "verdict": None,
+                        "operator_question": "Evidence overflowed the packet budget; advance anyway?",
+                        "review_summary": "5 merged PRs landed cleanly but the receipt could not fit.",
+                        "review_result": {"status": "DECISION_FAILED"},
+                        "binding_decision_allowed": False,
+                        "bet_snapshot": {"mode": "build", "claim": "Ship the bounded rollout"},
+                        "created_at": "2026-08-15T12:00:00Z",
+                        "updated_at": "2026-08-15T12:05:00Z",
+                        "reviewed_at": None,
+                    },
+                    {
+                        "id": "cycle-reviewed-00",
+                        "state": "reviewed",
+                        "revision": 2,
+                        "generation": 4,
+                        "verdict": "advance",
+                        "operator_question": None,
+                        "review_summary": "Advanced on complete evidence.",
+                        "review_result": {"status": "OK"},
+                        "binding_decision_allowed": True,
+                        "bet_snapshot": {},
+                        "created_at": "2026-08-14T12:00:00Z",
+                        "updated_at": "2026-08-14T12:05:00Z",
+                        "reviewed_at": "2026-08-14T12:05:00Z",
+                    },
+                ]
+            }
         if "/directions/" in path and "/unhold" in path:
             return {"status": "unheld", "direction_id": "d-abc12345", "was_held": True}
         if "/directions/" in path and method == "DELETE":
@@ -3273,6 +3309,53 @@ def test_directions_resolve_discovery(mock_api, monkeypatch, capsys):
     assert len(posts) == 1
     assert "next_bet" not in posts[0][2]
     assert "note" not in posts[0][2]
+
+
+def test_directions_show_discovery(mock_api, monkeypatch, capsys):
+    """show-discovery is a read-only GET; it renders state, verdict, the
+    operator_question, and binding-decision authority the operator could not
+    previously see (the read gap the discovery-operator-bundle incident
+    exposed -- an ask_operator disposition with nowhere to read the
+    question)."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+
+    rc = blueprint.main(["directions", "show-discovery", "d-abc"])
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    gets = [(m, p, b) for m, p, b in mock_api
+            if m == "GET" and "/discovery-cycles" in p]
+    assert len(gets) == 1
+    assert gets[0][1].endswith("/directions/d-abc12345/discovery-cycles?limit=5")
+
+    assert "cycle-blocked-01" in out
+    assert "review_blocked" in out
+    assert "binding_allowed=NO" in out
+    assert "Evidence overflowed the packet budget; advance anyway?" in out
+    assert "5 merged PRs landed cleanly but the receipt could not fit." in out
+    assert "Active bet: mode=build  claim=Ship the bounded rollout" in out
+
+    assert "cycle-reviewed-00" in out
+    assert "binding_allowed=yes" in out
+    assert "Advanced on complete evidence." in out
+
+    mock_api.clear()
+    rc = blueprint.main(["directions", "show-discovery", "d-abc", "--limit", "2"])
+    assert rc == 0
+    gets = [(m, p, b) for m, p, b in mock_api
+            if m == "GET" and "/discovery-cycles" in p]
+    assert len(gets) == 1
+    assert gets[0][1].endswith("/discovery-cycles?limit=2")
+    capsys.readouterr()
+
+    mock_api.clear()
+    rc = blueprint.main(["directions", "show-discovery", "d-abc", "--json"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["cycles"][0]["id"] == "cycle-blocked-01"
+    assert payload["cycles"][0]["binding_decision_allowed"] is False
 
 
 def test_system_autonomy_toggle(mock_api, monkeypatch, capsys):

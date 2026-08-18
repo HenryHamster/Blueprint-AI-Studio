@@ -438,6 +438,171 @@ def _evidence_projection(item: DiscoveryEvidenceItem) -> dict[str, Any]:
     return result
 
 
+def _slice_included_from_start(
+    values: list[dict[str, Any]], count: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Select up to ``count`` items from the start; return (included, omitted)."""
+
+    if count <= 0:
+        return [], list(values)
+    return values[:count], values[count:]
+
+
+def _slice_included_from_end(
+    values: list[dict[str, Any]], count: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Select up to ``count`` items from the end; return (included, omitted).
+
+    ``values[-0:]`` is the whole list, not empty, so ``count == 0`` is
+    special-cased rather than left to the slice syntax.
+    """
+
+    if count <= 0:
+        return [], list(values)
+    if len(values) <= count:
+        return list(values), []
+    return values[-count:], values[:-count]
+
+
+# name -> (slice function, selection-template). The template's ``{count}``
+# is the per-collection detail count actually included at the chosen
+# degradation level, so the rendered selection string always describes what
+# is really in the receipt.
+_COLLECTION_DETAIL_CONFIG: dict[str, tuple[Any, str]] = {
+    "research_findings": (
+        _slice_included_from_start,
+        "first_{count}_in_stable_task_order",
+    ),
+    "knowledge_outcomes": (
+        _slice_included_from_end,
+        "latest_{count}_in_stable_document_order",
+    ),
+    "landed_outcomes": (
+        _slice_included_from_end,
+        "latest_{count}_in_stable_task_order",
+    ),
+    "experiment_outcomes": (
+        _slice_included_from_end,
+        "latest_{count}_in_stable_artifact_order",
+    ),
+    "verification_summaries": (
+        _slice_included_from_end,
+        "latest_{count}_in_stable_task_order",
+    ),
+}
+
+_COLLECTION_BASE_DETAIL_COUNTS: dict[str, int] = {
+    "research_findings": DISCOVERY_REVIEW_RESEARCH_DETAILS,
+    "knowledge_outcomes": DISCOVERY_REVIEW_KNOWLEDGE_DETAILS,
+    "landed_outcomes": DISCOVERY_REVIEW_LANDED_OUTCOMES,
+    "experiment_outcomes": DISCOVERY_REVIEW_EXPERIMENT_DETAILS,
+    "verification_summaries": DISCOVERY_REVIEW_VERIFICATION_DETAILS,
+}
+
+
+def _progressive_detail_levels(
+    base_counts: Mapping[str, int],
+) -> list[dict[str, int]]:
+    """Halve every collection's detail count together each round (e.g.
+    6 -> 3 -> 1 -> 0), stopping once every count has reached zero. The final
+    entry is therefore always the all-zero-detail level, so a caller that
+    walks this list and still can't fit the packet has confirmed that even
+    the zero-detail form overflows.
+    """
+
+    levels: list[dict[str, int]] = []
+    current = dict(base_counts)
+    while any(count > 0 for count in current.values()):
+        current = {name: count // 2 for name, count in current.items()}
+        levels.append(current)
+    return levels
+
+
+def _evidence_coverage_for_level(
+    collections: Mapping[str, list[dict[str, Any]]],
+    detail_counts: Mapping[str, int],
+    *,
+    level: int,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """Slice every collection to ``detail_counts`` and build its coverage.
+
+    ``level`` 0 is the full-detail packet, so its selection strings match the
+    historical hardcoded text exactly; ``level`` above 0 appends a
+    ``reduced_to_fit_total_packet_budget`` suffix so the receipt records that
+    it was degraded to fit the packet budget.
+    """
+
+    included: dict[str, list[dict[str, Any]]] = {}
+    coverage: dict[str, dict[str, Any]] = {}
+    for name, values in collections.items():
+        slice_fn, template = _COLLECTION_DETAIL_CONFIG[name]
+        count = detail_counts[name]
+        included_values, omitted_values = slice_fn(values, count)
+        selection = template.format(count=count)
+        if level > 0:
+            selection = (
+                f"{selection}|reduced_to_fit_total_packet_budget(level={level})"
+            )
+        included[name] = included_values
+        coverage[name] = _bounded_collection_coverage(
+            values,
+            included_values,
+            omitted=omitted_values,
+            selection=selection,
+        )
+    return included, coverage
+
+
+def _assemble_receipt(
+    *,
+    source_parent: dict[str, Any],
+    included: Mapping[str, list[dict[str, Any]]],
+    stranded_deliveries: list[dict[str, Any]],
+    evidence_coverage: Mapping[str, dict[str, Any]],
+    execution: dict[str, Any],
+    missing_reasons: list[str],
+    compacted: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    """Assemble one candidate receipt at a given degradation level.
+
+    The authority invariant is derived exactly as at full detail:
+    ``binding_decision_allowed`` is ``not binding_action_blockers``, and a
+    blocker exists only when some collection's ``semantic_digest_complete``
+    is False -- unaffected by how many per-collection details are included.
+    """
+
+    incomplete_collections = [
+        name
+        for name, coverage in evidence_coverage.items()
+        if not coverage["semantic_digest_complete"]
+    ]
+    binding_action_blockers = (
+        [
+            "complete authored semantic coverage exceeds the bounded decision "
+            f"packet for: {', '.join(incomplete_collections)}"
+        ]
+        if incomplete_collections
+        else []
+    )
+    receipt = {
+        "source_parent": source_parent,
+        "research_findings": included["research_findings"],
+        "knowledge_outcomes": included["knowledge_outcomes"],
+        "landed_outcomes": included["landed_outcomes"],
+        "stranded_deliveries": stranded_deliveries[:DISCOVERY_REVIEW_LANDED_OUTCOMES],
+        "experiment_outcomes": included["experiment_outcomes"],
+        "verification_summaries": included["verification_summaries"],
+        "evidence_coverage": dict(evidence_coverage),
+        "execution": execution,
+        "missing_required_evidence": missing_reasons,
+        "binding_action_blockers": binding_action_blockers,
+        "binding_decision_allowed": not binding_action_blockers,
+    }
+    if compacted:
+        receipt["receipt_compacted_to_budget"] = True
+    return receipt, binding_action_blockers
+
+
 async def build_discovery_review_packet(
     session,
     cycle: DiscoveryCycle,
@@ -647,17 +812,6 @@ async def build_discovery_review_packet(
         for task in tasks
         if _task_type(task) in _VERIFICATION_TASK_TYPES
     ]
-    included_research_findings = research_findings[
-        :DISCOVERY_REVIEW_RESEARCH_DETAILS
-    ]
-    included_knowledge_outcomes = knowledge_outcomes[
-        -DISCOVERY_REVIEW_KNOWLEDGE_DETAILS:
-    ]
-    included_landed = landed[-DISCOVERY_REVIEW_LANDED_OUTCOMES:]
-    included_experiments = experiments[-DISCOVERY_REVIEW_EXPERIMENT_DETAILS:]
-    included_verification_summaries = verification_summaries[
-        -DISCOVERY_REVIEW_VERIFICATION_DETAILS:
-    ]
     source_parent = {
         "task_id": str(source.id) if source else None,
         "title": str(source.title or "")[:500] if source else None,
@@ -676,125 +830,55 @@ async def build_discovery_review_packet(
         else None,
         "estimated_cost_usd": round(total_cost, 6),
     }
-    evidence_coverage = {
-        "research_findings": _bounded_collection_coverage(
-            research_findings,
-            included_research_findings,
-            omitted=research_findings[DISCOVERY_REVIEW_RESEARCH_DETAILS:],
-            selection="first_6_in_stable_task_order",
-        ),
-        "knowledge_outcomes": _bounded_collection_coverage(
-            knowledge_outcomes,
-            included_knowledge_outcomes,
-            omitted=knowledge_outcomes[:-DISCOVERY_REVIEW_KNOWLEDGE_DETAILS]
-            if len(knowledge_outcomes) > DISCOVERY_REVIEW_KNOWLEDGE_DETAILS
-            else [],
-            selection="latest_6_in_stable_document_order",
-        ),
-        "landed_outcomes": _bounded_collection_coverage(
-            landed,
-            included_landed,
-            omitted=landed[:-DISCOVERY_REVIEW_LANDED_OUTCOMES]
-            if len(landed) > DISCOVERY_REVIEW_LANDED_OUTCOMES
-            else [],
-            selection="latest_4_in_stable_task_order",
-        ),
-        "experiment_outcomes": _bounded_collection_coverage(
-            experiments,
-            included_experiments,
-            omitted=experiments[:-DISCOVERY_REVIEW_EXPERIMENT_DETAILS]
-            if len(experiments) > DISCOVERY_REVIEW_EXPERIMENT_DETAILS
-            else [],
-            selection="latest_6_in_stable_artifact_order",
-        ),
-        "verification_summaries": _bounded_collection_coverage(
-            verification_summaries,
-            included_verification_summaries,
-            omitted=verification_summaries[:-DISCOVERY_REVIEW_VERIFICATION_DETAILS]
-            if len(verification_summaries) > DISCOVERY_REVIEW_VERIFICATION_DETAILS
-            else [],
-            selection="latest_6_in_stable_task_order",
-        ),
-    }
-    incomplete_collections = [
-        name
-        for name, coverage in evidence_coverage.items()
-        if not coverage["semantic_digest_complete"]
-    ]
-    binding_action_blockers = (
-        [
-            "complete authored semantic coverage exceeds the bounded decision "
-            f"packet for: {', '.join(incomplete_collections)}"
-        ]
-        if incomplete_collections
-        else []
-    )
     missing_reasons = _bounded_missing_reasons(missing)
-    receipt = {
-        "source_parent": source_parent,
-        "research_findings": included_research_findings,
-        "knowledge_outcomes": included_knowledge_outcomes,
-        "landed_outcomes": included_landed,
-        "stranded_deliveries": stranded_deliveries[:DISCOVERY_REVIEW_LANDED_OUTCOMES],
-        "experiment_outcomes": included_experiments,
-        "verification_summaries": included_verification_summaries,
-        "evidence_coverage": evidence_coverage,
-        "execution": execution,
-        "missing_required_evidence": missing_reasons,
-        "binding_action_blockers": binding_action_blockers,
-        "binding_decision_allowed": not binding_action_blockers,
+    collections: dict[str, list[dict[str, Any]]] = {
+        "research_findings": research_findings,
+        "knowledge_outcomes": knowledge_outcomes,
+        "landed_outcomes": landed,
+        "experiment_outcomes": experiments,
+        "verification_summaries": verification_summaries,
     }
+    included, evidence_coverage = _evidence_coverage_for_level(
+        collections, _COLLECTION_BASE_DETAIL_COUNTS, level=0
+    )
+    receipt, binding_action_blockers = _assemble_receipt(
+        source_parent=source_parent,
+        included=included,
+        stranded_deliveries=stranded_deliveries,
+        evidence_coverage=evidence_coverage,
+        execution=execution,
+        missing_reasons=missing_reasons,
+        compacted=False,
+    )
     if not _receipt_fits_evidence_metadata(receipt):
         # Detail-rich receipts may exceed the fixed controller budget even when
-        # every outcome exists. Rebuild from zero details: coverage counts,
-        # checksums, sampled provenance, and complete authored semantic digests
-        # then determine whether an autonomous binding action remains safe.
-        compact_collections = {
-            "research_findings": research_findings,
-            "knowledge_outcomes": knowledge_outcomes,
-            "landed_outcomes": landed,
-            "experiment_outcomes": experiments,
-            "verification_summaries": verification_summaries,
-        }
-        evidence_coverage = {
-            name: _bounded_collection_coverage(
-                values,
-                [],
-                omitted=values,
-                selection="details_removed_to_fit_total_packet_budget",
+        # every outcome exists. Progressively halve every collection's
+        # included-detail count each round (e.g. 6 -> 3 -> 1 -> 0), rebuilding
+        # the receipt at each level, and stop at the first size that fits.
+        # This keeps as many collections' authored details visible as the
+        # packet budget allows instead of zeroing every collection at once
+        # the moment the full-detail form overflows. Coverage counts,
+        # checksums, sampled provenance, and complete authored semantic
+        # digests stay intact at every level so binding_decision_allowed
+        # keeps depending solely on whether coverage is semantically
+        # complete, never on which detail level was chosen.
+        for level, detail_counts in enumerate(
+            _progressive_detail_levels(_COLLECTION_BASE_DETAIL_COUNTS), start=1
+        ):
+            included, evidence_coverage = _evidence_coverage_for_level(
+                collections, detail_counts, level=level
             )
-            for name, values in compact_collections.items()
-        }
-        incomplete_collections = [
-            name
-            for name, coverage in evidence_coverage.items()
-            if not coverage["semantic_digest_complete"]
-        ]
-        binding_action_blockers = (
-            [
-                "complete authored semantic coverage exceeds the bounded decision "
-                f"packet for: {', '.join(incomplete_collections)}"
-            ]
-            if incomplete_collections
-            else []
-        )
-        receipt = {
-            "source_parent": source_parent,
-            "research_findings": [],
-            "knowledge_outcomes": [],
-            "landed_outcomes": [],
-            "stranded_deliveries": stranded_deliveries[
-                :DISCOVERY_REVIEW_LANDED_OUTCOMES
-            ],
-            "experiment_outcomes": [],
-            "verification_summaries": [],
-            "evidence_coverage": evidence_coverage,
-            "execution": execution,
-            "missing_required_evidence": missing_reasons,
-            "binding_action_blockers": binding_action_blockers,
-            "binding_decision_allowed": not binding_action_blockers,
-            "receipt_compacted_to_budget": True,
-        }
+            receipt, binding_action_blockers = _assemble_receipt(
+                source_parent=source_parent,
+                included=included,
+                stranded_deliveries=stranded_deliveries,
+                evidence_coverage=evidence_coverage,
+                execution=execution,
+                missing_reasons=missing_reasons,
+                compacted=True,
+            )
+            if _receipt_fits_evidence_metadata(receipt):
+                break
     if not _receipt_fits_evidence_metadata(receipt):
         # Pathological cardinality can also overflow the compact semantic
         # indexes. Preserve exact counts/checksums, forbid binding action, and
