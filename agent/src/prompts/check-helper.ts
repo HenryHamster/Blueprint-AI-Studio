@@ -56,11 +56,6 @@ function loadMergeVerifyScript(): string {
   try { return readShellFragment(_MERGE_VERIFY_PATH); } catch { return ''; }
 }
 
-const _IMPACTED_TEST_PATH = path.join(_CHECK_HELPER_DIR, 'check_impacted_test.sh');
-function loadImpactedTestScript(): string {
-  try { return readShellFragment(_IMPACTED_TEST_PATH); } catch { return ''; }
-}
-
 const _VIEWPORT_UPLOAD_PATH = path.join(_CHECK_HELPER_DIR, 'check_viewport_upload.sh');
 function loadViewportUploadScript(): string {
   try { return readShellFragment(_VIEWPORT_UPLOAD_PATH); } catch { return ''; }
@@ -143,35 +138,22 @@ function buildMergeVerifyBlock(taskId: string): string {
   return loadMergeVerifyScript().replace(/@TASK_ID@/g, taskId);
 }
 
-/** Emit the impacted-test merge-time gate for the generated ./check.
- *
- *  The standalone `--no-postgres` smoke run alongside this block covers only the
- *  ~10-file invariant set. Test files that exercise the CHANGED modules — by
- *  importing `app.<module>` or by mock-patching `app.<module>...` — and even test
- *  files the PR ITSELF ADDS, never run mechanically before merge, so a contract
- *  break merges green on the task PR and only surfaces at the promotion-PR full
- *  matrix, burning a long diagnosis+re-provision round-trip.
- *
- *  This block derives the impacted backend test set from $CHANGED by piping it
- *  into the committed reverse-dependency resolver
- *  (`backend/testing/impacted_tests.py`) — invoked BY REFERENCE, NOT an embedded
- *  Python heredoc (see CLAUDE.md's "Generating Code for One Language From
- *  Another"). It runs the impacted files under the sanctioned Postgres harness,
- *  bounded (capped; never the full suite, which OOMs the 8 GB VM — the harness
- *  memory guard exempts targeted *.py args). A still-failing impacted test lands
- *  in FAILED, and since ./pr open gates on ./check, the push is blocked until it
- *  passes. Overflow past the cap is logged (deferred to CI), never silently
- *  dropped. Graceful when Docker is absent: warn + GATE-ENVIRONMENT marker,
- *  don't block (CI runs the authoritative suite on the PR). Does nothing (no
- *  output, no failure) when the impacted set is empty. It is additive — it does
- *  NOT replace the standalone smoke run; the two are complementary. */
-function buildImpactedTestBlock(taskId: string): string {
-  return loadImpactedTestScript().replace(/@TASK_ID@/g, taskId);
-}
-
 function buildRequiredBackendVerificationBlock(cfg: CodeChangeHelperConfig): string {
   const blocks: string[] = [];
-  for (const { directory: dir, harness } of projectVerificationTargets(cfg)) {
+  const targets = projectVerificationTargets(cfg);
+  // The self-repo's legacy authoring path predates capability/config-driven
+  // verification. It used to receive the raw impacted lane; keep its coverage
+  // by routing it through the same attributed fragment instead. Explicit
+  // capability declarations remain authoritative and are never inferred.
+  if (
+    targets.length === 0
+    && isBlueprintSelfRepo(cfg.owner, cfg.repo)
+    && !cfg.taskCapability
+    && !cfg.buildConfig
+  ) {
+    targets.push({ directory: 'backend', harness: 'scripts/test-backend.sh' });
+  }
+  for (const { directory: dir, harness } of targets) {
     const dirRe = dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pythonPathRe = dir === '.' ? '.*\\.py$' : `^${dirRe}/.*\\.py$`;
     const testPathRe = dir === '.'
@@ -711,7 +693,7 @@ if touches backend/; then
     # does not waive unrelated failures introduced by this task.
     run "backend pytest (attributed)" python3 scripts/static_release_guard.py \
       --corpus-only --base "$BASE" --repo-root "$WORKSPACE"
-${buildImpactedTestBlock(cfg.taskId)}  fi
+  fi
   # Fast migration-chain guard: no DB, no Docker, sub-second. Runs only
   # when at least one alembic/versions/ file was added or changed.
   if printf '%s\\n' "$CHANGED" | grep -q '^backend/alembic/versions/.*\\.py$'; then

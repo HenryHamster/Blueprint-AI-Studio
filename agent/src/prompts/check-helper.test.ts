@@ -1709,18 +1709,12 @@ esac
   });
 });
 
-// ── impacted-test merge-time gate ────────────────────────────────────────────
-// At the merge-time gate (baseBranch===promotionTarget / testsOnMainBranch), in
-// addition to the ~10-file standalone smoke set, mechanically run the backend
-// test files IMPACTED by the diff — test files that import a changed
-// app.<module> or mock-patch it by string target, plus test files the PR itself
-// adds — under the sanctioned Postgres harness. A still-failing impacted test
-// blocks ./pr open instead of leaking to the promotion-PR full matrix. The set
-// is derived from $CHANGED via the committed reverse-dep resolver
-// (backend/testing/impacted_tests.py), invoked BY REFERENCE (no embedded Python
-// heredoc, per CLAUDE.md), capped, with overflow deferred-unverified, and degrading
-// gracefully (GATE-ENVIRONMENT marker, non-blocking) when Docker is absent.
-describe('writeCheckHelper — impacted-test merge-time gate', () => {
+// ── attributed backend verification ─────────────────────────────────────────
+// The required backend verification fragment resolves the impacted selectors
+// and runs them once through the sanctioned Postgres harness plus the shared
+// baseline attributor. This keeps inherited failures publishable while keeping
+// introduced, disappeared, skipped, or unavailable verification states blocking.
+describe('writeCheckHelper — attributed backend verification', () => {
   let capturedScripts: Record<string, string> = {};
 
   beforeEach(() => {
@@ -1731,7 +1725,7 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     });
   });
 
-  it('emits the impacted-test block at the merge-time gate (self-repo, testsOnMainBranch)', async () => {
+  it('removes the duplicate raw impacted run and retains one attributed selector lane', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId: 'impacted-1',
@@ -1743,36 +1737,21 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     });
     const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
-    // The block exists and derives the impacted set from $CHANGED via the
-    // committed resolver, invoked BY REFERENCE (no embedded Python heredoc).
-    expect(script).toContain('impacted-test merge-time gate');
+    // The resolver-selected impacted selectors are owned by the required
+    // backend verification fragment, which invokes the shared attributor.
     expect(script).toContain('python3 backend/testing/impacted_tests.py');
-    // Capped run, overflow logged as unverified (never silently dropped).
-    expect(script).toContain('IMPACTED_TEST_CAP=8');
-    expect(script).toContain('IMPACTED_RESOLVER_TIMEOUT_SECS=30');
-    expect(script).toContain('IMPACTED_GATE_TIMEOUT_SECS=120');
-    expect(script).toContain('deferred-unverified:');
-    // Overflow is NOT covered by this gate or automain PR CI — the old "CI verifies the rest" claim must not return.
-    expect(script).not.toContain('CI verifies the rest');
-    // Both resolver and sanctioned Postgres harness are bounded; the harness
-    // emits progress while it runs so an operator can distinguish work from a wedge.
-    expect(script).toContain('timeout --foreground --signal=TERM');
-    expect(script).toContain('impacted-test gate: still running');
-    expect(script).toContain('scripts/test-backend.sh --postgres');
-    // Timeouts/unavailability write the taskId-scoped GATE-ENVIRONMENT marker,
-    // but an ordinary non-zero test exit remains a blocking failure.
-    expect(script).toContain('124|137)');
-    expect(script).toContain('/tmp/check_gate_env_impacted-1.txt');
-    expect(script).toContain('FAILED+=("impacted-test gate")');
-    // The attributed corpus run is INSIDE the WITH_TESTS merge-time backend
-    // gate, right before the impacted-test gate and its closing `fi`.
-    expect(script).toContain('run "backend pytest (attributed)" python3 scripts/static_release_guard.py');
-    expect(script).toMatch(
-      /if \[ "\$WITH_TESTS" = "1" \][\s\S]*?--corpus-only[\s\S]*?impacted-test merge-time gate[\s\S]*?\n {2}fi/,
-    );
+    expect(script).toContain('python3 scripts/backend_verification_guard.py');
+    expect(script.match(/python3 backend\/testing\/impacted_tests\.py/g)).toHaveLength(1);
+    // The weaker raw exit-code lane and its independent timeout/harness run are
+    // gone; a baseline failure cannot be charged twice by publication.
+    expect(script).not.toContain('impacted-test merge-time gate');
+    expect(script).not.toContain('IMPACTED_TEST_CAP=8');
+    expect(script).not.toContain('FAILED+=("impacted-test gate")');
+    expect(script).not.toContain('scripts/test-backend.sh --postgres $_it_run');
+    expect(script).toContain('preexisting_test_failure');
   });
 
-  it('the impacted-test gate always fires for the self-repo (no constant-false guard regardless of branch)', async () => {
+  it('the attributed backend verification always fires for the self-repo (no constant-false guard)', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     // Self-repo with baseBranch !== promotionTarget: shouldRunBackendMergeGate
     // returns true for isBlueprintSelfRepo, so the gate compiles to "1" — never "0".
@@ -1787,12 +1766,12 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     });
     const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
-    // Gate compiles to "1" — self-repo always gets the merge-time gate.
+    // Gate compiles to "1" — self-repo always gets backend verification.
     expect(script).toContain('[ "$WITH_TESTS" = "1" ] && [ "1" = "1" ]');
     expect(script).not.toContain('[ "$WITH_TESTS" = "1" ] && [ "0" = "1" ]');
   });
 
-  it('emits both backend test gates (smoke + impacted) on self-repo automain task PR (baseBranch=automain, promotionTarget=main)', async () => {
+  it('emits the attributed backend gate on self-repo automain task PR (baseBranch=automain, promotionTarget=main)', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     // Self-repo automain task: baseBranch='automain', promotionTarget='main' — the
     // old inline ternary evaluated to "0" so the gate never fired on these PRs.
@@ -1815,8 +1794,7 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     // The standalone corpus is routed through structured baseline attribution.
     expect(script).toContain('run "backend pytest (attributed)" python3 scripts/static_release_guard.py');
     expect(script).toContain('--corpus-only --base "$BASE" --repo-root "$WORKSPACE"');
-    // Impacted-test gate is present.
-    expect(script).toContain('impacted-test merge-time gate');
+    // The resolver-selected lane is the required attributed verification.
     expect(script).toContain('python3 backend/testing/impacted_tests.py');
   });
 
@@ -1837,7 +1815,7 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
 
-  it('generated ./check with the impacted-test gate passes `bash -n` syntax check', async () => {
+  it('generated ./check with attributed backend verification passes `bash -n` syntax check', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId: 'impacted-bashn',
@@ -1853,7 +1831,7 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
 
-  it('resolver crash is surfaced as a gate failure — not silently swallowed', async () => {
+  it('attribution resolver crash is surfaced as a gate failure — not silently swallowed', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId: 'impacted-crash',
@@ -1865,14 +1843,13 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     });
     const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
-    // The old silent-swallow pattern must be gone.
+    // The raw impacted lane is gone; the retained attributed lane captures
+    // resolver failures and charges them to the required verification gate.
     expect(script).not.toContain('python3 backend/testing/impacted_tests.py 2>/dev/null || true');
-    // Crash detection: capture exit code and surface non-zero exits as failures.
-    expect(script).toContain('_it_rc=$?');
-    expect(script).toContain('case "$_it_rc" in');
-    expect(script).toContain('FAILED+=("impacted-test resolver crash")');
+    expect(script).toContain('_verification_resolver_rc=$?');
+    expect(script).toContain('FAILED+=("$_VERIFICATION_DIR verification resolver")');
     // A crash prints stderr content so operators can diagnose.
-    expect(script).toContain('cat "$_it_stderr_f"');
+    expect(script).toContain('cat "$_verification_stderr"');
   });
 });
 

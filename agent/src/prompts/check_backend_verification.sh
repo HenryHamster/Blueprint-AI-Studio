@@ -127,7 +127,7 @@
             --current-exit-code "$_verification_exit" --route="$_verification_postgres_flag" \
             --harness "$_VERIFICATION_HARNESS" "${_verification_selector_args[@]}")
         else
-          _verification_attribution='{"state":"execution_failure","blocking":true,"new_failures":{}}'
+          _verification_attribution='{"state":"attribution_unavailable","blocking":true,"error":"current JUnit report missing after targeted harness"}'
         fi
         echo "[check] backend verification attribution: $_verification_attribution"
         _verification_state=$(printf '%s' "$_verification_attribution" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state","attribution_unavailable"))' 2>/dev/null || printf attribution_unavailable)

@@ -14,6 +14,7 @@ by the gate and harness.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -22,6 +23,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from testing.fixgate_attribution import JUnitReport, classify_verification
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if not (_REPO_ROOT / "check").exists() and Path("/repo/check").exists():
@@ -288,3 +291,95 @@ def test_backend_route_stays_fail_closed_without_a_runtime(tmp_path: Path) -> No
 
     assert result.returncode != 0
     assert result.stdout == ""
+
+
+def _failure_report(key: str, detail: str = "boom", *, skipped: bool = False) -> JUnitReport:
+    test_key = key.rsplit("::", 1)[0]
+    return JUnitReport(
+        failures={} if skipped else {key: detail},
+        test_routes={test_key},
+        skipped_routes={test_key} if skipped else set(),
+    )
+
+
+def test_attributed_gate_blocks_a_failure_introduced_by_the_diff() -> None:
+    key = "backend/testing/test_changed.py::test_new::failure"
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures={key: "introduced"},
+        current_report=_failure_report(key, "introduced"),
+        baseline_report=JUnitReport(test_routes={"backend/testing/test_changed.py::test_new"}),
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == {key: "introduced"}
+
+
+def test_attributed_gate_blocks_when_a_baseline_failure_disappears() -> None:
+    key = "backend/testing/test_old.py::test_existing::failure"
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_failures={},
+        current_report=JUnitReport(test_routes={"backend/testing/test_other.py::test_ok"}),
+        baseline_report=_failure_report(key),
+    )
+
+    assert outcome["state"] == "baseline_failure_disappeared"
+    assert outcome["blocking"] is True
+    assert key in outcome["disappeared_failures"]
+
+
+def test_attributed_gate_blocks_when_a_baseline_failure_becomes_skipped() -> None:
+    key = "backend/testing/test_old.py::test_existing::failure"
+    current = _failure_report(key, skipped=True)
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_failures={},
+        current_report=current,
+        baseline_report=_failure_report(key),
+    )
+
+    assert outcome["state"] == "baseline_failure_skipped"
+    assert outcome["blocking"] is True
+    assert key in outcome["skipped_failures"]
+
+
+def test_attributed_gate_names_unavailable_baseline_and_blocks(tmp_path: Path) -> None:
+    """The retained shell seam receives a named fail-closed attribution state."""
+    junit = tmp_path / "current.xml"
+    junit.write_text(
+        '<testsuite><testcase classname="testing.test_x" name="test_x" /></testsuite>',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "scripts" / "backend_verification_guard.py"),
+            "--base",
+            "missing-base",
+            "--repo-root",
+            str(tmp_path),
+            "--current-junit",
+            str(junit),
+            "--current-exit-code",
+            "0",
+            "--route=--sandbox-postgres",
+            "--harness",
+            "scripts/test-backend.sh",
+            "testing/test_x.py",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0  # the shell consumes the JSON verdict
+    verdict = json.loads(result.stdout)
+    assert verdict["state"] == "baseline_unavailable"
+    assert verdict["blocking"] is True
+    assert "cannot resolve base ref" in verdict["error"]
