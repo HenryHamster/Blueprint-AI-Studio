@@ -499,6 +499,7 @@ HELP_INVOCATIONS = [
     ["directions", "retarget"],
     ["directions", "activate"],
     ["directions", "cancel"],
+    ["directions", "resolve-discovery"],
     ["logs"],
     ["logs", "errors"],
     ["logs", "tail"],
@@ -1312,6 +1313,9 @@ def mock_api(monkeypatch):
                     "outcome_breakdown": {"success": 1},
                 },
             }
+        if "/discovery-resolution" in path and method == "POST":
+            return {"status": "resolved", "action": (body or {}).get("action"),
+                    "next_cycle_id": "cycle-next-01"}
         if "/directions/" in path and "/unhold" in path:
             return {"status": "unheld", "direction_id": "d-abc12345", "was_held": True}
         if "/directions/" in path and method == "DELETE":
@@ -3198,6 +3202,105 @@ def test_directions_group(mock_api, monkeypatch, capsys):
     assert patch_calls, "Expected retarget to PATCH directions endpoint"
     assert patch_calls[0][1].endswith("/directions/d-staged12345")
     assert patch_calls[0][2] == {"staged_for_version": 15}
+
+
+def test_directions_resolve_discovery(mock_api, monkeypatch, capsys):
+    """resolve-discovery posts the exact payload and enforces the next-bet contract."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main([
+        "directions", "resolve-discovery", "d-abc",
+        "--cycle-id", "cycle-1", "--cycle-revision", "4",
+        "--action", "continue",
+        "--bet-mode", "measure",
+        "--bet-claim", "claim text",
+        "--bet-question", "question text",
+        "--bet-success", "success text",
+        "--bet-retirement", "retirement text",
+        "--note", "operator note", "--yes",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Resolved cycle cycle-1" in out
+    assert "cycle-next-01" in out
+    posts = [(m, p, b) for m, p, b in mock_api
+             if m == "POST" and "/discovery-resolution" in p]
+    assert len(posts) == 1
+    _, path, body = posts[0]
+    assert path.endswith("/directions/d-abc12345/discovery-resolution")
+    assert body["cycle_id"] == "cycle-1"
+    assert body["cycle_revision"] == 4
+    assert body["action"] == "continue"
+    assert body["note"] == "operator note"
+    assert body["next_bet"] == {
+        "mode": "measure",
+        "claim": "claim text",
+        "decision_question": "question text",
+        "success_evidence": "success text",
+        "retirement_condition": "retirement text",
+    }
+    mock_api.clear()
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main([
+            "directions", "resolve-discovery", "d-abc",
+            "--cycle-id", "cycle-1", "--cycle-revision", "4",
+            "--action", "continue", "--bet-mode", "measure", "--yes",
+        ])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "full next-bet contract" in err
+    assert not [p for _, p, _ in mock_api if "/discovery-resolution" in p]
+    mock_api.clear()
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main([
+            "directions", "resolve-discovery", "d-abc",
+            "--cycle-id", "cycle-1", "--cycle-revision", "4",
+            "--action", "park", "--bet-claim", "stray", "--yes",
+        ])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "must not include next-bet" in err
+    assert not [p for _, p, _ in mock_api if "/discovery-resolution" in p]
+    mock_api.clear()
+    rc = blueprint.main([
+        "directions", "resolve-discovery", "d-abc",
+        "--cycle-id", "cycle-1", "--cycle-revision", "5",
+        "--action", "park", "--yes",
+    ])
+    assert rc == 0
+    posts = [(m, p, b) for m, p, b in mock_api
+             if m == "POST" and "/discovery-resolution" in p]
+    assert len(posts) == 1
+    assert "next_bet" not in posts[0][2]
+    assert "note" not in posts[0][2]
+
+
+def test_system_autonomy_toggle(mock_api, monkeypatch, capsys):
+    """system autonomy --enable/--disable PATCHes the project row; bare call stays read-only."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["system", "autonomy", "--enable", "--yes"])
+    assert rc == 0
+    patches = [(m, p, b) for m, p, b in mock_api if m == "PATCH"]
+    assert len(patches) == 1
+    assert patches[0][1].endswith("/api/admin/projects/proj-1")
+    assert patches[0][2] == {"autonomous_enabled": True}
+    mock_api.clear()
+    rc = blueprint.main(["system", "autonomy", "--disable", "--yes"])
+    assert rc == 0
+    patches = [(m, p, b) for m, p, b in mock_api if m == "PATCH"]
+    assert len(patches) == 1
+    assert patches[0][2] == {"autonomous_enabled": False}
+    mock_api.clear()
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["system", "autonomy", "--enable", "--disable", "--yes"])
+    assert exc.value.code == 1
+    assert "mutually exclusive" in capsys.readouterr().err
+    assert not [1 for m, _, _ in mock_api if m == "PATCH"]
+    mock_api.clear()
+    rc = blueprint.main(["system", "autonomy"])
+    assert rc == 0
+    assert not [1 for m, _, _ in mock_api if m == "PATCH"]
     mock_api.clear()
     rc = blueprint.main(["directions", "activate", "d-staged", "--yes"])
     assert rc == 0
