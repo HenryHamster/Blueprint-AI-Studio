@@ -647,6 +647,12 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     "revision": revision,
                 },
             ),
+            # The main-reachability guard shells out to `gh`; this test
+            # exercises the socket handoff/receipt path, not the guard, so
+            # keep the binding check a no-op like the rest of the mocks here.
+            unittest.mock.patch.object(
+                deploy_blueprint, "_validate_deploy_binding", return_value=None
+            ),
             unittest.mock.patch.object(
                 deploy_blueprint.socket,
                 "socket",
@@ -735,6 +741,12 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                         blueprint, "_local_served_sha", return_value=revision
                     ),
                     unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
+                    # The main-reachability guard shells out to `gh`; this test
+                    # exercises the socket-timeout/receipt-retry path, not the
+                    # guard itself.
+                    unittest.mock.patch.object(
+                        blueprint, "_validate_deploy_binding", return_value=None
+                    ),
                     unittest.mock.patch.object(
                         release,
                         "_release_command",
@@ -941,6 +953,12 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                         "revision": revision,
                     },
                 ),
+                # A timeout re-arm takes the fresh-activation path, which now
+                # runs the main-reachability guard (shells out to `gh`); this
+                # test exercises the re-arm/retry logic, not the guard.
+                unittest.mock.patch.object(
+                    blueprint, "_validate_deploy_binding", return_value=None
+                ),
                 unittest.mock.patch.object(
                     blueprint,
                     "_invoke_release_shim",
@@ -1039,6 +1057,12 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     blueprint, "_local_served_sha", return_value=revision
                 ),
                 unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
+                # This test exercises the accepted-handoff/receipt-retry path,
+                # not the main-reachability guard (which shells out to `gh`
+                # on the first, fresh-activation pass).
+                unittest.mock.patch.object(
+                    blueprint, "_validate_deploy_binding", return_value=None
+                ),
                 unittest.mock.patch.object(
                     blueprint,
                     "_invoke_release_shim",
@@ -1095,6 +1119,12 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     },
                 ),
                 unittest.mock.patch.object(blueprint, "get_project_id", return_value="project-1"),
+                # The first (fresh-activation) call runs the main-reachability
+                # guard, which shells out to `gh`; this test exercises the
+                # pending-confirmation retry logic, not the guard.
+                unittest.mock.patch.object(
+                    blueprint, "_validate_deploy_binding", return_value=None
+                ),
                 unittest.mock.patch.object(
                     blueprint,
                     "_invoke_release_shim",

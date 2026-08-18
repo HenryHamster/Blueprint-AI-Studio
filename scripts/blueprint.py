@@ -7449,11 +7449,27 @@ def _fetch_deploy_manifest(wanted_sha: str | None = None) -> dict:
 
 
 def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> bool:
-    """Use the root-owned release socket, or the legacy remote SSH path."""
+    """Use the root-owned release socket, locally or through SSH.
+
+    The bootstrap removes the legacy ``/etc/sudoers.d/blueprint-release``
+    grant, so a remote deploy cannot ``ssh sudo`` the shim. Instead the repo's
+    socket client (scripts/release_socket_submit.py) is piped over SSH to the
+    host's python3 and submits to the ACL-limited release socket — the same
+    execution boundary the resident deploy agent uses.
+    """
     if host is None:
         return _request_release_socket(digest, revision)
-    command = ["ssh", "-t", host, "sudo", _RELEASE_SHIM_PATH, digest, revision]
-    proc = subprocess.run(command, check=False)
+    client_path = Path(__file__).resolve().with_name("release_socket_submit.py")
+    command = ["ssh", host, "python3", "-", digest, revision]
+    with open(client_path, "rb") as client_source:
+        proc = subprocess.run(command, check=False, stdin=client_source)
+    if proc.returncode == 3:
+        print(
+            "Release executor accepted the handoff but its verdict was not "
+            "observed; verify the served revision before retrying.",
+            file=sys.stderr,
+        )
+        return False
     if proc.returncode != 0:
         print(f"ERROR: release exited {proc.returncode} — the release tool "
               "rolls back failed activations; inspect its receipt on the host.")

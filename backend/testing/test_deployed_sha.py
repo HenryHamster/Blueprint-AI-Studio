@@ -362,6 +362,13 @@ class TestApprovedActivationExecutor:
             "_read_live_approved_activation",
             lambda _args: self._PROMOTED,
         )
+        # Binding/reachability validation shells out to the real `gh` CLI
+        # (github compare API) which is not installed in the CI backend
+        # container and must never be reached from this receipt-path test —
+        # same seam TestAtMostOnceReleaseFence stubs below.
+        monkeypatch.setattr(
+            deploy_blueprint, "_validate_deploy_binding", lambda _rev, _approved: None
+        )
         monkeypatch.setattr(
             deploy_blueprint,
             "_fetch_deploy_manifest",
@@ -419,6 +426,12 @@ class TestApprovedActivationExecutor:
             deploy_blueprint,
             "_read_live_approved_activation",
             lambda _args: self._PROMOTED,
+        )
+        # Same seam as above: keep this receipt/failure-path test off the real
+        # `gh` CLI that binding/reachability validation would otherwise shell
+        # out to.
+        monkeypatch.setattr(
+            deploy_blueprint, "_validate_deploy_binding", lambda _rev, _approved: None
         )
         monkeypatch.setattr(
             deploy_blueprint,

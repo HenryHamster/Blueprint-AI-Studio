@@ -1603,7 +1603,9 @@ async def test_spawn_scope_overflow_signal_fires_after_commit(db_session, mocker
         ],
         context={
             "scope": "small",
-            "_pr_changed_files": [f"backend/app/m{i}.py" for i in range(7)],
+            # small-scope budget is SCOPE_FILE_BUDGETS["small"]["total_files_max"]
+            # (8); must exceed it to trigger the overflow signal.
+            "_pr_changed_files": [f"backend/app/m{i}.py" for i in range(9)],
             "review_loop": {"iteration": 0},
         },
     )
@@ -1716,7 +1718,9 @@ async def test_spawn_scope_overflow_signal_failure_does_not_block_spawn(
         ],
         context={
             "scope": "small",
-            "_pr_changed_files": [f"backend/app/n{i}.py" for i in range(7)],
+            # small-scope budget is SCOPE_FILE_BUDGETS["small"]["total_files_max"]
+            # (8); must exceed it to trigger the overflow signal.
+            "_pr_changed_files": [f"backend/app/n{i}.py" for i in range(9)],
             "review_loop": {"iteration": 0},
         },
     )
