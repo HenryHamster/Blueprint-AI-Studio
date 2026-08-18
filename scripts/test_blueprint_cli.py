@@ -24,6 +24,42 @@ import local_app_release as local_release
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_blueprint_config(monkeypatch, tmp_path):
+    """Guarantee blueprint_api.load_config() resolves without touching the host.
+
+    Most tests here mock blueprint_api.api directly, but several blueprint.py
+    helpers call the *real* load_config() unconditionally on the way to that
+    mocked api() (e.g. _using_scoped_service_credential(), which many CLI
+    flows consult before ever making a request). On a dev host that has an
+    ambient ~/.blueprint-config.json or repo-root .blueprint-config.json,
+    that real call silently succeeds — but the CI lane runs this file with
+    --noconftest in a container with no config anywhere in the search order
+    (see blueprint_api._config_search_paths), so the same call raises
+    APIError there. Point BLUEPRINT_CONFIG at a throwaway file with the
+    minimal shape load_config()/api() actually read (api_url, api_key) so
+    every test gets the same deterministic, host-independent resolution
+    regardless of what config files exist on the machine running pytest.
+    BLUEPRINT_CONFIG is checked first in load_config(), ahead of the
+    BLUEPRINT_API_URL/KEY pair, the repo-root/home search paths, and the
+    gcloud/agent-token fallbacks, so this fully short-circuits config
+    discovery. Also reset the process-global _config_cache so no test can
+    leak a resolved config into the next one.
+
+    Tests that exercise load_config()'s own search/precedence/error behavior
+    (test_load_config_*) or that replace load_config() outright override this
+    fixture via their own monkeypatch calls, which run after this fixture's
+    setup and are undone independently at teardown.
+    """
+    dummy_config = tmp_path / "hermetic-blueprint-config.json"
+    dummy_config.write_text(
+        json.dumps({"api_url": "https://blueprint-cli-test.invalid", "api_key": "test-key"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINT_CONFIG", str(dummy_config))
+    monkeypatch.setattr(blueprint_api, "_config_cache", None)
+
+
 def test_get_project_id_matches_configured_default_repo(monkeypatch):
     """Unscoped commands target the configured repo, not API list position."""
     monkeypatch.delenv("BLUEPRINT_PROJECT_ID", raising=False)
@@ -263,6 +299,10 @@ def test_check_wrapper_exists_and_is_executable():
     assert os.access(wrapper, os.X_OK), "./check is not executable"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="executing a bash-shebang script directly requires a POSIX exec bit",
+)
 def test_blueprint_wrapper_help_exits_zero():
     """./blueprint --help exits 0 and emits CLI output."""
     wrapper = os.path.join(REPO_ROOT, "blueprint")
@@ -373,11 +413,11 @@ def test_load_config_missing_raises_library_error(monkeypatch, tmp_path, capsys)
 def test_check_test_delegates_to_attributed_static_release_guard():
     """The developer fallback runs the attributed static guard for ./check test."""
     check_path = os.path.join(REPO_ROOT, "check")
-    with open(check_path) as f:
+    with open(check_path, encoding="utf-8") as f:
         wrapper = f.read()
     assert 'DEFAULT_GATE="$WORKSPACE/scripts/check-default.sh"' in wrapper
     default_path = os.path.join(REPO_ROOT, "scripts", "check-default.sh")
-    with open(default_path) as f:
+    with open(default_path, encoding="utf-8") as f:
         default_gate = f.read()
     assert 'if [ "$WITH_TESTS" = "1" ]; then' in default_gate
     assert (
@@ -389,6 +429,10 @@ def test_check_test_delegates_to_attributed_static_release_guard():
     assert "bash scripts/test-backend.sh --standalone --no-postgres" not in default_gate
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="a Windows-style backslash path is not a valid bash -n argument",
+)
 def test_blueprint_wrapper_shell_syntax():
     """./blueprint passes bash -n (no syntax errors)."""
     wrapper = os.path.join(REPO_ROOT, "blueprint")
@@ -396,6 +440,13 @@ def test_blueprint_wrapper_shell_syntax():
     assert result.returncode == 0, f"bash -n failed on ./blueprint: {result.stderr}"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "a Windows checkout with core.autocrlf converts LF to CRLF, which "
+        "trips bash's parser even though the file is valid on a POSIX checkout"
+    ),
+)
 def test_check_wrapper_shell_syntax():
     """Both ./check dispatch and its developer fallback pass bash -n."""
     for relative_path in ("check", "scripts/check-default.sh"):
@@ -408,6 +459,10 @@ def test_check_wrapper_shell_syntax():
         assert result.returncode == 0, f"bash -n failed on {relative_path}: {result.stderr}"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="a Windows-style backslash path is not a valid bash -n argument",
+)
 def test_install_cli_shell_syntax():
     """scripts/install-cli.sh passes bash -n (no syntax errors)."""
     script = os.path.join(REPO_ROOT, "scripts", "install-cli.sh")
@@ -415,6 +470,10 @@ def test_install_cli_shell_syntax():
     assert result.returncode == 0, f"bash -n failed on scripts/install-cli.sh: {result.stderr}"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="creating a symlink requires elevated privileges/Developer Mode on Windows",
+)
 def test_blueprint_wrapper_resolves_via_symlink(tmp_path):
     """./blueprint works when invoked via a symlink from an unrelated directory.
 
@@ -4792,6 +4851,10 @@ def test_compute_show_renders_terminal_reason_and_provisioning_cause(mock_api, c
     assert "Provisioning failure test" in out
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="invokes the python3 binary directly; Windows Python installs expose python.exe, not python3",
+)
 def test_compute_run_local(capsys):
     """compute run executes a trivial command locally and reports its emitted metric."""
     # Write {"accuracy": 0.95} to the result file that the wrapper provides via $BLUEPRINT_RESULT_FILE
@@ -6637,6 +6700,10 @@ def test_deploy_defaults_to_promoted_version(monkeypatch, capsys):
     assert body["host"] == "hamsterwheel"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="asserts POSIX chmod(0o600) permission bits, which Windows/NTFS does not enforce",
+)
 def test_migrate_local_runs_alembic_upgrade_against_local_db(monkeypatch, tmp_path, capsys):
     """The local migration is a repeatable worker-image container transaction."""
     image = (
@@ -6794,6 +6861,13 @@ def test_migration_credential_text_pins_worker_service_account_identity(tmp_path
         blueprint._migration_credential_text(path)
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "asserts POSIX chmod(0o600)/(0o640) permission bits and real symlink "
+        "creation, neither of which Windows/NTFS enforces the same way"
+    ),
+)
 def test_migration_secure_file_rejects_links_and_insecure_modes(tmp_path):
     regular = tmp_path / "regular"
     regular.write_text("safe", encoding="utf-8")
@@ -6812,6 +6886,10 @@ def test_migration_secure_file_rejects_links_and_insecure_modes(tmp_path):
         blueprint._migration_secure_file(str(link), "input")
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="asserts POSIX chmod(0o600) permission bits, which Windows/NTFS does not enforce",
+)
 def test_migration_worker_values_rejects_untrusted_secret_shapes_and_accepts_valid_input(
     tmp_path,
 ):
@@ -7155,6 +7233,10 @@ def test_deploy_receipt_post_failure_warns_and_exits_nonzero(monkeypatch, capsys
     assert "activation receipt could not be recorded" in err
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="asserts a POSIX chmod(0o755) executable bit, which Windows/NTFS does not enforce",
+)
 def test_deploy_agent_preflight_reports_install_state(monkeypatch, tmp_path, capsys):
     """Preflight reports the host contract and never executes a pending approval."""
     unit = tmp_path / "blueprint-deploy-agent.service"

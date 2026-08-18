@@ -550,8 +550,18 @@ CI_SCRIPT_TEST_DISCOVERY_GLOB="test_*.py"
 # Entries in this list need a capability that the Docker-less standalone lane
 # does not provide. They remain in the CI collection and are collected when the
 # Docker capability is present; the reason makes a local omission reviewable.
+#
+# test_blueprint_cli.py is deliberately NOT here. Its own module docstring
+# states the whole file mocks blueprint_api.api, so no network or operator
+# credentials are required, and every subprocess call the CLI itself makes
+# (docker, alembic, systemctl) is monkeypatched per-test. It ran fine in the
+# Docker-less CI lane before #17295 added a blanket exemption for it with the
+# reason "requires Blueprint operator API configuration and control-plane
+# network" — that reason does not match the file's design and no test in it
+# calls a real API or Docker daemon. Keep it in the roster; if a specific test
+# genuinely needs a capability this lane lacks, exempt that one test with
+# pytest.mark.skipif, not the whole file.
 CI_SCRIPT_TEST_EXEMPTIONS=(
-  "test_blueprint_cli.py|requires Blueprint operator API configuration and control-plane network"
   "test_blueprint_node.py|requires a root-owned system Python and systemd deployment host"
   "test_local_postgres_cutover_integration.py|requires a Docker daemon and two real PostgreSQL containers"
   "test_local_runner.py|requires an enrolled local runner and its host services"
