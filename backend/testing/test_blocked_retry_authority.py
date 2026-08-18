@@ -4,6 +4,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,11 +12,16 @@ from sqlalchemy.orm import sessionmaker
 from sqlmodel import select
 
 from app.blocked_retry_authority import (
+    _VIEWPORT_ADVISORY_POLICY_RECEIPT,
     blocked_precondition_state,
     pending_rollup_precondition_cleared,
     relock_blocked_retry_mutation_authority,
 )
-from app.blocked_task_unblock_sweeps import sweep_unblock_blocked_tasks
+from app.blocked_task_unblock_sweeps import (
+    _BLOCKED_ESCALATED_PARK,
+    _reconcile_escalated_precondition_rows,
+    sweep_unblock_blocked_tasks,
+)
 from app.models import Project, Task, TaskStatus
 from app.task_blocked import strip_fresh_attempt_context
 from app.time_utils import _utcnow
@@ -24,6 +30,183 @@ from app.time_utils import _utcnow
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
     "DATABASE_URL", ""
 ).startswith("postgresql")
+
+
+def _escalated_agent_precondition(
+    project: Project, *, reason: str, now, recheck_after
+) -> Task:
+    return Task(
+        project_id=project.id,
+        title="escalated agent precondition",
+        description="server-clearable blocker",
+        status=TaskStatus.BLOCKED,
+        created_by="ORCHESTRATOR",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={
+            "_blocked_escalated": True,
+            "blocker": {
+                "source": "agent",
+                "reason": reason,
+                "escalated": True,
+            },
+        },
+        blocker_kind="precondition",
+        blocked_reason=reason,
+        latest_status_message=reason,
+        blocked_at=now - timedelta(days=2),
+        recheck_after=recheck_after,
+        created_at=now - timedelta(days=2),
+    )
+
+
+@pytest.mark.asyncio
+async def test_escalated_viewport_blocker_requeues_once_with_policy_receipt(
+    db_session, mocker
+):
+    """A retired viewport gate is admitted once, then its receipt is durable."""
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    now = _utcnow()
+    project = Project(name="blocked-viewport-reconcile", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    reason = "BLOCKER: VIEWPORT_GATE_INFRA_UNAVAILABLE: Chromium cannot launch"
+    blocked = _escalated_agent_precondition(
+        project,
+        reason=reason,
+        now=now,
+        recheck_after=now + _BLOCKED_ESCALATED_PARK,
+    )
+    db_session.add(blocked)
+    await db_session.commit()
+
+    assert await sweep_unblock_blocked_tasks(db_session, now) == 1
+    await db_session.refresh(blocked)
+    assert blocked.status == TaskStatus.QUEUED
+    assert (
+        blocked.context["_blocked_retry_precondition_receipt"]
+        == _VIEWPORT_ADVISORY_POLICY_RECEIPT
+    )
+
+    assert await sweep_unblock_blocked_tasks(db_session, now) == 0
+    await db_session.refresh(blocked)
+    assert blocked.status == TaskStatus.QUEUED
+    assert (
+        blocked.context["_blocked_retry_precondition_receipt"]
+        == _VIEWPORT_ADVISORY_POLICY_RECEIPT
+    )
+
+
+@pytest.mark.asyncio
+async def test_escalated_agent_blocker_without_server_clear_stays_far_parked(
+    db_session, mocker
+):
+    """An ordinary parked agent blocker remains operator-owned."""
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    no_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_blocked_escalation_alert",
+        new_callable=AsyncMock,
+    )
+    now = _utcnow()
+    project = Project(name="blocked-no-server-clear", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    blocked = _escalated_agent_precondition(
+        project,
+        reason="BLOCKER: operator-only external dependency remains unavailable",
+        now=now,
+        recheck_after=now + _BLOCKED_ESCALATED_PARK,
+    )
+    db_session.add(blocked)
+    await db_session.commit()
+
+    assert await sweep_unblock_blocked_tasks(db_session, now) == 0
+    await db_session.refresh(blocked)
+    assert blocked.status == TaskStatus.BLOCKED
+    # Literal pin: the operator park is a multi-year horizon, not a six-hour loop.
+    assert blocked.recheck_after >= now + timedelta(days=3000)
+    assert blocked.context["_blocked_escalated"] is True
+    no_alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_parked_reconciliation_is_idempotent(db_session, mocker):
+    """Admitting a hard-parked row twice only changes its schedule once."""
+
+    now = _utcnow()
+    project = Project(name="blocked-reconcile-idempotence", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    blocked = _escalated_agent_precondition(
+        project,
+        reason="BLOCKER: server capability is now available",
+        now=now,
+        recheck_after=now + _BLOCKED_ESCALATED_PARK,
+    )
+    db_session.add(blocked)
+    await db_session.commit()
+
+    authority = mocker.patch(
+        "app.blocked_task_unblock_sweeps._blocked_precondition_state",
+        new_callable=AsyncMock,
+        return_value="retry",
+    )
+    project_ids = select(Project.id).where(Project.id == project.id)
+    admitted = await _reconcile_escalated_precondition_rows(
+        db_session,
+        now,
+        object(),
+        project_ids=project_ids,
+        batch_size=4,
+    )
+    assert admitted == {blocked.id}
+    await db_session.refresh(blocked)
+    assert blocked.recheck_after == now
+
+    admitted_again = await _reconcile_escalated_precondition_rows(
+        db_session,
+        now,
+        object(),
+        project_ids=project_ids,
+        batch_size=4,
+    )
+    assert admitted_again == set()
+    authority.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reconciled_server_blocker_rearms_at_six_hour_cadence(
+    db_session, mocker
+):
+    """A parked authority check that turns waiting uses the existing cadence."""
+
+    now = _utcnow()
+    project = Project(name="blocked-reconcile-cadence", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    blocked = _escalated_agent_precondition(
+        project,
+        reason="BLOCKER: server capability is temporarily unavailable",
+        now=now,
+        recheck_after=now + _BLOCKED_ESCALATED_PARK,
+    )
+    db_session.add(blocked)
+    await db_session.commit()
+
+    authority = mocker.patch(
+        "app.blocked_task_unblock_sweeps._blocked_precondition_state",
+        new_callable=AsyncMock,
+        side_effect=["retry", "waiting"],
+    )
+    assert await sweep_unblock_blocked_tasks(db_session, now) == 0
+    await db_session.refresh(blocked)
+    assert blocked.status == TaskStatus.BLOCKED
+    assert blocked.context["_blocked_parked_reevals"] == 1
+    # Literal pin: the reachable parked path is six hours, not the 3650-day park.
+    assert now + timedelta(hours=5) < blocked.recheck_after < now + timedelta(hours=7)
+    assert authority.await_count == 2
 
 
 def test_file_conflict_handoff_is_attempt_local():

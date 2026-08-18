@@ -155,6 +155,68 @@ def _next_recheck_delay(attempts: int) -> timedelta:
     return timedelta(seconds=min(secs, _BLOCKED_RECHECK_MAX.total_seconds()))
 
 
+def _is_escalated_needless_agent_blocker(task) -> bool:
+    """Return whether a parked row may still have server retry authority.
+
+    Escalation normally means "leave this for the operator".  Agent blockers are
+    the one exception: the server may have retired the client-side blocker or may
+    now have a different execution-capability epoch.  Rows with a structured need
+    remain on the existing parked-need path, and other blocker sources remain
+    operator-owned.
+    """
+    from app.task_blocked import get_blocker_metadata, get_blocker_needs
+
+    context = task.context or {}
+    return bool(
+        context.get("_blocked_escalated")
+        and task.blocker_kind == "precondition"
+        and not task.depends_on
+        and not get_blocker_needs(task)
+        and get_blocker_metadata(task).get("source") == "agent"
+    )
+
+
+async def _reconcile_escalated_precondition_rows(
+    session,
+    now: datetime,
+    verify_pr_merged,
+    *,
+    project_ids,
+    batch_size: int,
+) -> set:
+    """Admit already hard-parked rows whose existing authority can clear them.
+
+    This is deliberately a scheduling-only reconciliation.  It does not alert,
+    requeue, or add durable machinery; the ordinary sweep remains the single
+    transition owner.  Filtering to rows still beyond the parked horizon makes a
+    second invocation a no-op for every row admitted by the first invocation.
+    """
+    candidates = (
+        await session.execute(
+            select(Task)
+            .where(
+                Task.status == TaskStatus.BLOCKED,
+                Task.project_id.in_(project_ids),
+                Task.recheck_after > now,
+            )
+            .order_by(Task.recheck_after.asc(), Task.blocked_at.asc().nullsfirst())
+            .limit(batch_size)
+        )
+    ).scalars().all()
+    admitted: set = set()
+    for task in candidates:
+        if not _is_escalated_needless_agent_blocker(task):
+            continue
+        state = await _blocked_precondition_state(task, session, verify_pr_merged)
+        if state in {"clear", "retry"}:
+            task.recheck_after = now
+            session.add(task)
+            admitted.add(task.id)
+    if admitted:
+        await session.flush()
+    return admitted
+
+
 def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None:
     """Reset a task's durable blocker metadata and defer bookkeeping on unblock.
 
@@ -1192,6 +1254,19 @@ async def sweep_unblock_blocked_tasks(
         Project.archived.is_(False),
     )
 
+    # A prior escalation parked these rows beyond the due horizon.  Re-admit a
+    # bounded set only when the same server-owned authority already says that the
+    # blocker is clear or that a distinct execution capability epoch can retry.
+    # The recheck_after > now predicate makes this one-shot per admitted row; the
+    # normal due query below owns the actual transition and any broadcast.
+    reconciled_precondition_ids = await _reconcile_escalated_precondition_rows(
+        session,
+        now,
+        verify_pr_merged,
+        project_ids=resumable_project_ids,
+        batch_size=batch_size,
+    )
+
     # Lock-free pre-scan: collect IDs without holding a batch of row locks across
     # the per-task GitHub calls (_blocked_precondition_state → verify_pr_merged,
     # up to 120s each). A batch FOR UPDATE on 200 rows held that entire window —
@@ -1496,14 +1571,16 @@ async def sweep_unblock_blocked_tasks(
                     await _commit_task_row(_bc_start)
                     continue
             # Need-less parked blocker — handle transient vs durable separately.
-            # Transient blockers (file_conflict, pending_rollup) clear when the
-            # overlapping in-flight task merges; re-evaluate their precondition
-            # state so they requeue automatically when the conflict lifts, or
-            # re-arm with bounded backoff while it persists.  A need-less
-            # NON-transient blocker keeps the far-future park and stays for
-            # the operator.
+            # Transient blockers (file_conflict, pending_rollup) and the narrow
+            # server-owned agent-precondition exception both re-evaluate through
+            # the same authority.  Other need-less blockers keep the far-future
+            # park and stay for the operator.
             is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
-            if is_transient:
+            is_server_precondition = _is_escalated_needless_agent_blocker(task) and (
+                task.id in reconciled_precondition_ids
+                or int(ctx.get("_blocked_parked_reevals", 0)) > 0
+            )
+            if is_transient or is_server_precondition:
                 parked_retry_receipt: dict = {}
                 state = await _blocked_precondition_state(
                     task,
@@ -1511,7 +1588,16 @@ async def sweep_unblock_blocked_tasks(
                     verify_pr_merged,
                     retry_receipt_out=parked_retry_receipt,
                 )
-                if state == "clear":
+                if state in {"clear", "retry"}:
+                    optimistic_used = int(ctx.get("_blocked_optimistic_retries", 0))
+                    if (
+                        state == "retry"
+                        and optimistic_used >= _BLOCKED_OPTIMISTIC_RETRY_CAP
+                    ):
+                        task.recheck_after = now + _BLOCKED_ESCALATED_PARK
+                        session.add(task)
+                        await _commit_task_row(_bc_start)
+                        continue
                     receipt = parked_retry_receipt.get("receipt")
                     task = await _relock_blocked_retry_mutation_authority(session, task)
                     if task is None:
@@ -1519,7 +1605,7 @@ async def sweep_unblock_blocked_tasks(
                         continue
                     _reset_blocked_task_for_requeue(
                         task,
-                        preserve_first_blocked=False,
+                        preserve_first_blocked=(state == "retry"),
                         context_updates=(
                             {_BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY: receipt}
                             if isinstance(receipt, dict)
@@ -1528,8 +1614,22 @@ async def sweep_unblock_blocked_tasks(
                     )
                     task.status = TaskStatus.QUEUED
                     task.latest_status_message = (
-                        "Unblocked — transient conflict cleared, requeued"
+                        (
+                            "Unblocked — transient conflict cleared, requeued"
+                            if is_transient
+                            else "Unblocked — server precondition cleared, requeued"
+                        )
+                        if state == "clear"
+                        else (
+                            "Unblocked — optimistic infra-precondition retry "
+                            f"{optimistic_used + 1}/{_BLOCKED_OPTIMISTIC_RETRY_CAP}"
+                        )
                     )
+                    if state == "retry":
+                        ctx = dict(task.context or {})
+                        ctx["_blocked_optimistic_retries"] = optimistic_used + 1
+                        ctx["_blocked_last_retry_at"] = now.isoformat()
+                        task.context = ctx
                     flag_modified(task, "context")
                     session.add(task)
                     requeued += 1
@@ -1544,7 +1644,15 @@ async def sweep_unblock_blocked_tasks(
                         )
                     )
                 else:
-                    task.recheck_after = now + _BLOCKED_PARKED_REEVAL_INTERVAL
+                    reevals = int(ctx.get("_blocked_parked_reevals", 0)) + 1
+                    ctx["_blocked_parked_reevals"] = reevals
+                    task.context = ctx
+                    flag_modified(task, "context")
+                    task.recheck_after = (
+                        now + _BLOCKED_PARKED_REEVAL_INTERVAL
+                        if reevals < _BLOCKED_PARKED_REEVAL_CAP
+                        else now + _BLOCKED_ESCALATED_PARK
+                    )
                     session.add(task)
                 await _commit_task_row(_bc_start)
                 continue
