@@ -633,10 +633,10 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
     Array.from({ length: n }, (_, i) => `M\tsrc/file${i}.ts`).join('\n');
 
   it('small-scope PR exceeding threshold gets overflow preamble WITHOUT "lower priority" text', async () => {
-    // 8 files > small threshold of 6.
+    // 9 files > small threshold of 8 (SCOPE_OVERFLOW_THRESHOLDS.small).
     vi.mocked(indexMod.git).mockImplementation((args: string[]) => {
       if (Array.isArray(args) && args[0] === 'diff' && args[1] === '--name-status') {
-        return fakeDiffNameStatus(8);
+        return fakeDiffNameStatus(9);
       }
       return '';
     });
@@ -656,7 +656,7 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
   });
 
   it('small-scope PR within threshold keeps the small-scope preamble (no overflow note)', async () => {
-    // 3 files within small threshold of 6.
+    // 3 files within small threshold of 8 (SCOPE_OVERFLOW_THRESHOLDS.small).
     vi.mocked(indexMod.git).mockImplementation((args: string[]) => {
       if (Array.isArray(args) && args[0] === 'diff' && args[1] === '--name-status') {
         return fakeDiffNameStatus(3);
@@ -670,15 +670,16 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
     );
 
     const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
-    expect(prompt).toContain('Security and performance sections are lower priority');
+    expect(prompt).toContain('apply full rigor to what the diff actually touches');
+    expect(prompt).toContain('A small diff does not discount contract defects');
     expect(prompt).not.toContain('exceeds the typical range');
   });
 
   it('medium-scope PR exceeding threshold replaces empty preamble with overflow note', async () => {
-    // 12 files > medium threshold of 10.
+    // 17 files > medium threshold of 16 (SCOPE_OVERFLOW_THRESHOLDS.medium).
     vi.mocked(indexMod.git).mockImplementation((args: string[]) => {
       if (Array.isArray(args) && args[0] === 'diff' && args[1] === '--name-status') {
-        return fakeDiffNameStatus(12);
+        return fakeDiffNameStatus(17);
       }
       return '';
     });

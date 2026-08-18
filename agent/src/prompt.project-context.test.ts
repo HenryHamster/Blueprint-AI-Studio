@@ -543,7 +543,7 @@ describe('formatProjectContext', () => {
     const ctx = { cochange_files: ['src/foo.ts', 'src/bar.ts'] };
     const result = formatProjectContext(ctx, 'create', 'medium', '', 3);
     expect(result).toContain('Frequently Co-Changed Files');
-    expect(result).toContain('Budget note: you have 7 production file slots remaining');
+    expect(result).toContain('Budget note: you have 13 production file slots remaining');
   });
 
   it('omits co-change budget note for non-medium scopes', () => {
@@ -1482,10 +1482,10 @@ describe('buildRetryContext', () => {
     expect(result).toContain('## Previous Attempt (attempt #1 of 4 failed)');
     expect(result).toContain('Retry budget: attempt 2 of 4 (2 retries remaining after this one)');
     expect(result).not.toContain('Final attempt');
-    expect(result).not.toContain('Be conservative');
+    expect(result).not.toContain('Stay focused on the root cause');
   });
 
-  it('warns to be conservative when exactly one retry remains after this one', () => {
+  it('warns to stay focused when exactly one retry remains after this one', () => {
     const task = {
       context: {
         _attempt_number: 3,
@@ -1497,10 +1497,10 @@ describe('buildRetryContext', () => {
     const result = buildRetryContext(task);
     expect(result).toContain('attempt 3 of 4');
     expect(result).toContain('1 retry remaining after this one');
-    expect(result).toContain('Be conservative');
+    expect(result).toContain('Stay focused on the root cause');
   });
 
-  it('flags the final attempt and urges a conservative strategy when no retries remain', () => {
+  it('flags the final attempt and urges addressing the root cause completely when no retries remain', () => {
     const task = {
       context: {
         _attempt_number: 4,
@@ -1513,8 +1513,8 @@ describe('buildRetryContext', () => {
     expect(result).toContain('## Previous Attempt (attempt #3 of 4 failed)');
     expect(result).toContain('Final attempt (4 of 4)');
     expect(result).toContain('no retries remain after this one');
-    expect(result).toContain('conservative strategy');
-    expect(result).toContain('smallest viable change');
+    expect(result).toContain('Address the root cause directly and completely');
+    expect(result).toContain("don't fragment the fix to keep the diff small");
   });
 
   it('ignores inconsistent _max_attempts less than _attempt_number', () => {

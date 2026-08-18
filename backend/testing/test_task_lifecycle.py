@@ -2578,13 +2578,13 @@ def test_build_scope_overflow_details_returns_empty_without_changed_files():
 def test_build_scope_overflow_details_reports_expansion_ratio():
     """Expansion ratio is computed against SCOPE_OVERFLOW_THRESHOLDS for the failed scope."""
     ctx = {
-        "_previous_changed_files": [f"backend/app/f{i}.py" for i in range(15)],
+        "_previous_changed_files": [f"backend/app/f{i}.py" for i in range(24)],
     }
     block = _build_scope_overflow_details(ctx, "medium")
-    assert "Files touched: 15" in block
-    # medium threshold is 10 -> over by 5, 1.5x budget
-    assert "medium=10" in block
-    assert "over by 5" in block
+    assert "Files touched: 24" in block
+    # medium threshold is 16 -> over by 8, 1.5x budget
+    assert "medium=16" in block
+    assert "over by 8" in block
     assert "1.5x" in block
 
 
@@ -8016,11 +8016,17 @@ class TestCloseOrphanPrIfAny:
         assert close_mock.await_args.args[3] == 5983
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("payload_type", ["review"])
+    @pytest.mark.parametrize("payload_type", ["review", "fix"])
     async def test_review_cancel_does_not_close_reviewed_pr(
         self, tl_db, mocker, payload_type
     ):
-        """A reviewer references the implementation PR but never owns it."""
+        """A reviewer references the implementation PR but never owns it.
+
+        Fix tasks likewise: they push commits onto the PR's existing branch
+        and record it in review_loop.pr_number, but never open a PR of their
+        own. Regression for PR #17395 (2026-08-17): admin-cancelling a fix
+        child closed the rollup PR it was pointed at, stranding the parent.
+        """
         from app import task_lifecycle as tl
 
         session, _ = tl_db

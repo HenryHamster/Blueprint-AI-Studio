@@ -172,6 +172,12 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "runner.token_stale": OPERATOR_ACTION_NEEDED,
     "runner.fleet_no_healthy": OPERATOR_ACTION_NEEDED,
     "runner.post_update_silent": OPERATOR_ACTION_NEEDED,
+    # runner.update_drain_stuck: same update-failure family as
+    # runner.post_update_silent — the runner is stuck idle in auto-update
+    # drain (accepting no claims) instead of going silent outright. Same
+    # operator remediation (check the runner journal / redeploy), so it
+    # gets the same audience.
+    "runner.update_drain_stuck": OPERATOR_ACTION_NEEDED,
     "runner.cross_project_access": OPERATOR_ACTION_NEEDED,
     # GCE task-VM proactive resource-health alerts (warm-pool monitoring parity):
     # surfaced to the operator so an OOM- or disk-bound VM is visible in the fleet

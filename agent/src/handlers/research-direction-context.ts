@@ -34,7 +34,7 @@ export function formatCochangeHints(directionCtx: Record<string, unknown> | unde
   if (pairs.length === 0) return '';
   pairs.sort((a, b) => b[2] - a[2]);
   const lines = pairs.map(([a, b, s]) => `- ${a} ↔ ${b} (affinity: ${s})`);
-  return `## Co-Change Affinity Hints\n\nBased on prior merged PRs, these files in your task's scope have historically changed together. Prefer to keep high-affinity pairs in the same subtask; files without listed affinity can safely be split into independent subtasks.\n\n${lines.join('\n')}\n\n`;
+  return `## Co-Change Affinity Hints\n\nBased on prior merged PRs, these files in your task's scope have historically changed together. Prefer to keep high-affinity pairs in the same subtask. Absence of a listed affinity is NOT evidence of independence — contract coupling (shared APIs, schemas, invariants) does not show up in co-change history, so judge splits by whether the pieces share a contract, not by this table alone.\n\n${lines.join('\n')}\n\n`;
 }
 
 export function formatDecompositionOutcomes(directionCtx: Record<string, unknown> | undefined): string {
@@ -62,26 +62,14 @@ export function formatDecompositionOutcomes(directionCtx: Record<string, unknown
     lines.push(`- Max dependency depth: ${o.max_dependency_depth}`);
   }
 
-  const hints: string[] = [];
-  const avgFiles = typeof o.avg_files_per_subtask === 'number' ? o.avg_files_per_subtask : 0;
-  const maxDep = typeof o.max_dependency_depth === 'number' ? o.max_dependency_depth : 0;
-  const mergeRate = typeof o.avg_subtask_merge_rate === 'number' ? o.avg_subtask_merge_rate : null;
-  const xmodCorr = o.high_cross_module_correlates_with_low_merge === true;
-  if (avgFiles > 5 && (mergeRate === null || mergeRate < 0.6)) {
-    hints.push('Prior subtasks averaged many files and had middling merge rates — prefer smaller subtasks.');
-  }
-  if (maxDep > 3) {
-    hints.push('Prior decompositions had deep dependency chains — flatten the dependency graph.');
-  }
-  if (xmodCorr) {
-    hints.push('Cross-module subtasks (>=2 top-level dirs) correlate with lower merge rates — keep each subtask scoped to one module where possible.');
-  }
-
-  const hintSection = hints.length > 0
-    ? `\n\nActionable guidance:\n${hints.map(h => `- ${h}`).join('\n')}`
-    : '';
-
-  return `## Prior Decomposition Outcomes\n\nMetrics from recent plan decompositions in this direction:\n${lines.join('\n')}${hintSection}\n\n`;
+  // NOTE: these metrics are PROXIES, not goals. Per-subtask merge rate is
+  // blind to integration cost — N small file-disjoint subtasks can each merge
+  // cleanly while breaking each other's contracts, pushing the real cost into
+  // review/fix churn on the rollup. Do not derive "make subtasks smaller /
+  // flatter / single-module" imperatives from this table (a prior version did,
+  // and it trained the pipeline to shred coherent work). Decompose along
+  // contract boundaries at the size the work actually needs.
+  return `## Prior Decomposition Outcomes\n\nMetrics from recent plan decompositions in this direction (context only — these are proxies; per-subtask merge rate ignores integration cost across siblings, so do NOT shrink or flatten a decomposition just to chase it):\n${lines.join('\n')}\n\n`;
 }
 
 export function formatPreviousDecisionOutcomes(raw: unknown): string {

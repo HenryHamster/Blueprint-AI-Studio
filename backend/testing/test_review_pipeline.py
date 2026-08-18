@@ -1373,6 +1373,7 @@ class TestShouldAutoApproveSmallDiff:
         assert "0 non-test lines" in reason
 
     def test_scope_overflow_warning_disables_auto_approve(self):
+        # 9 non-test files > small overflow threshold (8)
         t = self._task(
             scope="small",
             files=[
@@ -1383,6 +1384,8 @@ class TestShouldAutoApproveSmallDiff:
                 "app/e.py",
                 "app/f.py",
                 "app/g.py",
+                "app/h.py",
+                "app/i.py",
             ],
             diff=[
                 {"file": "app/a.py", "added": 1, "removed": 0},
@@ -6326,8 +6329,8 @@ async def test_scope_budget_utilization_attached_to_fix_from_source_files(
     assert util["scope"] == "medium"
     assert util["file_count"] == 7
     assert util["non_test_file_count"] == 5
-    assert util["budget"] == 10  # medium production_files_max
-    assert util["percentage"] == 50
+    assert util["budget"] == 16  # medium production_files_max
+    assert util["percentage"] == 31
 
 
 @pytest.mark.asyncio
@@ -6389,7 +6392,7 @@ async def test_scope_budget_utilization_falls_back_to_create_task(db_session, mo
     util = (result.context or {}).get("scope_budget_utilization")
     assert util is not None
     assert util["non_test_file_count"] == 2
-    assert util["budget"] == 6  # small total_files_max
+    assert util["budget"] == 8  # small total_files_max
     assert util["scope"] == "small"
 
 
@@ -6479,8 +6482,8 @@ async def test_scope_budget_utilization_attached_to_review_spawn(db_session, moc
 
 @pytest.mark.asyncio
 async def test_scope_pressure_graduated_cap_at_mid_utilization(db_session, mocker):
-    """Medium task at 80% (8/10 prod) gets a graduated cap well below per_chain_cap
-    but no no-new-files prompt (below 90%)."""
+    """Medium task at ~81% (13/16 prod) gets a graduated cap well below
+    per_chain_cap but no no-new-files prompt (below 90%)."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -6497,7 +6500,7 @@ async def test_scope_pressure_graduated_cap_at_mid_utilization(db_session, mocke
         ],
         context={
             "scope": "medium",
-            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(8)]
+            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(13)]
             + ["backend/testing/test_a.py"],
             "review_loop": {"iteration": 0},
         },
@@ -6517,8 +6520,8 @@ async def test_scope_pressure_graduated_cap_at_mid_utilization(db_session, mocke
     )
     assert created is True and result is not None
     ctx = result.context or {}
-    # source iteration=0 → spawned iteration=1, base_remaining=11, 80% util
-    # → round(11 * 0.20) = 2 remaining, hard_cap = 1 + 2 = 3
+    # source iteration=0 → spawned iteration=1, base_remaining=11, 81.25% util
+    # (13/16) → round(11 * 0.1875) = 2 remaining, hard_cap = 1 + 2 = 3
     assert ctx.get("_scope_budget_hard_cap") == 3
     # No no-new-files prompt below 90%
     payload = result.payloads[0] if result.payloads else {}
@@ -6527,7 +6530,7 @@ async def test_scope_pressure_graduated_cap_at_mid_utilization(db_session, mocke
 
 @pytest.mark.asyncio
 async def test_scope_pressure_floor_of_two_at_high_utilization(db_session, mocker):
-    """At 80% the graduated formula floors at 2; at 100% it still floors at 2."""
+    """At ~81% the graduated formula floors at 2; at 100% it still floors at 2."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -6544,7 +6547,9 @@ async def test_scope_pressure_floor_of_two_at_high_utilization(db_session, mocke
         ],
         context={
             "scope": "medium",
-            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(8)],  # 8/10=80%
+            "_pr_changed_files": [
+                f"backend/app/p{i}.py" for i in range(13)
+            ],  # 13/16=81.25%
             "review_loop": {"iteration": 0},
         },
     )
@@ -6562,11 +6567,11 @@ async def test_scope_pressure_floor_of_two_at_high_utilization(db_session, mocke
         fix_prompt="fix",
     )
     ctx = result.context or {}
-    # iteration=1, base_remaining=11, 80% util → round(11*0.20)=2 → floor=2 →
+    # iteration=1, base_remaining=11, 81.25% util → round(11*0.1875)=2 → floor=2 →
     # hard_cap=1+2=3
     assert ctx.get("_scope_budget_hard_cap") == 3
     payload = result.payloads[0] if result.payloads else {}
-    # 80% < 90% → no hard_prefix yet
+    # 81.25% < 90% → no hard_prefix yet
     assert "SCOPE BUDGET EXHAUSTED" not in (payload.get("prompt") or "")
 
 
@@ -6590,8 +6595,8 @@ async def test_scope_pressure_no_new_files_still_at_90_percent(db_session, mocke
         context={
             "scope": "medium",
             "_pr_changed_files": [
-                f"backend/app/p{i}.py" for i in range(10)
-            ],  # 10/10=100%
+                f"backend/app/p{i}.py" for i in range(16)
+            ],  # 16/16=100%
             "review_loop": {"iteration": 0},
         },
     )
@@ -6664,7 +6669,7 @@ async def test_scope_pressure_large_scope_at_70_percent(db_session, mocker):
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
-    # Large scope has 20 file budget; 70% = 14 files. Use 15 files to exceed threshold.
+    # Large scope has a 32-file budget; 70% = 22.4 files. Use 24 files (75%).
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
@@ -6678,7 +6683,7 @@ async def test_scope_pressure_large_scope_at_70_percent(db_session, mocker):
         ],
         context={
             "scope": "large",
-            "_pr_changed_files": [f"backend/app/large_{i}.py" for i in range(15)]
+            "_pr_changed_files": [f"backend/app/large_{i}.py" for i in range(24)]
             + ["backend/testing/test_large.py"],
             "review_loop": {"iteration": 0},
         },
@@ -6699,7 +6704,7 @@ async def test_scope_pressure_large_scope_at_70_percent(db_session, mocker):
     assert created is True and result is not None
     ctx = result.context or {}
     # source iteration=0 → spawned iteration=1, base_cap=16, base_remaining=15, 75% util
-    # (15/20 non-test files = 75%) → round(15 * 0.25) = 4 remaining,
+    # (24/32 non-test files = 75%) → round(15 * 0.25) = 4 remaining,
     # no floor needed since 4 >= 3 → hard_cap = 1 + 4 = 5
     assert ctx.get("_scope_budget_hard_cap") == 5
     # No no-new-files prompt below 90%
@@ -6727,8 +6732,8 @@ async def test_prior_hard_cap_propagates_while_under_pressure(db_session, mocker
         ],
         context={
             "scope": "medium",
-            # 8/10 non-test = 80% (above warn threshold)
-            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(8)]
+            # 13/16 non-test = 81.25% (above warn threshold)
+            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(13)]
             + ["backend/testing/test_a.py"],
             "_scope_budget_hard_cap": 2,  # tighter than any freshly-derived cap
             "review_loop": {"iteration": 0},
@@ -8711,12 +8716,13 @@ class TestComputeScopeBudgetUtilization:
         )
 
     def test_small_scope_mixed_files(self):
-        # small budget = 6 (total_files_max); 3 non-test files → 50%
+        # small budget = 8 (total_files_max); 4 non-test files → 50%
         result = _compute_scope_budget_utilization(
             [
                 "backend/app/a.py",
                 "backend/app/b.py",
                 "backend/app/c.py",
+                "backend/app/d.py",
                 "backend/testing/test_a.py",
                 "backend/testing/test_b.py",
             ],
@@ -8724,21 +8730,21 @@ class TestComputeScopeBudgetUtilization:
         )
         assert result == {
             "scope": "small",
-            "file_count": 5,
-            "non_test_file_count": 3,
-            "budget": 6,
+            "file_count": 6,
+            "non_test_file_count": 4,
+            "budget": 8,
             "percentage": 50,
         }
 
     def test_medium_scope_uses_production_files_max(self):
-        # medium production_files_max = 10; 10 non-test → 100%
-        files = [f"backend/app/m{i}.py" for i in range(10)] + [
+        # medium production_files_max = 16; 16 non-test → 100%
+        files = [f"backend/app/m{i}.py" for i in range(16)] + [
             "backend/testing/test_m.py"
         ]
         result = _compute_scope_budget_utilization(files, "medium")
-        assert result["budget"] == 10
-        assert result["non_test_file_count"] == 10
-        assert result["file_count"] == 11
+        assert result["budget"] == 16
+        assert result["non_test_file_count"] == 16
+        assert result["file_count"] == 17
         assert result["percentage"] == 100
 
     def test_all_test_files_zero_non_test(self):
@@ -8755,10 +8761,10 @@ class TestComputeScopeBudgetUtilization:
         assert result["percentage"] == 0
 
     def test_large_scope_budget(self):
-        # large total_files_max = 20; 10 non-test → 50%
-        files = [f"backend/app/l{i}.py" for i in range(10)]
+        # large total_files_max = 32; 16 non-test → 50%
+        files = [f"backend/app/l{i}.py" for i in range(16)]
         result = _compute_scope_budget_utilization(files, "large")
-        assert result["budget"] == 20
+        assert result["budget"] == 32
         assert result["percentage"] == 50
 
 
@@ -9510,6 +9516,8 @@ async def test_scope_overflow_warning_propagates_to_review_context_and_prompt(
                 "backend/app/e.py",
                 "backend/app/f.py",
                 "backend/app/g.py",
+                "backend/app/h.py",
+                "backend/app/i.py",
             ],
             "review_loop": {"iteration": 0},
         },
@@ -9533,8 +9541,8 @@ async def test_scope_overflow_warning_propagates_to_review_context_and_prompt(
     assert ctx.get("scope_overflow_warned") is True
     overflow = ctx.get("scope_overflow_warning") or {}
     assert overflow.get("scope") == "small"
-    assert overflow.get("threshold") == 6
-    assert overflow.get("non_test_file_count") == 7
+    assert overflow.get("threshold") == 8
+    assert overflow.get("non_test_file_count") == 9
     assert (ctx.get("review_loop") or {}).get("scope_overflow_warned") is True
 
     payload = result.first_payload or {}
@@ -9545,7 +9553,7 @@ async def test_scope_overflow_warning_propagates_to_review_context_and_prompt(
     await db_session.refresh(source_task)
     source_ctx = source_task.context or {}
     assert source_ctx.get("scope_overflow_warned") is True
-    assert (source_ctx.get("scope_overflow_warning") or {}).get("threshold") == 6
+    assert (source_ctx.get("scope_overflow_warning") or {}).get("threshold") == 8
 
 
 @pytest.mark.asyncio
@@ -9569,6 +9577,8 @@ async def test_scope_overflow_pr_signal_emitted_once(db_session, mocker):
         "backend/app/e.py",
         "backend/app/f.py",
         "backend/app/g.py",
+        "backend/app/h.py",
+        "backend/app/i.py",
     ]
     source_task = make_task(
         project_id=project.id,
@@ -9607,8 +9617,8 @@ async def test_scope_overflow_pr_signal_emitted_once(db_session, mocker):
     first_comment = comment_mock.await_args.args[4]
     assert "Scope overflow detected" in first_comment
     assert "- Declared scope: `small`" in first_comment
-    assert "- Non-test files changed: `7`" in first_comment
-    assert "- Scope budget: `6`" in first_comment
+    assert "- Non-test files changed: `9`" in first_comment
+    assert "- Scope budget: `8`" in first_comment
     for path in overflow_files:
         assert f"- `{path}`" in first_comment
 

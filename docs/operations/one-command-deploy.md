@@ -16,9 +16,12 @@ python scripts/blueprint.py deploy --sha 74bf87c  # a specific main build
 
 The client finds the newest successful "Deploy Blueprint" run on `main`,
 downloads its `local-app-release.json` + `.sha256` artifact, verifies the
-checksum, and invokes the host-side shim over SSH. This remains the supported
-manual/emergency path: `--sha`, `--force`, `--dry-run`, and interactive
-confirmation keep their existing behavior.
+checksum, and submits the digest + revision to the host's root-owned release
+socket by piping `scripts/release_socket_submit.py` over SSH to the host's
+`python3` (the SSH account only needs the socket group ACL — no sudoers
+grant exists, the bootstrap removes the legacy one). This remains the
+supported manual/emergency path: `--sha`, `--force`, `--dry-run`, and
+interactive confirmation keep their existing behavior.
 
 ## Host-side shim and root release service (one-time install)
 

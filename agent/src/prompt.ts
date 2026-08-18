@@ -569,8 +569,10 @@ When implementing a feature or fix, do NOT introduce:
 - "Log-only" / observe mode that defers enforcement to a follow-up task
 
 These patterns re-introduce the hedging that every clean-up cycle has to remove later.
-If the change is correct, ship it on. If it is unsafe without a flag, the task scope is
-too broad — narrow the scope and ship the safe portion, then file a follow-up.
+If the change is correct, ship it on. If it is unsafe without a flag, finish what
+makes it safe — update the other side of the contract, migrate the callers — rather
+than shipping a partial change behind a hidden gate. If something genuinely blocks
+that, say so with a NOTE instead of quietly shrinking the change to fit.
 `;
 
 // Decision discipline: spend cheap self-critique tokens BEFORE proposing so the
@@ -1673,11 +1675,11 @@ export function buildRetryContext(task: Record<string, unknown>): string {
     const remainingAfter = Math.max(0, maxAttempts - attemptNumber);
     if (remainingAfter === 0) {
       lines.push(
-        `**Final attempt (${attemptNumber} of ${maxAttempts}) — no retries remain after this one.** Adopt a conservative strategy: prefer the smallest viable change that addresses the root cause. Fewer files, simpler approach, avoid speculative refactors or scope expansion.`,
+        `**Final attempt (${attemptNumber} of ${maxAttempts}) — no retries remain after this one.** Address the root cause directly and completely — don't fragment the fix to keep the diff small. Avoid speculative refactors or scope expansion unrelated to the fix.`,
       );
     } else if (remainingAfter === 1) {
       lines.push(
-        `Retry budget: attempt ${attemptNumber} of ${maxAttempts} (1 retry remaining after this one). **Be conservative** — narrow scope where possible and avoid speculative changes.`,
+        `Retry budget: attempt ${attemptNumber} of ${maxAttempts} (1 retry remaining after this one). **Stay focused on the root cause** — avoid speculative changes unrelated to the fix.`,
       );
     } else {
       lines.push(

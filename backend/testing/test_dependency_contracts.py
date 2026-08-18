@@ -989,11 +989,12 @@ class TestResearchSiblingFileOverlapSerialization:
         assert len(overlaps) == 1
 
     @pytest.mark.asyncio
-    async def test_incidental_shared_file_does_not_serialize_independent_work(
-        self, db_session
-    ):
-        """One shared integration file across otherwise disjoint scopes is a
-        merge warning, not evidence that the later task consumes the earlier."""
+    async def test_single_shared_integration_file_serializes(self, db_session):
+        """Even one shared file across otherwise disjoint scopes serializes the
+        pair: a shared file is the contract surface where parallel siblings
+        collide — the later PR is built on a base without the earlier sibling's
+        change to it, so they'd race at merge. There is deliberately no
+        overlap-ratio threshold."""
         from app.research_completion import (
             _log_file_overlaps,
             _wire_research_sibling_edges,
@@ -1011,9 +1012,10 @@ class TestResearchSiblingFileOverlapSerialization:
         )
 
         assert len(overlaps) == 1
-        assert wired == []
+        assert len(wired) == 1
+        assert wired[0][2] == ["backend/app/models.py"]
         assert (children[0].depends_on or []) == []
-        assert (children[1].depends_on or []) == []
+        assert (children[1].depends_on or []) == [str(children[0].id)]
 
     @pytest.mark.asyncio
     async def test_fully_contained_smaller_scope_serializes(self, db_session):

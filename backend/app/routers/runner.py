@@ -176,6 +176,11 @@ _PROJECT_VERIFICATION_VERSION = 1
 _MAX_PROJECT_VERIFICATION_REASON_CHARS = 500
 _PROJECT_VERIFICATION_BACKENDS = frozenset({"bwrap", "declined"})
 _PROJECT_VERIFICATION_BOUNDARY_CLASS = "agent"
+# An idle runner normally completes its self-update within one or two 60s
+# retry cycles; an idle drain older than this means the update is failing
+# repeatedly (e.g. version hint unreachable from the branch the runner
+# tracks) and the runner is silently out of the dispatch pool.
+_UPDATE_DRAIN_STUCK_ALERT_SECONDS = 30 * 60
 
 
 def _sanitize_image_cache_by_project(raw: Any) -> dict | None:
@@ -1768,6 +1773,78 @@ async def heartbeat(
                     "entered" if not was_update_draining else "remains in",
                     released_pins,
                 )
+            # Server-owned stuck-drain detection. The runner's own
+            # /update-report failure call is best-effort, swallowed on error,
+            # and deduped to one report per distinct failure per daemon
+            # lifetime — when the report is lost, an update-wedged runner
+            # drains silently forever (fleet-wide dispatch outage 2026-08-17:
+            # serving advertised a version hint unreachable from main; every
+            # runner looped update-retry every 60s with zero alerts). Track
+            # the drain episode here from heartbeats alone and raise one
+            # WARNING alert per episode once an IDLE runner has been
+            # draining past the threshold — an idle runner normally updates
+            # within one heartbeat interval, so a long idle drain means the
+            # update keeps failing.
+            if not was_update_draining:
+                caps["update_draining_since"] = now.isoformat()
+                caps.pop("update_drain_alerted_at", None)
+            elif not caps.get("update_draining_since"):
+                caps["update_draining_since"] = now.isoformat()
+            try:
+                _drain_age_s = (
+                    now - datetime.fromisoformat(str(caps["update_draining_since"]))
+                ).total_seconds()
+            except (TypeError, ValueError):
+                caps["update_draining_since"] = now.isoformat()
+                _drain_age_s = 0.0
+            if payload.active_work_report:
+                _drain_active_work = bool(
+                    payload.active_task_ids or payload.active_compute_job_ids
+                )
+            else:
+                _drain_active_work = bool(
+                    (caps.get("active_task_ids") or [])
+                    or (caps.get("active_compute_job_ids") or [])
+                )
+            if (
+                _drain_age_s > _UPDATE_DRAIN_STUCK_ALERT_SECONDS
+                and not _drain_active_work
+                and not caps.get("update_drain_alerted_at")
+            ):
+                caps["update_drain_alerted_at"] = now.isoformat()
+                from app.main import _current_sha
+
+                _runner_label = runner.hostname or f"runner {str(runner_id)[:8]}"
+                session.add(
+                    Alert(
+                        project_id=runner_project_id,
+                        severity=AlertSeverity.WARNING,
+                        title=f"Runner stuck in update drain: {_runner_label}",
+                        message=(
+                            f"Self-hosted runner {_runner_label} "
+                            f"({str(runner_id)[:8]}) has been idle in "
+                            f"auto-update drain for {int(_drain_age_s // 60)} "
+                            f"minutes — the self-update is failing repeatedly "
+                            f"(runner version {str(runner.version or '?')[:12]}, "
+                            f"orchestrator hint {str(_current_sha)[:12]}). The "
+                            "runner accepts no claims while draining. Check "
+                            "the runner journal; if the hint commit is not "
+                            "reachable from the branch the runner tracks "
+                            "(main), deploy a main-reachable revision."
+                        )[:1000],
+                        source="runner",
+                        event_type="runner.update_drain_stuck",
+                    )
+                )
+                logger.error(
+                    "[RUNNERS] Runner %s idle in update drain for %.0f min — "
+                    "raised runner.update_drain_stuck alert",
+                    runner_id,
+                    _drain_age_s / 60,
+                )
+        else:
+            caps.pop("update_draining_since", None)
+            caps.pop("update_drain_alerted_at", None)
     # Refresh the reported active-work set + its report timestamp ONLY for a
     # genuine active-work report. A ``--check`` preflight posts active_task_ids=[]
     # as a probe (active_work_report=False), NOT a real report: writing that empty

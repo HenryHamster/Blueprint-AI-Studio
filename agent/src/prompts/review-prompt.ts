@@ -41,7 +41,7 @@ export const REVIEW_DELTA_FOCUS_NOTE = (
 function buildReviewBudgetMidHint(maxIters: number): string {
   return `\nBudget-awareness: you are at or past 50% of the ${maxIters}-iteration budget. Do NOT flag MINOR-severity issues — every iteration now costs a meaningful fraction of remaining budget and cosmetic nits are not worth a round trip. Focus only on CRITICAL and MAJOR findings. If only MINOR issues remain, APPROVE and note them as non-blocking polish in \`feedback\`.`;
 }
-export const REVIEW_SMALL_SCOPE_EARLY_HINT = `\nSmall-scope early-iteration guidance: MINOR-severity issues (cosmetic nits, naming preferences, non-critical style) are NON-BLOCKING for small-scope changes. Do NOT include them in the \`issues\` array — mention them in \`feedback\` as optional polish. Only CRITICAL and MAJOR issues should drive a REQUEST_CHANGES verdict. A small-scope PR with only MINOR findings should APPROVE.`;
+export const REVIEW_SMALL_SCOPE_EARLY_HINT = `\nSmall-scope early-iteration guidance: MINOR-severity issues (cosmetic nits, naming preferences, non-critical style) are NON-BLOCKING for small-scope changes. Do NOT include them in the \`issues\` array — mention them in \`feedback\` as optional polish. Only CRITICAL and MAJOR issues should drive a REQUEST_CHANGES verdict. A small-scope PR with only MINOR findings should APPROVE. This relaxes the bar ONLY for cosmetic nits — CRITICAL/MAJOR rigor is identical to any other PR: incompleteness (missing callers, consumers, or tests for the changed contract) and integration defects are MAJOR regardless of how small the diff is.`;
 
 export function buildReviewIterationPreamble(
   iteration: number,
@@ -59,7 +59,7 @@ export function buildReviewIterationPreamble(
 export const REVIEW_QA_FOCUS_HINT = 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n';
 export const REVIEW_MIGRATE_FOCUS_HINT = 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n';
 
-export const REVIEW_SMALL_SCOPE_PREAMBLE = 'This is a small-scope change. Focus your review on Correctness & Logic. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n';
+export const REVIEW_SMALL_SCOPE_PREAMBLE = 'This is a small-scope change, so the review should be fast — but apply full rigor to what the diff actually touches: correctness & logic first, and the security/performance sections whenever the change intersects them (auth, user input handling, database queries, resource lifecycles). A small diff does not discount contract defects: verify the change is COMPLETE — every caller, consumer, and test of the changed contract updated — not merely inoffensive. Small PRs that individually pass while collectively breaking a shared contract are this pipeline\'s dominant integration failure; check how this change composes with the base branch, not just whether it compiles.\n\n';
 export const REVIEW_LARGE_SCOPE_PREAMBLE = 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n';
 
 export function buildReviewScopeOverflowPreamble(taskScope: string, changedFileCount: number, scopeThreshold: number): string {
@@ -70,8 +70,8 @@ export function buildReviewScopeBudgetSection(nonTest: number, budget: number, p
   return (
     `## Scope Budget\n` +
     `This PR touches ${nonTest} of ${budget} allowed production files (${pct}% utilized). ` +
-    `When requesting changes, consider whether the fix would require touching additional files that could push the PR over its scope budget. ` +
-    `Prefer feedback that can be addressed within existing files.\n\n`
+    `Never suppress or soften a real finding because fixing it would need additional files — raise it at its true severity and note the scope impact so the fixer and orchestrator can widen the budget deliberately. ` +
+    `The budget exists to catch runaway scope, not to discount legitimate feedback.\n\n`
   );
 }
 

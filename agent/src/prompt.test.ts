@@ -992,7 +992,7 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('**Approaches that worked:**');
   });
 
-  it('renders What tends to work with scope-constraint guidance when current scope underperforms', () => {
+  it('renders What tends to work with a root-cause investigation prompt when current scope underperforms', () => {
     const task = {
       context: { scope: 'medium' },
       direction_context: {
@@ -1008,7 +1008,8 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('**What tends to work:**');
     expect(result).toContain('medium-scope tasks in this direction merge at 0% (0/3)');
     expect(result).toContain('small-scope tasks merge at 80% (4/5)');
-    expect(result).toContain('constraining your changes');
+    expect(result).toContain('do NOT shrink your change below what the task actually needs');
+    expect(result).toContain('look at WHY prior medium-scope tasks failed');
   });
 
   it('does not emit scope guidance when current-scope merge rate is already healthy', () => {
@@ -1185,7 +1186,7 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('This task spans 6 files across 3 modules.');
     expect(result).toContain('Historical expansion ratio of 2.3x');
     expect(result).toContain('High co-change neighbor ratio (0.8)');
-    expect(result).toContain('File count (6) is above the high-merge band');
+    expect(result).toContain('File count (6) is on the larger side — keep the change coherent');
     // modules factor 0.85 is NOT below 0.8 — should be omitted
     expect(result).not.toContain('increase cross-system risk');
     // Should not dump raw key=value signals
@@ -1225,7 +1226,8 @@ describe('buildContextPrefix', () => {
     };
     const result = buildContextPrefix(task);
     expect(result).toContain('## Task Scope');
-    expect(result).toContain('Scope: small — expect <50 lines across 1-3 files');
+    expect(result).toContain('Scope: small — a focused change, typically well under ~150 lines');
+    expect(result).toContain('Touch every file the change actually needs');
   });
 
   it('renders ## Task Scope section for fix task with medium scope', () => {
@@ -1235,7 +1237,8 @@ describe('buildContextPrefix', () => {
     };
     const result = buildContextPrefix(task);
     expect(result).toContain('## Task Scope');
-    expect(result).toContain('Scope: medium — expect 50-200 lines across 2-5 files');
+    expect(result).toContain('Scope: medium — a substantive change, typically a few hundred lines');
+    expect(result).toContain('Implement the complete contract');
   });
 
   it('renders ## Task Scope section for refactor task with large scope', () => {
@@ -1279,7 +1282,7 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('## Task Scope');
     expect(result).toContain('Scope: large');
     expect(result).toContain('originally scoped as medium but calibrated up to large');
-    expect(result).toContain('Decompose the work');
+    expect(result).toContain('You have the larger budget now: plan the work as ONE coherent change and land the complete contract');
     expect(result).not.toContain('calibrated down');
   });
 
@@ -2007,7 +2010,7 @@ describe('formatProjectContext', () => {
     const ctx = { cochange_files: ['src/foo.ts', 'src/bar.ts'] };
     const result = formatProjectContext(ctx, 'create', 'medium', '', 3);
     expect(result).toContain('Frequently Co-Changed Files');
-    expect(result).toContain('Budget note: you have 7 production file slots remaining');
+    expect(result).toContain('Budget note: you have 13 production file slots remaining');
   });
 
   it('omits co-change budget note for non-medium scopes', () => {

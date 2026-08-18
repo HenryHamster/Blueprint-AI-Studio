@@ -18,15 +18,15 @@ def _score(files, direction=None, cochange_index=None):
 
 
 class TestFileCountFactor:
-    def test_no_penalty_up_to_two_files(self):
-        for files in ([], ["pkg/sub/a.py"], ["pkg/sub/a.py", "pkg/sub/b.py"]):
-            s, _ = _score(files)
+    def test_no_penalty_up_to_six_files(self):
+        for count in (0, 1, 2, 4, 6):
+            s, _ = _score([f"pkg/sub/f{i}.py" for i in range(count)])
             assert s == 1.0
 
-    def test_penalty_starts_at_three_files(self):
-        s, meta = _score(["pkg/sub/a.py", "pkg/sub/b.py", "pkg/sub/c.py"])
+    def test_penalty_starts_at_seven_files(self):
+        s, meta = _score([f"pkg/sub/f{i}.py" for i in range(7)])
         assert abs(s - (1.0 - 0.0625)) < 1e-9
-        assert meta["files"] == 3
+        assert meta["files"] == 7
         assert meta["factors"]["files"] == round(1.0 - 0.0625, 3)
 
     def test_file_factor_floors_at_half(self):
@@ -109,8 +109,8 @@ class TestCochangeFactor:
                 ["pkg/sub/a.py", "pkg/sub/b.py", "pkg/sub/c.py"],
                 cochange_index={"pkg/sub/a.py": {"pkg/sub/b.py": 1}},
             )
-        # f_files = 1 - 0.0625 = 0.9375; f_clusters = 1 - 0.08*2 = 0.84
-        assert abs(s - (0.9375 * 0.84)) < 1e-9
+        # f_files = 1.0 (3 files, under the 6-file knee); f_clusters = 1 - 0.08*2 = 0.84
+        assert abs(s - 0.84) < 1e-9
 
     def test_single_cluster_no_penalty(self):
         with patch(
@@ -208,8 +208,8 @@ class TestCrossModuleFactor:
 
     def test_three_modules(self):
         s, meta = _score(["backend/app/a.py", "admin-ui/src/b.ts", "agent/src/c.ts"])
-        # f_files = 1 - 0.0625 = 0.9375; f_modules = 1 - 0.125*2 = 0.75
-        assert abs(s - (0.9375 * 0.75)) < 1e-9
+        # f_files = 1.0 (3 files, under the 6-file knee); f_modules = 1 - 0.125*2 = 0.75
+        assert abs(s - 0.75) < 1e-9
         assert meta["modules"] == 3
 
 
@@ -286,7 +286,7 @@ class TestClampingAndEmpty:
 
     def test_none_direction_and_cochange(self):
         s, meta = _score(
-            ["pkg/sub/a.py", "pkg/sub/b.py", "pkg/sub/c.py"],
+            [f"pkg/sub/f{i}.py" for i in range(7)],
             direction=None,
             cochange_index=None,
         )

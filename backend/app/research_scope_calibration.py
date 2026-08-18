@@ -184,37 +184,29 @@ def _calibrate_finding_scope(
 
     if scope == "medium":
         _heuristic_files = finding.get("related_files") or []
-        if len(_heuristic_files) >= 8:
+        _medium_file_budget = (
+            SCOPE_FILE_BUDGETS.get("medium", {}).get("total_files_max") or 16
+        )
+        # There is deliberately no cross-module (top-level directory span)
+        # escalation here: directory span is not evidence that work decomposes
+        # — a cross-stack contract change always spans top-level dirs, and
+        # routing it to plan decomposition produces per-module fragments that
+        # merge individually while breaking the shared contract.
+        if len(_heuristic_files) >= _medium_file_budget:
             logger.info(
                 "[RESEARCH] Upgrading scope medium→large for '%s' "
-                "(file-count heuristic: %d related_files >= 8)",
+                "(file-count heuristic: %d related_files >= medium budget %d)",
                 title,
                 len(_heuristic_files),
+                _medium_file_budget,
             )
             scope = "large"
             scope_calibrated_from = "medium"
-        elif len({f.split("/", 1)[0] for f in _heuristic_files if "/" in f}) >= 3:
-            # Cross-module heuristic: related_files span 3+ top-level directories
-            # (e.g. backend + agent + admin-ui). These face language boundaries,
-            # separate build/test systems, and independent CI — upgrade to large
-            # for plan decomposition into per-module subtasks.
-            _modules = sorted(
-                {f.split("/", 1)[0] for f in _heuristic_files if "/" in f}
-            )
-            logger.info(
-                "[RESEARCH] Upgrading scope medium→large for '%s' "
-                "(cross-module heuristic: related_files span %d modules: %s)",
-                title,
-                len(_modules),
-                ",".join(_modules),
-            )
-            scope = "large"
-            scope_calibrated_from = "medium:cross_module"
         elif _heuristic_files:
             # Predictive expansion-ratio check: historical avg_expansion_ratio
             # (actual files touched / expected related_files) multiplied by this finding's
             # related_files predicts how many files the task will actually touch. If that
-            # exceeds the medium overflow threshold (10 in SCOPE_OVERFLOW_THRESHOLDS), route
+            # exceeds the medium file budget (SCOPE_FILE_BUDGETS), route
             # to large for plan decomposition before burning 5-10 minutes on a task that
             # will almost certainly scope-overflow during implementation.
             _avg_ratio = _avg_medium_expansion_ratio([direction]) if direction else None
@@ -235,16 +227,20 @@ def _calibrate_finding_scope(
                 _avg_ratio = 2.0
                 _ratio_source = "default"
             _predicted_files = len(_heuristic_files) * _avg_ratio
-            if _predicted_files > 10:
+            _medium_budget = (
+                SCOPE_FILE_BUDGETS.get("medium", {}).get("total_files_max") or 16
+            )
+            if _predicted_files > _medium_budget:
                 logger.info(
                     "[RESEARCH] Upgrading scope medium→large for '%s' "
                     "(expansion-ratio prediction [%s]: %d related_files × %.2f avg_ratio "
-                    "= %.1f predicted files > 10 threshold)",
+                    "= %.1f predicted files > %d threshold)",
                     title,
                     _ratio_source,
                     len(_heuristic_files),
                     _avg_ratio,
                     _predicted_files,
+                    _medium_budget,
                 )
                 scope = "large"
                 scope_calibrated_from = "medium"

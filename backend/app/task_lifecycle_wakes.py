@@ -68,14 +68,18 @@ async def close_orphan_pr_if_any(
         for payload in (task.payloads or [])
         if isinstance(payload, dict)
     }
-    if payload_types & {"review"}:
-        # Review tasks reference the PR they inspect; they do not own it.
-        # In particular, review_loop.pr_number is shared with create/fix
-        # tasks, so treating that reference as ownership lets cancelling a
-        # duplicate/stale reviewer close the implementation PR underneath the
-        # surviving review/fix lane.
+    if payload_types & {"review", "fix"}:
+        # Review and fix tasks reference the PR they operate on; they do not
+        # own it. Review tasks inspect it; fix tasks push commits onto its
+        # existing branch and never open a PR of their own. Both record the
+        # target in review_loop.pr_number, so treating that reference as
+        # ownership lets cancelling a duplicate/stale reviewer — or a fix
+        # child pointed at a rollup PR — close the implementation or rollup
+        # PR underneath the surviving lane (PR #17395 incident, 2026-08-17:
+        # admin-cancelling a fix child closed its parent's rollup PR).
         logger.info(
-            "[CANCEL-PR-CLEANUP] Skipping PR close for non-owning review task "
+            "[CANCEL-PR-CLEANUP] Skipping PR close for non-owning "
+            f"{sorted(payload_types & {'review', 'fix'})} task "
             f"{task.id} (reason={reason})"
         )
         return False

@@ -26,6 +26,7 @@ from sqlmodel import select
 import app.routers.admin_runners as admin_runners_mod
 import app.routers.runner as runner_mod
 from app.models import (
+    Alert,
     LocalRunner,
     Project,
     RunnerHeartbeatSnapshot,
@@ -648,6 +649,114 @@ async def test_update_drain_heartbeat_keeps_unpulled_resident_pin(db_session):
     assert stale_marker.status == TaskStatus.QUEUED
     assert stale_marker.vm_instance_id is None
     assert "runner_target_id" not in stale_marker.context
+
+
+@pytest.mark.asyncio
+async def test_update_drain_stuck_raises_one_alert_per_episode(db_session):
+    """An idle runner draining past the threshold raises exactly one alert.
+
+    Regression for the 2026-08-17 fleet outage: the serving orchestrator
+    advertised a version hint unreachable from main, every runner looped its
+    self-update retry every 60s, and the runner-side /update-report dedup
+    (one report per distinct failure per daemon lifetime) meant zero operator
+    alerts while the whole fleet sat out of the dispatch pool. The server now
+    tracks the drain episode from heartbeats alone.
+    """
+    project, runner = await _make_runner(db_session)
+
+    await heartbeat(
+        payload=HeartbeatRequest(update_draining=True),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.capabilities["update_draining_since"]
+
+    async def _stuck_alerts():
+        result = await db_session.execute(
+            select(Alert).where(Alert.event_type == "runner.update_drain_stuck")
+        )
+        return result.scalars().all()
+
+    # Young drain: no alert yet.
+    assert await _stuck_alerts() == []
+
+    # Backdate the episode start past the threshold.
+    caps = dict(runner.capabilities)
+    caps["update_draining_since"] = (
+        _utcnow()
+        - timedelta(seconds=runner_mod._UPDATE_DRAIN_STUCK_ALERT_SECONDS + 60)
+    ).isoformat()
+    runner.capabilities = caps
+    db_session.add(runner)
+    await db_session.commit()
+
+    await heartbeat(
+        payload=HeartbeatRequest(update_draining=True),
+        runner=runner,
+        session=db_session,
+    )
+    alerts = await _stuck_alerts()
+    assert len(alerts) == 1
+    assert alerts[0].project_id == project.id
+    assert alerts[0].source == "runner"
+    await db_session.refresh(runner)
+    assert runner.capabilities["update_drain_alerted_at"]
+
+    # Further draining heartbeats do not duplicate the alert.
+    await heartbeat(
+        payload=HeartbeatRequest(update_draining=True),
+        runner=runner,
+        session=db_session,
+    )
+    assert len(await _stuck_alerts()) == 1
+
+    # Ending the drain clears the episode markers so the NEXT episode can
+    # alert again from a fresh clock.
+    await heartbeat(
+        payload=HeartbeatRequest(update_draining=False),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert "update_draining_since" not in runner.capabilities
+    assert "update_drain_alerted_at" not in runner.capabilities
+
+
+@pytest.mark.asyncio
+async def test_update_drain_stuck_alert_suppressed_while_work_active(db_session):
+    """A long drain with genuine active work is normal, not an alert."""
+    project, runner = await _make_runner(db_session)
+
+    await heartbeat(
+        payload=HeartbeatRequest(update_draining=True),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    caps = dict(runner.capabilities)
+    caps["update_draining_since"] = (
+        _utcnow()
+        - timedelta(seconds=runner_mod._UPDATE_DRAIN_STUCK_ALERT_SECONDS + 60)
+    ).isoformat()
+    runner.capabilities = caps
+    db_session.add(runner)
+    await db_session.commit()
+
+    await heartbeat(
+        payload=HeartbeatRequest(
+            update_draining=True,
+            active_task_ids=["11111111-1111-1111-1111-111111111111"],
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    result = await db_session.execute(
+        select(Alert).where(Alert.event_type == "runner.update_drain_stuck")
+    )
+    assert result.scalars().all() == []
+    await db_session.refresh(runner)
+    assert "update_drain_alerted_at" not in runner.capabilities
 
 
 @pytest.mark.asyncio

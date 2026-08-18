@@ -38,14 +38,14 @@ _SCOPE_ORDER = ["small", "medium", "large"]
 # scope with these limits. Values mirror SCOPE_OVERFLOW_THRESHOLDS and
 # MEDIUM_ANALYSIS_PLAN_FILE_LIMIT in agent/src/constants.ts — keep in sync.
 SCOPE_FILE_BUDGETS: dict[str, dict[str, int]] = {
-    "small": {"total_files_max": 6},
-    "medium": {"production_files_max": 10, "total_files_max": 10},
-    "large": {"total_files_max": 20},
+    "small": {"total_files_max": 8},
+    "medium": {"production_files_max": 16, "total_files_max": 16},
+    "large": {"total_files_max": 32},
 }
 
 # Mirrors agent/src/constants.ts MEDIUM_ANALYSIS_PLAN_FILE_LIMIT. If a medium-scope
 # finding lists more files than this, the pre-spawn gate auto-upgrades to large.
-MEDIUM_ANALYSIS_PLAN_FILE_LIMIT: int = 10
+MEDIUM_ANALYSIS_PLAN_FILE_LIMIT: int = 16
 
 # Maximum implementation tasks to spawn when pipeline health is degraded.
 # Remaining findings are deferred to task.context['deferred_findings'] for
@@ -323,8 +323,7 @@ def _get_failure_coaching_suffix(direction_id: str, design_doc: dict) -> str | N
     )
     return (
         f"Note: this direction has recurring first-attempt rejections in the '{top_cat}' category "
-        f"({int(top_count)}/{int(total)} recent cases). Prefer findings that address this failure mode "
-        "and consider smaller scopes to reduce implementation risk."
+        f"({int(top_count)}/{int(total)} recent cases). Prefer findings that address this failure mode."
     )
 
 
@@ -1114,15 +1113,15 @@ def check_scope_budget_mismatch(
       decision (clean non-failure timeout) rather than a review escalation.
     """
     n = len(related_files) if related_files else 0
-    _large_limit = (SCOPE_FILE_BUDGETS.get("large") or {}).get("total_files_max") or 20
+    _large_limit = (SCOPE_FILE_BUDGETS.get("large") or {}).get("total_files_max") or 32
 
-    if scope == "small" and n > 2:
+    if scope == "small" and n > 4:
         warning = (
             f"scope_budget_mismatch: small scope with {n} related_files exceeds "
-            f"small-scope practical limit (2); auto-upgraded to medium."
+            f"small-scope practical limit (4); auto-upgraded to medium."
         )
         logger.info(
-            "[RESEARCH] pre-spawn budget gate: small→medium (%d related_files > 2)", n
+            "[RESEARCH] pre-spawn budget gate: small→medium (%d related_files > 4)", n
         )
         return "medium", "small", warning, False
 
