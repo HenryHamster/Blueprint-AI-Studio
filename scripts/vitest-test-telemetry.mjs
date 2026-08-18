@@ -46,10 +46,19 @@
  *   - No external test infra required — vitest runs standalone
  *
  * Performance notes:
- *   - agent/ suite: ~4-5 min (5357 tests across 95 files)
- *   - admin-ui/ suite: ~45-60 s (1400+ tests across 215 files)
+ *   - agent/ suite: several minutes (the committed artifact currently covers 121 files)
+ *   - admin-ui/ suite: about a minute (the committed artifact currently covers 250 files)
  *   - Total with --flake-runs 1: ~5-6 min
  *   - Total with --flake-runs 2: ~10-12 min
+ *
+ * Coverage note:
+ *   - Each artifact is seeded from the same on-disk test-file population as its
+ *     Vitest config, so the freshness guard can detect missing or stale entries.
+ *   - A file in that population with no reporter result is emitted as
+ *     `{duration_ms: null, tests: null, measured: false}` and the generator
+ *     exits non-zero naming those files. An aborted or partial run therefore
+ *     cannot produce a committable artifact: the freshness guard rejects any
+ *     unmeasured entry.
  */
 
 import { spawnSync } from 'child_process';
@@ -83,11 +92,13 @@ const SUITES = {
       path.join(WORKSPACE_ROOT, 'node_modules', '.bin', 'vitest'),
     ]),
     extraArgs: [],
+    testFileMatcher: relativePath =>
+      relativePath.startsWith('src/') && relativePath.endsWith('.test.ts'),
   },
   'admin-ui': {
     // admin-ui uses npm workspaces — vitest binary lives in root node_modules,
-    // but vitest.config.ts is in admin-ui/. Run from workspace root and pass --config.
-    cwd: WORKSPACE_ROOT,
+    // but the config's include paths are relative to admin-ui/.
+    cwd: path.join(WORKSPACE_ROOT, 'admin-ui'),
     // relative paths in the artifact are relative to admin-ui/
     relativeBase: path.join(WORKSPACE_ROOT, 'admin-ui'),
     output: path.join(WORKSPACE_ROOT, 'admin-ui', '.test_durations.json'),
@@ -96,6 +107,15 @@ const SUITES = {
       path.join(WORKSPACE_ROOT, 'admin-ui', 'node_modules', '.bin', 'vitest'),
     ]),
     extraArgs: ['--config', path.join(WORKSPACE_ROOT, 'admin-ui', 'vitest.config.ts')],
+    testFileMatcher: relativePath => {
+      const included =
+        (relativePath.startsWith('src/') &&
+          (relativePath.endsWith('.test.ts') || relativePath.endsWith('.test.tsx'))) ||
+        (relativePath.startsWith('eslint-rules/') &&
+          (relativePath.endsWith('.test.js') || relativePath.endsWith('.test.ts')));
+      return included &&
+        !(relativePath.startsWith('src/') && relativePath.includes('.viewport.test.'));
+    },
   },
 };
 
@@ -104,6 +124,29 @@ function findBin(candidates) {
     if (fs.existsSync(c)) return c;
   }
   return null; // falls back to npx vitest
+}
+
+export function collectTestFiles(relativeBase, matcher) {
+  const files = [];
+
+  function visit(directory) {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const absolutePath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== 'node_modules') visit(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const relativePath = path
+        .relative(relativeBase, absolutePath)
+        .split(path.sep)
+        .join('/');
+      if (matcher(relativePath)) files.push(relativePath);
+    }
+  }
+
+  visit(relativeBase);
+  return files.sort();
 }
 
 function runVitest(suite, suiteConfig, runIndex) {
@@ -166,7 +209,7 @@ function parseVitestJson(raw, relativeBase) {
   for (const r of testResults) {
     // vitest 2.x uses `name`; vitest 4.x / jest compat may use `testFilePath`
     const absPath = r.testFilePath || r.name || '';
-    const relPath = path.relative(relativeBase, absPath);
+    const relPath = path.relative(relativeBase, absPath).split(path.sep).join('/');
 
     const durationMs =
       r.endTime != null && r.startTime != null ? r.endTime - r.startTime : 0;
@@ -197,6 +240,48 @@ function mergeRuns(accumulated, runMap) {
   }
 }
 
+/**
+ * Build the artifact's `files` list from accumulated per-file stats plus the
+ * on-disk inventory the suite config collects.
+ *
+ * An inventory file with no reporter result was NOT measured — a run that
+ * aborted partway (OOM, crash, interrupt) leaves the rest of the inventory
+ * unexecuted. Such entries are emitted explicitly as unmeasured
+ * (`duration_ms: null`, `tests: null`, `measured: false`) rather than as a
+ * fabricated 0ms/0-test entry, which would be indistinguishable from a real
+ * measurement and would silently rank real files as free in the cost queue.
+ */
+export function buildArtifactFiles(accumulated, inventoryFiles, runs) {
+  const measured = Object.entries(accumulated)
+    .filter(([file]) => file && !file.startsWith('..'))
+    .map(([file, stats]) => ({
+      file,
+      duration_ms: Math.round(stats.duration_ms_sum / Math.max(stats.total_runs, 1)),
+      tests: stats.tests,
+      measured: true,
+      flaky: runs > 1
+        ? stats.passed_runs > 0 && stats.passed_runs < stats.total_runs
+        : false,
+    }))
+    .sort((a, b) => b.duration_ms - a.duration_ms);
+
+  const measuredFiles = new Set(measured.map(f => f.file));
+  const unmeasured = inventoryFiles
+    .filter(file => file && !file.startsWith('..') && !measuredFiles.has(file))
+    .sort()
+    .map(file => ({
+      file,
+      duration_ms: null,
+      tests: null,
+      measured: false,
+      flaky: false,
+    }));
+
+  // Unmeasured entries sort last: they carry no cost signal, and a null
+  // duration must never masquerade as the cheapest file in the ranking.
+  return { files: [...measured, ...unmeasured], unmeasured };
+}
+
 async function generateArtifact(suite, suiteConfig) {
   console.log(`\n[vitest-telemetry] Suite: ${suite}`);
   console.log(`  runs: ${flakeRuns}, flake_detection: ${flakeRuns > 1}`);
@@ -208,18 +293,11 @@ async function generateArtifact(suite, suiteConfig) {
     mergeRuns(accumulated, runMap);
   }
 
-  const files = Object.entries(accumulated)
-    .map(([file, stats]) => ({
-      file,
-      duration_ms: Math.round(stats.duration_ms_sum / Math.max(stats.total_runs, 1)),
-      tests: stats.tests,
-      flaky: flakeRuns > 1
-        ? stats.passed_runs > 0 && stats.passed_runs < stats.total_runs
-        : false,
-    }))
-    // Exclude paths that escaped the suite root (e.g. starts with "..")
-    .filter(f => f.file && !f.file.startsWith('..'))
-    .sort((a, b) => b.duration_ms - a.duration_ms);
+  // Keep the committed artifact's population tied to the same on-disk test
+  // files that the suite config collects, so the freshness guard can detect
+  // both missing and stale entries.
+  const inventory = collectTestFiles(suiteConfig.relativeBase, suiteConfig.testFileMatcher);
+  const { files, unmeasured } = buildArtifactFiles(accumulated, inventory, flakeRuns);
 
   const artifact = {
     _meta: {
@@ -235,18 +313,33 @@ async function generateArtifact(suite, suiteConfig) {
   console.log(
     `[vitest-telemetry] Wrote ${files.length} file entries → ${suiteConfig.output}`,
   );
-  if (files.length > 0) {
-    const top5 = files.slice(0, 5);
+  const ranked = files.filter(f => f.measured);
+  if (ranked.length > 0) {
+    const top5 = ranked.slice(0, 5);
     console.log('  Top 5 slowest files (cut candidates):');
     top5.forEach((f, i) =>
       console.log(`    ${i + 1}. ${f.file} (${f.duration_ms}ms, ${f.tests} tests)`),
     );
     if (flakeRuns > 1) {
-      const flaky = files.filter(f => f.flaky);
+      const flaky = ranked.filter(f => f.flaky);
       console.log(`  Flaky files detected: ${flaky.length}`);
       flaky.slice(0, 5).forEach(f => console.log(`    - ${f.file}`));
     }
   }
+
+  if (unmeasured.length > 0) {
+    console.error(
+      `[vitest-telemetry] INCOMPLETE run for ${suite}: ${unmeasured.length} of ` +
+        `${files.length} test file(s) produced no reporter result and are recorded ` +
+        'as unmeasured. The artifact is NOT publishable — rerun the suite until ' +
+        'every file is measured.',
+    );
+    unmeasured.slice(0, 20).forEach(f => console.error(`    - ${f.file}`));
+    if (unmeasured.length > 20) {
+      console.error(`    ... and ${unmeasured.length - 20} more`);
+    }
+  }
+  return unmeasured;
 }
 
 async function main() {
@@ -255,12 +348,21 @@ async function main() {
       ? Object.keys(SUITES)
       : suiteArg.split(',').map(s => s.trim());
 
+  let incomplete = 0;
   for (const suite of suitesToRun) {
     if (!SUITES[suite]) {
       console.error(`Unknown suite: ${suite}. Valid: ${Object.keys(SUITES).join(', ')}`);
       process.exit(1);
     }
-    await generateArtifact(suite, SUITES[suite]);
+    incomplete += (await generateArtifact(suite, SUITES[suite])).length;
+  }
+
+  if (incomplete > 0) {
+    console.error(
+      `\n[vitest-telemetry] FAILED: ${incomplete} test file(s) were never executed. ` +
+        'Do not commit the artifacts produced by this run.',
+    );
+    process.exit(1);
   }
 
   console.log(
@@ -268,7 +370,21 @@ async function main() {
   );
 }
 
-main().catch(err => {
-  console.error('[vitest-telemetry] Fatal:', err.message);
-  process.exit(1);
-});
+// Run only when invoked directly; importing the module (e.g. from tests) must
+// not spawn vitest. Both sides are realpath-resolved so a symlinked invocation
+// still matches.
+function realpathOrSelf(candidate) {
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return candidate;
+  }
+}
+
+const invokedPath = process.argv[1] ? realpathOrSelf(path.resolve(process.argv[1])) : '';
+if (invokedPath === realpathOrSelf(fileURLToPath(import.meta.url))) {
+  main().catch(err => {
+    console.error('[vitest-telemetry] Fatal:', err.message);
+    process.exit(1);
+  });
+}

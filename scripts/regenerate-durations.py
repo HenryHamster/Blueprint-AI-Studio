@@ -12,6 +12,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from durations_quality import MIN_ENTRIES, MIN_UNIQUE, MIN_CV, OUTLIER_CAP, quality_ok
+from merge_durations import filter_current_entries, load_duration_baseline
 
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
 os.chdir(BACKEND)
@@ -56,9 +57,18 @@ def docker_run(cmd, timeout=600):
 def get_coverage():
     """Return (covered_file_count, total_entry_count, set_of_covered_file_paths)."""
     merged = {}
+    td = ".test_durations"
+
+    # Existing data is the baseline; current partial runs are fresher and win.
+    if os.path.exists(td):
+        existing = load_duration_baseline(td)
+        # Only count entries with non-placeholder values (>3 unique values)
+        if len(set(existing.values())) > 10:  # Has real data
+            merged.update(existing)
+
     for p in sorted(glob.glob(".durations_partial_*.json")):
         with open(p) as f:
-            merged.update(json.load(f))
+            merged.update(filter_current_entries(json.load(f), os.getcwd()))
 
     files = set()
     for k in merged:
@@ -66,30 +76,27 @@ def get_coverage():
         if parts:
             files.add(parts[0])
 
-    # Also count what's already in .test_durations if it has real data
-    td = ".test_durations"
-    if os.path.exists(td):
-        with open(td) as f:
-            existing = json.load(f)
-        # Only count entries with non-placeholder values (>3 unique values)
-        unique_vals = len(set(existing.values()))
-        if unique_vals > 10:  # Has real data
-            for k in existing:
-                parts = k.split("::")
-                if parts:
-                    files.add(parts[0])
-            merged.update(existing)
-
     return len(files), len(merged), files
 
 
 def write_merged():
     """Merge all partial files into .test_durations, dropping outliers > OUTLIER_CAP."""
-    merged = {}
+    td = ".test_durations"
+    merged = load_duration_baseline(td)
+    root = os.getcwd()
     outlier_count = 0
+
+    # Historical values are part of the output unless they are outliers; partial
+    # measurements below overlay them so the newest timing wins.
+    for k in list(merged):
+        if merged[k] > OUTLIER_CAP:
+            outlier_count += 1
+            del merged[k]
+
     for p in sorted(glob.glob(".durations_partial_*.json")):
         with open(p) as f:
             data = json.load(f)
+        data = filter_current_entries(data, root)
         for k, v in data.items():
             if v > OUTLIER_CAP:
                 outlier_count += 1
@@ -103,7 +110,6 @@ def write_merged():
     if outlier_count:
         print(f"  Dropped {outlier_count} outlier(s) > {OUTLIER_CAP}s (fixture-setup misattribution)")
 
-    td = ".test_durations"
     with open(td, "w") as f:
         json.dump(merged, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -157,17 +163,10 @@ def main():
         print(f"\n[{elapsed:.0f}s] Files: {covered_count}/{total_files}, Entries: {entry_count}/{MIN_ENTRIES}")
 
         # Write a temporary merge and check quality guards
-        temp_merged = {}
+        temp_merged = load_duration_baseline(".test_durations")
         for p in sorted(glob.glob(".durations_partial_*.json")):
             with open(p) as f:
-                temp_merged.update(json.load(f))
-        td = ".test_durations"
-        if os.path.exists(td):
-            with open(td) as f:
-                existing = json.load(f)
-            # Existing data takes lower priority than partial results
-            for k, v in existing.items():
-                temp_merged.setdefault(k, v)
+                temp_merged.update(filter_current_entries(json.load(f), os.getcwd()))
 
         import statistics
         vs = list(temp_merged.values()) if temp_merged else [0]
@@ -222,7 +221,7 @@ def main():
             if batch_num % 3 == 0:
                 write_merged()
         else:
-            print(f"    -> No durations file produced (tests may have all failed)")
+            print("    -> No durations file produced (tests may have all failed)")
             # Remove these files from consideration by writing an empty partial
             with open(src, "w") as f:
                 json.dump({}, f)

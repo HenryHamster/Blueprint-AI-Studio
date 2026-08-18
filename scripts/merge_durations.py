@@ -7,23 +7,91 @@ Called by batch-store-durations.sh to replace the inline Python heredoc:
 Also importable by other scripts.
 """
 
+import ast
 import glob
 import json
 import os
 import statistics
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from durations_quality import MIN_ENTRIES, MIN_UNIQUE, MIN_CV, OUTLIER_CAP, quality_ok
 
 
+def _valid_test_ids(path: Path) -> set[str] | None:
+    """Return collectable test IDs, or None when the file cannot be parsed."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return None
+
+    valid_ids: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            for item in node.body:
+                if (
+                    isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name.startswith("test_")
+                ):
+                    valid_ids.add(f"{node.name}::{item.name}")
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        ):
+            valid_ids.add(node.name)
+    return valid_ids
+
+
+def filter_current_entries(data: dict, root: str | os.PathLike[str]) -> dict:
+    """Drop entries whose test file or statically collectable ID is gone."""
+    root_path = Path(root)
+    valid_ids_by_file: dict[Path, set[str] | None] = {}
+    current: dict = {}
+    for key, value in data.items():
+        file_key, separator, raw_node_id = key.partition("::")
+        if not separator:
+            continue
+        test_path = root_path / file_key
+        if not test_path.is_file():
+            continue
+        if test_path not in valid_ids_by_file:
+            valid_ids_by_file[test_path] = _valid_test_ids(test_path)
+        valid_ids = valid_ids_by_file[test_path]
+        base_node_id = raw_node_id.split("[", 1)[0]
+        if valid_ids is not None and base_node_id not in valid_ids:
+            continue
+        current[key] = value
+    return current
+
+
+def load_duration_baseline(path: str) -> dict:
+    """Load the existing artifact, retaining only entries in the current tree."""
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"duration baseline must be a JSON object: {path}")
+    return filter_current_entries(data, os.path.dirname(os.path.abspath(path)))
+
+
 def merge(src_dir: str, output_path: str) -> int:
     """Merge all *.json files from src_dir into output_path; return entry count."""
+    root = os.path.dirname(os.path.abspath(output_path))
     merged = {}
     outlier_count = 0
+
+    for k, v in load_duration_baseline(output_path).items():
+        if v > OUTLIER_CAP:
+            outlier_count += 1
+        else:
+            merged[k] = v
+
     for path in sorted(glob.glob(os.path.join(src_dir, "*/*.json"))):
         with open(path) as f:
             data = json.load(f)
+        data = filter_current_entries(data, root)
         pre = len(merged)
         for k, v in data.items():
             if v > OUTLIER_CAP:

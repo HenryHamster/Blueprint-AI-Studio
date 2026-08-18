@@ -3,6 +3,12 @@ Standalone guard: agent/.test_durations.json and admin-ui/.test_durations.json
 must exist, be valid, and contain real timing data so classification/cut work
 has a ranked signal to consume.
 
+Coverage is enforced on two axes: the artifact's file population must match the
+on-disk inventory the Vitest config collects, AND every entry must carry a real
+measurement. scripts/vitest-test-telemetry.mjs emits an inventory file that
+produced no reporter result as `measured: false` with a null duration (and exits
+non-zero), so a run aborted partway through the suite cannot be committed green.
+
 Runs under --noconftest (no DB, no conftest fixtures).
 
 To regenerate: node scripts/vitest-test-telemetry.mjs  (from workspace root)
@@ -25,6 +31,118 @@ def _resolve_workspace_root() -> Path:
 WORKSPACE_ROOT = _resolve_workspace_root()
 AGENT_DURATIONS = WORKSPACE_ROOT / "agent" / ".test_durations.json"
 ADMINUI_DURATIONS = WORKSPACE_ROOT / "admin-ui" / ".test_durations.json"
+
+
+def _test_file_inventory(suite: str) -> set[str]:
+    """Return the files collected by the suite's committed Vitest config."""
+    suite_root = WORKSPACE_ROOT / suite
+    files: set[str] = set()
+    for path in suite_root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(suite_root).as_posix()
+        if suite == "agent":
+            included = relative.startswith("src/") and relative.endswith(".test.ts")
+        elif suite == "admin-ui":
+            included = (
+                (relative.startswith("src/") and relative.endswith((".test.ts", ".test.tsx")))
+                or (
+                    relative.startswith("eslint-rules/")
+                    and relative.endswith((".test.js", ".test.ts"))
+                )
+            )
+            included = included and not (
+                relative.startswith("src/") and ".viewport.test." in relative
+            )
+        else:
+            raise ValueError(f"Unknown Vitest suite: {suite}")
+        if included:
+            files.add(relative)
+    return files
+
+
+def _assert_artifact_covers_inventory(suite: str, data: dict) -> None:
+    expected = _test_file_inventory(suite)
+    actual = {entry.get("file") for entry in data.get("files", [])}
+    missing = sorted(expected - actual)
+    stale = sorted(actual - expected)
+    assert not missing and not stale, (
+        f"{suite}/.test_durations.json is out of sync with Vitest's on-disk test inventory. "
+        f"Missing {len(missing)} file(s): {missing[:10]}; "
+        f"stale {len(stale)} file(s): {stale[:10]}. "
+        f"Regenerate: node scripts/vitest-test-telemetry.mjs --suite {suite}"
+    )
+
+
+def _assert_all_entries_measured(suite: str, data: dict) -> None:
+    """Reject artifacts containing entries the generator never measured.
+
+    An aborted or partial regeneration records the unexecuted files as
+    ``measured: false`` / ``duration_ms: null``. Those entries carry no cost
+    signal, so an artifact containing any of them must not be committed.
+    """
+    unmeasured = sorted(
+        entry.get("file")
+        for entry in data.get("files", [])
+        if entry.get("measured") is not True or not isinstance(
+            entry.get("duration_ms"), (int, float)
+        )
+    )
+    assert not unmeasured, (
+        f"{suite}/.test_durations.json contains {len(unmeasured)} unmeasured "
+        f"entry/entries: {unmeasured[:10]}. The regeneration run did not execute "
+        "these files (aborted run, crash, or OOM), so their cost is unknown. "
+        f"Rerun until every file is measured: "
+        f"node scripts/vitest-test-telemetry.mjs --suite {suite}"
+    )
+
+
+def test_measured_guard_rejects_unmeasured_entries() -> None:
+    """An aborted regeneration marks unexecuted files — the guard must fail."""
+    data = {
+        "files": [
+            {"file": "src/a.test.ts", "duration_ms": 120, "tests": 4, "measured": True},
+            {
+                "file": "src/b.test.ts",
+                "duration_ms": None,
+                "tests": None,
+                "measured": False,
+            },
+        ]
+    }
+    try:
+        _assert_all_entries_measured("agent", data)
+    except AssertionError as exc:
+        assert "src/b.test.ts" in str(exc)
+    else:
+        raise AssertionError("unmeasured entry was accepted by the freshness guard")
+
+
+def test_measured_guard_rejects_zero_filled_entry_without_measured_flag() -> None:
+    """A fabricated 0ms/0-test entry has no measured flag and must be rejected."""
+    data = {
+        "files": [
+            {"file": "src/a.test.ts", "duration_ms": 120, "tests": 4, "measured": True},
+            {"file": "src/b.test.ts", "duration_ms": 0, "tests": 0, "flaky": False},
+        ]
+    }
+    try:
+        _assert_all_entries_measured("admin-ui", data)
+    except AssertionError as exc:
+        assert "src/b.test.ts" in str(exc)
+    else:
+        raise AssertionError("zero-filled entry was accepted by the freshness guard")
+
+
+def test_measured_guard_accepts_fully_measured_artifact() -> None:
+    data = {
+        "files": [
+            {"file": "src/a.test.ts", "duration_ms": 120, "tests": 4, "measured": True},
+            {"file": "src/b.test.ts", "duration_ms": 0, "tests": 1, "measured": True},
+        ]
+    }
+    _assert_all_entries_measured("agent", data)
+
 
 # Minimum distinct duration values before the file is considered degenerate
 # (synthetic placeholder artifacts would have 1 or 2 distinct values).
@@ -72,6 +190,8 @@ def test_agent_artifact_nonempty_files() -> None:
     data = _load(AGENT_DURATIONS)
     files = data.get("files", [])
     assert len(files) > 0, "agent/.test_durations.json has no file entries"
+    _assert_artifact_covers_inventory("agent", data)
+    _assert_all_entries_measured("agent", data)
 
 
 def test_agent_artifact_file_schema() -> None:
@@ -81,6 +201,7 @@ def test_agent_artifact_file_schema() -> None:
         assert "duration_ms" in entry, f"Missing 'duration_ms' in entry: {entry}"
         assert "tests" in entry, f"Missing 'tests' in entry: {entry}"
         assert "flaky" in entry, f"Missing 'flaky' in entry: {entry}"
+        assert "measured" in entry, f"Missing 'measured' in entry: {entry}"
         assert isinstance(entry["duration_ms"], (int, float)), (
             f"duration_ms must be numeric, got {type(entry['duration_ms']).__name__}"
         )
@@ -149,6 +270,14 @@ def test_adminui_artifact_nonempty_files() -> None:
     data = _load(ADMINUI_DURATIONS)
     files = data.get("files", [])
     assert len(files) > 0, "admin-ui/.test_durations.json has no file entries"
+    _assert_artifact_covers_inventory("admin-ui", data)
+    _assert_all_entries_measured("admin-ui", data)
+
+
+def test_adminui_inventory_excludes_viewport_files() -> None:
+    inventory = _test_file_inventory("admin-ui")
+    assert inventory
+    assert all(".viewport.test." not in path for path in inventory)
 
 
 def test_adminui_artifact_file_schema() -> None:
@@ -158,6 +287,7 @@ def test_adminui_artifact_file_schema() -> None:
         assert "duration_ms" in entry, f"Missing 'duration_ms' in entry: {entry}"
         assert "tests" in entry, f"Missing 'tests' in entry: {entry}"
         assert "flaky" in entry, f"Missing 'flaky' in entry: {entry}"
+        assert "measured" in entry, f"Missing 'measured' in entry: {entry}"
         assert isinstance(entry["duration_ms"], (int, float)), (
             f"duration_ms must be numeric, got {type(entry['duration_ms']).__name__}"
         )
