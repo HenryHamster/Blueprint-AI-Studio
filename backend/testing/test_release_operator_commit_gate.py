@@ -65,9 +65,21 @@ def _score(gate: dict) -> dict:
     )
 
 
+_ZERO_BUDGET_CATEGORY = {
+    "category_key": "candidate-authorship",
+    "evidence_contract": {
+        "type": "operator_authored_commits",
+        "predicate": {"max_count": 0},
+    },
+}
+
+
 def test_candidate_zero_operator_commits_passes():
+    """With a declared zero-budget contract, zero operator commits passes."""
     gate = rs.evaluate_candidate_operator_authorship_gate(
-        _candidate_record(_receipt(0)), _measurement(_receipt(0))
+        _candidate_record(_receipt(0)),
+        _measurement(_receipt(0)),
+        [_ZERO_BUDGET_CATEGORY],
     )
 
     result = _score(gate)
@@ -80,8 +92,11 @@ def test_candidate_zero_operator_commits_passes():
 
 
 def test_candidate_nonzero_operator_commits_blocks_distinctly():
+    """With a declared zero-budget contract, a nonzero count hard-blocks."""
     gate = rs.evaluate_candidate_operator_authorship_gate(
-        _candidate_record(_receipt(1)), _measurement(_receipt(1))
+        _candidate_record(_receipt(1)),
+        _measurement(_receipt(1)),
+        [_ZERO_BUDGET_CATEGORY],
     )
 
     result = _score(gate)
@@ -90,6 +105,33 @@ def test_candidate_nonzero_operator_commits_blocks_distinctly():
     assert result["blocker"] == "candidate_operator_authorship_nonzero"
     assert result["failing_gates"] == ["candidate_operator_authorship_nonzero"]
     assert result["blocker"] != "criterion_coverage_incomplete"
+
+
+def test_candidate_no_contract_declared_is_not_applicable_and_passes():
+    """No active category declares an authorship evidence contract at all.
+
+    Operator hotfixes to main are policy here (v33..HEAD carries ~25
+    non-bot-authored commits) — the gate must not manufacture a zero budget
+    that hard-blocks the moment it is wired in.  Absent a declared contract
+    it reports a distinct, non-blocking ``"not_applicable"`` verdict instead,
+    even when the measured count is nonzero.
+    """
+    gate = rs.evaluate_candidate_operator_authorship_gate(
+        _candidate_record(_receipt(3)), _measurement(_receipt(3))
+    )
+
+    result = _score(gate)
+
+    assert gate["status"] == "not_applicable"
+    assert gate["passed"] is True
+    assert gate["count"] == 3
+    assert gate["max_count"] is None
+    assert gate["reason"] == "no_operator_authorship_contract_declared"
+    assert result["promote"] is True
+    assert result["blocker"] is None
+    assert result["sub_scores"]["candidate_operator_authorship"]["status"] == (
+        "not_applicable"
+    )
 
 
 def test_candidate_absent_or_unresolvable_evidence_fails_closed():

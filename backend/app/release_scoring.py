@@ -974,6 +974,14 @@ def evaluate_candidate_operator_authorship_gate(
     while the candidate is blocked and therefore creates a self-blocking gate.
     ``max_count`` is the existing structured authorship predicate used by
     category grading; multiple contracts use the strictest declared budget.
+
+    When NO active category declares an ``operator_authored_commits``
+    evidence contract, the gate does not manufacture a zero budget — that
+    would hard-block any candidate range containing so much as one
+    non-bot-authored commit (operator hotfixes to main are policy, not a
+    violation) the moment this gate is wired in, with no declared contract to
+    tell the operator a budget must be set.  Absent a declared contract the
+    gate reports a distinct, passing ``"not_applicable"`` status instead.
     """
     from app.release_commit_authorship import (
         authorship_receipt_for_measurement,
@@ -1007,7 +1015,22 @@ def evaluate_candidate_operator_authorship_gate(
         ]
         if contract is not None
     ]
-    max_count = min(max_counts, default=0)
+    if not max_counts:
+        # No active category declares an operator_authored_commits evidence
+        # contract at all — distinct from a declared contract with an
+        # explicit max_count of 0.  Fabricating a zero budget here would
+        # silently arm a hard blocker with nothing telling the operator a
+        # budget must be declared first.  Report a passing, non-blocking
+        # verdict instead so the gate stays inert until a contract exists.
+        return {
+            "status": "not_applicable",
+            "passed": True,
+            "count": count,
+            "max_count": None,
+            "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "reason": "no_operator_authorship_contract_declared",
+        }
+    max_count = min(max_counts)
     if isinstance(count, int) and count <= max_count:
         return {
             "status": "passed",
@@ -1236,7 +1259,7 @@ def compute_composite(
         if candidate_gate_status == "blocked":
             blocker = "candidate_operator_authorship_nonzero"
             failing_gates.append(blocker)
-        elif candidate_gate_status != "passed":
+        elif candidate_gate_status not in ("passed", "not_applicable"):
             blocker = "candidate_operator_authorship_evidence_missing"
             failing_gates.append(blocker)
     if env_preflight_enabled and env_preflight_score is None:

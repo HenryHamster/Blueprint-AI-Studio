@@ -13920,7 +13920,19 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     assert "test_roster_placeholder" in invoked, (
         "standalone harness did not execute its pytest roster"
     )
-    probe_invocations = log_path.read_text(encoding="utf-8").splitlines()
+    # PYTHON_REWRITE_ENABLED (#17367) means an explicitly injected $PYTHON is
+    # legitimately never invoked once the harness selects the Docker-less
+    # standalone lane — the probe log this fixture wires up via
+    # ROSTER_PROBE_LOG may therefore not exist at all. Treat that as zero
+    # probe invocations rather than crashing: the assertion below still
+    # catches a real regression (a rewritten literal python3 pytest
+    # subprocess always both creates the log AND logs an "-m pytest" line),
+    # it just no longer requires the file to exist first.
+    probe_invocations = (
+        log_path.read_text(encoding="utf-8").splitlines()
+        if log_path.exists()
+        else []
+    )
     assert not any("-m pytest" in line for line in probe_invocations), (
         "standalone harness rewrote its literal python3 pytest subprocess"
     )
