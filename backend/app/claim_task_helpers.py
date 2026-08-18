@@ -142,7 +142,8 @@ def _compute_failure_stage_pattern(history: list) -> "dict | None":
             "rate": round(approval_rate, 2),
             "message": (
                 "Recent tasks for this direction frequently stall waiting for approval — "
-                "consider smaller, more targeted changes that require less manual review."
+                "stay within the scope's file and spend budget; that's what avoids the "
+                "approval gate, not the size of the change."
             ),
         }
     if staging_only_rate >= threshold:

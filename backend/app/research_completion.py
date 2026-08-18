@@ -102,8 +102,6 @@ from app.research_finding_challenge_history import (
     consume_finding_challenge_record as _consume_finding_challenge_record,
 )
 from app.research_sibling_dependencies import (  # noqa: F401 — re-exported private helpers
-    _RESEARCH_SIBLING_SERIALIZATION_CONTAINMENT,
-    _RESEARCH_SIBLING_SERIALIZATION_JACCARD,
     _wire_research_sibling_edges,
     converge_spawn_batch_foundations,
 )
@@ -4564,8 +4562,9 @@ async def _handle_research_completion(
                 _compute_spend_decision.requires_monetary_approval
             )
 
-        # Apply failure-feedback mitigation: downscope when rejection patterns are high
-        # for this direction, and bias toward smaller scopes with proven success patterns.
+        # Apply failure-feedback mitigation: downscope only on repeated
+        # scope_related rejections for this direction (direct evidence the
+        # scope is too big); other failure categories coach without shrinking.
         _mit_dir_id = finding.get("direction_id") or _parent_direction_id
         _mit_direction = (
             _directions_by_id.get(str(_mit_dir_id)) if _mit_dir_id else None
@@ -5034,24 +5033,25 @@ async def _handle_research_completion(
                     "_file_change_details"
                 ]
             # Tighten analysis plan file limit for medium-scope retries whose
-            # prior attempt tripped a scope gate or touched ≥80% of the medium
-            # file threshold. The agent reads _analysis_plan_file_limit and
-            # overrides MEDIUM_ANALYSIS_PLAN_FILE_LIMIT (default 7) so the
-            # retry plans a narrower change set.
+            # prior attempt actually tripped a scope gate. The agent reads
+            # _analysis_plan_file_limit and overrides
+            # MEDIUM_ANALYSIS_PLAN_FILE_LIMIT so the retry plans a narrower
+            # change set. Derived from the shared constant so band changes
+            # propagate; deliberately NOT triggered by raw prior file count —
+            # a change that stayed within budget is not overflow, and
+            # punishing it just trains half-wired fragments.
             if scope == "medium":
                 _prior_scope_gate = _prior_ctx.get("scope_gate_triggered")
-                _prior_changed = _prior_ctx.get("_pr_changed_files") or []
-                _prior_file_count = (
-                    len(_prior_changed) if isinstance(_prior_changed, list) else 0
-                )
                 _tight_triggers = {
                     "scope_trim",
                     "analysis_overflow",
                     "post_review_overflow",
                     "small_overflow",
                 }
-                if _prior_scope_gate in _tight_triggers or _prior_file_count >= 8:
-                    prior_retry_ctx["_analysis_plan_file_limit"] = 5
+                if _prior_scope_gate in _tight_triggers:
+                    prior_retry_ctx["_analysis_plan_file_limit"] = (
+                        MEDIUM_ANALYSIS_PLAN_FILE_LIMIT // 2
+                    )
             # Generate failure-class-specific retry guidance, mirroring
             # task_lifecycle._requeue_parent_task so re-spawned findings get the
             # same tailored prompt_suffix as directly requeued retries.
@@ -5146,7 +5146,7 @@ async def _handle_research_completion(
             if _util_ratio is None:
                 _util_ratio = 2.0
             _medium_budget = (
-                SCOPE_FILE_BUDGETS.get("medium", {}).get("total_files_max") or 10
+                SCOPE_FILE_BUDGETS.get("medium", {}).get("total_files_max") or 16
             )
             _predicted_utilization = round(
                 len(related_files) * _util_ratio / _medium_budget, 3

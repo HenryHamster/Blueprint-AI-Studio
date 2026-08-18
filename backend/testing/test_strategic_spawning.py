@@ -6561,15 +6561,15 @@ async def test_strategic_review_skips_query_when_held_directions_filtered(db_ses
 # ---------------------------------------------------------------------------
 
 
-def test_failure_feedback_downscopes_large_to_medium():
-    """3 first-attempt failures in a category downscopes large→medium."""
+def test_scope_related_failures_downscope_large_to_medium():
+    """3 scope_related first-attempt rejections downscopes large→medium."""
     from app.strategic_spawning import _build_failure_feedback_mitigation
 
     direction = {"id": "d-abc123"}
     design_doc = {
         "direction_first_attempt_feedback": {
             "d-abc123": {
-                "code_defect": 3,
+                "scope_related": 3,
                 "total": 3,
                 "last_updated": "2026-04-20T00:00:00",
             },
@@ -6579,20 +6579,45 @@ def test_failure_feedback_downscopes_large_to_medium():
         direction, "large", "create", design_doc
     )
     assert scope == "medium"
-    assert note is not None and "code defect" in note
+    assert note is not None and "scope related" in note
     assert evidence["failure_downscope"]["count"] == 3
     assert evidence["failure_downscope"]["from"] == "large"
     assert evidence["failure_downscope"]["to"] == "medium"
 
 
-def test_failure_feedback_downscopes_medium_to_small():
-    """3+ first-attempt failures downscopes medium→small and names the category."""
+def test_scope_related_failures_downscope_medium_to_small():
+    """Dominant scope_related rejections downscope medium→small."""
     from app.strategic_spawning import _build_failure_feedback_mitigation
 
     direction = {"id": "d-def456"}
     design_doc = {
         "direction_first_attempt_feedback": {
             "d-def456": {
+                "scope_related": 5,
+                "testing": 1,
+                "total": 6,
+                "last_updated": "2026-04-20T00:00:00",
+            },
+        }
+    }
+    scope, note, evidence = _build_failure_feedback_mitigation(
+        direction, "medium", "create", design_doc
+    )
+    assert scope == "small"
+    assert note is not None and "scope related" in note
+    assert evidence["failure_downscope"]["category"] == "scope_related"
+
+
+def test_non_scope_failure_category_coaches_without_downscoping():
+    """Non-scope rejection categories (testing, code_defect) produce a coaching
+    note naming the failure mode but never shrink the scope — shrinking a task
+    doesn't fix a testing gap, it just fragments the work."""
+    from app.strategic_spawning import _build_failure_feedback_mitigation
+
+    direction = {"id": "d-def457"}
+    design_doc = {
+        "direction_first_attempt_feedback": {
+            "d-def457": {
                 "testing": 5,
                 "scope_related": 1,
                 "total": 6,
@@ -6603,9 +6628,9 @@ def test_failure_feedback_downscopes_medium_to_small():
     scope, note, evidence = _build_failure_feedback_mitigation(
         direction, "medium", "create", design_doc
     )
-    assert scope == "small"
+    assert scope == "medium"
     assert note is not None and "testing" in note
-    assert evidence["failure_downscope"]["category"] == "testing"
+    assert "failure_downscope" not in evidence
 
 
 def test_failure_feedback_no_downscope_below_threshold():
@@ -6630,40 +6655,32 @@ def test_failure_feedback_no_downscope_below_threshold():
     assert "failure_downscope" not in evidence
 
 
-def test_success_pattern_biases_medium_to_small():
-    """playbook/success-create-small with 3+ successes biases medium→small."""
+def test_success_pattern_never_biases_scope_smaller():
+    """A strong small-scope success history must NOT shrink a medium proposal.
+
+    The old success-bias arm squeezed every proposal into the smallest
+    historically-merged scope, optimizing per-task merge rate while
+    fragmenting contract-complete changes. What a task needs determines
+    its scope, not what merged before.
+    """
     from app.strategic_spawning import _build_failure_feedback_mitigation
 
     direction = {"id": "d-jkl012"}
     design_doc = {
         "playbook/success-create-small": {
             "source": "success-pattern",
+            "success_count": 40,
+        },
+        "playbook/success-create-medium": {
+            "source": "success-pattern",
             "success_count": 4,
         },
     }
-    scope, _note, evidence = _build_failure_feedback_mitigation(
-        direction, "medium", "create", design_doc
-    )
-    assert scope == "small"
-    assert evidence["success_bias"]["success_count"] == 4
-    assert evidence["success_bias"]["to"] == "small"
-
-
-def test_success_pattern_insufficient_count_no_bias():
-    """2 successes (< threshold) leaves scope unchanged."""
-    from app.strategic_spawning import _build_failure_feedback_mitigation
-
-    direction = {"id": "d-mno345"}
-    design_doc = {
-        "playbook/success-create-small": {
-            "source": "success-pattern",
-            "success_count": 2,
-        },
-    }
-    scope, _note, evidence = _build_failure_feedback_mitigation(
+    scope, note, evidence = _build_failure_feedback_mitigation(
         direction, "medium", "create", design_doc
     )
     assert scope == "medium"
+    assert note is None
     assert "success_bias" not in evidence
 
 

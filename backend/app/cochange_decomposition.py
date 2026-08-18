@@ -71,115 +71,6 @@ def cluster_files_by_cochange(
     return clusters
 
 
-def cluster_files_by_toplevel_dir(files: list[str]) -> list[list[str]] | None:
-    """Group files by their top-level directory (e.g. backend/, agent/, admin-ui/).
-
-    Fallback clustering for sparse-cochange findings: returns one cluster per
-    top-level dir when 3+ directory-prefixed files span 3+ dirs, else None.
-    Root-level files (no ``/``) don't establish a directory span and are
-    ignored — if after filtering fewer than 3 files remain, returns None.
-
-    The 3+ dir threshold matches the scope-escalation threshold so that
-    2-module medium findings stay coherent rather than being fragmented into
-    per-module tasks.
-    """
-    if len(files) < 3:
-        return None
-    groups: dict[str, list[str]] = {}
-    order: list[str] = []
-    kept = 0
-    for f in files:
-        if "/" not in f:
-            continue
-        top = f.split("/", 1)[0]
-        if top not in groups:
-            order.append(top)
-        groups.setdefault(top, []).append(f)
-        kept += 1
-    if kept < 3 or len(groups) < 3:
-        return None
-    return [groups[t] for t in order]
-
-
-def cluster_files_by_subdir(files: list[str]) -> list[list[str]] | None:
-    """Group files by first two path segments within a single top-level dir.
-
-    Third-tier fallback for findings confined to one top-level dir (e.g. all
-    ``backend/``) that still span multiple second-level dirs like
-    ``backend/app`` vs ``backend/testing``. Requires 3+ files, all sharing the
-    same top-level dir, each with at least three path segments, and spanning
-    2+ second-level directories; otherwise None.
-    """
-    if len(files) < 3:
-        return None
-    top_levels: set[str] = set()
-    for f in files:
-        parts = f.split("/")
-        if len(parts) < 3:
-            return None
-        top_levels.add(parts[0])
-    if len(top_levels) != 1:
-        return None
-    groups: dict[str, list[str]] = {}
-    order: list[str] = []
-    for f in files:
-        parts = f.split("/", 2)
-        key = "/".join(parts[:2])
-        if key not in groups:
-            order.append(key)
-        groups.setdefault(key, []).append(f)
-    if len(groups) < 2:
-        return None
-    return [groups[k] for k in order]
-
-
-def split_oversized_clusters_by_subdir(
-    clusters: list[list[str]], small_budget: int
-) -> list[list[str]] | None:
-    """Second-pass split: break oversized clusters by next sub-directory segment.
-
-    For each cluster exceeding ``small_budget``, regroup its files by the first
-    two path segments (e.g. ``backend/app`` vs ``backend/testing``). Returns a
-    new flat cluster list when at least one oversized cluster was actually
-    split and at least one resulting sub-cluster fits the small budget; else
-    None so callers can fall back to the prior behavior.
-
-    Refuses to split a cluster when any of its files lacks a real sub-directory
-    prefix (no ``/``) — the key would degrade to the bare filename and
-    fragment the cluster into singletons. Also requires at least one resulting
-    sub-cluster to contain two or more files, to avoid pure-singleton splits
-    that would flood the orchestrator with per-file tasks.
-    """
-    new_clusters: list[list[str]] = []
-    made_progress = False
-    for cluster in clusters:
-        if len(cluster) <= small_budget:
-            new_clusters.append(cluster)
-            continue
-        if any("/" not in f for f in cluster):
-            new_clusters.append(cluster)
-            continue
-        subgroups: dict[str, list[str]] = {}
-        order: list[str] = []
-        for f in cluster:
-            parts = f.split("/", 2)
-            key = "/".join(parts[:2])
-            if key not in subgroups:
-                order.append(key)
-            subgroups.setdefault(key, []).append(f)
-        if len(subgroups) >= 2 and any(len(g) >= 2 for g in subgroups.values()):
-            made_progress = True
-            for k in order:
-                new_clusters.append(subgroups[k])
-        else:
-            new_clusters.append(cluster)
-    if not made_progress or len(new_clusters) < 2:
-        return None
-    if not any(len(c) <= small_budget for c in new_clusters):
-        return None
-    return new_clusters
-
-
 def auto_decompose_findings_by_cochange(
     deduplicated: list[tuple[int, dict, str]],
     cochange_index: dict | None,
@@ -188,24 +79,24 @@ def auto_decompose_findings_by_cochange(
 ) -> list[tuple[int, dict, str]]:
     """Split medium-scope findings whose files form independent co-change clusters.
 
-    When a medium-scope finding's related_files form multiple independent
-    clusters in the cochange_index (files that don't historically co-change
-    together), split it into one small sub-finding per cluster so each piece
-    spawns as a small task at the healthier small-scope merge rate.
-
-    Falls back to clustering by top-level directory when the cochange index
-    has no affinity data for the finding's files — sparse history would
-    otherwise bypass decomposition entirely.
+    Splits ONLY on positive historical evidence: when the cochange_index
+    partitions the finding's related_files into multiple clusters, each with
+    genuine internal co-change affinity. Absence of affinity data is NOT
+    evidence of independence — files can be coupled through a shared contract
+    (types, API shapes, message schemas) that co-change history never
+    recorded, and fragmenting such a finding produces sibling PRs that merge
+    individually while breaking each other's contracts. For that reason there
+    is deliberately no directory-based fallback split, and a partition that
+    leaves any singleton cluster (a file with no proven affinity to either
+    side) skips decomposition entirely.
 
     Clusters that exceed the small-scope file budget keep medium scope rather
-    than being downgraded — a cluster too large for small wouldn't fit the
-    agent file budget at small scope. If every cluster exceeds the small
-    budget, skip decomposition entirely so the original medium finding stays
-    intact.
+    than being downgraded. If every cluster exceeds the small budget, skip
+    decomposition entirely so the original medium finding stays intact.
     """
     from app.research_completion import SCOPE_FILE_BUDGETS  # noqa: PLC0415
 
-    small_budget = SCOPE_FILE_BUDGETS.get("small", {}).get("total_files_max") or 6
+    small_budget = SCOPE_FILE_BUDGETS.get("small", {}).get("total_files_max") or 8
     expanded: list[tuple[int, dict, str]] = []
     for orig_i, finding, fhash in deduplicated:
         f_scope = finding.get("scope", DEFAULT_TASK_SCOPE)
@@ -216,40 +107,27 @@ def auto_decompose_findings_by_cochange(
         )
         if f_scope == "medium" and len(f_files) >= 2 and not f_already_calibrated:
             f_clusters: list[list[str]] | None = None
-            cluster_source = ""
-            if len(f_files) >= 3:
-                f_clusters = (
-                    cluster_files_by_cochange(f_files, cochange_index)
-                    if cochange_index
-                    else None
-                )
-                cluster_source = "co-change"
-                if f_clusters is None:
-                    f_clusters = cluster_files_by_toplevel_dir(f_files)
-                    cluster_source = "top-level-dir"
-                if f_clusters is None:
-                    f_clusters = cluster_files_by_subdir(f_files)
-                    cluster_source = "subdir"
+            cluster_source = "co-change"
+            if len(f_files) >= 3 and cochange_index:
+                f_clusters = cluster_files_by_cochange(f_files, cochange_index)
+            # Singleton clusters mean a file had no proven affinity to either
+            # side — absence of evidence, not independence. Keep the finding
+            # whole rather than strand that file in its own fragment.
+            if f_clusters is not None and any(len(c) < 2 for c in f_clusters):
+                f_clusters = None
             if f_clusters and len(f_clusters) >= 2:
                 f_title = finding.get("title", f"Research finding #{orig_i + 1}")
                 if all(len(c) > small_budget for c in f_clusters):
-                    subdir_split = split_oversized_clusters_by_subdir(
-                        f_clusters, small_budget
+                    logger.info(
+                        "[RESEARCH] Skipping co-change decomposition for "
+                        "'%s': all %d clusters exceed small-scope budget "
+                        "(%d files)",
+                        f_title,
+                        len(f_clusters),
+                        small_budget,
                     )
-                    if subdir_split is not None:
-                        f_clusters = subdir_split
-                        cluster_source = f"{cluster_source}+subdir"
-                    else:
-                        logger.info(
-                            "[RESEARCH] Skipping co-change decomposition for "
-                            "'%s': all %d clusters exceed small-scope budget "
-                            "(%d files) and sub-dir split produced no fit",
-                            f_title,
-                            len(f_clusters),
-                            small_budget,
-                        )
-                        expanded.append((orig_i, finding, fhash))
-                        continue
+                    expanded.append((orig_i, finding, fhash))
+                    continue
                 logger.info(
                     "[RESEARCH] Auto-decomposing medium finding '%s' into %d "
                     "sub-findings via %s clustering: %s",

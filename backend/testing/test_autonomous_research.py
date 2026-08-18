@@ -6117,7 +6117,7 @@ async def test_finding_type_security_audit_spawns_security_audit_task(
 async def test_medium_scope_with_many_related_files_upgrades_to_large(
     db_session, mocker
 ):
-    """Medium-scope finding with >=5 related_files is upgraded to large via pre-spawn heuristic."""
+    """Medium-scope finding at the medium file budget (16) is upgraded to large via pre-spawn heuristic."""
     direction = _active_direction("d-fchint01", "File-count heuristic direction")
     project = Project(
         name="File Count Heuristic Test",
@@ -6131,15 +6131,14 @@ async def test_medium_scope_with_many_related_files_upgrades_to_large(
 
     task = await _make_research_task(project, direction, db_session)
 
-    # Current upgrade threshold is 8 files (file-count heuristic) or cross-
-    # module span >= 3 modules. Use 8 files to exercise the file-count path.
+    # The upgrade threshold is the medium file budget (16 files) — a finding
+    # already at budget has no headroom for expansion, so it routes to large.
     finding = _make_finding(
         "Refactor auth module across many files",
         direction["id"],
         scope="medium",
     )
-    # Current upgrade threshold is 8 files (file-count heuristic).
-    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(8)]
+    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(16)]
 
     _patch_research_externals(mocker)
     mocker.patch(
@@ -6313,7 +6312,7 @@ async def test_small_scope_with_few_related_files_stays_small(
 async def test_medium_scope_with_few_related_files_stays_medium(
     db_session, mocker, monkeypatch
 ):
-    """Medium-scope finding with <8 related_files is not upgraded by the file-count heuristic."""
+    """Medium-scope finding below the medium file budget (16) is not upgraded by the file-count heuristic."""
     # Disable cold-start baseline upgrade so this test isolates the file-count heuristic.
     monkeypatch.setitem(
         _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
@@ -6359,10 +6358,15 @@ async def test_medium_scope_with_few_related_files_stays_medium(
 
 
 @pytest.mark.asyncio
-async def test_medium_scope_cross_module_related_files_auto_decomposes(
+async def test_medium_scope_cross_module_without_cochange_stays_intact(
     db_session, mocker, monkeypatch
 ):
-    """3-module cross-module medium finding auto-decomposes into per-file small sub-findings."""
+    """Cross-module medium finding with no co-change data spawns ONE intact task.
+
+    Directory span is not evidence of independence — a cross-stack contract
+    change always spans top-level dirs, and fragmenting it produces sibling
+    PRs that merge individually while breaking the shared contract. With the
+    directory fallback removed, only positive co-change evidence splits."""
     monkeypatch.setitem(
         _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
     )
@@ -6406,14 +6410,11 @@ async def test_medium_scope_cross_module_related_files_auto_decomposes(
         )
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 3
-    files_seen = set()
-    for ct in child_tasks:
-        assert ct.payloads[0]["type"] == "create"
-        assert ct.context["scope"] == "small"
-        assert ct.context["scope_calibrated_from"] == "medium"
-        files_seen.update(ct.context.get("related_files") or [])
-    assert files_seen == {
+    assert len(child_tasks) == 1
+    assert child_tasks[0].payloads[0]["type"] == "create"
+    assert child_tasks[0].context["scope"] == "medium"
+    assert "scope_calibrated_from" not in child_tasks[0].context
+    assert set(child_tasks[0].context.get("related_files") or []) == {
         "backend/app/foo.py",
         "agent/src/bar.ts",
         "admin-ui/src/baz.tsx",
@@ -6449,17 +6450,28 @@ async def test_auto_decomposed_siblings_are_chained_via_depends_on(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    # Two genuine co-change clusters trigger auto-decomposition (2 siblings).
+    await _seed_cochange_index(
+        db_session,
+        project,
+        {
+            "backend/app/foo.py": {"backend/app/foo_helpers.py": 2.0},
+            "backend/app/foo_helpers.py": {"backend/app/foo.py": 2.0},
+            "agent/src/bar.ts": {"agent/src/bar_types.ts": 2.0},
+            "agent/src/bar_types.ts": {"agent/src/bar.ts": 2.0},
+        },
+    )
 
     task = await _make_research_task(project, direction, db_session)
 
-    # 3-module finding triggers top-level-dir auto-decomposition (3 siblings).
     finding = _make_finding(
         "Coupled cross-module change", direction["id"], scope="medium"
     )
     finding["related_files"] = [
         "backend/app/foo.py",
+        "backend/app/foo_helpers.py",
         "agent/src/bar.ts",
-        "admin-ui/src/baz.tsx",
+        "agent/src/bar_types.ts",
     ]
 
     _patch_research_externals(mocker)
@@ -6476,15 +6488,14 @@ async def test_auto_decomposed_siblings_are_chained_via_depends_on(
         .order_by(Task.created_at)
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 3
+    assert len(child_tasks) == 2
 
-    # All three are auto-decomposed siblings of the same parent finding.
+    # Both are auto-decomposed siblings of the same parent finding.
     assert all((ct.payloads[0]["type"] == "create") for ct in child_tasks)
 
-    # Chain: first sibling free, second depends on first, third depends on second.
+    # Chain: first sibling free, second depends on first.
     assert list(child_tasks[0].depends_on or []) == []
     assert list(child_tasks[1].depends_on or []) == [str(child_tasks[0].id)]
-    assert list(child_tasks[2].depends_on or []) == [str(child_tasks[1].id)]
 
 
 @pytest.mark.asyncio
@@ -6595,7 +6606,7 @@ async def test_partial_adversarial_manifest_fail_closes_omitted_high_stakes_find
 async def test_medium_scope_expansion_ratio_prediction_upgrades_to_large(
     db_session, mocker, monkeypatch
 ):
-    """Medium finding with 4 related_files x 3.0 avg_expansion_ratio predicts >10 → upgrade."""
+    """Medium finding with 6 related_files x 3.0 avg_expansion_ratio predicts 18 > medium budget (16) → upgrade."""
     monkeypatch.setitem(
         _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
     )
@@ -6620,9 +6631,9 @@ async def test_medium_scope_expansion_ratio_prediction_upgrades_to_large(
     task = await _make_research_task(project, direction, db_session)
 
     finding = _make_finding(
-        "Refactor four related modules", direction["id"], scope="medium"
+        "Refactor six related modules", direction["id"], scope="medium"
     )
-    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(4)]
+    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(6)]
 
     _patch_research_externals(mocker)
     mocker.patch(
@@ -6935,40 +6946,14 @@ def test_cluster_files_by_cochange_skips_when_only_external_affinity():
     assert clusters is None
 
 
-def test_cluster_files_by_toplevel_dir_requires_min_files_and_dirs():
-    """Path-based fallback requires 3+ files spanning 3+ top-level directories.
+def test_auto_decompose_stays_intact_when_cochange_empty():
+    """Medium finding across 3+ top-level dirs stays WHOLE when cochange is empty.
 
-    2-module findings stay coherent — only 3+ module findings decompose,
-    matching the scope-escalation threshold.
+    Directory span is not evidence of independence — a cross-stack contract
+    change always spans top-level dirs, and fragmenting it produces sibling
+    PRs that merge individually while breaking the shared contract. Splitting
+    requires positive co-change evidence.
     """
-    from app.cochange_decomposition import cluster_files_by_toplevel_dir
-
-    assert cluster_files_by_toplevel_dir(["backend/a.py", "agent/b.ts"]) is None
-    assert (
-        cluster_files_by_toplevel_dir(["backend/a.py", "backend/b.py", "backend/c.py"])
-        is None
-    )
-    # 2-module findings (backend + agent) don't decompose.
-    assert (
-        cluster_files_by_toplevel_dir(["backend/a.py", "backend/b.py", "agent/c.ts"])
-        is None
-    )
-    # Root-level files don't establish a directory span.
-    assert cluster_files_by_toplevel_dir(["a.py", "b.py", "c.py"]) is None
-    clusters = cluster_files_by_toplevel_dir(
-        ["backend/a.py", "agent/b.ts", "admin-ui/c.tsx"]
-    )
-    assert clusters is not None
-    cluster_sets = {frozenset(c) for c in clusters}
-    assert cluster_sets == {
-        frozenset({"backend/a.py"}),
-        frozenset({"agent/b.ts"}),
-        frozenset({"admin-ui/c.tsx"}),
-    }
-
-
-def test_auto_decompose_falls_back_to_path_when_cochange_empty():
-    """Medium finding with files across 3+ top-level dirs splits when cochange is empty."""
     from app.cochange_decomposition import auto_decompose_findings_by_cochange
 
     def _hash(title: str, desc: str) -> str:
@@ -6990,15 +6975,9 @@ def test_auto_decompose_falls_back_to_path_when_cochange_empty():
         None,
         _hash,
     )
-    assert len(result) == 3
-    assert all(sub["scope"] == "small" for _, sub, _ in result)
-    assert all(sub["auto_decomposed"] for _, sub, _ in result)
-    sub_file_sets = {frozenset(sub["related_files"]) for _, sub, _ in result}
-    assert sub_file_sets == {
-        frozenset({"backend/app/x.py"}),
-        frozenset({"agent/src/y.ts"}),
-        frozenset({"admin-ui/src/z.tsx"}),
-    }
+    assert len(result) == 1
+    assert result[0][1] is finding
+    assert result[0][1].get("auto_decomposed") is not True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7260,17 +7239,24 @@ def test_auto_decompose_prepends_scope_boundary_preamble_to_prompt():
         "scope": "medium",
         "related_files": [
             "backend/app/x.py",
-            "agent/src/y.ts",
-            "admin-ui/src/z.tsx",
+            "backend/app/y.py",
+            "agent/src/a.ts",
+            "agent/src/b.ts",
         ],
+    }
+    idx = {
+        "backend/app/x.py": {"backend/app/y.py": 2.0},
+        "backend/app/y.py": {"backend/app/x.py": 2.0},
+        "agent/src/a.ts": {"agent/src/b.ts": 2.0},
+        "agent/src/b.ts": {"agent/src/a.ts": 2.0},
     }
     result = auto_decompose_findings_by_cochange(
         [(0, finding, "h0")],
-        {},
+        idx,
         None,
         _hash,
     )
-    assert len(result) == 3
+    assert len(result) == 2
     for _, sub, _ in result:
         prompt = sub["prompt"]
         assert prompt.endswith(original_prompt)
@@ -7317,7 +7303,7 @@ def _decomp_cochange_index(clusters: list[list[str]]) -> dict:
 
 
 def test_auto_decompose_normal_split_when_clusters_fit_small_budget():
-    """[5 files, 3 files] decomposes normally — both clusters fit small budget (6)."""
+    """[5 files, 3 files] decomposes normally — both clusters fit small budget (8)."""
     from app.cochange_decomposition import auto_decompose_findings_by_cochange
 
     cluster_a = [f"a{i}.py" for i in range(5)]
@@ -7336,10 +7322,10 @@ def test_auto_decompose_normal_split_when_clusters_fit_small_budget():
 
 
 def test_auto_decompose_oversized_cluster_keeps_medium_scope():
-    """[7 files, 3 files] — 7-file cluster stays medium, 3-file cluster goes small."""
+    """[9 files, 3 files] — 9-file cluster stays medium, 3-file cluster goes small."""
     from app.cochange_decomposition import auto_decompose_findings_by_cochange
 
-    cluster_a = [f"a{i}.py" for i in range(7)]
+    cluster_a = [f"a{i}.py" for i in range(9)]
     cluster_b = [f"b{i}.py" for i in range(3)]
     files = cluster_a + cluster_b
     idx = _decomp_cochange_index([cluster_a, cluster_b])
@@ -7349,8 +7335,8 @@ def test_auto_decompose_oversized_cluster_keeps_medium_scope():
     )
     assert len(out) == 2
     by_size = {len(sub["related_files"]): sub for _, sub, _ in out}
-    assert by_size[7]["scope"] == "medium"
-    assert "scope_calibrated_from" not in by_size[7]
+    assert by_size[9]["scope"] == "medium"
+    assert "scope_calibrated_from" not in by_size[9]
     assert by_size[3]["scope"] == "small"
     assert by_size[3]["scope_calibrated_from"] == "medium"
 
@@ -7359,8 +7345,8 @@ def test_auto_decompose_skipped_when_all_clusters_exceed_small_budget():
     """When every cluster exceeds the small budget, leave the original medium finding intact."""
     from app.cochange_decomposition import auto_decompose_findings_by_cochange
 
-    cluster_a = [f"a{i}.py" for i in range(7)]
-    cluster_b = [f"b{i}.py" for i in range(8)]
+    cluster_a = [f"a{i}.py" for i in range(9)]
+    cluster_b = [f"b{i}.py" for i in range(10)]
     files = cluster_a + cluster_b
     idx = _decomp_cochange_index([cluster_a, cluster_b])
     finding = _decomp_finding(files)
@@ -7375,195 +7361,22 @@ def test_auto_decompose_skipped_when_all_clusters_exceed_small_budget():
     assert fhash == "h"
 
 
-def test_split_oversized_clusters_by_subdir_splits_on_real_subdirs():
-    """Oversized cluster spanning two sub-dirs splits into per-sub-dir groups."""
-    from app.cochange_decomposition import split_oversized_clusters_by_subdir
-
-    cluster = [
-        "backend/app/a.py",
-        "backend/app/b.py",
-        "backend/app/c.py",
-        "backend/app/d.py",
-        "backend/testing/e.py",
-        "backend/testing/f.py",
-        "backend/testing/g.py",
-    ]
-    out = split_oversized_clusters_by_subdir([cluster], small_budget=6)
-    assert out is not None
-    assert {tuple(sorted(g)) for g in out} == {
-        (
-            "backend/app/a.py",
-            "backend/app/b.py",
-            "backend/app/c.py",
-            "backend/app/d.py",
-        ),
-        ("backend/testing/e.py", "backend/testing/f.py", "backend/testing/g.py"),
-    }
-
-
-def test_split_oversized_clusters_by_subdir_refuses_root_level_files():
-    """Root-level (bare-filename) files have no sub-dir prefix, so don't fragment."""
-    from app.cochange_decomposition import split_oversized_clusters_by_subdir
-
-    cluster = [f"a{i}.py" for i in range(7)]
-    out = split_oversized_clusters_by_subdir([cluster], small_budget=6)
-    assert out is None
-
-
-def test_split_oversized_clusters_by_subdir_refuses_mixed_root_and_subdir():
-    """Mixed root-level + sub-dir files: refuse split so root-level files aren't
-    fragmented into singletons while sub-dir files get grouped."""
-    from app.cochange_decomposition import split_oversized_clusters_by_subdir
-
-    cluster = [
-        "root_a.py",
-        "backend/app/a.py",
-        "backend/app/b.py",
-        "backend/testing/c.py",
-        "backend/testing/d.py",
-        "backend/testing/e.py",
-        "backend/testing/f.py",
-    ]
-    out = split_oversized_clusters_by_subdir([cluster], small_budget=6)
-    assert out is None
-
-
-def test_split_oversized_clusters_by_subdir_refuses_all_singleton_subgroups():
-    """Sub-grouping produces only singletons — refuse to flood the orchestrator."""
-    from app.cochange_decomposition import split_oversized_clusters_by_subdir
-
-    cluster = [
-        "backend/app/a.py",
-        "backend/lib/b.py",
-        "backend/cli/c.py",
-        "backend/util/d.py",
-        "backend/core/e.py",
-        "backend/util2/f.py",
-        "backend/util3/g.py",
-    ]
-    out = split_oversized_clusters_by_subdir([cluster], small_budget=6)
-    assert out is None
-
-
-def test_split_oversized_clusters_by_subdir_leaves_fitting_clusters_alone():
-    """Clusters already within small_budget pass through unchanged; None when
-    no split progress is made."""
-    from app.cochange_decomposition import split_oversized_clusters_by_subdir
-
-    fitting = ["a.py", "b.py", "c.py"]
-    out = split_oversized_clusters_by_subdir([fitting], small_budget=6)
-    assert out is None
-
-
-def test_cluster_files_by_subdir_splits_on_second_level_dirs():
-    """Files in one top-level dir spanning 2+ second-level dirs split by subdir."""
-    from app.cochange_decomposition import cluster_files_by_subdir
-
-    clusters = cluster_files_by_subdir(
-        [
-            "backend/app/x.py",
-            "backend/app/y.py",
-            "backend/testing/test_x.py",
-        ]
-    )
-    assert clusters is not None
-    cluster_sets = {frozenset(c) for c in clusters}
-    assert cluster_sets == {
-        frozenset({"backend/app/x.py", "backend/app/y.py"}),
-        frozenset({"backend/testing/test_x.py"}),
-    }
-
-
-def test_cluster_files_by_subdir_returns_none_when_single_subdir():
-    """Files all sharing the same second-level dir → None."""
-    from app.cochange_decomposition import cluster_files_by_subdir
-
-    assert (
-        cluster_files_by_subdir(
-            [
-                "backend/app/a.py",
-                "backend/app/b.py",
-                "backend/app/c.py",
-            ]
-        )
-        is None
-    )
-
-
-def test_cluster_files_by_subdir_requires_min_files():
-    """Fewer than 3 files → None."""
-    from app.cochange_decomposition import cluster_files_by_subdir
-
-    assert (
-        cluster_files_by_subdir(
-            [
-                "backend/app/a.py",
-                "backend/testing/b.py",
-            ]
-        )
-        is None
-    )
-
-
-def test_cluster_files_by_subdir_returns_none_for_multi_toplevel():
-    """Multiple top-level dirs → None (toplevel clustering handles that case)."""
-    from app.cochange_decomposition import cluster_files_by_subdir
-
-    assert (
-        cluster_files_by_subdir(
-            [
-                "backend/app/a.py",
-                "backend/testing/b.py",
-                "agent/src/c.ts",
-            ]
-        )
-        is None
-    )
-
-
-def test_cluster_files_by_subdir_returns_none_when_missing_subdir():
-    """Files without a real second-level dir (only 2 segments) → None."""
-    from app.cochange_decomposition import cluster_files_by_subdir
-
-    assert (
-        cluster_files_by_subdir(
-            [
-                "backend/a.py",
-                "backend/b.py",
-                "backend/c.py",
-            ]
-        )
-        is None
-    )
-
-
-def test_auto_decompose_falls_back_to_subdir_within_single_toplevel():
-    """Medium finding all under one top-level but spanning subdirs decomposes."""
+def test_auto_decompose_skipped_when_partition_leaves_singleton():
+    """A co-change partition that strands a file in a singleton cluster skips
+    decomposition — the singleton has no proven affinity to EITHER side, and
+    absence of evidence is not independence (the file may be coupled through
+    a shared contract that co-change history never recorded)."""
     from app.cochange_decomposition import auto_decompose_findings_by_cochange
 
-    finding = {
-        "title": "Backend cross-subdir cleanup",
-        "description": "desc",
-        "scope": "medium",
-        "related_files": [
-            "backend/app/x.py",
-            "backend/app/y.py",
-            "backend/testing/test_x.py",
-        ],
-    }
-    result = auto_decompose_findings_by_cochange(
-        [(0, finding, "h0")],
-        {},
-        None,
-        _decomp_hash_fn,
+    cluster_a = ["backend/app/x.py", "backend/app/y.py"]
+    idx = _decomp_cochange_index([cluster_a])
+    finding = _decomp_finding(cluster_a + ["backend/testing/test_x.py"])
+    out = auto_decompose_findings_by_cochange(
+        [(0, finding, "h")], idx, None, _decomp_hash_fn
     )
-    assert len(result) == 2
-    assert all(sub["scope"] == "small" for _, sub, _ in result)
-    sub_file_sets = {frozenset(sub["related_files"]) for _, sub, _ in result}
-    assert sub_file_sets == {
-        frozenset({"backend/app/x.py", "backend/app/y.py"}),
-        frozenset({"backend/testing/test_x.py"}),
-    }
+    assert len(out) == 1
+    assert out[0][1] is finding
+    assert out[0][1].get("auto_decomposed") is not True
 
 
 def test_cochange_decomposition_suppressed_triggers_on_poor_merge_rate():
@@ -20310,7 +20123,7 @@ def test_every_origination_class_has_a_live_stamping_site():
 
     app_dir = Path(models_module.__file__).resolve().parent
     sources = {
-        path: path.read_text()
+        path: path.read_text(encoding="utf-8")
         for path in app_dir.rglob("*.py")
         if path.name != "models.py"
     }

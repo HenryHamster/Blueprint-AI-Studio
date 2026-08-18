@@ -1887,10 +1887,10 @@ async def test_scope_file_budgets_surfaced_with_agent_limits():
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
     budgets = result["scope_file_budgets"]
-    assert budgets["small"]["total_files_max"] == 6
-    assert budgets["medium"]["production_files_max"] == 10
-    assert budgets["medium"]["total_files_max"] == 10
-    assert budgets["large"]["total_files_max"] == 20
+    assert budgets["small"]["total_files_max"] == 8
+    assert budgets["medium"]["production_files_max"] == 16
+    assert budgets["medium"]["total_files_max"] == 16
+    assert budgets["large"]["total_files_max"] == 32
 
 
 @pytest.mark.asyncio

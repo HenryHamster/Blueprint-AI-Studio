@@ -136,7 +136,7 @@ export function synthesizeSuccessPatterns(
       }
       if (best && best.pct - current.pct >= 20) {
         sentences.push(
-          `${taskScope}-scope tasks in this direction merge at ${current.pct}% (${current.merged}/${current.created}) while ${best.scope}-scope tasks merge at ${best.pct}% (${best.merged}/${best.created}) — consider constraining your changes to the smallest viable surface.`,
+          `${taskScope}-scope tasks in this direction merge at ${current.pct}% (${current.merged}/${current.created}) while ${best.scope}-scope tasks merge at ${best.pct}% (${best.merged}/${best.created}). Treat this as a proxy signal only: per-task merge rate is blind to integration cost, so do NOT shrink your change below what the task actually needs — instead, look at WHY prior ${taskScope}-scope tasks failed (review the failure analyses below) and fix that.`,
         );
       }
     }
@@ -1058,9 +1058,9 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
   const scopeApplicable = ['create', 'fix', 'refactor'].includes(taskType);
   if (taskScope && scopeApplicable) {
     const scopeDescriptions: Record<string, string> = {
-      small: 'expect <50 lines across 1-3 files. Keep changes minimal and focused.',
-      medium: 'expect 50-200 lines across 2-5 files. Moderate cross-cutting changes. Plan your changes before executing — identify files, dependencies, and order.',
-      large: 'cross-component, 200+ lines — plan before coding.',
+      small: 'a focused change, typically well under ~150 lines. Touch every file the change actually needs — completeness beats artificial smallness, and a half-wired change that "stays small" fails review.',
+      medium: 'a substantive change, typically a few hundred lines across however many files the work genuinely requires. Plan your changes before executing — identify files, dependencies, and order. Implement the complete contract: if the change spans a producer and its consumers, change all of them here rather than leaving a seam for another task.',
+      large: 'cross-component work — plan before coding, and land the full contract end to end.',
     };
     const scopeDesc = scopeDescriptions[taskScope] ?? '';
     const effort = payload ? strVal(payload.effort) : '';
@@ -1099,7 +1099,7 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
       }
       if (isUpgrade) {
         scopeLines.push(
-          `Note: This task was originally scoped as ${calibratedFrom} but calibrated up to ${taskScope} because ${calibratedFrom}-scope tasks have struggled for this direction while smaller scopes have succeeded.${ratesSuffix} Decompose the work into independent smaller pieces — each piece should be small enough to succeed on its own.`,
+          `Note: This task was originally scoped as ${calibratedFrom} but calibrated up to ${taskScope} because the work is bigger than first estimated — prior ${calibratedFrom}-scope attempts in this direction overflowed their budget.${ratesSuffix} You have the larger budget now: plan the work as ONE coherent change and land the complete contract. If you decompose, split along contract boundaries and keep coupled pieces together or explicitly sequenced — do not shred it into file-disjoint fragments that each merge but break each other's contracts.`,
         );
       } else {
         scopeLines.push(
@@ -1190,7 +1190,7 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
     if (typeof lowConfRate === 'number' && Number.isFinite(lowConfRate)) {
       const pct = Math.round(lowConfRate * 100);
       signalLines.push(
-        `**Low-confidence spawn:** predicted merge probability is ${pct}% — prefer the smallest viable change and avoid speculative scope expansion.`,
+        `**Low-confidence spawn:** predicted merge probability is ${pct}%. This is a proxy warning, not an instruction to shrink: read the specific risk signals in this section, address what they name, and still implement the complete change the task requires — a partial change that merges but leaves the contract half-wired is worse than a complete one that takes review iterations.`,
       );
     }
     const complexityScore = taskContext.complexity_score;
@@ -1217,7 +1217,7 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
         }
         const fRatio = f('ratio');
         if (fRatio !== null && fRatio < 0.8 && expansionRatio !== null) {
-          sentences.push(`Historical expansion ratio of ${expansionRatio}x means agents working on similar tasks touched ${expansionRatio}x the listed files — constrain your initial changes aggressively.`);
+          sentences.push(`Historical expansion ratio of ${expansionRatio}x means agents working on similar tasks touched ${expansionRatio}x the listed files — expect the real scope to be larger than listed and plan for those additional files up front instead of discovering them mid-change.`);
         }
         const fNeighbors = f('neighbors');
         if (fNeighbors !== null && fNeighbors < 0.8 && neighborRatio !== null) {
@@ -1229,7 +1229,7 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
         }
         const fFiles = f('files');
         if (fFiles !== null && fFiles < 0.8 && files !== null) {
-          sentences.push(`File count (${files}) is above the high-merge band — prefer the smallest viable subset.`);
+          sentences.push(`File count (${files}) is on the larger side — keep the change coherent: sequence related edits and verify the shared contract across all touched files before finishing.`);
         }
         if (sentences.length > 0) {
           signalLines.push(`- ${sentences.join(' ')}`);
@@ -1264,7 +1264,7 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
       remLines.push(`- Prior remediation attempts on this direction: ${attempts} — if a previous remediation failed to hold, favor a different angle over repeating the prior fix shape.`);
     }
     if (confidence === 'low') {
-      remLines.push('- Confidence is low: treat the recommended fix as a hypothesis, verify the root cause before applying, and prefer the smallest reversible change.');
+      remLines.push('- Confidence is low: treat the recommended fix as a hypothesis and verify the root cause before applying. Once verified, fix that root cause completely — do not patch the symptom just to keep the diff small.');
     }
     remLines.push('');
     prefix += remLines.join('\n') + '\n';

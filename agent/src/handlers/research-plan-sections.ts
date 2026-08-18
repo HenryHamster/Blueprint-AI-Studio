@@ -7,7 +7,7 @@ import { isGreenfieldRepo } from '../prompt.js';
 /**
  * Builds a compact (0-2 line) failure-calibration signal from direction history.
  * Line 1: last cycle's failures with class and actionability hint.
- * Line 2 (optional): recurring CODE_ERROR trend → urge smaller scope.
+ * Line 2 (optional): recurring CODE_ERROR trend → urge fixing the recurring cause.
  */
 export function buildScopeCalibrationSignal(history: Array<Record<string, unknown>>): string {
   if (history.length === 0) return '';
@@ -62,7 +62,8 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
     }
   }
 
-  // Scope trend: CODE_ERRORs recurring in prior cycles too → strongly urge smaller scope
+  // Scope trend: CODE_ERRORs recurring in prior cycles too → urge diagnosing the
+  // recurring cause (NOT scope-shrinking — that just fragments the same mistake)
   let line2 = '';
   if (codeErrors.length > 0 && history.length >= 2) {
     const prevEntries = history.slice(-3, -1);
@@ -74,7 +75,7 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
       prevCodeErrors += prevDetails.filter(fd => classifyFailureCategory(fd.category) === 'CODE_ERROR').length;
     }
     if (prevCodeErrors > 0) {
-      line2 = `\n  Scope trend: CODE_ERRORs in ${Math.min(history.length, 3)} consecutive cycles → strongly prefer smaller, narrower findings`;
+      line2 = `\n  Scope trend: CODE_ERRORs in ${Math.min(history.length, 3)} consecutive cycles → read the prior failure analyses and fix the recurring cause; do NOT reflexively shrink scope — a smaller fragment of the same mistake still fails`;
     }
   }
 
@@ -158,7 +159,7 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
     ? `\n  Scope accuracy (actual files / declared, last ${cycleLabel}): ${expansionParts.join(', ')}`
     : '';
   const line7 = maxRatio > 2.0
-    ? `\n  ⚠ Expansion ratio exceeds 2.0x — halve your file count estimates or prefer smaller scope`
+    ? `\n  ⚠ Expansion ratio exceeds 2.0x — your related_files estimates chronically understate the real footprint. List the files the work will ACTUALLY touch (including consumers of changed contracts) and scope honestly for that larger footprint; do not shrink the work to fit the underestimate`
     : '';
 
   if (!line1 && !line2 && !line3 && !line4 && !line5 && !line6 && !line7 && !priorFailuresLine) return '';

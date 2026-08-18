@@ -124,7 +124,7 @@ describe('formatDecompositionOutcomes', () => {
     expect(result).not.toContain('Actionable guidance');
   });
 
-  it('includes "flatten dependency graph" hint when max_dependency_depth > 3', () => {
+  it('renders max_dependency_depth as a proxy metric without a "flatten the graph" imperative', () => {
     const result = formatDecompositionOutcomes({
       decomposition_outcomes: {
         prior_decomposition_count: 2,
@@ -132,10 +132,11 @@ describe('formatDecompositionOutcomes', () => {
         max_dependency_depth: 5,
       },
     });
-    expect(result).toContain('flatten the dependency graph');
+    expect(result).toContain('Max dependency depth: 5');
+    expect(result).not.toContain('flatten the dependency graph');
   });
 
-  it('includes "smaller subtasks" hint when avg_files_per_subtask is high and merge rate modest', () => {
+  it('renders avg_files_per_subtask as a proxy metric without a "smaller subtasks" imperative', () => {
     const result = formatDecompositionOutcomes({
       decomposition_outcomes: {
         prior_decomposition_count: 3,
@@ -143,10 +144,11 @@ describe('formatDecompositionOutcomes', () => {
         avg_files_per_subtask: 8.0,
       },
     });
-    expect(result).toContain('prefer smaller subtasks');
+    expect(result).toContain('Avg files per subtask: 8');
+    expect(result).not.toContain('prefer smaller subtasks');
   });
 
-  it('includes cross-module correlation warning when flagged', () => {
+  it('does not derive a cross-module correlation warning from high_cross_module_correlates_with_low_merge', () => {
     const result = formatDecompositionOutcomes({
       decomposition_outcomes: {
         prior_decomposition_count: 3,
@@ -154,8 +156,9 @@ describe('formatDecompositionOutcomes', () => {
         high_cross_module_correlates_with_low_merge: true,
       },
     });
-    expect(result).toContain('Cross-module subtasks');
-    expect(result).toContain('keep each subtask scoped to one module');
+    expect(result).toContain('Avg subtask merge rate: 60%');
+    expect(result).not.toContain('Cross-module subtasks');
+    expect(result).not.toContain('keep each subtask scoped to one module');
   });
 
   it('does not recommend smaller subtasks when merge rate is high despite many files', () => {

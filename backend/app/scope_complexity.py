@@ -39,8 +39,12 @@ def _composite_complexity_score(
     auto_generated = [f for f in all_files if _is_auto_generated(f)]
     related_files = [f for f in all_files if not _is_auto_generated(f)]
     n = len(related_files)
-    # File count: no penalty up to 2 files, linear down to 0.5 at n=10+.
-    f_files = max(0.5, 1.0 - 0.0625 * max(0, n - 2))
+    # File count: no penalty up to 6 files, linear down to 0.5 at n=14+.
+    # The knee sits well inside the medium band (16 files) on purpose: modern
+    # implementing agents handle multi-file changes reliably, and penalizing
+    # ordinary contract-complete change sets just biases spawning toward
+    # fragments that individually merge while collectively breaking contracts.
+    f_files = max(0.5, 1.0 - 0.0625 * max(0, n - 6))
     ratio = 0.0
     f_ratio = 1.0
     if direction and n > 0:
