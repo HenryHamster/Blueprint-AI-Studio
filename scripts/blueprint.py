@@ -54,6 +54,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -2159,6 +2160,8 @@ def cmd_directions(args: argparse.Namespace) -> None:
         _directions_unhold(args)
     elif sub == "resolve-discovery":
         _directions_resolve_discovery(args)
+    elif sub == "show-discovery":
+        _directions_show_discovery(args)
     else:
         _directions_list(args)
 
@@ -2633,6 +2636,60 @@ def _directions_resolve_discovery(args: argparse.Namespace) -> None:
         + (f", successor cycle {r.get('next_cycle_id')}"
            if r.get("next_cycle_id") else "")
     ))
+
+
+def _directions_show_discovery(args: argparse.Namespace) -> None:
+    """Show a direction's most recent discovery cycles: state, verdict,
+    operator_question, and binding-decision authority.
+
+    Read-only counterpart to ``resolve-discovery`` — it exists so an operator
+    can see WHY a cycle landed where it did (and get the cycle_id +
+    cycle_revision resolve-discovery needs) without DB/SSH access.
+    """
+    pid = get_project_id(getattr(args, "project_id", None))
+    d = _resolve_direction(args, args.direction_id)
+    did = d["id"]
+    limit = getattr(args, "limit", 5)
+    result = api(
+        "GET",
+        f"/api/admin/projects/{pid}/directions/{did}/discovery-cycles"
+        f"?limit={limit}",
+    )
+    _emit(args, result, _render_discovery_cycles)
+
+
+def _render_discovery_cycles(data: dict) -> None:
+    cycles = data.get("cycles") or []
+    print(f"=== DISCOVERY CYCLES ({len(cycles)}) ===")
+    if not cycles:
+        print("  (none)")
+        return
+    for c in cycles:
+        cid = c.get("id", "?")
+        state = c.get("state", "?")
+        revision = c.get("revision", "?")
+        generation = c.get("generation", "?")
+        verdict = c.get("verdict") or "-"
+        allowed = c.get("binding_decision_allowed")
+        allowed_str = "?" if allowed is None else ("yes" if allowed else "NO")
+        updated = (c.get("updated_at") or "?")[:19]
+        print(
+            f"\n  {cid}  gen={generation}  rev={revision}  {state:16}  "
+            f"verdict={verdict:10}  binding_allowed={allowed_str}  "
+            f"updated={updated}"
+        )
+        summary = c.get("review_summary")
+        if summary:
+            print(f"    Summary: {summary}")
+        question = c.get("operator_question")
+        if question:
+            print("    ** Operator question:")
+            for line in textwrap.wrap(str(question), width=76):
+                print(f"       {line}")
+        bet = c.get("bet_snapshot") or {}
+        claim = bet.get("claim")
+        if claim:
+            print(f"    Active bet: mode={bet.get('mode', '?')}  claim={claim}")
 
 
 # ── trials ───────────────────────────────────────────────────────────────────
@@ -6557,6 +6614,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_dirs_resolve.add_argument("--note", help="Optional operator note (2000 chars max).")
     p_dirs_resolve.add_argument("--yes", action="store_true",
                                 help="Skip the confirmation prompt.")
+
+    p_dirs_show_discovery = dirs_sub.add_parser(
+        "show-discovery", parents=[common],
+        help="Show a direction's most recent discovery cycles: state, "
+             "verdict, operator_question, and binding-decision authority.")
+    p_dirs_show_discovery.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_show_discovery.add_argument("--limit", type=int, default=5,
+                                       help="Max cycles to show, newest first "
+                                            "(default 5, max 20).")
 
     p_dirs_retarget = dirs_sub.add_parser("retarget", parents=[common],
                                           help="Retarget a staged direction.")
