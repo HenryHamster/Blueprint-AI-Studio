@@ -756,11 +756,20 @@ def test_image_scanner_covers_runner_credential_allowlist():
     ri = importlib.util.module_from_spec(spec)
     # runner_isolation defines dataclasses; @dataclass resolves annotations via
     # sys.modules[cls.__module__], so the module must be registered BEFORE exec.
+    # Restore (not just pop) any pre-existing entry: other tests import
+    # runner_isolation from scripts/ and cache local_runner bound to that module
+    # object — dropping the entry makes a later `import runner_isolation` create
+    # a fresh module that local_runner.iso no longer points at, so their
+    # patch.object calls become inert (order-dependent cross-test pollution).
+    prior = sys.modules.get(spec.name)
     sys.modules[spec.name] = ri
     try:
         spec.loader.exec_module(ri)
     finally:
-        sys.modules.pop(spec.name, None)
+        if prior is not None:
+            sys.modules[spec.name] = prior
+        else:
+            sys.modules.pop(spec.name, None)
 
     # Credential-bearing subset of AGENT_ENV_ALLOWLIST: keys whose names suggest they
     # carry a secret (API key, token, credentials, secret).  Config/routing/locale keys

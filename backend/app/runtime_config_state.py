@@ -331,6 +331,16 @@ runtime_config: Dict = {
         "MODE_KNOB_GRADUATION_ENABLED", "true"
     ).lower()
     in ("1", "true", "yes"),
+    # How long an unresolved CUT recommendation stands before the harness
+    # re-affirms it with one fresh operator NOTE. The driver runs every reaper
+    # cycle (minutes), so the CUT notification is idempotency-keyed on
+    # (config_key, mode, re-affirm episode) — an unchanged verdict at the same
+    # mode coalesces onto the existing message instead of reposting every
+    # cycle, and only re-surfaces on a real mode transition or once this
+    # interval elapses. See app.mode_knob_graduation._cut_notification_idempotency_key.
+    "mode_knob_cut_reaffirm_interval_hours": float(
+        os.getenv("MODE_KNOB_CUT_REAFFIRM_INTERVAL_HOURS", "24")
+    ),
     # Per-knob thresholds for autonomous_spawn_budget_mode. The graduation SIGNAL
     # is initiative pressure = initiative_count / initiative_cap over the trailing
     # window. off→observe once pressure clears the observe threshold; observe→

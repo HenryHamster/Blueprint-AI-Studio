@@ -84,6 +84,8 @@ _HARNESS_RC_KEYS = (
     "direction_gap_respawn_block_graduation_cut_threshold",
     "direction_gap_respawn_block_graduation_min_sample",
     "direction_gap_respawn_block_graduation_window_hours",
+    # --- CUT-notification re-affirm cadence ---
+    mkg.MODE_KNOB_CUT_REAFFIRM_INTERVAL_HOURS_KEY,
 )
 
 
@@ -154,8 +156,21 @@ async def _project(db) -> Project:
     return p
 
 
-async def _spawn_tasks(db, project, task_type: str, n: int) -> None:
-    """Create ``n`` ORCHESTRATOR tasks of ``task_type`` (classified by the budget)."""
+async def _spawn_tasks(
+    db, project, task_type: str, n: int, *, created_at: datetime | None = None
+) -> None:
+    """Create ``n`` ORCHESTRATOR tasks of ``task_type`` (classified by the budget).
+
+    ``created_at`` anchors the spawned tasks to a specific timestamp instead of
+    the model's real-wall-clock default. The counterfactual evidence provider
+    (``_autonomous_spawn_budget_evidence``) filters tasks into a trailing
+    window ending at the harness's ``now`` argument — a test driving the
+    harness with a fixed, deterministic ``now`` (e.g. an epoch-aligned
+    timestamp for reaffirm-interval bucketing) must seed tasks inside THAT
+    window, not at real ``_utcnow()``, or they fall outside the measurement
+    window and the harness sees zero samples.
+    """
+    kwargs = {"created_at": created_at} if created_at is not None else {}
     for _ in range(n):
         db.add(
             Task(
@@ -163,6 +178,7 @@ async def _spawn_tasks(db, project, task_type: str, n: int) -> None:
                 payloads=[{"type": task_type}],
                 status=TaskStatus.COMPLETED,
                 created_by="ORCHESTRATOR",
+                **kwargs,
             )
         )
     await db.commit()
@@ -398,6 +414,124 @@ async def test_cut_recommendation_on_measured_no_lift(db):
     messages = await _cut_recommendation_messages(db, project)
     assert len(messages) == 2
     assert len({message.idempotency_key for message in messages}) == 2
+
+
+@pytest.mark.asyncio
+async def test_cut_recommendation_reaffirms_after_interval(db):
+    """A still-true CUT recommendation must not go silent forever.
+
+    Within the re-affirm interval, repeated reaper cycles coalesce onto the
+    existing message (this is the fix for the production spam defect: a
+    per-cycle heartbeat is exactly what must NOT happen). But once the
+    interval fully elapses, the unresolved recommendation re-surfaces as
+    exactly ONE fresh operator NOTE carrying the current numbers — an
+    indefinite, un-expiring suppression would silently bury a recommendation
+    the operator never acted on.
+
+    Anchored at a fixed epoch-aligned timestamp (not ``_utcnow()``) so the
+    24h episode-bucket boundary crossings in this test are deterministic
+    regardless of wall-clock time. The counterfactual evidence window is a
+    TRAILING 24h window ending at ``now``, so tasks are (re-)seeded with
+    ``created_at`` anchored just inside each ``now`` used below — spawning
+    them at the real wall-clock default would push them outside a window
+    that ends in 2024, starving the sample below ``min_sample`` and masking
+    the CUT decision entirely.
+    """
+    project = await _project(db)
+    await _seed_deployment_state(db)
+    await _seed_dormant_debt(db, project)
+    _configure(
+        enabled=True,
+        mode="observe",
+        initiative_cap=10,
+        cut_threshold=0.1,
+        min_sample=3,
+    )
+
+    t0 = datetime(2024, 1, 1)  # exact 24h-episode boundary from the epoch anchor
+    # all servicing → 0 initiative
+    await _spawn_tasks(db, project, "review", 5, created_at=t0 - timedelta(minutes=5))
+    decisions = await mkg.run_mode_knob_graduation(db, now=t0)
+    cut = next(d for d in decisions if d.config_key == CONFIG_KEY)
+    assert cut.action == mkg.CUT
+    messages = await _cut_recommendation_messages(db, project)
+    assert len(messages) == 1
+    first_key = messages[0].idempotency_key
+
+    # Well within the default 24h re-affirm interval: still coalesces onto the
+    # same durable message, no matter how many reaper cycles run.
+    for offset_hours in (1, 6, 23):
+        now_i = t0 + timedelta(hours=offset_hours)
+        await _spawn_tasks(db, project, "review", 5, created_at=now_i - timedelta(minutes=5))
+        still_within = await mkg.run_mode_knob_graduation(db, now=now_i)
+        still_within_cut = next(d for d in still_within if d.config_key == CONFIG_KEY)
+        assert still_within_cut.action == mkg.CUT
+        messages = await _cut_recommendation_messages(db, project)
+        assert len(messages) == 1
+        assert messages[0].idempotency_key == first_key
+
+    # Past the re-affirm interval: the still-true CUT re-surfaces as exactly
+    # one fresh NOTE (a new episode key), not a burst.
+    after_now = t0 + timedelta(hours=25)
+    await _spawn_tasks(db, project, "review", 5, created_at=after_now - timedelta(minutes=5))
+    after = await mkg.run_mode_knob_graduation(db, now=after_now)
+    after_cut = next(d for d in after if d.config_key == CONFIG_KEY)
+    assert after_cut.action == mkg.CUT
+    messages = await _cut_recommendation_messages(db, project)
+    assert len(messages) == 2
+    keys = {message.idempotency_key for message in messages}
+    assert len(keys) == 2
+    assert first_key in keys
+
+    # Immediately after crossing into the new episode, further cycles coalesce
+    # onto that fresh message rather than reposting again.
+    again_now = t0 + timedelta(hours=25, minutes=1)
+    await _spawn_tasks(db, project, "review", 5, created_at=again_now - timedelta(minutes=5))
+    again = await mkg.run_mode_knob_graduation(db, now=again_now)
+    again_cut = next(d for d in again if d.config_key == CONFIG_KEY)
+    assert again_cut.action == mkg.CUT
+    messages = await _cut_recommendation_messages(db, project)
+    assert len(messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_cut_reaffirm_interval_is_configurable(db):
+    """The re-affirm cadence is a runtime_config knob, not a hardcoded 24h —
+    operators can tighten (or loosen) how often a still-true CUT re-surfaces.
+
+    Like its sibling above, tasks must be (re-)seeded with ``created_at``
+    anchored just inside the trailing measurement window ending at each fixed
+    ``now`` used here, or the counterfactual evidence sees zero samples and
+    the decision silently degrades from CUT to HOLD.
+    """
+    project = await _project(db)
+    await _seed_deployment_state(db)
+    await _seed_dormant_debt(db, project)
+    _configure(
+        enabled=True,
+        mode="observe",
+        initiative_cap=10,
+        cut_threshold=0.1,
+        min_sample=3,
+    )
+    _rc[mkg.MODE_KNOB_CUT_REAFFIRM_INTERVAL_HOURS_KEY] = 1
+
+    t0 = datetime(2024, 1, 1)  # exact hour boundary
+    await _spawn_tasks(db, project, "review", 5, created_at=t0 - timedelta(minutes=5))
+    decisions = await mkg.run_mode_knob_graduation(db, now=t0)
+    cut = next(d for d in decisions if d.config_key == CONFIG_KEY)
+    assert cut.action == mkg.CUT
+    messages = await _cut_recommendation_messages(db, project)
+    assert len(messages) == 1
+
+    # A configured 1h interval re-affirms far sooner than the 24h default would.
+    now2 = t0 + timedelta(hours=2)
+    await _spawn_tasks(db, project, "review", 5, created_at=now2 - timedelta(minutes=5))
+    decisions2 = await mkg.run_mode_knob_graduation(db, now=now2)
+    cut2 = next(d for d in decisions2 if d.config_key == CONFIG_KEY)
+    assert cut2.action == mkg.CUT
+    messages = await _cut_recommendation_messages(db, project)
+    assert len(messages) == 2
 
 
 # --- HOLD --------------------------------------------------------------------

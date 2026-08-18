@@ -23,7 +23,13 @@ knob exactly one of three dispositions per driver tick:
 * **CUT** — the counterfactual shows the enforce branch would never bind (no
   lift); stamp a legible CUT recommendation carrying the measured numbers into
   the knob's ``dormant_knob`` debt-row detail AND post a HIGH-SIGNAL operator
-  NOTE. There was previously no CUT surface on the ledger — this is it.
+  NOTE. There was previously no CUT surface on the ledger — this is it. The
+  NOTE is idempotency-keyed on ``(config_key, mode, re-affirm episode)`` (see
+  ``_cut_notification_idempotency_key``): the driver runs every reaper cycle,
+  so an unchanged CUT verdict at the same mode coalesces onto the existing
+  message instead of reposting every tick, and re-surfaces only on a real
+  mode transition or after the re-affirm interval elapses (default 24h, see
+  ``MODE_KNOB_CUT_REAFFIRM_INTERVAL_HOURS_KEY``).
 * **HOLD** — below threshold (or insufficient sample); no-op, return the measured
   snapshot for observability.
 
@@ -67,11 +73,26 @@ CUT = "cut"
 HOLD = "hold"
 ERROR = "error"
 
+#: Overridable via runtime_config. How long an unresolved CUT recommendation
+#: stands before the harness re-affirms it with a fresh operator NOTE (see
+#: ``_cut_notification_idempotency_key``).
+MODE_KNOB_CUT_REAFFIRM_INTERVAL_HOURS_KEY = "mode_knob_cut_reaffirm_interval_hours"
+_DEFAULT_CUT_REAFFIRM_INTERVAL_HOURS = 24.0
+
+#: Naive-UTC epoch anchor for the re-affirm episode bucket below. ``now`` is
+#: always a naive UTC ``datetime`` in this codebase (see ``_utcnow``) — never
+#: call ``.timestamp()`` on it directly, since that reinterprets a naive value
+#: as local time and makes the bucket boundary depend on the host's timezone.
+#: Plain ``datetime`` subtraction avoids that entirely.
+_EPOCH = datetime(1970, 1, 1)
+
 
 def _cut_notification_idempotency_key(
     *,
     config_key: str,
     current_mode: str,
+    now: datetime,
+    reaffirm_interval_hours: float = _DEFAULT_CUT_REAFFIRM_INTERVAL_HOURS,
 ) -> str:
     """Return the durable identity of one operator-visible CUT recommendation.
 
@@ -79,8 +100,19 @@ def _cut_notification_idempotency_key(
     state transition, not a heartbeat: changing counters inside a still-CUT
     evidence window must not create a fresh operator message.  A real mode
     transition gets a new key and remains operator-visible.
+
+    The key also carries a coarse re-affirm *episode* bucket — the number of
+    ``reaffirm_interval_hours``-sized windows elapsed since the epoch. While a
+    knob stays CUT at the same mode within one episode, every cycle resolves
+    to the same key and ``post_event_message`` coalesces onto the existing
+    row (see its idempotency check). Once an episode boundary passes, the key
+    changes and one fresh NOTE is posted carrying the current numbers — so a
+    still-true recommendation does not go silent forever, while remaining a
+    once-per-interval re-affirmation rather than a per-cycle heartbeat.
     """
-    return f"mode-knob-cut:{config_key}:{current_mode}"
+    interval = timedelta(hours=max(float(reaffirm_interval_hours), 1.0))
+    episode = (now - _EPOCH) // interval
+    return f"mode-knob-cut:{config_key}:{current_mode}:{episode}"
 
 
 @dataclass(frozen=True)
@@ -812,6 +844,8 @@ async def _drive_one_knob(
             measurements=measurements,
             max_projects=max_projects,
             current_mode=current_mode,
+            runtime_config=runtime_config,
+            now=now,
         )
 
     threshold = observe_threshold if current_mode == "off" else enforce_threshold
@@ -984,6 +1018,8 @@ async def _cut(
     measurements: dict[str, Any],
     max_projects: int,
     current_mode: str,
+    runtime_config: Mapping[str, Any],
+    now: datetime,
 ) -> KnobGraduationDecision:
     """Apply a CUT: stamp the measured recommendation into the debt row + notify.
 
@@ -1003,9 +1039,17 @@ async def _cut(
         "measurements": measurements,
         "recommended_at": _utcnow().isoformat(),
     }
+    reaffirm_interval_hours = float(
+        runtime_config.get(
+            MODE_KNOB_CUT_REAFFIRM_INTERVAL_HOURS_KEY,
+            _DEFAULT_CUT_REAFFIRM_INTERVAL_HOURS,
+        )
+    )
     notification_idempotency_key = _cut_notification_idempotency_key(
         config_key=config_key,
         current_mode=current_mode,
+        now=now,
+        reaffirm_interval_hours=reaffirm_interval_hours,
     )
 
     stamped = False
