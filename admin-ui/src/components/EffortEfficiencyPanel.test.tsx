@@ -138,7 +138,7 @@ describe('EffortEfficiencyPanel', () => {
         })}
       />,
     );
-    expect(screen.getByText(/Pricing coverage/)).toBeInTheDocument();
+    expect(screen.getByText(/Spend-weighted pricing coverage/)).toBeInTheDocument();
     expect(screen.getByText(/75%/)).toBeInTheDocument();
     expect(screen.getByText(/openai:gpt-9/)).toBeInTheDocument();
   });

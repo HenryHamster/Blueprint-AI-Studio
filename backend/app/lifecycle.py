@@ -1532,8 +1532,11 @@ async def lifespan(app):
             maybe_write_daily_snapshot,
         )
 
+        # Run once immediately after the leader acquires ownership. The old
+        # ordering slept for a full hour before the first write, which made a
+        # newly elected worker look healthy while its durable series remained
+        # stale. The cadence marker still prevents duplicate daily writes.
         while True:
-            await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
@@ -1683,6 +1686,7 @@ async def lifespan(app):
                 logger.error(
                     "[EFFICIENCY_SNAPSHOT] scan error: %s", scan_exc, exc_info=True
                 )
+            await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
 
     efficiency_snapshot_task = asyncio.create_task(_efficiency_snapshot_service())
 

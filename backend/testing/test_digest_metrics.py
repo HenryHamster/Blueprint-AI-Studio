@@ -39,7 +39,11 @@ from app.digest_metrics import (
     compute_trial_arm_cost_delta,
 )
 from app.failure_classification import ALL_FAILURE_CLASSES
-from app.llm_cost_attribution import LLM_TOKEN_PRICING
+from app.llm_cost_attribution import (
+    LLM_TOKEN_PRICING,
+    UNPRICED_FALLBACK_INPUT_RATE,
+    UNPRICED_FALLBACK_OUTPUT_RATE,
+)
 from app.sr_review_quality_metrics import (
     compute_review_quality_metrics,
     compute_sr_prediction_accuracy,
@@ -5046,7 +5050,13 @@ def test_effort_model_efficiency_unpriced_combo_not_folded_into_priced():
     assert low["input_tokens"] == 5000
     # Totals: only the opus task's cost is folded in (the mystery model adds 0).
     assert result["totals"]["total_cost_usd"] == pytest.approx(priced_total)
-    assert result["totals"]["unpriced_coverage_fraction"] == 0.5
+    estimated_unpriced = 5000 * (
+        UNPRICED_FALLBACK_INPUT_RATE + UNPRICED_FALLBACK_OUTPUT_RATE
+    )
+    assert result["totals"]["unpriced_coverage_fraction"] == round(
+        priced_total / (priced_total + estimated_unpriced), 4
+    )
+    assert result["totals"]["task_coverage_fraction"] == 0.5
 
 
 def test_effort_model_efficiency_surfaces_fallback_divergence():

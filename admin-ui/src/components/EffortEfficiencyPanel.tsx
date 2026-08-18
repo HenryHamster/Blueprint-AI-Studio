@@ -436,8 +436,9 @@ export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | 
 
       {hasUnpricedGap && (
         <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-ui-sm text-amber-300">
-          <span className="font-semibold">Pricing coverage {fmtRate(coverage)}</span>
-          {' — '}{totals.unpriced_run_count} of {totals.priced_run_count + totals.unpriced_run_count} token-bearing runs have no pricing entry, so reported cost &amp; $/merge are understated.
+          <span className="font-semibold">Spend-weighted pricing coverage {fmtRate(coverage)}</span>
+          {' — '}{totals.unpriced_run_count} of {totals.priced_run_count + totals.unpriced_run_count} token-bearing runs have no pricing entry
+          {totals.task_coverage_fraction != null && ` (run coverage ${fmtRate(totals.task_coverage_fraction)})`}, so reported cost &amp; $/merge are understated.
           {(unpriced_combos?.length ?? 0) > 0 && (
             <div className="mt-1 text-amber-400/80">
               Unpriced: <span className="font-mono">{unpriced_combos.join(', ')}</span>

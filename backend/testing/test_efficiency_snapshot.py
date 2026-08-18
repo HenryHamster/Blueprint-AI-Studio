@@ -1063,6 +1063,22 @@ async def test_efficiency_snapshot_service_only_starts_on_leader():
 
 
 @pytest.mark.asyncio
+async def test_efficiency_snapshot_service_ticks_immediately_after_start():
+    """A newly elected worker must repair a stale series without an hour wait."""
+    import inspect
+
+    from app import lifecycle
+
+    source = inspect.getsource(lifecycle)
+    service = source[source.index("async def _efficiency_snapshot_service") :]
+    service = service[: service.index("efficiency_snapshot_task =")]
+    assert service.index("while True:") < service.index("try:")
+    assert service.index("except Exception as scan_exc") < service.index(
+        "await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_efficiency_axes_endpoint_returns_shape(client: AsyncClient, db_session):
     project = make_project(design_doc={})
     db_session.add(project)
@@ -1083,6 +1099,8 @@ async def test_efficiency_axes_endpoint_returns_shape(client: AsyncClient, db_se
     assert "axes" in data
     assert "baseline_captured_at" in data
     assert "last_snapshot_at" in data
+    assert data["cohort_task_count"] == 1
+    assert data["cohort_capped"] is False
     for axis in ALL_AXES:
         assert axis in data["axes"]
         entry = data["axes"][axis]
@@ -3469,6 +3487,66 @@ def test_compute_llm_cost_breakdown_approximate_priced():
     assert "openai:gpt-5.3-codex-spark" in result["approximate_priced_combos"]
     assert "openai:gpt-5.3-codex-spark" not in result["unpriced_combos"]
     assert result["unpriced_combos"] == []
+
+
+def test_effort_model_coverage_is_spend_weighted_with_run_fraction_secondary():
+    """A high-token unpriced run must dominate the honesty headline.
+
+    The run-count fraction remains available as a diagnostic, but the surfaced
+    coverage must follow estimated spend so a 1M-token blind spot is not read as
+    the same risk as a 1K-token blind spot.
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+    priced_input = 1_000
+    priced_output = 100
+    unpriced_input = 1_000_000
+    unpriced_output = 100_000
+    priced_input_rate, priced_output_rate = LLM_TOKEN_PRICING[
+        ("anthropic", "claude-sonnet-4-6")
+    ]
+    priced_cost = priced_input * priced_input_rate + priced_output * priced_output_rate
+    estimated_unpriced = (
+        unpriced_input * UNPRICED_FALLBACK_INPUT_RATE
+        + unpriced_output * UNPRICED_FALLBACK_OUTPUT_RATE
+    )
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "effort": "medium"}],
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            api_call_summary={
+                "total_input_tokens": priced_input,
+                "total_output_tokens": priced_output,
+                "llm_call_count": 1,
+            },
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "effort": "medium"}],
+            provider="fakeprovider",
+            model="mystery-model",
+            api_call_summary={
+                "total_input_tokens": unpriced_input,
+                "total_output_tokens": unpriced_output,
+                "llm_call_count": 1,
+            },
+        ),
+    ]
+
+    totals = compute_effort_model_efficiency(tasks)["totals"]
+
+    assert totals["task_coverage_fraction"] == 0.5
+    assert totals["unpriced_coverage_fraction"] == round(
+        priced_cost / (priced_cost + estimated_unpriced), 4
+    )
+    assert totals["unpriced_coverage_fraction"] != totals["task_coverage_fraction"]
+    assert totals["unpriced_input_tokens"] == unpriced_input
+    assert totals["estimated_unpriced_cost_usd"] == round(estimated_unpriced, 6)
 
 
 def test_compute_llm_cost_breakdown_merge_rate_and_cost_per_merge():

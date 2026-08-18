@@ -568,6 +568,17 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
 
   return (
     <div className="space-y-2">
+      {data.cohort_task_count != null && (
+        <div
+          data-testid="efficiency-cohort-provenance"
+          className={`px-3 py-1.5 rounded text-ui-sm ${data.cohort_capped ? 'bg-amber-500/10 text-amber-300 border border-amber-500/30' : 'bg-neutral-800/50 text-neutral-500'}`}
+        >
+          Cost cohort: {data.cohort_task_count} rows ·{' '}
+          {data.cohort_capped
+            ? `truncated to ${data.cohort_effective_window_start && data.cohort_effective_window_end ? 'effective window' : 'row cap'}`
+            : `${data.cohort_requested_window_days ?? 'requested'}d window`}
+        </div>
+      )}
       {EFFICIENCY_AXES.map((axisDef) => {
         const axisData = data.axes[axisDef.key];
         if (!axisData) return null;

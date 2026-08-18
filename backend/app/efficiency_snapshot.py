@@ -65,6 +65,8 @@ from app.llm_cost_attribution import (
     LLM_CACHE_READ_INPUT_PRICING,  # noqa: F401 — re-exported for callers
     CACHE_READ_INPUT_RATE_MULTIPLIER,  # noqa: F401 — re-exported for callers
     LLM_TOKEN_PRICING,
+    UNPRICED_FALLBACK_INPUT_RATE,
+    UNPRICED_FALLBACK_OUTPUT_RATE,
     SELF_REPAIR_BURN_SHARE_KEY,
     _UNPRICED_COMBOS_CAP,
     _compact_llm_cost_attribution,
@@ -2059,6 +2061,13 @@ def _new_efficiency_bucket() -> Dict[str, Any]:
         # coverage fractions reconcile.
         "priced_run_count": 0,
         "unpriced_run_count": 0,
+        # Unpriced token volume is retained so the headline pricing-coverage
+        # signal can be spend-weighted instead of treating every run equally.
+        "estimated_unpriced_cost_usd": 0.0,
+        "unpriced_input_tokens": 0,
+        "unpriced_output_tokens": 0,
+        "unpriced_cache_creation_input_tokens": 0,
+        "unpriced_cache_read_input_tokens": 0,
     }
 
 
@@ -2069,6 +2078,10 @@ def _finalize_efficiency_bucket(b: Dict[str, Any], **extra: Any) -> Dict[str, An
     pr_eligible_run_count = int(b["pr_eligible_run_count"])
     cost = round(float(b["cost_usd"]), 6)
     priceable = int(b["priced_run_count"]) + int(b["unpriced_run_count"])
+    estimated_unpriced_cost = round(
+        float(b["estimated_unpriced_cost_usd"]), 6
+    )
+    estimated_total_spend = cost + estimated_unpriced_cost
     out: Dict[str, Any] = {
         "run_count": run_count,
         # PR-eligible denominator: only tasks that can land a PR are counted.
@@ -2101,8 +2114,27 @@ def _finalize_efficiency_bucket(b: Dict[str, Any], **extra: Any) -> Dict[str, An
         "llm_call_count": int(b["llm_call_count"]),
         "priced_run_count": int(b["priced_run_count"]),
         "unpriced_run_count": int(b["unpriced_run_count"]),
+        # Headline coverage is spend-weighted. Unpriced rows have no published
+        # rate, so their retained token volume is valued with the same fallback
+        # rates used by compute_llm_cost_breakdown.
         "unpriced_coverage_fraction": (
+            round(cost / estimated_total_spend, 4)
+            if estimated_total_spend > 0
+            else None
+        ),
+        # Keep the old run-count view as a secondary diagnostic; it must not be
+        # mistaken for the honesty headline above.
+        "task_coverage_fraction": (
             round(b["priced_run_count"] / priceable, 4) if priceable else None
+        ),
+        "estimated_unpriced_cost_usd": estimated_unpriced_cost,
+        "unpriced_input_tokens": int(b["unpriced_input_tokens"]),
+        "unpriced_output_tokens": int(b["unpriced_output_tokens"]),
+        "unpriced_cache_creation_input_tokens": int(
+            b["unpriced_cache_creation_input_tokens"]
+        ),
+        "unpriced_cache_read_input_tokens": int(
+            b["unpriced_cache_read_input_tokens"]
         ),
     }
     out.update(extra)
@@ -2195,6 +2227,8 @@ def compute_effort_model_efficiency(
         call_count: int,
         cost: float,
         priced: bool,
+        cache_creation: int,
+        cache_read: int,
     ) -> None:
         b["input_tokens"] += int(input_tokens)
         b["output_tokens"] += int(output_tokens)
@@ -2206,6 +2240,18 @@ def compute_effort_model_efficiency(
             b["priced_run_count"] += 1
         else:
             b["unpriced_run_count"] += 1
+            b["estimated_unpriced_cost_usd"] += _price_llm_attempt(
+                input_tokens,
+                output_tokens,
+                cache_creation,
+                cache_read,
+                UNPRICED_FALLBACK_INPUT_RATE,
+                UNPRICED_FALLBACK_OUTPUT_RATE,
+            )
+            b["unpriced_input_tokens"] += int(input_tokens)
+            b["unpriced_output_tokens"] += int(output_tokens)
+            b["unpriced_cache_creation_input_tokens"] += int(cache_creation)
+            b["unpriced_cache_read_input_tokens"] += int(cache_read)
 
     for t in tasks:
         landed = is_merged_completion(t) and t.id not in _parent_ids
@@ -2273,7 +2319,14 @@ def compute_effort_model_efficiency(
                     unpriced_combos.append(combo)
 
             _accumulate_attempt(
-                eff_bucket, input_tokens, output_tokens, call_count, cost, priced
+                eff_bucket,
+                input_tokens,
+                output_tokens,
+                call_count,
+                cost,
+                priced,
+                cache_creation,
+                cache_read,
             )
             _accumulate_attempt(
                 model_buckets[key],
@@ -2282,9 +2335,18 @@ def compute_effort_model_efficiency(
                 call_count,
                 cost,
                 priced,
+                cache_creation,
+                cache_read,
             )
             _accumulate_attempt(
-                totals, input_tokens, output_tokens, call_count, cost, priced
+                totals,
+                input_tokens,
+                output_tokens,
+                call_count,
+                cost,
+                priced,
+                cache_creation,
+                cache_read,
             )
             task_model_keys.add(key)
 
@@ -4189,6 +4251,18 @@ async def read_baseline_with_drift(
         },
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
+        # Cohort provenance for every aggregate in the latest reading. Keep it
+        # at the top level so both the admin dashboard and agent readers can
+        # render the same honest window/cap explanation.
+        "cohort_task_count": latest.get("cohort_task_count"),
+        "cohort_capped": latest.get("cohort_capped"),
+        "cohort_requested_window_days": latest.get(
+            "cohort_requested_window_days"
+        ),
+        "cohort_effective_window_start": latest.get(
+            "cohort_effective_window_start"
+        ),
+        "cohort_effective_window_end": latest.get("cohort_effective_window_end"),
         # Merged-work origination is a persisted sibling reading, including its
         # capture-window and quotability provenance rather than a bare share.
         "merged_work_origination": latest.get("merged_work_origination"),
@@ -4333,12 +4407,12 @@ async def read_baseline_with_drift(
 SNAPSHOT_INTERVAL_SECONDS = 3600
 _DAY_SECONDS = 24 * 3600
 
-# Overdue threshold for the daily-snapshot cadence operator alert. At a healthy
-# one-per-UTC-day cadence with an hourly tick, ``last_run_at`` is at most ~25 h
-# old (24 h cadence + up to 1 h until the next tick writes). Aging past 48 h
-# therefore means at least one full daily write was skipped and never recovered
-# — that is the condition the operator must hear about.
-SNAPSHOT_CADENCE_OVERDUE_SECONDS = 2 * _DAY_SECONDS
+# Overdue threshold for the daily-snapshot cadence operator alert. A healthy
+# one-per-UTC-day cadence with an hourly tick can be at most one cadence plus
+# one tick late. Alerting at that boundary makes the first missed daily write
+# visible; a 48-hour threshold would allow a second missed write to remain
+# silent and was the reason the July flatline was not actionable.
+SNAPSHOT_CADENCE_OVERDUE_SECONDS = _DAY_SECONDS + SNAPSHOT_INTERVAL_SECONDS
 
 
 def _last_run_due(last_run_at_iso: str | None, now: datetime) -> bool:
@@ -4828,7 +4902,7 @@ def _snapshot_cadence_overdue(last_run_at_iso: str | None, now: datetime) -> boo
 
     Cadence is one snapshot per UTC day. At a healthy cadence with the hourly
     service tick, ``last_run_at`` is at most ~25 h old. When it has aged past
-    :data:`SNAPSHOT_CADENCE_OVERDUE_SECONDS` (48 h) a full daily write was
+    :data:`SNAPSHOT_CADENCE_OVERDUE_SECONDS` (~25 h) a full daily write was
     skipped with no recovery — the condition the operator must hear about. A
     project that has never written a snapshot (``last_run_at`` is ``None``) is
     not "overdue": there is no baseline to go stale, and a fresh project would

@@ -301,7 +301,13 @@ export interface EfficiencyBucket {
   // combo has a pricing entry. Unpriced runs contribute 0 cost.
   priced_run_count: number;
   unpriced_run_count: number;
+  // Headline pricing honesty is spend-weighted; this preserves the old
+  // token-bearing run fraction as a secondary diagnostic.
   unpriced_coverage_fraction: number | null;
+  task_coverage_fraction?: number | null;
+  estimated_unpriced_cost_usd?: number;
+  unpriced_input_tokens?: number;
+  unpriced_output_tokens?: number;
 }
 
 // Which actual models a requested effort tier ran on (requested-vs-actual

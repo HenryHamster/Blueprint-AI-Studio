@@ -452,6 +452,11 @@ describe('MetricsDashboard', () => {
           },
           baseline_captured_at: '2026-05-01T00:00:00Z',
           last_snapshot_at: '2026-05-20T00:00:00Z',
+          cohort_task_count: 5000,
+          cohort_capped: true,
+          cohort_requested_window_days: 7,
+          cohort_effective_window_start: '2026-05-19T00:00:00Z',
+          cohort_effective_window_end: '2026-05-20T00:00:00Z',
         }), { status: 200 });
       }
       return original(url);
@@ -474,6 +479,10 @@ describe('MetricsDashboard', () => {
       await act(async () => {
         await Promise.resolve();
       });
+
+      expect(screen.getByTestId('efficiency-cohort-provenance')).toHaveTextContent(
+        'Cost cohort: 5000 rows · truncated to effective window',
+      );
 
       // Axis that was re-seeded after the top-level baseline shows provenance
       const provenance = screen.getByTestId('axis-reseed-provenance-cost_per_merged_pr');
