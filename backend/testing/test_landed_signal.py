@@ -29,6 +29,7 @@ from app.landed_signal import (
 )
 from app.models import Project, Task, TaskStatus
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY, LANDED_ON_INTEGRATION_KEY
+from app.task_blocked import reset_task_for_fresh_attempt
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +196,107 @@ def test_mark_landed_on_integration_preserves_existing_merge_sha_when_none():
     mark_landed_on_integration(task)
 
     assert task.context.get(LANDED_MERGE_SHA_KEY) == "c" * 40
+
+
+def test_landing_converges_author_projection_and_archives_stale_gate_failure():
+    """A definitive landing replaces PR-open prose and stale current gate red."""
+
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+    task.payloads[0]["pr_number"] = 17378
+    task.latest_status_message = "PR #17378 opened — review pending"
+    failed_receipt = {
+        "status": "failed",
+        "command": "./check test",
+        "timeout_seconds": 600,
+        "hard_timeout_seconds": 1800,
+        "elapsed_seconds": 42,
+        "deadline_extended": False,
+        "exit_code": 23,
+        "authoritative_ci_required": False,
+        "recorded_at": "2026-08-15T23:21:44Z",
+    }
+    task.context = {
+        **(task.context or {}),
+        "publication_gate_receipt": failed_receipt,
+    }
+    project = Project(
+        name="projection", user_id="test-user", integration_branch="automain"
+    )
+
+    mark_landed_on_integration(task, project, merge_commit_sha="d" * 40)
+
+    assert task.latest_status_message == "PR #17378 merged into automain"
+    assert "publication_gate_receipt" not in (task.context or {})
+    history = (task.context or {}).get("publication_gate_receipt_history")
+    assert history == [{**failed_receipt, "superseded_by": "integration_landing"}]
+
+
+def test_rollup_landing_reports_child_work_without_claiming_child_pr_merge():
+    task = _make_code_task_with_evidence(changed_files=["backend/app/widget.py"])
+    task.parent_task_id = uuid.uuid4()
+    task.payloads[0]["pr_number"] = 7
+    task.latest_status_message = "PR #7 merged into staging/rollup-123"
+    task.context = {
+        **(task.context or {}),
+        LANDED_SIGNAL_KEY: True,
+        LANDED_ON_INTEGRATION_KEY: False,
+        NON_MERGE_UNBLOCK_REASON_KEY: "merged_pr_non_integration_branch",
+    }
+    project = Project(
+        name="rollup projection", user_id="test-user", integration_branch="automain"
+    )
+
+    mark_landed_on_integration(task, project)
+
+    assert task.status == TaskStatus.COMPLETED
+    assert task.first_payload.get("type") == "create"
+    assert task.latest_status_message == (
+        "Work from PR #7 landed via rollup into automain"
+    )
+    assert NON_MERGE_UNBLOCK_REASON_KEY not in (task.context or {})
+
+
+def test_landing_preserves_current_passing_gate_receipt():
+    task = _make_code_task_with_evidence(changed_files=["backend/app/widget.py"])
+    task.payloads[0]["pr_number"] = 42
+    passing = {
+        "status": "passed",
+        "command": "./check test",
+        "recorded_at": "2026-08-15T23:20:00Z",
+    }
+    task.context = {**(task.context or {}), "publication_gate_receipt": passing}
+
+    mark_landed_on_integration(task)
+
+    assert (task.context or {}).get("publication_gate_receipt") == passing
+    assert task.latest_status_message == "PR #42 merged into integration"
+
+
+def test_fresh_attempt_archives_current_gate_receipt_before_clearing_projection():
+    task = _make_code_task_with_evidence(changed_files=["backend/app/widget.py"])
+    failed = {
+        "status": "failed",
+        "command": "./check test",
+        "recorded_at": "2026-08-15T23:20:00Z",
+    }
+    task.context = {
+        **(task.context or {}),
+        "publication_gate_receipt": failed,
+        "blocker": {"kind": "agent", "reason": "publication failed"},
+        "failure_class": "BLOCKED_PRECONDITION",
+    }
+    task.blocker_kind = "agent"
+    task.blocked_reason = "publication failed"
+
+    reset_task_for_fresh_attempt(task)
+
+    assert "publication_gate_receipt" not in (task.context or {})
+    assert (task.context or {})["publication_gate_receipt_history"] == [
+        {**failed, "superseded_by": "fresh_attempt"}
+    ]
 
 
 def test_apply_merged_landed_signal_stamps_merge_sha_only_on_integration():

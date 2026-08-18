@@ -828,20 +828,20 @@ async def test_direction_spawn_fails_closed_on_missing_or_contentless_objective(
 @pytest.mark.asyncio
 async def test_direction_spawn_fails_closed_when_project_missing(db_session):
     """No project row → no integration branch to pin the diff range to — the
-    spawner fails closed (never fabricates a hardcoded 'main' fallback)."""
+    spawner raises the canonical admission error instead of fabricating a
+    hardcoded 'main' fallback."""
     from app.release_qualifier_audit import _spawn_direction_merge_grade_task
 
     attempt_id = uuid.uuid4()
     candidate_sha = "face" * 10
-    spawned = await _spawn_direction_merge_grade_task(
-        db_session,
-        uuid.uuid4(),  # a project id that has no Project row
-        direction={"id": "d-orphan", "completion_criteria": "A real objective"},
-        candidate_sha=candidate_sha,
-        qualification_attempt_id=attempt_id,
-    )
-    await db_session.commit()
-    assert spawned is None
+    with pytest.raises(RuntimeError, match="project_unavailable"):
+        await _spawn_direction_merge_grade_task(
+            db_session,
+            uuid.uuid4(),  # a project id that has no Project row
+            direction={"id": "d-orphan", "completion_criteria": "A real objective"},
+            candidate_sha=candidate_sha,
+            qualification_attempt_id=attempt_id,
+        )
 
 
 @pytest.mark.asyncio

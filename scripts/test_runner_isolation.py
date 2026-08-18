@@ -655,6 +655,56 @@ class TestEnvAllowlist(unittest.TestCase):
             {"AGENT_SOURCE_SHA": "9" * 40}, {}, [],
         ))
 
+    def test_vitest_worker_policy_is_injected_only(self):
+        policy = {
+            "VITEST_MIN_THREADS": "1",
+            "VITEST_MAX_THREADS": "4",
+            "VITEST_MIN_FORKS": "1",
+            "VITEST_MAX_FORKS": "4",
+            "VITEST_MIN_WORKERS": "1",
+            "VITEST_MAX_WORKERS": "4",
+        }
+        env = iso.build_agent_env(
+            {key: "99" for key in policy},
+            policy,
+            [],
+            per_task_creds={key: "99" for key in policy},
+        )
+        self.assertEqual({key: env[key] for key in policy}, policy)
+
+        # Neither a long-lived host environment nor a credential envelope can
+        # author these execution-policy values without the runner injection.
+        untrusted = iso.build_agent_env(
+            {key: "99" for key in policy},
+            {},
+            [],
+            per_task_creds={key: "99" for key in policy},
+        )
+        for key in policy:
+            self.assertNotIn(key, untrusted)
+
+    def test_backend_verification_runtime_is_validated_toolchain_only(self):
+        runtime = {
+            "BLUEPRINT_SANDBOX_PYTHON": "/opt/verified/bin/python",
+            "BLUEPRINT_SANDBOX_PG_BINDIR": "/opt/verified/pg/bin",
+        }
+        untrusted = iso.build_agent_env(
+            {},
+            {key: f"/credential/{key}" for key in runtime},
+            [],
+            per_task_creds={key: f"/vended/{key}" for key in runtime},
+        )
+        for key in runtime:
+            self.assertNotIn(key, untrusted)
+
+        trusted = iso.build_agent_env(
+            {},
+            {},
+            [],
+            verification_env=runtime,
+        )
+        self.assertEqual({key: trusted[key] for key in runtime}, runtime)
+
 
 # ── bwrap argv builder ────────────────────────────────────────────────────────
 
@@ -960,6 +1010,48 @@ class TestGpuExposure(unittest.TestCase):
 # ── Resource caps ─────────────────────────────────────────────────────────────
 
 class TestResourceCaps(unittest.TestCase):
+    def test_systemd_probe_requires_working_user_scope(self):
+        with mock.patch.object(
+            iso, "_which", side_effect=lambda name: f"/usr/bin/{name}"
+        ), mock.patch.object(
+            iso.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "Failed to connect to bus"),
+        ) as run:
+            self.assertIsNone(iso.probe_systemd_run())
+        self.assertIn("--user", run.call_args.args[0])
+        self.assertIn("--scope", run.call_args.args[0])
+        self.assertIn("MemoryMax=67108864", run.call_args.args[0])
+
+    def test_systemd_probe_accepts_successful_user_scope(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+                "BLUEPRINT_RUNNER_TOKEN": "must-not-flow",
+            },
+            clear=True,
+        ), mock.patch.object(
+            iso, "_which", side_effect=lambda name: f"/usr/bin/{name}"
+        ), mock.patch.object(
+            iso.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            self.assertEqual(iso.probe_systemd_run(), "/usr/bin/systemd-run")
+        argv = run.call_args.args[0]
+        self.assertIn("MemoryMax=67108864", argv)
+        self.assertIn("/proc/self/cgroup", argv[-1])
+        self.assertIn("memory.max", argv[-1])
+        self.assertEqual(
+            run.call_args.kwargs["env"],
+            {
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            },
+        )
+
     def test_systemd_scope_prefix(self):
         caps = _caps(systemd_run_path="/usr/bin/systemd-run")
         argv = iso.build_resource_scope_prefix(caps, cpu_limit="2", mem_limit="4g", scope_name="bp-x")
@@ -982,6 +1074,13 @@ class TestResourceCaps(unittest.TestCase):
         self.assertEqual(iso._parse_mem_bytes("1024"), 1024)
         self.assertIsNone(iso._parse_mem_bytes(None))
         self.assertIsNone(iso._parse_mem_bytes("abc"))
+        self.assertIsNone(iso._parse_mem_bytes("1e3"))
+        self.assertIsNone(iso._parse_mem_bytes("inf"))
+        self.assertIsNone(iso._parse_mem_bytes("1e999"))
+        self.assertIsNone(iso._parse_mem_bytes(str(1 << 64)))
+        self.assertIsNone(iso._parse_mem_bytes("0"))
+        self.assertIsNone(iso._parse_mem_bytes(".5"))
+        self.assertIsNone(iso._parse_mem_bytes("0.0000000001g"))
 
 
 # ── Plan orchestrators ────────────────────────────────────────────────────────
@@ -1202,6 +1301,21 @@ class TestAgentPlan(unittest.TestCase):
         self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", plan.env)
         # Host PATH is NOT forwarded into the container (`-e PATH` absent).
         self.assertNotIn("-e PATH", joined)
+
+    def test_agent_plan_docker_enforces_per_task_memory_limit(self):
+        """The agent container and descendants carry the admitted memory cap."""
+        plan = iso.plan_agent_execution(
+            caps=_caps(docker_usable=True),
+            agent_binary=None,
+            workspace_host="/tmp/ws/t1",
+            injected_env={"AGENT_SECRET_TOKEN": "jwt", "TASK_ID": "t1"},
+            source_env={"PATH": "/usr/bin"},
+            task_type="research",
+            agent_image="reg/blueprint-agent-job:latest",
+            mem_limit="8g",
+        )
+        joined = " ".join(plan.argv)
+        self.assertIn("--memory 8g", joined)
 
     def test_agent_plan_no_image_stays_bwrap(self):
         # An eligible task_type but NO image → the existing bwrap plan; backend

@@ -195,6 +195,27 @@ async def _handle_issue_implementation_inner(
     # ── Build agent prompt ──
     prompt = _build_issue_prompt(issue_context, issue_number, issue_title)
 
+    # Fetching and scanning issue content is intentionally outside the Project
+    # lock.  Re-enter canonical automatic-task authority at the publication
+    # edge and keep the lock through commit, closing the label-webhook vs pause
+    # race without holding pause behind GitHub I/O.
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    creation_admission = await acquire_automatic_task_creation_authority(
+        session, project_id
+    )
+    if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[ISSUE-IMPL] Automatic task creation held for issue #%d: %s",
+            issue_number,
+            creation_admission,
+        )
+        await session.rollback()
+        return
+
     # ── Create the task ──
     task = Task(
         project_id=project_id,

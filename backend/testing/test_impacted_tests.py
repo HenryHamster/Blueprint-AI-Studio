@@ -13,6 +13,7 @@ import os
 import pytest
 
 from testing import impacted_tests
+from testing.fixgate_attribution import parse_junit_report
 
 
 def _write(root: str, rel: str, content: str = "") -> None:
@@ -69,7 +70,135 @@ def test_backend_verification_reports_runtime_unavailable_separately():
     }
 
 
-def test_backend_verification_junit_parser_normalizes_tree_specific_details(tmp_path):
+@pytest.mark.parametrize("exit_code", [1, 2, 3, 4, 5, 137, -15])
+def test_backend_verification_nonzero_clean_report_is_execution_failure(exit_code):
+    current = impacted_tests.JUnitReport(
+        test_routes={"backend/testing/test_x.py::test_passes"}
+    )
+    baseline = impacted_tests.JUnitReport(
+        test_routes={"backend/testing/test_x.py::test_passes"}
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=exit_code,
+        current_failures={},
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome == {
+        "state": "execution_failure",
+        "blocking": True,
+        "new_failures": {},
+    }
+
+
+def test_backend_verification_zero_exit_with_failures_is_execution_failure():
+    failures = {"backend/testing/test_x.py::test_fails::failure": "boom"}
+    current = impacted_tests.JUnitReport(
+        failures=failures,
+        test_routes={"backend/testing/test_x.py::test_fails"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_failures=failures,
+        current_report=current,
+        baseline_report=impacted_tests.JUnitReport(),
+    )
+
+    assert outcome == {
+        "state": "execution_failure",
+        "blocking": True,
+        "new_failures": {},
+    }
+
+
+@pytest.mark.parametrize("exit_code", [2, 3, 4, 5, 137, -15])
+def test_backend_verification_abnormal_exit_cannot_suppress_matching_failure(
+    exit_code,
+):
+    failures = {"backend/testing/test_x.py::test_fails::failure": "boom"}
+    report = impacted_tests.JUnitReport(
+        failures=failures,
+        test_routes={"backend/testing/test_x.py::test_fails"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=exit_code,
+        current_failures=failures,
+        current_report=report,
+        baseline_report=report,
+    )
+
+    assert outcome == {
+        "state": "execution_failure",
+        "blocking": True,
+        "new_failures": {},
+    }
+
+
+def test_backend_verification_exit_one_matching_failure_is_preexisting():
+    failures = {"backend/testing/test_x.py::test_fails::failure": "boom"}
+    report = impacted_tests.JUnitReport(
+        failures=failures,
+        test_routes={"backend/testing/test_x.py::test_fails"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=failures,
+        current_report=report,
+        baseline_report=report,
+    )
+
+    assert outcome["state"] == "preexisting_test_failure"
+    assert outcome["blocking"] is False
+    assert outcome["new_failures"] == {}
+
+
+def test_backend_verification_exit_one_new_failure_remains_blocking():
+    failures = {"backend/testing/test_x.py::test_fails::failure": "boom"}
+    current = impacted_tests.JUnitReport(
+        failures=failures,
+        test_routes={"backend/testing/test_x.py::test_fails"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=failures,
+        current_report=current,
+        baseline_report=impacted_tests.JUnitReport(),
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == failures
+
+
+def test_backend_verification_clean_exit_and_report_pass():
+    report = impacted_tests.JUnitReport(
+        test_routes={"backend/testing/test_x.py::test_passes"}
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_failures={},
+        current_report=report,
+        baseline_report=report,
+    )
+
+    assert outcome["state"] == "passed"
+    assert outcome["blocking"] is False
+
+
+def test_backend_verification_junit_parser_preserves_route_keyed_detail(tmp_path):
     report = tmp_path / "junit.xml"
     report.write_text(
         '<testsuite><testcase classname="testing.test_x" name="test_old">'
@@ -81,14 +210,172 @@ def test_backend_verification_junit_parser_normalizes_tree_specific_details(tmp_
     failures = impacted_tests.parse_junit_failures(report)
 
     assert failures == {
-        "testing.test_x::test_old": "Assertion at /candidate/object at 0xABC"
+        "testing.test_x::test_old::failure": "Assertion at /candidate/object at 0xABC"
     }
     assert impacted_tests.attribute_new_failures(
         failures,
-        {"testing.test_x::test_old": "Assertion at /base/object at 0x123"},
+        {"testing.test_x::test_old::failure": "Assertion at /base/object at 0x123"},
         current_root="/candidate",
         baseline_root="/base",
     ) == {}
+
+
+def test_junit_parser_extracts_offender_set_marker(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        '<testsuite><testcase classname="testing.test_x" name="test_old">'
+        '<failure>counts\nBLUEPRINT_OFFENDERS: ["app/a.py", "app/b.py"]</failure>'
+        "</testcase></testsuite>",
+        encoding="utf-8",
+    )
+
+    parsed = parse_junit_report(report)
+
+    assert parsed.offender_sets == {
+        "testing.test_x::test_old::failure": frozenset({"app/a.py", "app/b.py"})
+    }
+
+
+def test_backend_verification_treats_changed_failure_detail_as_new():
+    current = {"backend/testing/test_x.py::test_old::failure": "line 99: changed"}
+    baseline = {"backend/testing/test_x.py::test_old::failure": "line 12: old"}
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=current,
+        baseline_failures=baseline,
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == current
+    assert outcome["suppressed_failures"] == {}
+
+
+def test_offender_set_subset_is_attributed_to_baseline():
+    """Changing diagnostics or removing an old offender stays pre-existing."""
+    key = "backend/testing/test_invariants.py::test_backend::failure"
+    current = impacted_tests.JUnitReport(
+        failures={key: 'current counts\nBLUEPRINT_OFFENDERS: ["app/a.py"]'},
+        test_routes={"backend/testing/test_invariants.py::test_backend"},
+    )
+    baseline = impacted_tests.JUnitReport(
+        failures={
+            key: 'baseline counts\nBLUEPRINT_OFFENDERS: ["app/a.py", "app/old.py"]'
+        },
+        test_routes={"backend/testing/test_invariants.py::test_backend"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=current.failures,
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome["state"] == "preexisting_test_failure"
+    assert outcome["blocking"] is False
+    assert outcome["new_failures"] == {}
+    assert outcome["suppressed_failures"][key]["detail"] == current.failures[key]
+
+
+def test_offender_set_new_path_remains_blocking():
+    key = "backend/testing/test_invariants.py::test_backend::failure"
+    current = impacted_tests.JUnitReport(
+        failures={key: 'current\nBLUEPRINT_OFFENDERS: ["app/a.py", "app/new.py"]'},
+        test_routes={"backend/testing/test_invariants.py::test_backend"},
+    )
+    baseline = impacted_tests.JUnitReport(
+        failures={key: 'baseline\nBLUEPRINT_OFFENDERS: ["app/a.py"]'},
+        test_routes={"backend/testing/test_invariants.py::test_backend"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=current.failures,
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == {key: current.failures[key]}
+
+
+def test_backend_verification_keeps_diff_introduced_route_blocking():
+    current = {"backend/testing/test_x.py::test_new::failure": "introduced"}
+    baseline = {"backend/testing/test_x.py::test_old::failure": "old"}
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=current,
+        baseline_failures=baseline,
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == current
+
+
+def test_backend_verification_reports_base_failure_route_missing_from_current_report():
+    current = impacted_tests.JUnitReport(
+        failures={},
+        test_routes={"backend/testing/test_other.py::test_still_present"},
+    )
+    baseline = impacted_tests.JUnitReport(
+        failures={"backend/testing/test_old.py::test_removed::failure": "old"},
+        test_routes={"backend/testing/test_old.py::test_removed"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_failures={},
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome["state"] == "baseline_failure_disappeared"
+    assert outcome["blocking"] is True
+    assert outcome["disappeared_failures"] == {
+        "backend/testing/test_old.py::test_removed::failure": {
+            "detail": "old",
+            "reason": "baseline failing route absent from current report",
+        }
+    }
+
+
+def test_backend_verification_reports_base_failure_route_skipped():
+    current = impacted_tests.JUnitReport(
+        failures={},
+        test_routes={"backend/testing/test_old.py::test_removed"},
+        skipped_routes={"backend/testing/test_old.py::test_removed"},
+    )
+    baseline = impacted_tests.JUnitReport(
+        failures={"backend/testing/test_old.py::test_removed::failure": "old"},
+        test_routes={"backend/testing/test_old.py::test_removed"},
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_failures={},
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome["state"] == "baseline_failure_skipped"
+    assert outcome["blocking"] is True
+    assert outcome["skipped_failures"] == {
+        "backend/testing/test_old.py::test_removed::failure": {
+            "detail": "old",
+            "reason": "baseline failing route is skipped in current report",
+        }
+    }
 
 
 def test_app_module_for_path():

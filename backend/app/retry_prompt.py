@@ -22,7 +22,7 @@ from app.retry_budget import CODE_ERROR_STAGE_GUIDANCE
 
 
 # Mirrors SCOPE_OVERFLOW_THRESHOLDS in agent/src/constants.ts — keep in sync.
-_SCOPE_OVERFLOW_THRESHOLDS = {"small": 6, "medium": 10, "large": 20}
+_SCOPE_OVERFLOW_THRESHOLDS = {"small": 8, "medium": 16, "large": 32}
 
 
 # Build/lint complaint patterns the reviewer's local VM might raise that
@@ -457,7 +457,7 @@ def _build_retry_prompt_suffix(
                 "- Focus on the single most critical change only\n"
                 "- Skip non-essential improvements, refactors, or cleanup\n"
                 "- Commit working changes early and often\n"
-                "- If the task requires changes across many files, pick the 2-3 most important\n"
+                "- If the task touches many files, narrow to the most critical coherent change and defer the rest\n"
             )
         if subtype not in (TIMEOUT_CASCADE, TIMEOUT_ITERATION_LIMIT):
             if attempt >= 2 and task_scope == "large":
@@ -484,7 +484,7 @@ def _build_retry_prompt_suffix(
         else:
             extra_guidance = (
                 "RETRY GUIDANCE: The previous attempt exceeded the scope's file-count budget.\n"
-                "- Focus on the single most critical change; limit production edits to 1-3 files\n"
+                "- Fit the change within the scope's file budget; keep it contract-complete rather than shedding files the change actually needs\n"
                 "- Split unrelated concerns into follow-up work rather than bundling them here\n"
             )
         extra_guidance += _build_scope_overflow_details(ctx, task_scope)

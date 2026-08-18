@@ -722,8 +722,8 @@ class TestScopeBudgetGate:
         assert warning is not None and "scope_budget_mismatch" in warning
         assert not requires_approval
 
-    def test_medium_12_files_upgrades_to_large(self):
-        files = [f"file{i}.py" for i in range(12)]
+    def test_medium_18_files_upgrades_to_large(self):
+        files = [f"file{i}.py" for i in range(18)]
         scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
             "medium", files
         )
@@ -732,8 +732,8 @@ class TestScopeBudgetGate:
         assert warning is not None and "scope_budget_mismatch" in warning
         assert not requires_approval
 
-    def test_large_30_files_requires_approval(self):
-        files = [f"file{i}.py" for i in range(30)]
+    def test_large_40_files_requires_approval(self):
+        files = [f"file{i}.py" for i in range(40)]
         scope, cal_from, warning, requires_approval = check_scope_budget_mismatch(
             "large", files
         )

@@ -835,15 +835,14 @@ async def test_lock_task_for_mutation_preserves_prior_dirty_state_on_skip(
 
 @pytest.mark.asyncio
 async def test_capture_ci_polling_snapshot_includes_all_5_fields():
-    """`_capture_ci_polling_snapshot` must return a dict with the 5 fields
-    that the CI-polling lock-window break protects: status (Task-level)
-    plus review_loop.{pr_number, ci_passed, review_approved, iteration}.
+    """`_capture_ci_polling_snapshot` must cover the full attempt authority.
 
     Heartbeat-only updates touch none of these — that's the whole point
     of the content-snapshot validator (R5-W2-A). If a future refactor
-    drops a field or renames a key in review_loop, the CI polling sites
-    will silently stop deferring on that mutation; this test pins the
-    contract.
+    drops an attempt coordinate, review-wait owner, or approval provenance
+    field, the CI polling sites can silently write through a peer mutation;
+    this test pins the expanded contract.  The historical test name is kept
+    so CI duration history remains comparable.
     """
     from app.orchestrator import _capture_ci_polling_snapshot
 
@@ -865,27 +864,54 @@ async def test_capture_ci_polling_snapshot_includes_all_5_fields():
     snapshot = _capture_ci_polling_snapshot(task)
     assert set(snapshot.keys()) == {
         "status",
+        "archived",
+        "project_id",
+        "requires_approval",
+        "ci_waiting",
         "pr_number",
         "ci_passed",
         "review_approved",
         "iteration",
+        "branch",
+        "base_branch",
+        "ci_checked_head_sha",
+        "ci_checked_base_sha",
+        "review_wait_started",
+        "review_wait_approval_hold",
+        "approval_set_at",
+        "approval_hold_reason",
+        "touched_critical",
     }, (
-        f"Snapshot must include exactly the 5 protected fields; got {set(snapshot.keys())}. "
+        f"Snapshot must include exactly the protected authority fields; got "
+        f"{set(snapshot.keys())}. "
         "Adding/removing keys is a contract change — update the CI polling sites in lockstep."
     )
     assert snapshot["status"] == TaskStatus.EVALUATING
+    assert snapshot["archived"] is False
+    assert snapshot["project_id"] == str(task.project_id)
+    assert snapshot["requires_approval"] is False
+    assert snapshot["ci_waiting"] is None
     assert snapshot["pr_number"] == 17
     assert snapshot["ci_passed"] is False
     assert snapshot["review_approved"] is False
     assert snapshot["iteration"] == 2
+    assert snapshot["branch"] is None
+    assert snapshot["base_branch"] is None
+    assert snapshot["ci_checked_head_sha"] is None
+    assert snapshot["ci_checked_base_sha"] is None
+    assert snapshot["review_wait_started"] is None
+    assert snapshot["review_wait_approval_hold"] is None
+    assert snapshot["approval_set_at"] is None
+    assert snapshot["approval_hold_reason"] is None
+    assert snapshot["touched_critical"] is None
 
 
 @pytest.mark.asyncio
 async def test_capture_ci_polling_snapshot_handles_missing_review_loop():
     """When ``context`` lacks a ``review_loop`` key (early in the pipeline,
-    or when the task hasn't entered review yet), the snapshot must still
-    return all 5 keys with None placeholders so callers can compare
-    deterministically across the pre/post-release boundary."""
+    or when the task hasn't entered review yet), the snapshot must still return
+    the complete authority shape with deterministic placeholders across the
+    pre/post-release boundary."""
     from app.orchestrator import _capture_ci_polling_snapshot
 
     task = Task(
@@ -898,10 +924,23 @@ async def test_capture_ci_polling_snapshot_handles_missing_review_loop():
     snapshot = _capture_ci_polling_snapshot(task)
     assert snapshot == {
         "status": TaskStatus.EVALUATING,
+        "archived": False,
+        "project_id": str(task.project_id),
+        "requires_approval": False,
+        "ci_waiting": None,
         "pr_number": None,
         "ci_passed": None,
         "review_approved": None,
         "iteration": None,
+        "branch": None,
+        "base_branch": None,
+        "ci_checked_head_sha": None,
+        "ci_checked_base_sha": None,
+        "review_wait_started": None,
+        "review_wait_approval_hold": None,
+        "approval_set_at": None,
+        "approval_hold_reason": None,
+        "touched_critical": None,
     }
 
 
@@ -1564,7 +1603,9 @@ async def test_spawn_scope_overflow_signal_fires_after_commit(db_session, mocker
         ],
         context={
             "scope": "small",
-            "_pr_changed_files": [f"backend/app/m{i}.py" for i in range(7)],
+            # small-scope budget is SCOPE_FILE_BUDGETS["small"]["total_files_max"]
+            # (8); must exceed it to trigger the overflow signal.
+            "_pr_changed_files": [f"backend/app/m{i}.py" for i in range(9)],
             "review_loop": {"iteration": 0},
         },
     )
@@ -1677,7 +1718,9 @@ async def test_spawn_scope_overflow_signal_failure_does_not_block_spawn(
         ],
         context={
             "scope": "small",
-            "_pr_changed_files": [f"backend/app/n{i}.py" for i in range(7)],
+            # small-scope budget is SCOPE_FILE_BUDGETS["small"]["total_files_max"]
+            # (8); must exceed it to trigger the overflow signal.
+            "_pr_changed_files": [f"backend/app/n{i}.py" for i in range(9)],
             "review_loop": {"iteration": 0},
         },
     )

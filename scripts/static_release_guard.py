@@ -12,14 +12,20 @@ import argparse
 import base64
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+from testing.fixgate_attribution import (  # noqa: E402
+    JUnitReport,
+    attribute_reports,
+    extract_base,
+    is_attributable_pytest_result,
+    parse_junit_report,
+)
 
 STATIC_PATH_PREFIXES = (
     "backend/",
@@ -65,57 +71,53 @@ def _is_static_scope(path: str) -> bool:
     )
 
 
-def _extract_base(repo: Path, ref: str, destination: Path) -> None:
-    with tempfile.TemporaryFile() as stderr_file:
-        archive = subprocess.Popen(
-            ["git", "-c", f"safe.directory={repo}", "archive", ref],
-            cwd=repo,
-            stdout=subprocess.PIPE,
-            stderr=stderr_file,
-        )
-        assert archive.stdout is not None
-        try:
-            with tarfile.open(fileobj=archive.stdout, mode="r|") as bundle:
-                bundle.extractall(destination, filter="data")
-        finally:
-            return_code = archive.wait()
-            stderr_file.seek(0)
-            stderr = stderr_file.read().decode("utf-8", errors="replace")
-    if return_code != 0:
-        raise RuntimeError(f"git archive {ref} failed ({return_code}): {stderr.strip()}")
+_extract_base = extract_base
 
 
 def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, check=False)
 
 
-def _junit_failures(path: Path, *, label: str) -> dict[str, str]:
-    if not path.is_file():
-        raise RuntimeError(f"{label} JUnit report is missing: {path}")
-    if path.stat().st_size == 0:
-        raise RuntimeError(f"{label} JUnit report is empty: {path}")
-    try:
-        root = ET.parse(path).getroot()
-    except (ET.ParseError, OSError) as exc:
-        raise RuntimeError(f"{label} JUnit report is not parseable: {path}: {exc}") from exc
-    if not any(element.tag == "testcase" for element in root.iter()):
-        raise RuntimeError(f"{label} JUnit report has no testcase records: {path}")
-    failures: dict[str, str] = {}
-    for case in root.iter("testcase"):
-        failure = case.find("failure")
-        error = case.find("error")
-        detail = failure if failure is not None else error
-        if detail is None:
-            continue
-        key = f"{case.attrib.get('classname', '')}::{case.attrib.get('name', '')}"
-        failures[key] = (detail.text or detail.attrib.get("message", "")).strip()
-    return failures
+def _pytest_result_is_authoritative(
+    result: subprocess.CompletedProcess[str],
+    report: JUnitReport,
+    *,
+    authority: str,
+) -> bool:
+    """Reject an exit/JUnit pair that cannot authorize differential attribution."""
+
+    if is_attributable_pytest_result(result.returncode, report):
+        return True
+    print(
+        f"[static guard] ERROR: {authority} \u2014 pytest exit code/JUnit pair "
+        f"is not attributable (exit {result.returncode})",
+        file=sys.stderr,
+    )
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return False
 
 
-def _normalize_failure_detail(detail: str, *, tree_root: Path) -> str:
-    """Remove the tree-specific absolute root from a JUnit failure detail."""
-    normalized = detail.replace(str(tree_root), "<tree-root>")
-    return re.sub(r"(object at )0x[0-9a-fA-F]+", r"\1<address>", normalized)
+def _junit_failures(
+    path: Path, *, label: str, tree_root: Path | None = None
+) -> dict[str, str]:
+    """Compatibility wrapper for callers that only need failed nodes."""
+    return parse_junit_report(path, tree_root=tree_root, label=label).failures
+
+
+def _static_roster_changed(base_harness: Path, current_harness: Path) -> bool:
+    """Return whether the harness changed how the static corpus is selected."""
+    start_marker = "CI_TEST_MODULE_ROOTS=("
+    end_marker = "STATIC_GUARD_SELECTORS_ARGS=()"
+    fingerprints = []
+    for harness in (base_harness, current_harness):
+        source = harness.read_text(encoding="utf-8")
+        start = source.find(start_marker)
+        end = source.find(end_marker, start + len(start_marker))
+        if start < 0 or end < 0:
+            return True
+        fingerprints.append(source[start:end])
+    return fingerprints[0] != fingerprints[1]
 
 
 def _run_static_corpus(
@@ -154,54 +156,6 @@ def _task_id() -> str:
     return os.environ.get("TASK_ID", "").strip()
 
 
-def _pytest_selector(
-    classname: str, name: str, *, tree_root: Path
-) -> tuple[str, Path] | None:
-    """Translate pytest's JUnit classname/name pair into a repository node id.
-
-    pytest derives ``classname`` from the failing node id relative to its
-    rootdir, so a file selected from OUTSIDE rootdir keeps the traversal
-    segments — and ``.``-splitting drops the empty ones but keeps any real
-    directory name they walked through.  The harness runs pytest from the
-    backend directory and selects the ``scripts/`` corpus by path, giving two
-    distinct shapes for the same file:
-
-    * non-Docker: ``../scripts/test_x.py`` -> ``...scripts.test_x``
-    * Docker (rootdir ``/app``, repo bind-mounted at ``/repo``):
-      ``/repo/scripts/test_x.py`` -> ``...repo.scripts.test_x``
-
-    The Docker shape retains the ``repo`` mount segment, which exists in the
-    container but not in the tree being resolved.  So resolution walks the
-    leading segments off as well as the trailing ones: the first prefix that
-    names a real file wins, which handles the ``/repo`` mount (and any future
-    mount point) without hard-coding the container layout.
-
-    A COLLECTION error has no test identity: pytest's ``mangle_test_address``
-    yields a single element, so ``classname`` is empty and the dotted MODULE
-    path lands in ``name`` instead.  That shape is resolved by reading the
-    module path out of ``name`` and returning a file-level selector with no
-    ``::`` node — otherwise an import error present in both trees would be
-    unresolvable here and charged as new.
-    """
-    parts = [part for part in classname.split(".") if part]
-    node = name
-    if not parts:
-        parts = [part for part in name.split(".") if part]
-        node = ""
-    for start in range(len(parts)):
-        for module_length in range(len(parts), start, -1):
-            relative = Path(*parts[start:module_length]).with_suffix(".py")
-            for source_root in (tree_root, tree_root / "backend"):
-                source = source_root / relative
-                if source.is_file():
-                    suffix = [part for part in (*parts[module_length:], node) if part]
-                    return (
-                        f"{relative}{''.join(f'::{part}' for part in suffix)}",
-                        source,
-                    )
-    return None
-
-
 def _base_file_selectors(selectors: dict[str, str], *, base_root: Path) -> list[str]:
     """Return FILE-level pytest selectors for failed nodes resolvable in base.
 
@@ -236,23 +190,12 @@ def _failed_selectors(
     non-empty unresolved list as the signal to run the FULL base corpus, which
     is what the pre-scoping guard always did.
     """
-    if not path.is_file() or path.stat().st_size == 0:
-        return {}, []
-    root = ET.parse(path).getroot()
-    selectors: dict[str, str] = {}
-    unresolved: list[str] = []
-    for case in root.iter("testcase"):
-        if case.find("failure") is None and case.find("error") is None:
-            continue
-        classname = case.attrib.get("classname", "")
-        name = case.attrib.get("name", "")
-        key = f"{classname}::{name}"
-        selector = _pytest_selector(classname, name, tree_root=tree_root)
-        if selector is not None:
-            selectors[key] = selector[0]
-        else:
-            unresolved.append(key)
-    return selectors, sorted(set(unresolved))
+    report = parse_junit_report(path, tree_root=tree_root, label="current")
+    selectors = {
+        key: selector for key, selector in report.selectors.items()
+    }
+    unresolved = sorted(set(report.failures) - set(selectors))
+    return selectors, unresolved
 
 
 def _attributed_findings(
@@ -274,10 +217,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="automain")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--size-only",
         action="store_true",
         help="run the always-on module-size check without the standalone corpus",
+    )
+    mode_group.add_argument(
+        "--corpus-only",
+        action="store_true",
+        help="run the attributed standalone corpus without the module-size check",
     )
     args = parser.parse_args(argv)
     repo = args.repo_root.resolve()
@@ -310,25 +259,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[static guard] ERROR: {exc}", file=sys.stderr)
             return 2
 
-        size_result = _run_size_guard(repo, base_root)
-        if size_result.returncode != 0:
-            print("[static guard] module size guard FAILED")
-            try:
-                size_findings = _attributed_findings(
-                    {"<module-size-guard>": size_result.stdout + size_result.stderr},
-                    task_id=task_id,
-                    source="module size guard",
-                )
-            except RuntimeError as exc:
-                print(f"[static guard] ERROR: {exc}", file=sys.stderr)
-                failures.append("module size guard attribution")
-            else:
-                print(f"[static guard] findings: {json.dumps(size_findings)}")
-            print(size_result.stdout, end="")
-            print(size_result.stderr, end="", file=sys.stderr)
-            failures.append("module size guard")
+        if args.corpus_only:
+            print("[static guard] module size guard SKIPPED (--corpus-only)")
         else:
-            print("[static guard] module size guard OK")
+            size_result = _run_size_guard(repo, base_root)
+            if size_result.returncode != 0:
+                print("[static guard] module size guard FAILED")
+                try:
+                    size_findings = _attributed_findings(
+                        {"<module-size-guard>": size_result.stdout + size_result.stderr},
+                        task_id=task_id,
+                        source="module size guard",
+                    )
+                except RuntimeError as exc:
+                    print(f"[static guard] ERROR: {exc}", file=sys.stderr)
+                    failures.append("module size guard attribution")
+                else:
+                    print(f"[static guard] findings: {json.dumps(size_findings)}")
+                print(size_result.stdout, end="")
+                print(size_result.stderr, end="", file=sys.stderr)
+                failures.append("module size guard")
+            else:
+                print("[static guard] module size guard OK")
 
         if args.size_only:
             if failures:
@@ -350,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
             print("[static guard] ERROR: scripts/test-backend.sh is unavailable", file=sys.stderr)
             return 2
         harness_changed = "scripts/test-backend.sh" in scoped
+        roster_changed = _static_roster_changed(base_harness, current_harness)
         # The route helper is an execution dependency mounted alongside the
         # harness; retain the existing fixture/bootstrap behavior for it. The
         # harness and its roster above remain tree-specific.
@@ -364,51 +317,71 @@ def main(argv: list[str] | None = None) -> int:
         base_result: subprocess.CompletedProcess[str] | None = None
         current_result = _run_static_corpus(repo, current_junit)
         try:
-            current_failures = _junit_failures(current_junit, label="current")
+            current_report = parse_junit_report(
+                current_junit, tree_root=repo, label="current"
+            )
         except RuntimeError as exc:
             print(f"[static guard] ERROR: cannot attribute standalone corpus: {exc}", file=sys.stderr)
             print(current_result.stdout, end="")
             print(current_result.stderr, end="", file=sys.stderr)
             failures.append("standalone static corpus attribution")
         else:
-            if not current_failures and not harness_changed:
-                # A harness/import failure has no testcase identity. It is still a
-                # real failure, and must not be converted into a green result.
-                if current_result.returncode != 0:
-                    new_failures = {
-                        "<harness>": current_result.stderr or current_result.stdout
-                    }
-                else:
-                    new_failures = {}
+            current_failures = current_report.failures
+            new_failures: dict[str, str] = {}
+            corpus_authoritative = _pytest_result_is_authoritative(
+                current_result,
+                current_report,
+                authority="execution_failure",
+            )
+            if not corpus_authoritative:
+                failures.append("standalone static corpus execution_failure")
             elif not current_failures:
-                # A changed harness needs a baseline even when the candidate
-                # reports clean: disappearance of a base failure can itself be
-                # evidence that the changed roster stopped collecting it.
-                base_result = _run_static_corpus(base_root, base_junit)
-                try:
-                    base_failures = _junit_failures(base_junit, label="base")
-                except RuntimeError as exc:
-                    print(
-                        f"[static guard] ERROR: cannot attribute standalone corpus: {exc}",
-                        file=sys.stderr,
-                    )
-                    print(base_result.stdout, end="")
-                    print(base_result.stderr, end="", file=sys.stderr)
-                    failures.append("standalone static corpus attribution")
-                    new_failures = {}
-                else:
-                    new_failures = {
-                        "<harness>": (
-                            "changed scripts/test-backend.sh made base corpus "
-                            "failure(s) disappear"
+                # A changed harness is checked against the base corpus, but a
+                # normal clean candidate does not need differential subtraction.
+                if harness_changed:
+                    # The partial roster fingerprint only sharpens the finding's
+                    # diagnostic. It can never authorize a clean current report
+                    # when the unchanged base harness still exposes failures.
+                    base_result = _run_static_corpus(base_root, base_junit)
+                    try:
+                        baseline_report = parse_junit_report(
+                            base_junit, tree_root=base_root, label="base"
                         )
-                    } if base_failures else {}
+                    except RuntimeError as exc:
+                        print(
+                            f"[static guard] ERROR: cannot attribute standalone corpus: {exc}",
+                            file=sys.stderr,
+                        )
+                        print(base_result.stdout, end="")
+                        print(base_result.stderr, end="", file=sys.stderr)
+                        failures.append("standalone static corpus attribution")
+                        corpus_authoritative = False
+                    else:
+                        if not _pytest_result_is_authoritative(
+                            base_result,
+                            baseline_report,
+                            authority="baseline_unavailable",
+                        ):
+                            failures.append("standalone static corpus baseline_unavailable")
+                            corpus_authoritative = False
+                        elif baseline_report.failures:
+                            if roster_changed:
+                                reason = "changed static test roster"
+                            else:
+                                reason = "changed static test harness"
+                            new_failures["<harness>"] = (
+                                f"{reason} made base corpus failure(s) disappear"
+                            )
             else:
-                # Current-tree failures need a baseline comparison; a clean tree
-                # takes the no-failure path above and avoids this second run.
                 selectors, unresolved = _failed_selectors(current_junit, tree_root=repo)
-                base_selectors: list[str] | None
-                if unresolved:
+                if harness_changed:
+                    # A changed harness can hide a baseline failure outside the
+                    # files that still fail in the current tree.  A baseline
+                    # scoped to those surviving failures cannot distinguish
+                    # current A from baseline A+B, so only the full base corpus
+                    # is authoritative for harness-change attribution.
+                    base_selectors = None
+                elif unresolved:
                     # At least one current failure has no derivable selector
                     # (e.g. a collection error, which pytest reports with an
                     # empty classname). A scoped baseline cannot cover it, so
@@ -426,18 +399,18 @@ def main(argv: list[str] | None = None) -> int:
                     base_selectors = _base_file_selectors(
                         selectors, base_root=base_root
                     )
-                base_failures: dict[str, str] | None
                 if base_selectors is not None and not base_selectors:
                     # Every failed file is absent from the base tree, so there is
                     # no baseline evidence to gather: all of it is new.
-                    base_failures = {}
-                    new_failures = current_failures
+                    baseline_report = JUnitReport()
                 else:
                     base_result = _run_static_corpus(
                         base_root, base_junit, selectors=base_selectors
                     )
                     try:
-                        base_failures = _junit_failures(base_junit, label="base")
+                        baseline_report = parse_junit_report(
+                            base_junit, tree_root=base_root, label="base"
+                        )
                     except RuntimeError as scoped_exc:
                         # The scoped baseline produced no usable report (e.g. the
                         # diff changed the harness's own roster/routing, so the
@@ -455,7 +428,9 @@ def main(argv: list[str] | None = None) -> int:
                             base_junit.unlink(missing_ok=True)
                             base_result = _run_static_corpus(base_root, base_junit)
                         try:
-                            base_failures = _junit_failures(base_junit, label="base")
+                            baseline_report = parse_junit_report(
+                                base_junit, tree_root=base_root, label="base"
+                            )
                         except RuntimeError as exc:
                             print(
                                 f"[static guard] ERROR: cannot attribute standalone corpus: {exc}",
@@ -466,20 +441,48 @@ def main(argv: list[str] | None = None) -> int:
                             print(current_result.stdout, end="")
                             print(current_result.stderr, end="", file=sys.stderr)
                             failures.append("standalone static corpus attribution")
-                            base_failures = None
-                            new_failures = {}
-                    if base_failures is not None:
-                        new_failures = {
-                            key: detail
-                            for key, detail in current_failures.items()
-                            if key not in base_failures
-                            or _normalize_failure_detail(
-                                base_failures[key], tree_root=base_root
-                            )
-                            != _normalize_failure_detail(detail, tree_root=repo)
-                        }
+                            baseline_report = None
+                            corpus_authoritative = False
+                    if baseline_report is not None:
+                        if base_result is not None and not _pytest_result_is_authoritative(
+                            base_result,
+                            baseline_report,
+                            authority="baseline_unavailable",
+                        ):
+                            failures.append("standalone static corpus baseline_unavailable")
+                            corpus_authoritative = False
+                        else:
+                            attributed = attribute_reports(current_report, baseline_report)
+                            new_failures = attributed.new_failures
+                            hidden_by_harness: list[str] = []
+                            if harness_changed and attributed.disappeared_failures:
+                                hidden_by_harness.append("disappear")
+                            if harness_changed and attributed.skipped_failures:
+                                hidden_by_harness.append("become skipped")
+                            if hidden_by_harness:
+                                new_failures["<harness>"] = (
+                                    "changed static test harness made base corpus "
+                                    f"failure(s) {' or '.join(hidden_by_harness)}"
+                                )
+                            elif harness_changed and roster_changed and baseline_report.failures:
+                                new_failures["<harness>"] = (
+                                    "changed static test roster made base corpus "
+                                    "failure(s) disappear"
+                                )
+                            if attributed.suppressed_failures:
+                                suppressed = {
+                                    key: {
+                                        "detail": detail,
+                                        "reason": "same route/test/failure kind failed on baseline",
+                                    }
+                                    for key, detail in attributed.suppressed_failures.items()
+                                }
+                                print(
+                                    "[static guard] suppressed baseline failures: "
+                                    f"{json.dumps(suppressed, sort_keys=True)}"
+                                )
 
-            if new_failures:
+            if corpus_authoritative and new_failures:
                 try:
                     attributed = _attributed_findings(
                         new_failures, task_id=task_id, source="standalone static corpus"
@@ -493,16 +496,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(current_result.stdout, end="")
                 print(current_result.stderr, end="", file=sys.stderr)
                 failures.append("standalone static corpus")
-            elif (
-                current_result.returncode != 0
-                and base_result is not None
-                and base_result.returncode == 0
-            ):
-                print("[static guard] standalone static corpus FAILED")
-                print(current_result.stdout, end="")
-                print(current_result.stderr, end="", file=sys.stderr)
-                failures.append("standalone static corpus")
-            else:
+            elif corpus_authoritative:
                 print("[static guard] standalone static corpus OK (no new failures vs base)")
 
     if failures:

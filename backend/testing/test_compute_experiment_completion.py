@@ -6664,6 +6664,7 @@ async def test_sweep_aggregate_best_effort_when_arm_wedged_past_deadline(
         _ACT_ON_VERDICT_SWEEP_KEY,
         _maybe_spawn_sweep_aggregate_followon,
     )
+    from app.task_locking import AUTOMATIC_TASK_CREATION_ALLOWED
 
     sweep_id = f"sweep-{uuid.uuid4().hex[:12]}"
 
@@ -6725,6 +6726,8 @@ async def test_sweep_aggregate_best_effort_when_arm_wedged_past_deadline(
         {},
         "",
         failure_mode=False,
+        automatic_admission=AUTOMATIC_TASK_CREATION_ALLOWED,
+        locked_project=project,
     )
     await db_session.commit()
 

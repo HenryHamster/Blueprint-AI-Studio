@@ -104,6 +104,50 @@ describePosix('writePrHelper', () => {
     }
   };
 
+  const setupPushRace = (
+    dir: string,
+    realFs: typeof import('node:fs'),
+    taskId: string,
+    expectedSha: string,
+    observedSha: string,
+    localSha: string,
+  ): void => {
+    const bin = `${dir}/bin`;
+    realFs.mkdirSync(bin, { recursive: true });
+    realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
+STATE="${dir}/ls-remote-count"
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"ls-remote --heads origin refs/heads/blueprint/${taskId}"*)
+    N=$(cat "$STATE" 2>/dev/null || printf '0'); N=$((N + 1)); printf '%s' "$N" > "$STATE"
+    if [ "$N" = 1 ]; then printf '%s\\t%s\\n' '${expectedSha}' 'refs/heads/blueprint/${taskId}';
+    else printf '%s\\t%s\\n' '${observedSha}' 'refs/heads/blueprint/${taskId}'; fi
+    exit 0 ;;
+  *"push --force-with-lease=refs/heads/blueprint/${taskId}:${expectedSha}"*)
+    printf '%s\\n' 'send-pack: connection reset after update' >&2; exit 1 ;;
+  *"rev-parse HEAD"*) printf '%s\\n' '${localSha}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    realFs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"; OUT=""
+while [ $# -gt 0 ]; do case "$1" in -o) OUT="$2"; shift 2 ;; *) shift ;; esac; done
+case "$ARGS" in
+  *"/api/agent/heartbeat"*) cat >/dev/null; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    realFs.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/7\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
+  };
+
   it('closes the PR with --superseded-by and writes the canonical PR URL', async () => {
     const script = writeScript({
       taskId: 'task-close-1',
@@ -147,6 +191,9 @@ esac
   });
 
   it('forces ./check test on LTS branches when backend paths changed', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const gatePayloadPath = '/tmp/pr_gate_pass_payload_task-lts-1.json';
+    realFs.rmSync(gatePayloadPath, { force: true });
     const script = writeScript({
       taskId: 'task-lts-1',
       workBranch: 'blueprint/task-lts-1',
@@ -184,6 +231,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$ARGS" in
+  *"/api/agent/heartbeat"*) cat > ${gatePayloadPath}; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
   *"/api/agent/github/token?task_id=task-lts-1"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
   *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
   *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
@@ -195,6 +243,20 @@ esac
 
     expect(result.status).toBe(0);
     expect(result.checkArgs).toBe('test');
+    const gatePayload = JSON.parse(realFs.readFileSync(gatePayloadPath, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(gatePayload).toMatchObject({
+      task_id: 'task-lts-1',
+      status_message: 'local publication gate passed (passed)',
+      publication_gate_receipt: {
+        status: 'passed',
+        command: './check test',
+        exit_code: 0,
+      },
+    });
+    realFs.rmSync(gatePayloadPath, { force: true });
   });
 
   it('fails fast before push when workflow files are present in the base-relative diff', async () => {
@@ -292,7 +354,7 @@ case "$*" in
   *"status --porcelain"*) exit 0 ;;
   *"rev-list --count origin/main..HEAD"*) printf '1\n'; exit 0 ;;
   *"remote set-url origin"*) exit 0 ;;
-  *"push --force-with-lease origin blueprint/task-workflow-2"*)
+  *"push --force-with-lease="*"task-workflow-2"*)
     printf '%s\n' 'remote: refusing to allow a GitHub App to create or update workflow ./.github/workflows/ci.yml without workflows permission.' >&2
     exit 1
     ;;
@@ -310,6 +372,32 @@ exit 0
     expect(result.stderr).toContain('Revert the workflow file(s) below before pushing');
     expect(result.stderr).not.toContain('push attempt 1');
     expect(result.stderr).not.toContain('push failed after 3 attempts');
+  });
+
+  it('reconciles a lost push response only when the remote equals local HEAD', async () => {
+    const expectedSha = 'a'.repeat(40);
+    const localSha = 'b'.repeat(40);
+    const script = writeScript({ taskId: 'task-push-lost', workBranch: 'blueprint/task-push-lost', baseBranch: 'main', owner: 'acme', repo: 'repo', testsOnMainBranch: false });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      setupPushRace(dir, realFs, 'task-push-lost', expectedSha, localSha, localSha);
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('exact remote ref equals local HEAD');
+  });
+
+  it('refuses to retry when a competing writer advances the remote branch', async () => {
+    const expectedSha = 'a'.repeat(40);
+    const localSha = 'b'.repeat(40);
+    const competingSha = 'c'.repeat(40);
+    const script = writeScript({ taskId: 'task-push-race', workBranch: 'blueprint/task-push-race', baseBranch: 'main', owner: 'acme', repo: 'repo', testsOnMainBranch: false });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      setupPushRace(dir, realFs, 'task-push-race', expectedSha, competingSha, localSha);
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('remote branch advanced to a competing SHA');
+    expect(result.stderr).toContain(competingSha);
   });
 
   it('surfaces the GATE-ENVIRONMENT marker after a passing ./check test', async () => {
@@ -606,6 +694,131 @@ esac
     realFs.rmSync('/tmp/pr_body_task-nojq-1', { force: true });
     realFs.rmSync('/tmp/pr_url_task-nojq-1', { force: true });
   });
+
+  const assertSuppressedBaselineReceipt = async (
+    receiptShape: 'writer-shaped nested' | 'legacy flat',
+  ): Promise<void> => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const taskId = receiptShape === 'writer-shaped nested'
+      ? 'task-suppressed-baseline-nested-1'
+      : 'task-suppressed-baseline-legacy-1';
+    const receiptPath = `/tmp/project_verification_receipt_${taskId}.json`;
+    const bodyPath = `/tmp/pr_body_${taskId}`;
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(bodyPath, { force: true });
+
+    const suppressedFailures = {
+      'backend/testing/test_z.py::test_inherited::failure': {
+        detail: 'AssertionError: inherited failure',
+        reason: 'same route/test/failure kind failed on baseline',
+      },
+      'backend/testing/test_a.py::test_older::error': {
+        detail: 'RuntimeError: baseline-only issue',
+        reason: 'same route/test/failure kind failed on baseline',
+      },
+    };
+    const receipt = receiptShape === 'writer-shaped nested'
+      ? {
+          version: 1,
+          task_id: taskId,
+          directory: '.',
+          created_at: '2026-08-17T00:00:00+00:00',
+          ruff: {
+            command: 'python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>',
+            exit_code: 0,
+          },
+          pytest: {
+            command: 'USE_TEST_POSTGRES=true bash scripts/test-backend.sh <impacted-selectors>',
+            harness: 'scripts/test-backend.sh',
+            selectors: ['backend/testing/test_z.py', 'backend/testing/test_a.py'],
+            targeted: true,
+            use_test_postgres: true,
+            postgres_sidecar: true,
+            state: 'preexisting_test_failure',
+            current_exit_code: 1,
+            tests: 2,
+            skipped: 0,
+            failures: 2,
+            new_failures: {},
+            suppressed_failures: suppressedFailures,
+            disappeared_failures: {},
+            skipped_failures: {},
+            exit_code: 0,
+          },
+        }
+      : {
+          state: 'preexisting_test_failure',
+          suppressed_failures: suppressedFailures,
+        };
+
+    const script = writeScript({
+      taskId,
+      workBranch: `blueprint/${taskId}`,
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(
+        receiptPath,
+        JSON.stringify(receipt),
+      );
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/${taskId}"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/heartbeat"*) cat >/dev/null; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) cat > ${bodyPath}; [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    }, { TASK_ID: taskId });
+
+    expect(result.status).toBe(0);
+    const body = JSON.parse(realFs.readFileSync(bodyPath, 'utf8')) as { body: string };
+    expect(body.body).toContain('- Status: passed');
+    expect(body.body).toContain('### Suppressed baseline failures');
+    expect(body.body).toContain('`backend/testing/test_a.py::test_older::error`: RuntimeError: baseline-only issue');
+    expect(body.body).toContain('`backend/testing/test_z.py::test_inherited::failure`: AssertionError: inherited failure');
+    expect(body.body.indexOf('test_a.py')).toBeLessThan(body.body.indexOf('test_z.py'));
+    expect(body.body).toContain('<!-- /blueprint:local-gate -->');
+
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(bodyPath, { force: true });
+    realFs.rmSync(`/tmp/pr_url_${taskId}`, { force: true });
+  };
+
+  it.each(['writer-shaped nested', 'legacy flat'] as const)(
+    'surfaces suppressed baseline failures from a %s receipt in the local-gate PR section',
+    assertSuppressedBaselineReceipt,
+  );
 
   // ── Zero-effective-diff guard ────────────────────────────────────────────────
   // A rebased/superseded branch can be commits-ahead by SHA yet net to ZERO
@@ -1216,6 +1429,26 @@ describe('writePrHelper — run_pr_gate timeout-absent fallback (static)', () =>
     // Error message must explain what happened and how to fix it.
     expect(timeoutBlock).toContain('did not complete within the absolute time limit');
     expect(timeoutBlock).toContain('no verdict was produced');
+  });
+
+  it('uses one immutable explicit remote lease and never refreshes it after failure', () => {
+    writePrHelper({
+      taskId: 'task-exact-lease',
+      workBranch: 'blueprint/task-exact-lease',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+
+    expect(script).toContain(
+      '_PR_LEASE="--force-with-lease=$_PR_REMOTE_REF:$_PR_EXPECTED_REMOTE_SHA"',
+    );
+    expect(script).toContain('git push "$_PR_LEASE" origin "HEAD:$_PR_REMOTE_REF"');
+    expect(script).toContain('if [ "$_PR_OBSERVED_REMOTE_SHA" != "$_PR_EXPECTED_REMOTE_SHA" ]; then');
+    expect(script).not.toContain('stale lease, fetching + retrying');
+    expect(script).not.toContain('git fetch origin "blueprint/task-exact-lease"');
   });
 });
 

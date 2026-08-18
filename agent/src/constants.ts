@@ -176,11 +176,18 @@ export const MAX_CLAUDE_CHECK_INVOCATIONS = 10; // hard ceiling: kill regardless
 export const CHECK_RUNAWAY_MIN_INVOCATIONS = 6; // minimum calls before consecutive-failure check
 export const CHECK_RUNAWAY_CONSECUTIVE_FAILURES = 3; // last-N failures triggers kill
 
-// Scope overflow detection — 2× the upper bound of each scope range
+// Scope overflow detection — a generous multiple of each scope's expected
+// range. These exist to catch RUNAWAY scope (a task quietly rewriting half the
+// repo), not to squeeze organic growth: modern implementing agents handle
+// multi-file changes well, and punishing a task for touching the callers and
+// consumers its contract change requires just trains the pipeline to ship
+// half-wired fragments. Keep in sync with backend SCOPE_FILE_BUDGETS
+// (backend/app/spawn_calibration.py) and _SCOPE_OVERFLOW_THRESHOLDS
+// (backend/app/retry_prompt.py).
 export const SCOPE_OVERFLOW_THRESHOLDS: Record<string, number> = {
-  small: 6,   // small expects 1-3 files; warn at >6
-  medium: 10, // medium expects 2-5 files; warn at >10
-  large: 20,  // large expects 5+ files; warn at >20
+  small: 8,   // small expects a handful of files; warn at >8
+  medium: 16, // medium expects up to ~a dozen files; warn at >16
+  large: 32,  // large is cross-component; warn at >32
 };
 
 // Parallel review fan-out thresholds. False positive (extra fan-out) costs a
@@ -289,7 +296,7 @@ export const GREENFIELD_SOURCE_FILE_THRESHOLD = 8;
 // proposes more files than this, the handler retries the analysis with a
 // narrowing directive once, then fails fast rather than burning the
 // implementation budget on a task that will hit SCOPE_OVERFLOW_THRESHOLDS.
-export const MEDIUM_ANALYSIS_PLAN_FILE_LIMIT = 10;
+export const MEDIUM_ANALYSIS_PLAN_FILE_LIMIT = 16;
 
 // Maximum characters of analysis text injected into the implementation prompt.
 // Prevents unbounded growth from large pre-implementation analysis results.

@@ -264,24 +264,58 @@ GATE_SECTION=""
 GATE_COMMAND="./check"
 GATE_ELAPSED_SECONDS=0
 GATE_DEADLINE_EXTENDED=false
+_VERIFY_TASK_ID="\${TASK_ID:-${cfg.taskId}}"
+_VERIFY_RECEIPT="/tmp/project_verification_receipt_\${_VERIFY_TASK_ID}.json"
+SUPPRESSED_BASELINE_SECTION=""
+
+# A successful backend verification can rely on failures inherited from the
+# base branch. Surface those exact structured failure identities in the PR
+# body so a passing publication remains honest and reviewable. The receipt is
+# optional for stacks without targeted backend verification; malformed or
+# unavailable receipts must not change the publication verdict.
+render_suppressed_baseline_section() {
+  local receipt_file="$1"
+  if [ ! -s "$receipt_file" ] || ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  python3 -c 'import json,sys; payload=json.load(open(sys.argv[1],encoding="utf-8")); pytest=payload.get("pytest"); d=pytest.get("suppressed_failures") if isinstance(pytest,dict) and "suppressed_failures" in pytest else payload.get("suppressed_failures"); lines=["### Suppressed baseline failures"]+["- {}{}{}: {}".format(chr(96),k,chr(96),v.get("detail","") if isinstance(v,dict) else v) for k,v in sorted(d.items())] if isinstance(d,dict) and d else []; print("\\n".join(lines),end="") if lines else None' "$receipt_file" 2>/dev/null || true
+}
 
 write_gate_receipt() {
   local status="$1"
   local exit_code="$2"
   local fallback="$3"
   local recorded_at
+  GATE_RECEIPT_STATUS="$status"
   recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf '{"status":"%s","command":"%s","timeout_seconds":%s,"hard_timeout_seconds":%s,"elapsed_seconds":%s,"deadline_extended":%s,"exit_code":%s,"authoritative_ci_required":%s,"recorded_at":"%s"}\n' \
     "$status" "$GATE_COMMAND" "$GATE_TIMEOUT_SECONDS" "$GATE_HARD_TIMEOUT_SECONDS" "$GATE_ELAPSED_SECONDS" "$GATE_DEADLINE_EXTENDED" "$exit_code" "$fallback" "$recorded_at" > "$GATE_RECEIPT_FILE"
-  GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
-    '<!-- blueprint:local-gate -->' \
-    '### Local publication gate' \
-    "- Status: $status" \
-    "- Command: $GATE_COMMAND" \
-    "- Deadlines: soft \${GATE_TIMEOUT_SECONDS}s; hard \${GATE_HARD_TIMEOUT_SECONDS}s (absolute ceiling 1800s)" \
-    "- Elapsed: \${GATE_ELAPSED_SECONDS}s; soft deadline extended: $GATE_DEADLINE_EXTENDED" \
-    "- Exit code: $exit_code; authoritative CI required: $fallback" \
-    '<!-- /blueprint:local-gate -->')
+  SUPPRESSED_BASELINE_SECTION=""
+  case "$status" in
+    passed*) SUPPRESSED_BASELINE_SECTION=$(render_suppressed_baseline_section "$_VERIFY_RECEIPT") ;;
+  esac
+  if [ -n "$SUPPRESSED_BASELINE_SECTION" ]; then
+    GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+      '<!-- blueprint:local-gate -->' \
+      '### Local publication gate' \
+      "- Status: $status" \
+      "- Command: $GATE_COMMAND" \
+      "- Deadlines: soft \${GATE_TIMEOUT_SECONDS}s; hard \${GATE_HARD_TIMEOUT_SECONDS}s (absolute ceiling 1800s)" \
+      "- Elapsed: \${GATE_ELAPSED_SECONDS}s; soft deadline extended: $GATE_DEADLINE_EXTENDED" \
+      "- Exit code: $exit_code; authoritative CI required: $fallback" \
+      "$SUPPRESSED_BASELINE_SECTION" \
+      '<!-- /blueprint:local-gate -->')
+  else
+    GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+      '<!-- blueprint:local-gate -->' \
+      '### Local publication gate' \
+      "- Status: $status" \
+      "- Command: $GATE_COMMAND" \
+      "- Deadlines: soft \${GATE_TIMEOUT_SECONDS}s; hard \${GATE_HARD_TIMEOUT_SECONDS}s (absolute ceiling 1800s)" \
+      "- Elapsed: \${GATE_ELAPSED_SECONDS}s; soft deadline extended: $GATE_DEADLINE_EXTENDED" \
+      "- Exit code: $exit_code; authoritative CI required: $fallback" \
+      '<!-- /blueprint:local-gate -->')
+  fi
 }
 
 # A blocked gate normally exits before any PR body exists, so the bounded
@@ -300,7 +334,7 @@ write_gate_receipt() {
 record_gate_receipt() {
   local gate_status="$1"
   local api="\${ORCHESTRATOR_URL:-}"
-  local receipt_json payload http
+  local receipt_json payload http status_message
   if [ -z "$api" ]; then
     echo "[pr] Warning: cannot persist local-gate receipt — ORCHESTRATOR_URL is unset" >&2
     return 1
@@ -314,9 +348,13 @@ record_gate_receipt() {
     echo "[pr] Warning: cannot persist local-gate receipt — receipt file is empty" >&2
     return 1
   fi
+  case "$gate_status" in
+    passed*) status_message="local publication gate passed ($gate_status)" ;;
+    *) status_message="local publication gate blocked with status $gate_status" ;;
+  esac
   payload=$(printf '{"task_id":%s,"status_message":%s,"publication_gate_receipt":%s}' \\
     "$(_json_str "${cfg.taskId}")" \\
-    "$(_json_str "local publication gate blocked with status $gate_status")" \\
+    "$(_json_str "$status_message")" \\
     "$receipt_json")
   for attempt in 1 2 3; do
     http=$(printf '%s' "$payload" | curl -sS -o /tmp/pr_gate_receipt_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
@@ -425,6 +463,11 @@ else
     exit 1
   fi
 fi
+# Success is a verdict too.  Failure paths have always persisted through the
+# heartbeat channel, but a passing rerun previously existed only in the local
+# file/PR body.  That left the task's authoritative current receipt red even
+# after publication and merge.
+record_gate_receipt "\${GATE_RECEIPT_STATUS:-passed}" || true
 # Persist the gate result in the PR body; retries replace a stale receipt.
 BODY=$(printf '%s' "$BODY" | sed '/<!-- blueprint:local-gate -->/,/<!-- \\/blueprint:local-gate -->/d')
 BODY=$(printf '%s\n\n%s' "$BODY" "$GATE_SECTION")
@@ -582,23 +625,53 @@ TASK_ID="${cfg.taskId}"
 #    .git/config until the next refresh scrubs it. The origin URL stays clean
 #    (https://github.com/owner/repo.git); the helper supplies credentials.
 
-# 4. Push (with retry — concurrent-push handling)
+# 4. Push with an immutable, explicit compare-and-swap lease.  Refreshing the
+# remote-tracking ref after a stale-lease failure silently accepts a competing
+# writer as the new lease authority; a later retry can then overwrite that
+# writer.  Snapshot the exact remote SHA once, reconcile a lost response only
+# when remote == our HEAD, and otherwise fail closed on any competing advance.
+_PR_REMOTE_REF="refs/heads/${cfg.workBranch}"
+_PR_EXPECTED_QUERY=$(git ls-remote --heads origin "$_PR_REMOTE_REF" 2>/tmp/pr_ls_remote.log)
+_PR_EXPECTED_QUERY_STATUS=$?
+if [ "$_PR_EXPECTED_QUERY_STATUS" -ne 0 ]; then
+  echo "[pr] cannot establish the exact remote branch lease:" >&2
+  sed 's/^/[pr]   /' /tmp/pr_ls_remote.log >&2 2>/dev/null || true
+  exit 1
+fi
+_PR_EXPECTED_REMOTE_SHA=$(printf '%s\n' "$_PR_EXPECTED_QUERY" | awk 'NR == 1 {print $1}')
+_PR_LEASE="--force-with-lease=$_PR_REMOTE_REF:$_PR_EXPECTED_REMOTE_SHA"
 PUSH_OK=0
 for attempt in 1 2 3; do
-  if git push --force-with-lease origin "${cfg.workBranch}" 2>/tmp/pr_push.log; then
+  if git push "$_PR_LEASE" origin "HEAD:$_PR_REMOTE_REF" 2>/tmp/pr_push.log; then
     PUSH_OK=1
     break
   fi
   if classify_push_error "$(cat /tmp/pr_push.log)"; then
     exit 1
   fi
-  if grep -q 'stale info' /tmp/pr_push.log; then
-    echo "[pr] push attempt $attempt: stale lease, fetching + retrying..."
-    git fetch origin "${cfg.workBranch}" 2>/dev/null || true
-    sleep 2
-  else
-    echo "[pr] push attempt $attempt failed:"; cat /tmp/pr_push.log; sleep 2
+  _PR_LOCAL_HEAD=$(git rev-parse HEAD 2>/dev/null || true)
+  _PR_OBSERVED_QUERY=$(git ls-remote --heads origin "$_PR_REMOTE_REF" 2>/tmp/pr_ls_remote.log)
+  _PR_OBSERVED_QUERY_STATUS=$?
+  if [ "$_PR_OBSERVED_QUERY_STATUS" -ne 0 ]; then
+    echo "[pr] push failed and the remote state cannot be reconciled; refusing a blind retry:" >&2
+    cat /tmp/pr_push.log >&2
+    exit 1
   fi
+  _PR_OBSERVED_REMOTE_SHA=$(printf '%s\n' "$_PR_OBSERVED_QUERY" | awk 'NR == 1 {print $1}')
+  if [ -n "$_PR_LOCAL_HEAD" ] && [ "$_PR_OBSERVED_REMOTE_SHA" = "$_PR_LOCAL_HEAD" ]; then
+    echo "[pr] push response was lost, but the exact remote ref equals local HEAD — reconciled."
+    PUSH_OK=1
+    break
+  fi
+  if [ "$_PR_OBSERVED_REMOTE_SHA" != "$_PR_EXPECTED_REMOTE_SHA" ]; then
+    echo "[pr] remote branch advanced to a competing SHA; refusing to overwrite it." >&2
+    echo "[pr] expected: \${_PR_EXPECTED_REMOTE_SHA:-<absent>}" >&2
+    echo "[pr] observed: \${_PR_OBSERVED_REMOTE_SHA:-<absent>}" >&2
+    exit 1
+  fi
+  echo "[pr] push attempt $attempt failed without a remote advance; retrying the original exact lease:"
+  cat /tmp/pr_push.log
+  sleep 2
 done
 if [ "$PUSH_OK" = "0" ]; then
   echo "[pr] push failed after 3 attempts" >&2

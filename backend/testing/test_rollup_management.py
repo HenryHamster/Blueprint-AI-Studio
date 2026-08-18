@@ -121,6 +121,11 @@ def _mock_automerge_deps(mocker, *, pr_files, merge_merged=True):
             },
         },
     )
+    mocker.patch(
+        "app.ci_merge_helpers._merge_commit_parent_matches_checked_base",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
     mock_merge = mocker.patch(
         "app.github.merge_pull_request",
         new_callable=AsyncMock,
@@ -634,7 +639,6 @@ async def test_rollup_auto_merges_for_custom_staging_prefix(cleanup_db, mocker):
             },
         },
     )
-
     from app.rollup_management import _check_and_trigger_rollup
 
     project = await _make_project(cleanup_db)
@@ -1652,6 +1656,46 @@ async def _make_distinct_branch_project(session):
     return project
 
 
+async def _execute_exact_operator_approval(
+    task,
+    session,
+    *,
+    pr_number: int,
+    base_branch: str,
+    head_sha: str,
+    base_sha: str,
+):
+    """Exercise the durable public approval decision/follow-up boundary."""
+
+    from app.admin_approval_authority import decide_operator_approval
+    from app.admin_task_approvals import execute_approval_followup
+
+    context = dict(task.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    review_loop.update(
+        {
+            "pr_number": pr_number,
+            "base_branch": base_branch,
+            "ci_checked_head_sha": head_sha,
+            "ci_checked_base_sha": base_sha,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+        }
+    )
+    context["review_loop"] = review_loop
+    task.context = context
+    task.requires_approval = True
+    session.add(task)
+    await session.commit()
+    _, decision, _ = await decide_operator_approval(
+        task.id,
+        False,
+        session,
+        modified_by="TEST",
+    )
+    return await execute_approval_followup(decision, session)
+
+
 @pytest.mark.asyncio
 async def test_rollup_targeting_promotion_target_is_held_not_merged(cleanup_db, mocker):
     """A completed rollup whose target == promotion (distinct from integration)
@@ -1795,7 +1839,6 @@ def test_promotion_target_merge_allowed_gate():
 async def test_admin_task_merge_to_promotion_target_returns_409(cleanup_db):
     """Approving a task merge whose base == promotion (distinct from integration)
     returns 409 and leaves the task requires_approval=True without merging."""
-    from app.admin_task_mutations import _handle_task_pr_approval
     from app.models import Artifact, ArtifactType
 
     project = await _make_distinct_branch_project(cleanup_db)
@@ -1820,8 +1863,13 @@ async def test_admin_task_merge_to_promotion_target_returns_409(cleanup_db):
     await cleanup_db.commit()
 
     with pytest.raises(HTTPException) as exc_info:
-        await _handle_task_pr_approval(
-            task, task.context or {}, task.first_payload, cleanup_db, {}
+        await _execute_exact_operator_approval(
+            task,
+            cleanup_db,
+            pr_number=4242,
+            base_branch="main",
+            head_sha="promotion-head-4242",
+            base_sha="promotion-base-4242",
         )
 
     assert exc_info.value.status_code == 409
@@ -1840,8 +1888,6 @@ async def test_admin_rollup_merge_to_promotion_target_proceeds_unqualified(
     lands but stays unqualified: pr_merged is left unset and the out-of-band
     promotion-target alert is raised. The autonomous rollup path still holds such
     landings for approval first; this handler IS that approval."""
-    from app.admin_task_mutations import _handle_rollup_pr_approval
-
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1861,9 +1907,21 @@ async def test_admin_rollup_merge_to_promotion_target_proceeds_unqualified(
     mock_merge = mocker.patch(
         "app.github.merge_pull_request",
         new_callable=AsyncMock,
-        return_value={"merged": True, "message": "ok"},
+        return_value={"merged": True, "message": "ok", "sha": "merge-4242"},
+    )
+    mocker.patch(
+        "app.ci_merge_helpers._merge_commit_parent_matches_checked_base",
+        new_callable=AsyncMock,
+        return_value=True,
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_issue_comments", new_callable=AsyncMock, return_value=[]
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
     # The pre-merge Alembic dual-head guard lists the PR's files; this rollup
     # touches no migrations, so an empty list yields an "ok" verdict and the
@@ -1882,15 +1940,21 @@ async def test_admin_rollup_merge_to_promotion_target_proceeds_unqualified(
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"rollup_pr_number": 4242},
-        payloads=[{"type": "research", "base_branch": "main"}],
+        payloads=[
+            {"type": "research", "branch": "rollup/4242", "base_branch": "main"}
+        ],
     )
     task.requires_approval = True
     cleanup_db.add(task)
     await cleanup_db.commit()
 
-    changes: dict = {}
-    await _handle_rollup_pr_approval(
-        task, task.context or {}, 4242, cleanup_db, changes
+    task, changes = await _execute_exact_operator_approval(
+        task,
+        cleanup_db,
+        pr_number=4242,
+        base_branch="main",
+        head_sha="approved-head-4242",
+        base_sha="approved-base-4242",
     )
 
     mock_merge.assert_awaited_once()
@@ -1904,8 +1968,6 @@ async def test_admin_rollup_merge_to_promotion_target_proceeds_unqualified(
 async def test_admin_rollup_hotfix_to_promotion_target_merges(cleanup_db, mocker):
     """A hotfix-marked approved rollup IS allowed to merge to the promotion
     target (positive branch of the hotfix exemption)."""
-    from app.admin_task_mutations import _handle_rollup_pr_approval
-
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1914,9 +1976,21 @@ async def test_admin_rollup_hotfix_to_promotion_target_merges(cleanup_db, mocker
     mock_merge = mocker.patch(
         "app.github.merge_pull_request",
         new_callable=AsyncMock,
-        return_value={"merged": True, "message": "ok"},
+        return_value={"merged": True, "message": "ok", "sha": "merge-hotfix"},
+    )
+    mocker.patch(
+        "app.ci_merge_helpers._merge_commit_parent_matches_checked_base",
+        new_callable=AsyncMock,
+        return_value=True,
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_issue_comments", new_callable=AsyncMock, return_value=[]
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
     # See sibling test: empty PR-file list → "ok" Alembic guard verdict so the
     # hotfix merge proceeds instead of hitting the fail-safe "defer" refusal.
@@ -1947,12 +2021,22 @@ async def test_admin_rollup_hotfix_to_promotion_target_merges(cleanup_db, mocker
         task_type="research",
         status=TaskStatus.EVALUATING,
         context={"rollup_pr_number": 4242},
-        payloads=[{"type": "research", "base_branch": "main", "hotfix": True}],
+        payloads=[
+            {
+                "type": "research",
+                "branch": "hotfix/approved-rollup",
+                "base_branch": "main",
+                "hotfix": True,
+            }
+        ],
     )
-    changes: dict = {}
-
-    await _handle_rollup_pr_approval(
-        task, task.context or {}, 4242, cleanup_db, changes
+    task, changes = await _execute_exact_operator_approval(
+        task,
+        cleanup_db,
+        pr_number=4242,
+        base_branch="main",
+        head_sha="hotfix-head",
+        base_sha="base-sha",
     )
 
     mock_merge.assert_awaited_once()

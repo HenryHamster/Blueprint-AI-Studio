@@ -638,11 +638,10 @@ ${buildViewportUploadBlock(cfg.taskId)}      fi
   # Typecheck on agent VM; vite bundle OOMs here and is CI's job.
   run "admin-ui typecheck" bash -c 'cd admin-ui && npm run typecheck 2>&1'
 
-  # Run the admin-ui unit vitest suite on EVERY ./check (not gated behind \`test\`):
-  # mirrors the agent-vitest rationale — ./pr open gates on plain ./check, so
-  # behind-\`test\` leaves the suite unenforced. Bare \`npx vitest run\` picks up
-  # the default vitest config (happy-dom, no Chromium) matching CI's unit shards.
-  run "admin-ui vitest" bash -c 'set -o pipefail; cd admin-ui && npx vitest run 2>&1 | tail -80'
+  # Run the admin-ui unit suite on EVERY ./check. The guard compares its JUnit
+  # identities with an isolated base checkout, so only confirmed inherited
+  # failures warn-pass; unavailable attribution remains fail-closed.
+  run "admin-ui vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
 fi
 
 if touches agent/; then
@@ -670,14 +669,9 @@ if touches agent/; then
     fi
   fi
 
-  # Run the agent vitest suite on EVERY ./check (not gated behind \`test\`):
-  # \`./pr open\` gates on plain \`./check\`, so behind-\`test\` would leave the
-  # suite unenforced by the PR gate — the exact silent-rot this guards against.
-  # The suite is deterministic and ~40s. \`set -o pipefail\` makes the inner
-  # bash propagate vitest's non-zero exit through the \`| tail\` (the outer
-  # script's pipefail does not reach a fresh \`bash -c\`), so \`run\` records a
-  # real failure in FAILED and ./check fails closed.
-  run "agent vitest" bash -c 'set -o pipefail; cd agent && npx vitest run 2>&1 | tail -80'
+  # This stays always-on because ./pr open gates on plain ./check. The shared
+  # guard has the same fail-closed, base-attributed contract as admin-ui.
+  run "agent vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite agent --base "$BASE" --repo-root "$WORKSPACE"
 fi
 
 if touches backend/; then
@@ -711,54 +705,12 @@ if touches backend/; then
     # admin-auth, metric-manifest + emitter-inventory contracts) which
     # catches file-size breaches, security regressions, and basic pipeline
     # and contract assertions — the rest is CI's job.
-    # Baseline-recheck: if the standalone suite fails, re-run it on the
-    # base branch to distinguish pre-existing failures (WARN, not blocking)
-    # from regressions introduced by this PR (real failure, blocking).
-    # Mirrors the viewport and eslint baseline-recheck pattern exactly.
-    echo "[check] backend pytest..."
-    BPYTEST_PR_LOG=/tmp/check_backend_pytest_pr.log
-    if ( set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200 ) > "$BPYTEST_PR_LOG" 2>&1; then
-      tail -20 "$BPYTEST_PR_LOG"
-      echo "[check] backend pytest OK"
-    else
-      echo "[check] backend pytest FAILED on PR — checking baseline on origin/$BASE..."
-      BPYTEST_BASELINE_FAILED=0
-      BPYTEST_BASELINE_REASON=""
-      BPYTEST_BASE_REF="origin/$BASE"
-      if ! git rev-parse --verify "$BPYTEST_BASE_REF" >/dev/null 2>&1; then
-        BPYTEST_BASE_REF="$BASE"
-        git rev-parse --verify "$BPYTEST_BASE_REF" >/dev/null 2>&1 || BPYTEST_BASELINE_REASON="base ref unavailable"
-      fi
-      if [ -z "$BPYTEST_BASELINE_REASON" ]; then
-        BPYTEST_WT=/tmp/check_backend_pytest_baseline_wt
-        # Stale worktree from a prior run can wedge \`worktree add\`.
-        # \`worktree remove --force\` is the safe cleanup (no rm -rf).
-        git worktree remove --force "$BPYTEST_WT" >/dev/null 2>&1 || true
-        if ! git worktree add --detach "$BPYTEST_WT" "$BPYTEST_BASE_REF" >/tmp/check_backend_pytest_wt.log 2>&1; then
-          BPYTEST_BASELINE_REASON="worktree add failed (see /tmp/check_backend_pytest_wt.log)"
-        else
-          BPYTEST_MAIN_LOG=/tmp/check_backend_pytest_main.log
-          if ( set -o pipefail; cd "$BPYTEST_WT" && bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200 ) > "$BPYTEST_MAIN_LOG" 2>&1; then
-            BPYTEST_BASELINE_FAILED=0
-          else
-            BPYTEST_BASELINE_FAILED=1
-          fi
-          git worktree remove --force "$BPYTEST_WT" >/dev/null 2>&1 || true
-        fi
-      fi
-      if [ "$BPYTEST_BASELINE_FAILED" = "1" ]; then
-        echo "[check] backend pytest WARN — also broken on $BPYTEST_BASE_REF; not blocking PR"
-        echo "[check] PR-side tail:"
-        tail -30 "$BPYTEST_PR_LOG" || true
-        echo "[check] Baseline-side tail:"
-        tail -30 "$BPYTEST_MAIN_LOG" || true
-      else
-        echo "[check] backend pytest FAILED — passes on $BPYTEST_BASE_REF, fails on PR. Real regression."
-        [ -n "$BPYTEST_BASELINE_REASON" ] && echo "[check] (baseline check skipped: $BPYTEST_BASELINE_REASON — treating PR failure as real)"
-        tail -100 "$BPYTEST_PR_LOG" || true
-        FAILED+=("backend pytest")
-      fi
-    fi
+    # The shared static guard runs the same corpus on the task and base trees,
+    # then attributes failures by structured route/test/failure-kind identity.
+    # It must remain the single baseline decision point: a non-zero base run
+    # does not waive unrelated failures introduced by this task.
+    run "backend pytest (attributed)" python3 scripts/static_release_guard.py \
+      --corpus-only --base "$BASE" --repo-root "$WORKSPACE"
 ${buildImpactedTestBlock(cfg.taskId)}  fi
   # Fast migration-chain guard: no DB, no Docker, sub-second. Runs only
   # when at least one alembic/versions/ file was added or changed.

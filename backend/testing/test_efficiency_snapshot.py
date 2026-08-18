@@ -993,6 +993,50 @@ async def test_maybe_write_daily_snapshot_fires_when_due(db_session):
 
 
 @pytest.mark.asyncio
+async def test_maybe_write_daily_snapshot_records_cadence_after_strategic_cycle(
+    db_session,
+):
+    """A strategic cycle must not make the daily writer fail before its marker."""
+    now = _utcnow()
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.COMPLETED,
+            strategic_cycle_id="cycle-daily-writer-test",
+            created_at=now - timedelta(minutes=2),
+            started_at=now - timedelta(minutes=1),
+            completed_at=now,
+            updated_at=now,
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 100,
+                "llm_call_count": 1,
+            },
+        )
+    )
+    await db_session.commit()
+
+    written = await maybe_write_daily_snapshot(db_session, project.id, now=now)
+    assert written is not None
+    assert written["llm_cost_attribution"]["strategic_cycle_cost_per_event"][
+        "by_cycle"
+    ][0]["cycle_id"] == "cycle-daily-writer-test"
+
+    await db_session.commit()
+    await db_session.refresh(project)
+    container = await _require_container(db_session, project)
+    assert container["last_run_at"] == written["captured_at"]
+
+
+@pytest.mark.asyncio
 async def test_efficiency_snapshot_service_only_starts_on_leader():
     """The snapshot service is wired only into the leader-elected path.
 

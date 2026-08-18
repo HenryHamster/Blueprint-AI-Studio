@@ -183,6 +183,25 @@ def test_list_projects_scoped_credential_follows_bounded_pages(monkeypatch):
     ]
 
 
+def test_projects_renderer_prefers_operational_state_over_legacy_status(capsys):
+    blueprint._render_projects(
+        {
+            "projects": [
+                {
+                    "id": "project-1",
+                    "name": "Blueprint",
+                    "status": "DEPLOYING",
+                    "operational_state": "active",
+                }
+            ]
+        }
+    )
+
+    out = capsys.readouterr().out
+    assert "Blueprint · active" in out
+    assert "DEPLOYING" not in out
+
+
 def test_strategic_chat_sends_required_idempotency_key(monkeypatch):
     """Interactive Strategic sends satisfy the durable message contract."""
     requests = []
@@ -351,8 +370,8 @@ def test_load_config_missing_raises_library_error(monkeypatch, tmp_path, capsys)
     assert "no Blueprint API config found" in capsys.readouterr().err
 
 
-def test_check_test_delegates_to_standalone_harness():
-    """The tracked developer fallback keeps ./check test's standalone gate."""
+def test_check_test_delegates_to_attributed_static_release_guard():
+    """The developer fallback runs the attributed static guard for ./check test."""
     check_path = os.path.join(REPO_ROOT, "check")
     with open(check_path) as f:
         wrapper = f.read()
@@ -360,9 +379,14 @@ def test_check_test_delegates_to_standalone_harness():
     default_path = os.path.join(REPO_ROOT, "scripts", "check-default.sh")
     with open(default_path) as f:
         default_gate = f.read()
-    assert "scripts/test-backend.sh" in default_gate
-    assert "--standalone" in default_gate
-    assert "--no-postgres" in default_gate
+    assert 'if [ "$WITH_TESTS" = "1" ]; then' in default_gate
+    assert (
+        'run "static release guards (task diff)" python3 '
+        'scripts/static_release_guard.py --base "$BASE" --repo-root "$PWD"'
+        in default_gate
+    )
+    assert "static release guard helper is missing — refusing to skip the gate" in default_gate
+    assert "bash scripts/test-backend.sh --standalone --no-postgres" not in default_gate
 
 
 def test_blueprint_wrapper_shell_syntax():
@@ -3483,6 +3507,27 @@ def test_health_group(monkeypatch, capsys):
     assert "Add widget feature" in out
 
 
+def test_health_deploy_renders_cross_process_orchestrator_heartbeat(capsys):
+    blueprint._render_health_deploy(
+        {
+            "status": "STABLE",
+            "external_health": {},
+            "orchestrator": {
+                "status": "ok",
+                "authority": "background_leader_advisory_lock",
+                "heartbeat_age_seconds": 4.0,
+                "stale_after_seconds": 90.0,
+                "cycle_age_seconds": None,
+            },
+        }
+    )
+
+    out = capsys.readouterr().out
+    assert "Authority: background_leader_advisory_lock" in out
+    assert "Last heartbeat: 4s ago" in out
+    assert "loop has not completed" not in out
+
+
 def test_health_alerts_dismiss_read_only_refused(monkeypatch, capsys):
     """health alerts --dismiss refuses under read-only config."""
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
@@ -6158,9 +6203,28 @@ _DEPLOY_REV = "c" * 40
 _DEPLOY_PROMOTED_SHA = "a" * 40
 
 
-def _deploy_gh_fake(revision: str = _DEPLOY_REV, compare_status: str = "ahead"):
+def _deploy_gh_fake(
+    revision: str = _DEPLOY_REV,
+    compare_status: str = "ahead",
+    *,
+    main_status: str = "identical",
+):
     """Fake blueprint._gh serving a successful run list, a manifest download,
-    and a GitHub compare result."""
+    and GitHub compare results.
+
+    Two distinct ``gh api .../compare/...`` calls happen during a deploy, and
+    they encode different git relationships:
+
+    - ``compare/{promoted_sha}...{revision}`` — the descendant-of-promoted
+      binding check. ``compare_status`` answers this one; "ahead" (revision
+      contains the promoted commit plus more) is the common legitimate case.
+    - ``compare/main...{revision}`` — the main-reachability guard added by
+      _validate_main_reachability. ``main_status`` answers this one, and its
+      pass values ("identical"/"behind") differ from the binding check's
+      ("identical"/"ahead") — conflating the two here previously made every
+      normal "ahead of promoted" deploy also look "ahead of main" and get
+      refused by the reachability guard.
+    """
 
     def fake_gh(*args):
         if args[:2] == ("run", "list"):
@@ -6186,6 +6250,9 @@ def _deploy_gh_fake(revision: str = _DEPLOY_REV, compare_status: str = "ahead"):
                 fh.write(hashlib.sha256(body.encode()).hexdigest())
             return ""
         if args[0] == "api":
+            path = args[1] if len(args) > 1 else ""
+            if f"compare/main...{revision}" in path:
+                return json.dumps({"status": main_status})
             return json.dumps({"status": compare_status})
         raise AssertionError(f"unexpected gh call: {args}")
 
@@ -6311,10 +6378,21 @@ def _deploy_api_fake(calls, *, promoted=None, post_failure=None):
     return fake_api
 
 
-def _deploy_env(monkeypatch, api_fake, *, revision=_DEPLOY_REV, compare_status="ahead"):
+def _deploy_env(
+    monkeypatch,
+    api_fake,
+    *,
+    revision=_DEPLOY_REV,
+    compare_status="ahead",
+    main_status="identical",
+):
     """Common deploy test scaffolding: config, project id, gh, api, ssh, input."""
     calls = []
-    monkeypatch.setattr(blueprint, "_gh", _deploy_gh_fake(revision, compare_status))
+    monkeypatch.setattr(
+        blueprint,
+        "_gh",
+        _deploy_gh_fake(revision, compare_status, main_status=main_status),
+    )
     monkeypatch.setattr(blueprint, "api", api_fake)
     monkeypatch.setattr(blueprint_api, "api", api_fake)
     monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
@@ -6774,16 +6852,42 @@ def test_deploy_force_remains_unbound_without_promoted_version(monkeypatch):
 
     _deploy_env(monkeypatch, fake_api)
     shim_calls = []
-    monkeypatch.setattr(
-        blueprint.subprocess,
-        "run",
-        lambda command, **kwargs: shim_calls.append(command)
-        or type("R", (), {"returncode": 0})(),
-    )
+
+    def record_run(command, **kwargs):
+        shim_calls.append((command, kwargs))
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(blueprint.subprocess, "run", record_run)
 
     assert blueprint.main(["deploy", "--host", "hamsterwheel", "--yes", "--force"]) == 0
-    assert shim_calls[0][:3] == ["ssh", "-t", "hamsterwheel"]
+    command, kwargs = shim_calls[0]
+    # No sudoers grant exists on the host: the remote activation must pipe the
+    # repo's socket client to python3, never invoke sudo or the shim path.
+    assert command[:4] == ["ssh", "hamsterwheel", "python3", "-"]
+    assert "sudo" not in command
+    assert kwargs["stdin"].name.endswith("release_socket_submit.py")
     assert not any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
+
+
+def test_invoke_release_shim_remote_exit_codes(monkeypatch, capsys):
+    """The remote socket client's exit codes map to the shim contract:
+    0 = completed, 3 = accepted-but-unverified (parked, no receipt), else error."""
+    digest = "sha256:" + "a" * 64
+    revision = "b" * 40
+
+    def run_with(code):
+        return lambda command, **kwargs: type("R", (), {"returncode": code})()
+
+    monkeypatch.setattr(blueprint.subprocess, "run", run_with(0))
+    assert blueprint._invoke_release_shim(digest, revision, host="h") is True
+
+    monkeypatch.setattr(blueprint.subprocess, "run", run_with(3))
+    assert blueprint._invoke_release_shim(digest, revision, host="h") is False
+    assert "verdict was not observed" in capsys.readouterr().err
+
+    monkeypatch.setattr(blueprint.subprocess, "run", run_with(2))
+    with pytest.raises(blueprint_api.APIError):
+        blueprint._invoke_release_shim(digest, revision, host="h")
 
 
 def test_deploy_refuses_non_descendant_without_force(monkeypatch, capsys):
@@ -6796,6 +6900,41 @@ def test_deploy_refuses_non_descendant_without_force(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "is behind the promoted SHA" in out
     assert not any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
+
+
+def test_deploy_refuses_revision_not_reachable_from_main_without_force(monkeypatch, capsys):
+    """deploy refuses a build whose revision is not reachable from main — the
+    2026-08-17 fleet outage: a PR branch tip descendant of the promoted SHA
+    passed the binding check above but was never on main, so runner
+    auto-update could never satisfy the served-version hint."""
+    calls = []
+    api_fake = _deploy_api_fake(calls)
+    _deploy_env(monkeypatch, api_fake, main_status="ahead")
+    rc = blueprint.main(["deploy", "--host", "hamsterwheel", "--yes"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "not reachable from main" in out
+    assert not any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
+
+
+def test_deploy_force_downgrades_main_reachability_to_warning(monkeypatch, capsys):
+    """--force still activates a main-unreachable revision, but only as a loud
+    warning, not silently — the fleet is left to drain until the next
+    main-reachable deploy."""
+    calls = []
+    api_fake = _deploy_api_fake(calls)
+    _deploy_env(monkeypatch, api_fake, main_status="diverged")
+
+    def record_run(command, **kwargs):
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(blueprint.subprocess, "run", record_run)
+    rc = blueprint.main(["deploy", "--host", "hamsterwheel", "--yes", "--force"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "NOT reachable from main" in out
+    assert any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
 
 
 def test_deploy_dry_run_does_not_ssh_or_post_receipt(monkeypatch, capsys):

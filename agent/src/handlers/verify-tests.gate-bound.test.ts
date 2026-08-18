@@ -1,4 +1,6 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 // Proves the durable no-CI verify-gate safety net:
 //  (1) a runaway/SIGTERM full-suite run (loop.timedOut) degrades to a
@@ -56,12 +58,18 @@ vi.mock('../utils/test-fix-loop.js', async (importOriginal) => {
 
 // existsSync answers true ONLY for the committed impacted-test resolver, so
 // impactedResolverAvailable() is realistic (a Blueprint repo carries it).
-vi.mock('fs', () => ({
-  default: {
-    writeFileSync: vi.fn(),
-    existsSync: vi.fn((p: unknown) => typeof p === 'string' && p.endsWith('backend/testing/impacted_tests.py')),
-  },
-}));
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  const actualDefault = (actual as typeof actual & { default?: typeof actual }).default ?? actual;
+  return {
+    ...actual,
+    default: {
+      ...actualDefault,
+      writeFileSync: vi.fn(),
+      existsSync: vi.fn((p: unknown) => typeof p === 'string' && p.endsWith('backend/testing/impacted_tests.py')),
+    },
+  };
+});
 
 import { handleVerifyTests } from './verify-tests.js';
 import { persistAndPostStatus, execFileAsync } from '../index.js';
@@ -160,5 +168,19 @@ describe('handleVerifyTests — bounded/fall-open safety net', () => {
     expect(verdict.detected).toBe(false);
     expect(verdict.passed).toBe(false);
     expect(verdict.setupFailed).toBeUndefined();
+  });
+
+  it('(3) the publication backend lane records route-keyed baseline attribution', () => {
+    const verifier = readFileSync(
+      fileURLToPath(new URL('../prompts/check_backend_verification.sh', import.meta.url)),
+      'utf8',
+    );
+
+    // The production lane must attribute both successful and failed JUnit runs
+    // through the shared route-aware guard; a rendered traceback comparison is
+    // not an acceptable substitute for these structured fields.
+    expect(verifier).toContain('--current-exit-code "$_verification_exit"');
+    expect(verifier).toContain('"suppressed_failures":d.get("suppressed_failures",{})');
+    expect(verifier).toContain('"disappeared_failures":d.get("disappeared_failures",{})');
   });
 });

@@ -28,7 +28,14 @@ from app.capability_registry import (
     registry_capability_evidence_refs_map,
     registry_capability_vocabulary,
 )
-from app.discovery_admission import direction_authority_snapshot
+from app.discovery_admission import (
+    POLICY_BLOCKING_DISCOVERY_VERDICTS,
+    direction_authority_matches,
+    direction_authority_snapshot,
+)
+from app.discovery_authority_reconciliation import (
+    reconcile_stalled_direction_authority as _reconcile_stalled_direction_authority,
+)
 from app.discovery_review_packet import (
     DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS as _DECISION_SNAPSHOT_CHARS,
     DISCOVERY_REVIEW_MAX_PACKET_ITEMS as _MAX_PACKET_ITEMS,
@@ -38,6 +45,7 @@ from app.discovery_review_packet import (
     build_discovery_review_packet as _build_review_packet,
 )
 from app.direction_priority import direction_task_priority
+from app.findings_index import FINALIZED_RESEARCH_FINDINGS_KEY
 from app.models import (
     DiscoveryCycle,
     Project,
@@ -54,6 +62,11 @@ from app.research_deferred_carry import (
 )
 from app.research_finding_policy import NON_SPAWNING_FINDING_TYPES
 from app.shared_state import runtime_config as _runtime_config
+from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    AUTOMATIC_TASK_CREATION_PROJECT_PAUSED,
+    acquire_automatic_task_creation_authority,
+)
 from app.time_utils import _utcnow
 
 
@@ -85,7 +98,7 @@ _SOURCE_TERMINAL_STATUSES = frozenset(
 _SPAWNABLE_CYCLE_STATES = frozenset(
     {"open", "admission_closed", "review_pending"}
 )
-_SWEEPABLE_CYCLE_STATES = _SPAWNABLE_CYCLE_STATES | {"reviewing"}
+_SWEEPABLE_CYCLE_STATES = _SPAWNABLE_CYCLE_STATES | {"reviewing", "review_blocked"}
 _VALID_ACTIONS = frozenset({"advance", "park", "stop", "ask_operator"})
 _VALID_NEXT_BET_MODES = frozenset({"research", "measure", "build"})
 _LEGACY_REVIEW_PAYLOAD_KEYS = frozenset(
@@ -147,9 +160,7 @@ def _validate_frozen_direction_authority(
         raise DiscoveryReviewResultError(
             f"direction authority snapshot is missing before {action}"
         )
-    frozen_authority = direction_authority_snapshot(frozen)
-    current = direction_authority_snapshot(direction)
-    if _checksum(frozen_authority) != _checksum(current):
+    if direction_authority_matches(frozen, direction) is not True:
         raise DiscoveryReviewResultError(
             f"direction authority changed before {action}"
         )
@@ -423,10 +434,12 @@ async def _cycle_is_quiescent(
         return False, "source_research_task_missing"
     source = (
         await session.execute(
-            select(Task).where(
+            select(Task)
+            .where(
                 Task.id == cycle.source_research_task_id,
                 Task.project_id == cycle.project_id,
             )
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if source is None:
@@ -435,6 +448,11 @@ async def _cycle_is_quiescent(
         return False, "source_research_task_missing"
     if source.status not in _SOURCE_TERMINAL_STATUSES:
         return False, "source_research_task_active"
+    if (
+        source.status == TaskStatus.COMPLETED
+        and (source.context or {}).get(FINALIZED_RESEARCH_FINDINGS_KEY) is not True
+    ):
+        return False, "source_research_findings_pending"
     if source.post_commit_pending:
         return False, "source_research_post_commit_pending"
     active = (
@@ -830,10 +848,38 @@ async def maybe_close_and_spawn_discovery_review(
     parsed_cycle_id = (
         cycle_id if isinstance(cycle_id, uuid.UUID) else uuid.UUID(str(cycle_id))
     )
+    # Resolve the parent project without a child lock, then take the universal
+    # automatic-task admission lock before locking/mutating the DiscoveryCycle.
+    # This preserves Project -> child order and makes pause linearizable with
+    # the decision-task INSERT below.
+    cycle_project_id = (
+        await session.execute(
+            select(DiscoveryCycle.project_id).where(
+                DiscoveryCycle.id == parsed_cycle_id
+            )
+        )
+    ).scalar_one_or_none()
+    if cycle_project_id is None:
+        return DiscoveryReviewSpawnResult(
+            parsed_cycle_id, None, False, False, "cycle_missing"
+        )
+    admission = await acquire_automatic_task_creation_authority(
+        session, cycle_project_id, skip_locked=True
+    )
+    if admission not in {
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        AUTOMATIC_TASK_CREATION_PROJECT_PAUSED,
+    }:
+        return DiscoveryReviewSpawnResult(
+            parsed_cycle_id, None, False, False, admission
+        )
     cycle = (
         await session.execute(
             select(DiscoveryCycle)
-            .where(DiscoveryCycle.id == parsed_cycle_id)
+            .where(
+                DiscoveryCycle.id == parsed_cycle_id,
+                DiscoveryCycle.project_id == cycle_project_id,
+            )
             .with_for_update()
         )
     ).scalar_one_or_none()
@@ -842,6 +888,25 @@ async def maybe_close_and_spawn_discovery_review(
             parsed_cycle_id, None, False, False, "cycle_missing"
         )
     now = now or _utcnow()
+    authority_reconciliation = await _reconcile_stalled_direction_authority(
+        session,
+        cycle=cycle,
+        now=now,
+    )
+    if authority_reconciliation in {
+        "authority_reconciliation_deferred",
+        "authority_superseded",
+        "authority_proof_missing",
+        "authority_proof_missing_unchanged",
+        "authority_reconciliation_budget_exhausted",
+    }:
+        return DiscoveryReviewSpawnResult(
+            cycle.id,
+            cycle.review_task_id,
+            False,
+            False,
+            authority_reconciliation,
+        )
     legacy_disposition = await _notify_legacy_advisory_disposition(
         session,
         cycle=cycle,
@@ -900,8 +965,7 @@ async def maybe_close_and_spawn_discovery_review(
         session.add(cycle)
         return DiscoveryReviewSpawnResult(cycle.id, None, False, False, reason)
 
-    project = await session.get(Project, cycle.project_id)
-    if project is not None and project.paused:
+    if admission == AUTOMATIC_TASK_CREATION_PROJECT_PAUSED:
         cycle.state = "review_pending"
         cycle.updated_at = now
         session.add(cycle)
@@ -1588,13 +1652,20 @@ async def complete_discovery_review(
         quiescent, quiescence_reason = await _cycle_is_quiescent(
             session, cycle, now=now
         )
-        if not quiescent:
+        invalidation_reason = quiescence_reason if not quiescent else None
+        if invalidation_reason is None:
+            _, current_packet_checksum, _, _, _, _ = await _build_review_packet(
+                session, cycle, now=now
+            )
+            if payload.get("packet_checksum") != current_packet_checksum:
+                invalidation_reason = "review_packet_stale"
+        if invalidation_reason is not None:
             stale_review_task_id = cycle.review_task_id
             cycle.state = "review_pending"
             cycle.review_task_id = None
             cycle.review_result = {
                 "status": "REVIEW_PACKET_INVALIDATED",
-                "reason": quiescence_reason,
+                "reason": invalidation_reason,
                 "stale_review_task_id": str(stale_review_task_id),
             }
             cycle.revision = int(cycle.revision or 0) + 1
@@ -1607,10 +1678,10 @@ async def complete_discovery_review(
                 event_type="discovery.review_packet_invalidated",
                 summary=(
                     f"Discovery decision packet invalidated for {cycle.direction_key}: "
-                    f"{quiescence_reason}"
+                    f"{invalidation_reason}"
                 ),
                 extra={
-                    "reason": quiescence_reason,
+                    "reason": invalidation_reason,
                     "policy_status": "REVIEW_PACKET_INVALIDATED",
                 },
             )
@@ -1900,6 +1971,9 @@ async def _sweep_discovery_cycle(session, cycle_id: uuid.UUID, *, now: datetime)
                 session, cycle_id, now=now
             )
         changed = result.spawned or result.reason in {
+            "authority_reconciled",
+            "authority_superseded",
+            "authority_proof_missing",
             "evidence_pending",
             "evidence_pending_escalated",
             "legacy_successor_needs_next_bet",
@@ -1932,15 +2006,23 @@ async def sweep_discovery_reviews(
                         DiscoveryCycle.state.in_(_SWEEPABLE_CYCLE_STATES),
                         (
                             (DiscoveryCycle.state == "reviewed")
-                            & (DiscoveryCycle.verdict == "ask_operator")
                             & (
-                                DiscoveryCycle.review_result["status"].as_string()
-                                == "LEGACY_DISPOSITION_REQUIRES_RESOLUTION"
+                                DiscoveryCycle.verdict.in_(
+                                    POLICY_BLOCKING_DISCOVERY_VERDICTS
+                                )
                             )
                         ),
                     )
                 )
-                .order_by(DiscoveryCycle.updated_at.asc(), DiscoveryCycle.id.asc())
+                # Live-cycle convergence always wins the bounded batch.  Once
+                # there is spare sweep capacity, policy-blocking reviewed cycles
+                # are rechecked for true-authority supersession without an old
+                # disposition starving current reviews.
+                .order_by(
+                    (DiscoveryCycle.state == "reviewed").asc(),
+                    DiscoveryCycle.updated_at.asc(),
+                    DiscoveryCycle.id.asc(),
+                )
                 .limit(max(1, min(limit, DISCOVERY_REVIEW_SWEEP_LIMIT)))
             )
         )

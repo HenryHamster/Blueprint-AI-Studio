@@ -9,6 +9,8 @@ from __future__ import annotations
 
 
 import enum
+import hashlib
+import json
 import logging
 import re
 import secrets
@@ -409,6 +411,10 @@ MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES = 10
 #: demotion.  Mirrors
 #: :data:`app.capability_proof.CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS`.
 CRITERION_NAMED_TEST_TRIAL_WALL_CLOCK_SECONDS = 900
+# Bump only when the targeted runner's provisioning/execution contract changes.
+# Combined with project build_config, this is the named precondition identity
+# that can legitimately re-arm a terminal could_not_run trial at the same SHA.
+CRITERION_NAMED_TEST_TRIAL_CONTRACT = "criterion_named_test_trial:v2"
 
 # Legacy criterion-key aliases.  A walkthrough script may post a semantic slug
 # (e.g. 'c-workday-session-lifecycle') before the script is updated to emit the
@@ -4692,6 +4698,23 @@ async def spawn_corroboration_task(
     """
     try:
         from app.models import Task, TaskStatus
+        from app.task_locking import (
+            AUTOMATIC_TASK_CREATION_ALLOWED,
+            acquire_automatic_task_creation_authority,
+        )
+
+        admission = await acquire_automatic_task_creation_authority(
+            session, project_id, skip_locked=True
+        )
+        if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            logger.info(
+                "[AC] Corroboration task admission closed for criterion %s "
+                "(project %s, %s)",
+                criterion_key,
+                project_id,
+                admission,
+            )
+            return
 
         # Dedup: skip spawning when a non-terminal corroboration task already
         # exists for this criterion.  The attest endpoint calls this on BOTH
@@ -4779,40 +4802,31 @@ async def enroll_criterion_named_test_trial(
     criterion_text: str,
     test_refs: list[str],
 ) -> Any:
-    """Create + persist a QUEUED ``criterion_named_test_trial`` Task for one criterion.
+    """Enroll one bounded, SHA-pinned named-test trial.
 
-    Slice 2 of the machine-verified executed-named-test earn path: the earn loop's
-    backfill discovers a merged task whose declared ``named_test`` test shipped in
-    the PR's changed files, records lower-confidence ``backfilled`` evidence, and
-    then enrolls this targeted runner job in its place. The agent handler runs ONLY
-    the passed ``test_refs`` (the covering test the backfill discovered) at the
-    version's qualifying candidate SHA; on a green run the ingestion handler
-    (:func:`app.task_completion._handle_criterion_named_test_trial_completion`)
-    mints genuine ``covered`` evidence via :func:`record_named_test_execution_evidence`.
-
-    This is the ENROLL half, called by :func:`backfill_merged_named_test_coverage`
-    in place of the research corroboration spawn. It is gated on the
-    ``criterion_named_test_trials_enabled`` runtime flag (default True); with the
-    operator kill switch off it is a no-op returning ``None``. It is also gated on
-    the version having a qualifying candidate SHA — without a pinned revision the
-    trial could not be verified against anything, so nothing is enrolled.
-
-    Bounded launch contract (mirrors ``enroll_capability_proof_trial``):
-    ``test_refs`` is normalized and capped to
-    :data:`MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES`, and a wall-clock timeout
-    (:data:`CRITERION_NAMED_TEST_TRIAL_WALL_CLOCK_SECONDS`) is stamped into the
-    payload. A trial that cannot be built cleanly (flag off, no usable test refs,
-    no qualifying SHA) is a no-op returning ``None`` — never a raise, never a
-    fabricated proof.
-
-    Returns the persisted Task on success, or ``None`` on any no-op/degraded path.
-    Non-raising: any error is logged at WARNING level and yields ``None`` so the
-    backfill sweep can never be crashed by enrollment.
+    The kill switch, project work freeze, absent SHA/refs, and an unchanged
+    candidate+test+precondition identity are no-ops. A GREEN receipt may mint
+    covered evidence; every degraded path returns ``None`` without raising.
     """
     try:
         from app.shared_state import runtime_config as _rc
 
         if not (_rc or {}).get("criterion_named_test_trials_enabled", True):
+            return None
+
+        if (
+            bool(getattr(project, "paused", False))
+            or not bool(getattr(project, "autonomous_enabled", False))
+            or bool(getattr(project, "archived", False))
+        ):
+            logger.info(
+                "[CRITERION_TRIAL] enrollment frozen for project %s "
+                "(paused=%s autonomous_enabled=%s archived=%s)",
+                getattr(project, "id", None),
+                bool(getattr(project, "paused", False)),
+                bool(getattr(project, "autonomous_enabled", False)),
+                bool(getattr(project, "archived", False)),
+            )
             return None
 
         refs = [r for r in (test_refs or []) if isinstance(r, str) and r.strip()]
@@ -4849,70 +4863,105 @@ async def enroll_criterion_named_test_trial(
         project_id = getattr(project, "id", None)
         version_id = getattr(version, "id", None)
 
-        # Dedup guard: only block re-enrollment when an in-flight (non-terminal)
-        # trial already exists for the same criterion_key + release version.
-        # Terminal states (COMPLETED, FAILED) deliberately do NOT block a fresh
-        # enrollment so a completed trial can be re-run after a new commit lands.
-        # Note: a narrow TOCTOU window exists — two concurrent sweeps that both
-        # miss the in-flight check can both enroll; this is tolerated (idempotent
-        # evidence recording handles the duplicate) and only risks one extra
-        # runner job per criterion per sweep cycle.
-        in_flight_statuses = [
-            TaskStatus.QUEUED,
-            TaskStatus.PROVISIONING,
-            TaskStatus.IN_PROGRESS,
-            TaskStatus.EVALUATING,
-        ]
-        try:
-            from app.database import resolve_dialect_name
-            from sqlalchemy import func as _func
+        from app.task_locking import (
+            AUTOMATIC_TASK_CREATION_ALLOWED,
+            acquire_automatic_task_creation_authority,
+        )
 
-            # ``Task.payloads.contains`` renders ``@>`` which PostgreSQL supports
-            # but SQLite does not — branch on dialect like
-            # ``backfill_direction_merge_evidence`` does.
-            dialect = resolve_dialect_name(session)
-            existing_q = (
-                select(Task.id)
+        admission = await acquire_automatic_task_creation_authority(
+            session,
+            project_id,
+            skip_locked=True,
+            require_autonomous_enabled=True,
+        )
+        if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            logger.info(
+                "[CRITERION_TRIAL] automatic admission closed for criterion %s "
+                "(project %s, %s)",
+                criterion_key,
+                project_id,
+                admission,
+            )
+            return None
+
+        # Stable retry authority. Only inputs the trial handler actually consumes
+        # belong to this named execution-precondition epoch. Project build_config
+        # contains unrelated release/sweep policy and must not launder a terminal
+        # trial into fresh work when one of those settings changes.
+        refs = sorted(dict.fromkeys(r.strip() for r in refs))
+        test_identity = hashlib.sha256(
+            json.dumps(refs, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        precondition_identity = hashlib.sha256(
+            json.dumps(
+                {
+                    "contract": CRITERION_NAMED_TEST_TRIAL_CONTRACT,
+                    "max_test_files": MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES,
+                    "wall_clock_seconds": CRITERION_NAMED_TEST_TRIAL_WALL_CLOCK_SECONDS,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        identity_seed = (
+            f"{criterion_key}\n{head_sha}\n"
+            f"{test_identity}\n{precondition_identity}"
+        )
+        trial_identity = hashlib.sha256(identity_seed.encode()).hexdigest()
+
+        # Ask the database for the full durable identity across every task state.
+        # A newest-N object scan lets unrelated churn push a terminal row out of
+        # view. This exact JSON scalar predicate remains authoritative after any
+        # amount of later task history and returns only the tiny matching row.
+        trial_payload = Task.payloads[0]
+        identity_match = (
+            await session.execute(
+                select(Task.id, Task.status)
                 .where(
                     Task.project_id == project_id,
-                    Task.status.in_(in_flight_statuses),
                     Task.context[CRITERION_RELEASE_VERSION_CONTEXT_KEY].as_string()
                     == str(version_id),
+                    trial_payload["type"].as_string()
+                    == "criterion_named_test_trial",
+                    trial_payload["criterion_key"].as_string() == criterion_key,
+                    trial_payload["trial_identity"].as_string() == trial_identity,
                 )
                 .limit(1)
             )
-            if dialect == "sqlite":
-                existing_q = existing_q.where(
-                    _func.json_extract(Task.payloads, "$[0].type")
-                    == "criterion_named_test_trial",
-                    _func.json_extract(Task.payloads, "$[0].criterion_key")
-                    == criterion_key,
-                )
-            else:
-                existing_q = existing_q.where(
-                    Task.payloads.contains(
-                        [
-                            {
-                                "type": "criterion_named_test_trial",
-                                "criterion_key": criterion_key,
-                            }
-                        ]
+        ).first()
+
+        # Compatibility for trials created before identities were persisted.
+        # Their stored refs were already canonicalized at enrollment, so the
+        # database can apply the exact array identity without loading history.
+        if identity_match is None:
+            identity_match = (
+                await session.execute(
+                    select(Task.id, Task.status)
+                    .where(
+                        Task.project_id == project_id,
+                        Task.context[
+                            CRITERION_RELEASE_VERSION_CONTEXT_KEY
+                        ].as_string()
+                        == str(version_id),
+                        trial_payload["type"].as_string()
+                        == "criterion_named_test_trial",
+                        trial_payload["criterion_key"].as_string() == criterion_key,
+                        trial_payload["head_sha"].as_string() == head_sha,
+                        trial_payload["test_refs"] == refs,
+                        trial_payload["precondition_identity"].as_string().is_(None),
                     )
+                    .limit(1)
                 )
-            if (await session.execute(existing_q)).scalar_one_or_none() is not None:
-                logger.info(
-                    "[CRITERION_TRIAL] skipping duplicate enrollment for criterion %s — "
-                    "a trial is already in-flight",
-                    criterion_key,
-                )
-                return None
-        except Exception:
-            logger.warning(
-                "[CRITERION_TRIAL] dedup check failed for criterion %s — "
-                "proceeding with enroll",
+            ).first()
+        if identity_match is not None:
+            logger.info(
+                "[CRITERION_TRIAL] skipping unchanged trial identity for "
+                "criterion %s (existing task %s status=%s)",
                 criterion_key,
-                exc_info=True,
+                identity_match[0],
+                identity_match[1],
             )
+            return None
 
         payload: dict[str, Any] = {
             "type": "criterion_named_test_trial",
@@ -4920,6 +4969,10 @@ async def enroll_criterion_named_test_trial(
             "criterion_text": criterion_text,
             "test_refs": refs,
             "head_sha": head_sha,
+            "candidate_identity": head_sha,
+            "test_identity": test_identity,
+            "precondition_identity": precondition_identity,
+            "trial_identity": trial_identity,
             "max_test_files": MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES,
             "wall_clock_seconds": CRITERION_NAMED_TEST_TRIAL_WALL_CLOCK_SECONDS,
         }
@@ -4935,6 +4988,9 @@ async def enroll_criterion_named_test_trial(
             payloads=[payload],
             status=TaskStatus.QUEUED,
             created_by="SYSTEM_AUTO_REVIEW",
+            idempotency_key=(
+                f"criterion-trial:{version_id}:{criterion_key}:{trial_identity[:24]}"
+            ),
         )
         session.add(task)
         await session.commit()
@@ -4969,35 +5025,11 @@ async def backfill_merged_named_test_coverage(
     *,
     batch_size: int = 500,
 ) -> int:
-    """Backfill criterion evidence for merged tasks whose named_test shipped in changed files.
+    """Backfill merged named-test evidence and enroll each new target once.
 
-    The acceptance gate classifies >95% of merged code tasks as 'unproven' because
-    the automated earn loop only mints ``path_proven`` tiers — it never executes
-    the covering tests it already discovers statically to mint the real ``proven``
-    tier.  This backfill finds merged COMPLETED tasks whose declared ``named_test``
-    acceptance evidence matches test files that shipped in the same PR, and records
-    :data:`UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND` evidence for their active
-    criteria — upgrading them from 'unproven' to at least 'backfilled' on the
-    coverage ladder.
-
-    Unlike :func:`backfill_unverified_merge_evidence`, this function processes
-    ALL merged tasks regardless of merge-verification status: a verified merge
-    whose criteria were added AFTER the merge (so ``record_task_merge_evidence``
-    never fired) also qualifies.
-
-    For every active criterion that received (or already had) merged-named-test
-    backfill evidence, this ALSO enrolls a targeted
-    :func:`enroll_criterion_named_test_trial` — a bounded runner job that executes
-    the covering test against the version's qualifying candidate SHA.  A green
-    run upgrades the criterion from the lower-confidence 'backfilled' tier to
-    genuine machine-verified 'covered'; this replaces the research corroboration
-    spawn for this lane.  ``backfilled`` stays the floor until such a trial
-    upgrades the criterion.
-
-    Best-effort: errors are logged and swallowed so a backfill failure never blocks
-    the caller (the reaper sweep).
-
-    Returns the count of new ``backfilled`` rows recorded.
+    A shipped declared test plus production seam records the lower-confidence
+    backfill tier. Only a newly admitted, not-yet-covered row becomes a bounded
+    trial target. Best-effort; returns the number of rows recorded.
     """
     total = 0
     try:
@@ -5149,22 +5181,27 @@ async def backfill_merged_named_test_coverage(
                     or declared_test
                 )
                 for criterion in active:
-                    # Enroll a targeted named-test trial for every active
-                    # backfilled criterion, whether or not its evidence row is
-                    # new — this earns-up or re-verifies pre-existing backfill
-                    # too (in-flight dedup in the enroller guards duplicates).
-                    trial_targets[criterion.criterion_key] = (
-                        criterion.text,
-                        declared_test,
-                    )
-                    if criterion.id in already_present:
-                        continue
-
                     # Skip if the criterion is already machine-verified as covered
                     # by other evidence (e.g. a reachability badge or a prior
                     # task_merge with proven=True).
                     existing = evidence_by_criterion.get(criterion.id, [])
                     if compute_criterion_coverage(existing) == "covered":
+                        continue
+
+                    # Every still-uncovered backfilled criterion remains eligible
+                    # for the identity-aware earn-up path.  The enroller's exact
+                    # candidate + test + execution-precondition identity suppresses
+                    # an unchanged terminal/could_not_run attempt, while a new
+                    # candidate or repaired execution precondition legitimately
+                    # re-arms it.  Restricting this to newly inserted backfill rows
+                    # strands a failed first attempt forever because the durable
+                    # backfill row is already present on every later sweep.
+                    trial_targets[criterion.criterion_key] = (
+                        criterion.text,
+                        declared_test,
+                    )
+
+                    if criterion.id in already_present:
                         continue
 
                     detail: dict[str, Any] = {

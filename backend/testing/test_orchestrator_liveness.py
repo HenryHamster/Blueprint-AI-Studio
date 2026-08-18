@@ -12,14 +12,19 @@ from the live PR head so a missing stored branch can't wedge a poison task.
 
 import asyncio
 import threading
-from datetime import timedelta
+import uuid
+from datetime import timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
+from sqlmodel import select
 
 import app.orchestrator as _orch
 import app.orchestrator_liveness as _liv
 import app.shared_state as _ss
 from app.time_utils import _utcnow
+from app.models import Alert, StrategicCycle
+from testing.factories import make_project
 
 
 @pytest.fixture
@@ -114,6 +119,131 @@ class TestLivenessModuleExtraction:
         assert _orch._orchestrator_last_progress is not None
         age = (_utcnow() - _orch._orchestrator_last_progress).total_seconds()
         assert age < 5
+
+
+@pytest.mark.asyncio
+class TestStrategicLoopLiveness:
+    """Completion-keyed strategic-loop detection and its operator route."""
+
+    async def test_halted_loop_raises_and_routes_signal(self, db_session, monkeypatch):
+        """An old/incomplete cycle raises one alert and broadcasts it."""
+        from app.reaper_sweeps import (
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            created_at=now - timedelta(days=3),
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        last_completed = now - timedelta(hours=25)
+        db_session.add(
+            StrategicCycle(
+                id=f"sc-{uuid.uuid4().hex[:8]}",
+                project_id=project.id,
+                phase1_started_at=last_completed - timedelta(minutes=20),
+                phase1_completed_at=last_completed - timedelta(minutes=5),
+                phase2_completed_at=last_completed,
+                outcome="completed",
+            )
+        )
+        db_session.add(
+            StrategicCycle(
+                id=f"sc-{uuid.uuid4().hex[:8]}",
+                project_id=project.id,
+                phase1_started_at=now - timedelta(hours=25),
+                outcome="phase1_running",
+            )
+        )
+        await db_session.commit()
+
+        routed = []
+
+        async def record_broadcast(project_id, event, payload):
+            routed.append((project_id, event, payload))
+
+        monkeypatch.setattr("app.alert_dispatch.broadcast_to_project", record_broadcast)
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+
+        alert = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().one()
+        assert "loop=strategic" in alert.message
+        assert f"last_completed_at={last_completed.isoformat()}" in alert.message
+        assert routed == [
+            (
+                str(project.id),
+                "alert_created",
+                {
+                    "alert_id": str(alert.id),
+                    "severity": "WARNING",
+                    "title": _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                },
+            )
+        ]
+
+    async def test_quiet_healthy_portfolio_does_not_raise_signal(self, db_session):
+        """A recent intentional no-delta receipt is healthy idle, not a halt."""
+        from app.reaper_sweeps import (
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            created_at=now - timedelta(days=3),
+            vision={
+                "_strategic_no_delta_skips": [
+                    {"skipped_at": (now - timedelta(hours=1)).isoformat()}
+                ]
+            },
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+        assert not (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().first()
+
+    async def test_failure_breaker_decays_before_early_return(self, db_session):
+        """The 48h decay runs before unavailable-account return, reopening backstop eligibility."""
+        from app.autonomous_research import _spawn_research_task_inner
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=False,
+            vision={
+                "_strategic_failures": 3,
+                "_strategic_failures_at": (
+                    (now - timedelta(hours=49)).replace(tzinfo=timezone.utc).isoformat()
+                ),
+            },
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _spawn_research_task_inner(project, db_session)
+        await db_session.refresh(project)
+
+        assert project.vision.get("_strategic_failures") is None
+        assert project.vision.get("_strategic_failures_at") is None
 
 
 class TestResolveCiFixBranch:
@@ -372,6 +502,10 @@ class TestAuthedOrchestratorHealth:
     informational slow-cycle signal. See orchestrator-operator-health-split.
     """
 
+    @pytest.fixture(autouse=True)
+    def _use_local_leader_authority(self, restore_orch_state):
+        _ss.is_leader = True
+
     async def test_debug_slow_but_progressing_is_alive_not_hung(
         self, client, restore_orch_state
     ):
@@ -422,6 +556,41 @@ class TestAuthedOrchestratorHealth:
         assert body["orchestrator_hung"] is True
         assert body["orchestrator_alive"] is False
 
+    async def test_debug_api_role_uses_worker_lock_heartbeat(
+        self, client, restore_orch_state, mocker
+    ):
+        """Split API diagnostics must not classify their empty local gauges."""
+        _ss.is_leader = False
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_last_progress = None
+        observed = mocker.patch(
+            "app.main.observe_background_leader_health",
+            new=AsyncMock(
+                return_value={
+                    "status": "ok",
+                    "authority": "background_leader_advisory_lock",
+                    "cycle_age_seconds": None,
+                    "cycle_age_kind": "not_observable_cross_process",
+                    "heartbeat_age_seconds": 4.0,
+                    "progress_age_seconds": 4.0,
+                    "stale_after_seconds": 90.0,
+                    "leader_pid": 123,
+                    "reason": "background leader keepalive is fresh",
+                }
+            ),
+        )
+
+        resp = await client.get("/api/debug/orchestrator")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["orchestrator_alive"] is True
+        assert body["orchestrator_hung"] is False
+        assert body["orchestrator_progress_age_seconds"] == 4.0
+        assert body["orchestrator_cycle_age_seconds"] is None
+        assert body["orchestrator_authority"] == "background_leader_advisory_lock"
+        observed.assert_awaited_once()
+
     async def test_detailed_slow_but_progressing_is_not_down(
         self, client, restore_orch_state
     ):
@@ -463,6 +632,40 @@ class TestAuthedOrchestratorHealth:
         resp = await client.get("/api/health/detailed")
         assert resp.status_code == 200
         assert resp.json()["components"]["orchestrator"]["status"] == "down"
+
+    async def test_detailed_api_role_uses_worker_lock_heartbeat(
+        self, client, restore_orch_state, mocker
+    ):
+        """Split API processes must not classify their empty local gauges."""
+        _ss.is_leader = False
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_last_progress = None
+        observed = mocker.patch(
+            "app.main.observe_background_leader_health",
+            new=AsyncMock(
+                return_value={
+                    "status": "ok",
+                    "authority": "background_leader_advisory_lock",
+                    "cycle_age_seconds": None,
+                    "cycle_age_kind": "not_observable_cross_process",
+                    "heartbeat_age_seconds": 4.0,
+                    "progress_age_seconds": 4.0,
+                    "stale_after_seconds": 90.0,
+                    "leader_pid": 123,
+                    "reason": "background leader keepalive is fresh",
+                }
+            ),
+        )
+
+        resp = await client.get("/api/health/detailed")
+
+        assert resp.status_code == 200
+        orch = resp.json()["components"]["orchestrator"]
+        assert orch["status"] == "ok"
+        assert orch["authority"] == "background_leader_advisory_lock"
+        assert orch["heartbeat_age_seconds"] == 4.0
+        assert orch["cycle_age_seconds"] is None
+        observed.assert_awaited_once()
 
 
 class TestHardWatchdogDecision:

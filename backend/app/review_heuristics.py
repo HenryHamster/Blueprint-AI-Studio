@@ -12,6 +12,8 @@ tokenization/similarity, and the diff-size/test-file utilities shared with
 ``review_policy`` (which owns the review-skip decisions).
 """
 
+import hashlib
+import json
 import re
 
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.55
@@ -72,6 +74,15 @@ _FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 # count decreasing — evades Jaccard stuck-cycle detection but still unproductive.
 ISSUE_CHURN_WINDOW = 2
 
+# Cross-PR repeat-concern replay deliberately uses a lower threshold than the
+# intra-PR stuck-cycle detector: it compares one finding across independently
+# merged PRs, where wording changes are expected. The file path remains the
+# hard identity boundary; a symbol, when both reviews provide one, is also
+# required to match.
+CROSS_PR_CONCERN_JACCARD_THRESHOLD = 0.5
+CROSS_PR_MIN_DISTINCT_PRS = 2
+_CROSS_PR_ACTIONABLE_SEVERITIES = frozenset({"CRITICAL", "MAJOR"})
+
 
 def _critical_major_count(entry: dict) -> int:
     return sum(
@@ -82,17 +93,86 @@ def _critical_major_count(entry: dict) -> int:
     )
 
 
+def _entry_target_pair(entry: dict) -> tuple[str, str] | None:
+    base_sha = str(entry.get("reviewed_base_sha") or "").strip()
+    head_sha = str(entry.get("reviewed_head_sha") or "").strip()
+    if not base_sha or not head_sha:
+        return None
+    return (base_sha, head_sha)
+
+
+def _verified_blocking_issue_ids(entry: dict) -> set[str] | None:
+    """Return canonical blocker IDs when the round proves an exact target.
+
+    ``None`` means the older count-only fallback must remain in force. An empty
+    set is valid exact evidence (an approval/no-blocker round).
+    """
+
+    if (
+        entry.get("target_verified_by_backend") is not True
+        or not str(entry.get("review_task_id") or "").strip()
+        or not _entry_target_pair(entry)
+    ):
+        return None
+    issue_ids: set[str] = set()
+    for issue in entry.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        if issue.get("severity", "").upper() not in ("CRITICAL", "MAJOR"):
+            continue
+        if not (issue.get("description") or "").strip():
+            continue
+        issue_id = str(issue.get("issue_id") or "").strip()
+        if not issue_id:
+            return None
+        issue_ids.add(issue_id)
+    return issue_ids
+
+
 def _detect_issue_churn(history: list) -> tuple[bool, list[int]]:
     if len(history) < ISSUE_CHURN_WINDOW:
         return (False, [])
-    counts = [_critical_major_count(e) for e in history[-ISSUE_CHURN_WINDOW:]]
+    window = history[-ISSUE_CHURN_WINDOW:]
+    counts = [_critical_major_count(e) for e in window]
     if any(c == 0 for c in counts):
         return (False, counts)
     non_decreasing = all(counts[i + 1] >= counts[i] for i in range(len(counts) - 1))
     # Oscillating patterns (e.g. [5, 3, 5], [4, 2, 4]) also represent zero net
     # progress: the fix agent removes some issues but reintroduces others.
     no_net_progress = counts[-1] >= counts[0]
-    return (non_decreasing or no_net_progress, counts)
+    count_shape_is_churn = non_decreasing or no_net_progress
+    if not count_shape_is_churn:
+        return (False, counts)
+
+    canonical_ids = [_verified_blocking_issue_ids(entry) for entry in window]
+    if all(issue_ids is not None for issue_ids in canonical_ids):
+        canonical_id_sets = [
+            issue_ids for issue_ids in canonical_ids if issue_ids is not None
+        ]
+        target_pairs = [
+            pair
+            for entry in window
+            if (pair := _entry_target_pair(entry)) is not None
+        ]
+        heads_changed = all(
+            target_pairs[index][1] != target_pairs[index + 1][1]
+            for index in range(len(target_pairs) - 1)
+        ) and len(target_pairs) == len(window)
+        current_ids = canonical_id_sets[-1]
+        prior_canonical_ids: set[str] = set()
+        for prior_entry in history[:-1]:
+            prior_ids = _verified_blocking_issue_ids(prior_entry)
+            if prior_ids is not None:
+                prior_canonical_ids.update(prior_ids)
+        re_raised = bool(current_ids & prior_canonical_ids)
+        if heads_changed and not re_raised:
+            # Every retained canonical blocker disappeared on an actioned head
+            # and every current blocker is genuinely new. Count growth here is
+            # reviewer discovery, not failed repair progress; shortening the
+            # patch budget would punish convergence. Comparing the current set
+            # with all bounded retained history also catches A -> B -> A loops.
+            return (False, counts)
+    return (True, counts)
 
 
 # ── Early non-convergence escalation (whack-a-mole / drift detection) ─────────
@@ -545,6 +625,228 @@ def _feedback_jaccard(a: str, b: str) -> float:
     return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
 
+def _cross_pr_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _cross_pr_record_pr_number(record: dict) -> int | None:
+    """Read a PR number from normalized or historical task-shaped records."""
+    context = record.get("context") or {}
+    context = context if isinstance(context, dict) else {}
+    review_loop = context.get("review_loop") or {}
+    review_loop = review_loop if isinstance(review_loop, dict) else {}
+    payloads = record.get("payloads") or []
+    payload = payloads[0] if payloads and isinstance(payloads[0], dict) else {}
+    for value in (
+        record.get("pr_number"),
+        review_loop.get("pr_number"),
+        payload.get("pr_number"),
+        context.get("rollup_pr_number"),
+    ):
+        number = _cross_pr_int(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _cross_pr_review_history(record: dict) -> list:
+    direct = record.get("review_history")
+    if isinstance(direct, list):
+        return direct
+    context = record.get("context") or {}
+    context = context if isinstance(context, dict) else {}
+    review_loop = context.get("review_loop") or {}
+    review_loop = review_loop if isinstance(review_loop, dict) else {}
+    history = review_loop.get("review_history")
+    return history if isinstance(history, list) else []
+
+
+def _cross_pr_file(issue: dict) -> str:
+    path = issue.get("file") or issue.get("file_path") or ""
+    if not isinstance(path, str):
+        return ""
+    return path.strip().replace("\\", "/").removeprefix("./")
+
+
+def _cross_pr_symbol(issue: dict) -> str:
+    symbol = issue.get("symbol") or issue.get("region") or ""
+    return str(symbol).strip() if symbol else ""
+
+
+def _cross_pr_description(issue: dict) -> str:
+    description = issue.get("description") or issue.get("summary") or ""
+    return str(description).strip() if description else ""
+
+
+def _cross_pr_concern_similarity(left: dict, right: dict) -> float:
+    if left["file"] != right["file"]:
+        return 0.0
+    if left["symbol"] and right["symbol"] and left["symbol"] != right["symbol"]:
+        return 0.0
+    return _feedback_jaccard(left["description"], right["description"])
+
+
+def detect_cross_pr_repeat_concern_chains(
+    records: list[dict],
+    *,
+    min_distinct_prs: int = CROSS_PR_MIN_DISTINCT_PRS,
+    similarity_threshold: float = CROSS_PR_CONCERN_JACCARD_THRESHOLD,
+) -> dict:
+    """Replay repeat-concern identity across distinct PRs without side effects.
+
+    ``records`` are task-shaped dictionaries. Each record may expose
+    ``review_history`` directly or under ``context.review_loop`` and must carry
+    a PR number directly, in that review loop, or in its first payload. A group
+    is a repeat-concern chain only when the same file and compatible region
+    recur on at least ``min_distinct_prs`` PRs. Repeated observations on one PR
+    are retained as iterative-hardening evidence, never as cross-PR burden.
+    """
+    groups: list[dict] = []
+    malformed_records = 0
+    concern_observations = 0
+
+    for record_index, record in enumerate(records or []):
+        if not isinstance(record, dict):
+            malformed_records += 1
+            continue
+        pr_number = _cross_pr_record_pr_number(record)
+        history = _cross_pr_review_history(record)
+        if pr_number is None or not history:
+            malformed_records += 1
+            continue
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("verdict") or "").upper() == "APPROVE":
+                continue
+            iteration = _cross_pr_int(entry.get("iteration"))
+            iteration = iteration if iteration is not None else 0
+            for issue in entry.get("issues") or []:
+                if not isinstance(issue, dict):
+                    continue
+                severity = str(issue.get("severity") or "").upper()
+                description = _cross_pr_description(issue)
+                file_path = _cross_pr_file(issue)
+                if severity not in _CROSS_PR_ACTIONABLE_SEVERITIES or not description or not file_path:
+                    continue
+                concern = {
+                    "pr_number": pr_number,
+                    "iteration": iteration,
+                    "severity": severity,
+                    "description": description,
+                    "file": file_path,
+                    "symbol": _cross_pr_symbol(issue),
+                    "record_index": record_index,
+                }
+                concern_observations += 1
+                group = next(
+                    (
+                        candidate
+                        for candidate in groups
+                        if any(
+                            _cross_pr_concern_similarity(observation, concern)
+                            >= similarity_threshold
+                            for observation in candidate["observations"]
+                        )
+                    ),
+                    None,
+                )
+                if group is None:
+                    groups.append(
+                        {
+                            "representative": concern,
+                            "pr_numbers": [pr_number],
+                            "iterations_by_pr": {str(pr_number): [iteration]},
+                            "severities": [severity],
+                            "descriptions": [description],
+                            "observations": [concern],
+                        }
+                    )
+                    continue
+                if pr_number not in group["pr_numbers"]:
+                    group["pr_numbers"].append(pr_number)
+                group["iterations_by_pr"].setdefault(str(pr_number), []).append(iteration)
+                if severity not in group["severities"]:
+                    group["severities"].append(severity)
+                if description not in group["descriptions"] and len(group["descriptions"]) < 5:
+                    group["descriptions"].append(description)
+                group["observations"].append(concern)
+
+    chain_groups = [
+        group
+        for group in groups
+        if len(group["pr_numbers"]) >= max(2, int(min_distinct_prs))
+    ]
+    hardening_groups = [
+        group
+        for group in groups
+        if len(group["pr_numbers"]) == 1
+        and len(set(group["iterations_by_pr"][str(group["pr_numbers"][0])])) > 1
+    ]
+
+    chains: list[dict] = []
+    for group in chain_groups:
+        representative = group["representative"]
+        normalized_tokens = " ".join(
+            sorted(_feedback_token_set(representative["description"]))
+        )
+        # The grouping identity is (file, compatible symbol, description
+        # tokens) at a given similarity threshold — see
+        # _cross_pr_concern_similarity, which refuses to merge two concerns
+        # that carry different symbols. The key must hash every one of those
+        # components, or two independent chains on the same file (different
+        # symbols) collapse onto one key and any consumer keying escalation or
+        # dedup on chain_key silently merges them.
+        identity = (
+            f"{representative['file']}"
+            f"|{representative['symbol']}"
+            f"|{normalized_tokens}"
+            f"|{float(similarity_threshold):.4f}"
+        )
+        chain = {
+            "chain_key": hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16],
+            "file": representative["file"],
+            "symbol": representative["symbol"] or None,
+            "representative_description": representative["description"],
+            "pr_numbers": list(group["pr_numbers"]),
+            "distinct_prs": len(group["pr_numbers"]),
+            "occurrences": len(group["pr_numbers"]),
+            "iterations_by_pr": {
+                pr: sorted(set(iterations))
+                for pr, iterations in group["iterations_by_pr"].items()
+            },
+            "severities": sorted(group["severities"]),
+            "descriptions": list(group["descriptions"]),
+            "resolved_before_next_pr": max(0, len(group["pr_numbers"]) - 1),
+            "same_pr_hardening_prs": sorted(
+                int(pr)
+                for pr, iterations in group["iterations_by_pr"].items()
+                if len(set(iterations)) > 1
+            ),
+        }
+        chains.append(chain)
+
+    return {
+        "records_seen": len(records or []),
+        "concern_observations": concern_observations,
+        "malformed_records": malformed_records,
+        "concern_groups": len(groups),
+        "repeat_concern_chain_count": len(chains),
+        "repeat_concern_chains": chains,
+        "same_pr_hardening_count": len(hardening_groups),
+        "resolved_before_next_pr": sum(
+            chain["resolved_before_next_pr"] for chain in chains
+        ),
+        "similarity_threshold": similarity_threshold,
+    }
+
+
 # ── Mechanical hedge detection (anti-hedging enforcement) ─────────────────────
 # Anti-hedging principle: new features, gates, and flags must default ON/committed,
 # not observe/off/disabled/fail-open, without documented justification.
@@ -639,9 +941,9 @@ LANE_CAP_CI_DEFAULT = 6
 LANE_CAP_NON_REVIEW_DEFAULT = 8  # conflict + ci collectively
 
 # Number of consecutive conflict-lane fix completions that trigger persistent-
-# conflict escalation BEFORE the lane sub-cap fires. The loop closes the PR and
-# records failure_detail="persistent_merge_conflict" on the orig task so the
-# operator can see the conflict, not a generic cap-exhaustion message.
+# conflict escalation BEFORE the lane sub-cap fires. The loop parks the open PR
+# in the operator-disposition hold with a persistent-conflict marker and exact
+# target evidence; conflict alone is not authority to reject or close the PR.
 # Fires at lane_count >= threshold (default 2) so the first conflict attempt
 # is preserved (keeps hardened prompt behavior for attempt 1), and a second
 # failure without resolution confirms the conflict is not auto-resolvable.
@@ -717,3 +1019,171 @@ def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined] 
     if fix_reason == "ci_failure":
         return LANE_CI
     return LANE_REVIEW_CONVERGENCE
+
+
+def _exact_review_target_identity(target: object) -> tuple[str, int, str, str] | None:
+    """Return the complete immutable review-target identity, if present.
+
+    Review authority is a property of the exact ``(project, PR, base, head)``
+    tuple.  A head-only identity is deliberately not accepted: two reviews of
+    the same head against different integration bases did not inspect the same
+    effective change.
+    """
+
+    if not isinstance(target, dict):
+        return None
+    project_id = str(target.get("project_id") or "").strip()
+    base_sha = str(target.get("base_sha") or "").strip()
+    head_sha = str(target.get("head_sha") or "").strip()
+    try:
+        pr_number = int(target.get("pr_number") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not project_id or pr_number <= 0 or not base_sha or not head_sha:
+        return None
+    return (project_id, pr_number, base_sha, head_sha)
+
+
+def _structured_review_verdict(task: "Task") -> tuple[str, str, str] | None:  # type: ignore[name-defined]  # noqa: F821
+    """Return ``(verdict, reviewed_base, reviewed_head)`` from signed result data.
+
+    ``blueprint_review_verdict`` is a convenient UI mirror, not sufficient
+    provenance for cap accounting.  The replay-safe ``review_result`` retains
+    the agent-stamped exact pair and is therefore the authoritative source.
+    """
+
+    result = (task.context or {}).get("review_result")
+    if not isinstance(result, dict) or result.get("structured") is not True:
+        return None
+    raw = result.get("verdict_json")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    verdict = str(payload.get("verdict") or result.get("verdict") or "").upper()
+    reviewed_base = str(payload.get("reviewed_base_sha") or "").strip()
+    reviewed_head = str(payload.get("reviewed_head_sha") or "").strip()
+    if verdict not in ("APPROVE", "REQUEST_CHANGES"):
+        return None
+    return (verdict, reviewed_base, reviewed_head)
+
+
+def review_cap_generation_identity(
+    task: "Task",  # type: ignore[name-defined]  # noqa: F821
+) -> tuple[object, ...] | None:
+    """Return the actioned generation charged to the review/fix cap.
+
+    A cap unit is an exact patch/open-set generation, not a worker row:
+
+    * a structured REQUEST_CHANGES review and the fix it launches share the
+      same exact target key and therefore consume one unit together;
+    * parallel reviewers of that same target collapse to the same unit;
+    * APPROVE-only, stale-target, and target-mismatched reviews consume none;
+    * mechanical conflict/CI fixes remain bounded independently; and
+    * old unstructured rows retain a task-id fallback so legacy chains cannot
+      become unbounded merely because they predate exact-target receipts.
+    """
+
+    payload = task.first_payload or {}
+    task_type = str(payload.get("type") or "")
+    if task_type not in ("review", "fix"):
+        return None
+    context = task.context or {}
+    if context.get("_review_stale_head") or context.get("_review_stale_target"):
+        return None
+    loop = context.get("review_loop")
+    loop = loop if isinstance(loop, dict) else {}
+    lane = classify_iteration_lane(task)
+
+    if task_type == "fix":
+        target = _exact_review_target_identity(loop.get("fix_target"))
+        if target is not None:
+            # A code-review fix and the REQUEST_CHANGES review that demanded it
+            # are one actioned patch generation. Mechanical lanes keep their
+            # own namespace so their sub-caps remain independent.
+            return (lane, *target)
+        reviewed_base = str(loop.get("reviewed_base_sha") or "").strip()
+        reviewed_head = str(loop.get("reviewed_head_sha") or "").strip()
+        if reviewed_base and reviewed_head:
+            try:
+                pr_number = int(payload.get("pr_number") or 0)
+            except (TypeError, ValueError):
+                return (lane, "legacy-fix", str(task.id))
+            return (
+                lane,
+                str(task.project_id),
+                pr_number,
+                reviewed_base,
+                reviewed_head,
+            )
+        return (lane, "legacy-fix", str(task.id))
+
+    target = _exact_review_target_identity(loop.get("review_target"))
+    signed = _structured_review_verdict(task)
+    if signed is not None:
+        verdict, reviewed_base, reviewed_head = signed
+        if target is None:
+            return None
+        # Both halves are required. A result that was stamped for a different
+        # base or head is stale/non-actionable even if a legacy completion path
+        # happened to leave the row COMPLETED.
+        if (reviewed_base, reviewed_head) != (target[2], target[3]):
+            return None
+        if verdict != "REQUEST_CHANGES":
+            return None
+        return (LANE_REVIEW_CONVERGENCE, *target)
+
+    # Durable authoritative history is accepted for rows that predate the
+    # replay-safe review_result mirror. Require this task's exact id and pair so
+    # a copied/parallel history row cannot make an unrelated reviewer count.
+    for entry in reversed(loop.get("review_history") or []):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("review_task_id") or "") != str(task.id):
+            continue
+        if entry.get("target_verified_by_backend") is not True or target is None:
+            return None
+        entry_base = str(entry.get("reviewed_base_sha") or "").strip()
+        entry_head = str(entry.get("reviewed_head_sha") or "").strip()
+        if (entry_base, entry_head) != (target[2], target[3]):
+            return None
+        if str(entry.get("verdict") or "").upper() != "REQUEST_CHANGES":
+            return None
+        return (LANE_REVIEW_CONVERGENCE, *target)
+
+    # Explicitly parallel rows without exact, actioned verdict evidence are
+    # observation fan-out, not patch generations.
+    if context.get("review_was_parallelized") is True:
+        return None
+    # Legacy rows without target/result receipts remain one bounded unit each.
+    if target is None:
+        return (LANE_REVIEW_CONVERGENCE, "legacy-review", str(task.id))
+    return None
+
+
+def actioned_review_cap_tasks(
+    tasks: "list[Task]",  # type: ignore[name-defined]  # noqa: F821
+) -> list["Task"]:  # type: ignore[name-defined]  # noqa: F821
+    """Collapse eligible task rows into actioned review/fix generations.
+
+    The returned representative rows are used for both global and lane counts,
+    keeping those two views on the same unit. Prefer a fix row when a review and
+    its fix share a target because the fix is the concrete patch action.
+    """
+
+    by_generation: dict[tuple[object, ...], "Task"] = {}  # type: ignore[name-defined]  # noqa: F821
+    for task in tasks:
+        identity = review_cap_generation_identity(task)
+        if identity is None:
+            continue
+        prior = by_generation.get(identity)
+        if prior is None or (
+            (prior.first_payload or {}).get("type") != "fix"
+            and (task.first_payload or {}).get("type") == "fix"
+        ):
+            by_generation[identity] = task
+    return list(by_generation.values())

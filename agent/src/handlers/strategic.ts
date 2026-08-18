@@ -1482,12 +1482,12 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # Direction spawn with explicit extra criterion coverage (merged with direction's own keys):
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "...", "direction_id": "d-xxx", "criterion_ids": ["c-key-extra"], "acceptance_evidence": {"kind": "named_test", "test_path": "testing/test_foo.py"}}'
 
-# Sequenced build-on-top work (landing gates): to author an ORDERED chain instead
-# of independent parallel siblings, spawn the FOUNDATION first, then on each
-# successor pass the foundation's RETURNED task_id in depends_on and declare the
-# named landing branch. Dispatch then holds until EVERY dependency has LANDED on
-# that branch before the successor's base is re-cut. Keep genuinely independent
-# work parallel (no depends_on) so it is not held by the chain.
+# Sequenced build-on-top work (landing gates): when a successor builds on a
+# foundation's contract (shared types, schema, API surface), spawn the FOUNDATION first,
+# then on the successor pass the foundation's RETURNED task_id in depends_on and
+# declare the named landing branch. Dispatch then holds until EVERY dependency has
+# LANDED on that branch before the successor's base is re-cut.
+# Only omit depends_on for work that is genuinely independent — no shared files or contracts.
 ./strategic spawn-task '{"type": "create", "title": "Implement foundation", "prompt": "...", "direction_id": "d-xxx"}'
 #   → response returns a task_id; the successor references it and declares the gate:
 ./strategic spawn-task '{"type": "create", "title": "Build on the foundation", "prompt": "...", "direction_id": "d-xxx", "depends_on": ["<foundation task_id>"], "require_deps_landed_on": "${baseBranch}", "release_base_branch": "${baseBranch}"}'

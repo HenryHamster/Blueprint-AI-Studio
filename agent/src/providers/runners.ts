@@ -849,6 +849,20 @@ export function buildIsolatedTextOnlyMemoryCommand(
   return command;
 }
 
+// These values are execution authority chosen by the local runner. They may
+// cross the provider-CLI boundary, but an operator-supplied translation map
+// must never synthesize them when the runner did not provide them.
+const RUNNER_AUTHORED_CLI_ENV_KEYS: ReadonlySet<string> = new Set([
+  'BLUEPRINT_SANDBOX_PYTHON',
+  'BLUEPRINT_SANDBOX_PG_BINDIR',
+  'VITEST_MIN_THREADS',
+  'VITEST_MAX_THREADS',
+  'VITEST_MIN_FORKS',
+  'VITEST_MAX_FORKS',
+  'VITEST_MIN_WORKERS',
+  'VITEST_MAX_WORKERS',
+]);
+
 function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, string> {
   const env: Record<string, string> = {
     HOME: process.env.HOME || os.homedir(),
@@ -878,6 +892,9 @@ function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, stri
     'GOOGLE_GENAI_USE_VERTEXAI',
     'ORCHESTRATOR_URL',
     'TASK_ID',
+    // Runner-authored backend verification and test-execution policy. Shell
+    // tools are children of the provider CLI, not the agent coordinator.
+    ...RUNNER_AUTHORED_CLI_ENV_KEYS,
   ]) {
     const v = process.env[key];
     if (v !== undefined) env[key] = v;
@@ -895,7 +912,7 @@ function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, stri
   if (ghTokenFilePath) env[GITHUB_TOKEN_FILE_ENV] = ghTokenFilePath;
   if (LLM_CLI_TRANSLATION?.env) {
     for (const [k, v] of Object.entries(LLM_CLI_TRANSLATION.env)) {
-      if (!(k in env)) env[k] = v;
+      if (!(k in env) && !RUNNER_AUTHORED_CLI_ENV_KEYS.has(k)) env[k] = v;
     }
   }
   if (provider === 'zai') {

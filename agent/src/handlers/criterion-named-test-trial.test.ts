@@ -69,8 +69,9 @@ describe('handleCriterionNamedTestTrial could_not_run (pre-clone)', () => {
     expect(result).toEqual({
       type: 'criterion_named_test_trial',
       criterion_key: '',
-      head_sha: 'pinned-sha', queued_head_sha: 'pinned-sha', test_refs: ['backend/testing/test_foo.py'],
+      head_sha: null, queued_head_sha: 'pinned-sha', test_refs: ['backend/testing/test_foo.py'],
       ran: false, passed: false, could_not_run: true,
+      could_not_run_reason: 'criterion_identity_missing',
     });
     expect(execFileAsync).not.toHaveBeenCalled();
   });
@@ -146,6 +147,7 @@ describe('handleCriterionNamedTestTrial pinned-SHA checkout', () => {
       criterion_key: 'speed-of-iteration',
       head_sha: null, queued_head_sha: 'deadbeef', test_refs: ['backend/testing/test_foo.py'],
       ran: false, passed: false, could_not_run: true,
+      could_not_run_reason: 'candidate_unavailable',
     });
     // Only the git pin operations were attempted — never a test run.
     const commands = vi.mocked(execFileAsync).mock.calls.map(c => c[0]);
@@ -275,7 +277,33 @@ describe('handleCriterionNamedTestTrial classification + receipt', () => {
 
     const result = await runTrial(payloadFor({}));
 
-    expect(result).toMatchObject({ ran: false, passed: false, could_not_run: true });
+    expect(result).toMatchObject({
+      ran: false, passed: false, could_not_run: true,
+      could_not_run_reason: 'execution_environment_unavailable',
+    });
+  });
+
+  it('echoes stable retry identities without turning could_not_run into success', async () => {
+    vi.mocked(execFileAsync)
+      .mockResolvedValueOnce('ok\n')
+      .mockResolvedValueOnce('checked-out\n')
+      .mockResolvedValueOnce('sha\n')
+      .mockRejectedValueOnce(Object.assign(new Error('spawn bash ENOENT'), { stderr: '' }));
+
+    const result = await runTrial(payloadFor({
+      trial_identity: 'trial-v1',
+      test_identity: 'tests-v1',
+      precondition_identity: 'runner-v1',
+    }));
+
+    expect(result).toMatchObject({
+      trial_identity: 'trial-v1',
+      test_identity: 'tests-v1',
+      precondition_identity: 'runner-v1',
+      ran: false,
+      passed: false,
+      could_not_run: true,
+    });
   });
 
   it('reports a red (non-zero-exit) run as ran but not passed — fail-open, nothing minted', async () => {

@@ -20,7 +20,8 @@ WORKSPACE="${WORKSPACE:-/tmp/workspace}"
 _VERIFY_TASK_ID="${TASK_ID:-local-developer}"
 _VERIFY_RECEIPT="/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"
 _VERIFY_HARNESS_RECEIPT="/tmp/backend_verification_harness_${_VERIFY_TASK_ID}.json"
-if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT"; then
+_VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${_VERIFY_TASK_ID}"
+if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT"; then
   echo "[check] unable to remove prior verification receipt(s) — refusing to run" >&2
   exit 1
 fi
@@ -42,11 +43,6 @@ for arg in "$@"; do
     full|--full)  FULL_SCOPE=1  ;;
   esac
 done
-
-# Fresh GATE-ENVIRONMENT marker per run: cleared here, re-written by the
-# config-driven pytest gate below only if this environment still cannot run
-# the suite faithfully. ./pr surfaces it after a passing `./check test`.
-rm -f /tmp/check_gate_env_local-developer.txt
 
 # Determine changed paths: committed since base + uncommitted. The base diff
 # FAILS CLOSED when it cannot be computed — an empty CHANGED must only ever
@@ -224,7 +220,7 @@ if touches "admin-ui/"; then
   # full vite bundle runs in CI after ./pr open.
   run "admin-ui typecheck" bash -c 'cd "admin-ui" && npm run typecheck'
   if [ "$WITH_TESTS" = "1" ]; then
-    run "admin-ui vitest" bash -c 'set -o pipefail; cd admin-ui && npx vitest run 2>&1 | tail -80'
+    run "admin-ui vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
   fi
 fi
 
@@ -245,7 +241,7 @@ if touches "agent/"; then
   fi
   run "agent build" bash -c 'cd "agent" && npm run build'
   if [ "$WITH_TESTS" = "1" ]; then
-    run "agent vitest" bash -c 'set -o pipefail; cd agent && npx vitest run 2>&1 | tail -80'
+    run "agent vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite agent --base "$BASE" --repo-root "$WORKSPACE"
   fi
 fi
 
@@ -263,71 +259,19 @@ if touches "backend/"; then
       echo "[check] no changed Python files in backend, skipping lint"
     fi
   fi
-  if [ "$WITH_TESTS" = "1" ]; then
-    # Honest pytest gate: prefer the sanctioned Docker harness; if only an
-    # unfaithful SQLite fallback is available, emit GATE-ENVIRONMENT instead
-    # of blocking on pre-existing environment-only failures. CI remains the
-    # authoritative Postgres run either way.
-    _GATE_MODE="bare"
-    _PG_ENV_OK=0
-    case "${DATABASE_URL:-}" in
-      postgresql*) [ "$(printf '%s' "${USE_TEST_POSTGRES:-}" | tr '[:upper:]' '[:lower:]')" = "true" ] && _PG_ENV_OK=1 ;;
-    esac
-    if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-      _AVAIL_MB=$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 99999)
-      if [ -n "${ALLOW_LOW_MEM:-}" ]; then
-        # Explicit opt-in: force the full sanctioned harness regardless of memory.
-        _GATE_MODE="harness"
-      elif grep -qs -- '--standalone' scripts/test-backend.sh; then
-        # Default on the agent VM: the local gate is a SMOKE CHECK; the full
-        # Docker/Postgres suite is CI's job (and OOMs the 8 GB agent VM, exit
-        # 137). When the harness offers its sanctioned standalone partial, always
-        # prefer it — do NOT run the full suite just because memory happens to be
-        # free at gate-start (the old "_AVAIL_MB >= 4096 -> full" rule fired the
-        # full suite on exactly the VMs too small to survive it).
-        _GATE_MODE="harness-standalone"
-      elif [ "${_AVAIL_MB:-99999}" -ge 4096 ]; then
-        # Harness has no standalone mode — only then run the full harness, and
-        # only with memory headroom for it.
-        _GATE_MODE="harness"
-      fi
-    elif [ -f scripts/test-backend.sh ] && grep -qs -- '--standalone' scripts/test-backend.sh && grep -qs -- '--no-postgres' scripts/test-backend.sh && ! command -v docker >/dev/null 2>&1; then
-      # Docker binary absent AND harness supports --standalone --no-postgres: run
-      # the no-DB invariant + manifest suites directly. When docker binary is
-      # present but the daemon is unavailable (docker info exits 1 — handled above),
-      # the harness still detects the binary and tries to build/pull, so we must
-      # not enter this path in that case. Without docker at all, the harness falls
-      # through to direct pytest which does not need a daemon.
-      _GATE_MODE="harness-standalone"
-    fi
-    if [ "$_GATE_MODE" = "bare" ] && [ "$_PG_ENV_OK" = "0" ] && grep -qs USE_TEST_POSTGRES "backend/conftest.py" "backend"/*/conftest.py; then
-      # The suite selects Postgres-vs-SQLite from env, the Postgres test env
-      # is absent, and the sanctioned harness cannot run here — a bare run
-      # would be the unfaithful SQLite fallback.
-      _GATE_MODE="gate-env"
-    fi
-    case "$_GATE_MODE" in
-      harness)
-        run "backend test (sanctioned harness)" bash -c 'set -o pipefail; bash scripts/test-backend.sh 2>&1 | tail -200' ;;
-      harness-standalone)
-        echo "[check] note: local gate is a smoke check — full Docker/Postgres suite runs in CI; running the harness standalone mode"
-        run "backend test (harness standalone)" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200' ;;
-      bare)
-        run "backend test" bash -c 'cd "backend" && pytest' ;;
-      gate-env)
-        echo "[check] GATE-ENVIRONMENT: backend test gate cannot run faithfully on this VM."
-        echo "[check]   A bare pytest here would select the in-memory SQLite fallback (no Postgres test env, no Docker for the sanctioned harness), where pre-existing Postgres-only tests fail regardless of your diff."
-        echo "[check]   Skipping the unfaithful run instead of blocking on an environment artifact. This is NOT a verdict on your change:"
-        echo "[check]   - Validate the diff where the suite CAN faithfully run (the project's Docker/Postgres harness, or targeted single-file runs) and record that evidence in the PR body."
-        echo "[check]   - CI runs the authoritative Postgres suite on the PR after ./pr open."
-        echo "[check]   - If you have NO faithful test evidence for a test-relevant change, call ./blocked \"<reason>\" --needs-capability \"postgres test environment\" instead of shipping blind."
-        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env; a bare run would be an unfaithful SQLite fallback" >> /tmp/check_gate_env_local-developer.txt ;;
-    esac
-  fi
-
   if [ -n "$(printf '%s\n' "$CHANGED" | while IFS= read -r f; do case "$f" in backend/*.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]; then
     # required backend-authoring verification. No skip can mint this receipt.
-    source scripts/backend-test-route.sh
+    _VERIFICATION_ROUTE_HELPER_OK=0
+    unset -f select_backend_test_route 2>/dev/null || true
+    if [ -r scripts/backend-test-route.sh ] \
+      && bash -n scripts/backend-test-route.sh >/dev/null 2>&1 \
+      && source scripts/backend-test-route.sh \
+      && declare -F select_backend_test_route >/dev/null 2>&1; then
+      _VERIFICATION_ROUTE_HELPER_OK=1
+    else
+      echo "[check] required backend verification FAILED — route helper unavailable or invalid"
+      FAILED+=("backend verification route helper")
+    fi
     _VERIFICATION_DIR='backend'
     _VERIFICATION_HARNESS='scripts/test-backend.sh'
     _VERIFICATION_CHANGED=$(mktemp /tmp/check_verification_changed.XXXXXX)
@@ -405,66 +349,70 @@ if touches "backend/"; then
       fi
       mapfile -t _verification_selector_args < <(printf '%s\n' "$_VERIFICATION_SELECTORS" | head -n 8)
       _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
+      _verification_postgres_flag=""
       if [ -z "$_VERIFICATION_HARNESS" ] || [ ! -f "$_VERIFICATION_HARNESS" ]; then
         echo "[check] required backend verification FAILED — sanctioned harness missing: $_VERIFICATION_HARNESS"
         FAILED+=("$_VERIFICATION_DIR verification: harness missing")
-      else
-        _verification_postgres_flag=""
+      elif [ "$_VERIFICATION_ROUTE_HELPER_OK" = "1" ]; then
         if _verification_postgres_flag="$(select_backend_test_route)"; then
           :
         else
           echo "[check] required backend verification state=runtime_unavailable — PostgreSQL runtime unavailable"
+          _verification_capability_tmp="${_VERIFY_CAPABILITY_RECEIPT}.$$"
+          if ( umask 077; printf 'backend_verification:runtime_unavailable:v1:%s\n' \
+            "$_VERIFY_TASK_ID" >"$_verification_capability_tmp" ) \
+            && mv -f "$_verification_capability_tmp" "$_VERIFY_CAPABILITY_RECEIPT"; then
+            echo "[check] execution capability receipt: $_VERIFY_CAPABILITY_RECEIPT"
+          else
+            echo "[check] unable to record backend verification capability receipt" >&2
+            rm -f "$_verification_capability_tmp" "$_VERIFY_CAPABILITY_RECEIPT"
+            FAILED+=("$_VERIFICATION_DIR verification: capability receipt")
+          fi
           FAILED+=("$_VERIFICATION_DIR verification: runtime_unavailable")
         fi
       fi
       if [ -n "${_verification_postgres_flag:-}" ]; then
         echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest..."
         _verification_harness_receipt="$_VERIFY_HARNESS_RECEIPT"
-        rm -f "$_verification_harness_receipt"
-        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_verification_harness_receipt" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ) \
-          && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d.get("exit_code")==0 and d.get("targeted") is True and d.get("use_test_postgres") is True and d.get("postgres_sidecar") is True and int(d.get("tests",0))>int(d.get("skipped",0)) and d.get("selectors")' "$_verification_harness_receipt"; then
+        _verification_attribution_dir=$(mktemp -d /tmp/check_verification_attribution.XXXXXX)
+        _verification_current_junit="$_verification_attribution_dir/current.xml"
+        rm -f "$_verification_harness_receipt" "$_verification_current_junit"
+        _verification_exit=0
+        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_verification_harness_receipt" BLUEPRINT_VERIFICATION_JUNIT="$_verification_current_junit" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ); then
+          :
+        else
+          _verification_exit=$?
+        fi
+        if [ -s "$_verification_current_junit" ]; then
+          _verification_attribution=$(python3 scripts/backend_verification_guard.py \
+            --base "$BASE" --repo-root "$PWD" --current-junit "$_verification_current_junit" \
+            --current-exit-code "$_verification_exit" --route="$_verification_postgres_flag" \
+            --harness "$_VERIFICATION_HARNESS" "${_verification_selector_args[@]}")
+        else
+          _verification_attribution='{"state":"execution_failure","blocking":true,"new_failures":{}}'
+        fi
+        echo "[check] backend verification attribution: $_verification_attribution"
+        _verification_state=$(printf '%s' "$_verification_attribution" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state","attribution_unavailable"))' 2>/dev/null || printf attribution_unavailable)
+        _verification_tests=$(python3 -c 'import sys,xml.etree.ElementTree as ET; print(sum(1 for _ in ET.parse(sys.argv[1]).getroot().iter("testcase")))' "$_verification_current_junit" 2>/dev/null || printf 0)
+        _verification_skipped=$(python3 -c 'import sys,xml.etree.ElementTree as ET; print(sum(1 for c in ET.parse(sys.argv[1]).getroot().iter("testcase") if c.find("skipped") is not None))' "$_verification_current_junit" 2>/dev/null || printf 0)
+        if [ "$_verification_tests" -gt 0 ] && [ "$_verification_skipped" -eq "$_verification_tests" ]; then
+          _verification_state=skipped_test
+        fi
+        if [ "$_verification_state" = "passed" ] || [ "$_verification_state" = "preexisting_test_failure" ]; then
+          echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest OK — state=$_verification_state"
           _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
-          _verification_tmp="${_VERIFY_RECEIPT}.$$"
-          if python3 -c 'import datetime,json,sys; out,task,directory,harness,selectors,harness_receipt,postgres_flag=sys.argv[1:]; runtime=json.load(open(harness_receipt,encoding="utf-8")); payload={"version":1,"task_id":task,"directory":directory,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"ruff":{"command":"python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>","exit_code":0},"pytest":{"command":"USE_TEST_POSTGRES=true bash "+harness+" "+postgres_flag+" <impacted-selectors>","harness":harness,"selectors":json.loads(selectors),"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":runtime["tests"],"skipped":runtime["skipped"],"exit_code":0}}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$_verification_tmp" "$_VERIFY_TASK_ID" "$_VERIFICATION_DIR" "$_VERIFICATION_HARNESS" "$_verification_selectors_json" "$_verification_harness_receipt" "$_verification_postgres_flag" \
-            && mv -f "$_verification_tmp" "$_VERIFY_RECEIPT"; then
-            echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest OK"
+          if python3 -c 'import datetime,json,sys,xml.etree.ElementTree as ET; out,task,directory,harness,selectors,attribution,junit=sys.argv[1:]; d=json.loads(attribution); root=ET.parse(junit).getroot(); cases=list(root.iter("testcase")); skipped=sum(1 for c in cases if c.find("skipped") is not None); failed=sum(1 for c in cases if c.find("failure") is not None or c.find("error") is not None); payload={"version":1,"task_id":task,"directory":directory,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"ruff":{"command":"python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>","exit_code":0},"pytest":{"command":"USE_TEST_POSTGRES=true bash "+harness+" <impacted-selectors>","harness":harness,"selectors":json.loads(selectors),"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"state":d["state"],"current_exit_code":int(d.get("current_exit_code",0)),"tests":len(cases),"skipped":skipped,"failures":failed,"new_failures":d.get("new_failures",{}),"suppressed_failures":d.get("suppressed_failures",{}),"disappeared_failures":d.get("disappeared_failures",{}),"skipped_failures":d.get("skipped_failures",{}),"exit_code":0}}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$_VERIFY_RECEIPT" "$_VERIFY_TASK_ID" "$_VERIFICATION_DIR" "$_VERIFICATION_HARNESS" "$_verification_selectors_json" "$_verification_attribution" "$_verification_current_junit"; then
             echo "[check] verification receipt: $_VERIFY_RECEIPT"
           else
-            echo "[check] required backend verification FAILED — could not write receipt"
-            rm -f "$_verification_tmp" "$_VERIFY_RECEIPT"
+            echo "[check] required backend verification FAILED — could not write attribution receipt"
             FAILED+=("$_VERIFICATION_DIR verification receipt")
           fi
         else
-          echo "[check] $_VERIFICATION_DIR targeted Postgres pytest failed; collecting JUnit attribution"
-          _verification_attribution_dir=$(mktemp -d /tmp/check_verification_attribution.XXXXXX)
-          _verification_current_junit="$_verification_attribution_dir/current.xml"
-          rm -f "$_verification_harness_receipt" "$_verification_current_junit"
-          if ( set -o pipefail; BLUEPRINT_VERIFICATION_JUNIT="$_verification_current_junit" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ); then
-            _verification_attribution='{"state":"execution_failure","blocking":true,"new_failures":{}}'
-          elif [ -s "$_verification_current_junit" ]; then
-            _verification_attribution=$(python3 scripts/backend_verification_guard.py \
-              --base "$BASE" --repo-root "$PWD" --current-junit "$_verification_current_junit" \
-              --route="$_verification_postgres_flag" --harness "$_VERIFICATION_HARNESS" \
-              "${_verification_selector_args[@]}" 2>/dev/null || true)
-          else
-            _verification_attribution='{"state":"execution_failure","blocking":true,"new_failures":{}}'
-          fi
-          _verification_state=$(printf '%s' "$_verification_attribution" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state","attribution_unavailable"))' 2>/dev/null || printf attribution_unavailable)
-          if [ "$_verification_state" = "preexisting_test_failure" ]; then
-            echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest OK — only pre-existing failures"
-            if python3 -c 'import datetime,json,sys; out,task,directory,harness,selectors,attribution=sys.argv[1:]; d=json.loads(attribution); payload={"version":1,"task_id":task,"directory":directory,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"ruff":{"command":"python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>","exit_code":0},"pytest":{"command":"USE_TEST_POSTGRES=true bash "+harness+" <impacted-selectors>","harness":harness,"selectors":json.loads(selectors),"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"state":d["state"],"current_exit_code":1,"new_failures":d["new_failures"],"exit_code":0}}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$_VERIFY_RECEIPT" "$_VERIFY_TASK_ID" "$_VERIFICATION_DIR" "$_VERIFICATION_HARNESS" "$_verification_selectors_json" "$_verification_attribution"; then
-              echo "[check] verification receipt: $_VERIFY_RECEIPT"
-            else
-              echo "[check] required backend verification FAILED — could not write attribution receipt"
-              FAILED+=("$_VERIFICATION_DIR verification receipt")
-            fi
-          else
-            echo "[check] required backend verification FAILED — state=$_verification_state"
-            rm -f "$_VERIFY_RECEIPT"
-            FAILED+=("$_VERIFICATION_DIR verification: $_verification_state")
-          fi
-          rm -rf "$_verification_attribution_dir"
+          echo "[check] required backend verification FAILED — state=$_verification_state"
+          rm -f "$_VERIFY_RECEIPT"
+          FAILED+=("$_VERIFICATION_DIR verification: $_verification_state")
         fi
+        rm -rf "$_verification_attribution_dir"
         rm -f "$_verification_harness_receipt"
       fi
     fi

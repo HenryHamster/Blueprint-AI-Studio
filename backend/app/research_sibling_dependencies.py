@@ -8,9 +8,6 @@ from app.models import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
 
-RESEARCH_SIBLING_SERIALIZATION_JACCARD = 0.5
-RESEARCH_SIBLING_SERIALIZATION_CONTAINMENT = 1.0
-
 
 def wire_research_sibling_edges(
     child_tasks: List[Task],
@@ -18,7 +15,16 @@ def wire_research_sibling_edges(
     overlaps: List[tuple],
     candidates: List[Task],
 ) -> List[tuple]:
-    """Wire dependencies for siblings whose complete file scopes overlap."""
+    """Wire a serialization edge for every sibling pair that shares a file.
+
+    A shared file is positive evidence of coupling — the later sibling's PR is
+    otherwise built on a base that lacks the earlier sibling's change to that
+    file, so the pair races at merge and the survivors break each other's
+    contracts. There is deliberately no overlap-ratio threshold: even a single
+    shared integration file (models.py, a shared schema) is the contract
+    surface where parallel siblings collide. Genuinely disjoint siblings still
+    run fully parallel.
+    """
 
     from app.blocked_need_resolution import _would_create_cycle
 
@@ -54,17 +60,8 @@ def wire_research_sibling_edges(
             if isinstance(successor_related, list)
             else set()
         )
-        file_union = predecessor_files | successor_files
         actual_shared = predecessor_files & successor_files
-        smaller_scope = min(len(predecessor_files), len(successor_files))
-        jaccard_overlap = len(actual_shared) / len(file_union) if file_union else 0
-        containment_overlap = (
-            len(actual_shared) / smaller_scope if smaller_scope else 0
-        )
-        if (
-            jaccard_overlap < RESEARCH_SIBLING_SERIALIZATION_JACCARD
-            and containment_overlap < RESEARCH_SIBLING_SERIALIZATION_CONTAINMENT
-        ):
+        if not actual_shared:
             continue
         if (
             predecessor.status in (TaskStatus.CANCELLED, TaskStatus.FAILED)
@@ -125,8 +122,4 @@ def converge_spawn_batch_foundations(
 
 
 # Established private/public names remain import-compatible.
-_RESEARCH_SIBLING_SERIALIZATION_JACCARD = RESEARCH_SIBLING_SERIALIZATION_JACCARD
-_RESEARCH_SIBLING_SERIALIZATION_CONTAINMENT = (
-    RESEARCH_SIBLING_SERIALIZATION_CONTAINMENT
-)
 _wire_research_sibling_edges = wire_research_sibling_edges

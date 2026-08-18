@@ -13,7 +13,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 from sqlalchemy import func
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -48,10 +48,11 @@ from app.spawn_calibration import (
 
 # Authoritative issue ledger. Side-effect-free; re-exported here so callers
 # importing from app.review_pipeline keep working.
-from app.issue_ledger import (  # noqa: F401
+from app.issue_ledger import (
     build_issue_ledger,
     ensure_issue_ids,
 )
+from app.module_finding_chain import MODULE_FINDING_CHAIN_ESCALATION_KEY
 
 # Pure, side-effect-free review-loop heuristics live in review_heuristics; they
 # are re-exported here so existing callers/tests that import them from
@@ -75,6 +76,8 @@ from app.review_heuristics import (  # noqa: F401
     STUCK_CYCLE_THRESHOLD_DEFAULT,
     STUCK_CYCLE_THRESHOLD_MEDIUM,
     STUCK_CYCLE_THRESHOLD_REFACTOR,
+    CROSS_PR_CONCERN_JACCARD_THRESHOLD,
+    CROSS_PR_MIN_DISTINCT_PRS,
     _critical_major_count,
     _detect_issue_churn,
     _diff_lines_changed,
@@ -86,9 +89,11 @@ from app.review_heuristics import (  # noqa: F401
     _reconcile_narrow_focus_with_fix_all,
     _repeating_issue_descriptions,
     _stuck_thresholds,
+    actioned_review_cap_tasks,
     classify_iteration_lane,
     compute_drift_signal,
     detect_early_nonconvergence,
+    detect_cross_pr_repeat_concern_chains,
     detect_fix_all_issue_class,
     detect_hedges_in_diff,
     detect_unjustified_hedge,
@@ -121,14 +126,14 @@ from app.review_loop_convergence import (
     SCOPE_PRESSURE_WARN_THRESHOLD,
     _CHURN_NARROW_FOCUS_PREFIX,
     _EARLY_REPEATING_ISSUES_PREFIX,
-    _handle_cap_exhaustion,
-    _handle_persistent_conflict_escalation,
+    _handle_cap_exhaustion,  # noqa: F401 - compatibility re-export
     _MID_BUDGET_NARROW_FOCUS_PREFIX,
     _SCOPE_PRESSURE_HARD_CAP_PREFIX,
     _is_pipeline_task_stale,
     _task_is_actively_ci_waiting,
     _set_review_loop_terminal_outcome,
     build_cross_episode_abandon_candidate,
+    build_review_cap_abandon_candidate,
     CROSS_EPISODE_ABANDON_THRESHOLD,
     REVIEW_LOOP_ABANDON_CANDIDATE_KEY,
     review_loop_parked_for_operator,  # noqa: F401 — re-exported for lifecycle/rollup callers
@@ -677,6 +682,11 @@ SPAWN_REASON_ALREADY_MERGED = "already_merged"
 # log accurately (a closed-unmerged PR is NOT the same as a mid-flight merge).
 SPAWN_REASON_PR_CLOSED_UNMERGED = "pr_closed_unmerged"
 SPAWN_REASON_DEFERRED = "deferred_cross_type"
+SPAWN_REASON_ADMISSION_PAUSED = "deferred_admission_paused"
+# A row/advisory-lock peer temporarily prevented exact authority. Unlike a
+# paused/archived/missing project, this must preserve an already-elapsed
+# review-wait backstop and retry on the short scheduler interval.
+SPAWN_REASON_CONTENDED = "spawn_authority_contended"
 SPAWN_REASON_CAP = "cap_exhausted"
 SPAWN_REASON_STUCK = "stuck_cycle"
 # Early non-convergence escalation: the review-fix loop is whittling/drifting
@@ -785,8 +795,9 @@ async def _halt_for_cross_episode_abandon_candidate(
     original_task: Task | None,
     *,
     pr_number: int,
-    candidate: dict[str, object],
+    candidate: dict[str, Any],
     session: AsyncSession,
+    spawn_reason: str = SPAWN_REASON_ABANDON_CANDIDATE,
 ) -> None:
     """Persist and surface the PR-level stop signal before any new spawn.
 
@@ -806,11 +817,21 @@ async def _halt_for_cross_episode_abandon_candidate(
     target_ctx = dict(target.context or {})
     target_ctx[REVIEW_LOOP_ABANDON_CANDIDATE_KEY] = marker
     target.context = target_ctx
-    target.requires_approval = True
+    from app.admin_approval_authority import establish_independent_approval_hold
+
+    establish_independent_approval_hold(
+        target,
+        reason="cross_episode_abandon_candidate",
+        owner="review_pipeline",
+    )
+    candidate_reason = str(candidate.get("reason") or "abandon_candidate")
+    candidate_detail = str(candidate.get("detail") or "").strip()
     target.latest_status_message = (
-        f"PR #{pr_number} is an abandon candidate after {candidate['attempts']} "
-        f"review/fix attempts across {candidate['cycles']} cycle(s); "
-        "automatic fix spawning stopped."
+        f"PR #{pr_number} is parked for operator disposition after "
+        f"{candidate['attempts']} review/fix attempts across "
+        f"{candidate['cycles']} actioned generation(s) "
+        f"({candidate_reason}); automatic fix spawning stopped."
+        + (f" {candidate_detail}" if candidate_detail else "")
     )
     flag_modified(target, "context")
     session.add(target)
@@ -821,7 +842,7 @@ async def _halt_for_cross_episode_abandon_candidate(
         source_task.context = source_ctx
         source_task.latest_status_message = target.latest_status_message
         flag_modified(source_task, "context")
-    _set_spawn_reason(source_task, SPAWN_REASON_ABANDON_CANDIDATE)
+    _set_spawn_reason(source_task, spawn_reason)
     session.add(source_task)
 
     try:
@@ -850,6 +871,60 @@ async def _halt_for_cross_episode_abandon_candidate(
             exc_info=True,
         )
     await session.commit()
+
+
+async def _surface_module_finding_chain_escalation(
+    source_task: Task,
+    original_task: Task | None,
+    *,
+    pr_number: int,
+    candidate: dict[str, object],
+    session: AsyncSession,
+) -> None:
+    """Surface a recurring concern without blocking the current PR's fix."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    target = original_task or source_task
+    marker = {
+        **candidate,
+        "pr_number": pr_number,
+        "recorded_at": _utcnow().isoformat(),
+    }
+    target_ctx = dict(target.context or {})
+    target_ctx[MODULE_FINDING_CHAIN_ESCALATION_KEY] = marker
+    target.context = target_ctx
+    flag_modified(target, "context")
+    session.add(target)
+    if source_task.id != target.id:
+        source_ctx = dict(source_task.context or {})
+        source_ctx[MODULE_FINDING_CHAIN_ESCALATION_KEY] = marker
+        source_task.context = source_ctx
+        flag_modified(source_task, "context")
+        session.add(source_task)
+
+    try:
+        from app.alert_dispatch import _maybe_create_escalation_alert
+
+        await _maybe_create_escalation_alert(
+            target,
+            session,
+            pr_number=pr_number,
+            reason="module-finding-chain",
+            iteration=int(
+                candidate.get("verified_occurrences") or candidate["occurrences"]
+            ),
+            detail=(
+                f"Recurring concern in {candidate['file_path']} across "
+                f"{candidate['occurrences']} merged PR(s); current fix continues."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — marker remains durable
+        logger.warning(
+            "[PIPELINE] Failed to create module-finding-chain alert for PR #%s: %s",
+            pr_number,
+            exc,
+            exc_info=True,
+        )
 
 
 def _normalized_review_target(
@@ -1522,7 +1597,9 @@ async def _check_fix_mid_retry_defer(
     return False
 
 
-def task_counts_toward_review_cap(task: Task) -> bool:
+def task_counts_toward_review_cap(
+    task: Task, *, include_archived: bool = False
+) -> bool:
     """Whether ``task`` counts toward the per-PR / per-lane review-fix iteration cap.
 
     Single source of truth for cap-counting eligibility, shared by the pipeline
@@ -1531,14 +1608,17 @@ def task_counts_toward_review_cap(task: Task) -> bool:
     control logic exactly. A task is EXCLUDED from the cap when any of the
     following apply:
 
-      * it is archived — the pipeline cap query always filters ``archived=False``,
-        mirroring the manual iteration-cap reset path;
+      * it is archived and ``include_archived`` is false — the ordinary pipeline
+        cap query filters ``archived=False``, mirroring the manual iteration-cap
+        reset path. The PR-lifetime cross-episode backstop passes true because
+        archival is not authority to erase already-consumed work;
       * it is FAILED/CANCELLED with an infra-class ``failure_category`` — it
         never actually ran a review (provisioning / rate limit / agent timeout
         / external API / admin-cancel supersede), so counting it would trip the
         cap with zero real reviews on the PR; or
-      * it is a stale-head discard (``_review_stale_head``) — a review that ran
-        against an older head than the live PR head, discarded and respawned;
+      * it is a stale-target discard (``_review_stale_head`` compatibility or
+        ``_review_stale_target``) — a review that ran against a different exact
+        base/head pair, discarded and respawned;
         counting it would penalise the chain for a verdict it couldn't act on.
 
     Note: the live pipeline cap query selects status in (COMPLETED, FAILED) only
@@ -1558,13 +1638,16 @@ def task_counts_toward_review_cap(task: Task) -> bool:
     """
     from app.failure_classification import INFRA_ANALYTICS_CLASSES
 
-    if getattr(task, "archived", False):
+    if getattr(task, "archived", False) and not include_archived:
         return False
     if task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
         fc = (task.context or {}).get("failure_category")
         if fc in INFRA_ANALYTICS_CLASSES:
             return False
-    return not (task.context or {}).get("_review_stale_head")
+    context = task.context or {}
+    return not (
+        context.get("_review_stale_head") or context.get("_review_stale_target")
+    )
 
 
 def _recent_consecutive_lane_count(
@@ -1880,6 +1963,10 @@ async def _spawn_pipeline_task(
     fix_target: dict[str, str | int] | None = None,
     suppress_warm_handoff: bool = False,
     attempt: int = 0,
+    source_spawn_authority: Callable[[AsyncSession], Awaitable[Task | None]]
+    | None = None,
+    source_spawn_publication: Callable[[Task, AsyncSession], Awaitable[None]]
+    | None = None,
 ) -> tuple[Task | None, bool]:
     """Spawn a review or fix task as part of the automated review pipeline.
 
@@ -1913,9 +2000,52 @@ async def _spawn_pipeline_task(
     # commits — each spawn has a distinct idempotency_key so the active-key
     # partial UNIQUE doesn't catch the race, and we end up with a double
     # review/fix on the same PR/chain. Lock is held until commit/rollback.
-    from app.task_locking import (
+    from app.task_locking import (  # local import to keep top of file lean
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE,
+        acquire_automatic_task_creation_authority,
         acquire_pr_spawn_lock,
-    )  # local import to keep top of file lean
+    )
+
+    # Project pause is an admission authority, not merely a dispatch filter.
+    # Take it before the PR serializer or any child-task query/mutation and hold
+    # it through the eventual INSERT commit.  Otherwise review/fix chains can
+    # author latent QUEUED rows during a drain and release a burst on resume.
+    admission = await acquire_automatic_task_creation_authority(
+        session, source_task.project_id, skip_locked=True
+    )
+    admission_contended = False
+    if (
+        source_spawn_authority is not None
+        and admission == AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE
+    ):
+        # ``project_unavailable`` intentionally conflates a missing Project with
+        # SKIP LOCKED contention. A plain MVCC read does not wait on the row lock
+        # and lets this backstop distinguish a true unavailable fence (clock may
+        # pause/reset) from harmless contention (short retry, elapsed preserved).
+        from app.models import Project as _AdmissionProject
+
+        admission_contended = (
+            (
+                await session.execute(
+                    select(_AdmissionProject.id).where(
+                        _AdmissionProject.id == source_task.project_id
+                    )
+                )
+            ).scalar_one_or_none()
+            is not None
+        )
+    if (
+        admission != AUTOMATIC_TASK_CREATION_ALLOWED
+        and source_spawn_authority is None
+    ):
+        source_task.latest_status_message = (
+            f"{task_type.title()} spawn deferred for PR #{pr_number} — "
+            f"automatic task admission is closed ({admission})"
+        )
+        _set_spawn_reason(source_task, SPAWN_REASON_DEFERRED)
+        session.add(source_task)
+        return (None, False)
 
     # ``pg_advisory_xact_lock`` BLOCKS. Under contention it waits out Postgres'
     # bounded ``lock_timeout`` (30s — database.py:405-418) and then raises
@@ -1939,6 +2069,11 @@ async def _spawn_pipeline_task(
             f"the per-PR spawn lock (a peer spawner holds it) — deferring to the "
             f"next sweep: {str(_spawn_lock_exc)[:200]}"
         )
+        # A caller-provided authority was never acquired, so this transaction
+        # has no right to rewrite the released source row.  Its caller treats
+        # this source-neutral suppression as a transient deferral.
+        if source_spawn_authority is not None:
+            return (None, False)
         # The rollback expired every loaded instance (even under
         # expire_on_commit=False), so re-fetch the source by id before touching
         # it — mirrors the INSERT-side lock-timeout handler.
@@ -1964,6 +2099,99 @@ async def _spawn_pipeline_task(
             _set_spawn_reason(_reloaded_source, SPAWN_REASON_DEFERRED)
             session.add(_reloaded_source)
             await session.commit()
+        return (None, False)
+
+    # Canonical lock order for a source row released by the caller is
+    # Project -> PR -> Task.  Acquire and validate the exact source attempt now,
+    # before any source-derived decision or committing early return.  The Task
+    # lock remains held through the eventual child INSERT commit, so a concurrent
+    # approval, replacement, or archive either wins before this check (and
+    # suppresses the spawn) or waits until the child is authoritative.
+    if source_spawn_authority is not None:
+        authoritative_source = await source_spawn_authority(session)
+        if authoritative_source is None:
+            await session.rollback()
+            return (None, False)
+        source_task = authoritative_source
+    elif task_type == "fix":
+        # A human-approval merge may have reached its durable pre-PUT boundary
+        # after this caller loaded ``source_task``.  Re-read code-writing
+        # admissions under the already-held canonical Project -> PR -> Task
+        # order; reviews are read-only reconciliation and remain unaffected.
+        authoritative_source = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(Task.id == source_task_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if authoritative_source is None:
+            await session.rollback()
+            return (None, False)
+        source_task = authoritative_source
+
+    if task_type == "fix":
+        from app.admin_approval_authority import approval_merge_in_flight
+
+        merge_fence_task = source_task
+        merge_fence_task_id = str(
+            original_task_id
+            or source_task.first_payload.get("original_task_id")
+            or ""
+        )
+        if merge_fence_task_id and merge_fence_task_id != str(source_task.id):
+            try:
+                merge_fence_uuid = uuid.UUID(merge_fence_task_id)
+            except (TypeError, ValueError, AttributeError):
+                merge_fence_uuid = None
+            if merge_fence_uuid is not None:
+                # The per-PR admission lock already serializes this publication
+                # against merge submission.  A fresh MVCC read of the chain
+                # original is therefore enough to see any intent that could
+                # possibly have reached SUBMISSION_STARTED; a not_sent intent
+                # committed just after this read still cannot pass its PR gate
+                # until this child transaction releases it.
+                merge_fence_task = (
+                    (
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id == merge_fence_uuid)
+                            .execution_options(populate_existing=True)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if merge_fence_task is None:
+                    await session.rollback()
+                    return (None, False)
+
+        if await approval_merge_in_flight(merge_fence_task, session):
+            # ``ambiguous`` means the GitHub merge PUT may already have been
+            # accepted.  Suppress source-neutrally: the durable ledger, not a
+            # spawn-reason/status rewrite, owns convergence from this point.
+            await session.rollback()
+            return (None, False)
+
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        source_task.latest_status_message = (
+            f"{task_type.title()} spawn deferred for PR #{pr_number} — "
+            f"automatic task admission is closed ({admission})"
+        )
+        _set_spawn_reason(
+            source_task,
+            (
+                SPAWN_REASON_CONTENDED
+                if admission_contended
+                else SPAWN_REASON_ADMISSION_PAUSED
+            ),
+        )
+        session.add(source_task)
         return (None, False)
 
     from app.review_repository_scope import repository_project_ids
@@ -2019,9 +2247,11 @@ async def _spawn_pipeline_task(
 
     # Guard: don't spawn if PR is already merged (check both original and source).
     orig_task: Task | None = None
+    _orig_pr_already_merged = False
     try:
         orig_task = await session.get(Task, uuid.UUID(resolved_original_id))
         if orig_task and (orig_task.context or {}).get("pr_merged"):
+            _orig_pr_already_merged = True
             logger.info(
                 f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (original task {resolved_original_id[:8]})"
             )
@@ -2059,8 +2289,18 @@ async def _spawn_pipeline_task(
                 logger.debug(
                     "[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True
                 )
+            # Callback callers release their outer source lock before entering
+            # this helper. Persist the authoritative terminal effects while the
+            # exact source authority acquired above is still held; the caller's
+            # stale-state cleanup must never roll back completion/lane retirement.
+            await session.commit()
             return (None, False)
     except Exception:  # noqa: BLE001
+        if _orig_pr_already_merged:
+            # A matched terminal guard owns real completion/lane mutations.
+            # Commit failure must propagate to the caller's retry boundary; it
+            # is not a best-effort inability to inspect ``pr_merged``.
+            raise
         logger.debug(
             f"[PIPELINE] Could not verify pr_merged for original task {resolved_original_id[:8]}: skipping check"
         )
@@ -2079,6 +2319,7 @@ async def _spawn_pipeline_task(
             logger.debug(
                 "[PIPELINE] retire_chain_lane failed (non-critical)", exc_info=True
             )
+        await session.commit()
         return (None, False)
 
     # Guard: don't spawn if PR was closed without merge.
@@ -2104,6 +2345,24 @@ async def _spawn_pipeline_task(
                 "[PIPELINE] retire_chain_lane (pr_closed_unmerged) failed (non-critical)",
                 exc_info=True,
             )
+        await session.commit()
+        return (None, False)
+
+    # A convergence/cap stop hands the PR to the existing operator-disposition
+    # path.  The reset-iteration-cap operation clears the abandon marker and
+    # fences a fresh census window; until then, no direct completion callback
+    # may bypass the park and restart review/fix work.
+    # The chain root owns terminal disposition.  Child copies are only a
+    # callback breadcrumb; consulting them after reset-iteration-cap would
+    # resurrect the cleared park from stale source history.
+    _operator_park_reason = review_loop_parked_for_operator(orig_task or source_task)
+    if _operator_park_reason is not None:
+        source_task.latest_status_message = (
+            f"Review/fix spawn suppressed for PR #{pr_number} — operator owns "
+            f"the parked disposition ({_operator_park_reason})"
+        )
+        _set_spawn_reason(source_task, SPAWN_REASON_ABANDON_CANDIDATE)
+        session.add(source_task)
         return (None, False)
 
     # ── verify_tests fast-path ──────────────────────────────────────────────
@@ -2534,7 +2793,15 @@ async def _spawn_pipeline_task(
             if churn_last:
                 detail += f" Last superseded task: {churn_last}."
         if _runtime_config.get("require_approval_gates", True):
-            orig_task.requires_approval = True
+            from app.admin_approval_authority import (
+                establish_independent_approval_hold,
+            )
+
+            establish_independent_approval_hold(
+                orig_task,
+                reason="supersession_churn_halt",
+                owner="review_pipeline",
+            )
         orig_task.latest_status_message = (
             f"Review/fix supersession churn on PR #{pr_number}: "
             f"{supersede_churn_count} consecutive superseded task(s); "
@@ -2617,6 +2884,13 @@ async def _spawn_pipeline_task(
                 f"[PIPELINE] Cancelled in-flight {_inflight_type} task {_inflight.id} "
                 f"for PR #{pr_number} (churn halt)"
             )
+        # Commit every source/original/cancellation mutation, including the
+        # terminal spawn reason, exactly once while Project -> PR -> Task
+        # authority is still held. The alert helper below commits independently;
+        # no source ORM identity may be dirtied after that release point.
+        _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
+        session.add(source_task)
+        await session.commit()
         try:
             await _maybe_create_escalation_alert(
                 orig_task,
@@ -2652,9 +2926,6 @@ async def _spawn_pipeline_task(
             )
         except Exception as _ne:  # noqa: BLE001
             logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}")
-        _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
-        session.add(source_task)
-        await session.commit()
         # Delete VMs for all cancelled tasks after commit
         for vm_id, reason in vms_to_delete:
             await vm_lifecycle._ensure_vm_deleted(
@@ -2869,17 +3140,12 @@ async def _spawn_pipeline_task(
     abandon_candidate = build_cross_episode_abandon_candidate(
         consumed_cross_episode_tasks,
         threshold=CROSS_EPISODE_ABANDON_THRESHOLD,
+        actionable_tasks=[
+            task
+            for task in consumed_cross_episode_tasks
+            if task_counts_toward_review_cap(task, include_archived=True)
+        ],
     )
-    if abandon_candidate is not None and task_type in ("review", "fix"):
-        await _halt_for_cross_episode_abandon_candidate(
-            source_task,
-            orig_task,
-            pr_number=pr_number,
-            candidate=abandon_candidate,
-            session=session,
-        )
-        return (None, False)
-
     # The remaining guards use the pre-existing completed/failed population;
     # cancelled tasks are evidence for abandonment but do not change the
     # ordinary cap or lane budgets.
@@ -2941,6 +3207,7 @@ async def _spawn_pipeline_task(
                         f"both failed with fp={fp_b} — halting spawn"
                         f"{' (already classified, skipping reclassify)' if already_halted else ', reclassifying most-recent as BLOCKED_PRECONDITION'}."
                     )
+                    _orig = None
                     if not already_halted:
                         # Reclassify b (the most recent FAILED) so its row stops
                         # contributing to CODE_ERROR cap pressure and so any
@@ -2962,7 +3229,6 @@ async def _spawn_pipeline_task(
                         session.add(b)
                         # Surface to operator/strategic via requires_approval
                         # on the chain's original task — mirrors stuck-cycle.
-                        _orig = None
                         try:
                             _orig = await session.get(
                                 Task, uuid.UUID(resolved_original_id)
@@ -2977,7 +3243,15 @@ async def _spawn_pipeline_task(
                                 # parent. The BLOCKER status message is informational
                                 # and set regardless.
                                 if _runtime_config.get("require_approval_gates", True):
-                                    _orig.requires_approval = True
+                                    from app.admin_approval_authority import (
+                                        establish_independent_approval_hold,
+                                    )
+
+                                    establish_independent_approval_hold(
+                                        _orig,
+                                        reason="repeat_fingerprint_halt",
+                                        owner="review_pipeline",
+                                    )
                                 _orig.latest_status_message = (
                                     f"Repeat-fingerprint halt on PR #{pr_number}: last "
                                     f"two {src_payload_type} attempts failed identically "
@@ -3013,6 +3287,15 @@ async def _spawn_pipeline_task(
                                 f"message for PR #{pr_number}: {_msg_err}",
                                 exc_info=True,
                             )
+                        # The alert helper is best-effort and may either
+                        # deduplicate without committing or raise before it
+                        # writes. Persist the authoritative terminal outcome,
+                        # failed-row classification, BLOCKER message, and
+                        # approval gate as one transaction before entering that
+                        # advisory boundary. The source spawn reason below is
+                        # deliberately return-only bookkeeping for the wrapper.
+                        await session.commit()
+
                         # Durable operator Alert — fires regardless of approval
                         # gates (mirrors the stuck-cycle path). Deduplicated by
                         # (task_id, title) so re-entry does not spam the banner.
@@ -3047,7 +3330,29 @@ async def _spawn_pipeline_task(
     # 78de0fdb: supersede-cancels burning cap slots at PR #4091).
     _counts_toward_cap = task_counts_toward_review_cap
 
-    pr_iterations = sum(1 for t in pr_pipeline_tasks if _counts_toward_cap(t))
+    cap_eligible_tasks = [
+        task for task in pr_pipeline_tasks if _counts_toward_cap(task)
+    ]
+    # Collapse worker rows onto the exact patch/open-set generation they
+    # actioned. A REQUEST_CHANGES review and its fix share one target key;
+    # parallel reviews of the same pair also share it. This makes the cap a
+    # bound on attempted code generations rather than a concurrency tax.
+    cap_generation_tasks = actioned_review_cap_tasks(cap_eligible_tasks)
+    pr_iterations = len(cap_generation_tasks)
+    chain_generation_tasks = [
+        task
+        for task in cap_generation_tasks
+        if is_rollup_source
+        or str(
+            ((task.context or {}).get("review_loop") or {}).get(
+                "original_task_id"
+            )
+            or task.first_payload.get("original_task_id")
+            or ""
+        )
+        == resolved_original_id
+    ]
+    chain_iterations = len(chain_generation_tasks)
 
     # ── Per-lane iteration counts ───────────────────────────────────────────
     # Count existing iterations by lane (applying the same infra-class cap
@@ -3058,12 +3363,11 @@ async def _spawn_pipeline_task(
         LANE_CI: 0,
         LANE_REVIEW_CONVERGENCE: 0,
     }
-    for _lt in pr_pipeline_tasks:
-        if _counts_toward_cap(_lt):
-            _lane = classify_iteration_lane(_lt)
-            lane_counts[_lane] = lane_counts.get(_lane, 0) + 1
+    for _lt in cap_generation_tasks:
+        _lane = classify_iteration_lane(_lt)
+        lane_counts[_lane] = lane_counts.get(_lane, 0) + 1
     recent_consecutive_conflict_count = _recent_consecutive_lane_count(
-        pr_pipeline_tasks,
+        cap_generation_tasks,
         LANE_CONFLICT,
         _counts_toward_cap,
     )
@@ -3117,29 +3421,144 @@ async def _spawn_pipeline_task(
     # context flags set authoritatively by rollup_management when spawning review/fix tasks.
     is_rollup = _is_rollup_chain_source(source_task)
     global_cap = MAX_REVIEW_FIX_ITERATIONS if is_rollup else base_cap
+    source_loop = (source_task.context or {}).get("review_loop", {})
+    iteration = source_loop.get("iteration", 0) + 1
+    per_chain_cap = MAX_REVIEW_FIX_ITERATIONS if is_rollup else base_cap
+
+    # Build the incoming authoritative review round before applying any
+    # numerical cap. Semantic non-convergence owns a more specific and safer
+    # disposition than generic budget exhaustion; evaluating it after the cap
+    # made its escalation branch unreachable at the exact threshold.
+    prev_review_history = source_loop.get("review_history", [])
+    _source_changed_files = (
+        (source_task.context or {}).get("_pr_changed_files")
+        or ((orig_task.context or {}).get("_pr_changed_files") if orig_task else None)
+        or []
+    )
+    _normalized_current_issues = ensure_issue_ids(
+        current_issues,
+        reviewed_head_sha=reviewed_head_sha,
+        iteration=iteration - 1,
+    )
+    new_review_entry: dict[str, object] = {
+        "iteration": iteration - 1,
+        "feedback": current_feedback,
+        "verdict": "REQUEST_CHANGES",
+        "changed_files": list(_source_changed_files)[:30],
+        **(
+            {"reviewed_head_sha": reviewed_head_sha}
+            if reviewed_head_sha
+            else {}
+        ),
+        **(
+            {"reviewed_base_sha": reviewed_base_sha}
+            if reviewed_base_sha
+            else {}
+        ),
+        **(
+            {
+                "target_verified_by_backend": True,
+                "review_task_id": str(source_task.id),
+            }
+            if target_verified_by_backend
+            and reviewed_head_sha
+            and reviewed_base_sha
+            else {}
+        ),
+        **(
+            {"delta_base_sha": source_loop.get("delta_base_sha")}
+            if source_loop.get("delta_base_sha")
+            else {}
+        ),
+        **(
+            {"resolutions": list(current_resolutions or [])[:30]}
+            if current_resolutions
+            else {}
+        ),
+    }
+    if _normalized_current_issues:
+        new_review_entry["issues"] = _normalized_current_issues
+    has_current_review_result = task_type == "fix" and bool(
+        current_feedback or _normalized_current_issues or current_resolutions
+    )
+    new_review_history = bound_review_history(
+        [*prev_review_history, new_review_entry]
+        if has_current_review_result
+        else prev_review_history
+    )
+
+    if task_type == "fix" and iteration >= EARLY_NONCONVERGENCE_ESCALATE_AT:
+        should_escalate, nonconvergence_reason = detect_early_nonconvergence(
+            new_review_history
+        )
+        if should_escalate:
+            candidate = build_review_cap_abandon_candidate(
+                consumed_cross_episode_tasks,
+                actioned_generations=max(pr_iterations, chain_iterations),
+                threshold=per_chain_cap,
+                scope="semantic-nonconvergence",
+                lane_counts=lane_counts,
+                reason="semantic_nonconvergence",
+                detail=(
+                    f"Review-fix loop is not converging at iteration {iteration}; "
+                    "detected before the numerical cap: "
+                    f"{nonconvergence_reason}"
+                ),
+            )
+            await _halt_for_cross_episode_abandon_candidate(
+                source_task,
+                orig_task,
+                pr_number=pr_number,
+                candidate=candidate,
+                session=session,
+                spawn_reason=SPAWN_REASON_NONCONVERGENCE,
+            )
+            return (None, False)
+
     if pr_iterations >= global_cap:
         logger.warning(
-            f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)"
+            f"[PIPELINE] PR #{pr_number} hit global review-fix cap "
+            f"({pr_iterations} actioned generations across all chains)"
         )
-        await _handle_cap_exhaustion(
-            source_task,
-            resolved_original_id,
-            pr_number,
-            pr_iterations,
-            session,
+        candidate = build_review_cap_abandon_candidate(
+            consumed_cross_episode_tasks,
+            actioned_generations=pr_iterations,
+            threshold=global_cap,
             scope="global",
             lane_counts=lane_counts,
         )
-        _set_spawn_reason(source_task, SPAWN_REASON_CAP)
-        session.add(source_task)
+        await _halt_for_cross_episode_abandon_candidate(
+            source_task,
+            orig_task,
+            pr_number=pr_number,
+            candidate=candidate,
+            session=session,
+            spawn_reason=SPAWN_REASON_CAP,
+        )
+        return (None, False)
+
+    # The ordinary actioned-generation cap owns the exact threshold and keeps
+    # its lane telemetry. This broader cross-episode census is the backstop for
+    # history that ordinary completed/failed accounting cannot see; it must not
+    # preempt either semantic convergence or the canonical cap disposition.
+    if abandon_candidate is not None and task_type in ("review", "fix"):
+        await _halt_for_cross_episode_abandon_candidate(
+            source_task,
+            orig_task,
+            pr_number=pr_number,
+            candidate=abandon_candidate,
+            session=session,
+        )
         return (None, False)
 
     # ── Persistent-conflict early escalation ───────────────────────────────
     # When the conflict-fix lane has already accumulated >= threshold completions
     # without resolving the conflict and this spawn would add another conflict
-    # attempt, stop early and close with a conflict-named terminal outcome. Fires
-    # BEFORE the lane sub-cap (LANE_CAP_CONFLICT_DEFAULT=4) so the PR closes at
-    # attempt 3 instead of grinding to cap or global exhaustion.
+    # attempt, stop early and hand the still-open PR to the existing operator-
+    # disposition hold. Fires BEFORE the lane sub-cap
+    # (LANE_CAP_CONFLICT_DEFAULT=4) so the PR parks at attempt 3 instead of
+    # grinding to cap or global exhaustion. A conflict is evidence that an
+    # automated strategy did not converge; it is not authority to reject the PR.
     _persistent_conflict_threshold = _runtime_config.get(
         "review_persistent_conflict_threshold",
         PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
@@ -3154,16 +3573,98 @@ async def _spawn_pipeline_task(
             f"iterations completed without resolution "
             f"(threshold={_persistent_conflict_threshold})"
         )
-        await _handle_persistent_conflict_escalation(
-            source_task,
-            resolved_original_id,
-            pr_number,
-            pr_iterations,
-            recent_consecutive_conflict_count,
-            session,
+        persistent_conflict_tasks = sorted(
+            (
+                task
+                for task in cap_generation_tasks
+                if classify_iteration_lane(task) == LANE_CONFLICT
+            ),
+            key=lambda task: (
+                task.created_at.timestamp() if task.created_at is not None else 0.0
+            ),
+            reverse=True,
+        )[:recent_consecutive_conflict_count]
+        prior_conflict_targets = [
+            target
+            for conflict_task in persistent_conflict_tasks
+            for target in (
+                ((conflict_task.context or {}).get("review_loop") or {}).get(
+                    "fix_target"
+                ),
+                ((conflict_task.context or {}).get("review_loop") or {}).get(
+                    "review_target"
+                ),
+            )
+        ]
+        persistent_conflict_target = requested_fix_target
+        if persistent_conflict_target is None:
+            for candidate_target in (
+                source_loop.get("fix_target"),
+                source_loop.get("review_target"),
+                ((orig_task.context or {}).get("review_loop") or {}).get(
+                    "fix_target"
+                )
+                if orig_task is not None
+                else None,
+                ((orig_task.context or {}).get("review_loop") or {}).get(
+                    "review_target"
+                )
+                if orig_task is not None
+                else None,
+                *prior_conflict_targets,
+            ):
+                persistent_conflict_target = _normalized_review_target(
+                    candidate_target,
+                    project_id=source_task.project_id,
+                    pr_number=pr_number,
+                )
+                if persistent_conflict_target is not None:
+                    break
+        if (
+            persistent_conflict_target is None
+            and reviewed_base_sha
+            and reviewed_head_sha
+        ):
+            persistent_conflict_target = _normalized_review_target(
+                {
+                    "base_sha": reviewed_base_sha,
+                    "head_sha": reviewed_head_sha,
+                },
+                project_id=source_task.project_id,
+                pr_number=pr_number,
+            )
+
+        candidate = build_review_cap_abandon_candidate(
+            consumed_cross_episode_tasks,
+            actioned_generations=pr_iterations,
+            threshold=_persistent_conflict_threshold,
+            scope="persistent-conflict",
+            lane_counts=lane_counts,
+            reason="persistent_merge_conflict",
+            detail=(
+                f"Merge conflict persisted across "
+                f"{recent_consecutive_conflict_count} consecutive conflict-fix "
+                "generation(s); PR left open pending explicit disposition."
+            ),
         )
-        _set_spawn_reason(source_task, SPAWN_REASON_PERSISTENT_CONFLICT)
-        session.add(source_task)
+        candidate["conflict_evidence"] = {
+            "source_task_id": str(source_task.id),
+            "fix_reason": str(fix_reason or source_loop.get("fix_reason") or ""),
+            "consecutive_conflict_generations": recent_consecutive_conflict_count,
+            "threshold": int(_persistent_conflict_threshold),
+            "actioned_generations": pr_iterations,
+            "task_ids": [str(task.id) for task in persistent_conflict_tasks],
+        }
+        if persistent_conflict_target is not None:
+            candidate["fix_target"] = dict(persistent_conflict_target)
+        await _halt_for_cross_episode_abandon_candidate(
+            source_task,
+            orig_task,
+            pr_number=pr_number,
+            candidate=candidate,
+            session=session,
+            spawn_reason=SPAWN_REASON_PERSISTENT_CONFLICT,
+        )
         return (None, False)
 
     # ── Per-lane sub-cap checks ─────────────────────────────────────────────
@@ -3200,17 +3701,33 @@ async def _spawn_pipeline_task(
             f"[PIPELINE] PR #{pr_number} {_scope_label} lane cap exhausted. "
             f"Lane breakdown: {_detail}"
         )
-        await _handle_cap_exhaustion(
-            source_task,
-            resolved_original_id,
-            pr_number,
-            pr_iterations,
-            session,
+        candidate = build_review_cap_abandon_candidate(
+            consumed_cross_episode_tasks,
+            actioned_generations=(
+                non_review_total
+                if _lane_exhausted == "non_review_collective"
+                else lane_counts.get(_spawn_lane, 0)
+            ),
+            threshold=(
+                _lane_cap_non_review
+                if _lane_exhausted == "non_review_collective"
+                else (
+                    _lane_cap_conflict
+                    if _spawn_lane == LANE_CONFLICT
+                    else _lane_cap_ci
+                )
+            ),
             scope=_scope_label,
             lane_counts=lane_counts,
         )
-        _set_spawn_reason(source_task, SPAWN_REASON_CAP)
-        session.add(source_task)
+        await _halt_for_cross_episode_abandon_candidate(
+            source_task,
+            orig_task,
+            pr_number=pr_number,
+            candidate=candidate,
+            session=session,
+            spawn_reason=SPAWN_REASON_CAP,
+        )
         return (None, False)
 
     # Track review-fix iteration count to prevent infinite loops (per-chain).
@@ -3220,7 +3737,6 @@ async def _spawn_pipeline_task(
     # 2026-05-07 task 78de0fdb hit per-chain cap on rollup PR #4091 with simple
     # fixable issues (duplicate vi.mock keys) because the per-chain cap had
     # not been bumped in step with the global cap.
-    source_loop = (source_task.context or {}).get("review_loop", {})
     if task_type == "fix" and not reviewed_head_sha:
         # CI, conflict, and migration-guard fixes are commonly spawned after
         # approval, from a parked source task rather than directly from the
@@ -3300,24 +3816,26 @@ async def _spawn_pipeline_task(
                 pr_number,
             )
             break
-    iteration = source_loop.get("iteration", 0) + 1
-    per_chain_cap = MAX_REVIEW_FIX_ITERATIONS if is_rollup else base_cap
-
-    if iteration > per_chain_cap:
+    if chain_iterations >= per_chain_cap:
         logger.warning(
-            f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations"
+            f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} "
+            f"after {chain_iterations} actioned generations"
         )
-        await _handle_cap_exhaustion(
-            source_task,
-            resolved_original_id,
-            pr_number,
-            per_chain_cap,
-            session,
+        candidate = build_review_cap_abandon_candidate(
+            consumed_cross_episode_tasks,
+            actioned_generations=chain_iterations,
+            threshold=per_chain_cap,
             scope="per-chain",
             lane_counts=lane_counts,
         )
-        _set_spawn_reason(source_task, SPAWN_REASON_CAP)
-        session.add(source_task)
+        await _halt_for_cross_episode_abandon_candidate(
+            source_task,
+            orig_task,
+            pr_number=pr_number,
+            candidate=candidate,
+            session=session,
+            spawn_reason=SPAWN_REASON_CAP,
+        )
         return (None, False)
 
     idempotency_key = _pipeline_task_idempotency_key(
@@ -3478,80 +3996,6 @@ async def _spawn_pipeline_task(
             ),
         }
 
-    # Build review_history: carry forward from source task, appending current feedback if spawning a fix
-    prev_review_history = source_loop.get("review_history", [])
-    # The PR's actual changed files at this iteration boundary, used by drift
-    # detection. The review task itself doesn't push commits and so won't have
-    # _pr_changed_files in its own context — fall back to the original task
-    # (which is the create/fix that pushed the commits being reviewed).
-    _source_changed_files = (
-        (source_task.context or {}).get("_pr_changed_files")
-        or ((orig.context or {}).get("_pr_changed_files") if orig else None)
-        or []
-    )
-    _normalized_current_issues = ensure_issue_ids(
-        current_issues,
-        reviewed_head_sha=reviewed_head_sha,
-        iteration=iteration - 1,
-    )
-    new_review_entry: dict[str, object] = {
-        "iteration": iteration - 1,
-        "feedback": current_feedback,
-        # Gate: this branch fires when spawning a fix from REQUEST_CHANGES.
-        # APPROVE iterations are written separately at the CI-wait transition
-        # in task_lifecycle.py so the trajectory shows them too.
-        "verdict": "REQUEST_CHANGES",
-        "changed_files": list(_source_changed_files)[:30],
-        **(
-            {"reviewed_head_sha": reviewed_head_sha}
-            if reviewed_head_sha
-            else {}
-        ),
-        **(
-            {"reviewed_base_sha": reviewed_base_sha}
-            if reviewed_base_sha
-            else {}
-        ),
-        **(
-            {
-                "target_verified_by_backend": True,
-                "review_task_id": str(source_task.id),
-            }
-            if target_verified_by_backend
-            and reviewed_head_sha
-            and reviewed_base_sha
-            else {}
-        ),
-        **(
-            {"delta_base_sha": source_loop.get("delta_base_sha")}
-            if source_loop.get("delta_base_sha")
-            else {}
-        ),
-        **(
-            {"resolutions": list(current_resolutions or [])[:30]}
-            if current_resolutions
-            else {}
-        ),
-    }
-    if _normalized_current_issues:
-        new_review_entry["issues"] = _normalized_current_issues
-    # Bound each entry's freeform feedback so the persisted row can never be fat,
-    # no matter how large the underlying agent log is. Applied to the whole list —
-    # the freshly built entry AND any carried-forward prior entries — BEFORE the
-    # stuck-cycle similarity check below, so the Jaccard compares consistently
-    # bounded prefixes. Uses bound_review_history (REVIEW_FEEDBACK_MAX_CHARS + marker)
-    # rather than the legacy _cap_review_history_feedback so the truncation marker is
-    # present on truncated entries; the bound_review_history call at the persistence
-    # chokepoint below becomes a no-op because the list is already bounded here.
-    has_current_review_result = task_type == "fix" and bool(
-        current_feedback or _normalized_current_issues or current_resolutions
-    )
-    new_review_history = bound_review_history(
-        [*prev_review_history, new_review_entry]
-        if has_current_review_result
-        else prev_review_history
-    )
-
     churn_detections = int(source_loop.get("churn_detections", 0) or 0)
     # Carry forward any prior churn cap reduction so it survives across iterations.
     churn_cap_reduction: int | None = (source_task.context or {}).get(
@@ -3685,7 +4129,15 @@ async def _spawn_pipeline_task(
                     # approval-gate when require_approval_gates is on; with gates off
                     # the rollup respawn-cap terminalization converges the parent.
                     if _runtime_config.get("require_approval_gates", True):
-                        stuck_orig.requires_approval = True
+                        from app.admin_approval_authority import (
+                            establish_independent_approval_hold,
+                        )
+
+                        establish_independent_approval_hold(
+                            stuck_orig,
+                            reason="standoff" if is_standoff else "stuck",
+                            owner="review_pipeline",
+                        )
                     stuck_orig.latest_status_message = (
                         f"Review-fix cycle appears stuck — same issues repeated across "
                         f"{iteration} iterations. Manual review required."
@@ -3753,78 +4205,6 @@ async def _spawn_pipeline_task(
             _set_spawn_reason(source_task, SPAWN_REASON_STUCK)
             session.add(source_task)
             return (None, False)
-
-        # Early non-convergence escalation: catches the whack-a-mole / drift
-        # shape the stuck-cycle, standoff, and churn detectors all MISS — a
-        # shrinking-but-never-zero issue count, verification-only drift, or
-        # one-at-a-time disclosure. The existing detectors require the SAME
-        # issue re-raised (stuck/standoff) or NON-decreasing counts (churn), so
-        # a sequence like [3, 2, 2, 1, 1] grinds all the way to the cap. We
-        # escalate to the operator at iteration K instead of burning the full
-        # budget. Only fires from iteration K onward so a normally-converging
-        # loop (which lands APPROVE well before K) is never escalated early.
-        if task_type == "fix" and iteration >= EARLY_NONCONVERGENCE_ESCALATE_AT:
-            should_escalate, nonconvergence_reason = detect_early_nonconvergence(
-                new_review_history
-            )
-            if should_escalate:
-                logger.warning(
-                    f"[PIPELINE] Early non-convergence for PR #{pr_number} at "
-                    f"iteration {iteration} (cap {per_chain_cap}): "
-                    f"{nonconvergence_reason}. Escalating to operator instead of "
-                    f"grinding to cap."
-                )
-                try:
-                    nc_orig = await session.get(Task, uuid.UUID(resolved_original_id))
-                    if nc_orig:
-                        # Discretionary gate, same as stuck-cycle: only
-                        # approval-gate when require_approval_gates is on.
-                        if _runtime_config.get("require_approval_gates", True):
-                            nc_orig.requires_approval = True
-                        nc_orig.latest_status_message = (
-                            f"Review-fix loop not converging "
-                            f"({nonconvergence_reason}) after {iteration} "
-                            f"iterations — escalated for manual review at "
-                            f"iteration {iteration} rather than grinding to cap."
-                        )
-                        session.add(nc_orig)
-                        await session.commit()
-                        try:
-                            import asyncio as _asyncio
-                            from app.notification_dispatch import (
-                                dispatch_external_notification,
-                            )
-
-                            _asyncio.ensure_future(  # noqa: RUF006
-                                dispatch_external_notification(
-                                    nc_orig.project_id,
-                                    "APPROVAL_NEEDED",
-                                    {
-                                        "task_id": str(nc_orig.id),
-                                        "task_title": nc_orig.title
-                                        or str(nc_orig.id)[:8],
-                                        "pr_number": pr_number,
-                                        "iteration": iteration,
-                                        "reason": (
-                                            "Review-fix loop not converging — "
-                                            f"{nonconvergence_reason}"
-                                        ),
-                                    },
-                                )
-                            )
-                        except Exception as _ne:  # noqa: BLE001
-                            logger.warning(
-                                f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}"
-                            )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        f"[PIPELINE] Failed to escalate non-convergence on "
-                        f"{resolved_original_id}: {e}",
-                        exc_info=True,
-                    )
-                _set_spawn_reason(source_task, SPAWN_REASON_NONCONVERGENCE)
-                session.add(source_task)
-                return (None, False)
 
         # Issue-churn detection: complements stuck-cycle above. If total
         # CRITICAL+MAJOR count fails to decrease across the last
@@ -4425,16 +4805,6 @@ async def _spawn_pipeline_task(
         record_spawn_pin_skipped,
     )
 
-    # Defense-in-depth pause guard: never pin a warm-handoff to a paused
-    # project's VM. Pause blocks ALL new dispatch on every path; the
-    # chain-continuity claim site (agent_warm_continuity.py) already filters
-    # Project.paused, but skipping the pin here stops a paused project's
-    # create->review->fix->... chain from even creating the pin during drain.
-    from app.models import Project
-
-    source_project = await session.get(Project, source_task.project_id)
-    source_project_paused = bool(source_project and source_project.paused)
-
     record_spawn_attempt()
     if suppress_warm_handoff:
         record_spawn_pin_skipped("caller_suppressed")
@@ -4446,8 +4816,6 @@ async def _spawn_pipeline_task(
         record_spawn_pin_skipped("disabled")
     elif is_warm_continuity_suppressed():
         record_spawn_pin_skipped("breaker_tripped")
-    elif source_project_paused:
-        record_spawn_pin_skipped("project_paused")
     elif not source_task.vm_instance_id:
         record_spawn_pin_skipped("source_cold")
     else:
@@ -4533,7 +4901,30 @@ async def _spawn_pipeline_task(
         if orig_task is not None and orig_task.id != source_task.id:
             revoke_review_authority_for_active_fix(orig_task, new_task.id)
             session.add(orig_task)
+    # Some callers must mutate the exact source attempt only when a fresh child
+    # is actually publishable.  Source authority is acquired much earlier so
+    # every guard reads a fresh, locked row, but mutating there would let a
+    # canonical early-return commit release an approval gate without a child.
+    # Run the caller's publication mutation at the sole child/history commit
+    # boundary instead.  The Project -> PR -> Task locks acquired above are
+    # still held, and any exception rolls the source mutation, child, and
+    # SPAWNED history back together.
+    if source_spawn_publication is not None:
+        await source_spawn_publication(source_task, session)
     session.add(new_task)
+    # The child row and its SPAWNED audit record are one publication unit.
+    # A second commit here used to leave a dispatchable child without history
+    # when refresh/history construction failed after the INSERT committed.
+    history = TaskHistory(
+        task_id=new_task.id,
+        action="SPAWNED",
+        details={
+            "spawned_by": "REVIEW_PIPELINE",
+            "type": task_type,
+            "pr_number": pr_number,
+        },
+    )
+    session.add(history)
     if lane_fix_to_activate is not None:
         await activate_lane_for_fix(
             session,
@@ -4583,7 +4974,11 @@ async def _spawn_pipeline_task(
             f"[PIPELINE] Concurrent {task_type} spawn for PR #{pr_number} "
             f"hit idempotency key; using existing task {existing.id}"
         )
-        reloaded_source = await session.get(Task, source_task_id)
+        reloaded_source = (
+            await session.get(Task, source_task_id)
+            if source_spawn_authority is None
+            else None
+        )
         if reloaded_source is not None:
             reloaded_source.latest_status_message = (
                 f"{task_type.title()} skipped for PR #{pr_number} — "
@@ -4634,7 +5029,11 @@ async def _spawn_pipeline_task(
             f"timeout on commit — deferring to the next sweep: "
             f"{str(_spawn_db_exc)[:200]}"
         )
-        reloaded_source = await session.get(Task, source_task_id)
+        reloaded_source = (
+            await session.get(Task, source_task_id)
+            if source_spawn_authority is None
+            else None
+        )
         if reloaded_source is not None:
             reloaded_source.latest_status_message = (
                 f"{task_type.title()} deferred for PR #{pr_number} — "
@@ -4645,25 +5044,18 @@ async def _spawn_pipeline_task(
         return (None, False)
     await session.refresh(new_task)
 
-    history = TaskHistory(
-        task_id=new_task.id,
-        action="SPAWNED",
-        details={
-            "spawned_by": "REVIEW_PIPELINE",
-            "type": task_type,
-            "pr_number": pr_number,
-        },
-    )
-    session.add(history)
-    await session.commit()
-
     await broadcast_to_project(
         str(source_task.project_id),
         "task_updated",
         {"task_id": str(new_task.id), "status": TaskStatus.QUEUED},
     )
-    _set_spawn_reason(source_task, SPAWN_REASON_SPAWNED)
-    session.add(source_task)
+    # The authoritative source lock ended with the child INSERT commit.  A
+    # concurrent replacement may own the row now, so callback callers must not
+    # stage a post-commit context write from their former identity.  They already
+    # receive ``was_created=True`` as the canonical outcome.
+    if source_spawn_authority is None:
+        _set_spawn_reason(source_task, SPAWN_REASON_SPAWNED)
+        session.add(source_task)
 
     # C2 lock-window fix: emit the deferred scope-overflow PR signal AFTER the
     # spawn commit above released the per-PR advisory lock (helper does the

@@ -67,9 +67,12 @@ from app.research_cycle_cadence import (
     record_strategic_cadence_fire,
     strategic_cadence_due,
 )
+from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
 from app.research_finding_policy import NON_SPAWNING_FINDING_TYPES
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    acquire_automatic_task_creation_authority,
     acquire_direction_research_spawn_lock,
     with_vision_locked,
 )
@@ -431,7 +434,11 @@ async def _undirected_research_recently_active(project_id, session) -> bool:
     return recent > 0
 
 
-async def _cycle_blocked_direction_keys(session, project_id) -> set[str]:
+async def _cycle_blocked_direction_keys(
+    session,
+    project_id,
+    directions: list[dict] | None = None,
+) -> set[str]:
     """Direction keys whose live discovery cycle cannot admit a new research root.
 
     Mirrors the admission predicate in ``ensure_discovery_cycle_for_research``:
@@ -440,31 +447,23 @@ async def _cycle_blocked_direction_keys(session, project_id) -> set[str]:
     consumes a ``max_parallel`` slot (head-of-line blocking every other
     eligible direction when the cap is low).
     """
-    from app.models import DiscoveryCycle
+    from app.discovery_admission import (
+        direction_discovery_admission_decision,
+        load_latest_direction_discovery_cycles,
+    )
 
+    cycles = await load_latest_direction_discovery_cycles(session, project_id)
+    direction_by_key = {
+        str(direction.get("id")): direction
+        for direction in (directions or [])
+        if direction.get("id")
+    }
     return {
         key
-        for key, state, source_id in (
-            await session.execute(
-                select(
-                    DiscoveryCycle.direction_key,
-                    DiscoveryCycle.state,
-                    DiscoveryCycle.source_research_task_id,
-                ).where(
-                    DiscoveryCycle.project_id == project_id,
-                    DiscoveryCycle.state.in_(
-                        [
-                            "open",
-                            "admission_closed",
-                            "review_pending",
-                            "reviewing",
-                            "review_blocked",
-                        ]
-                    ),
-                )
-            )
-        ).all()
-        if state != "open" or source_id is not None
+        for key, cycle in cycles.items()
+        if not direction_discovery_admission_decision(
+            direction_by_key.get(key, {"id": key}), cycle
+        ).can_admit_root
     }
 
 
@@ -928,6 +927,39 @@ async def _spawn_research_task_inner(
     except LegacyEngineAuthorityExpired:
         await session.rollback()
         return
+
+    # Failure-breaker decay must run before any availability, budget, bootstrap,
+    # or circuit-breaker early return. Otherwise an unavailable model/account can
+    # keep the strategic failure latch alive indefinitely, making the sparse
+    # wall-clock backstop unreachable even after the 48h recovery window.
+    vision_data = project.vision or {}
+    strategic_failures = vision_data.get("_strategic_failures", 0)
+    if strategic_failures >= 3:
+        failures_at = vision_data.get("_strategic_failures_at")
+        try:
+            last_failure = datetime.fromisoformat(
+                str(failures_at).replace("Z", "+00:00")
+            )
+            if last_failure.tzinfo is not None:
+                last_failure = last_failure.astimezone(timezone.utc).replace(tzinfo=None)
+            if (_utcnow() - last_failure).total_seconds() > 48 * 3600:
+
+                def _clear_strategic_failures(vision: dict) -> None:
+                    vision.pop("_strategic_failures", None)
+                    vision.pop("_strategic_failures_at", None)
+
+                await with_vision_locked(session, project.id, _clear_strategic_failures)
+                await commit_legacy_authorized(session, project.id, legacy_generation)
+                await session.refresh(project)
+                strategic_failures = 0
+                vision_data = project.vision or {}
+                logger.info(
+                    f"[STRATEGIC] Auto-decayed _strategic_failures for project {project.id} "
+                    f"(last failure: {failures_at})"
+                )
+        except (ValueError, TypeError, OverflowError):
+            pass  # malformed or missing timestamp, keep current value
+
     from app.research_completion import (
         _compute_momentum_factor,
         _compute_productivity_score,
@@ -956,6 +988,12 @@ async def _spawn_research_task_inner(
             "autonomous_enabled is False" if not project.autonomous_enabled else "project is archived",
         )
         return
+
+    # ``autonomous_enabled`` authorizes tactical direction research. Strategic
+    # cadence/force work is a separate operator-owned lane so a bounded tactical
+    # canary can run without also releasing the strategist. Manual/operator
+    # Strategic surfaces never enter this function and remain unaffected.
+    automatic_strategic_cycles_allowed = automatic_strategic_cycles_enabled(project)
 
     # Playbook auto-seed removed: the hardcoded seed entries were specific to the
     # Blueprint pipeline repo and polluted new projects with wrong build/test
@@ -1294,33 +1332,6 @@ async def _spawn_research_task_inner(
     # Stop forcing after 3 consecutive strategic failures to prevent infinite loops.
     vision_data = project.vision or {}
     strategic_failures = vision_data.get("_strategic_failures", 0)
-    decay_fired = False
-    # Auto-decay: if last failure was >48h ago, reset counter for recovery purposes
-    if strategic_failures >= 3:
-        failures_at = vision_data.get("_strategic_failures_at")
-        if failures_at:
-            try:
-                last_failure = datetime.fromisoformat(
-                    failures_at.replace("Z", "+00:00")
-                )
-                if (_utcnow() - last_failure).total_seconds() > 48 * 3600:
-                    strategic_failures = 0
-                    decay_fired = True
-                    logger.info(
-                        f"[STRATEGIC] Auto-decayed _strategic_failures for project {project.id} (last failure: {failures_at})"
-                    )
-            except (ValueError, TypeError):
-                pass  # malformed timestamp, keep current value
-
-    # Persist the auto-decay to the database if it fired
-    if decay_fired:
-
-        def _clear_strategic_failures(vision: dict) -> None:
-            vision.pop("_strategic_failures", None)
-            vision.pop("_strategic_failures_at", None)
-
-        await with_vision_locked(session, project.id, _clear_strategic_failures)
-        await commit_legacy_authorized(session, project.id, legacy_generation)
     # Check if ANY direction is active in the project (ignoring cooldown filter).
     # active_directions only contains non-cooldown directions, so a project with
     # active-but-cooling directions should not trigger a strategic cycle.
@@ -1338,10 +1349,14 @@ async def _spawn_research_task_inner(
     # every tick (rate-limited only by the spawn cooldown).
     from app.problem_model import project_has_purpose as _project_has_purpose
 
-    force_strategic = strategic_failures < 3 and (
-        not _project_has_purpose(project)
-        or not any_active_in_project
-        or all_dirs_saturated
+    force_strategic = (
+        automatic_strategic_cycles_allowed
+        and strategic_failures < 3
+        and (
+            not _project_has_purpose(project)
+            or not any_active_in_project
+            or all_dirs_saturated
+        )
     )
     # An operator steering refresh must schedule the strategist promptly even
     # when the failure breaker would otherwise suppress forcing (and the
@@ -1356,9 +1371,12 @@ async def _spawn_research_task_inner(
         strategic_refresh_origin as _strategic_refresh_origin,
     )
 
-    if _strategic_refresh_origin(vision_data) == _ORIGIN_OPERATOR:
+    if (
+        automatic_strategic_cycles_allowed
+        and _strategic_refresh_origin(vision_data) == _ORIGIN_OPERATOR
+    ):
         force_strategic = True
-    elif not force_strategic:
+    elif automatic_strategic_cycles_allowed and not force_strategic:
         _refresh_min_interval = _runtime_config.get(
             "strategic_refresh_min_interval_seconds", 120
         )
@@ -1380,7 +1398,11 @@ async def _spawn_research_task_inner(
     # — never reaching the strategic spawn block, no matter how long since the
     # last cycle. Hit on 2026-05-26 (deploy 00195): backstop never fired despite
     # last strategic being 2h+ old, because both directions were busy.
-    if not force_strategic and strategic_failures < 3:
+    if (
+        automatic_strategic_cycles_allowed
+        and not force_strategic
+        and strategic_failures < 3
+    ):
         strategic_max_interval = _runtime_config.get(
             "strategic_max_interval_minutes", 1_440
         )
@@ -1421,7 +1443,7 @@ async def _spawn_research_task_inner(
             for d in (project.directions or [])
             if d.get("status") == "active"
         )
-        if _any_refractory:
+        if _any_refractory and automatic_strategic_cycles_allowed:
             from app.strategic_trigger import (
                 ORIGIN_QUALIFICATION as _OQ,
                 request_strategic_refresh as _req_strat,
@@ -1552,14 +1574,29 @@ async def _spawn_research_task_inner(
         # max_parallel candidate slots only to be skipped at spawn admission.
         # With a low cap the same blocked direction then head-of-line blocks
         # every other eligible direction on every sweep, so exclude them here.
-        cycle_blocked_keys = await _cycle_blocked_direction_keys(session, project.id)
+        from app.discovery_admission import (
+            load_direction_discovery_admission_decisions,
+        )
+
+        discovery_admission = await load_direction_discovery_admission_decisions(
+            session,
+            project.id,
+            list(project.directions or []),
+        )
+        cycle_blocked_keys = {
+            key
+            for key, admission in discovery_admission.items()
+            if not admission.can_admit_root
+        }
         for d in sorted_eligible:
             did = d.get("id")
             if did in cycle_blocked_keys:
+                admission = discovery_admission[did]
                 logger.info(
-                    "[AUTONOMOUS] skipped direction %s: live discovery cycle "
-                    "cannot admit a new research root",
+                    "[AUTONOMOUS] skipped direction %s: %s; next action: %s",
                     did,
+                    admission.reason,
+                    admission.next_action,
                 )
                 continue
             if is_pause_mode(d):
@@ -1673,7 +1710,7 @@ async def _spawn_research_task_inner(
     # If the design_doc → strategic_review spawn failed last cycle, retry it now
     # rather than waiting up to 6 more research spawns (~3+ hours).
     pending_sr = (project.vision or {}).get("_pending_strategic_review")
-    if pending_sr:
+    if automatic_strategic_cycles_allowed and pending_sr:
         _sr_attempt_count = pending_sr.get("attempt_count", 0)
         _sr_first_attempted_at = pending_sr.get("first_attempted_at")
         _sr_max_attempts = _runtime_config.get("pending_sr_max_attempts", 3)
@@ -1723,6 +1760,7 @@ async def _spawn_research_task_inner(
             try:
                 from app.strategic_spawning import _spawn_strategic_review
 
+                _sr_suppression: dict[str, str] = {}
                 if await _spawn_strategic_review(
                     project,
                     session,
@@ -1747,6 +1785,7 @@ async def _spawn_research_task_inner(
                     }
                     if pending_sr.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY)
                     else None,
+                    suppression_reason_out=_sr_suppression,
                 ):
 
                     def _clear_pending_sr(vision: dict) -> None:
@@ -1762,24 +1801,52 @@ async def _spawn_research_task_inner(
                     )
                     return  # Don't spawn tactical research this cycle
                 else:
-                    logger.warning(
-                        f"[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}"
+                    from app.strategic_cycle_admission import (
+                        AUTOMATIC_STRATEGIC_CYCLES_DISABLED,
                     )
-                    _now_iso = _utcnow().isoformat()
-
-                    def _bump_pending_sr_skip(vision: dict) -> None:
-                        marker = vision.get("_pending_strategic_review")
-                        if marker is None:
-                            return
-                        marker["attempt_count"] = marker.get("attempt_count", 0) + 1
-                        if not marker.get("first_attempted_at"):
-                            marker["first_attempted_at"] = _now_iso
-
-                    await with_vision_locked(session, project.id, _bump_pending_sr_skip)
-                    await commit_legacy_authorized(
-                        session, project.id, legacy_generation
+                    from app.task_locking import (
+                        AUTOMATIC_TASK_CREATION_PROJECT_ARCHIVED,
+                        AUTOMATIC_TASK_CREATION_PROJECT_PAUSED,
+                        AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE,
                     )
-                    await session.refresh(project)
+
+                    _authority_suppressions = {
+                        AUTOMATIC_STRATEGIC_CYCLES_DISABLED,
+                        AUTOMATIC_TASK_CREATION_PROJECT_ARCHIVED,
+                        AUTOMATIC_TASK_CREATION_PROJECT_PAUSED,
+                        AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE,
+                    }
+                    _suppression_reason = _sr_suppression.get("reason")
+                    if _suppression_reason in _authority_suppressions:
+                        logger.info(
+                            "[STRATEGIC] Pending SR retry held without spending "
+                            "attempt budget for project %s (%s)",
+                            project.id,
+                            _suppression_reason,
+                        )
+                    else:
+                        logger.warning(
+                            f"[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}"
+                        )
+                        _now_iso = _utcnow().isoformat()
+
+                        def _bump_pending_sr_skip(vision: dict) -> None:
+                            marker = vision.get("_pending_strategic_review")
+                            if marker is None:
+                                return
+                            marker["attempt_count"] = (
+                                marker.get("attempt_count", 0) + 1
+                            )
+                            if not marker.get("first_attempted_at"):
+                                marker["first_attempted_at"] = _now_iso
+
+                        await with_vision_locked(
+                            session, project.id, _bump_pending_sr_skip
+                        )
+                        await commit_legacy_authorized(
+                            session, project.id, legacy_generation
+                        )
+                        await session.refresh(project)
                     # Fall through to tactical research
             except LegacyEngineAuthorityExpired:
                 raise
@@ -1832,11 +1899,14 @@ async def _spawn_research_task_inner(
     strategic_frequency = (project.vision or {}).get(
         "_strategic_frequency_override"
     ) or _runtime_config.get("strategic_research_frequency", 6)
-    is_strategic = strategic_cadence_due(
-        research_spawn_count,
-        (project.vision or {}).get(STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY),
-        strategic_frequency,
-    ) or force_strategic
+    is_strategic = automatic_strategic_cycles_allowed and (
+        strategic_cadence_due(
+            research_spawn_count,
+            (project.vision or {}).get(STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY),
+            strategic_frequency,
+        )
+        or force_strategic
+    )
     # 2026-05-03: gate strategic spawn on (a) no-active-strategic AND
     # (b) no recent strategic spawn (regardless of terminal state).
     #
@@ -2535,6 +2605,23 @@ async def _spawn_research_task_inner(
         # Fall through to the normal commit so any pending session state from
         # this cycle (e.g. an anomaly-adjustment Alert added above) still lands.
         directions_to_spawn = []
+
+    # All candidate/policy preparation above is read-only.  Linearize the
+    # actual automatic admissions with operator pause now, before taking any
+    # direction/discovery child lock and keep the Project lock through the
+    # batched Task INSERT commit below.
+    admission_project_id = project.id
+    admission = await acquire_automatic_task_creation_authority(
+        session, admission_project_id, skip_locked=True
+    )
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        await session.rollback()
+        logger.info(
+            "[AUTONOMOUS] Research admission closed for project %s (%s)",
+            admission_project_id,
+            admission,
+        )
+        return 0
 
     spawned_tasks = []
     for chosen_direction in directions_to_spawn:
@@ -3589,6 +3676,23 @@ async def _spawn_periodic_task(
         f"periodic task spawn (type={task_type})",
         expected_legacy_generation=expected_legacy_generation,
     ):
+        return
+
+    # The circuit-breaker path above may commit policy transitions.  Acquire
+    # the universal Project pause/archive authority after it and before the
+    # first Task child query so the schedule check -> INSERT window is fenced.
+    admission_project_id = project.id
+    admission = await acquire_automatic_task_creation_authority(
+        session, admission_project_id, skip_locked=True
+    )
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        await session.rollback()
+        logger.info(
+            "[AUTONOMOUS] Periodic admission closed for project %s type=%s (%s)",
+            admission_project_id,
+            task_type,
+            admission,
+        )
         return
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(

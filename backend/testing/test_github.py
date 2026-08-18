@@ -737,8 +737,10 @@ async def test_get_check_runs_paginates_all_pages_pending_run_on_later_page(mock
 @pytest.mark.asyncio
 async def test_merge_pull_request_rate_limit_retries_then_propagates(mocker):
     """
-    A 429 rate-limit response should be retried (respecting Retry-After),
-    and if all retries fail, raise an HTTPException.
+    A merge PUT is irreversible and a lost response is ambiguous, so even a
+    retryable 429 must be surfaced after exactly one transport attempt.  The
+    durable approval-merge recovery protocol performs GET-only reconciliation;
+    this transport layer must never replay the PUT on its behalf.
     """
     from app.github import merge_pull_request
 
@@ -757,8 +759,7 @@ async def test_merge_pull_request_rate_limit_retries_then_propagates(mocker):
         )
 
     assert exc_info.value.status_code >= 400
-    # Should have retried (3 attempts total)
-    assert mock_request.call_count == 3
+    assert mock_request.call_count == 1
 
 
 @pytest.mark.smoketest

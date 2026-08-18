@@ -520,8 +520,19 @@ async def _make_distinct_branch_project_with_member(db_session, owner_id=TEST_US
     return project
 
 
+_BULK_ROLLUP_PR = 4242
+_BULK_ROLLUP_BRANCH = "research/bulk-rollup-4242"
+_BULK_ROLLUP_HEAD = "bulk-head-4242"
+_BULK_ROLLUP_BASE = "bulk-base-4242"
+_BULK_ROLLUP_MERGE = "bulk-merge-4242"
+
+
 async def _make_rollup_approval_task(db_session, project, base_branch, *, hotfix=False):
-    payload = {"type": "research", "base_branch": base_branch}
+    payload = {
+        "type": "research",
+        "branch": _BULK_ROLLUP_BRANCH,
+        "base_branch": base_branch,
+    }
     if hotfix:
         payload["hotfix"] = True
     task = Task(
@@ -529,7 +540,26 @@ async def _make_rollup_approval_task(db_session, project, base_branch, *, hotfix
         title="rollup approval",
         status=TaskStatus.EVALUATING,
         requires_approval=True,
-        context={"rollup_pr_number": 4242},
+        context={
+            "rollup_pr_number": _BULK_ROLLUP_PR,
+            # Human merge approval is bound to the exact reviewed attempt.  A
+            # PR number alone must fail closed because its head can move before
+            # the durable merge intent is published.
+            "review_loop": {
+                "project_id": str(project.id),
+                "pr_number": _BULK_ROLLUP_PR,
+                "branch": _BULK_ROLLUP_BRANCH,
+                "base_branch": base_branch,
+                "head_sha": _BULK_ROLLUP_HEAD,
+                "base_sha": _BULK_ROLLUP_BASE,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": _BULK_ROLLUP_PR,
+                    "head_sha": _BULK_ROLLUP_HEAD,
+                    "base_sha": _BULK_ROLLUP_BASE,
+                },
+            },
+        },
         payloads=[payload],
     )
     db_session.add(task)
@@ -541,10 +571,11 @@ async def _make_rollup_approval_task(db_session, project, base_branch, *, hotfix
 def _patch_explicit_merge_target(mocker, project, *, base_ref: str):
     target = {
         "project_id": str(project.id),
-        "pr_number": 4242,
-        "base_sha": "bulk-base-4242",
-        "head_sha": "bulk-head-4242",
+        "pr_number": _BULK_ROLLUP_PR,
+        "base_sha": _BULK_ROLLUP_BASE,
+        "head_sha": _BULK_ROLLUP_HEAD,
         "base_ref": base_ref,
+        "head_ref": _BULK_ROLLUP_BRANCH,
         "state": "open",
         "merged": False,
         "draft": False,
@@ -560,6 +591,11 @@ def _patch_explicit_merge_target(mocker, project, *, base_ref: str):
             new_callable=AsyncMock,
             return_value=dict(target),
         )
+    mocker.patch(
+        "app.ci_merge_helpers._merge_commit_parent_matches_checked_base",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -584,7 +620,7 @@ async def test_bulk_approve_rollup_to_promotion_target_merges_without_pr_merged(
     mock_merge = mocker.patch(
         "app.github.merge_pull_request",
         new_callable=AsyncMock,
-        return_value={"merged": True, "message": "ok"},
+        return_value={"merged": True, "sha": _BULK_ROLLUP_MERGE, "message": "ok"},
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
@@ -717,7 +753,7 @@ async def test_bulk_approve_rollup_to_integration_branch_merges(
     mock_merge = mocker.patch(
         "app.github.merge_pull_request",
         new_callable=AsyncMock,
-        return_value={"merged": True, "message": "ok"},
+        return_value={"merged": True, "sha": _BULK_ROLLUP_MERGE, "message": "ok"},
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
@@ -759,7 +795,7 @@ async def test_bulk_approve_rollup_hotfix_to_promotion_target_merges(
     mock_merge = mocker.patch(
         "app.github.merge_pull_request",
         new_callable=AsyncMock,
-        return_value={"merged": True, "message": "ok"},
+        return_value={"merged": True, "sha": _BULK_ROLLUP_MERGE, "message": "ok"},
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)

@@ -1,9 +1,20 @@
 """Regression coverage for descendant retry and blocker propagation."""
 
+import copy
+
 import pytest
 from fastapi import HTTPException
 
+from app.admin_approval_authority import (
+    APPROVAL_HOLD_EPISODE_KEY,
+    APPROVAL_HOLD_PROVENANCE_KEY,
+    establish_independent_approval_hold,
+)
 from app.ci_merge_helpers import _capture_merge_snapshot
+from app.closed_pr_reconciliation import (
+    REVIEW_WAIT_APPROVAL_HOLD_KEY,
+    REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+)
 from app.models import TaskStatus
 from app.rollup_lineage_fence import (
     invalidate_ancestor_rollups_for_requeue,
@@ -12,6 +23,19 @@ from app.rollup_lineage_fence import (
 )
 from app.rollup_locking import _capture_rollup_parent_snapshot
 from testing.factories import make_project, make_task
+
+
+def _approval_hold_state(task):
+    context = dict(task.context or {})
+    return {
+        "requires_approval": task.requires_approval,
+        "_approval_set_at": context.get("_approval_set_at"),
+        "approval_hold_reason": copy.deepcopy(context.get("approval_hold_reason")),
+        APPROVAL_HOLD_EPISODE_KEY: context.get(APPROVAL_HOLD_EPISODE_KEY),
+        APPROVAL_HOLD_PROVENANCE_KEY: copy.deepcopy(
+            context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+        ),
+    }
 
 
 async def _lineage(db_session, *, parent_status=TaskStatus.EVALUATING):
@@ -144,6 +168,129 @@ async def test_descendant_requeue_invalidates_open_ancestor_rollup(db_session):
 
 
 @pytest.mark.asyncio
+async def test_descendant_requeue_releases_exact_review_wait_approval_hold(db_session):
+    parent, child = await _lineage(db_session)
+    timer = "2026-08-17T12:00:00+00:00"
+    context = dict(parent.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    review_loop.update(
+        {
+            "ci_checked_head_sha": "head-997",
+            "ci_checked_base_sha": "base-997",
+            "review_wait_escalated": True,
+            REVIEW_WAIT_APPROVAL_HOLD_KEY: {
+                "owner": REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+                "project_id": str(parent.project_id),
+                "pr_number": 997,
+                "head_sha": "head-997",
+                "base_sha": "base-997",
+                "set_at": timer,
+            },
+        }
+    )
+    context["review_loop"] = review_loop
+    context["_approval_set_at"] = timer
+    context["unrelated_rollup_sentinel"] = {"keep": "exactly"}
+    parent.context = context
+    parent.requires_approval = True
+    db_session.add(parent)
+    await db_session.commit()
+
+    await invalidate_ancestor_rollups_for_requeue(child, db_session)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert parent.requires_approval is False
+    assert "_approval_set_at" not in parent.context
+    assert REVIEW_WAIT_APPROVAL_HOLD_KEY not in parent.context["review_loop"]
+    assert "review_wait_escalated" not in parent.context["review_loop"]
+    assert parent.context["unrelated_rollup_sentinel"] == {"keep": "exactly"}
+
+
+@pytest.mark.asyncio
+async def test_descendant_requeue_releases_current_hold_with_stale_nested_target(
+    db_session,
+):
+    """A pre-force-push nested target cannot mask the current exact hold."""
+
+    parent, child = await _lineage(db_session)
+    timer = "2026-08-17T12:30:00+00:00"
+    context = dict(parent.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    review_loop.update(
+        {
+            "ci_checked_head_sha": "force-pushed-head-997",
+            "ci_checked_base_sha": "current-base-997",
+            "review_target": {
+                "project_id": str(parent.project_id),
+                "pr_number": 997,
+                "head_sha": "pre-force-push-head-997",
+                "base_sha": "old-base-997",
+            },
+            "review_wait_escalated": True,
+            REVIEW_WAIT_APPROVAL_HOLD_KEY: {
+                "owner": REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+                "project_id": str(parent.project_id),
+                "pr_number": 997,
+                "head_sha": "force-pushed-head-997",
+                "base_sha": "current-base-997",
+                "set_at": timer,
+            },
+        }
+    )
+    context["review_loop"] = review_loop
+    context["_approval_set_at"] = timer
+    parent.context = context
+    parent.requires_approval = True
+    db_session.add(parent)
+    await db_session.commit()
+
+    await invalidate_ancestor_rollups_for_requeue(child, db_session)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert parent.requires_approval is False
+    assert "_approval_set_at" not in parent.context
+    assert REVIEW_WAIT_APPROVAL_HOLD_KEY not in parent.context["review_loop"]
+    assert "review_wait_escalated" not in parent.context["review_loop"]
+
+
+@pytest.mark.asyncio
+async def test_descendant_requeue_preserves_independent_approval_hold_byte_for_byte(
+    db_session,
+):
+    parent, child = await _lineage(db_session)
+    independent_hold = {
+        "_approval_set_at": "manual-timer",
+        "approval_hold_reason": "manual security review",
+        "_approval_hold_episode": "manual-episode",
+        "_approval_hold_provenance": {
+            "owner": "operator",
+            "episode": "manual-episode",
+            "set_at": "manual-timer",
+            "reason": "manual security review",
+        },
+        "touched_critical": ["backend/app/security.py"],
+    }
+    context = dict(parent.context or {})
+    context.update(independent_hold)
+    parent.context = context
+    parent.requires_approval = True
+    db_session.add(parent)
+    await db_session.commit()
+
+    await invalidate_ancestor_rollups_for_requeue(child, db_session)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert parent.requires_approval is True
+    assert {
+        key: parent.context[key]
+        for key in independent_hold
+    } == independent_hold
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "terminal_status",
     [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED],
@@ -209,6 +356,115 @@ async def test_requeue_clears_matching_ancestor_operator_block(db_session):
     assert parent.requires_approval is False
     assert "_descendant_operator_blocks" not in parent.context
     assert "_descendant_operator_blocks_prior_approval" not in parent.context
+
+
+@pytest.mark.asyncio
+async def test_requeue_preserves_newer_approval_episode_that_replaced_block_hold(
+    db_session,
+):
+    parent, child = await _lineage(db_session)
+    await mark_ancestor_rollups_awaiting_operator(
+        child,
+        db_session,
+        reason="review spawn failed (cap reached)",
+        pr_number=997,
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    establish_independent_approval_hold(
+        parent,
+        reason="later explicit security hold",
+        owner="operator",
+    )
+    newer_hold = _approval_hold_state(parent)
+    db_session.add(parent)
+    await db_session.commit()
+
+    await invalidate_ancestor_rollups_for_requeue(child, db_session)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert _approval_hold_state(parent) == newer_hold
+    assert "_descendant_operator_blocks" not in parent.context
+    assert "_descendant_operator_blocks_prior_approval" not in parent.context
+
+
+@pytest.mark.asyncio
+async def test_requeue_restores_exact_prior_approval_episode_after_block_clears(
+    db_session,
+):
+    parent, child = await _lineage(db_session)
+    establish_independent_approval_hold(
+        parent,
+        reason="preexisting manual risk hold",
+        owner="operator",
+    )
+    prior_hold = _approval_hold_state(parent)
+    db_session.add(parent)
+    await db_session.commit()
+
+    await mark_ancestor_rollups_awaiting_operator(
+        child,
+        db_session,
+        reason="review spawn failed (cap reached)",
+        pr_number=997,
+    )
+    await db_session.commit()
+
+    await invalidate_ancestor_rollups_for_requeue(child, db_session)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert _approval_hold_state(parent) == prior_hold
+    assert "_descendant_operator_blocks" not in parent.context
+    assert "_descendant_operator_blocks_prior_approval" not in parent.context
+
+
+@pytest.mark.asyncio
+async def test_requeue_does_not_restore_invalidated_prior_review_wait_hold(db_session):
+    parent, child = await _lineage(db_session)
+    timer = "2026-08-17T13:00:00+00:00"
+    context = dict(parent.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    review_loop.update(
+        {
+            "ci_checked_head_sha": "head-997",
+            "ci_checked_base_sha": "base-997",
+            "review_wait_escalated": True,
+            REVIEW_WAIT_APPROVAL_HOLD_KEY: {
+                "owner": REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+                "project_id": str(parent.project_id),
+                "pr_number": 997,
+                "head_sha": "head-997",
+                "base_sha": "base-997",
+                "set_at": timer,
+            },
+        }
+    )
+    context["review_loop"] = review_loop
+    context["_approval_set_at"] = timer
+    parent.context = context
+    parent.requires_approval = True
+    db_session.add(parent)
+    await db_session.commit()
+
+    await mark_ancestor_rollups_awaiting_operator(
+        child,
+        db_session,
+        reason="review spawn failed (cap reached)",
+        pr_number=997,
+    )
+    await db_session.commit()
+
+    await invalidate_ancestor_rollups_for_requeue(child, db_session)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert parent.requires_approval is False
+    assert "_approval_set_at" not in parent.context
+    assert REVIEW_WAIT_APPROVAL_HOLD_KEY not in parent.context["review_loop"]
+    assert "review_wait_escalated" not in parent.context["review_loop"]
 
 
 @pytest.mark.asyncio

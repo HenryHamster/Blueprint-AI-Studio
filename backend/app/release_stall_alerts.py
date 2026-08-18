@@ -4,15 +4,24 @@ from __future__ import annotations
 
 
 import logging
+import re
 from datetime import datetime
+from pathlib import Path
+from typing import cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.release_artifacts import summarize_required_artifact_gap
-from app import pause_clock, release_version
-from app.models import Alert, AlertSeverity, DeploymentState
+from app import github, pause_clock, release_version
+from app.models import Alert, AlertSeverity, DeploymentState, Project
+from app.notification_dispatch import post_event_message
+from app.release_promotion import _resolve_github_with_session
+from app.release_qualifier_audit_surface import (
+    _changed_audited_surface_paths,
+    audited_surface_path_map,
+)
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 _MODULE_SIZE_GOVERNANCE_CAP: int = 715
@@ -43,6 +52,207 @@ _MANAGED_CHECK_WAIT_STALL_SECONDS = 4 * 3600
 _MANAGED_CHECK_WAIT_REALERT_INTERVAL_SECONDS = 4 * 3600
 _MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS = 24 * 3600
 
+_BLOCKER_LITERAL = re.compile(
+    r"(?:\bblocker\s*=\s*|['\"]blocker['\"]\s*:\s*)['\"]([a-z0-9_]+)['\"]"
+)
+_GATE_SOURCES = (
+    ("backend/app/release_scoring.py", Path(__file__).with_name("release_scoring.py")),
+    ("backend/app/release_qualifier.py", Path(__file__).with_name("release_qualifier.py")),
+)
+
+
+def gate_implementing_paths(blocker: str) -> list[str]:
+    """Return deployed modules containing the emitted blocker literal."""
+    if not isinstance(blocker, str) or not blocker:
+        return []
+    return sorted(
+        name for name, source_path in _GATE_SOURCES
+        if blocker in _BLOCKER_LITERAL.findall(source_path.read_text())
+    )
+
+
+def detect_self_modifying_gate(
+    blocker: str,
+    deployed_surface: dict[str, str] | None,
+    candidate_surface: dict[str, str] | None,
+) -> dict[str, object] | None:
+    """Measure whether a candidate edits the deployed implementation of *blocker*."""
+    if not isinstance(deployed_surface, dict) or not isinstance(candidate_surface, dict):
+        return None
+    changed = _changed_audited_surface_paths(deployed_surface, candidate_surface)
+    implicated = sorted(set(changed) & set(gate_implementing_paths(blocker)))
+    if not implicated:
+        return None
+    return {
+        "blocker": blocker,
+        "implicated_paths": implicated,
+        "deployed_blobs": {path: deployed_surface.get(path) for path in implicated},
+        "candidate_blobs": {path: candidate_surface.get(path) for path in implicated},
+    }
+
+
+async def _deployed_audited_surface(
+    session: AsyncSession, version: release_version.ReleaseVersion
+) -> tuple[str, dict[str, str]] | None:
+    """Fetch the complete audited tree at the live promotion target."""
+    try:
+        project = await session.get(Project, version.project_id)
+        if project is None:
+            return None
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return None
+        token, owner, repo = resolved
+        _, target = _release_qualifier_module()._lts_branch_names(project)
+        target_sha = await github.get_branch_sha(
+            token, owner, repo, target, project_id=str(project.id)
+        )
+        entries = await github.list_repo_tree_paths_at_ref(
+            token, owner, repo, target_sha, project_id=str(project.id)
+        )
+    except Exception:  # noqa: BLE001 — diagnosis degrades to the old alert
+        logger.warning(
+            "[RELEASE_QUALIFIER] deployed audited-surface lookup failed for v%d",
+            version.version_number,
+            exc_info=True,
+        )
+        return None
+    return None if entries is None else (target_sha, audited_surface_path_map(entries))
+
+
+def _deployed_gate_latch_details(
+    version: release_version.ReleaseVersion,
+    *,
+    base_tree_entries: list[dict] | None = None,
+    candidate_tree_entries: list[dict] | None = None,
+    deployed_surface: dict[str, str] | None = None,
+    candidate_surface: dict[str, str] | None = None,
+    compare_base_sha: str | None = None,
+) -> tuple[str, list[str], str] | None:
+    """Return ``(gate, implicated_paths, compare_range)`` for a self-repair.
+
+    A missing identity is indeterminate, not an empty range: without both SHAs
+    the operator-facing alert would claim evidence it cannot name.
+    """
+    qual = version.last_qualification or {}
+    if version.status != "open" or qual.get("status") != "not_promoted":
+        return None
+    blocker = qual.get("blocker")
+    if not isinstance(blocker, str) or not blocker:
+        return None
+    if not gate_implementing_paths(blocker):
+        return None
+    base_sha = compare_base_sha or version.base_sha
+    candidate_sha = qual.get("candidate_sha")
+    if not isinstance(base_sha, str) or not base_sha:
+        return None
+    if not isinstance(candidate_sha, str) or not candidate_sha:
+        return None
+    if deployed_surface is None and base_tree_entries is not None:
+        deployed_surface = audited_surface_path_map(base_tree_entries)
+    if candidate_surface is None and candidate_tree_entries is not None:
+        candidate_surface = audited_surface_path_map(candidate_tree_entries)
+    detected = detect_self_modifying_gate(blocker, deployed_surface, candidate_surface)
+    if detected is None:
+        return None
+    implicated = cast(list[str], detected["implicated_paths"])
+    if not implicated:
+        return None
+    return str(blocker), implicated, f"{base_sha}...{candidate_sha}"
+
+
+def _deployed_gate_latch_dedupe_key(
+    version: release_version.ReleaseVersion, gate: str, compare_range: str
+) -> str:
+    return f"release-gate-latch:{version.id}:{gate}:{compare_range}"[:255]
+
+
+async def _check_deployed_gate_latch(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    *,
+    base_tree_entries: list[dict] | None = None,
+    candidate_tree_entries: list[dict] | None = None,
+    deployed_surface: dict[str, str] | None = None,
+    candidate_surface: dict[str, str] | None = None,
+    compare_base_sha: str | None = None,
+) -> bool:
+    """Alert when a blocked candidate carries the deployed gate's repair."""
+    details = _deployed_gate_latch_details(
+        version,
+        base_tree_entries=base_tree_entries,
+        candidate_tree_entries=candidate_tree_entries,
+        deployed_surface=deployed_surface,
+        candidate_surface=candidate_surface,
+        compare_base_sha=compare_base_sha,
+    )
+    if details is None:
+        return False
+    gate, implicated_paths, compare_range = details
+    dedupe_key = _deployed_gate_latch_dedupe_key(version, gate, compare_range)
+    existing = await session.scalar(
+        select(Alert).where(
+            Alert.project_id == version.project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        ).limit(1)
+    )
+    if existing is not None:
+        return False
+
+    paths_text = ", ".join(implicated_paths)
+    summary = (
+        f"v{version.version_number} is blocked by gate {gate}, but the candidate "
+        f"modifies its deployed implementation: {paths_text}. Compare range "
+        f"{compare_range}. This repair cannot clear the gate from inside the "
+        "qualifier; use the approved release-machinery hotfix lane."
+    )
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            event_type="release_blocked",
+            severity=AlertSeverity.ERROR,
+            domain="release_lifecycle",
+            source="release_stall_alerts",
+            dedupe_key=dedupe_key,
+            title=f"Release v{version.version_number} gate latched: {gate}",
+            message=summary,
+        )
+    )
+    try:
+        await post_event_message(
+            session,
+            version.project_id,
+            "release_blocked",
+            summary,
+            context={
+                "version_number": version.version_number,
+                "version_id": str(version.id),
+                "blocker": gate,
+                "implicated_paths": implicated_paths,
+                "compare_range": compare_range,
+                "calcification": "deployed_gate_latch",
+            },
+            idempotency_key=f"{dedupe_key}:message",
+        )
+    except Exception as exc:  # noqa: BLE001 — alert must not break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post deployed-gate latch message "
+            "for v%d (non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+    version.calcification_alerted_blocker = gate
+    session.add(version)
+    logger.error(
+        "[RELEASE_QUALIFIER] deployed gate latch for v%d: gate=%s paths=%s range=%s",
+        version.version_number,
+        gate,
+        paths_text,
+        compare_range,
+    )
+    return True
+
 
 def _release_qualifier_module():
     from app import release_qualifier as rq
@@ -53,7 +263,7 @@ def _release_qualifier_module():
 def _is_build_stalled(age_days: int, merged_count: int) -> bool:
     """Return True iff a build-phase version is past the conservative threshold."""
     rq = _release_qualifier_module()
-    return (
+    return bool(
         age_days >= rq._BUILD_STALL_AGE_DAYS
         or merged_count >= rq._BUILD_STALL_MERGED_TASKS
     )
@@ -86,6 +296,20 @@ async def _check_version_calcification(
         return False
     if version.calcification_alerted_blocker == blocker:
         return False
+
+    candidate_surface = qual.get("audited_surface_paths")
+    if isinstance(candidate_surface, dict):
+        deployed = await _deployed_audited_surface(session, version)
+        if deployed is not None:
+            target_sha, deployed_surface = deployed
+            if await _check_deployed_gate_latch(
+                session,
+                version,
+                deployed_surface=deployed_surface,
+                candidate_surface=candidate_surface,
+                compare_base_sha=target_sha,
+            ):
+                return True
 
     alert_title = f"Release v{version.version_number} calcifying: {blocker}"
 
@@ -302,14 +526,17 @@ async def _check_version_stabilize_stall(
     qual_status = qual.get("status")
     if qual_status == "dry_run":
         return False
-    if qual_status == "not_promoted" and qual.get("blocker"):
+    if (
+        qual_status == "not_promoted"
+        and qual.get("blocker")
+        and (version.qualification_attempts or 0) >= _MIN_CALCIFICATION_ATTEMPTS
+    ):
         # Only suppress the stall alert when the calcification checker already
         # covers this version (i.e. it has accumulated enough hard-blocker
         # attempts for _check_version_calcification to fire).  Below that
         # threshold the calcification alert is silent, so the age/count gate
         # below serves as the backstop to keep the version operator-visible.
-        if (version.qualification_attempts or 0) >= _MIN_CALCIFICATION_ATTEMPTS:
-            return False
+        return False
 
     ref_time = version.phase_changed_at or version.opened_at
     if ref_time is None:
@@ -458,7 +685,7 @@ async def _alert_promotion_deploy_failed(
         )
     )
     try:
-        from app.release_promotion import _notify_operator  # noqa: PLC0415
+        from app.release_promotion import _notify_operator
 
         await _notify_operator(
             session,

@@ -26,7 +26,10 @@ from app.review_pipeline import (
     MAX_REVIEW_HISTORY_FEEDBACK_CHARS,
     PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
     PIPELINE_TASK_STALE_MINUTES,
+    SPAWN_REASON_ADMISSION_PAUSED,
     SPAWN_REASON_BLOCKED_REPEAT,
+    SPAWN_REASON_CONTENDED,
+    SPAWN_REASON_DEFERRED,
     SPAWN_REASON_KEY,
     SPAWN_REASON_PERSISTENT_CONFLICT,
     SPAWN_REASON_SUPERSEDE_CHURN,
@@ -41,6 +44,8 @@ from app.review_pipeline import (
     STUCK_CYCLE_THRESHOLD_REFACTOR,
     EARLY_NONCONVERGENCE_ESCALATE_AT,
     SPAWN_REASON_NONCONVERGENCE,
+    REVIEW_LOOP_ABANDON_CANDIDATE_KEY,
+    actioned_review_cap_tasks,
     _cap_review_history_feedback,
     _compute_scope_budget_utilization,
     _detect_issue_churn,
@@ -78,6 +83,263 @@ def _review_target(project_id, pr_number: int, base_sha: str, head_sha: str) -> 
         "base_sha": base_sha,
         "head_sha": head_sha,
     }
+
+
+@pytest.mark.asyncio
+async def test_source_spawn_authority_loss_prevents_canonical_child(
+    db_session, mocker
+):
+    """A revoked released-source claim stops before source-derived spawn work."""
+    project = await _make_db_project(db_session)
+    project_id = project.id
+    source = make_task(
+        project_id=project_id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "branch": "feat/revoked"}],
+        context={
+            "review_loop": {
+                "iteration": 0,
+                "pr_number": 705,
+                "branch": "feat/revoked",
+                "base_branch": "main",
+            }
+        },
+    )
+    await _persist(db_session, source)
+    source_id = source.id
+    authority = AsyncMock(return_value=None)
+    repository_scope = mocker.patch(
+        "app.review_repository_scope.repository_project_ids",
+        new_callable=AsyncMock,
+    )
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        705,
+        "feat/revoked",
+        "main",
+        original_task_id=str(source_id),
+        review_target=_review_target(project_id, 705, "base", "head"),
+        source_spawn_authority=authority,
+    )
+
+    assert spawned is None and created is False
+    authority.assert_awaited_once_with(db_session)
+    repository_scope.assert_not_awaited()
+    rows = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.id for row in rows] == [source_id]
+
+
+@pytest.mark.asyncio
+async def test_source_spawn_authority_is_acquired_before_source_derivation(
+    db_session, mocker
+):
+    """The canonical spawner owns the fresh Task row before reading its chain."""
+    project = await _make_db_project(db_session)
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "branch": "feat/authority"}],
+        context={
+            "review_loop": {
+                "iteration": 0,
+                "pr_number": 706,
+                "branch": "feat/authority",
+                "base_branch": "main",
+            }
+        },
+    )
+    await _persist(db_session, source)
+    authority_acquired = False
+
+    async def _authority(authority_session):
+        nonlocal authority_acquired
+        authoritative = (
+            (
+                await authority_session.execute(
+                    select(Task)
+                    .where(Task.id == source.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        authority_acquired = True
+        return authoritative
+
+    async def _repository_scope(_session, _project_id):
+        assert authority_acquired is True
+        return [project.id]
+
+    mocker.patch(
+        "app.review_repository_scope.repository_project_ids",
+        new=AsyncMock(side_effect=_repository_scope),
+    )
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        706,
+        "feat/authority",
+        "main",
+        original_task_id=str(source.id),
+        review_target=_review_target(project.id, 706, "base", "head"),
+        source_spawn_authority=_authority,
+    )
+
+    assert authority_acquired is True
+    assert created is True and spawned is not None
+    assert spawned.first_payload.get("type") == "review"
+    assert (spawned.context or {})["review_loop"]["review_target"] == (
+        _review_target(project.id, 706, "base", "head")
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_authority_pause_defers_then_resume_creates(
+    db_session, mocker
+):
+    """Project admission DEFERRED is retryable under the same exact source."""
+    project = await _make_db_project(db_session)
+    project.paused = True
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "branch": "feat/pause-resume"}],
+        context={
+            "review_loop": {
+                "iteration": 0,
+                "pr_number": 707,
+                "branch": "feat/pause-resume",
+                "base_branch": "main",
+            }
+        },
+    )
+    db_session.add(project)
+    await _persist(db_session, source)
+
+    async def _authority(authority_session):
+        return (
+            (
+                await authority_session.execute(
+                    select(Task)
+                    .where(Task.id == source.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .one()
+        )
+
+    target = _review_target(project.id, 707, "base", "head")
+    deferred, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        707,
+        "feat/pause-resume",
+        "main",
+        original_task_id=str(source.id),
+        review_target=target,
+        source_spawn_authority=_authority,
+    )
+    assert deferred is None and created is False
+    assert (
+        source.context or {}
+    ).get(SPAWN_REASON_KEY) == SPAWN_REASON_ADMISSION_PAUSED
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id, populate_existing=True)
+    project.paused = False
+    db_session.add(project)
+    await db_session.commit()
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        707,
+        "feat/pause-resume",
+        "main",
+        original_task_id=str(source.id),
+        review_target=target,
+        source_spawn_authority=_authority,
+    )
+    assert created is True and spawned is not None
+    assert (spawned.context or {})["review_loop"]["review_target"] == target
+
+
+@pytest.mark.asyncio
+async def test_source_authority_project_lock_contention_has_short_retry_reason(
+    db_session, mocker
+):
+    """An existing active Project hidden by SKIP LOCKED is not a pause."""
+    from app.task_locking import AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE
+
+    project = await _make_db_project(db_session)
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "branch": "feat/project-contention"}],
+        context={
+            "review_loop": {
+                "iteration": 0,
+                "pr_number": 708,
+                "branch": "feat/project-contention",
+                "base_branch": "main",
+            }
+        },
+    )
+    await _persist(db_session, source)
+    mocker.patch(
+        "app.task_locking.acquire_automatic_task_creation_authority",
+        new=AsyncMock(return_value=AUTOMATIC_TASK_CREATION_PROJECT_UNAVAILABLE),
+    )
+
+    async def _authority(authority_session):
+        return (
+            (
+                await authority_session.execute(
+                    select(Task)
+                    .where(Task.id == source.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .one()
+        )
+
+    deferred, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        708,
+        "feat/project-contention",
+        "main",
+        original_task_id=str(source.id),
+        review_target=_review_target(project.id, 708, "base", "head"),
+        source_spawn_authority=_authority,
+    )
+
+    assert deferred is None and created is False
+    assert (source.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_CONTENDED
 
 
 @pytest.mark.asyncio
@@ -795,6 +1057,63 @@ async def _persist(db_session, *tasks) -> None:
         await db_session.refresh(t)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["review", "fix", "verify_tests"])
+async def test_paused_project_authors_no_latent_pipeline_task(
+    db_session, task_type
+):
+    """Pause fences review/fix continuations before any QUEUED row exists."""
+
+    project = await _make_db_project(db_session, paused=True)
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 9751,
+                "branch": "paused/pipeline",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "iteration": 0,
+                "original_task_id": "",
+                "pr_number": 9751,
+            },
+        },
+    )
+    source.context["review_loop"]["original_task_id"] = str(source.id)
+    await _persist(db_session, source)
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        task_type,
+        db_session,
+        pr_number=9751,
+        branch="paused/pipeline",
+        base_branch="main",
+        original_task_id=str(source.id),
+        fix_prompt="Apply the bounded correction." if task_type == "fix" else "",
+    )
+
+    assert spawned is None
+    assert created is False
+    rows = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.id for row in rows] == [source.id]
+    assert source.context[SPAWN_REASON_KEY] == SPAWN_REASON_DEFERRED
+
+
 # ── _requeue_parent_task: carry-forward review iterations ────────────────────
 
 
@@ -1054,6 +1373,7 @@ class TestShouldAutoApproveSmallDiff:
         assert "0 non-test lines" in reason
 
     def test_scope_overflow_warning_disables_auto_approve(self):
+        # 9 non-test files > small overflow threshold (8)
         t = self._task(
             scope="small",
             files=[
@@ -1064,6 +1384,8 @@ class TestShouldAutoApproveSmallDiff:
                 "app/e.py",
                 "app/f.py",
                 "app/g.py",
+                "app/h.py",
+                "app/i.py",
             ],
             diff=[
                 {"file": "app/a.py", "added": 1, "removed": 0},
@@ -1789,10 +2111,11 @@ async def test_spawn_lock_timeout_defers_without_poisoning_session(db_session, m
 
 @pytest.mark.asyncio
 async def test_global_cap_blocks_spawn(db_session, mocker):
-    """When the global completed-task count for a PR reaches the cap,
-    _spawn_pipeline_task returns None without creating a new task, transitions
-    the root task to FAILED with failure_detail=review_cap_exhausted, closes
-    the PR, keeps requires_approval=True, and fires a failure alert."""
+    """A global cap parks the nonempty PR for explicit disposition.
+
+    Exhausting a work budget is not evidence that the patch should be rejected;
+    the chain therefore stays non-terminal and the PR stays open.
+    """
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -1876,46 +2199,25 @@ async def test_global_cap_blocks_spawn(db_session, mocker):
     assert result is None, "Global cap (10 iterations, small scope) should block spawn"
 
     await db_session.refresh(original_task)
-    assert original_task.status == TaskStatus.FAILED, (
-        f"Global cap must transition the root task to FAILED, got {original_task.status}"
-    )
-    assert (original_task.context or {}).get(
-        "failure_detail"
-    ) == "review_cap_exhausted", (
-        "Global cap must tag failure_detail=review_cap_exhausted so the rollup respawn "
-        "loop can skip this child and the parent can finalize."
-    )
-    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome")
-    assert terminal_outcome and terminal_outcome.get("kind") == "cap_exhausted"
-    assert terminal_outcome.get("reason") == "review_cap_exhausted"
-    assert (original_task.context or {}).get("pr_rejected") is True, (
-        "Global cap must preempt the webhook by setting pr_rejected=True before closing the PR"
-    )
-    assert original_task.requires_approval is True, (
-        "Global cap preserves requires_approval=True as the UI signal for manual intervention"
-    )
-    assert "manual review" in (original_task.latest_status_message or "").lower(), (
-        f"Status message should mention manual review: {original_task.latest_status_message!r}"
-    )
-    close_mock.assert_awaited_once()
-    assert close_mock.call_args.args[3] == 101, (
-        f"close_pull_request must be called with pr_number=101, got {close_mock.call_args.args}"
-    )
-    alert_mock.assert_called_once()
-    call_args = alert_mock.call_args[0]
-    assert "cap" in call_args[2].lower() or "manual" in call_args[2].lower(), (
-        f"Alert should mention cap or manual intervention, got: {call_args[2]!r}"
-    )
+    assert original_task.status == TaskStatus.COMPLETED
+    marker = (original_task.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    assert marker and marker["reason"] == "review_cap"
+    assert marker["actioned_generations"] == 10
+    assert (original_task.context or {}).get("failure_detail") is None
+    assert (original_task.context or {}).get("pr_rejected") is not True
+    assert original_task.requires_approval is True
+    assert "parked for operator disposition" in (
+        original_task.latest_status_message or ""
+    ).lower()
+    close_mock.assert_not_called()
+    alert_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_cap_paths_symmetric_terminal_state(db_session, mocker):
-    """Both the global-cap and per-chain-cap paths must produce a symmetric
-    terminal state: FAILED status with failure_detail=review_cap_exhausted,
-    requires_approval=True, and a 'manual review required' status message.
-    Prevents silent-block conditions where one cap path fails the task but
-    the other leaves it COMPLETED (the bug that produced the PR #1947 respawn
-    loop, fixed 2026-04-17)."""
+async def test_cap_uses_actioned_generations_not_raw_iteration_counter(
+    db_session, mocker
+):
+    """Actioned work parks at cap; a stale raw iteration counter does not."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -1934,7 +2236,9 @@ async def test_cap_paths_symmetric_terminal_state(db_session, mocker):
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
 
-    async def _run_cap(pr_number: int, iteration: int, completed_count: int) -> Task:
+    async def _run_cap(
+        pr_number: int, iteration: int, completed_count: int
+    ) -> tuple[Task, Task | None]:
         project = await _make_db_project(db_session)
         original_task = make_task(
             project_id=project.id,
@@ -1995,43 +2299,29 @@ async def test_cap_paths_symmetric_terminal_state(db_session, mocker):
             original_task_id=str(original_task.id),
             fix_prompt="Still broken",
         )
-        assert result is None
         await db_session.refresh(original_task)
-        return original_task
+        return original_task, result
 
-    global_root = await _run_cap(pr_number=901, iteration=0, completed_count=10)
-    per_chain_root = await _run_cap(pr_number=902, iteration=10, completed_count=0)
+    capped_root, capped_result = await _run_cap(
+        pr_number=901, iteration=0, completed_count=10
+    )
+    raw_root, raw_result = await _run_cap(
+        pr_number=902, iteration=10, completed_count=0
+    )
 
-    for root, label in ((global_root, "global"), (per_chain_root, "per-chain")):
-        assert root.status == TaskStatus.FAILED, (
-            f"{label} cap must transition to FAILED, got {root.status}"
-        )
-        assert (root.context or {}).get("failure_detail") == "review_cap_exhausted", (
-            f"{label} cap must tag failure_detail=review_cap_exhausted"
-        )
-        terminal_outcome = (root.context or {}).get("review_loop_terminal_outcome")
-        assert terminal_outcome and terminal_outcome.get("kind") == "cap_exhausted"
-        assert terminal_outcome.get("reason") == "review_cap_exhausted"
-        assert root.requires_approval is True, (
-            f"{label} cap must preserve requires_approval"
-        )
-        msg = (root.latest_status_message or "").lower()
-        assert "manual review" in msg, (
-            f"{label} cap message missing 'manual review': {msg!r}"
-        )
-        assert "review-fix cycle reached limit" in msg, (
-            f"{label} cap message should use symmetric 'Review-fix cycle reached limit' phrasing: {msg!r}"
-        )
+    assert capped_result is None
+    assert capped_root.status == TaskStatus.COMPLETED
+    assert (capped_root.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    assert capped_root.requires_approval is True
+
+    assert raw_result is not None
+    assert raw_root.status == TaskStatus.COMPLETED
+    assert not (raw_root.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
 
 
 @pytest.mark.asyncio
-async def test_cap_exhaustion_skips_approval_when_gates_disabled(db_session, mocker):
-    """With require_approval_gates off, hitting the review-fix cap must still
-    FAIL the child (terminal -> partial rollup) and close the PR, but must NOT
-    set requires_approval. Otherwise rollup_management escalates the flag onto
-    the parent and services.py's 2h approval-gate timeout FAILs the otherwise-
-    healthy parent, discarding its already-merged siblings. Regression for the
-    c255c4cb / rollup PR #6722 incident (2026-05-28)."""
+async def test_cap_disposition_owns_pr_when_gates_disabled(db_session, mocker):
+    """A safety disposition is explicit even when ordinary gates are disabled."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -2118,18 +2408,11 @@ async def test_cap_exhaustion_skips_approval_when_gates_disabled(db_session, moc
     assert result is None, "Global cap must still block the spawn"
 
     await db_session.refresh(original_task)
-    # Terminal outcome is preserved — the cap still fails the child and closes the PR.
-    assert original_task.status == TaskStatus.FAILED, (
-        f"Cap must still FAIL the child even with gates off, got {original_task.status}"
-    )
-    assert (original_task.context or {}).get("failure_detail") == "review_cap_exhausted"
-    close_mock.assert_awaited_once()
-    # The fix: NO approval gate is raised when require_approval_gates is off.
-    assert not original_task.requires_approval, (
-        "With require_approval_gates off, cap exhaustion must NOT set "
-        "requires_approval — the capped child is FAILED (terminal) and converges "
-        "via partial rollup without gating the parent."
-    )
+    assert original_task.status == TaskStatus.COMPLETED
+    assert (original_task.context or {}).get("failure_detail") is None
+    assert (original_task.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    close_mock.assert_not_called()
+    assert original_task.requires_approval is True
 
 
 # ── FIX D: cap exhaustion after approval → CANCELLED (no CODE_ERROR) ────────
@@ -2226,6 +2509,7 @@ async def test_approved_cap_exhaustion_records_distinct_outcome(db_session, mock
         16,
         db_session,
         scope="per-chain",
+        verified_disposition="reject",
     )
 
     await db_session.refresh(orig)
@@ -2333,6 +2617,7 @@ async def test_approved_rollup_cap_preserved_not_closed(db_session, mocker):
         16,
         db_session,
         scope="per-chain",
+        verified_disposition="reject",
     )
 
     await db_session.refresh(orig)
@@ -2424,7 +2709,8 @@ async def test_cap_exhaustion_with_outstanding_changes_requested_stays_failed(
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 405, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 405, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -2729,10 +3015,8 @@ async def test_global_cap_under_limit_allows_spawn(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_per_chain_cap_blocks_spawn_and_marks_original(db_session, mocker):
-    """When the per-chain iteration counter exceeds the cap, _spawn_pipeline_task
-    returns None, transitions the original task to FAILED with
-    failure_detail=review_cap_exhausted, closes the PR, and fires a failure alert."""
+async def test_raw_per_chain_iteration_does_not_consume_cap(db_session, mocker):
+    """A copied/raw loop counter is not proof of an actioned patch generation."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -2803,40 +3087,21 @@ async def test_per_chain_cap_blocks_spawn_and_marks_original(db_session, mocker)
         fix_prompt="Still broken",
     )
 
-    assert result is None, "Per-chain cap should block the fix spawn"
+    assert result is not None
 
     await db_session.refresh(original_task)
-    assert original_task.status == TaskStatus.FAILED, (
-        f"Per-chain cap must transition the original task to FAILED, got {original_task.status}"
-    )
-    assert (original_task.context or {}).get(
-        "failure_detail"
-    ) == "review_cap_exhausted", (
-        "Per-chain cap must tag failure_detail=review_cap_exhausted"
-    )
-    assert original_task.requires_approval is True, (
-        "Per-chain cap preserves requires_approval=True"
-    )
-    assert "manual review" in (original_task.latest_status_message or "").lower(), (
-        f"Status message should mention manual review: {original_task.latest_status_message!r}"
-    )
-    close_mock.assert_awaited_once()
-    assert close_mock.call_args.args[3] == 103, (
-        f"close_pull_request must be called with pr_number=103, got {close_mock.call_args.args}"
-    )
-    alert_mock.assert_called_once()
-    call_args = alert_mock.call_args[0]
-    assert "cap" in call_args[2].lower() or "manual" in call_args[2].lower(), (
-        f"Alert should mention cap or manual review, got: {call_args[2]!r}"
-    )
+    assert original_task.status == TaskStatus.COMPLETED
+    assert not (original_task.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    assert original_task.requires_approval is False
+    close_mock.assert_not_called()
+    alert_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_cap_exhaustion_records_task_and_direction_result(db_session, mocker):
-    """Review-fix cap exhaustion must surface to deploy_monitoring.task_results
-    and to per-direction failure streaks. Without this, cap failures bypass
-    per-type failure gates and anomaly detection — regression guard for the
-    cluster 2/5 fix of the missing-record_task_result sweep."""
+async def test_raw_iteration_does_not_record_task_or_direction_failure(
+    db_session, mocker
+):
+    """A raw counter cannot manufacture a terminal task/direction outcome."""
     from collections import deque
     import app.shared_state as ss
     from app.routers import agent_status as _agent_status_mod
@@ -2910,31 +3175,18 @@ async def test_cap_exhaustion_records_task_and_direction_result(db_session, mock
         fix_prompt="Still broken",
     )
 
-    assert result is None, "Per-chain cap should block spawn"
+    assert result is not None
 
     results = list(ss.deploy_monitoring["task_results"])
-    assert len(results) == 1, (
-        f"Cap exhaustion must append exactly one deploy_monitoring entry, got {results!r}"
-    )
-    _, outcome, fclass, ttype = results[0]
-    assert outcome == "failure", f"Expected failure outcome, got {outcome!r}"
-    assert fclass == "CODE_ERROR", f"Expected CODE_ERROR failure_class, got {fclass!r}"
-    assert ttype == "create", f"Expected task_type=create, got {ttype!r}"
-
-    streak = ss.direction_failure_streaks.get(direction_id)
-    assert streak is not None, "Cap exhaustion must register a direction failure streak"
-    assert streak["consecutive_infra_failures"] == 0
-    assert streak["consecutive_failures"] == 1
-    assert streak["last_failure_class"] == "CODE_ERROR"
+    assert results == []
+    assert ss.direction_failure_streaks.get(direction_id) is None
 
 
 @pytest.mark.asyncio
-async def test_cap_exhaustion_records_remediation_failure_on_direction(
+async def test_raw_iteration_does_not_record_remediation_failure_on_direction(
     db_session, mocker
 ):
-    """Cap exhaustion on a remediation create task must stamp the linked direction
-    with a failed outcome. Without this call, a premature 'merged' recorded on PR
-    creation would persist even though the PR was auto-closed."""
+    """A copied loop counter cannot overwrite a direction with a false failure."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -3007,22 +3259,17 @@ async def test_cap_exhaustion_records_remediation_failure_on_direction(
         original_task_id=str(original_task.id),
         fix_prompt="Still broken",
     )
-    assert result is None
+    assert result is not None
 
     await db_session.refresh(project)
     direction = next(d for d in project.directions if d["id"] == direction_id)
-    assert direction.get("remediation_attempts") == 1, (
-        f"Cap exhaustion must record a remediation attempt on the direction, got {direction!r}"
-    )
-    assert direction.get("last_remediation_result") == "failed"
+    assert direction.get("remediation_attempts") is None
+    assert direction.get("last_remediation_result") is None
 
 
 @pytest.mark.asyncio
-async def test_cap_exhaustion_idempotent(db_session, mocker):
-    """If rollup or another handler re-enters _spawn_pipeline_task for an
-    already-cap-exhausted PR, the side effects (PR close, alert) must fire
-    exactly once. Before the 2026-04-17 fix this path looped every 10min,
-    re-writing the same status message and never converging."""
+async def test_cap_park_is_idempotent_and_never_closes(db_session, mocker):
+    """Repeated callbacks keep one operator-owned park and no destructive effects."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -3103,36 +3350,25 @@ async def test_cap_exhaustion_idempotent(db_session, mocker):
         )
     await db_session.commit()
 
-    await _spawn_once()
-    assert close_mock.await_count == 1
-    assert alert_mock.call_count == 1
-    assert comment_mock.await_count == 1
-
-    await _spawn_once()
-    assert close_mock.await_count == 1, (
-        f"close_pull_request must only fire once; idempotent handler got {close_mock.await_count} calls"
-    )
-    assert alert_mock.call_count == 1, (
-        f"Alert must only fire once; got {alert_mock.call_count}"
-    )
-    assert comment_mock.await_count == 1, (
-        f"PR comment must only fire once; got {comment_mock.await_count}"
-    )
-
-    await _spawn_once()
-    assert close_mock.await_count == 1
+    assert await _spawn_once() == (None, False)
+    assert await _spawn_once() == (None, False)
+    assert await _spawn_once() == (None, False)
+    await db_session.refresh(original_task)
+    marker = (original_task.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    assert marker and marker["actioned_generations"] == 10
+    assert close_mock.await_count == 0
+    assert alert_mock.call_count == 0
+    assert comment_mock.await_count == 0
 
 
 @pytest.mark.asyncio
-async def test_per_chain_cap_small_vs_medium_scope(db_session, mocker):
-    """small scope caps at 10 while medium scope allows up to 12 — verifies the
-    per-chain cap is scope-aware (not a fixed constant)."""
+async def test_raw_iteration_counter_does_not_trigger_scope_cap(db_session, mocker):
+    """Neither small nor medium scope burns cap from an inherited row counter."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
 
-    # At iteration=11, small scope (cap=10) should block; medium scope (cap=12) allows.
-    for scope, should_block in [("small", True), ("medium", False)]:
+    for scope in ("small", "medium"):
         original = make_task(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
@@ -3180,14 +3416,7 @@ async def test_per_chain_cap_small_vs_medium_scope(db_session, mocker):
             fix_prompt="Fix it",
         )
 
-        if should_block:
-            assert result is None, (
-                f"scope={scope!r} at iteration=11 should be blocked (cap=10)"
-            )
-        else:
-            assert result is not None, (
-                f"scope={scope!r} at iteration=11 should be allowed (cap=12)"
-            )
+        assert result is not None
 
 
 # ── _spawn_pipeline_task: stuck-cycle detection ───────────────────────────────
@@ -3445,7 +3674,18 @@ async def test_stuck_cycle_detected_at_50pct_blocks_spawn(db_session, mocker):
         project_id=project.id,
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+        context={
+            "_approval_set_at": "old-review-wait-timer",
+            "_operator_approval_followup_claim": {"token": "old-operator-claim"},
+            "review_loop": {
+                "review_wait_approval_hold": {
+                    "owner": "ci_review_wait_backstop",
+                    "set_at": "old-review-wait-timer",
+                }
+            },
+        },
     )
+    original_task.requires_approval = True
     db_session.add(original_task)
     await db_session.commit()
     await db_session.refresh(original_task)
@@ -3511,6 +3751,16 @@ async def test_stuck_cycle_detected_at_50pct_blocks_spawn(db_session, mocker):
     assert "stuck" in (original_task.latest_status_message or "").lower(), (
         f"Status message should mention stuck cycle: {original_task.latest_status_message!r}"
     )
+    original_context = original_task.context or {}
+    assert "review_wait_approval_hold" not in (
+        original_context.get("review_loop") or {}
+    )
+    assert "_operator_approval_followup_claim" not in original_context
+    assert original_context.get("approval_hold_reason") == "stuck"
+    assert original_context.get("_approval_set_at") != "old-review-wait-timer"
+    assert (original_context.get("_approval_hold_provenance") or {}).get(
+        "owner"
+    ) == "review_pipeline"
 
 
 @pytest.mark.asyncio
@@ -5275,10 +5525,6 @@ async def test_rollup_chain_at_iter_13_does_not_hit_global_cap(db_session, mocke
     broadcast_mock = mocker.patch(
         "app.review_pipeline.broadcast_to_project", new_callable=AsyncMock
     )
-    cap_exhaustion_mock = mocker.patch(
-        "app.review_pipeline._handle_cap_exhaustion", new_callable=AsyncMock
-    )
-
     project = await _make_db_project(db_session)
 
     source_task = make_task(
@@ -5338,14 +5584,12 @@ async def test_rollup_chain_at_iter_13_does_not_hit_global_cap(db_session, mocke
         fix_prompt="Address the review feedback",
     )
 
-    assert cap_exhaustion_mock.call_count == 0, (
-        f"Rollup chain at 13 iterations (medium scope) must NOT hit "
-        f"_handle_cap_exhaustion when the rollup chain is recognised correctly "
-        f"(elevated cap=16). Got {cap_exhaustion_mock.call_count} call(s)."
-    )
     assert result is not None, (
         "Rollup chain at iter 13 (medium scope) must still spawn a fix task "
         "because the elevated cap (16) is not exhausted"
+    )
+    assert REVIEW_LOOP_ABANDON_CANDIDATE_KEY not in (source_task.context or {}), (
+        "A below-cap rollup chain must not be parked for operator disposition"
     )
     # The child must NOT carry the parent-only _is_rollup_review marker (strand
     # fix), but the rollup lineage that drives the elevated cap is carried.
@@ -6085,8 +6329,8 @@ async def test_scope_budget_utilization_attached_to_fix_from_source_files(
     assert util["scope"] == "medium"
     assert util["file_count"] == 7
     assert util["non_test_file_count"] == 5
-    assert util["budget"] == 10  # medium production_files_max
-    assert util["percentage"] == 50
+    assert util["budget"] == 16  # medium production_files_max
+    assert util["percentage"] == 31
 
 
 @pytest.mark.asyncio
@@ -6148,7 +6392,7 @@ async def test_scope_budget_utilization_falls_back_to_create_task(db_session, mo
     util = (result.context or {}).get("scope_budget_utilization")
     assert util is not None
     assert util["non_test_file_count"] == 2
-    assert util["budget"] == 6  # small total_files_max
+    assert util["budget"] == 8  # small total_files_max
     assert util["scope"] == "small"
 
 
@@ -6238,8 +6482,8 @@ async def test_scope_budget_utilization_attached_to_review_spawn(db_session, moc
 
 @pytest.mark.asyncio
 async def test_scope_pressure_graduated_cap_at_mid_utilization(db_session, mocker):
-    """Medium task at 80% (8/10 prod) gets a graduated cap well below per_chain_cap
-    but no no-new-files prompt (below 90%)."""
+    """Medium task at ~81% (13/16 prod) gets a graduated cap well below
+    per_chain_cap but no no-new-files prompt (below 90%)."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -6256,7 +6500,7 @@ async def test_scope_pressure_graduated_cap_at_mid_utilization(db_session, mocke
         ],
         context={
             "scope": "medium",
-            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(8)]
+            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(13)]
             + ["backend/testing/test_a.py"],
             "review_loop": {"iteration": 0},
         },
@@ -6276,8 +6520,8 @@ async def test_scope_pressure_graduated_cap_at_mid_utilization(db_session, mocke
     )
     assert created is True and result is not None
     ctx = result.context or {}
-    # source iteration=0 → spawned iteration=1, base_remaining=11, 80% util
-    # → round(11 * 0.20) = 2 remaining, hard_cap = 1 + 2 = 3
+    # source iteration=0 → spawned iteration=1, base_remaining=11, 81.25% util
+    # (13/16) → round(11 * 0.1875) = 2 remaining, hard_cap = 1 + 2 = 3
     assert ctx.get("_scope_budget_hard_cap") == 3
     # No no-new-files prompt below 90%
     payload = result.payloads[0] if result.payloads else {}
@@ -6286,7 +6530,7 @@ async def test_scope_pressure_graduated_cap_at_mid_utilization(db_session, mocke
 
 @pytest.mark.asyncio
 async def test_scope_pressure_floor_of_two_at_high_utilization(db_session, mocker):
-    """At 80% the graduated formula floors at 2; at 100% it still floors at 2."""
+    """At ~81% the graduated formula floors at 2; at 100% it still floors at 2."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -6303,7 +6547,9 @@ async def test_scope_pressure_floor_of_two_at_high_utilization(db_session, mocke
         ],
         context={
             "scope": "medium",
-            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(8)],  # 8/10=80%
+            "_pr_changed_files": [
+                f"backend/app/p{i}.py" for i in range(13)
+            ],  # 13/16=81.25%
             "review_loop": {"iteration": 0},
         },
     )
@@ -6321,11 +6567,11 @@ async def test_scope_pressure_floor_of_two_at_high_utilization(db_session, mocke
         fix_prompt="fix",
     )
     ctx = result.context or {}
-    # iteration=1, base_remaining=11, 80% util → round(11*0.20)=2 → floor=2 →
+    # iteration=1, base_remaining=11, 81.25% util → round(11*0.1875)=2 → floor=2 →
     # hard_cap=1+2=3
     assert ctx.get("_scope_budget_hard_cap") == 3
     payload = result.payloads[0] if result.payloads else {}
-    # 80% < 90% → no hard_prefix yet
+    # 81.25% < 90% → no hard_prefix yet
     assert "SCOPE BUDGET EXHAUSTED" not in (payload.get("prompt") or "")
 
 
@@ -6349,8 +6595,8 @@ async def test_scope_pressure_no_new_files_still_at_90_percent(db_session, mocke
         context={
             "scope": "medium",
             "_pr_changed_files": [
-                f"backend/app/p{i}.py" for i in range(10)
-            ],  # 10/10=100%
+                f"backend/app/p{i}.py" for i in range(16)
+            ],  # 16/16=100%
             "review_loop": {"iteration": 0},
         },
     )
@@ -6423,7 +6669,7 @@ async def test_scope_pressure_large_scope_at_70_percent(db_session, mocker):
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
-    # Large scope has 20 file budget; 70% = 14 files. Use 15 files to exceed threshold.
+    # Large scope has a 32-file budget; 70% = 22.4 files. Use 24 files (75%).
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
@@ -6437,7 +6683,7 @@ async def test_scope_pressure_large_scope_at_70_percent(db_session, mocker):
         ],
         context={
             "scope": "large",
-            "_pr_changed_files": [f"backend/app/large_{i}.py" for i in range(15)]
+            "_pr_changed_files": [f"backend/app/large_{i}.py" for i in range(24)]
             + ["backend/testing/test_large.py"],
             "review_loop": {"iteration": 0},
         },
@@ -6458,7 +6704,7 @@ async def test_scope_pressure_large_scope_at_70_percent(db_session, mocker):
     assert created is True and result is not None
     ctx = result.context or {}
     # source iteration=0 → spawned iteration=1, base_cap=16, base_remaining=15, 75% util
-    # (15/20 non-test files = 75%) → round(15 * 0.25) = 4 remaining,
+    # (24/32 non-test files = 75%) → round(15 * 0.25) = 4 remaining,
     # no floor needed since 4 >= 3 → hard_cap = 1 + 4 = 5
     assert ctx.get("_scope_budget_hard_cap") == 5
     # No no-new-files prompt below 90%
@@ -6486,8 +6732,8 @@ async def test_prior_hard_cap_propagates_while_under_pressure(db_session, mocker
         ],
         context={
             "scope": "medium",
-            # 8/10 non-test = 80% (above warn threshold)
-            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(8)]
+            # 13/16 non-test = 81.25% (above warn threshold)
+            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(13)]
             + ["backend/testing/test_a.py"],
             "_scope_budget_hard_cap": 2,  # tighter than any freshly-derived cap
             "review_loop": {"iteration": 0},
@@ -8470,12 +8716,13 @@ class TestComputeScopeBudgetUtilization:
         )
 
     def test_small_scope_mixed_files(self):
-        # small budget = 6 (total_files_max); 3 non-test files → 50%
+        # small budget = 8 (total_files_max); 4 non-test files → 50%
         result = _compute_scope_budget_utilization(
             [
                 "backend/app/a.py",
                 "backend/app/b.py",
                 "backend/app/c.py",
+                "backend/app/d.py",
                 "backend/testing/test_a.py",
                 "backend/testing/test_b.py",
             ],
@@ -8483,21 +8730,21 @@ class TestComputeScopeBudgetUtilization:
         )
         assert result == {
             "scope": "small",
-            "file_count": 5,
-            "non_test_file_count": 3,
-            "budget": 6,
+            "file_count": 6,
+            "non_test_file_count": 4,
+            "budget": 8,
             "percentage": 50,
         }
 
     def test_medium_scope_uses_production_files_max(self):
-        # medium production_files_max = 10; 10 non-test → 100%
-        files = [f"backend/app/m{i}.py" for i in range(10)] + [
+        # medium production_files_max = 16; 16 non-test → 100%
+        files = [f"backend/app/m{i}.py" for i in range(16)] + [
             "backend/testing/test_m.py"
         ]
         result = _compute_scope_budget_utilization(files, "medium")
-        assert result["budget"] == 10
-        assert result["non_test_file_count"] == 10
-        assert result["file_count"] == 11
+        assert result["budget"] == 16
+        assert result["non_test_file_count"] == 16
+        assert result["file_count"] == 17
         assert result["percentage"] == 100
 
     def test_all_test_files_zero_non_test(self):
@@ -8514,10 +8761,10 @@ class TestComputeScopeBudgetUtilization:
         assert result["percentage"] == 0
 
     def test_large_scope_budget(self):
-        # large total_files_max = 20; 10 non-test → 50%
-        files = [f"backend/app/l{i}.py" for i in range(10)]
+        # large total_files_max = 32; 16 non-test → 50%
+        files = [f"backend/app/l{i}.py" for i in range(16)]
         result = _compute_scope_budget_utilization(files, "large")
-        assert result["budget"] == 20
+        assert result["budget"] == 32
         assert result["percentage"] == 50
 
 
@@ -8528,13 +8775,27 @@ class TestDetectIssueChurn:
     def _entry(self, issues):
         return {"iteration": 0, "feedback": "f", "issues": issues}
 
+    def _exact_entry(self, iteration: int, head: str, issue_ids: list[str]):
+        return {
+            "iteration": iteration,
+            "verdict": "REQUEST_CHANGES",
+            "reviewed_base_sha": "base-live",
+            "reviewed_head_sha": head,
+            "target_verified_by_backend": True,
+            "review_task_id": f"review-{iteration}",
+            "issues": [
+                {**_issue(f"finding {issue_id}"), "issue_id": issue_id}
+                for issue_id in issue_ids
+            ],
+        }
+
     def test_short_history_no_churn(self):
         hist = [self._entry([_issue("a")])]
         is_churn, counts = _detect_issue_churn(hist)  # noqa: RUF059
         assert is_churn is False
 
     def test_non_decreasing_distinct_issues_is_churn(self):
-        # Counts 2, 2 with entirely different issues each iter → churn.
+        # Without exact canonical IDs, retain the conservative legacy fallback.
         hist = [
             self._entry([_issue("b1"), _issue("b2")]),
             self._entry([_issue("c1"), _issue("c2")]),
@@ -8542,6 +8803,40 @@ class TestDetectIssueChurn:
         is_churn, counts = _detect_issue_churn(hist)
         assert is_churn is True
         assert counts == [2, 2]
+
+    def test_exact_distinct_open_sets_are_progress_not_count_churn(self):
+        hist = [
+            self._exact_entry(1, "head-1", ["BP-old"]),
+            self._exact_entry(2, "head-2", ["BP-new-a", "BP-new-b"]),
+        ]
+
+        is_churn, counts = _detect_issue_churn(hist)
+
+        assert is_churn is False
+        assert counts == [1, 2]
+
+    def test_exact_re_raised_blocker_is_still_churn(self):
+        hist = [
+            self._exact_entry(1, "head-1", ["BP-old"]),
+            self._exact_entry(2, "head-2", ["BP-old", "BP-new"]),
+        ]
+
+        is_churn, counts = _detect_issue_churn(hist)
+
+        assert is_churn is True
+        assert counts == [1, 2]
+
+    def test_exact_nonadjacent_re_raised_blocker_is_churn(self):
+        hist = [
+            self._exact_entry(1, "head-1", ["BP-a"]),
+            self._exact_entry(2, "head-2", ["BP-b"]),
+            self._exact_entry(3, "head-3", ["BP-a"]),
+        ]
+
+        is_churn, counts = _detect_issue_churn(hist)
+
+        assert is_churn is True
+        assert counts == [1, 1]
 
     def test_strictly_decreasing_not_churn(self):
         hist = [
@@ -9221,6 +9516,8 @@ async def test_scope_overflow_warning_propagates_to_review_context_and_prompt(
                 "backend/app/e.py",
                 "backend/app/f.py",
                 "backend/app/g.py",
+                "backend/app/h.py",
+                "backend/app/i.py",
             ],
             "review_loop": {"iteration": 0},
         },
@@ -9244,8 +9541,8 @@ async def test_scope_overflow_warning_propagates_to_review_context_and_prompt(
     assert ctx.get("scope_overflow_warned") is True
     overflow = ctx.get("scope_overflow_warning") or {}
     assert overflow.get("scope") == "small"
-    assert overflow.get("threshold") == 6
-    assert overflow.get("non_test_file_count") == 7
+    assert overflow.get("threshold") == 8
+    assert overflow.get("non_test_file_count") == 9
     assert (ctx.get("review_loop") or {}).get("scope_overflow_warned") is True
 
     payload = result.first_payload or {}
@@ -9256,7 +9553,7 @@ async def test_scope_overflow_warning_propagates_to_review_context_and_prompt(
     await db_session.refresh(source_task)
     source_ctx = source_task.context or {}
     assert source_ctx.get("scope_overflow_warned") is True
-    assert (source_ctx.get("scope_overflow_warning") or {}).get("threshold") == 6
+    assert (source_ctx.get("scope_overflow_warning") or {}).get("threshold") == 8
 
 
 @pytest.mark.asyncio
@@ -9280,6 +9577,8 @@ async def test_scope_overflow_pr_signal_emitted_once(db_session, mocker):
         "backend/app/e.py",
         "backend/app/f.py",
         "backend/app/g.py",
+        "backend/app/h.py",
+        "backend/app/i.py",
     ]
     source_task = make_task(
         project_id=project.id,
@@ -9318,8 +9617,8 @@ async def test_scope_overflow_pr_signal_emitted_once(db_session, mocker):
     first_comment = comment_mock.await_args.args[4]
     assert "Scope overflow detected" in first_comment
     assert "- Declared scope: `small`" in first_comment
-    assert "- Non-test files changed: `7`" in first_comment
-    assert "- Scope budget: `6`" in first_comment
+    assert "- Non-test files changed: `9`" in first_comment
+    assert "- Scope budget: `8`" in first_comment
     for path in overflow_files:
         assert f"- `{path}`" in first_comment
 
@@ -9658,15 +9957,20 @@ class TestFailureFingerprint:
         assert all(c in "0123456789abcdef" for c in fp)
 
 
+@pytest.mark.parametrize("alert_outcome", ["dedup", "error"])
 @pytest.mark.asyncio
 async def test_repeat_fingerprint_halts_chain_and_classifies_blocked(
-    db_session, mocker
+    db_session, mocker, alert_outcome
 ):
     """Two same-type FAILED tasks in the same chain with identical failure
     fingerprints → next spawn returns (None, False), the most-recent FAILED
     is reclassified as BLOCKED_PRECONDITION, the chain's original task is
     marked requires_approval=True, ProjectMessage posted to strategic."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    alert = AsyncMock(return_value=None)
+    if alert_outcome == "error":
+        alert.side_effect = RuntimeError("synthetic alert outage")
+    mocker.patch("app.alert_dispatch._maybe_create_escalation_alert", new=alert)
 
     project = await _make_db_project(db_session)
     original_task = make_task(
@@ -9677,6 +9981,8 @@ async def test_repeat_fingerprint_halts_chain_and_classifies_blocked(
     db_session.add(original_task)
     await db_session.commit()
     await db_session.refresh(original_task)
+    project_id = project.id
+    original_task_id = original_task.id
 
     common_failure = "[wrapper] ./check failed: error while loading shared libraries: libatk-1.0.so.0"
 
@@ -9724,6 +10030,8 @@ async def test_repeat_fingerprint_halts_chain_and_classifies_blocked(
         latest_status_message=f"[2026-05-06T09:42:08] iter=3 vm=agent-vm-bbb222 {common_failure}",
     )
     await _persist(db_session, earlier_fix, most_recent_fix)
+    earlier_fix_id = earlier_fix.id
+    most_recent_fix_id = most_recent_fix.id
 
     # Source is most_recent_fix being handed off (FAILED here, but the halt
     # fires regardless of source.status — see also EVALUATING test below).
@@ -9734,57 +10042,62 @@ async def test_repeat_fingerprint_halts_chain_and_classifies_blocked(
         pr_number=901,
         branch="fix/901",
         base_branch="main",
-        original_task_id=str(original_task.id),
+        original_task_id=str(original_task_id),
     )
 
     assert result is None
     assert was_created is False
 
-    # Persist before refreshing: the halt path leaves the reclassification and
-    # the spawn-reason marker pending for the rollup caller's final commit
-    # (per the _spawn_pipeline_task contract); under real ORM expiry a refresh
-    # without this commit would discard the pending writes.
-    await db_session.commit()
+    # The wrapper rolls back all uncommitted helper bookkeeping before it
+    # reselects the source. Terminal repeat-fingerprint evidence must therefore
+    # be self-committed before the best-effort alert helper can dedup or raise.
+    await db_session.rollback()
 
-    # most_recent_fix gets reclassified.
-    await db_session.refresh(most_recent_fix)
-    ctx = most_recent_fix.context or {}
-    assert ctx.get("failure_category") == "BLOCKED_PRECONDITION"
-    assert ctx.get("blocked_repeat_fingerprint")
-    assert ctx.get("blocked_repeat_prior_task_id") == str(earlier_fix.id)
-    msg = (most_recent_fix.latest_status_message or "").lstrip().lower()
-    assert msg.startswith("blocker:")
-
-    # source_task gets the spawn-reason marker.
-    ctx_src = most_recent_fix.context or {}
-    assert ctx_src.get(SPAWN_REASON_KEY) == SPAWN_REASON_BLOCKED_REPEAT
-
-    # Original task gets requires_approval=True (mirrors stuck-cycle).
-    await db_session.refresh(original_task)
-    assert original_task.requires_approval is True
-    assert "repeat-fingerprint" in (original_task.latest_status_message or "").lower()
-
-    # ProjectMessage posted to strategic so it can decide the next move.
+    from app.database import AsyncSessionLocal
     from app.models import MessageType, ProjectMessage
 
-    pms = (
-        (
-            await db_session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.message_type == MessageType.BLOCKER,
+    async with AsyncSessionLocal() as verifying_session:
+        persisted_recent = await verifying_session.get(Task, most_recent_fix_id)
+        persisted_original = await verifying_session.get(Task, original_task_id)
+        assert persisted_recent is not None
+        assert persisted_original is not None
+
+        # most_recent_fix gets reclassified durably. The source spawn reason is
+        # intentionally return-only bookkeeping and was rolled back above.
+        ctx = persisted_recent.context or {}
+        assert ctx.get("failure_category") == "BLOCKED_PRECONDITION"
+        assert ctx.get("blocked_repeat_fingerprint")
+        assert ctx.get("blocked_repeat_prior_task_id") == str(earlier_fix_id)
+        assert SPAWN_REASON_KEY not in ctx
+        msg = (persisted_recent.latest_status_message or "").lstrip().lower()
+        assert msg.startswith("blocker:")
+
+        # Original task gets requires_approval=True (mirrors stuck-cycle).
+        assert persisted_original.requires_approval is True
+        assert "repeat-fingerprint" in (
+            persisted_original.latest_status_message or ""
+        ).lower()
+
+        # ProjectMessage posted to strategic so it can decide the next move.
+        pms = (
+            (
+                await verifying_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.message_type == MessageType.BLOCKER,
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
     assert len(pms) == 1
     assert pms[0].from_type == "system"
     assert pms[0].context.get("trigger") == "repeat_fingerprint_halt"
     assert pms[0].context.get("pr_number") == 901
-    assert pms[0].context.get("source_task_id") == str(most_recent_fix.id)
-    assert pms[0].context.get("prior_task_id") == str(earlier_fix.id)
+    assert pms[0].context.get("source_task_id") == str(most_recent_fix_id)
+    assert pms[0].context.get("prior_task_id") == str(earlier_fix_id)
+    alert.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -11982,6 +12295,8 @@ class TestDetectEarlyNonconvergence:
         ]
         should, reason = detect_early_nonconvergence(hist)
         assert should is True
+
+
         assert "plateau" in reason
 
     def test_normally_converging_loop_does_not_escalate(self):
@@ -12040,6 +12355,266 @@ class TestDetectEarlyNonconvergence:
         # Distinct total (24) >> max round (6) → caught as one-at-a-time
         # disclosure, which is the correct escalation for 24 distinct issues.
         assert should is True
+
+
+def test_parallel_review_and_fix_rows_collapse_to_one_actioned_generation():
+    project_id = uuid.uuid4()
+    original_id = uuid.uuid4()
+    target = _review_target(project_id, 17355, "base-a", "head-a")
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "issues": [{"severity": "MAJOR", "description": "fix scanner"}],
+            "reviewed_base_sha": "base-a",
+            "reviewed_head_sha": "head-a",
+        }
+    )
+    reviews = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 17355,
+                    "original_task_id": str(original_id),
+                }
+            ],
+            context={
+                "review_was_parallelized": True,
+                "review_loop": {
+                    "original_task_id": str(original_id),
+                    "review_target": target,
+                },
+                "review_result": {
+                    "structured": True,
+                    "verdict": "REQUEST_CHANGES",
+                    "verdict_json": verdict_json,
+                },
+            },
+        )
+        for _ in range(2)
+    ]
+    fix = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 17355,
+                "original_task_id": str(original_id),
+            }
+        ],
+        context={
+            "review_loop": {
+                "original_task_id": str(original_id),
+                "fix_target": target,
+            }
+        },
+    )
+
+    units = actioned_review_cap_tasks([*reviews, fix])
+
+    assert units == [fix]
+
+
+@pytest.mark.asyncio
+async def test_pr17355_stale_base_and_issue_rounds_park_before_raw_cap(
+    db_session, mocker
+):
+    """Raw cap8 must not destroy a clean PR with four actioned generations.
+
+    Mirrors PR17355: one parallel approval is stale on base-only drift, four
+    authoritative issue rounds have counts 1/2/1/1, and three intervening fixes
+    produce eight worker rows in total. Semantic convergence must park before
+    raw-row cap handling and keep the PR operator-owned/open.
+    """
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_escalation_alert", new_callable=AsyncMock
+    )
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock
+    )
+    project = await _make_db_project(db_session)
+    original = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "harden scanner"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original)
+    await db_session.commit()
+    await db_session.refresh(original)
+
+    def _issues(count: int, round_no: int) -> list[dict]:
+        return [
+            {
+                "severity": "MAJOR",
+                "description": f"suppression scanner variant r{round_no}-{index}",
+                "file": "scanner.py",
+                "line": round_no * 10 + index,
+            }
+            for index in range(count)
+        ]
+
+    def _result(target: dict, issues: list[dict], verdict: str) -> dict:
+        return {
+            "structured": True,
+            "verdict": verdict,
+            "verdict_json": json.dumps(
+                {
+                    "verdict": verdict,
+                    "issues": issues,
+                    "reviewed_base_sha": target["base_sha"],
+                    "reviewed_head_sha": target["head_sha"],
+                }
+            ),
+        }
+
+    # Parallel approval of the same head against the old base: observational,
+    # stale, and never actioned by a patch.
+    stale_target = _review_target(project.id, 17355, "base-old", "head-0")
+    stale_approval = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 17355,
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_was_parallelized": True,
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original.id),
+                "review_target": stale_target,
+            },
+            "review_result": _result(stale_target, [], "APPROVE"),
+        },
+    )
+    db_session.add(stale_approval)
+
+    history: list[dict] = []
+    for round_no, count in enumerate((1, 2, 1), start=1):
+        target = _review_target(
+            project.id, 17355, "base-live", f"head-{round_no}"
+        )
+        review = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 17355,
+                    "original_task_id": str(original.id),
+                }
+            ],
+            context={
+                "review_loop": {
+                    "iteration": round_no * 2 - 1,
+                    "original_task_id": str(original.id),
+                    "review_target": target,
+                },
+                "review_result": _result(
+                    target, _issues(count, round_no), "REQUEST_CHANGES"
+                ),
+            },
+        )
+        fix = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "fix",
+                    "pr_number": 17355,
+                    "original_task_id": str(original.id),
+                }
+            ],
+            context={
+                "review_loop": {
+                    "iteration": round_no * 2,
+                    "original_task_id": str(original.id),
+                    "fix_target": target,
+                }
+            },
+        )
+        db_session.add_all([review, fix])
+        history.append(
+            {
+                "iteration": round_no * 2 - 1,
+                "verdict": "REQUEST_CHANGES",
+                "issues": _issues(count, round_no),
+                "reviewed_base_sha": target["base_sha"],
+                "reviewed_head_sha": target["head_sha"],
+                "target_verified_by_backend": True,
+                "review_task_id": str(review.id),
+            }
+        )
+
+    current_target = _review_target(project.id, 17355, "base-live", "head-4")
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 17355,
+                "branch": "blueprint/task-pr17355",
+                "base_branch": "automain",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "_scope_budget_hard_cap": 8,
+            "review_loop": {
+                "iteration": 7,
+                "original_task_id": str(original.id),
+                "review_target": current_target,
+                "review_history": history,
+            },
+            "review_result": _result(
+                current_target, _issues(1, 4), "REQUEST_CHANGES"
+            ),
+        },
+    )
+    db_session.add(source)
+    await db_session.commit()
+    await db_session.refresh(source)
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "fix",
+        db_session,
+        pr_number=17355,
+        branch="blueprint/task-pr17355",
+        base_branch="automain",
+        original_task_id=str(original.id),
+        fix_prompt="fix the final scanner variant",
+        current_feedback="one final scanner variant",
+        current_issues=_issues(1, 4),
+        reviewed_base_sha="base-live",
+        reviewed_head_sha="head-4",
+        target_verified_by_backend=True,
+        fix_target=current_target,
+    )
+
+    assert spawned is None and created is False
+    await db_session.refresh(original)
+    marker = (original.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    assert marker is not None
+    assert marker["reason"] == "semantic_nonconvergence"
+    assert marker["attempts"] == 8
+    assert marker["actioned_generations"] == 4
+    assert marker["threshold"] == 8
+    assert original.status == TaskStatus.EVALUATING
+    assert original.requires_approval is True
+    assert (source.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_NONCONVERGENCE
+    close_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -12291,7 +12866,8 @@ async def test_cap_preserves_nonempty_mergeable_rollup_pr(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 610, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 610, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -12356,7 +12932,8 @@ async def test_preserve_creates_handmerge_attention_message(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 711, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 711, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -12423,7 +13000,8 @@ async def test_approved_preserve_creates_handmerge_attention_message(db_session,
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 712, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 712, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -12532,7 +13110,8 @@ async def test_cap_closes_empty_rollup_pr(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 611, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 611, 16, db_session,
+        scope="per-chain", verified_disposition="empty"
     )
 
     await db_session.refresh(orig)
@@ -12589,7 +13168,8 @@ async def test_cap_closes_conflicted_rollup_pr(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 612, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 612, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -12645,7 +13225,8 @@ async def test_cap_closes_nonrollup_pr_even_if_mergeable(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 613, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 613, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -13751,9 +14332,7 @@ async def test_conflict_lane_sub_cap_blocks_spawn(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_conflict_lane_sub_cap_rollup_preserves_for_handmerge(db_session, mocker):
-    """Conflict-lane sub-cap on a rollup PR → routes to preserve-for-handmerge
-    (orig.requires_approval=True, failure_detail='review_cap_preserved_for_handmerge',
-    PR left open / not closed)."""
+    """Conflict-lane exhaustion parks the rollup without adjudicating the PR."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
@@ -13855,12 +14434,13 @@ async def test_conflict_lane_sub_cap_rollup_preserves_for_handmerge(db_session, 
     assert created is False
     assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_CAP
 
-    # Preserve-for-handmerge path: orig flagged, PR NOT closed.
+    # The cap only transfers ownership; it does not claim rejection/emptiness.
     await db_session.refresh(original_task)
     assert original_task.requires_approval is True
-    assert (original_task.context or {}).get(
-        "failure_detail"
-    ) == "review_cap_preserved_for_handmerge"
+    marker = (original_task.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    assert marker and marker["scope"] == "conflict-lane"
+    assert marker["actioned_generations"] == 4
+    assert (original_task.context or {}).get("failure_detail") is None
     close_pr_mock.assert_not_called()
 
 
@@ -14126,9 +14706,8 @@ async def test_global_cap_still_bounded_with_lane_churn(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_terminal_outcome_detail_includes_lane_breakdown(db_session, mocker):
-    """When the global cap is hit, review_loop_terminal_outcome.detail must
-    include the per-lane breakdown string so fix_loop_telemetry can parse it."""
+async def test_cap_park_marker_includes_lane_breakdown(db_session, mocker):
+    """The non-terminal disposition marker retains per-lane telemetry."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     _mock_lane_cap_github(mocker)
 
@@ -14240,15 +14819,13 @@ async def test_terminal_outcome_detail_includes_lane_breakdown(db_session, mocke
     )
 
     await db_session.refresh(original_task)
-    terminal = (original_task.context or {}).get("review_loop_terminal_outcome") or {}
-    detail = terminal.get("detail", "")
-    lane_counts_stored = terminal.get("lane_counts") or {}
-    # Detail should carry the lane breakdown.
-    assert "conflict=" in detail or lane_counts_stored, (
-        f"Terminal outcome detail must include lane breakdown, got detail={detail!r}, "
-        f"lane_counts={lane_counts_stored!r}"
-    )
-    assert lane_counts_stored.get("ci") == 4 or "ci=4" in detail
+    marker = (original_task.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY) or {}
+    lane_counts_stored = marker.get("lane_counts") or {}
+    assert marker.get("reason") == "review_cap"
+    assert marker.get("actioned_generations") == 16
+    assert lane_counts_stored.get("ci") == 4
+    assert lane_counts_stored.get("conflict") == 4
+    assert lane_counts_stored.get("review_convergence") == 8
 
 
 # ── Authoritative issue-ledger persistence ────────────────────────────────────
@@ -17630,11 +18207,18 @@ async def test_lane_pilot_manifest_patch_and_fix_resume_context(db_session, mock
 
 
 @pytest.mark.asyncio
-async def test_persistent_merge_conflict_escalates_before_cap(db_session, mocker):
+@pytest.mark.parametrize(
+    "supply_current_target",
+    [True, False],
+    ids=["incoming-target", "latest-conflict-evidence-fallback"],
+)
+async def test_persistent_merge_conflict_escalates_before_cap(
+    db_session, mocker, supply_current_target
+):
     """When the conflict lane has accumulated >= PERSISTENT_CONFLICT_ESCALATION_THRESHOLD
     completions and a new conflict fix would be spawned, _spawn_pipeline_task returns
-    (None, False), sets failure_detail='persistent_merge_conflict' on the orig task,
-    closes the PR, and the status message explicitly names 'merge conflict'.
+    (None, False), preserves the immutable conflict target/evidence on the existing
+    operator-disposition hold, and leaves both the root and PR non-terminal/open.
 
     This fires before LANE_CAP_CONFLICT_DEFAULT (4), so the escalation happens at
     iteration 3 (after 2 completed conflict-fix tasks), well below the global cap.
@@ -17646,6 +18230,9 @@ async def test_persistent_merge_conflict_escalates_before_cap(db_session, mocker
     )
     mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    escalation_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_escalation_alert", new_callable=AsyncMock
     )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
@@ -17661,7 +18248,7 @@ async def test_persistent_merge_conflict_escalates_before_cap(db_session, mocker
 
     orig = make_task(
         project_id=project.id,
-        status=TaskStatus.COMPLETED,
+        status=TaskStatus.EVALUATING,
         payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
         context={"scope": "small"},
     )
@@ -17694,7 +18281,15 @@ async def test_persistent_merge_conflict_escalates_before_cap(db_session, mocker
     db_session.add(source_task)
 
     # Two COMPLETED conflict-fix tasks for PR #555 — reaches the threshold (2).
-    for _ in range(PERSISTENT_CONFLICT_ESCALATION_THRESHOLD):
+    prior_conflicts = []
+    conflict_history_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for attempt_index in range(PERSISTENT_CONFLICT_ESCALATION_THRESHOLD):
+        prior_target = _review_target(
+            project.id,
+            555,
+            "base-conflict",
+            f"head-conflict-{attempt_index}",
+        )
         t = make_task(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
@@ -17710,14 +18305,23 @@ async def test_persistent_merge_conflict_escalates_before_cap(db_session, mocker
                 "review_loop": {
                     "fix_reason": "merge_conflict",
                     "original_task_id": str(orig.id),
+                    "fix_target": prior_target,
                 }
             },
         )
+        t.created_at = conflict_history_start + timedelta(seconds=attempt_index)
         db_session.add(t)
+        prior_conflicts.append(t)
 
     await db_session.commit()
     await db_session.refresh(source_task)
 
+    current_target = _review_target(
+        project.id,
+        555,
+        "base-conflict",
+        "head-conflict-current",
+    )
     result, created = await _spawn_pipeline_task(
         source_task,
         "fix",
@@ -17727,19 +18331,39 @@ async def test_persistent_merge_conflict_escalates_before_cap(db_session, mocker
         base_branch="main",
         fix_reason="merge_conflict",
         original_task_id=str(orig.id),
+        fix_target=current_target if supply_current_target else None,
     )
 
     assert result is None, "Persistent conflict should block the spawn"
     assert not created
 
     await db_session.refresh(orig)
-    assert orig.status == TaskStatus.FAILED, (
-        f"orig must be FAILED on persistent conflict, got {orig.status}"
-    )
-    assert (orig.context or {}).get("failure_detail") == "persistent_merge_conflict", (
-        f"failure_detail must be 'persistent_merge_conflict', "
-        f"got {(orig.context or {}).get('failure_detail')!r}"
-    )
+    assert orig.status == TaskStatus.EVALUATING
+    assert orig.requires_approval is True
+    assert (orig.context or {}).get("failure_detail") is None
+    assert (orig.context or {}).get("pr_rejected") is None
+    assert (orig.context or {}).get("review_loop_terminal_outcome") is None
+
+    marker = (orig.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY) or {}
+    assert marker["status"] == "abandon_candidate"
+    assert marker["reason"] == "persistent_merge_conflict"
+    assert marker["scope"] == "persistent-conflict"
+    assert marker["pr_number"] == 555
+    expected_target = current_target if supply_current_target else prior_target
+    assert marker["fix_target"] == expected_target
+    assert marker["conflict_evidence"] == {
+        "source_task_id": str(source_task.id),
+        "fix_reason": "merge_conflict",
+        "consecutive_conflict_generations": (
+            PERSISTENT_CONFLICT_ESCALATION_THRESHOLD
+        ),
+        "threshold": PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
+        "actioned_generations": PERSISTENT_CONFLICT_ESCALATION_THRESHOLD,
+        "task_ids": [str(task.id) for task in reversed(prior_conflicts)],
+    }
+    from app.review_loop_convergence import review_loop_parked_for_operator
+
+    assert review_loop_parked_for_operator(orig) == "persistent_merge_conflict"
 
     # Status message must name merge conflict explicitly.
     status_msg = orig.latest_status_message or ""
@@ -17747,23 +18371,15 @@ async def test_persistent_merge_conflict_escalates_before_cap(db_session, mocker
         f"Status message must mention 'merge conflict': {status_msg!r}"
     )
 
-    terminal_outcome = (orig.context or {}).get("review_loop_terminal_outcome") or {}
-    assert terminal_outcome.get("kind") == "persistent_conflict", (
-        f"Terminal outcome kind must be 'persistent_conflict': {terminal_outcome!r}"
-    )
+    close_mock.assert_not_awaited()
+    comment_mock.assert_not_awaited()
+    escalation_mock.assert_awaited_once()
 
-    close_mock.assert_awaited_once()
-    assert close_mock.call_args.args[3] == 555
-
-    # PR comment must mention merge conflict.
-    comment_mock.assert_awaited()
-    comment_text = comment_mock.call_args[0][4] if comment_mock.call_args else ""
-    assert "merge conflict" in comment_text.lower(), (
-        f"PR comment must mention 'merge conflict': {comment_text!r}"
-    )
-
-    # spawn_reason must be recorded.
+    # The source gets the same durable hold and the precise refusal reason.
     await db_session.refresh(source_task)
+    assert (source_task.context or {}).get(
+        REVIEW_LOOP_ABANDON_CANDIDATE_KEY
+    ) == marker
     assert (source_task.context or {}).get(
         SPAWN_REASON_KEY
     ) == SPAWN_REASON_PERSISTENT_CONFLICT
@@ -17861,12 +18477,9 @@ async def test_conflict_resolved_on_first_attempt_no_escalation(db_session, mock
         original_task_id=str(orig.id),
     )
 
-    # The orig must NOT have been marked with persistent_merge_conflict —
-    # that's the sole assertion: the escalation did not fire.
+    # Below threshold, the operator-disposition hold must not fire.
     await db_session.refresh(orig)
-    assert (orig.context or {}).get("failure_detail") != "persistent_merge_conflict", (
-        "One conflict-fix attempt is below threshold — no escalation should fire"
-    )
+    assert REVIEW_LOOP_ABANDON_CANDIDATE_KEY not in (orig.context or {})
     spawn_reason = (source_task.context or {}).get(SPAWN_REASON_KEY)
     assert spawn_reason != SPAWN_REASON_PERSISTENT_CONFLICT, (
         f"spawn_reason must not be persistent_conflict with only 1 prior conflict attempt: {spawn_reason!r}"

@@ -11355,6 +11355,8 @@ async def test_backfill_merged_named_test_skips_already_covered(db_session):
 
     project = await _make_project(db_session, "MergedNamedTestSkipCovered")
     version = await _make_version(db_session, project)
+    version.last_qualification = {"status": "scoring", "candidate_sha": "c" * 40}
+    await db_session.commit()
 
     criterion = await ac.create_criterion(
         db_session, project.id, version.id,
@@ -11403,6 +11405,9 @@ async def test_backfill_merged_named_test_skips_already_covered(db_session):
 
     recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
     assert recorded == 0, "Already-covered criterion must not get backfill evidence"
+    assert await _select_criterion_trials(db_session, project.id) == [], (
+        "covered criteria must be skipped before trial-target collection"
+    )
 
 
 @pytest.mark.asyncio
@@ -11785,6 +11790,123 @@ async def test_backfill_merged_named_test_trial_suppressed_by_in_flight_trial(db
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("identity_change", ["candidate", "execution_contract"])
+async def test_backfill_merged_named_test_terminal_trial_rearms_only_for_new_identity(
+    db_session, identity_change
+):
+    """The production backfill caller reaches exact-identity retry authority.
+
+    Durable backfill evidence must not hide a still-uncovered criterion from the
+    enroller: an unchanged terminal/could_not_run identity stays final, while a
+    new candidate or repaired named execution precondition creates exactly one
+    fresh trial.
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(
+        db_session, f"MergedNamedTestTerminalRearm-{identity_change}"
+    )
+    version = await _make_version(db_session, project)
+    old_sha = "a" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": old_sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Merged named-test terminal retry criterion",
+        created_by="strategist",
+    )
+    merged_task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_terminal_rearm.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_terminal_rearm.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(merged_task)
+    await db_session.commit()
+
+    rc = {"criterion_named_test_trials_enabled": True}
+    with patch("app.shared_state.runtime_config", new=rc):
+        assert (
+            await ac.backfill_merged_named_test_coverage(db_session, project.id)
+            == 1
+        )
+        trials = await _select_criterion_trials(db_session, project.id)
+        assert len(trials) == 1
+        first = trials[0]
+        first.status = TaskStatus.COMPLETED
+        first.context = {
+            **(first.context or {}),
+            "criterion_named_test_trial_contradiction": {
+                "could_not_run": True,
+                "passed": False,
+            },
+        }
+        db_session.add(first)
+        await db_session.commit()
+
+        # The durable backfill row remains, but it must flow to exact-identity
+        # dedup rather than either churning or disappearing from retry authority.
+        assert (
+            await ac.backfill_merged_named_test_coverage(db_session, project.id)
+            == 0
+        )
+        assert len(await _select_criterion_trials(db_session, project.id)) == 1
+
+        if identity_change == "candidate":
+            version.last_qualification = {
+                "status": "scoring",
+                "candidate_sha": "b" * 40,
+            }
+            db_session.add(version)
+        await db_session.commit()
+
+        next_contract = (
+            ac.CRITERION_NAMED_TEST_TRIAL_CONTRACT
+            if identity_change == "candidate"
+            else f"{ac.CRITERION_NAMED_TEST_TRIAL_CONTRACT}:repaired-runner"
+        )
+        with patch.object(
+            ac, "CRITERION_NAMED_TEST_TRIAL_CONTRACT", next_contract
+        ):
+            assert (
+                await ac.backfill_merged_named_test_coverage(db_session, project.id)
+                == 0
+            )
+            trials = await _select_criterion_trials(db_session, project.id)
+            assert len(trials) == 2
+            assert (
+                trials[0].first_payload["trial_identity"]
+                != trials[1].first_payload["trial_identity"]
+            )
+
+            # The fresh identity is itself terminal for unchanged inputs.
+            assert (
+                await ac.backfill_merged_named_test_coverage(db_session, project.id)
+                == 0
+            )
+            assert len(await _select_criterion_trials(db_session, project.id)) == 2
+
+
+@pytest.mark.asyncio
 async def test_backfill_merged_named_test_no_qualifying_sha_enrolls_nothing(db_session):
     """Without a qualifying candidate SHA the backfill enrolls no trial.
 
@@ -11896,6 +12018,263 @@ async def test_enroll_criterion_named_test_trial_defaults_on_when_flag_key_absen
     )
     assert trials[0].first_payload["criterion_key"] == criterion.criterion_key
     assert trials[0].status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_terminal_identity_does_not_churn_but_fresh_candidate_does(
+    db_session,
+):
+    """An unchanged terminal/could_not_run trial is final for its exact retry
+    identity, while a new candidate remains legitimate fresh work."""
+    project = await _make_project(db_session, "CriterionTrialTerminalIdentity")
+    version = await _make_version(db_session, project)
+    version.last_qualification = {"status": "scoring", "candidate_sha": "a" * 40}
+    await db_session.commit()
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Stable terminal trial criterion"
+    )
+
+    first = await ac.enroll_criterion_named_test_trial(
+        db_session,
+        project,
+        version=version,
+        criterion_key=criterion.criterion_key,
+        criterion_text=criterion.text,
+        test_refs=["testing/test_stable_trial.py"],
+    )
+    assert first is not None
+    first.status = TaskStatus.COMPLETED
+    first.context = {
+        **(first.context or {}),
+        "criterion_named_test_trial_contradiction": {
+            "could_not_run": True,
+            "passed": False,
+        },
+    }
+    db_session.add(first)
+    await db_session.commit()
+
+    unchanged = await ac.enroll_criterion_named_test_trial(
+        db_session,
+        project,
+        version=version,
+        criterion_key=criterion.criterion_key,
+        criterion_text=criterion.text,
+        test_refs=["testing/test_stable_trial.py"],
+    )
+    assert unchanged is None, "unchanged terminal trial identity must not rerun"
+
+    version.last_qualification = {"status": "scoring", "candidate_sha": "b" * 40}
+    db_session.add(version)
+    await db_session.commit()
+    fresh = await ac.enroll_criterion_named_test_trial(
+        db_session,
+        project,
+        version=version,
+        criterion_key=criterion.criterion_key,
+        criterion_text=criterion.text,
+        test_refs=["testing/test_stable_trial.py"],
+    )
+    assert fresh is not None
+    assert fresh.first_payload["candidate_identity"] == "b" * 40
+    assert fresh.first_payload["trial_identity"] != first.first_payload["trial_identity"]
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_only_named_execution_precondition_rearms_terminal_trial(
+    db_session,
+):
+    project = await _make_project(db_session, "CriterionTrialPrecondition")
+    version = await _make_version(db_session, project)
+    version.last_qualification = {"status": "scoring", "candidate_sha": "d" * 40}
+    await db_session.commit()
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Changed precondition criterion"
+    )
+    first = await ac.enroll_criterion_named_test_trial(
+        db_session,
+        project,
+        version=version,
+        criterion_key=criterion.criterion_key,
+        criterion_text=criterion.text,
+        test_refs=["testing/test_precondition.py"],
+    )
+    assert first is not None
+    first.status = TaskStatus.COMPLETED
+    db_session.add(first)
+    await db_session.commit()
+
+    # Unrelated project policy is not consumed by the trial handler and cannot
+    # turn an unchanged terminal/could_not_run identity into new work.
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    unchanged = await ac.enroll_criterion_named_test_trial(
+        db_session,
+        project,
+        version=version,
+        criterion_key=criterion.criterion_key,
+        criterion_text=criterion.text,
+        test_refs=["testing/test_precondition.py"],
+    )
+    assert unchanged is None
+
+    # A new handler/source contract is a real named execution precondition.
+    with patch.object(
+        ac,
+        "CRITERION_NAMED_TEST_TRIAL_CONTRACT",
+        f"{ac.CRITERION_NAMED_TEST_TRIAL_CONTRACT}:repaired-runner",
+    ):
+        changed = await ac.enroll_criterion_named_test_trial(
+            db_session,
+            project,
+            version=version,
+            criterion_key=criterion.criterion_key,
+            criterion_text=criterion.text,
+            test_refs=["testing/test_precondition.py"],
+        )
+    assert changed is not None
+    assert (
+        changed.first_payload["precondition_identity"]
+        != first.first_payload["precondition_identity"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_terminal_identity_survives_more_than_200_newer_tasks(
+    db_session,
+):
+    """Unrelated task volume cannot evict durable same-identity authority."""
+
+    project = await _make_project(db_session, "CriterionTrialDeepHistory")
+    version = await _make_version(db_session, project)
+    version.last_qualification = {"status": "scoring", "candidate_sha": "9" * 40}
+    await db_session.commit()
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Deep-history terminal criterion"
+    )
+    first = await ac.enroll_criterion_named_test_trial(
+        db_session,
+        project,
+        version=version,
+        criterion_key=criterion.criterion_key,
+        criterion_text=criterion.text,
+        test_refs=["testing/test_deep_history.py"],
+    )
+    assert first is not None
+    first.status = TaskStatus.COMPLETED
+    db_session.add(first)
+    db_session.add_all(
+        [
+            Task(
+                project_id=project.id,
+                title=f"Newer criterion trial {index}",
+                payloads=[{
+                    "type": "criterion_named_test_trial",
+                    "criterion_key": f"noise-{index}",
+                    "head_sha": "9" * 40,
+                    "test_refs": [f"testing/test_noise_{index}.py"],
+                }],
+                context={
+                    ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id)
+                },
+                status=TaskStatus.COMPLETED,
+                created_by="SYSTEM_AUTO_REVIEW",
+            )
+            for index in range(205)
+        ]
+    )
+    await db_session.commit()
+
+    duplicate = await ac.enroll_criterion_named_test_trial(
+        db_session,
+        project,
+        version=version,
+        criterion_key=criterion.criterion_key,
+        criterion_text=criterion.text,
+        test_refs=["testing/test_deep_history.py"],
+    )
+
+    assert duplicate is None
+    trials = await _select_criterion_trials(db_session, project.id)
+    matching = [
+        task
+        for task in trials
+        if task.first_payload.get("criterion_key") == criterion.criterion_key
+    ]
+    assert [task.id for task in matching] == [first.id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("freeze", ["paused", "autonomy_off"])
+async def test_criterion_trial_respects_project_work_freeze(db_session, freeze):
+    project = await _make_project(db_session, f"CriterionTrialFreeze-{freeze}")
+    version = await _make_version(db_session, project)
+    version.last_qualification = {"status": "scoring", "candidate_sha": "f" * 40}
+    if freeze == "paused":
+        project.paused = True
+    else:
+        project.autonomous_enabled = False
+    db_session.add(project)
+    db_session.add(version)
+    await db_session.commit()
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Frozen project criterion"
+    )
+
+    trial = await ac.enroll_criterion_named_test_trial(
+        db_session,
+        project,
+        version=version,
+        criterion_key=criterion.criterion_key,
+        criterion_text=criterion.text,
+        test_refs=["testing/test_frozen.py"],
+    )
+    assert trial is None
+    assert await _select_criterion_trials(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_rechecks_autonomy_at_locked_admission(
+    db_session, mocker
+):
+    """A stale enabled Project snapshot cannot bypass locked autonomy policy."""
+
+    from app.task_locking import AUTOMATIC_TASK_CREATION_AUTONOMY_DISABLED
+
+    project = await _make_project(db_session, "CriterionTrialLockedAutonomy")
+    version = await _make_version(db_session, project)
+    version.last_qualification = {"status": "scoring", "candidate_sha": "e" * 40}
+    db_session.add(version)
+    await db_session.commit()
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Locked autonomy criterion"
+    )
+    assert project.autonomous_enabled is True
+
+    locked_admission = mocker.patch(
+        "app.task_locking.acquire_automatic_task_creation_authority",
+        new_callable=AsyncMock,
+        return_value=AUTOMATIC_TASK_CREATION_AUTONOMY_DISABLED,
+    )
+    trial = await ac.enroll_criterion_named_test_trial(
+        db_session,
+        project,
+        version=version,
+        criterion_key=criterion.criterion_key,
+        criterion_text=criterion.text,
+        test_refs=["testing/test_stale_autonomy.py"],
+    )
+
+    assert trial is None
+    locked_admission.assert_awaited_once_with(
+        db_session,
+        project.id,
+        skip_locked=True,
+        require_autonomous_enabled=True,
+    )
+    assert await _select_criterion_trials(db_session, project.id) == []
 
 
 @pytest.mark.asyncio

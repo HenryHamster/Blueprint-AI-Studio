@@ -1915,6 +1915,29 @@ async def test_self_orig_merge_sets_pr_merged_without_lock_conflict(db_session, 
     merge (prod 2026-06-01..06-07, 144 drops).
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.landed_signal import (
+        corroborate_and_apply_merged_landed_signal as _real_landing,
+    )
+
+    landing_session_owns_orig: list[bool] = []
+
+    async def _guard_landing_session(orig, orig_project, landing_session, **kwargs):
+        """Fail fast instead of waiting on a cross-session Project row lock."""
+        from sqlalchemy import inspect as sa_inspect
+
+        owns_orig = (
+            sa_inspect(orig).session is landing_session.sync_session
+            and sa_inspect(orig_project).session is landing_session.sync_session
+        )
+        landing_session_owns_orig.append(owns_orig)
+        if not owns_orig:
+            return False
+        return await _real_landing(orig, orig_project, landing_session, **kwargs)
+
+    mocker.patch(
+        "app.landed_signal.corroborate_and_apply_merged_landed_signal",
+        new=_guard_landing_session,
+    )
 
     mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
@@ -1945,6 +1968,10 @@ async def test_self_orig_merge_sets_pr_merged_without_lock_conflict(db_session, 
     )
 
     assert result is True
+    assert landing_session_owns_orig == [True], (
+        "landing corroboration must use the dedicated session that owns the "
+        "original task and project"
+    )
 
     # Both the terminal status AND the orig-side flag must be durable. Read
     # back from the DB: the orig write runs in its own AsyncSessionLocal
@@ -5013,6 +5040,10 @@ async def test_first_merge_gate_verdict_is_idempotent(db_session, mocker):
 # ---------------------------------------------------------------------------
 
 
+_REVIEW_WAIT_HEAD_SHA = "review-wait-head"
+_REVIEW_WAIT_BASE_SHA = "review-wait-base"
+
+
 def _make_task_no_review_approved(
     db_session, project, pr_number: int = 42, ci_loop_extra: dict | None = None
 ):
@@ -5067,7 +5098,15 @@ async def test_review_wait_stamps_ci_last_polled_and_raises_poll_interval(
 
     ci_result = {"status": "completed", "conclusion": "success"}
     result = await handle_ci_completion(
-        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
     )
 
     assert result is True
@@ -5078,6 +5117,44 @@ async def test_review_wait_stamps_ci_last_polled_and_raises_poll_interval(
     assert (review_loop.get("ci_poll_interval") or 0) >= 120, (
         "ci_poll_interval must be raised to >= 120s when parked in review-wait"
     )
+
+
+@pytest.mark.asyncio
+async def test_review_wait_does_not_spawn_before_backstop_timeout(db_session, mocker):
+    """First-green review-wait remains a park, not a second spawn trigger."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+
+    project = Project(name="Review wait no first-green spawn", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task_no_review_approved(db_session, project)
+    await db_session.commit()
+
+    result = await handle_ci_completion(
+        task,
+        {"status": "completed", "conclusion": "success"},
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
+    )
+
+    assert result is True
+    spawn_mock.assert_not_awaited()
+    await db_session.refresh(task)
+    assert task.requires_approval is not True
+    assert not (task.context or {})["review_loop"].get("review_approved")
 
 
 @pytest.mark.asyncio
@@ -5135,6 +5212,7 @@ async def test_review_wait_backstop_fires_after_timeout(db_session, mocker):
     from datetime import datetime, timedelta
 
     from app.ci_completion import handle_ci_completion
+    from app.review_pipeline import SPAWN_REASON_CAP
 
     alert_mock = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
@@ -5144,7 +5222,11 @@ async def test_review_wait_backstop_fires_after_timeout(db_session, mocker):
     # (None, False) so the requires_approval fallback is what we assert here.
     mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
-        new=AsyncMock(return_value=(None, False)),
+        new=AsyncMock(
+            side_effect=_canonical_review_wait_spawn(
+                (None, False), reason=SPAWN_REASON_CAP
+            )
+        ),
     )
 
     project = Project(name="Review wait backstop", user_id="test-user")
@@ -5165,7 +5247,15 @@ async def test_review_wait_backstop_fires_after_timeout(db_session, mocker):
 
     ci_result = {"status": "completed", "conclusion": "success"}
     result = await handle_ci_completion(
-        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
     )
 
     assert result is True
@@ -5213,7 +5303,15 @@ async def test_review_wait_backstop_does_not_refire(db_session, mocker):
 
     ci_result = {"status": "completed", "conclusion": "success"}
     result = await handle_ci_completion(
-        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
     )
 
     # handle_ci_completion's review-wait park path always returns True (an action
@@ -5226,15 +5324,688 @@ async def test_review_wait_backstop_does_not_refire(db_session, mocker):
     alert_mock.assert_not_called()
 
 
-def _make_fake_review_task(project_id):
+def _make_fake_review_task(
+    project_id,
+    *,
+    review_target: dict | None = None,
+    status: TaskStatus = TaskStatus.QUEUED,
+):
     """A minimal stand-in for the freshly spawned review task."""
     return Task(
         id=uuid.uuid4(),
         project_id=project_id,
         title="Respawned review",
         payloads=[{"type": "review"}],
-        status=TaskStatus.QUEUED,
+        status=status,
+        context=(
+            {"review_loop": {"review_target": dict(review_target)}}
+            if review_target
+            else {}
+        ),
     )
+
+
+def _review_wait_target(project_id, pr_number: int = 42) -> dict:
+    return {
+        "project_id": str(project_id),
+        "pr_number": pr_number,
+        "base_sha": _REVIEW_WAIT_BASE_SHA,
+        "head_sha": _REVIEW_WAIT_HEAD_SHA,
+    }
+
+
+def _canonical_review_wait_spawn(result, *, reason: str | None = None):
+    """Model the canonical spawner's exact source-authority boundary."""
+
+    async def _spawn(source_task, _task_type, source_session, *args, **kwargs):
+        authority = kwargs.get("source_spawn_authority")
+        assert authority is not None
+        authoritative_source = await authority(source_session)
+        assert authoritative_source is not None
+        if reason is not None:
+            from app.review_pipeline import SPAWN_REASON_KEY
+
+            authoritative_source.context = {
+                **(authoritative_source.context or {}),
+                SPAWN_REASON_KEY: reason,
+            }
+            source_session.add(authoritative_source)
+        return result
+
+    return _spawn
+
+
+@pytest.mark.asyncio
+async def test_review_wait_deferred_spawn_retries_after_resume(db_session, mocker):
+    """A canonical admission defer resets the episode instead of escalating."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+    from app.review_pipeline import (
+        SPAWN_REASON_ADMISSION_PAUSED,
+        SPAWN_REASON_KEY,
+        SPAWN_REASON_SPAWNED,
+    )
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name="Review wait pause resume", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    target = _review_wait_target(project.id)
+    new_review = _make_fake_review_task(project.id, review_target=target)
+    attempts = 0
+
+    async def _spawn(source_task, _task_type, source_session, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        assert kwargs.get("review_target") == target
+        authoritative_source = await kwargs["source_spawn_authority"](
+            source_session
+        )
+        assert authoritative_source is not None
+        ctx = dict(authoritative_source.context or {})
+        ctx[SPAWN_REASON_KEY] = (
+            SPAWN_REASON_ADMISSION_PAUSED
+            if attempts == 1
+            else SPAWN_REASON_SPAWNED
+        )
+        authoritative_source.context = ctx
+        source_session.add(authoritative_source)
+        if attempts == 1:
+            return (None, False)
+        return (new_review, True)
+
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new=AsyncMock(side_effect=_spawn)
+    )
+    old_started = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)
+    ).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+
+    result = await handle_ci_completion(
+        task,
+        {"status": "completed", "conclusion": "success"},
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
+    )
+
+    assert result is True
+    await db_session.refresh(task)
+    first_loop = (task.context or {})["review_loop"]
+    assert first_loop.get("review_wait_escalated") is not True
+    assert first_loop.get("review_wait_started") != old_started
+    assert task.requires_approval is not True
+    alert_mock.assert_not_called()
+
+    # Model the project resuming and the replacement backstop window elapsing.
+    resumed_loop = dict(first_loop)
+    resumed_loop["review_wait_started"] = old_started
+    task.context = {**(task.context or {}), "review_loop": resumed_loop}
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await handle_ci_completion(
+        task,
+        {"status": "completed", "conclusion": "success"},
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
+    )
+
+    assert result is True
+    assert spawn_mock.await_count == 2
+    await db_session.refresh(task)
+    resumed_loop = (task.context or {})["review_loop"]
+    assert resumed_loop.get("review_wait_respawn_task_id") == str(new_review.id)
+    assert resumed_loop.get("review_wait_escalated") is not True
+    assert task.requires_approval is not True
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "retry_case",
+    ["authority_contention", "preauthority_contention", "missing_base"],
+)
+@pytest.mark.asyncio
+async def test_review_wait_transient_retry_preserves_elapsed_backstop(
+    db_session, mocker, retry_case
+):
+    """Lock contention and an incomplete poll snapshot retry without +60m."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+    from app.review_pipeline import SPAWN_REASON_CONTENDED
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name=f"Review wait retry {retry_case}", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    old_started = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)
+    ).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    if retry_case == "authority_contention":
+        # Supported legacy approval shape: this used to raise while building
+        # the exact claim because bool is not iterable.
+        task.context = {**(task.context or {}), "touched_critical": True}
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(
+            return_value=(None, False)
+            if retry_case == "preauthority_contention"
+            else None,
+            side_effect=(
+                _canonical_review_wait_spawn(
+                    (None, False), reason=SPAWN_REASON_CONTENDED
+                )
+                if retry_case != "preauthority_contention"
+                else None
+            ),
+        ),
+    )
+    result = await handle_ci_completion(
+        task,
+        {"status": "completed", "conclusion": "success"},
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=(
+            _REVIEW_WAIT_BASE_SHA if retry_case != "missing_base" else ""
+        ),
+    )
+
+    assert result is True
+    if retry_case == "missing_base":
+        spawn_mock.assert_not_awaited()
+    else:
+        spawn_mock.assert_awaited_once()
+    await db_session.refresh(task)
+    review_loop = (task.context or {})["review_loop"]
+    assert review_loop.get("review_wait_started") == old_started
+    assert review_loop.get("ci_poll_interval") == 30
+    assert review_loop.get("review_wait_escalated") is not True
+    if retry_case == "missing_base":
+        assert review_loop.get("polls_since_pr_fetch") == 999
+    assert task.requires_approval is not True
+    if retry_case == "authority_contention":
+        assert (task.context or {}).get("touched_critical") is True
+    alert_mock.assert_not_called()
+
+
+
+
+@pytest.mark.parametrize("candidate_case", ["terminal", "wrong_target"])
+@pytest.mark.asyncio
+async def test_review_wait_dedup_dead_or_wrong_row_is_non_authority(
+    db_session, mocker, candidate_case
+):
+    """A malformed canonical dedup result cannot open or stand in for review."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+    from app.closed_pr_reconciliation import REVIEW_WAIT_APPROVAL_HOLD_KEY
+    from app.review_pipeline import SPAWN_REASON_DEDUP, SPAWN_REASON_KEY
+
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name=f"Review wait bad dedup {candidate_case}", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    target = _review_wait_target(project.id)
+    candidate_target = (
+        {**target, "head_sha": "wrong-head"}
+        if candidate_case == "wrong_target"
+        else target
+    )
+    candidate = _make_fake_review_task(
+        project.id,
+        review_target=candidate_target,
+        status=(TaskStatus.FAILED if candidate_case == "terminal" else TaskStatus.QUEUED),
+    )
+    db_session.add(candidate)
+    old_started = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)
+    ).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+
+    async def _dedup(source_task, _task_type, source_session, *args, **kwargs):
+        assert kwargs.get("review_target") == target
+        authoritative_source = await kwargs["source_spawn_authority"](
+            source_session
+        )
+        assert authoritative_source is not None
+        authoritative_source.context = {
+            **(authoritative_source.context or {}),
+            SPAWN_REASON_KEY: SPAWN_REASON_DEDUP,
+        }
+        source_session.add(authoritative_source)
+        return (candidate, False)
+
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new=AsyncMock(side_effect=_dedup)
+    )
+
+    result = await handle_ci_completion(
+        task,
+        {"status": "completed", "conclusion": "success"},
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
+    )
+
+    assert result is True
+    await db_session.refresh(task)
+    loop = (task.context or {})["review_loop"]
+    assert loop.get("authoritative_review_task_id") != str(candidate.id)
+    assert loop.get("review_approved") is not True
+    assert task.requires_approval is True
+    assert loop.get(REVIEW_WAIT_APPROVAL_HOLD_KEY)
+
+
+@pytest.mark.parametrize(
+    "race_case", ["replacement", "approve", "archive", "manual_hold"]
+)
+@pytest.mark.asyncio
+async def test_review_wait_spawn_commit_race_does_not_overwrite_new_attempt(
+    db_session, mocker, race_case
+):
+    """Independent revocation wins before the canonical child commit."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+    from app.database import AsyncSessionLocal
+    from sqlmodel import select as _select
+
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name="Review wait helper commit race", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    project_id = project.id
+    old_started = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)
+    ).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+
+    async def _spawn_after_independent_revoke(
+        source_task, _task_type, source_session, *args, **kwargs
+    ):
+        async with AsyncSessionLocal() as competing_session:
+            competing_task = await competing_session.get(Task, task.id)
+            assert competing_task is not source_task
+            competing_context = dict(competing_task.context or {})
+            raced_loop = dict(competing_context.get("review_loop") or {})
+            raced_loop["race_sentinel"] = f"preserve-{race_case}"
+            if race_case == "replacement":
+                raced_loop.update(
+                    {
+                        "pr_number": 99,
+                        "branch": "blueprint/rebound",
+                        "base_branch": "automain",
+                        "ci_wait_started": "2026-08-17T00:00:00",
+                        "head_sha": "new-attempt-head",
+                    }
+                )
+                competing_context["rollup_pr_number"] = 99
+            elif race_case == "approve":
+                raced_loop["review_approved"] = True
+            elif race_case == "archive":
+                competing_task.archived = True
+            else:
+                competing_task.requires_approval = True
+                competing_context["approval_hold_reason"] = "manual"
+            competing_task.context = {
+                **competing_context,
+                "review_loop": raced_loop,
+            }
+            competing_session.add(competing_task)
+            await competing_session.commit()
+
+        authoritative_source = await kwargs["source_spawn_authority"](
+            source_session
+        )
+        assert authoritative_source is None
+        return (None, False)
+
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(side_effect=_spawn_after_independent_revoke),
+    )
+
+    result = await handle_ci_completion(
+        task,
+        {"status": "completed", "conclusion": "success"},
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
+    )
+
+    assert result is True
+    await db_session.refresh(task)
+    loop = (task.context or {})["review_loop"]
+    assert loop.get("race_sentinel") == f"preserve-{race_case}"
+    if race_case == "replacement":
+        assert loop.get("pr_number") == 99
+    elif race_case == "approve":
+        assert loop.get("review_approved") is True
+    elif race_case == "archive":
+        assert task.archived is True
+    else:
+        assert task.requires_approval is True
+        assert (task.context or {}).get("approval_hold_reason") == "manual"
+    assert loop.get("review_wait_respawned") is not True
+    reviews = (
+        (
+            await db_session.execute(
+                _select(Task).where(Task.project_id == project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert not [
+        row
+        for row in reviews
+        if row.id != task.id and row.first_payload.get("type") == "review"
+    ]
+
+
+@pytest.mark.parametrize(
+    "early_exit", ["terminal", "repeat_fingerprint", "supersession_churn"]
+)
+@pytest.mark.asyncio
+async def test_review_wait_postcommit_spawn_reason_cannot_overwrite_replacement(
+    db_session, mocker, early_exit
+):
+    """A canonical post-commit source annotation is never flushed stale.
+
+    Stuck, repeat-fingerprint, and supersession-churn exits commit authoritative
+    escalation work before returning. This models a replacement winning after
+    that commit and before the old ORM identity is annotated with its reason.
+    """
+    from copy import deepcopy
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+    from app.database import AsyncSessionLocal
+    from app.review_pipeline import (
+        SPAWN_REASON_BLOCKED_REPEAT,
+        SPAWN_REASON_KEY,
+        SPAWN_REASON_STUCK,
+        SPAWN_REASON_SUPERSEDE_CHURN,
+    )
+
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name=f"Review wait stale {early_exit}", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    old_started = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)
+    ).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+    old_reason = {
+        "terminal": SPAWN_REASON_STUCK,
+        "repeat_fingerprint": SPAWN_REASON_BLOCKED_REPEAT,
+        "supersession_churn": SPAWN_REASON_SUPERSEDE_CHURN,
+    }[early_exit]
+
+    async def _postcommit_early_exit(
+        source_task, _task_type, source_session, *args, **kwargs
+    ):
+        authoritative_source = await kwargs["source_spawn_authority"](
+            source_session
+        )
+        assert authoritative_source is not None
+        assert authoritative_source is source_task
+        stale_context = deepcopy(authoritative_source.context or {})
+
+        # Match the canonical early exits: commit releases source authority,
+        # then a peer replacement changes the attempt in an independent session.
+        await source_session.commit()
+        async with AsyncSessionLocal() as competing_session:
+            competing_task = await competing_session.get(Task, task.id)
+            assert competing_task is not authoritative_source
+            competing_context = dict(competing_task.context or {})
+            competing_loop = dict(competing_context.get("review_loop") or {})
+            competing_loop.update(
+                {
+                    "pr_number": 99,
+                    "branch": "blueprint/rebound",
+                    "head_sha": "replacement-head",
+                    "race_sentinel": f"preserve-{early_exit}",
+                }
+            )
+            competing_context["rollup_pr_number"] = 99
+            competing_task.context = {
+                **competing_context,
+                "review_loop": competing_loop,
+            }
+            competing_session.add(competing_task)
+            await competing_session.commit()
+
+        # This is the unsafe historical shape: the canonical spawner dirties
+        # the now-stale source identity after its internal commit.
+        authoritative_source.context = {
+            **stale_context,
+            SPAWN_REASON_KEY: old_reason,
+        }
+        source_session.add(authoritative_source)
+        return (None, False)
+
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(side_effect=_postcommit_early_exit),
+    )
+
+    result = await handle_ci_completion(
+        task,
+        {"status": "completed", "conclusion": "success"},
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
+    )
+
+    assert result is True
+    await db_session.refresh(task)
+    review_loop = (task.context or {})["review_loop"]
+    assert review_loop.get("pr_number") == 99
+    assert review_loop.get("race_sentinel") == f"preserve-{early_exit}"
+    assert review_loop.get("review_wait_respawned") is not True
+    assert task.requires_approval is not True
+
+
+@pytest.mark.asyncio
+async def test_review_wait_real_supersession_commit_cannot_overwrite_replacement(
+    db_session, mocker
+):
+    """The real churn-halt second commit cannot resurrect a superseded attempt."""
+    from datetime import datetime, timedelta
+
+    from app.alert_dispatch import (
+        _maybe_create_escalation_alert as _real_escalation_alert,
+    )
+    from app.ci_completion import handle_ci_completion
+    from app.database import AsyncSessionLocal
+    from app.review_pipeline import PIPELINE_TASK_STALE_MINUTES
+
+    mocker.patch("app.review_pipeline._REVIEW_SUPERSEDE_CHURN_LIMIT", 1)
+    mocker.patch("app.review_pipeline.broadcast_to_project", new=AsyncMock())
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Review wait real churn race", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_started = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)
+    ).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    stale_review = Task(
+        project_id=project.id,
+        title="Stale exact review",
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 42,
+                "branch": "blueprint/test-branch",
+                "base_branch": "main",
+                "original_task_id": str(task.id),
+            }
+        ],
+        context={"review_loop": {"review_target": _review_wait_target(project.id)}},
+        status=TaskStatus.IN_PROGRESS,
+        started_at=(
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES + 5)
+        ),
+        last_heartbeat=None,
+    )
+    db_session.add(stale_review)
+    await db_session.commit()
+
+    async def _alert_then_replace(*args, **kwargs):
+        # Exercise the helper's real commit, then let a separate ORM identity
+        # install the replacement before the canonical spawner resumes.
+        await _real_escalation_alert(*args, **kwargs)
+        async with AsyncSessionLocal() as competing_session:
+            competing = await competing_session.get(Task, task.id)
+            assert competing is not task
+            context = dict(competing.context or {})
+            review_loop = dict(context.get("review_loop") or {})
+            review_loop.pop("review_wait_spawn_claim", None)
+            review_loop.update(
+                {
+                    "pr_number": 99,
+                    "branch": "blueprint/rebound",
+                    "base_branch": "automain",
+                    "head_sha": "replacement-head",
+                    "ci_checked_head_sha": "replacement-head",
+                    "ci_checked_base_sha": "replacement-base",
+                    "review_wait_started": "2026-08-17T02:00:00",
+                    "race_sentinel": "preserve-real-churn-replacement",
+                }
+            )
+            context["rollup_pr_number"] = 99
+            context.pop("_approval_set_at", None)
+            competing.requires_approval = False
+            competing.context = {**context, "review_loop": review_loop}
+            competing_session.add(competing)
+            await competing_session.commit()
+
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_escalation_alert",
+        new=AsyncMock(side_effect=_alert_then_replace),
+    )
+
+    result = await handle_ci_completion(
+        task,
+        {"status": "completed", "conclusion": "success"},
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
+    )
+
+    assert result is True
+    await db_session.refresh(task)
+    review_loop = (task.context or {})["review_loop"]
+    assert review_loop.get("pr_number") == 99
+    assert review_loop.get("race_sentinel") == "preserve-real-churn-replacement"
+    assert review_loop.get("review_wait_escalated") is not True
+    assert task.requires_approval is False
 
 
 @pytest.mark.asyncio
@@ -5260,7 +6031,9 @@ async def test_orphan_review_wait_respawns_review(db_session, mocker):
     fake_review = _make_fake_review_task(project.id)
     spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
-        new=AsyncMock(return_value=(fake_review, True)),
+        new=AsyncMock(
+            side_effect=_canonical_review_wait_spawn((fake_review, True))
+        ),
     )
 
     old_started = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)).isoformat()
@@ -5274,7 +6047,15 @@ async def test_orphan_review_wait_respawns_review(db_session, mocker):
 
     ci_result = {"status": "completed", "conclusion": "success"}
     result = await handle_ci_completion(
-        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
     )
 
     assert result is True
@@ -5307,6 +6088,7 @@ async def test_review_wait_respawn_suppressed_falls_back_to_approval(
     from datetime import datetime, timedelta
 
     from app.ci_completion import handle_ci_completion
+    from app.review_pipeline import SPAWN_REASON_CAP
 
     alert_mock = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
@@ -5314,7 +6096,11 @@ async def test_review_wait_respawn_suppressed_falls_back_to_approval(
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
-        new=AsyncMock(return_value=(None, False)),
+        new=AsyncMock(
+            side_effect=_canonical_review_wait_spawn(
+                (None, False), reason=SPAWN_REASON_CAP
+            )
+        ),
     )
 
     project = Project(name="Review wait respawn suppressed", user_id="test-user")
@@ -5333,7 +6119,15 @@ async def test_review_wait_respawn_suppressed_falls_back_to_approval(
 
     ci_result = {"status": "completed", "conclusion": "success"}
     result = await handle_ci_completion(
-        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
     )
 
     assert result is True
@@ -5382,7 +6176,15 @@ async def test_review_wait_respawn_capped(db_session, mocker):
 
     ci_result = {"status": "completed", "conclusion": "success"}
     result = await handle_ci_completion(
-        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
     )
 
     assert result is True
@@ -5431,7 +6233,15 @@ async def test_review_wait_auto_respawn_disabled(db_session, mocker):
 
     ci_result = {"status": "completed", "conclusion": "success"}
     result = await handle_ci_completion(
-        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
     )
 
     assert result is True
@@ -5496,12 +6306,22 @@ async def test_review_wait_respawn_capped_resets_for_superseded_review(
     fake_review = _make_fake_review_task(project.id)
     spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
-        new=AsyncMock(return_value=(fake_review, True)),
+        new=AsyncMock(
+            side_effect=_canonical_review_wait_spawn((fake_review, True))
+        ),
     )
 
     ci_result = {"status": "completed", "conclusion": "success"}
     result = await handle_ci_completion(
-        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=_REVIEW_WAIT_HEAD_SHA,
+        checked_base_sha=_REVIEW_WAIT_BASE_SHA,
     )
 
     assert result is True
@@ -5521,11 +6341,10 @@ async def test_review_wait_respawn_capped_resets_for_superseded_review(
 
 
 @pytest.mark.asyncio
-async def test_review_wait_accelerated_deferred_retry(db_session, mocker):
-    """When the CI task's review_loop carries a recent review_spawn_deferred_at
-    marker (from a fix-completion handler that hit a transient lock-contention
-    deferral), the backstop must retry the review spawn immediately upon
-    entering review-wait instead of waiting for the 60-minute timeout."""
+async def test_review_wait_recent_window_does_not_bypass_backstop(
+    db_session, mocker
+):
+    """A recent review-wait window cannot create a pre-60-minute review."""
     from datetime import datetime, timedelta
 
     from app.ci_completion import handle_ci_completion
@@ -5535,34 +6354,25 @@ async def test_review_wait_accelerated_deferred_retry(db_session, mocker):
     )
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
 
-    project = Project(name="Accelerated defer retry", user_id="test-user")
+    project = Project(name="Recent window waits for backstop", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    fake_review = _make_fake_review_task(project.id)
     spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
-        new=AsyncMock(return_value=(fake_review, True)),
+        new_callable=AsyncMock,
     )
 
-    # Start just 30 seconds ago — NOT past the 60min backstop. The
-    # review_spawn_deferred_at marker (2 seconds ago) should trigger the
-    # accelerated retry path instead.
+    # A recent wait cannot bypass the 60m gate.
     recent_started = (
         datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30)
-    ).isoformat()
-    deferred_at = (
-        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=2)
     ).isoformat()
 
     task = _make_task_no_review_approved(
         db_session,
         project,
-        ci_loop_extra={
-            "review_wait_started": recent_started,
-            "review_spawn_deferred_at": deferred_at,
-        },
+        ci_loop_extra={"review_wait_started": recent_started},
     )
     await db_session.commit()
     await db_session.refresh(task)
@@ -5573,16 +6383,11 @@ async def test_review_wait_accelerated_deferred_retry(db_session, mocker):
     )
 
     assert result is True
-    # The accelerated path must have spawned a review (not the 60min backstop).
-    spawn_mock.assert_awaited_once()
-    spawn_args = spawn_mock.await_args
-    assert spawn_args.args[1] == "review"
+    spawn_mock.assert_not_awaited()
 
     await db_session.refresh(task)
     review_loop = (task.context or {}).get("review_loop", {})
-    assert review_loop.get("review_wait_respawned") is True
-    # The deferred marker should have been consumed.
-    assert "review_spawn_deferred_at" not in review_loop
+    assert review_loop.get("review_wait_respawned") is not True
     assert task.requires_approval is not True
     alert_mock.assert_not_called()
 

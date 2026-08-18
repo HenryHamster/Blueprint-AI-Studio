@@ -35,7 +35,12 @@ from app.models import (
 from app.research_execution_authority import is_server_owned_research_context_key
 from app.sidecar_authority import is_server_owned_sidecar_context_key
 from app.strategic_watches import register_task_watch
-from app.task_locking import project_lock
+from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    AUTOMATIC_TASK_CREATION_PROJECT_PAUSED,
+    acquire_automatic_task_creation_authority,
+    project_lock,
+)
 
 DEFAULT_BURST_CAP = 100
 DEFAULT_BURST_WINDOW_MINUTES = 60
@@ -517,6 +522,21 @@ async def submit_strategic_spawn(
 ) -> SpawnSubmission:
     """Persist one intent and immediately dispatch unless the abuse guard trips."""
 
+    # Project -> child is the canonical order.  Take the pause/archive
+    # authority before reading the parent Task or authoring a request row so an
+    # operator pause cannot race this direct Strategic continuation and leave a
+    # latent task/request to burst on resume.
+    admission = await acquire_automatic_task_creation_authority(
+        session, project_id, skip_locked=True
+    )
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        if admission == AUTOMATIC_TASK_CREATION_PROJECT_PAUSED:
+            raise ValueError("project is paused; strategic spawning is disabled")
+        raise ValueError(
+            "project is unavailable for automatic strategic spawning "
+            f"({admission})"
+        )
+
     parent_task = (
         await session.execute(
             select(Task).where(
@@ -590,8 +610,9 @@ async def submit_strategic_spawn(
     project = await session.get(Project, project_id)
     if project is None:
         raise ValueError("project not found")
-    if project.paused:
-        raise ValueError("project is paused; strategic spawning is disabled")
+    # ``admission`` above is the authoritative locked check.  This loaded row
+    # is retained for the policy inputs used below, not as a second racy pause
+    # predicate.
 
     # The request row is intentionally parent-scoped for exact API replay, but
     # executable work is scoped to project + direction + logical request key.
@@ -725,8 +746,10 @@ async def drain_deferred_spawn_requests(
     The caller must hold the project lock and commits after this function.
     """
 
-    project = await session.get(Project, project_id)
-    if project is None or project.paused:
+    admission = await acquire_automatic_task_creation_authority(
+        session, project_id, skip_locked=True
+    )
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
         return []
 
     now = _utcnow()

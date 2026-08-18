@@ -70,6 +70,7 @@ CONVERSATION_EVENT_TYPES = frozenset(
         "rollback_recommended",
         "fix_loop_divergence_regressed",
         "release_calcifying",
+        "release_blocked",
         "release_build_stalled",
         "release_stabilize_stalled",
         "release_ci_unresolved_stall",
@@ -272,11 +273,10 @@ async def reserve_project_message_sequences(
         raise ValueError("message sequence reservation count must be between 1 and 100")
 
     dialect = resolve_dialect_name(session)
-    if dialect == "postgresql":
-        if lock_timeout_ms is not None:
-            await session.execute(
-                text(f"SET LOCAL lock_timeout = '{max(1, int(lock_timeout_ms))}ms'")
-            )
+    if dialect == "postgresql" and lock_timeout_ms is not None:
+        await session.execute(
+            text(f"SET LOCAL lock_timeout = '{max(1, int(lock_timeout_ms))}ms'")
+        )
     try:
         locked_project_id = await session.scalar(
             select(Project.id)
@@ -467,7 +467,7 @@ def stored_wakeup_state(message: ProjectMessage) -> str:
     context = message.context if isinstance(message.context, dict) else {}
     value = context.get(WAKEUP_STATE_CONTEXT_KEY)
     if value in {"queued", "coalesced", "paused", "waiting_for_capacity"}:
-        return value
+        return str(value)
     return "waiting_for_capacity"
 
 
@@ -779,7 +779,7 @@ async def create_operator_project_message(
     # Keep the low-level message creation module importable without pulling in
     # the resident runtime (and, through it, the admin/release router graph).
     # This import is intentionally local to the Workday-only association path.
-    from app.strategic_resident_session import (  # noqa: PLC0415
+    from app.strategic_resident_session import (
         RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY,
         resident_session_snapshot,
     )

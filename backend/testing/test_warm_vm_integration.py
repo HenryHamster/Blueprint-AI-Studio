@@ -1006,10 +1006,11 @@ async def test_warm_vm_next_role_chain_continuity_blocked_when_paused(
 async def test_spawn_pipeline_task_skips_warm_pin_when_project_paused(
     db_session, mocker
 ):
-    """Defense-in-depth: _spawn_pipeline_task must not set a warm-handoff pin
-    for a paused project's source task, even when the source is IN_PROGRESS
-    with a live VM. The follow-on is still spawned QUEUED (so resume can
-    dispatch it cold), but with no warm_target_vm_id pin and no warm VM."""
+    """Universal pause admission forbids even an unpinned follow-on task.
+
+    A paused project must return the explicit not-created result even when the
+    source task is IN_PROGRESS on a live VM and warm continuity is enabled.
+    """
     from app.shared_state import runtime_config as _runtime_config
 
     mocker.patch(
@@ -1053,13 +1054,8 @@ async def test_spawn_pipeline_task_skips_warm_pin_when_project_paused(
             branch="feat/spawn-paused",
             base_branch="main",
         )
-        assert was_created is True and spawned is not None
-        assert spawned.status == TaskStatus.QUEUED
-        # No warm pin: vm_instance_id is the source VM name (cold spawn default),
-        # and no warm_target_vm_id was stamped into context.
-        ctx = spawned.context or {}
-        assert "warm_target_vm_id" not in ctx
-        assert "warm_handoff_deadline" not in ctx
+        assert was_created is False
+        assert spawned is None
 
     finally:
         if prior_warm_continuity is None:

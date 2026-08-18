@@ -90,14 +90,21 @@ def has_merge_unblock_signal(task: Task) -> bool:
     return (task.context or {}).get(LANDED_SIGNAL_KEY) is True
 
 
-def has_landed_signal(task: Task) -> bool:
-    """Canonical read of the integration-branch landing signal.
+def has_landed_signal_context(context: dict[str, Any] | None) -> bool:
+    """Canonical landing predicate evaluated against a raw context mapping.
 
-    New writes stamp ``landed_on_integration`` explicitly. Legacy rows that
-    predate the split fall back to ``pr_merged is True`` unless they carry the
-    explicit non-merge marker introduced by :func:`mark_unblocked_non_merge`.
+    Callers that hold a plain ``task.context``-shaped dict (admin task-list
+    payloads, replay/diagnostic readers) must use this rather than
+    re-deriving the clauses, so the three-clause rule below lives in exactly
+    one place:
+
+      1. explicit ``landed_on_integration is True`` → landed,
+      2. explicit ``landed_on_integration is False`` → not landed,
+      3. otherwise the legacy ``pr_merged is True`` fallback, valid only while
+         the explicit non-merge marker written by
+         :func:`mark_unblocked_non_merge` is ABSENT.
     """
-    ctx = task.context or {}
+    ctx = context or {}
     landed = ctx.get(LANDED_ON_INTEGRATION_KEY)
     if landed is True:
         return True
@@ -106,6 +113,16 @@ def has_landed_signal(task: Task) -> bool:
     return (
         ctx.get(LANDED_SIGNAL_KEY) is True and NON_MERGE_UNBLOCK_REASON_KEY not in ctx
     )
+
+
+def has_landed_signal(task: Task) -> bool:
+    """Canonical read of the integration-branch landing signal.
+
+    New writes stamp ``landed_on_integration`` explicitly. Legacy rows that
+    predate the split fall back to ``pr_merged is True`` unless they carry the
+    explicit non-merge marker introduced by :func:`mark_unblocked_non_merge`.
+    """
+    return has_landed_signal_context(task.context)
 
 
 async def has_landed_signal_via_rollup(task: Task, session: AsyncSession) -> bool:
@@ -387,6 +404,40 @@ def mark_landed_on_integration(
         if isinstance(review_loop, dict):
             review_loop.pop(UNVERIFIED_MERGE_REASON_KEY, None)
     task.context = ctx
+    # A definitive landing supersedes an older agent's failed-only current gate
+    # projection without deleting the diagnostic receipt.  New agents report
+    # passing gates directly; legacy failures move into bounded history here.
+    from app.task_blocked import supersede_failed_publication_gate_receipt_on_landing
+
+    supersede_failed_publication_gate_receipt_on_landing(task)
+
+    # Standalone author tasks intentionally become COMPLETED at PR-open while a
+    # review task owns merge.  Converge that read model when the canonical
+    # integration writer observes the landing; otherwise completed tasks keep
+    # saying "review pending" forever even though pr_merged is already true.
+    payload = task.first_payload or {}
+    pr_number = payload.get("pr_number")
+    if (
+        task.status == TaskStatus.COMPLETED
+        and pr_number is not None
+        and payload.get("type") not in {"review", "fix", "verify_tests"}
+    ):
+        if project is not None:
+            from app.shared_state import get_project_integration_branch
+
+            branch = get_project_integration_branch(project)
+            if had_non_merge_unblock:
+                task.latest_status_message = (
+                    f"Work from PR #{pr_number} landed via rollup into {branch}"
+                )
+            else:
+                task.latest_status_message = f"PR #{pr_number} merged into {branch}"
+        elif had_non_merge_unblock:
+            task.latest_status_message = (
+                f"Work from PR #{pr_number} landed via rollup into integration"
+            )
+        else:
+            task.latest_status_message = f"PR #{pr_number} merged into integration"
     try:
         from app.acceptance_gate import record_code_acceptance_verdict
 
@@ -470,6 +521,7 @@ def apply_merged_landed_signal(
     hotfix_lane: bool,
     non_merge_reason: str | None = None,
     merge_commit_sha: str | None = None,
+    onboarding_proof_authorized: bool = True,
 ) -> bool:
     """Guarded write path for a merged PR.
 
@@ -535,30 +587,32 @@ def apply_merged_landed_signal(
         # already records the capability proof, so it mirrors that pattern
         # exactly — no session parameter, the caller's session already tracks
         # ``project``. Best-effort and idempotent; never undoes a real merge.
-        try:
-            from app.onboarding_proof import stamp_first_pr_merged
+        if onboarding_proof_authorized:
+            try:
+                from app.onboarding_proof import stamp_first_pr_merged
 
-            stamp_first_pr_merged(project)
-        except Exception:  # noqa: BLE001 — observability stamp must never undo a real merge
-            logger.warning(
-                "[LANDED] onboarding first-pr-merged stamp failed for task %s",
-                getattr(task, "id", None),
-                exc_info=True,
-            )
+                stamp_first_pr_merged(project)
+            except Exception:  # noqa: BLE001 — observability stamp must never undo a real merge
+                logger.warning(
+                    "[LANDED] onboarding first-pr-merged stamp failed for task %s",
+                    getattr(task, "id", None),
+                    exc_info=True,
+                )
         # Onboarding-proof: record the first autonomous code improvement
         # (create/fix/refactor) that landed on an external (non-self-repo)
         # project. Makes the g-generality direction retirement condition
         # machine-checkable. Same pattern: best-effort, idempotent.
-        try:
-            from app.onboarding_proof import stamp_first_autonomous_improvement
+        if onboarding_proof_authorized:
+            try:
+                from app.onboarding_proof import stamp_first_autonomous_improvement
 
-            stamp_first_autonomous_improvement(task, project)
-        except Exception:  # noqa: BLE001 — stamp must never undo a real merge
-            logger.warning(
-                "[LANDED] first-autonomous-improvement stamp failed for task %s",
-                getattr(task, "id", None),
-                exc_info=True,
-            )
+                stamp_first_autonomous_improvement(task, project)
+            except Exception:  # noqa: BLE001 — stamp must never undo a real merge
+                logger.warning(
+                    "[LANDED] first-autonomous-improvement stamp failed for task %s",
+                    getattr(task, "id", None),
+                    exc_info=True,
+                )
     elif non_merge_reason:
         mark_unblocked_non_merge(task, reason=non_merge_reason)
     return landed_on_integration
@@ -762,11 +816,37 @@ async def corroborate_and_apply_merged_landed_signal(
         merge_commit_sha=merge_commit_sha,
         github_credentials=github_credentials,
     )
-    return apply_merged_landed_signal(
+    # The corroboration above can spend seconds in GitHub I/O.  Fresh-read the
+    # Project under its canonical row authority only at this final write seam,
+    # so the onboarding build_config stamps below cannot restore a stale value
+    # over an operator edit made during that I/O.  This path can already own a
+    # Task lock, so contention skips only the best-effort proof stamps instead
+    # of waiting in reverse lock order.
+    from app.onboarding_proof import lock_project_for_onboarding_proof
+
+    proof_project = await lock_project_for_onboarding_proof(project, session)
+    landed = apply_merged_landed_signal(
         task,
-        project,
+        proof_project or project,
         base_branch=base_branch,
         hotfix_lane=hotfix_lane,
         non_merge_reason=non_merge_reason,
         merge_commit_sha=merge_commit_sha,
+        onboarding_proof_authorized=proof_project is not None,
     )
+    if landed:
+        try:
+            from app.module_finding_chain import record_merged_pr_finding_chains
+
+            await record_merged_pr_finding_chains(
+                task,
+                session,
+                pr_number=pr_number,
+            )
+        except Exception:  # noqa: BLE001 — chain tracking never aborts a merge
+            logger.warning(
+                "[LANDED] module-finding-chain recording failed for task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
+    return landed

@@ -87,6 +87,13 @@ describe('DetailsTab — sideboard context', () => {
     expect(screen.getByText('Attempt').parentElement).toHaveTextContent('2');
   });
 
+  it('shows the durable work source separately from the collapsed creator', () => {
+    render(<DetailsTab task={makeTask({ origination: 'RESEARCH' })} />);
+
+    expect(screen.getByText('Created By').parentElement).toHaveTextContent('Orchestrator');
+    expect(screen.getByText('Work Source').parentElement).toHaveTextContent('Research');
+  });
+
   it('renders bounded task sideboard context', () => {
     const onNavigateToTask = vi.fn();
     render(

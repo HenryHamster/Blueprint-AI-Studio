@@ -2541,6 +2541,7 @@ async def test_enforce_mode_debt_read_failure_does_not_inflate_confidence(
     """
     from app import shared_state
     from importlib import import_module as original_import
+    from unittest.mock import patch
 
     _enforce_weight = 0.15  # DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
 
@@ -2584,20 +2585,20 @@ async def test_enforce_mode_debt_read_failure_does_not_inflate_confidence(
             raise RuntimeError("simulated debt-module failure")
         return original_import(name, *args, **kwargs)
 
-    mocker.patch("importlib.import_module", new=_fail_import)
-
     _ci_pre_gates = _clean_finalize_pre_gates(rq._CI_GREEN, ci_green=True)
 
-    result_fail = await rq._finalize_qualification(
-        db_session,
-        version,
-        _pre_gates=_ci_pre_gates,
-    )
+    # Scope only the debt-module failure.  ``mocker.stopall()`` would also stop
+    # this suite's autouse candidate-authorship fixture and make the comparison
+    # arm fail closed on an unrelated hard gate.
+    with patch("importlib.import_module", new=_fail_import):
+        result_fail = await rq._finalize_qualification(
+            db_session,
+            version,
+            _pre_gates=_ci_pre_gates,
+        )
     enforce_confidence_fail = result_fail["confidence"]
 
     # --- Arm 2: debt snapshot succeeds with zero open debt ----------------
-    # Reset the mock so the real module is importable again.
-    mocker.stopall()
     mocker.patch.dict(shared_state.runtime_config, _make_cfg(), clear=False)
 
     project2, version2 = await _make_project_and_version(db_session, phase="stabilize")

@@ -3609,15 +3609,20 @@ def test_orchestrator_no_checks_escalation_backstop_wiring():
 
 
 def test_orchestrator_verify_tests_spawn_deferral_escalation_wiring():
-    """The orchestrator must escalate to FAILED+requires_approval after
-    _VERIFY_TESTS_SPAWN_DEFERRAL_CAP consecutive spawn deferrals."""
+    """The orchestrator must escalate through canonical approval provenance.
+
+    A direct ``requires_approval = True`` write would inherit an older
+    review-wait owner.  The monitor-owned helper establishes a fresh independent
+    hold after the verify_tests spawn-deferral cap is exhausted.
+    """
     src = _orchestrator_source()
     required = [
         "_VERIFY_TESTS_SPAWN_DEFERRAL_CAP",
         '"verify_tests_spawn_deferrals"',
         "verify_tests spawn deferred",
         "escalating for operator review",
-        "ci_task.requires_approval = True",
+        "_establish_monitor_approval_hold(",
+        'reason="verify_tests_spawn_deferrals_exhausted"',
     ]
     missing = [needle for needle in required if needle not in src]
     assert not missing, (

@@ -27,7 +27,10 @@ and permanently burning a runner for a task would strand it on a single-runner
 fleet.
 """
 
+import hashlib
+import json
 import logging
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -36,7 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
-from app.models import Alert, AlertSeverity, Task, _utcnow
+from app.models import Alert, AlertSeverity, LocalRunner, Task, _utcnow
 from app.time_utils import _coerce_naive_utc
 
 logger = logging.getLogger(__name__)
@@ -75,6 +78,158 @@ DECLINE_ESCALATION_THRESHOLD = 3
 
 DECLINE_ALERT_TITLE = "Task repeatedly declined by runners"
 
+_CAPABILITY_EPOCH_CONTEXT_KEY = "capability_epoch"
+_CAPABILITY_EPOCH_KEYS = (
+    "runner_source_sha",
+    "runner_agent_source_sha",
+    "project_verification_fingerprint",
+)
+
+
+class RunnerDeclineExclusions(set[str]):
+    """Set-compatible exclusions carrying their immutable decline records.
+
+    Callers historically passed a plain ``set[str]`` into runner selection.
+    Keeping this as a set subclass preserves that public contract while letting
+    the shared selector compare a deterministic decline with the runner's
+    current capability epoch.  Hand-built/plain sets remain strict exclusions.
+    """
+
+    def __init__(self, runner_ids=(), *, records: dict | None = None):
+        super().__init__(str(runner_id) for runner_id in runner_ids)
+        self.records = records or {}
+
+
+def _bounded_epoch_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value[:64] if value else None
+
+
+def project_verification_proof_fingerprint(report: object) -> str | None:
+    """Fingerprint the stable backend-verification proof used by retry receipts."""
+
+    if not isinstance(report, dict):
+        return None
+    proof = {"backend_verification": report}
+    return hashlib.sha256(
+        json.dumps(
+            proof, sort_keys=True, separators=(",", ":"), default=str
+        ).encode()
+    ).hexdigest()[:16]
+
+
+def runner_capability_epoch(runner: Any | None) -> dict[str, str | None] | None:
+    """Stable identity for the code/proof epoch that can execute a task.
+
+    Load/heartbeat timestamps are deliberately absent.  A daemon self-update,
+    an agent checkout update, or a changed functional project-verification
+    proof is an authority change; an otherwise identical heartbeat is not.
+    """
+
+    if runner is None:
+        return None
+    capabilities = getattr(runner, "capabilities", None) or {}
+    proof = capabilities.get("project_verification")
+    epoch = {
+        "runner_source_sha": _bounded_epoch_text(
+            getattr(runner, "source_sha", None)
+        ),
+        "runner_agent_source_sha": _bounded_epoch_text(
+            getattr(runner, "agent_source_sha", None)
+        ),
+        "project_verification_fingerprint": (
+            project_verification_proof_fingerprint(proof)
+        ),
+    }
+    # The all-null tuple is still a real, explicit epoch for an existing legacy
+    # runner.  Persisting it distinguishes "this runner reported no versioned
+    # proof yet" from a historical decline record that predates epoch fencing.
+    return epoch
+
+
+def _normalized_capability_epoch(value: object) -> dict[str, str | None] | None:
+    if not isinstance(value, dict):
+        return None
+    if not any(key in value for key in _CAPABILITY_EPOCH_KEYS):
+        return None
+    epoch = {
+        key: _bounded_epoch_text(value.get(key)) for key in _CAPABILITY_EPOCH_KEYS
+    }
+    return epoch
+
+
+def decline_exclusion_applies_to_runner(
+    exclusions: set[str], runner: Any
+) -> bool:
+    """Whether ``runner`` is still fenced by its recorded decline epoch.
+
+    Transient and legacy records retain their historical behavior.  A
+    deterministic record with an epoch stops excluding the same stable runner
+    id only after its code/proof epoch changes.  The ordinary eligibility gate
+    then independently requires the new epoch's functional proof to pass.
+    """
+
+    runner_id = str(getattr(runner, "id", ""))
+    if runner_id not in exclusions:
+        return False
+    if not isinstance(exclusions, RunnerDeclineExclusions):
+        return True
+    record = exclusions.records.get(runner_id)
+    if not isinstance(record, dict) or record.get("same_runner_retryable") is not False:
+        return True
+    declined_epoch = _normalized_capability_epoch(
+        record.get(_CAPABILITY_EPOCH_CONTEXT_KEY)
+    )
+    if declined_epoch is None:
+        # Pre-epoch deterministic records stay task-lifetime fenced.  Silently
+        # guessing recovery from an unversioned marker would restore the loop.
+        return True
+    current_epoch = runner_capability_epoch(runner)
+    return current_epoch is None or current_epoch == declined_epoch
+
+
+def decline_exclusion_is_advisory_for_candidates(
+    exclusions: set[str], task_type: str, candidates: list[Any]
+) -> bool:
+    """Epoch-aware Strategic waiver over the selector's current candidates.
+
+    The task-only predicate cannot know that a deterministic record belongs to
+    an obsolete runner epoch.  At selection time, ignore those stale/absent
+    deterministic records so they cannot prevent a different runner's
+    transient single-runner waiver.  A deterministic fence that still matches
+    a current candidate remains non-advisory.
+    """
+
+    from app.task_capabilities import STRATEGIC_TASK_TYPES
+
+    if (
+        task_type not in STRATEGIC_TASK_TYPES
+        or not isinstance(exclusions, RunnerDeclineExclusions)
+    ):
+        return False
+    candidates_by_id = {str(runner.id): runner for runner in candidates}
+    lifetime_transient_declines = 0
+    for runner_id, record in exclusions.records.items():
+        if not isinstance(record, dict):
+            continue
+        if record.get("same_runner_retryable") is False:
+            runner = candidates_by_id.get(runner_id)
+            if runner is not None and decline_exclusion_applies_to_runner(
+                exclusions, runner
+            ):
+                return False
+            continue
+        # Preserve the task/fleet-wide lifetime bound: expired transient
+        # declines and runners no longer in the candidate cache still count.
+        # Only an epoch-obsolete deterministic record is ignored here.
+        try:
+            lifetime_transient_declines += int(record.get("count") or 1)
+        except (TypeError, ValueError):
+            lifetime_transient_declines += 1
+    return lifetime_transient_declines < DECLINE_ESCALATION_THRESHOLD
+
 
 def record_runner_decline(
     task: Task,
@@ -83,6 +238,7 @@ def record_runner_decline(
     reason: str,
     hostname: str | None = None,
     same_runner_retryable: bool = True,
+    runner: Any | None = None,
     now: datetime | None = None,
 ) -> tuple[int, int]:
     """Persist one runner decline and return ``(runner_count, total_count)``.
@@ -104,13 +260,18 @@ def record_runner_decline(
         runner_count = 1
 
     clean_reason = (reason or "").strip() or "unspecified"
-    records[runner_key] = {
+    record = {
         "count": runner_count,
         "at": (now or _utcnow()).isoformat(),
         "reason": clean_reason[:500],
         "hostname": hostname,
         "same_runner_retryable": bool(same_runner_retryable),
     }
+    if not same_runner_retryable:
+        capability_epoch = runner_capability_epoch(runner)
+        if capability_epoch is not None:
+            record[_CAPABILITY_EPOCH_CONTEXT_KEY] = capability_epoch
+    records[runner_key] = record
     ctx[DECLINED_BY_CONTEXT_KEY] = records
     task.context = ctx
     flag_modified(task, "context")
@@ -158,11 +319,49 @@ def recently_declined_runner_ids(
             continue
         if (now - declined_at).total_seconds() < DECLINE_EXCLUSION_SECONDS:
             excluded.add(str(runner_id))
-    return excluded
+    return RunnerDeclineExclusions(excluded, records=records)
+
+
+async def record_deterministic_runner_decline(
+    session: AsyncSession,
+    task: Task,
+    runner_id: str,
+    *,
+    reason: str,
+    hostname: str | None = None,
+    now: datetime | None = None,
+) -> tuple[int, int]:
+    """Record a deterministic decline against the runner's current epoch.
+
+    A missing/malformed runner id intentionally falls back to an unversioned,
+    task-lifetime fence.  That is safer than making an incapable runner
+    retryable when the server cannot prove which epoch emitted the failure.
+    """
+
+    runner = None
+    try:
+        runner_uuid = uuid.UUID(str(runner_id))
+    except (TypeError, ValueError, AttributeError):
+        runner_uuid = None
+    if runner_uuid is not None:
+        runner = await session.get(LocalRunner, runner_uuid)
+    return record_runner_decline(
+        task,
+        runner_id,
+        reason=reason,
+        hostname=hostname,
+        same_runner_retryable=False,
+        runner=runner,
+        now=now,
+    )
 
 
 def decline_record_for_runner(
-    task: Any, runner_id: str, now: datetime | None = None
+    task: Any,
+    runner_id: str,
+    now: datetime | None = None,
+    *,
+    runner: Any | None = None,
 ) -> dict | None:
     """The active decline fence for ``runner_id`` on ``task``, or None.
 
@@ -179,6 +378,11 @@ def decline_record_for_runner(
     if not isinstance(rec, dict):
         return None
     if rec.get("same_runner_retryable") is False:
+        exclusions = RunnerDeclineExclusions({str(runner_id)}, records=records)
+        if runner is not None and not decline_exclusion_applies_to_runner(
+            exclusions, runner
+        ):
+            return None
         active = dict(rec)
         active["seconds_left"] = None
         active["task_lifetime"] = True

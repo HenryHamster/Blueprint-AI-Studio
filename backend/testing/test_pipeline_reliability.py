@@ -811,11 +811,11 @@ async def test_ci_polling_graces_replacement_publication_then_rebinds(orch_db, m
     await session.refresh(ci_task)
     task_id = ci_task.id
 
-    mocker.patch(
+    token_resolver = mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         return_value=("fake-token", "owner", "repo"),
     )
-    mocker.patch(
+    get_pr = mocker.patch(
         "app.github.get_pull_request",
         return_value={
             "number": 77,
@@ -850,11 +850,27 @@ async def test_ci_polling_graces_replacement_publication_then_rebinds(orch_db, m
         assert first.status == TaskStatus.EVALUATING
         first_loop = (first.context or {}).get("review_loop", {})
         assert first_loop.get("closed_pr_replacement_wait_started")
+        assert first_loop.get("ci_last_polled")
+        assert first_loop.get("ci_poll_interval", 0) >= 120
         assert "waiting for replacement publication" in (
             first.latest_status_message or ""
         ).lower()
 
-    # Next poll sees the authoritative same-head/base replacement and rebinds.
+    # The immediately following sweep is throttled and performs no GitHub I/O.
+    await _run_one_cycle(mocker)
+    assert token_resolver.call_count == 1
+    assert get_pr.call_count == 1
+    assert replacement_lookup.await_count == 1
+
+    # Once the bounded retry interval is due, the authoritative replacement is
+    # fetched and rebound normally.
+    async with _Session() as due_session:
+        due = await due_session.get(Task, task_id)
+        due_loop = dict((due.context or {}).get("review_loop", {}) or {})
+        due_loop["ci_poll_interval"] = 0
+        due.context = {**(due.context or {}), "review_loop": due_loop}
+        due_session.add(due)
+        await due_session.commit()
     await _run_one_cycle(mocker)
     async with _Session() as verify_session:
         rebound = await verify_session.get(Task, task_id)
@@ -871,6 +887,11 @@ async def test_ci_polling_graces_replacement_publication_then_rebinds(orch_db, m
 @pytest.mark.asyncio
 async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker):
     """A unique same-head/base replacement owns the task after old PR closure."""
+    from app.closed_pr_reconciliation import (
+        REVIEW_WAIT_APPROVAL_HOLD_KEY,
+        REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+    )
+
     session, _Session = orch_db
 
     project = Project(name="CI Replacement PR Test", user_id="user1")
@@ -878,13 +899,16 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
     await session.commit()
     await session.refresh(project)
 
+    approval_set_at = "2026-08-17T01:02:03"
     ci_task = Task(
         project_id=project.id,
         payloads=[
             {"type": "create", "prompt": "replacement", "branch": "feat/replaced"}
         ],
         status=TaskStatus.EVALUATING,
+        requires_approval=True,
         context={
+            "_approval_set_at": approval_set_at,
             "rollup_pr_number": 77,
             "blueprint_review_verdict": "APPROVE",
             "review_loop": {
@@ -894,6 +918,10 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
                 "base_branch": "automain",
                 "ci_wait_started": _naive_utc_ago(hours=2).isoformat(),
                 "ci_wait_pause_baseline": 1234.0,
+                "ci_poll_interval": 0,
+                "pending_reopen": True,
+                "ci_checked_base_sha": "oldbase",
+                "ci_checked_head_sha": "oldsha",
                 "ci_passed": True,
                 "review_approved": True,
                 "verdict": "APPROVE",
@@ -903,6 +931,15 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
                 ).isoformat(),
                 "review_recovery_attempted": True,
                 "review_history": [{"verdict": "APPROVE"}],
+                REVIEW_WAIT_APPROVAL_HOLD_KEY: {
+                    "owner": REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+                    "project_id": str(project.id),
+                    "pr_number": 77,
+                    "base_sha": "oldbase",
+                    "head_sha": "oldsha",
+                    "set_at": approval_set_at,
+                },
+                "review_wait_spawn_claim": {"token": "superseded-claim"},
                 "iteration": 2,
             },
         },
@@ -916,16 +953,26 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
         "app.routers.agent.get_github_token_for_task",
         return_value=("fake-token", "owner", "repo"),
     )
-    mocker.patch(
+    get_pr = mocker.patch(
         "app.github.get_pull_request",
-        return_value={
-            "number": 77,
-            "state": "closed",
-            "merged": False,
-            "head": {"sha": "oldsha", "ref": "feat/replaced"},
-            "base": {"ref": "automain"},
-            "mergeable": None,
-        },
+        side_effect=[
+            {
+                "number": 77,
+                "state": "open",
+                "merged": False,
+                "head": {"sha": "oldsha", "ref": "feat/replaced"},
+                "base": {"sha": "oldbase", "ref": "automain"},
+                "mergeable": True,
+            },
+            {
+                "number": 77,
+                "state": "closed",
+                "merged": False,
+                "head": {"sha": "oldsha", "ref": "feat/replaced"},
+                "base": {"sha": "oldbase", "ref": "automain"},
+                "mergeable": None,
+            },
+        ],
     )
     lookup = mocker.patch(
         "app.github.get_open_pull_request_for_head_branch",
@@ -934,13 +981,29 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
             "number": 91,
             "state": "open",
             "head": {"sha": "newsha", "ref": "feat/replaced"},
-            "base": {"ref": "automain"},
+            "base": {"sha": "newbase", "ref": "automain"},
         },
+    )
+    reopen = mocker.patch(
+        "app.github.reopen_pull_request",
+        new_callable=AsyncMock,
+        return_value=True,
     )
     alert_mock = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
+    # An open PR with the exact owned marker is inspected at the parked cadence
+    # but remains approval-gated; it cannot fall through to merge handling.
+    await _run_one_cycle(mocker)
+    async with _Session() as verify_session:
+        still_gated = await verify_session.get(Task, task_id)
+        assert still_gated.requires_approval is True
+        assert (still_gated.context or {})["review_loop"]["pr_number"] == 77
+    lookup.assert_not_awaited()
+
+    # Once the same exact attempt is closed, only replacement reconciliation is
+    # allowed through and it releases the backstop-owned hold on rebind.
     await _run_one_cycle(mocker)
 
     async with _Session() as verify_session:
@@ -957,6 +1020,8 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
         )
 
     assert updated.status == TaskStatus.EVALUATING
+    assert updated.requires_approval is False
+    assert "_approval_set_at" not in (updated.context or {})
     loop = (updated.context or {}).get("review_loop", {})
     assert loop.get("pr_number") == 91
     assert loop.get("head_sha") == "newsha"
@@ -973,6 +1038,8 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
         "_ci_backstop_first_defer_at",
         "review_recovery_attempted",
         "review_history",
+        REVIEW_WAIT_APPROVAL_HOLD_KEY,
+        "review_wait_spawn_claim",
         "escalated",
     ):
         assert stale_key not in loop, (
@@ -991,10 +1058,282 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
         "automain",
         project_id=str(project.id),
     )
-    # The old PR was already beyond the soft-alert threshold when this cycle
-    # began. Its one alert is allowed, but the replacement must not inherit
-    # the `escalated` latch (asserted above).
-    assert alert_mock.await_count == 1
+    reopen.assert_not_awaited()
+    assert get_pr.await_count == 2
+    # The owned approval gate permits only replacement reconciliation; it does
+    # not re-fire the ordinary CI timeout alert while inspecting the closed PR.
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("io_result", ["replacement", "404"])
+@pytest.mark.parametrize("hold_case", ["manual", "spend", "replaced"])
+@pytest.mark.asyncio
+async def test_review_wait_owned_gate_revalidates_after_unlocked_pr_io(
+    orch_db, mocker, io_result, hold_case
+):
+    """Independent holds arriving during GitHub I/O stop every bypass path."""
+    from app.closed_pr_reconciliation import (
+        REVIEW_WAIT_APPROVAL_HOLD_KEY,
+        REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+    )
+
+    session, _Session = orch_db
+    project = Project(name=f"Owned gate I/O {io_result} {hold_case}", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    set_at = "2026-08-17T01:02:03"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "branch": "feat/owned-io"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": set_at,
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 77,
+                "branch": "feat/owned-io",
+                "base_branch": "automain",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+                "ci_poll_interval": 0,
+                "ci_checked_base_sha": "oldbase",
+                "ci_checked_head_sha": "oldsha",
+                REVIEW_WAIT_APPROVAL_HOLD_KEY: {
+                    "owner": REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+                    "project_id": str(project.id),
+                    "pr_number": 77,
+                    "base_sha": "oldbase",
+                    "head_sha": "oldsha",
+                    "set_at": set_at,
+                },
+            },
+        },
+    )
+    session.add(task)
+    await session.commit()
+    task_id = task.id
+
+    async def _install_independent_hold():
+        async with _Session() as competing_session:
+            competing = await competing_session.get(Task, task_id)
+            assert competing is not task
+            context = dict(competing.context or {})
+            context["io_race_sentinel"] = f"{io_result}-{hold_case}"
+            if hold_case == "manual":
+                context["approval_hold_reason"] = "manual"
+            elif hold_case == "spend":
+                context["approval_hold_reason"] = "spend_budget"
+            else:
+                context["_approval_set_at"] = "later-independent-hold"
+            competing.context = context
+            competing_session.add(competing)
+            await competing_session.commit()
+
+    async def _get_pr(*args, **kwargs):
+        assert session.in_transaction() is False
+        if io_result == "404":
+            await _install_independent_hold()
+            raise _HTTPException(status_code=404, detail="gone during hold race")
+        return {
+            "number": 77,
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "oldsha", "ref": "feat/owned-io"},
+            "base": {"sha": "oldbase", "ref": "automain"},
+            "mergeable": None,
+        }
+
+    async def _lookup(*args, **kwargs):
+        assert session.in_transaction() is False
+        await _install_independent_hold()
+        return {
+            "number": 91,
+            "state": "open",
+            "head": {"sha": "newsha", "ref": "feat/owned-io"},
+            "base": {"sha": "newbase", "ref": "automain"},
+        }
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_pull_request", new=AsyncMock(side_effect=_get_pr))
+    replacement_lookup = mocker.patch(
+        "app.github.get_open_pull_request_for_head_branch",
+        new=AsyncMock(side_effect=_lookup),
+    )
+    reconcile = mocker.patch(
+        "app.orchestrator_ci_monitor.reconcile_closed_pr_replacement",
+        new_callable=AsyncMock,
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify_session:
+        updated = await verify_session.get(Task, task_id)
+        assert updated.status == TaskStatus.EVALUATING
+        assert updated.requires_approval is True
+        assert (updated.context or {}).get("io_race_sentinel") == (
+            f"{io_result}-{hold_case}"
+        )
+        assert (updated.context or {})["review_loop"]["pr_number"] == 77
+        if hold_case in ("manual", "spend"):
+            assert (updated.context or {}).get("approval_hold_reason")
+        else:
+            assert (updated.context or {}).get("_approval_set_at") == (
+                "later-independent-hold"
+            )
+
+    reconcile.assert_not_awaited()
+    if io_result == "replacement":
+        replacement_lookup.assert_awaited_once()
+    else:
+        replacement_lookup.assert_not_awaited()
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "token_outcome",
+    [
+        "critical_hold",
+        "replacement_error",
+        "unchanged_error",
+        "unchanged_pr_error",
+    ],
+)
+@pytest.mark.asyncio
+async def test_review_wait_owned_gate_revalidates_after_unlocked_token_io(
+    orch_db, mocker, token_outcome
+):
+    """Cold credential I/O holds no lock; fresh holds/attempts win the gap."""
+    from app.closed_pr_reconciliation import (
+        REVIEW_WAIT_APPROVAL_HOLD_KEY,
+        REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+    )
+
+    session, _Session = orch_db
+    project = Project(
+        name=f"Owned gate token I/O {token_outcome}", user_id="user1"
+    )
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    set_at = "2026-08-17T01:02:03"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "branch": "feat/owned-token-io"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": set_at,
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 77,
+                "branch": "feat/owned-token-io",
+                "base_branch": "automain",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+                "ci_poll_interval": 0,
+                "ci_checked_base_sha": "oldbase",
+                "ci_checked_head_sha": "oldsha",
+                REVIEW_WAIT_APPROVAL_HOLD_KEY: {
+                    "owner": REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+                    "project_id": str(project.id),
+                    "pr_number": 77,
+                    "base_sha": "oldbase",
+                    "head_sha": "oldsha",
+                    "set_at": set_at,
+                },
+            },
+        },
+    )
+    session.add(task)
+    await session.commit()
+    task_id = task.id
+
+    async def _resolve_after_independent_change(*args, **kwargs):
+        assert session.in_transaction() is False
+        if token_outcome not in ("unchanged_error", "unchanged_pr_error"):
+            async with _Session() as competing_session:
+                competing = await competing_session.get(Task, task_id)
+                assert competing is not task
+                context = dict(competing.context or {})
+                review_loop = dict(context.get("review_loop") or {})
+                context["token_io_race_sentinel"] = f"preserve-{token_outcome}"
+                if token_outcome == "critical_hold":
+                    context["touched_critical"] = True
+                else:
+                    competing.requires_approval = False
+                    context.pop("_approval_set_at", None)
+                    context["rollup_pr_number"] = 91
+                    review_loop.pop(REVIEW_WAIT_APPROVAL_HOLD_KEY, None)
+                    review_loop.update(
+                        {
+                            "pr_number": 91,
+                            "branch": "feat/replacement-after-token",
+                            "head_sha": "replacement-head",
+                        }
+                    )
+                competing.context = {**context, "review_loop": review_loop}
+                competing_session.add(competing)
+                await competing_session.commit()
+        if token_outcome in ("replacement_error", "unchanged_error"):
+            raise _HTTPException(status_code=404, detail="stale token lookup")
+        return ("fake-token", "owner", "repo")
+
+    token_resolver = mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(side_effect=_resolve_after_independent_change),
+    )
+    get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=(
+            RuntimeError("non-HTTP PR fetch outage")
+            if token_outcome == "unchanged_pr_error"
+            else None
+        ),
+    )
+    reconcile = mocker.patch(
+        "app.orchestrator_ci_monitor.reconcile_closed_pr_replacement",
+        new_callable=AsyncMock,
+    )
+
+    await _run_one_cycle(mocker)
+    if token_outcome in ("unchanged_error", "unchanged_pr_error"):
+        # Persisted backoff must suppress the immediately following sweep.
+        await _run_one_cycle(mocker)
+
+    async with _Session() as verify_session:
+        updated = await verify_session.get(Task, task_id)
+        assert updated.status == TaskStatus.EVALUATING
+        if token_outcome in ("unchanged_error", "unchanged_pr_error"):
+            review_loop = (updated.context or {})["review_loop"]
+            assert review_loop.get("ci_last_polled") is not None
+            assert review_loop.get("ci_poll_interval", 0) >= 120
+            assert updated.requires_approval is True
+        else:
+            assert (updated.context or {}).get("token_io_race_sentinel") == (
+                f"preserve-{token_outcome}"
+            )
+        if token_outcome == "critical_hold":
+            assert updated.requires_approval is True
+            assert (updated.context or {}).get("touched_critical") is True
+        elif token_outcome == "replacement_error":
+            assert updated.requires_approval is False
+            assert (updated.context or {})["review_loop"]["pr_number"] == 91
+    if token_outcome in ("unchanged_error", "unchanged_pr_error"):
+        assert token_resolver.await_count == 1
+    if token_outcome == "unchanged_pr_error":
+        get_pr.assert_awaited_once()
+    else:
+        get_pr.assert_not_awaited()
+    reconcile.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1010,16 +1349,15 @@ async def test_replacement_ci_backstop_uses_new_attempt_clock(eval_db, mocker):
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
-    mocker.patch(
-        "app.github.get_open_pull_request_for_head_branch",
-        new_callable=AsyncMock,
-        return_value={
+    replacement_lookup = {
+        "status": "ok",
+        "replacement_pr": {
             "number": 91,
             "state": "open",
             "head": {"sha": "newsha", "ref": "feat/replaced"},
             "base": {"ref": "automain"},
         },
-    )
+    }
 
     project = Project(name="Replacement Backstop Clock", user_id="user1")
     eval_db.add(project)
@@ -1062,9 +1400,7 @@ async def test_replacement_ci_backstop_uses_new_attempt_clock(eval_db, mocker):
             "head": {"sha": "oldsha", "ref": "feat/replaced"},
             "base": {"ref": "automain"},
         },
-        github_token="fake-token",
-        github_owner="owner",
-        github_repo="repo",
+        replacement_lookup=replacement_lookup,
     )
     await eval_db.refresh(task)
     new_wait = (task.context or {})["review_loop"]["ci_wait_started"]
@@ -1094,6 +1430,169 @@ async def test_replacement_ci_backstop_uses_new_attempt_clock(eval_db, mocker):
     await eval_db.refresh(task)
     assert task.status == TaskStatus.FAILED
     assert "backstop" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.parametrize(
+    ("hold_case", "owned"),
+    [
+        ("exact", True),
+        ("manual", False),
+        ("spend", False),
+        ("critical", False),
+        ("wrong_attempt", False),
+        ("replaced_timer", False),
+    ],
+)
+def test_review_wait_approval_hold_ownership_is_exact(hold_case, owned):
+    """Manual/spend/replaced-timer/wrong-attempt gates are never claimed."""
+    from app.closed_pr_reconciliation import (
+        REVIEW_WAIT_APPROVAL_HOLD_KEY,
+        REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+        _owns_superseded_review_wait_approval_hold,
+    )
+
+    project = Project(name="Review wait hold owner", user_id="user1")
+    set_at = "2026-08-17T01:02:03"
+    marker = {
+        "owner": REVIEW_WAIT_APPROVAL_HOLD_OWNER,
+        "project_id": str(project.id),
+        "pr_number": 77,
+        "base_sha": "oldbase",
+        "head_sha": "oldsha",
+        "set_at": set_at,
+    }
+    context = {
+        "_approval_set_at": (
+            "later-approval" if hold_case == "replaced_timer" else set_at
+        ),
+        "review_loop": {},
+    }
+    if hold_case != "manual":
+        context["review_loop"][REVIEW_WAIT_APPROVAL_HOLD_KEY] = marker
+    if hold_case == "spend":
+        context["approval_hold_reason"] = "spend_budget"
+    elif hold_case == "critical":
+        context["touched_critical"] = ["backend/app/main.py"]
+    elif hold_case == "wrong_attempt":
+        marker["head_sha"] = "different-head"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context=context,
+    )
+
+    assert _owns_superseded_review_wait_approval_hold(
+        task,
+        context["review_loop"],
+        pr_number=77,
+        pr_data={
+            "head": {"sha": "oldsha"},
+            "base": {"sha": "oldbase"},
+        },
+    ) is owned
+
+
+@pytest.mark.asyncio
+async def test_explicit_manual_hold_preserves_concurrent_replacement_attempt(
+    db_session,
+):
+    """Approval-only PATCH serializes before revoking backstop provenance."""
+    from fastapi import BackgroundTasks
+
+    from app.admin_task_mutations import modify_task_apply
+    from app.closed_pr_reconciliation import REVIEW_WAIT_APPROVAL_HOLD_KEY
+    from app.database import AsyncSessionLocal
+
+    project = Project(name="Manual hold provenance", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": "backstop-timer",
+            "review_loop": {
+                REVIEW_WAIT_APPROVAL_HOLD_KEY: {
+                    "owner": "ci_review_wait_backstop",
+                    "project_id": str(project.id),
+                    "pr_number": 77,
+                    "base_sha": "old-base",
+                    "head_sha": "old-head",
+                    "set_at": "backstop-timer",
+                },
+                "pr_number": 77,
+                "branch": "feat/old-attempt",
+                "base_branch": "automain",
+                "head_sha": "old-head",
+                "ci_checked_base_sha": "old-base",
+                "ci_checked_head_sha": "old-head",
+                "review_wait_started": "old-clock",
+                "review_wait_spawn_claim": {"token": "old-claim"},
+            },
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    # The route's authorization lookup has already loaded ``task``. A closed-PR
+    # reconciliation commits a replacement attempt through another request
+    # before the operator's approval-only PATCH reaches the mutation helper.
+    async with AsyncSessionLocal() as competing_session:
+        competing = await competing_session.get(Task, task_id)
+        assert competing is not None and competing is not task
+        competing.requires_approval = True
+        competing.context = {
+            "_approval_set_at": "new-timer",
+            "rollup_pr_number": 91,
+            "replacement_sentinel": "preserve-fresh-attempt",
+            "review_loop": {
+                REVIEW_WAIT_APPROVAL_HOLD_KEY: {
+                    "owner": "ci_review_wait_backstop",
+                    "project_id": str(project.id),
+                    "pr_number": 91,
+                    "base_sha": "new-base",
+                    "head_sha": "new-head",
+                    "set_at": "new-timer",
+                },
+                "pr_number": 91,
+                "branch": "feat/replacement-attempt",
+                "base_branch": "automain",
+                "head_sha": "new-head",
+                "ci_checked_base_sha": "new-base",
+                "ci_checked_head_sha": "new-head",
+                "review_wait_started": "new-clock",
+                "review_wait_spawn_claim": {"token": "new-claim"},
+            },
+        }
+        competing_session.add(competing)
+        await competing_session.commit()
+
+    await modify_task_apply(
+        task,
+        {"requires_approval": True},
+        BackgroundTasks(),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.requires_approval is True
+    context = task.context or {}
+    loop = context.get("review_loop") or {}
+    assert context.get("replacement_sentinel") == "preserve-fresh-attempt"
+    assert context.get("rollup_pr_number") == 91
+    assert loop.get("pr_number") == 91
+    assert loop.get("head_sha") == "new-head"
+    assert loop.get("ci_checked_base_sha") == "new-base"
+    assert loop.get("review_wait_started") == "new-clock"
+    assert loop.get("review_wait_spawn_claim") == {"token": "new-claim"}
+    assert REVIEW_WAIT_APPROVAL_HOLD_KEY not in loop
 
 
 @pytest.mark.asyncio
@@ -1127,11 +1626,11 @@ async def test_ci_polling_retries_when_replacement_lookup_is_uncertain(
     await session.refresh(ci_task)
     task_id = ci_task.id
 
-    mocker.patch(
+    token_resolver = mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         return_value=("fake-token", "owner", "repo"),
     )
-    mocker.patch(
+    get_pr = mocker.patch(
         "app.github.get_pull_request",
         return_value={
             "state": "closed",
@@ -1141,7 +1640,7 @@ async def test_ci_polling_retries_when_replacement_lookup_is_uncertain(
             "mergeable": None,
         },
     )
-    mocker.patch(
+    replacement_lookup = mocker.patch(
         "app.github.get_open_pull_request_for_head_branch",
         new_callable=AsyncMock,
         side_effect=_HTTPException(status_code=503, detail="rate limited"),
@@ -1150,6 +1649,7 @@ async def test_ci_polling_retries_when_replacement_lookup_is_uncertain(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
+    await _run_one_cycle(mocker)
     await _run_one_cycle(mocker)
 
     async with _Session() as verify_session:
@@ -1170,6 +1670,12 @@ async def test_ci_polling_retries_when_replacement_lookup_is_uncertain(
         updated.latest_status_message or ""
     ).lower()
     assert (updated.context or {}).get("review_loop", {}).get("pr_number") == 77
+    retry_loop = (updated.context or {}).get("review_loop", {})
+    assert retry_loop.get("ci_last_polled")
+    assert retry_loop.get("ci_poll_interval", 0) >= 120
+    assert token_resolver.call_count == 1
+    assert get_pr.call_count == 1
+    assert replacement_lookup.await_count == 1
     alert_mock.assert_not_called()
 
 

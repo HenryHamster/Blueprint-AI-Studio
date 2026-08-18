@@ -132,6 +132,76 @@ async def test_spawn_boundary_rejects_parent_cancelled_after_completion_commit(
 
 
 @pytest.mark.asyncio
+async def test_spawn_boundary_rejects_project_paused_after_completion_commit(
+    db_session,
+):
+    """A research completion cannot publish latent children after pause wins."""
+
+    from conftest import TestingSessionLocal
+    from app.research_execution_authority import lock_research_spawn_boundary
+
+    project = Project(name="Paused spawn project", user_id="user")
+    db_session.add(project)
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="Completed research awaiting paused spawn",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        context={"research_depth": 0},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    stale_context = {**(task.context or {}), "locally_parsed": True}
+    async with TestingSessionLocal() as pausing_session:
+        paused = await pausing_session.get(Project, project.id)
+        assert paused is not None
+        paused.paused = True
+        await pausing_session.commit()
+
+    locked_task, prior_children = await lock_research_spawn_boundary(
+        db_session,
+        task,
+        local_context=stale_context,
+        plan_output=[{"title": "must not publish"}],
+        latest_status_message="stale completion",
+    )
+
+    assert locked_task is None
+    assert prior_children == []
+    await db_session.rollback()
+    await db_session.refresh(task)
+    assert "locally_parsed" not in (task.context or {})
+    children = (
+        await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    ).scalars().all()
+    assert children == []
+
+
+@pytest.mark.asyncio
+async def test_research_spawn_retry_rechecks_pause_after_rollback(db_session):
+    """Collision recovery cannot re-admit pending children after pause."""
+
+    from app.research_execution_authority import relock_research_spawn_retry
+
+    project = Project(name="Paused retry project", user_id="user", paused=True)
+    db_session.add(project)
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="Research parent awaiting collision retry",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    assert await relock_research_spawn_retry(db_session, project.id, task.id) is None
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio
 async def test_prelock_research_reads_never_autoflush_parent_task(
     db_session, mocker
 ):

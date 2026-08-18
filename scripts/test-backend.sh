@@ -123,6 +123,10 @@ PG_SOCKET=""
 PG_BIN=""
 VERIFICATION_OUTPUT_DIR=""
 VERIFICATION_OUTPUT_DIR_OWNED=0
+VERIFICATION_HOST_JUNIT=""
+DOCKER_ARGS=()
+PYTHON_REWRITE_ENABLED=0
+ALEMBIC="alembic"
 cleanup() {
   [ -n "$PG_CONTAINER" ] && docker rm -f "$PG_CONTAINER" &>/dev/null || true
   [ -n "$PG_NETWORK" ] && docker network rm "$PG_NETWORK" &>/dev/null || true
@@ -146,6 +150,7 @@ trap cleanup EXIT
 if [ "$SANDBOX_POSTGRES" = "1" ]; then
   USE_DOCKER=0
   PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
+  PYTHON_REWRITE_ENABLED=1
   [ -x "$PYTHON" ] || {
     echo "ERROR: --sandbox-postgres requires $PYTHON" >&2
     exit 2
@@ -154,6 +159,7 @@ elif [ "$USE_POSTGRES" = "1" ] && _AUTO_POSTGRES_FLAG="$(select_backend_test_rou
   SANDBOX_POSTGRES=1
   USE_DOCKER=0
   PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
+  PYTHON_REWRITE_ENABLED=1
   echo "=== Using off-image pgserver PostgreSQL sandbox ==="
 elif command -v docker &>/dev/null && docker info >/dev/null 2>&1; then
   USE_DOCKER=1
@@ -176,7 +182,12 @@ else
   fi
   # Install dependencies if needed (use uv if pip is unavailable)
   VENV=/tmp/blueprint-backend-venv
-  [ -z "${PYTHON:-}" ] && [ -d "$VENV" ] && export PYTHON="$VENV/bin/python"
+  # Preserve an explicitly selected interpreter.  Read-only harness probes
+  # use this to inject a recorder without requiring an app checkout.
+  if [ -z "${PYTHON:-}" ] && [ -d "$VENV" ]; then
+    export PYTHON="$VENV/bin/python"
+    PYTHON_REWRITE_ENABLED=1
+  fi
   if ! "${PYTHON:-python3}" -c "import fastapi" &>/dev/null; then
     if [ "$EXPLICIT_BACKEND_TEST_PYTHON" = "1" ]; then
       echo "ERROR: explicit BLUEPRINT_BACKEND_TEST_PYTHON cannot import backend dependencies" >&2
@@ -190,6 +201,7 @@ else
       uv pip install --python "$VENV/bin/python" -q -r requirements.txt
       uv pip install --python "$VENV/bin/python" -q "setuptools<81"
       export PYTHON="$VENV/bin/python"
+      PYTHON_REWRITE_ENABLED=1
     fi
   fi
   PYTHON="${PYTHON:-python3}"
@@ -220,6 +232,7 @@ else
       if [ -n "$PYTHON_311" ]; then
         echo "=== Using Python 3.11 (found $PYTHON_311; system python is $PYTHON_VERSION) ==="
         PYTHON="$PYTHON_311"
+        PYTHON_REWRITE_ENABLED=1
       else
         echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
         echo "!!! WARNING: NON-AUTHORITATIVE ENVIRONMENT !!!" >&2
@@ -237,6 +250,10 @@ else
       fi
     fi
   fi
+fi
+
+if [ "$PYTHON_REWRITE_ENABLED" = "1" ]; then
+  ALEMBIC="$(dirname "$PYTHON")/alembic"
 fi
 
 # --- Docker Hub rate-limit resilience --------------------------------------
@@ -373,7 +390,7 @@ resolve_deps_image() {
   return 1
 }
 
-# --- Configure DATABASE_URL / ENV_ARGS based on --postgres ---
+# --- Configure DATABASE_URL / Docker argv based on --postgres ---
 if [ "$USE_POSTGRES" = "1" ] && [ "$SANDBOX_POSTGRES" = "1" ]; then
   PG_BIN="$(resolve_pg_bindir)" || {
     echo "ERROR: --sandbox-postgres requires a PostgreSQL server bindir (pg_config on PATH, or /usr/lib/postgresql/*/bin with initdb)" >&2
@@ -386,7 +403,7 @@ if [ "$USE_POSTGRES" = "1" ] && [ "$SANDBOX_POSTGRES" = "1" ]; then
     -o "-F -c listen_addresses='' -k '$PG_SOCKET'" -w start >/dev/null
   "$PG_BIN/createdb" -h "$PG_SOCKET" -U test test_blueprint
   PG_DSN="postgresql+asyncpg://test@/test_blueprint?host=$PG_SOCKET"
-  ENV_ARGS=""
+  DOCKER_ARGS=()
 elif [ "$USE_POSTGRES" = "1" ]; then
   PG_NETWORK="blueprint-test-net-$$"
   PG_CONTAINER="blueprint-test-pg-$$"
@@ -401,25 +418,29 @@ elif [ "$USE_POSTGRES" = "1" ]; then
     -e POSTGRES_DB=test_blueprint \
     postgres:15 >/dev/null
 
-  ENV_ARGS="--network $PG_NETWORK \
-    -e DATABASE_URL=$PG_DSN \
-    -e USE_TEST_POSTGRES=true \
-    -e GCE_METADATA_IP=127.0.0.1 \
-    -e GCE_METADATA_HOST=127.0.0.1:9 \
-    -e GCP_PROJECT_ID=test-project \
-    -e LOCAL_MODE=true \
-    -e GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
-    -e AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
-    -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
+  DOCKER_ARGS=(
+    --network "$PG_NETWORK"
+    -e "DATABASE_URL=$PG_DSN"
+    -e USE_TEST_POSTGRES=true
+    -e GCE_METADATA_IP=127.0.0.1
+    -e GCE_METADATA_HOST=127.0.0.1:9
+    -e GCP_PROJECT_ID=test-project
+    -e LOCAL_MODE=true
+    -e "GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY"
+    -e AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx
+    -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx
+  )
 else
-  ENV_ARGS="-e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
-    -e GCE_METADATA_IP=127.0.0.1 \
-    -e GCE_METADATA_HOST=127.0.0.1:9 \
-    -e GCP_PROJECT_ID=test-project \
-    -e LOCAL_MODE=true \
-    -e GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
-    -e AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
-    -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
+  DOCKER_ARGS=(
+    -e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x
+    -e GCE_METADATA_IP=127.0.0.1
+    -e GCE_METADATA_HOST=127.0.0.1:9
+    -e GCP_PROJECT_ID=test-project
+    -e LOCAL_MODE=true
+    -e "GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY"
+    -e AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx
+    -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx
+  )
 fi
 
 # Mount admin-ui/src read-only so test_invariants.py's frontend size
@@ -431,7 +452,7 @@ fi
 # guardrails fail loudly there until the workflow is updated similarly.
 if [ "$USE_DOCKER" = "1" ] && [ -d ../admin-ui/src ]; then
   ADMIN_UI_HOST_PATH="$(cd ../admin-ui/src && pwd)"
-  ENV_ARGS="$ENV_ARGS -v ${ADMIN_UI_HOST_PATH}:/admin-ui/src:ro"
+  DOCKER_ARGS+=(-v "${ADMIN_UI_HOST_PATH}:/admin-ui/src:ro")
 fi
 
 # Mount agent/src read-only so test_invariants.py's SR category parity
@@ -440,7 +461,7 @@ fi
 # one of the candidate paths in `_resolve_prompt_ts_path()`.
 if [ "$USE_DOCKER" = "1" ] && [ -d ../agent/src ]; then
   MSYS_NO_PATHCONV=1 AGENT_SRC_HOST_PATH="$(cd ../agent/src && pwd)"
-  ENV_ARGS="$ENV_ARGS -v ${AGENT_SRC_HOST_PATH}:/agent/src:ro"
+  DOCKER_ARGS+=(-v "${AGENT_SRC_HOST_PATH}:/agent/src:ro")
 fi
 
 # Mount the repo root read-only so the operator CLI test suite
@@ -448,7 +469,7 @@ fi
 # the ./check and ./blueprint wrappers it tests for existence/syntax.
 if [ "$USE_DOCKER" = "1" ] && [ -d .. ]; then
   MSYS_NO_PATHCONV=1 REPO_HOST_PATH="$(cd .. && pwd)"
-  ENV_ARGS="$ENV_ARGS -v ${REPO_HOST_PATH}:/repo:ro"
+  DOCKER_ARGS+=(-v "${REPO_HOST_PATH}:/repo:ro")
 fi
 
 # The static release guard supplies a host-side temporary JUnit path. Docker
@@ -463,13 +484,14 @@ if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
     exit 2
   }
   if [ "$USE_DOCKER" = "1" ]; then
-    ENV_ARGS="$ENV_ARGS -v ${STATIC_GUARD_OUTPUT_DIR}:/static-guard-output"
+    STATIC_GUARD_OUTPUT_DIR="$(cd "$STATIC_GUARD_OUTPUT_DIR" && pwd -P)"
+    DOCKER_ARGS+=(-v "${STATIC_GUARD_OUTPUT_DIR}:/static-guard-output")
     BLUEPRINT_STATIC_GUARD_JUNIT="/static-guard-output/${STATIC_GUARD_OUTPUT_NAME}"
-    ENV_ARGS="$ENV_ARGS -e BLUEPRINT_STATIC_GUARD_JUNIT=$BLUEPRINT_STATIC_GUARD_JUNIT"
+    DOCKER_ARGS+=(-e "BLUEPRINT_STATIC_GUARD_JUNIT=$BLUEPRINT_STATIC_GUARD_JUNIT")
   fi
 fi
 if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ] && [ "$USE_DOCKER" = "1" ]; then
-  ENV_ARGS="$ENV_ARGS -e BLUEPRINT_STATIC_GUARD_SELECTORS=$BLUEPRINT_STATIC_GUARD_SELECTORS"
+  DOCKER_ARGS+=(-e "BLUEPRINT_STATIC_GUARD_SELECTORS=$BLUEPRINT_STATIC_GUARD_SELECTORS")
 fi
 
 ENV_VARS="DATABASE_URL=${PG_DSN:-postgresql+asyncpg://x:x@localhost/x} \
@@ -493,15 +515,17 @@ _run() {
       # Fast path: the deps image has no source baked in (it's the `deps`
       # stage), so bind-mount the backend source over /app — exactly as the
       # CI shards do. $PWD is the backend dir here (we cd'd at the top), so
-      # /app/CLAUDE.md (cp'd above), the agent/admin-ui mounts in $ENV_ARGS,
+      # /app/CLAUDE.md (cp'd above), the agent/admin-ui mounts in DOCKER_ARGS,
       # alembic, and `app.*` all resolve identically to the built image.
-      MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/app" $ENV_ARGS "$DEPS_IMAGE" "$@"
+      MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/app" "${DOCKER_ARGS[@]}" "$DEPS_IMAGE" "$@"
     else
-      MSYS_NO_PATHCONV=1 docker run --rm $ENV_ARGS blueprint-backend-test "$@"
+      MSYS_NO_PATHCONV=1 docker run --rm "${DOCKER_ARGS[@]}" blueprint-backend-test "$@"
     fi
   else
-    # Replace leading "python3" with $PYTHON if set (venv interpreter)
-    if [ -n "${PYTHON:-}" ] && [ "$1" = "python3" ]; then
+    # Replace leading "python3" only when the harness selected the venv.
+    # An explicit PYTHON is also used by read-only probes that deliberately
+    # exercise the literal python3 subprocess command.
+    if [ "$PYTHON_REWRITE_ENABLED" = "1" ] && [ "$1" = "python3" ]; then
       shift; env $ENV_VARS PYTHONPATH="$(pwd)" "$PYTHON" "$@"
     else
       env $ENV_VARS PYTHONPATH="$(pwd)" "$@"
@@ -629,7 +653,7 @@ if [ "$USE_POSTGRES" = "1" ]; then
     verify_required_postgres_extensions docker exec "$PG_CONTAINER" psql -U test -d test_blueprint
   fi
   echo "=== Running alembic migrations ==="
-  _run python3 -m alembic upgrade head
+  _run "$ALEMBIC" upgrade head
 fi
 
 echo "=== Verify app imports ==="
@@ -720,29 +744,27 @@ if [ $# -gt 0 ]; then
         echo "ERROR: verification JUnit output directory is unavailable: $VERIFICATION_OUTPUT_DIR" >&2
         exit 2
       }
+      VERIFICATION_OUTPUT_DIR="$(cd "$VERIFICATION_OUTPUT_DIR" && pwd -P)"
     else
       VERIFICATION_OUTPUT_DIR=$(mktemp -d /tmp/blueprint-backend-verification.XXXXXX)
       VERIFICATION_OUTPUT_DIR_OWNED=1
       VERIFICATION_JUNIT_NAME=""
     fi
+    VERIFICATION_HOST_JUNIT="$VERIFICATION_OUTPUT_DIR/${VERIFICATION_JUNIT_NAME:-junit.xml}"
     if [ "$USE_DOCKER" = "1" ]; then
-      ENV_ARGS="$ENV_ARGS -v ${VERIFICATION_OUTPUT_DIR}:/verification-output"
+      DOCKER_ARGS+=(-v "${VERIFICATION_OUTPUT_DIR}:/verification-output")
       if [ -n "$VERIFICATION_JUNIT_NAME" ]; then
         verification_junit="/verification-output/${VERIFICATION_JUNIT_NAME}"
-        ENV_ARGS="$ENV_ARGS -e BLUEPRINT_VERIFICATION_JUNIT=$verification_junit"
+        DOCKER_ARGS+=(-e "BLUEPRINT_VERIFICATION_JUNIT=$verification_junit")
       else
         verification_junit=/verification-output/junit.xml
       fi
     else
-      if [ -n "$VERIFICATION_JUNIT_NAME" ]; then
-        verification_junit="$VERIFICATION_OUTPUT_DIR/$VERIFICATION_JUNIT_NAME"
-      else
-        verification_junit="$VERIFICATION_OUTPUT_DIR/junit.xml"
-      fi
+      verification_junit="$VERIFICATION_HOST_JUNIT"
     fi
   _run python3 -m pytest "$@" --junitxml="$verification_junit"
     verification_tmp="${BLUEPRINT_VERIFICATION_RESULT_FILE}.$$"
-    python3 -c 'import datetime,json,sys,xml.etree.ElementTree as ET; junit,out,*selectors=sys.argv[1:]; root=ET.parse(junit).getroot(); suites=[root] if root.tag.endswith("testsuite") else list(root); tests=sum(int(s.attrib.get("tests",0)) for s in suites); skipped=sum(int(s.attrib.get("skipped",0)) for s in suites); failures=sum(int(s.attrib.get("failures",0))+int(s.attrib.get("errors",0)) for s in suites); assert tests>0 and skipped<tests and failures==0, f"unacceptable pytest result tests={tests} skipped={skipped} failures={failures}"; payload={"version":1,"harness":"scripts/test-backend.sh","selectors":selectors,"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":tests,"skipped":skipped,"failures":failures,"exit_code":0,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$VERIFICATION_OUTPUT_DIR/junit.xml" "$verification_tmp" "$@"
+    python3 -c 'import datetime,json,sys,xml.etree.ElementTree as ET; junit,out,*selectors=sys.argv[1:]; root=ET.parse(junit).getroot(); suites=[root] if root.tag.endswith("testsuite") else list(root); tests=sum(int(s.attrib.get("tests",0)) for s in suites); skipped=sum(int(s.attrib.get("skipped",0)) for s in suites); failures=sum(int(s.attrib.get("failures",0))+int(s.attrib.get("errors",0)) for s in suites); assert tests>0 and skipped<tests and failures==0, f"unacceptable pytest result tests={tests} skipped={skipped} failures={failures}"; payload={"version":1,"harness":"scripts/test-backend.sh","selectors":selectors,"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":tests,"skipped":skipped,"failures":failures,"exit_code":0,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$VERIFICATION_HOST_JUNIT" "$verification_tmp" "$@"
     mv -f "$verification_tmp" "$BLUEPRINT_VERIFICATION_RESULT_FILE"
   else
     if [ -n "${BLUEPRINT_VERIFICATION_JUNIT:-}" ]; then
@@ -752,10 +774,11 @@ if [ $# -gt 0 ]; then
         echo "ERROR: verification JUnit output directory is unavailable: $VERIFICATION_OUTPUT_DIR" >&2
         exit 2
       }
+      VERIFICATION_OUTPUT_DIR="$(cd "$VERIFICATION_OUTPUT_DIR" && pwd -P)"
       if [ "$USE_DOCKER" = "1" ]; then
-        ENV_ARGS="$ENV_ARGS -v ${VERIFICATION_OUTPUT_DIR}:/verification-output"
+        DOCKER_ARGS+=(-v "${VERIFICATION_OUTPUT_DIR}:/verification-output")
         verification_junit="/verification-output/${VERIFICATION_JUNIT_NAME}"
-        ENV_ARGS="$ENV_ARGS -e BLUEPRINT_VERIFICATION_JUNIT=$verification_junit"
+        DOCKER_ARGS+=(-e "BLUEPRINT_VERIFICATION_JUNIT=$verification_junit")
       else
         verification_junit="$BLUEPRINT_VERIFICATION_JUNIT"
       fi

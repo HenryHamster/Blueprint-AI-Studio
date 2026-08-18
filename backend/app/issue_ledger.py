@@ -21,7 +21,7 @@ from app.issue_ledger_state import (
     ISSUE_LEDGER_SCHEMA_VERSION,
     _history_entry_key,
     _seed_open_record,
-    issue_ledger_complete_for_history,
+    issue_ledger_complete_for_history,  # noqa: F401 - compatibility re-export
     normalize_issue_ledger,
 )
 
@@ -230,25 +230,46 @@ def build_issue_ledger(
     )
     entries_to_apply = history
     matching_index: int | None = None
-    if seed_is_complete:
-        through_key = str(normalized_seed.get("through_entry_key") or "")
+    seed_through_key = str(
+        (normalized_seed or {}).get("through_entry_key") or ""
+    )
+    seed_has_lineage_marker = bool(normalized_seed is not None and seed_through_key)
+    if seed_has_lineage_marker:
         matching_index = next(
             (
                 index
                 for index in range(len(history) - 1, -1, -1)
-                if _history_entry_key(history[index]) == through_key
+                if _history_entry_key(history[index]) == seed_through_key
             ),
             None,
         )
         if matching_index is not None:
             entries_to_apply = history[matching_index + 1 :]
+        else:
+            # The retained window is not demonstrably downstream of this
+            # durable seed. Replaying it on top of the seed can run older review
+            # rows "backwards" over newer open findings, manufacturing
+            # impossible resolutions (a finding introduced at iteration 5
+            # appearing fixed at iteration 1). Preserve the seed exactly and
+            # wait for an authoritative rebuild or a window containing its
+            # marker; never guess temporal ordering.
+            entries_to_apply = []
+    # A markerless legacy seed has no claim to a position *after* this bounded
+    # history window. Rebuild conservatively from the retained reviews: seeded
+    # unverified blockers cannot be closed by omission, explicit exact-target
+    # resolutions remain required, and newly observed blockers must still enter
+    # the open set. Once the bounded tail is ingested below it receives a marker
+    # so subsequent updates regain ordered incremental semantics.
     # A complete seed only remains a proof when its tail is still present in
     # the retained history (or no new history was supplied). If the marker is
     # absent, replaying the retained cap may reconstruct current-looking state
     # while silently skipping rows between the seed and that window.
     lineage_complete = bool(
         (seed_is_complete and (not history or matching_index is not None))
-        or (not seed_is_complete and len(history) < REVIEW_HISTORY_MAX_ENTRIES)
+        or (
+            not seed_has_lineage_marker
+            and len(history) < REVIEW_HISTORY_MAX_ENTRIES
+        )
     )
 
     for entry in entries_to_apply:
@@ -466,7 +487,8 @@ def build_issue_ledger(
         (entry for entry in reversed(history) if isinstance(entry, dict)),
         None,
     )
-    if stamp_complete and tail is not None:
+    can_advance_marker = not seed_has_lineage_marker or matching_index is not None
+    if stamp_complete and tail is not None and can_advance_marker:
         result.update(
             {
                 "schema_version": ISSUE_LEDGER_SCHEMA_VERSION,
@@ -474,8 +496,17 @@ def build_issue_ledger(
                 "through_entry_key": _history_entry_key(tail),
             }
         )
-    elif stamp_complete and normalized_seed is not None:
+    elif stamp_complete and normalized_seed is not None and not history:
         for key in ("schema_version", "complete", "through_entry_key"):
             if key in normalized_seed:
                 result[key] = normalized_seed[key]
+    elif stamp_complete and normalized_seed is not None:
+        # Missing lineage is a durable fail-closed state. Keep the seed marker
+        # so a later authoritative window may reconnect to it, but never carry
+        # ``complete=True`` across the gap or advance the marker to rows that
+        # were deliberately not applied.
+        result["schema_version"] = ISSUE_LEDGER_SCHEMA_VERSION
+        result["complete"] = False
+        if seed_through_key:
+            result["through_entry_key"] = seed_through_key
     return result

@@ -36,6 +36,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.admin_approval_authority import (
+    APPROVAL_FOLLOWUP_CLAIM_KEY,
+    APPROVAL_HOLD_PROVENANCE_KEY,
+    approval_hold_provenance,
+    establish_independent_approval_hold,
+)
 from app.branch_resolution import classify_rollup_merge_outcome
 from app.context_bounds import bound_review_history
 from app.landed_signal import corroborate_and_apply_merged_landed_signal
@@ -49,10 +55,29 @@ from app.review_pipeline import (
     fix_all_occurrences_directive,
     review_loop_parked_for_operator,
     stale_respawn_delta_base_sha,
+    _surface_module_finding_chain_escalation,
 )
+from app.module_finding_chain import find_and_mark_chain_escalation
 from app.rollup_locking import _OriginalTaskLockTimeout, _lock_original_task
 
 logger = logging.getLogger(__name__)
+
+
+def _establish_request_changes_hold(task: Task, *, reason: str) -> None:
+    context = dict(task.context or {})
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    if (
+        task.requires_approval is True
+        and isinstance(provenance, dict)
+        and provenance.get("owner") == "review_request_changes"
+        and provenance.get("reason") == reason
+        and not context.get(APPROVAL_FOLLOWUP_CLAIM_KEY)
+        and approval_hold_provenance(task).get("review_wait_hold") is None
+    ):
+        return
+    establish_independent_approval_hold(
+        task, reason=reason, owner="review_request_changes"
+    )
 
 
 async def run_request_changes(
@@ -339,14 +364,16 @@ async def run_request_changes(
 
     # Stale/unproven-target guard: REQUEST_CHANGES can launch a
     # code-writing fix only when the reviewer proved the exact
-    # immutable head it inspected. The base branch tip is ambient while
-    # the PR is in flight, so base-only drift does not invalidate head-bound
-    # review guidance; the live base is still required for downstream merge
-    # authority. If GitHub cannot provide the live target, fail closed for
+    # immutable base+head pair it inspected. Base-only drift changes the
+    # effective diff and can invalidate both approval and defect guidance; a
+    # head-relative delta is empty in that case, so the replacement must be a
+    # full exact-target review. If GitHub cannot provide the live target, fail closed for
     # operator attention rather than expanding to an unpinned review.
     if not head_sha or not base_sha:
         task.status = TaskStatus.COMPLETED
-        task.requires_approval = True
+        _establish_request_changes_hold(
+            task, reason="review_target_unavailable"
+        )
         task.latest_status_message = (
             f"Review changes for PR #{pr_number} withheld: could not "
             "prove the live immutable review target"
@@ -362,7 +389,9 @@ async def run_request_changes(
 
     review_target_unproven = (
         not reviewed_head_sha
+        or not reviewed_base_sha
         or reviewed_head_sha != head_sha
+        or reviewed_base_sha != base_sha
     )
     if review_target_unproven:
         # A stale finding can waste a fix iteration just as a
@@ -403,6 +432,7 @@ async def run_request_changes(
             task.context = {
                 **(task.context or {}),
                 "_review_stale_head": True,
+                "_review_stale_target": True,
             }
             flag_modified(task, "context")
             session.add(task)
@@ -412,7 +442,10 @@ async def run_request_changes(
                 f"{original_task_id[:8]} parked for operator "
                 f"({_stale_park_reason})"
             )
-        elif not (task.context or {}).get("_review_stale_head"):
+        elif not (
+            (task.context or {}).get("_review_stale_head")
+            or (task.context or {}).get("_review_stale_target")
+        ):
             task.status = TaskStatus.COMPLETED
             task.latest_status_message = (
                 f"Stale-target review discarded for PR #{pr_number} "
@@ -436,6 +469,7 @@ async def run_request_changes(
             task.context = {
                 **(task.context or {}),
                 "_review_stale_head": True,
+                "_review_stale_target": True,
             }
             flag_modified(task, "context")
             session.add(task)
@@ -478,9 +512,8 @@ async def run_request_changes(
         await session.commit()
         return True, {"status": "accepted"}
 
-    # A cached verdict must have evaluated this exact head. Base drift is
-    # handled by the final merge-authority gate, not review admission.
-    if reviewed_head_sha == head_sha:
+    # A cached verdict must have evaluated this exact effective target.
+    if reviewed_head_sha == head_sha and reviewed_base_sha == base_sha:
         _record_structured_review_result(
             {
                 "project_id": str(task.project_id),
@@ -524,7 +557,9 @@ async def run_request_changes(
             ) from _revoke_lock_err
 
         if _orig is None:
-            task.requires_approval = True
+            _establish_request_changes_hold(
+                task, reason="originating_task_missing"
+            )
             task.latest_status_message = (
                 f"Review blocked PR #{pr_number}, but its originating "
                 "task is missing; fix withheld for manual recovery"
@@ -634,7 +669,7 @@ async def run_request_changes(
                 _orig_loop[
                     "ci_wait_pause_baseline"
                 ] = await pause_clock.current_baseline(session)
-            except Exception as _pause_err:  # noqa: BLE001
+            except Exception as _pause_err:
                 logger.warning(
                     "[REVIEW PIPELINE] Could not refresh pause "
                     "baseline while revoking parent %s: %r",
@@ -653,6 +688,24 @@ async def run_request_changes(
         # failure must leave the parent safely revoked and the
         # post-commit sweep free to retry the idempotent spawn.
         await session.commit()
+
+    # Cross-PR recurring-concern escalation is advisory to this PR: the marker
+    # and alert route a durable design decision, while this request-changes
+    # cycle continues to receive its ordinary fix task.
+    chain_candidate = await find_and_mark_chain_escalation(
+        session,
+        project_id=task.project_id,
+        issues=issues,
+        authoritative_files=_pr_files,
+    )
+    if chain_candidate is not None:
+        await _surface_module_finding_chain_escalation(
+            task,
+            _orig if original_task_id else None,
+            pr_number=int(pr_number),
+            candidate=chain_candidate,
+            session=session,
+        )
 
     # CI vs reviewer build-gate disagreement detector. When the
     # reviewer flags build/lint complaints but CI shows the
@@ -719,6 +772,7 @@ async def run_request_changes(
         fix_prompt_text = (
             f"{fix_all_occurrences_directive()}{fix_prompt_text}"
         )
+    review_task_id = task.id
     fix_task, _ = await _spawn_pipeline_task(
         task,
         "fix",
@@ -746,6 +800,54 @@ async def run_request_changes(
             f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}"
         )
     else:
+        # The chain original may own a durable human-merge intent even though
+        # this REQUEST_CHANGES completion runs on its review child.  The
+        # canonical spawner suppresses code publication under the PR lock; do
+        # not reinterpret that source-neutral outcome as an iteration cap or
+        # dirty the now-expired review-task snapshot after its rollback.
+        if original_task_id:
+            from app.admin_approval_authority import approval_merge_in_flight
+
+            spawn_return_transaction_active = session.in_transaction()
+            try:
+                merge_source_id = uuid.UUID(str(original_task_id))
+            except (TypeError, ValueError, AttributeError):
+                merge_source_id = None
+            with session.no_autoflush:
+                merge_source = (
+                    await session.get(Task, merge_source_id, populate_existing=True)
+                    if merge_source_id is not None
+                    else None
+                )
+            if merge_source is not None and await approval_merge_in_flight(
+                merge_source, session
+            ):
+                await session.rollback()
+                logger.info(
+                    "[REVIEW PIPELINE] Fix for PR #%s deferred while exact "
+                    "human-merge intent reconciles",
+                    pr_number,
+                )
+                return True, {
+                    "status": "accepted",
+                    "reason": "approval_merge_reconciliation_wait",
+                }
+            if not spawn_return_transaction_active:
+                # A source-neutral suppression or lock-timeout rollback expires
+                # the review child.  If the outcome was unrelated to a merge
+                # intent, continue only from a fresh identity before applying
+                # the ordinary cap/stuck disposition below.
+                refreshed_review_task = await session.get(
+                    Task, review_task_id, populate_existing=True
+                )
+                if refreshed_review_task is None:
+                    await session.rollback()
+                    return True, {
+                        "status": "accepted",
+                        "reason": "review_source_disappeared",
+                    }
+                task = refreshed_review_task
+
         # Surface the REAL refusal reason, not a blanket "cap
         # reached" (lineage d3c12745 / PR #16759: 13 tasks said
         # "iteration cap reached" when the truth was
@@ -756,7 +858,9 @@ async def run_request_changes(
             f"Fix not spawned for PR #{pr_number} — "
             f"{_fix_refusal_label}"
         )
-        task.requires_approval = True
+        _establish_request_changes_hold(
+            task, reason="review_fix_spawn_refused"
+        )
         session.add(task)
         cap_alert_title = (
             f"PR #{pr_number} stalled — {_fix_refusal_label}"

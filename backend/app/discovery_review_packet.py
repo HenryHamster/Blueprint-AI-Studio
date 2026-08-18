@@ -15,7 +15,10 @@ import uuid
 
 from sqlmodel import select
 
-from app.findings_index import finalized_research_findings
+from app.findings_index import (
+    FINALIZED_RESEARCH_FINDINGS_KEY,
+    finalized_research_findings,
+)
 from app.landed_signal import has_landed_signal
 from app.models import (
     Artifact,
@@ -30,7 +33,7 @@ from app.task_capabilities import WRITE_TASK_TYPES
 from app.time_utils import _utcnow
 
 
-DISCOVERY_REVIEW_PACKET_VERSION = 2
+DISCOVERY_REVIEW_PACKET_VERSION = 3
 DISCOVERY_REVIEW_MAX_PACKET_ITEMS = 24
 DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS = 32_000
 DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS = 8_000
@@ -467,6 +470,7 @@ async def build_discovery_review_packet(
                     else True,
                 )
                 .order_by(Task.created_at.asc(), Task.id.asc())
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -483,6 +487,7 @@ async def build_discovery_review_packet(
                     select(Artifact)
                     .where(Artifact.task_id.in_(task_ids))
                     .order_by(Artifact.created_at.asc(), Artifact.id.asc())
+                    .execution_options(populate_existing=True)
                 )
             )
             .scalars()
@@ -501,6 +506,7 @@ async def build_discovery_review_packet(
                     select(KnowledgeDocument)
                     .where(KnowledgeDocument.source_task_id.in_(task_ids))
                     .order_by(KnowledgeDocument.created_at.asc(), KnowledgeDocument.id.asc())
+                    .execution_options(populate_existing=True)
                 )
             )
             .scalars()
@@ -821,7 +827,9 @@ async def build_discovery_review_packet(
     outcome_item = await _get_or_add_evidence(
         session,
         cycle=cycle,
-        dedupe_key=f"parent-outcome:v2:{_checksum(receipt)}",
+        dedupe_key=(
+            f"parent-outcome:v{DISCOVERY_REVIEW_PACKET_VERSION}:{_checksum(receipt)}"
+        ),
         semantic_role="parent_outcome",
         source_kind="research_parent",
         source_id=str(cycle.source_research_task_id),
@@ -832,6 +840,12 @@ async def build_discovery_review_packet(
     manifest = {
         "version": DISCOVERY_REVIEW_PACKET_VERSION,
         "source_research_task_id": str(cycle.source_research_task_id),
+        "source_research_findings_finalized": bool(
+            source is not None
+            and source.status == TaskStatus.COMPLETED
+            and isinstance(source.context, Mapping)
+            and source.context.get(FINALIZED_RESEARCH_FINDINGS_KEY) is True
+        ),
         "task_count": len(tasks),
         "artifact_count": len(artifacts),
         "semantic_receipt_checksum": outcome_item.checksum,
@@ -847,7 +861,10 @@ async def build_discovery_review_packet(
     manifest_item = await _get_or_add_evidence(
         session,
         cycle=cycle,
-        dedupe_key=f"packet-manifest:v2:{_checksum(manifest)}",
+        dedupe_key=(
+            f"packet-manifest:v{DISCOVERY_REVIEW_PACKET_VERSION}:"
+            f"{_checksum(manifest)}"
+        ),
         semantic_role="packet_manifest",
         source_kind="server_ledger",
         source_id=str(cycle.id),

@@ -1610,6 +1610,31 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                     task.id, session
                 )
 
+                # Fix admission locks the same-PR Task chain.  Take the
+                # universal Project authority first so the full ordering is
+                # Project -> PR/Task -> lane, and retain it through recovery
+                # Task publication.  A paused project leaves the lane intact
+                # for a later sweep instead of consuming recovery budget and
+                # creating latent work.
+                from app.task_locking import (
+                    AUTOMATIC_TASK_CREATION_ALLOWED,
+                    acquire_automatic_task_creation_authority,
+                )
+
+                creation_admission = await acquire_automatic_task_creation_authority(
+                    session, task.project_id
+                )
+                if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+                    logger.info(
+                        "[WARM-POOL] stranded-lane recovery held for project %s "
+                        "lane %s: %s",
+                        task.project_id,
+                        lane.id,
+                        creation_admission,
+                    )
+                    await session.commit()
+                    continue
+
                 async def _fetch_lane_pr() -> dict:
                     return await get_pull_request(
                         gh_token, owner, repo, int(pr_number)

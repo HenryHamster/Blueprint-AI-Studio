@@ -27,7 +27,6 @@ from app.database import AsyncSessionLocal
 from app.context_bounds import bound_review_history
 from app.models import (
     TASK_ORIGINATION_REMEDIATION,
-    TASK_ORIGINATION_SMOKETEST,
     Task,
     TaskHistory,
     Project,
@@ -49,6 +48,7 @@ import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project, _sanitize_log
 from app.payload_schemas import validate_internal_payload
 from app.review_pipeline import (
+    _PIPELINE_ACTIVE_STATUSES,
     SPAWN_REASON_KEY,
     _genuine_blocking_issue_exists,
     _spawn_pipeline_task,
@@ -83,8 +83,340 @@ from app.notification_dispatch import (
     is_residual_remediation_task,
     post_remediation_result_message,
 )
+from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    automatic_task_creation_parent_lock,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _set_independent_approval_hold(task: Task, reason: str) -> None:
+    """Replace any older approval owner with this lifecycle safety hold."""
+
+    from app.admin_approval_authority import establish_independent_approval_hold
+
+    establish_independent_approval_hold(
+        task,
+        reason=reason,
+        owner="task_lifecycle",
+    )
+
+
+def _normalized_exact_review_target(
+    target: dict[str, str | int] | None,
+    *,
+    project_id: object,
+    pr_number: int,
+) -> dict[str, str | int] | None:
+    """Return the complete immutable target owned by this project/PR."""
+    if not isinstance(target, dict):
+        return None
+    head_sha = str(target.get("head_sha") or "")
+    base_sha = str(target.get("base_sha") or "")
+    try:
+        target_pr = int(target.get("pr_number") or 0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not head_sha
+        or not base_sha
+        or str(target.get("project_id") or "") != str(project_id)
+        or target_pr != int(pr_number)
+    ):
+        return None
+    return {
+        "project_id": str(project_id),
+        "pr_number": int(pr_number),
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+
+
+def _normalized_critical_paths(value: object) -> list[str]:
+    """Normalize legacy boolean/scalar critical markers for stable messaging."""
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item)]
+    if isinstance(value, str):
+        return [value] if value else []
+    if value is True:
+        return ["security-critical files"]
+    return [str(value)] if value else []
+
+
+def _review_publication_identity_is_current(
+    task: Task,
+    *,
+    target: dict[str, str | int],
+    branch: str,
+    base_branch: str,
+    allow_failed_with_independent_hold: bool = False,
+) -> bool:
+    """Reject a fresh lock whose original task now names another attempt."""
+    if (
+        task.project_id is None
+        or str(task.project_id) != str(target["project_id"])
+        or task.archived is True
+        or task.status == TaskStatus.CANCELLED
+        or (
+            task.status == TaskStatus.FAILED
+            and not (
+                allow_failed_with_independent_hold
+                and task.requires_approval is True
+            )
+        )
+    ):
+        return False
+    context = dict(task.context or {})
+    if context.get("pr_merged"):
+        return False
+    rollup_pr_number = context.get("rollup_pr_number")
+    if rollup_pr_number not in (None, "") and str(rollup_pr_number) != str(
+        target["pr_number"]
+    ):
+        return False
+    review_loop = dict(context.get("review_loop") or {})
+    expected = {
+        "project_id": str(target["project_id"]),
+        "pr_number": int(target["pr_number"]),
+        "head_sha": str(target.get("head_sha") or ""),
+        "base_sha": str(target.get("base_sha") or ""),
+        "branch": str(branch),
+        "base_branch": str(base_branch),
+        "original_task_id": str(task.id),
+    }
+    for key, value in expected.items():
+        current = review_loop.get(key)
+        if current not in (None, "") and str(current) != str(value):
+            return False
+    current_target = review_loop.get("review_target")
+    if isinstance(current_target, dict):
+        for key in ("project_id", "pr_number", "head_sha", "base_sha"):
+            current = current_target.get(key)
+            if current not in (None, "") and str(current) != str(expected[key]):
+                return False
+    return True
+
+
+def _publish_exact_review_target(
+    task: Task,
+    *,
+    target: dict[str, str | int] | None,
+    branch: str,
+    base_branch: str,
+    review_history: list | None,
+    issue_ledger: dict | None,
+    review_approved: bool,
+    approval_reason: str | None = None,
+    allow_failed_with_independent_hold: bool = False,
+) -> bool:
+    """Bind exact review proof without replacing newer source authority."""
+    if not _review_publication_identity_is_current(
+        task,
+        target=target,
+        branch=branch,
+        base_branch=base_branch,
+        allow_failed_with_independent_hold=allow_failed_with_independent_hold,
+    ):
+        return False
+    context = dict(task.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    combined_history: list = []
+    seen_review_ids: set[str] = set()
+    for entry in [
+        *(review_loop.get("review_history") or []),
+        *(review_history or []),
+    ]:
+        if not isinstance(entry, dict):
+            continue
+        review_id = str(entry.get("review_task_id") or "")
+        if review_id and review_id in seen_review_ids:
+            continue
+        if review_id:
+            seen_review_ids.add(review_id)
+        if entry not in combined_history:
+            combined_history.append(entry)
+    combined_history = bound_review_history(combined_history)
+    seed_ledger = issue_ledger
+    if seed_ledger is None and isinstance(review_loop.get("issue_ledger"), dict):
+        seed_ledger = review_loop["issue_ledger"]
+    published_ledger = build_issue_ledger(
+        combined_history,
+        **({"seed_ledger": seed_ledger} if seed_ledger is not None else {}),
+        stamp_complete=True,
+    )
+    review_loop.update(
+        {
+            "project_id": str(target["project_id"]),
+            "pr_number": int(target["pr_number"]),
+            "head_sha": str(target["head_sha"]),
+            "base_sha": str(target["base_sha"]),
+            "branch": str(branch),
+            "base_branch": str(base_branch),
+            "original_task_id": str(task.id),
+            "review_target": dict(target),
+            "review_history": combined_history,
+            "issue_ledger": published_ledger,
+            "review_approved": bool(review_approved),
+        }
+    )
+    context["review_loop"] = review_loop
+    task.context = context
+    flag_modified(task, "context")
+    if approval_reason and task.requires_approval is not True:
+        from app.admin_approval_authority import establish_independent_approval_hold
+
+        establish_independent_approval_hold(
+            task,
+            reason=approval_reason,
+            owner="task_lifecycle",
+        )
+    return True
+
+
+async def _lock_exact_review_original(
+    session: AsyncSession,
+    *,
+    project_id: object,
+    pr_number: int,
+    original_task_id: object,
+) -> Task | None:
+    """Acquire canonical Project -> PR -> original-Task publication authority."""
+    project = await _lock_exact_review_project_pr(
+        session,
+        project_id=project_id,
+        pr_number=pr_number,
+    )
+    if project is None:
+        return None
+    return (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == original_task_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def _lock_exact_review_project_pr(
+    session: AsyncSession,
+    *,
+    project_id: object,
+    pr_number: int,
+) -> Project | None:
+    """Freeze project config, then serialize the exact repository PR."""
+    from app.task_locking import acquire_pr_spawn_lock
+
+    with session.no_autoflush:
+        project = (
+            (
+                await session.execute(
+                    select(Project)
+                    .where(Project.id == project_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if project is None:
+            return None
+        repo_identity = (
+            f"{project.github_owner}/{project.github_repo}"
+            if project.github_owner and project.github_repo
+            else None
+        )
+        await acquire_pr_spawn_lock(
+            session,
+            project_id,
+            pr_number,
+            repo_identity=repo_identity,
+        )
+        return project
+
+
+async def _adopt_exact_active_review(
+    session: AsyncSession,
+    *,
+    project_id: object,
+    pr_number: int,
+    original_task_id: object,
+    review_task_id: object,
+    target: dict[str, str | int],
+    branch: str,
+    base_branch: str,
+) -> bool:
+    """Bind a deduplicated exact active review in a fresh authority window."""
+    await session.rollback()
+    project = await _lock_exact_review_project_pr(
+        session,
+        project_id=project_id,
+        pr_number=pr_number,
+    )
+    if project is None:
+        await session.rollback()
+        return False
+    # Child before original matches review-completion's Task-row order.  The
+    # project/PR locks are already held, so a terminal child cannot slip between
+    # this proof and source publication and no original -> child inversion is
+    # introduced.
+    review_task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == review_task_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    child_target = (
+        ((review_task.context or {}).get("review_loop") or {}).get("review_target")
+        if review_task is not None
+        else None
+    )
+    if (
+        review_task is None
+        or review_task.status not in _PIPELINE_ACTIVE_STATUSES
+        or review_task.first_payload.get("type") != "review"
+        or child_target != target
+    ):
+        await session.rollback()
+        return False
+    original = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == original_task_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if original is None or not _publish_exact_review_target(
+        original,
+        target=target,
+        branch=branch,
+        base_branch=base_branch,
+        review_history=None,
+        issue_ledger=None,
+        review_approved=False,
+    ):
+        await session.rollback()
+        return False
+    session.add(original)
+    await session.commit()
+    return True
 
 
 # Write task types whose COMPLETED handler opens a *fresh* PR and routes it
@@ -117,6 +449,61 @@ def _pipeline_spawn_refusal_label(task: Task) -> str:
         "stuck_cycle": "stuck_cycle (operator review required)",
         "cap_exhausted": "cap_exhausted (iteration cap reached)",
     }.get(reason, reason)
+
+
+async def _publish_exact_review_refusal(
+    session: AsyncSession,
+    *,
+    project_id: object,
+    pr_number: int,
+    original_task_id: object,
+    target: dict[str, str | int],
+    branch: str,
+    base_branch: str,
+) -> str | None:
+    """Publish a refusal hold only under fresh exact source authority."""
+    await session.commit()
+    source = await _lock_exact_review_original(
+        session,
+        project_id=project_id,
+        pr_number=pr_number,
+        original_task_id=original_task_id,
+    )
+    if source is None:
+        await session.rollback()
+        return None
+    refusal = _pipeline_spawn_refusal_label(source)
+    had_hold = source.requires_approval is True
+    if target is None:
+        if not _review_publication_identity_is_current(
+            source,
+            target={"project_id": str(project_id), "pr_number": pr_number},
+            branch=branch,
+            base_branch=base_branch,
+        ):
+            await session.rollback()
+            return None
+        if not had_hold:
+            _set_independent_approval_hold(source, f"review spawn refused: {refusal}")
+    elif not _publish_exact_review_target(
+        source,
+        target=target,
+        branch=branch,
+        base_branch=base_branch,
+        review_history=None,
+        issue_ledger=None,
+        review_approved=False,
+        approval_reason=f"review spawn refused: {refusal}",
+    ):
+        await session.rollback()
+        return None
+    if not had_hold:
+        source.latest_status_message = (
+            f"Review not spawned for PR #{pr_number} — {refusal}"
+        )
+    session.add(source)
+    await session.commit()
+    return refusal
 
 
 def _sidecar_application_marker(
@@ -382,7 +769,7 @@ async def _persist_stale_review_evidence(
             f"could not revoke parent authority for late review on PR #{pr_number}"
         ) from exc
     if orig is None:
-        task.requires_approval = True
+        _set_independent_approval_hold(task, "late review source task missing")
         return
 
     parent_loop = dict((orig.context or {}).get("review_loop") or {})
@@ -502,7 +889,7 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     ``docs/concurrency.md`` for the full canonical-order argument.
     """
     result = await session.execute(
-        select(Project.id)
+        select(Project.id, Project.paused, Project.archived)
         .where(Project.id == project_id)
         # SQLAlchemy renders key_share=True (without read=True) as
         # ``FOR NO KEY UPDATE`` on PostgreSQL: strategic spawners still
@@ -510,9 +897,17 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
         # conversation sends can take KEY SHARE without convoying.
         .with_for_update(skip_locked=True, key_share=True)
     )
-    if result.first() is None:
+    project_row = result.first()
+    if project_row is None:
         # Row missing or held — fail safe. The other holder will spawn (or
         # already has); our caller will skip and re-evaluate next cycle.
+        return True
+    if bool(project_row.paused) or bool(project_row.archived):
+        # This helper is the Project-before-child admission point shared by the
+        # design-doc and strategic-review spawners.  Treat the universal pause
+        # (and archive) authority exactly like an active strategic task: no
+        # automatic child may be authored, including a Phase 1 -> Phase 2
+        # continuation that would otherwise sit latent until resume.
         return True
     # Phase B4 (H-P6): we only need first_payload.type per row to filter, so
     # drop status_log/plan_output JSONB. Loading payloads keeps first_payload
@@ -1407,6 +1802,7 @@ async def _process_post_commit(
     payload: AgentStatusPayload,
     _session_factory=None,
     _expected_childless_recovery_token: str | None = None,
+    _expected_research_spawn_recovery_token: str | None = None,
     _expected_post_commit_claim_token: str | None = None,
     _expected_post_commit_status: TaskStatus | None = None,
 ) -> dict:
@@ -1610,6 +2006,55 @@ async def _process_post_commit(
                     str(task_id)[:8],
                 )
                 return {"status": "accepted", "recovery_skipped": True}
+
+        # Sidecar-resumed research has no agent-status write-ahead marker.  Its
+        # dedicated marker-less recovery lease is exact-attempt authority only:
+        # revalidate the server-owned token, attempt identity, persisted routing
+        # input, terminal/progress state, and project pause boundary while the
+        # canonical Project -> Task locks are held.  A stale lease can never
+        # revive a cancelled/requeued attempt or create work while paused.
+        if _expected_research_spawn_recovery_token is not None:
+            from app.findings_index import FINALIZED_RESEARCH_FINDINGS_KEY
+            from app.recovery_research_spawn_pending import (
+                RESEARCH_SPAWN_RECOVERY_KEY,
+                research_spawn_recovery_attempt_identity,
+            )
+
+            recovery_meta = dict(
+                (task.context or {}).get(RESEARCH_SPAWN_RECOVERY_KEY) or {}
+            )
+            project_paused = bool(
+                locked_project is None
+                or locked_project.paused
+                or locked_project.archived
+            )
+            claim_is_current = bool(
+                recovery_meta.get("claim_token")
+                == _expected_research_spawn_recovery_token
+                and recovery_meta.get("attempt_identity")
+                == research_spawn_recovery_attempt_identity(task)
+                and task.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING)
+                and not task.archived
+                and not task.post_commit_pending
+                and (task.first_payload or {}).get("type") == "research"
+                and (task.context or {}).get("_research_spawn_pending") is True
+                and (task.context or {}).get(FINALIZED_RESEARCH_FINDINGS_KEY)
+                is not True
+                and isinstance(task.plan_output, list)
+            )
+            if project_paused or not claim_is_current:
+                reason = "project_paused" if project_paused else "stale_claim"
+                logger.info(
+                    "[POST_COMMIT SWEEP] Skipping marker-less research "
+                    "recovery for task %s (%s)",
+                    str(task_id)[:8],
+                    reason,
+                )
+                return {
+                    "status": "accepted",
+                    "recovery_skipped": True,
+                    "recovery_reason": reason,
+                }
 
         # Marker-based recovery claims are leases too. Revalidate the exact
         # claim while holding canonical Project -> Task locks immediately
@@ -1942,12 +2387,29 @@ async def _process_post_commit(
                 # This is the caller that records the freshly-opened PR and has
                 # both the Project ORM object and the async session in scope (the
                 # low-level create_pull_request helper has neither). Best-effort
-                # and idempotent; the staged mutation persists via the routing
-                # commits below. Never gates the PR-routing path.
+                # and idempotent; the short fresh-read mutation commits before
+                # routing begins. Never gates the PR-routing path.
                 try:
-                    from app.onboarding_proof import stamp_first_pr_opened
+                    from app.onboarding_proof import (
+                        lock_project_for_onboarding_proof,
+                        stamp_first_pr_opened,
+                    )
 
-                    stamp_first_pr_opened(_project, session, when=_utcnow())
+                    _proof_project = await lock_project_for_onboarding_proof(
+                        _project,
+                        session,
+                    )
+                    if _proof_project is not None:
+                        stamp_first_pr_opened(
+                            _proof_project,
+                            session,
+                            when=_utcnow(),
+                        )
+                        # No routing mutations have been staged since the
+                        # entry commit above. Release this Project lock now so
+                        # it never spans the slow review/merge GitHub calls.
+                        await session.commit()
+                        _project = _proof_project
                 except Exception:  # observability stamp never blocks PR routing
                     logger.warning(
                         "[POST_COMMIT] onboarding first-pr-opened stamp failed",
@@ -2106,7 +2568,9 @@ async def _process_post_commit(
                                 f"[SECURITY] Pipeline scan: {scan_result['summary']}"
                             )
                             if scan_result["blocked"]:
-                                task.requires_approval = True
+                                _set_independent_approval_hold(
+                                    task, "pipeline security scan blocked"
+                                )
                                 task.latest_status_message = (
                                     f"Security scan blocked: {scan_result['summary']}"
                                 )
@@ -2156,7 +2620,10 @@ async def _process_post_commit(
                                         f"[SECURITY] Small-scope scan retry succeeded: {scan_result['summary']}"
                                     )
                                     if scan_result["blocked"]:
-                                        task.requires_approval = True
+                                        _set_independent_approval_hold(
+                                            task,
+                                            "pipeline security scan retry blocked",
+                                        )
                                         task.latest_status_message = f"Security scan blocked: {scan_result['summary']}"
                                         session.add(task)
                                         if task.auto_remediation:
@@ -2195,7 +2662,10 @@ async def _process_post_commit(
                                         f"[SECURITY] Small-scope scan retry also failed for PR #{pr_number}: {retry_exc}",
                                         exc_info=True,
                                     )
-                                    task.requires_approval = True
+                                    _set_independent_approval_hold(
+                                        task,
+                                        "pipeline security scan retry unavailable",
+                                    )
                                     task.context = {
                                         **(task.context or {}),
                                         "scan_transient_failure": True,
@@ -2225,7 +2695,9 @@ async def _process_post_commit(
                                     f"[SECURITY] Small-scope scan failed for PR #{pr_number}, blocking: {e}",
                                     exc_info=True,
                                 )
-                                task.requires_approval = True
+                                _set_independent_approval_hold(
+                                    task, "pipeline security scan unavailable"
+                                )
                                 task.latest_status_message = _safe_exception_message(
                                     e, "Security scan failed — requires manual approval"
                                 )
@@ -2790,7 +3262,9 @@ async def _process_post_commit(
                         )
                         logger.info(f"[SECURITY] {scan_result['summary']}")
                         if scan_result["blocked"]:
-                            task.requires_approval = True
+                            _set_independent_approval_hold(
+                                task, "security scan blocked"
+                            )
                             task.latest_status_message = scan_result["summary"]
                             session.add(task)
                             await session.commit()
@@ -2812,7 +3286,9 @@ async def _process_post_commit(
                                     f"[SECURITY] Scan retry succeeded: {scan_result['summary']}"
                                 )
                                 if scan_result["blocked"]:
-                                    task.requires_approval = True
+                                    _set_independent_approval_hold(
+                                        task, "security scan retry blocked"
+                                    )
                                     task.latest_status_message = scan_result["summary"]
                                     session.add(task)
                                     await session.commit()
@@ -2829,7 +3305,9 @@ async def _process_post_commit(
                                     f"[SECURITY] Scan retry also failed for PR #{pr_number}: {retry_exc}",
                                     exc_info=True,
                                 )
-                                task.requires_approval = True
+                                _set_independent_approval_hold(
+                                    task, "security scan retry unavailable"
+                                )
                                 task.context = {
                                     **(task.context or {}),
                                     "scan_transient_failure": True,
@@ -2845,7 +3323,9 @@ async def _process_post_commit(
                                 f"[SECURITY] Scan failed for PR #{pr_number}, flagging for approval: {e}",
                                 exc_info=True,
                             )
-                            task.requires_approval = True
+                            _set_independent_approval_hold(
+                                task, "security scan unavailable"
+                            )
                             task.latest_status_message = _safe_exception_message(
                                 e,
                                 "Security scan failed — review will proceed but merge requires manual approval",
@@ -2903,19 +3383,123 @@ async def _process_post_commit(
                     # review-complete path), not reviewing. A security scan failure
                     # or blocking finding should not orphan the PR by preventing
                     # review entirely.
-                    review_task, _ = await _spawn_pipeline_task(
-                        task,
-                        "review",
-                        session,
-                        pr_number,
-                        branch,
-                        base_branch,
-                        original_prompt=original_prompt,
-                        original_task_id=str(task.id),
-                        review_target=await _resolve_live_review_target(
-                            task, session, pr_number
-                        ),
+                    _initial_review_target = await _resolve_live_review_target(
+                        task, session, pr_number
                     )
+                    _initial_review_target = _normalized_exact_review_target(
+                        _initial_review_target,
+                        project_id=task.project_id,
+                        pr_number=pr_number,
+                    )
+                    _initial_project_id = task.project_id
+                    _initial_task_id = task.id
+                    # Target resolution is the last GitHub I/O.  Start the
+                    # publication transaction only now and freeze Project
+                    # config before the PR and source rows through child commit.
+                    await session.commit()
+                    _initial_project_authority = (
+                        await _lock_exact_review_project_pr(
+                            session,
+                            project_id=_initial_project_id,
+                            pr_number=pr_number,
+                        )
+                        if _initial_review_target is not None
+                        else None
+                    )
+
+                    async def _initial_review_source_authority(
+                        authority_session: AsyncSession,
+                    ) -> Task | None:
+                        source = (
+                            (
+                                await authority_session.execute(
+                                    select(Task)
+                                    .where(Task.id == _initial_task_id)
+                                    .with_for_update()
+                                    .execution_options(populate_existing=True)
+                                )
+                            )
+                            .scalars()
+                            .first()
+                        )
+                        if (
+                            source is None
+                            or _initial_review_target is None
+                            or not _review_publication_identity_is_current(
+                                source,
+                                target=_initial_review_target,
+                                branch=branch,
+                                base_branch=base_branch,
+                            )
+                        ):
+                            return None
+                        return source
+
+                    async def _publish_initial_review(
+                        source: Task,
+                        _authority_session: AsyncSession,
+                    ) -> None:
+                        if _initial_review_target is None or not (
+                            _publish_exact_review_target(
+                                source,
+                                target=_initial_review_target,
+                                branch=branch,
+                                base_branch=base_branch,
+                                review_history=None,
+                                issue_ledger=None,
+                                review_approved=False,
+                            )
+                        ):
+                            raise PostCommitFinalCommitFailed(
+                                f"exact review target changed before publication "
+                                f"for PR #{pr_number}"
+                            )
+                        _authority_session.add(source)
+
+                    if _initial_project_authority is not None:
+                        review_task, review_was_created = await _spawn_pipeline_task(
+                            task,
+                            "review",
+                            session,
+                            pr_number,
+                            branch,
+                            base_branch,
+                            original_prompt=original_prompt,
+                            original_task_id=str(_initial_task_id),
+                            review_target=_initial_review_target,
+                            source_spawn_authority=_initial_review_source_authority,
+                            source_spawn_publication=_publish_initial_review,
+                        )
+                    else:
+                        await session.rollback()
+                        task = await session.get(
+                            Task, _initial_task_id, populate_existing=True
+                        )
+                        if task is None:
+                            return {"status": "accepted"}
+                        review_task, review_was_created = None, False
+                    if (
+                        review_task is not None
+                        and not review_was_created
+                        and _initial_review_target is not None
+                    ):
+                        adopted = await _adopt_exact_active_review(
+                            session,
+                            project_id=_initial_project_id,
+                            pr_number=pr_number,
+                            original_task_id=_initial_task_id,
+                            review_task_id=review_task.id,
+                            target=_initial_review_target,
+                            branch=branch,
+                            base_branch=base_branch,
+                        )
+                        if not adopted:
+                            review_task = None
+                            task = await session.get(
+                                Task, task.id, populate_existing=True
+                            )
+                            if task is None:
+                                return {"status": "accepted"}
                     if review_task:
                         if task.requires_approval:
                             logger.info(
@@ -2926,18 +3510,22 @@ async def _process_post_commit(
                                 f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}"
                             )
                     else:
-                        # Truthful refusal: _spawn_pipeline_task records why it
-                        # returned None in SPAWN_REASON_KEY (stuck_cycle,
-                        # cap_exhausted, ...) — surface that instead of a
-                        # blanket "iteration cap reached".
-                        _review_refusal_label = _pipeline_spawn_refusal_label(task)
-                        task.latest_status_message = (
-                            f"Review not spawned for PR #{pr_number} — "
-                            f"{_review_refusal_label}"
+                        _review_refusal_label = await _publish_exact_review_refusal(
+                            session,
+                            project_id=_initial_project_id,
+                            pr_number=pr_number,
+                            original_task_id=_initial_task_id,
+                            target=_initial_review_target,
+                            branch=branch,
+                            base_branch=base_branch,
                         )
-                        task.requires_approval = True
-                        session.add(task)
-                        await session.commit()
+                        if _review_refusal_label is None:
+                            # The freshly locked source is gone, terminal, or
+                            # owned by a replacement attempt.  The helper has
+                            # rolled back this session, so stop before any
+                            # later post-commit hook can reuse expired ORM
+                            # state or publish a hold over the winner.
+                            return {"status": "accepted"}
                         logger.warning(
                             f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number} ({_review_refusal_label})"
                         )
@@ -3411,7 +3999,9 @@ async def _process_post_commit(
                         try:
                             orig = await session.get(Task, uuid.UUID(original_task_id))
                             if orig:
-                                orig.requires_approval = True
+                                _set_independent_approval_hold(
+                                    orig, "review agent produced no verdict"
+                                )
                                 orig.latest_status_message = "Review agent did not produce a verdict — manual review required"
                                 session.add(orig)
                                 await session.commit()
@@ -3615,7 +4205,9 @@ async def _process_post_commit(
                     )
                     if _live_approve_target is None:
                         task.status = TaskStatus.COMPLETED
-                        task.requires_approval = True
+                        _set_independent_approval_hold(
+                            task, "approval target could not be proven"
+                        )
                         task.latest_status_message = (
                             f"Approval for PR #{pr_number} withheld: could not prove "
                             "the live immutable review target"
@@ -3625,7 +4217,9 @@ async def _process_post_commit(
                         return {"status": "accepted"}
                     if (
                         not reviewed_head_sha
+                        or not reviewed_base_sha
                         or reviewed_head_sha != _live_approve_target["head_sha"]
+                        or reviewed_base_sha != _live_approve_target["base_sha"]
                     ):
                         task.status = TaskStatus.COMPLETED
                         task.latest_status_message = (
@@ -3647,6 +4241,7 @@ async def _process_post_commit(
                         task.context = {
                             **(task.context or {}),
                             "_review_stale_head": True,
+                            "_review_stale_target": True,
                         }
                         flag_modified(task, "context")
                         session.add(task)
@@ -4143,7 +4738,9 @@ async def _process_post_commit(
                         live_base_sha = str(pr_data.get("base", {}).get("sha", ""))
                         approve_target_is_stale = (
                             not reviewed_head_sha
+                            or not reviewed_base_sha
                             or reviewed_head_sha != head_sha
+                            or reviewed_base_sha != live_base_sha
                         )
                         if approve_target_is_stale:
                             # Do not let an APPROVE issued for a different
@@ -4156,6 +4753,7 @@ async def _process_post_commit(
                                 task.context = {
                                     **(task.context or {}),
                                     "_review_stale_head": True,
+                                    "_review_stale_target": True,
                                 }
                                 flag_modified(task, "context")
                                 task.status = TaskStatus.COMPLETED
@@ -4202,7 +4800,10 @@ async def _process_post_commit(
                                     )
                             await session.commit()
                             return {"status": "accepted"}
-                        if reviewed_head_sha == head_sha:
+                        if (
+                            reviewed_head_sha == head_sha
+                            and reviewed_base_sha == live_base_sha
+                        ):
                             _record_structured_review_result(
                                 {
                                     "project_id": str(task.project_id),
@@ -4346,34 +4947,96 @@ async def _process_post_commit(
                             "require_approval_gates", True
                         ):
                             try:
-                                orig_task = await session.get(
-                                    Task, uuid.UUID(original_task_id)
+                                _critical_original_id = uuid.UUID(original_task_id)
+                                _critical_project_id = task.project_id
+                                # Persist the child-side proof and release every
+                                # earlier transaction before taking canonical
+                                # Project -> PR -> original-Task authority.  All
+                                # GitHub reads required to prove this approval
+                                # (live target and CI) are already complete.
+                                task.context = {
+                                    **(task.context or {}),
+                                    "review_loop": dict(review_loop),
+                                }
+                                flag_modified(task, "context")
+                                session.add(task)
+                                await session.commit()
+                                _critical_peek = (
+                                    (
+                                        await session.execute(
+                                            select(Task.context).where(
+                                                Task.id == _critical_original_id
+                                            )
+                                        )
+                                    )
+                                    .scalars()
+                                    .first()
                                 )
-                                critical_touched = (
-                                    (orig_task.context or {}).get(
+                                critical_touched = _normalized_critical_paths(
+                                    (_critical_peek or {}).get(
                                         "touched_critical", []
                                     )
-                                    if orig_task
-                                    else []
                                 )
                                 if critical_touched:
-                                    orig_task.requires_approval = True
-                                    orig_task.status = TaskStatus.EVALUATING
-                                    orig_task.latest_status_message = f"Review approved — awaiting human approval to merge (critical files: {', '.join(critical_touched)})"
+                                    orig_task = await _lock_exact_review_original(
+                                        session,
+                                        project_id=_critical_project_id,
+                                        pr_number=pr_number,
+                                        original_task_id=_critical_original_id,
+                                    )
+                                    locked_critical = (
+                                        _normalized_critical_paths(
+                                            (orig_task.context or {}).get(
+                                                "touched_critical", []
+                                            )
+                                        )
+                                        if orig_task is not None
+                                        else []
+                                    )
+                                    if not locked_critical:
+                                        await session.rollback()
+                                        action_taken = True
+                                        return {"status": "accepted"}
+                                    had_independent_hold = (
+                                        orig_task.requires_approval is True
+                                    )
+                                    if not _publish_exact_review_target(
+                                        orig_task,
+                                        target=dict(_live_approve_target),
+                                        branch=branch,
+                                        base_branch=base_branch,
+                                        review_history=_approved_history,
+                                        issue_ledger=_authoritative_ledger,
+                                        review_approved=True,
+                                        approval_reason="security_critical_files",
+                                        allow_failed_with_independent_hold=True,
+                                    ):
+                                        # A replacement/new attempt won after
+                                        # GitHub proof.  Its target and hold are
+                                        # authoritative; never paste this older
+                                        # approval over them.
+                                        await session.rollback()
+                                        logger.warning(
+                                            "[PIPELINE] Exact critical approval "
+                                            "publication lost replacement race for "
+                                            "PR #%s; leaving current authority intact",
+                                            pr_number,
+                                        )
+                                        action_taken = True
+                                        return {"status": "accepted"}
+                                    else:
+                                        critical_touched = locked_critical
+                                    if not had_independent_hold:
+                                        orig_task.status = TaskStatus.EVALUATING
+                                        orig_task.latest_status_message = f"Review approved — awaiting human approval to merge (critical files: {', '.join(critical_touched)})"
                                     session.add(orig_task)
-                                    task.context = {
-                                        **(task.context or {}),
-                                        "review_loop": dict(review_loop),
-                                    }
-                                    flag_modified(task, "context")
-                                    session.add(task)
                                     await session.commit()
                                     await broadcast_to_project(
                                         str(orig_task.project_id),
                                         "task_updated",
                                         {
                                             "task_id": str(orig_task.id),
-                                            "status": TaskStatus.EVALUATING,
+                                            "status": orig_task.status,
                                         },
                                     )
                                     await create_pr_comment(
@@ -4389,10 +5052,16 @@ async def _process_post_commit(
                                     action_taken = True
                                     return {"status": "accepted"}
                             except Exception as e:
+                                await session.rollback()
                                 logger.error(
                                     f"[PIPELINE] Error checking critical files for merge gate: {e}",
                                     exc_info=True,
                                 )
+                                # Publication failure is not merge authority.
+                                # A later lifecycle retry may reacquire the
+                                # canonical locks; this invocation stops here.
+                                action_taken = True
+                                return {"status": "accepted"}
 
                         # Security / approval gate: if the original create task was
                         # flagged (security scan blocking, scan failure, etc.), park
@@ -4402,50 +5071,34 @@ async def _process_post_commit(
                             "require_approval_gates", True
                         ):
                             try:
-                                _approval_orig = await session.get(
-                                    Task, uuid.UUID(original_task_id)
+                                from app.review_approval_gate_publication import (
+                                    handle_review_approval_gate,
                                 )
-                                if _approval_orig and _approval_orig.requires_approval:
-                                    _approval_orig.status = TaskStatus.EVALUATING
-                                    reason = (
-                                        _approval_orig.latest_status_message
-                                        or "requires manual approval"
-                                    )
-                                    _approval_orig.latest_status_message = f"Review approved — awaiting human approval to merge ({reason})"
-                                    session.add(_approval_orig)
-                                    task.context = {
-                                        **(task.context or {}),
-                                        "review_loop": dict(review_loop),
-                                    }
-                                    flag_modified(task, "context")
-                                    session.add(task)
-                                    await session.commit()
-                                    await broadcast_to_project(
-                                        str(_approval_orig.project_id),
-                                        "task_updated",
-                                        {
-                                            "task_id": str(_approval_orig.id),
-                                            "status": TaskStatus.EVALUATING,
-                                        },
-                                    )
-                                    await _comment_with_retry(
-                                        create_pr_comment,
-                                        gh_token,
-                                        owner,
-                                        repo,
-                                        pr_number,
-                                        f"**Blueprint Review Pipeline**: Review approved, but merge requires human approval — {reason}",
-                                    )
-                                    logger.info(
-                                        f"[PIPELINE] PR #{pr_number} review approved but merge blocked — requires_approval set on {original_task_id[:8]}"
-                                    )
+
+                                if await handle_review_approval_gate(
+                                    task,
+                                    session,
+                                    original_task_id=original_task_id,
+                                    pr_number=pr_number,
+                                    target=dict(_live_approve_target),
+                                    branch=branch,
+                                    base_branch=base_branch,
+                                    approved_review_loop=dict(review_loop),
+                                    comment_call=create_pr_comment,
+                                    gh_token=gh_token,
+                                    owner=owner,
+                                    repo=repo,
+                                ):
                                     action_taken = True
                                     return {"status": "accepted"}
                             except Exception as e:
+                                await session.rollback()
                                 logger.error(
                                     f"[PIPELINE] Error checking requires_approval for merge gate: {e}",
                                     exc_info=True,
                                 )
+                                action_taken = True
+                                return {"status": "accepted"}
 
                         # Pre-merge Alembic dual-head guard (parity with the
                         # CI-completion, rollup, hotfix back-merge and promotion
@@ -4989,90 +5642,18 @@ async def _process_post_commit(
                                             and base_branch == _orig_promotion_target
                                             and _runtime_config.get("smoketest_enabled")
                                         ):
-                                            try:
-                                                type_model = (
-                                                    _runtime_config.get(
-                                                        "task_type_models", {}
-                                                    ).get("smoketest")
-                                                    or None
-                                                )
-                                                type_effort = (
-                                                    _runtime_config.get(
-                                                        "task_type_efforts", {}
-                                                    ).get("smoketest")
-                                                    or None
-                                                )
-                                                health_check_urls = (
-                                                    _runtime_config.get(
-                                                        "health_check_urls"
-                                                    )
-                                                    or []
-                                                )
-                                                _smoketest_payload = validate_internal_payload(
-                                                    {
-                                                        "type": "smoketest",
-                                                        "base_branch": base_branch,
-                                                        **(
-                                                            {"model": type_model}
-                                                            if type_model
-                                                            else {}
-                                                        ),
-                                                        **(
-                                                            {"effort": type_effort}
-                                                            if type_effort
-                                                            else {}
-                                                        ),
-                                                        **(
-                                                            {
-                                                                "health_check_urls": health_check_urls
-                                                            }
-                                                            if health_check_urls
-                                                            else {}
-                                                        ),
-                                                    },
-                                                    "task_lifecycle:smoketest",
-                                                )
-                                                smoketest_task = Task(
-                                                    project_id=task.project_id,
-                                                    title=f"Smoketest after rollup merge to {base_branch}",
-                                                    description=f"Post-merge health checks for {owner}/{repo}@{base_branch}",
-                                                    payloads=[_smoketest_payload],
-                                                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                                                    status=TaskStatus.QUEUED,
-                                                    created_by="ORCHESTRATOR",
-                                                    origination=TASK_ORIGINATION_SMOKETEST,
-                                                )
-                                                session.add(smoketest_task)
-                                                await session.commit()
-                                                await session.refresh(smoketest_task)
-                                                history = TaskHistory(
-                                                    task_id=smoketest_task.id,
-                                                    action="SPAWNED",
-                                                    details={
-                                                        "spawned_by": "POST_ROLLUP_MERGE",
-                                                        "base_branch": base_branch,
-                                                    },
-                                                )
-                                                session.add(history)
-                                                await session.commit()
-                                                await broadcast_to_project(
-                                                    str(task.project_id),
-                                                    "task_updated",
-                                                    {
-                                                        "task_id": str(
-                                                            smoketest_task.id
-                                                        ),
-                                                        "status": TaskStatus.QUEUED,
-                                                    },
-                                                )
-                                                logger.info(
-                                                    f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after rollup merge to {base_branch}"
-                                                )
-                                            except Exception as e:
-                                                logger.warning(
-                                                    f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}",
-                                                    exc_info=True,
-                                                )
+                                            from app.admin_task_approvals import (
+                                                _maybe_spawn_rollup_smoketest,
+                                            )
+
+                                            await _maybe_spawn_rollup_smoketest(
+                                                orig,
+                                                owner,
+                                                repo,
+                                                base_branch,
+                                                session,
+                                                spawned_by="POST_ROLLUP_MERGE",
+                                            )
                                         # Back-merge: when a HOTFIX merges to the
                                         # promotion target, open a promotion_target ->
                                         # integration_branch PR so branches don't diverge.
@@ -5133,11 +5714,51 @@ async def _process_post_commit(
                                         # Spawn security rescan if merged task's parent was a security_audit
                                         if orig.parent_task_id:
                                             try:
-                                                audit_parent = await session.get(
-                                                    Task, orig.parent_task_id
-                                                )
+                                                _rescan_project_id = orig.project_id
+                                                _audit_parent_id = orig.parent_task_id
+                                                # The merge-success path currently
+                                                # holds ``orig`` Task-only. Persist
+                                                # its terminal bookkeeping, release
+                                                # that lock, then reacquire Project
+                                                # -> audit parent before any child
+                                                # query or rescan INSERT.
+                                                await session.commit()
+                                                async with automatic_task_creation_parent_lock(
+                                                    session,
+                                                    _rescan_project_id,
+                                                    _audit_parent_id,
+                                                    skip_locked=False,
+                                                ) as (
+                                                    _rescan_admission,
+                                                    _rescan_project,
+                                                    audit_parent,
+                                                ):
+                                                    if (
+                                                        _rescan_project is None
+                                                        or audit_parent is None
+                                                    ):
+                                                        raise RuntimeError(
+                                                            "security rescan admission could not lock project/parent"
+                                                        )
                                                 if (
-                                                    audit_parent
+                                                    _rescan_admission
+                                                    != AUTOMATIC_TASK_CREATION_ALLOWED
+                                                ):
+                                                    audit_parent.context = {
+                                                        **(audit_parent.context or {}),
+                                                        "automatic_rescan_creation_suppressed": _rescan_admission,
+                                                    }
+                                                    session.add(audit_parent)
+                                                    await session.commit()
+                                                    logger.info(
+                                                        "[SECURITY RESCAN] Suppressed rescan for audit %s: %s",
+                                                        _audit_parent_id,
+                                                        _rescan_admission,
+                                                    )
+                                                if (
+                                                    _rescan_admission
+                                                    == AUTOMATIC_TASK_CREATION_ALLOWED
+                                                    and audit_parent
                                                     and audit_parent.first_payload.get(
                                                         "type"
                                                     )
@@ -5216,7 +5837,7 @@ async def _process_post_commit(
                                                             "task_lifecycle:security_audit",
                                                         )
                                                         rescan_task = Task(
-                                                            project_id=orig.project_id,
+                                                            project_id=_rescan_project_id,
                                                             title=f"Security rescan: verify {audit_title} fixes",
                                                             description=f"Verify that security fixes merged in PR #{pr_number} addressed reported vulnerabilities.",
                                                             payloads=[_rescan_payload],
@@ -5246,7 +5867,7 @@ async def _process_post_commit(
                                                         session.add(history)
                                                         await session.commit()
                                                         await broadcast_to_project(
-                                                            str(orig.project_id),
+                                                            str(_rescan_project_id),
                                                             "task_updated",
                                                             {
                                                                 "task_id": str(
@@ -5531,6 +6152,7 @@ async def _process_post_commit(
                 _peek_task_type=_peek_task_type,
                 _expected_post_commit_claim_token=_expected_post_commit_claim_token,
                 _expected_childless_recovery_token=_expected_childless_recovery_token,
+                _expected_research_spawn_recovery_token=_expected_research_spawn_recovery_token,
                 refetch=_rollback_and_refetch_task,
             )
             if _dispatch_response is not None:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from app.evidence_primitive import classify_evidence, classify_evidence_tiered
 
@@ -960,6 +960,54 @@ def capability_proof_gate_mode(override: str | None = None) -> str:
     if override is not None:
         return override if override in ("off", "observe", "enforce") else "off"
     return "off"
+
+
+_CAPABILITY_ADOPT_VERDICTS = frozenset({"adopt", "ADOPT"})
+
+
+def resolve_capability_enablement(
+    verdicts: object,
+    cap_name: object,
+) -> dict[str, Any]:
+    """Resolve a trial-backed capability's effective enablement state.
+
+    A durable adopt verdict is the trial's proof that the capability should
+    graduate: it is enabled and runs in enforce mode. Every other state,
+    including a missing, continuing, rejected, no-effect, or killed verdict,
+    remains disabled and fail-closed. This is deliberately a pure projection of
+    the existing verdict ledger; it does not create a second proof mechanism or
+    mutate runtime configuration.
+
+    The returned verdict is retained alongside the state so callers can expose
+    why a capability is enabled (or still disabled) rather than making a silent
+    behavior change.
+    """
+    normalized = normalize_capability_name(cap_name)
+    entry = None
+    if isinstance(verdicts, Mapping):
+        # Trial definitions predate the registry's kebab-case vocabulary and
+        # persist names such as ``repo_map``. Prefer an exact durable key, then
+        # match the normalized form so both registry and trial spellings work.
+        keys = [cap_name] if isinstance(cap_name, str) else []
+        if normalized is not None and normalized != cap_name:
+            keys.append(normalized)
+        for key in keys:
+            if key in verdicts:
+                entry = verdicts[key]
+                break
+        if entry is None and normalized is not None:
+            for key, candidate in verdicts.items():
+                if normalize_capability_name(key) == normalized:
+                    entry = candidate
+                    break
+    verdict = entry.get("verdict") if isinstance(entry, Mapping) else None
+    graduated = verdict in _CAPABILITY_ADOPT_VERDICTS
+    return {
+        "enabled": graduated,
+        "mode": "enforce" if graduated else "off",
+        "resolution": "enabled" if graduated else "disabled",
+        "verdict": verdict if isinstance(verdict, str) else None,
+    }
 
 
 def capability_need_blocked_by_proof_gate(

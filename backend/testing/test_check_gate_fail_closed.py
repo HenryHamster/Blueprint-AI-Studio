@@ -150,7 +150,7 @@ def test_genuine_noop_diff_still_exits_zero(tmp_path: Path) -> None:
 def test_required_backend_verification_unavailable_is_a_hard_failure(
     tmp_path: Path,
 ) -> None:
-    """A missing PostgreSQL route cannot become a non-blocking check skip."""
+    """Even ``check test`` cannot turn a missing PostgreSQL route into a skip."""
     repo = tmp_path / "repo"
     _init_repo(repo)
     _git(repo, "branch", "automain")
@@ -161,11 +161,23 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
         _REPO_ROOT / "backend" / "testing" / "impacted_tests.py",
         repo / "backend" / "testing" / "impacted_tests.py",
     )
+    # impacted_tests.py delegates JUnit attribution to this sibling module.
+    # Install the complete resolver boundary so this test reaches the intended
+    # PostgreSQL-capability decision instead of manufacturing an import error.
+    shutil.copy2(
+        _REPO_ROOT / "backend" / "testing" / "fixgate_attribution.py",
+        repo / "backend" / "testing" / "fixgate_attribution.py",
+    )
     # The gate checks that the sanctioned harness exists before probing the
     # route. It must still fail on the unavailable route, without invoking it.
     harness = repo / "scripts" / "test-backend.sh"
     harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     harness.chmod(harness.stat().st_mode | stat.S_IXUSR)
+    # Keep the broad test-gate prelude green so the only final failure is the
+    # required targeted verification capability decision under test.
+    (repo / "scripts" / "static_release_guard.py").write_text(
+        "raise SystemExit(0)\n", encoding="utf-8"
+    )
 
     (repo / "backend" / "app" / "changed.py").write_text(
         "VALUE = 1\n", encoding="utf-8"
@@ -186,6 +198,9 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
         encoding="utf-8",
     )
     fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+    fake_pytest = fake_bin / "pytest"
+    fake_pytest.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_pytest.chmod(fake_pytest.stat().st_mode | stat.S_IXUSR)
 
     env = os.environ.copy()
     env["WORKSPACE"] = str(repo)
@@ -193,7 +208,7 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["BLUEPRINT_SANDBOX_PYTHON"] = str(tmp_path / "missing-python")
     result = subprocess.run(
-        ["bash", str(_CHECK)],
+        ["bash", str(_CHECK), "test"],
         capture_output=True,
         text=True,
         env=env,
@@ -207,6 +222,8 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
     )
     assert "required backend verification state=runtime_unavailable" in combined
     assert "backend verification: runtime_unavailable" in combined
+    assert "execution capability receipt:" in combined
+    assert "unbound variable" not in combined
     assert "GATE-ENVIRONMENT: required backend verification skipped" not in combined
     assert "[check] PASS" not in combined
 

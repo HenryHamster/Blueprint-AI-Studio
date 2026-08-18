@@ -87,6 +87,54 @@ def serving_authorship_range(version: Any) -> tuple[str | None, str | None]:
     )
 
 
+def candidate_authorship_range(version: Any) -> tuple[str | None, str | None]:
+    """Return the candidate's entire compare range: base main to candidate head."""
+    if isinstance(version, dict):
+        base_sha = version.get("base_sha")
+        candidate_sha = version.get("candidate_sha")
+        if candidate_sha is None:
+            qualification = version.get("last_qualification")
+            candidate_sha = (
+                qualification.get("candidate_sha")
+                if isinstance(qualification, dict)
+                else None
+            )
+    else:
+        base_sha = getattr(version, "base_sha", None)
+        candidate_sha = getattr(version, "candidate_sha", None)
+        if candidate_sha is None:
+            qualification = getattr(version, "last_qualification", None)
+            candidate_sha = (
+                qualification.get("candidate_sha")
+                if isinstance(qualification, dict)
+                else None
+            )
+    return (
+        base_sha if isinstance(base_sha, str) else None,
+        candidate_sha if isinstance(candidate_sha, str) else None,
+    )
+
+
+def authorship_receipt_for_measurement(
+    measurement: Any,
+    base_sha: str | None,
+    head_sha: str | None,
+) -> dict[str, Any]:
+    """Wrap a candidate measurement in the immutable receipt contract.
+
+    Candidate evidence is measured before promotion, so it is not persisted on
+    a serving row.  The qualifier still needs the same validated receipt shape
+    used by category grading; keeping this adapter here prevents the hard gate
+    and the category projector from inventing separate evidence rules.
+    """
+    return _persisted_receipt(
+        measurement,
+        base_sha if isinstance(base_sha, str) else "",
+        head_sha if isinstance(head_sha, str) else "",
+        attempt=1,
+    )
+
+
 AUTHORSHIP_EVIDENCE_CONTRACT_TYPE = "operator_authored_commits"
 
 
@@ -457,7 +505,12 @@ def _persisted_receipt(
     state = measurement.get("state") if isinstance(measurement, dict) else None
     report_range = measurement.get("range") if isinstance(measurement, dict) else None
     valid_range = report_range == {"base_sha": base_sha, "head_sha": head_sha}
-    if state == "resolved" and valid_range:
+    if (
+        state == "resolved"
+        and isinstance(measurement, dict)
+        and set(measurement) == {"state", "count", "offenders", "range"}
+        and valid_range
+    ):
         count = measurement.get("count")
         offenders = measurement.get("offenders")
         if (

@@ -2495,3 +2495,310 @@ def test_reviewer_confirmed_categories_empty_ctx():
     from app.sr_blind_spots import reviewer_confirmed_categories
 
     assert reviewer_confirmed_categories({}) == set()
+
+
+def _repeat_concern_task(
+    task_id: str,
+    pr_number: int,
+    description: str,
+    *,
+    iteration: int = 0,
+    created_at: str = "2026-01-01T00:00:00+00:00",
+    landed: bool = True,
+) -> dict:
+    return {
+        "id": task_id,
+        "project_id": "project-1",
+        "status": "COMPLETED",
+        "created_at": created_at,
+        "payloads": [{"type": "create", "pr_number": pr_number}],
+        "context": {
+            "landed_on_integration": landed,
+            "pr_merged": True,
+            "review_loop": {
+                "pr_number": pr_number,
+                "review_history": [
+                    {
+                        "iteration": iteration,
+                        "verdict": "REQUEST_CHANGES",
+                        "issues": [
+                            {
+                                "severity": "MAJOR",
+                                "file": "backend/app/review_learning.py",
+                                "description": description,
+                            }
+                        ],
+                    }
+                ],
+            },
+        },
+    }
+
+
+def test_repeat_concern_chain_detected_across_distinct_prs():
+    """Replay separates same-PR hardening from a recurring landed concern."""
+    from app.review_learning import replay_cross_pr_repeat_concern_detector
+
+    tasks = [
+        _repeat_concern_task(
+            "task-101",
+            101,
+            "Missing null guard before processing payload",
+            created_at="2026-01-01T00:00:00+00:00",
+        ),
+        _repeat_concern_task(
+            "task-101-fix",
+            101,
+            "Missing null guard before processing payload",
+            iteration=1,
+            created_at="2026-01-01T00:01:00+00:00",
+        ),
+        _repeat_concern_task(
+            "task-102",
+            102,
+            "Null check required before processing payload",
+            created_at="2026-01-02T00:00:00+00:00",
+        ),
+        _repeat_concern_task(
+            "task-103",
+            103,
+            "Null check required before processing payload",
+            created_at="2026-01-03T00:00:00+00:00",
+        ),
+        # Explicit false must win over the legacy merge marker.
+        _repeat_concern_task(
+            "task-stranded",
+            104,
+            "Null check required before processing payload",
+            created_at="2026-01-04T00:00:00+00:00",
+            landed=False,
+        ),
+        # A repeated API page must not create a second observation.
+        _repeat_concern_task(
+            "task-102",
+            102,
+            "Null check required before processing payload",
+            created_at="2026-01-02T00:00:00+00:00",
+        ),
+    ]
+    original = json.loads(json.dumps(tasks))
+
+    result = replay_cross_pr_repeat_concern_detector(tasks)
+
+    assert result["repeat_concern_chain_count"] == 1
+    chain = result["repeat_concern_chains"][0]
+    assert chain["pr_numbers"] == [101, 102, 103]
+    assert chain["distinct_prs"] == 3
+    assert chain["resolved_before_next_pr"] == 2
+    assert chain["same_pr_hardening_prs"] == [101]
+    assert result["same_pr_hardening_count"] == 0
+    assert result["duplicate_tasks"] == 1
+    assert result["excluded_not_landed"] == 1
+    assert tasks == original
+
+
+def _concern_record(
+    pr_number: int,
+    description: str,
+    *,
+    severity: str = "MAJOR",
+    file_path: str = "backend/app/a.py",
+    symbol: str | None = None,
+    iteration: int = 0,
+    verdict: str = "REQUEST_CHANGES",
+) -> dict:
+    """Minimal record for the pure detector (no replay-wrapper normalization)."""
+    issue: dict = {
+        "severity": severity,
+        "file": file_path,
+        "description": description,
+    }
+    if symbol is not None:
+        issue["symbol"] = symbol
+    return {
+        "pr_number": pr_number,
+        "review_history": [
+            {"iteration": iteration, "verdict": verdict, "issues": [issue]}
+        ],
+    }
+
+
+def test_cross_pr_detector_separates_chains_by_symbol():
+    """Same file + same description but different symbols are distinct chains."""
+    from app.review_heuristics import detect_cross_pr_repeat_concern_chains
+
+    description = "Missing null guard before processing payload"
+    result = detect_cross_pr_repeat_concern_chains(
+        [
+            _concern_record(1, description, symbol="foo"),
+            _concern_record(2, description, symbol="foo"),
+            _concern_record(3, description, symbol="bar"),
+            _concern_record(4, description, symbol="bar"),
+        ]
+    )
+
+    assert result["repeat_concern_chain_count"] == 2
+    chains = sorted(result["repeat_concern_chains"], key=lambda c: c["symbol"])
+    assert [chain["symbol"] for chain in chains] == ["bar", "foo"]
+    assert [chain["pr_numbers"] for chain in chains] == [[3, 4], [1, 2]]
+    # The grouping identity includes the symbol, so the chain key must too —
+    # otherwise a consumer keying escalation on chain_key merges both chains.
+    assert chains[0]["chain_key"] != chains[1]["chain_key"]
+
+
+def test_cross_pr_detector_skips_approve_verdict_entries():
+    from app.review_heuristics import detect_cross_pr_repeat_concern_chains
+
+    description = "Missing null guard before processing payload"
+    result = detect_cross_pr_repeat_concern_chains(
+        [
+            _concern_record(1, description, verdict="APPROVE"),
+            _concern_record(2, description, verdict="approve"),
+        ]
+    )
+
+    assert result["concern_observations"] == 0
+    assert result["repeat_concern_chain_count"] == 0
+
+
+def test_cross_pr_detector_ignores_minor_severity():
+    from app.review_heuristics import detect_cross_pr_repeat_concern_chains
+
+    description = "Missing null guard before processing payload"
+    minor_only = detect_cross_pr_repeat_concern_chains(
+        [
+            _concern_record(1, description, severity="MINOR"),
+            _concern_record(2, description, severity="MINOR"),
+        ]
+    )
+    assert minor_only["concern_observations"] == 0
+    assert minor_only["repeat_concern_chain_count"] == 0
+
+    critical = detect_cross_pr_repeat_concern_chains(
+        [
+            _concern_record(1, description, severity="CRITICAL"),
+            _concern_record(2, description, severity="MAJOR"),
+        ]
+    )
+    assert critical["concern_observations"] == 2
+    assert critical["repeat_concern_chain_count"] == 1
+    assert critical["repeat_concern_chains"][0]["severities"] == ["CRITICAL", "MAJOR"]
+
+
+def test_cross_pr_detector_min_distinct_prs_parameter():
+    from app.review_heuristics import detect_cross_pr_repeat_concern_chains
+
+    description = "Missing null guard before processing payload"
+    records = [_concern_record(1, description), _concern_record(2, description)]
+
+    assert (
+        detect_cross_pr_repeat_concern_chains(records, min_distinct_prs=2)[
+            "repeat_concern_chain_count"
+        ]
+        == 1
+    )
+    assert (
+        detect_cross_pr_repeat_concern_chains(records, min_distinct_prs=3)[
+            "repeat_concern_chain_count"
+        ]
+        == 0
+    )
+
+
+def test_cross_pr_detector_similarity_threshold_parameter():
+    from app.review_heuristics import detect_cross_pr_repeat_concern_chains
+
+    records = [
+        _concern_record(1, "Missing null guard before processing payload"),
+        _concern_record(2, "Null check required before processing payload"),
+    ]
+
+    loose = detect_cross_pr_repeat_concern_chains(records, similarity_threshold=0.2)
+    assert loose["repeat_concern_chain_count"] == 1
+    assert loose["similarity_threshold"] == 0.2
+
+    strict = detect_cross_pr_repeat_concern_chains(records, similarity_threshold=0.95)
+    assert strict["repeat_concern_chain_count"] == 0
+    assert strict["concern_groups"] == 2
+
+    # The key is threshold-scoped identity: the same concern grouped under a
+    # different threshold is not the same chain.
+    same_at_default = detect_cross_pr_repeat_concern_chains(records)
+    assert (
+        same_at_default["repeat_concern_chains"][0]["chain_key"]
+        != loose["repeat_concern_chains"][0]["chain_key"]
+    )
+
+
+def test_cross_pr_detector_counts_same_pr_hardening():
+    """Repeated iterations on ONE PR are hardening, never a cross-PR chain."""
+    from app.review_heuristics import detect_cross_pr_repeat_concern_chains
+
+    description = "Missing null guard before processing payload"
+    result = detect_cross_pr_repeat_concern_chains(
+        [
+            _concern_record(1, description, iteration=0),
+            _concern_record(1, description, iteration=1),
+        ]
+    )
+
+    assert result["same_pr_hardening_count"] == 1
+    assert result["repeat_concern_chain_count"] == 0
+    assert result["concern_observations"] == 2
+
+
+def test_replay_counts_excluded_status_project_and_malformed():
+    from app.review_learning import replay_cross_pr_repeat_concern_detector
+
+    description = "Missing null guard before processing payload"
+    other_project = _repeat_concern_task("task-other", 201, description)
+    other_project["project_id"] = "project-2"
+    wrong_status = _repeat_concern_task("task-open", 202, description)
+    wrong_status["status"] = "IN_PROGRESS"
+
+    result = replay_cross_pr_repeat_concern_detector(
+        [
+            "not-a-dict",
+            None,
+            other_project,
+            wrong_status,
+            _repeat_concern_task("task-ok", 203, description),
+        ],
+        project_id="project-1",
+    )
+
+    assert result["malformed_tasks"] == 2
+    assert result["excluded_project"] == 1
+    assert result["excluded_status"] == 1
+    assert result["landed_tasks"] == 1
+
+
+def test_replay_excludes_legacy_non_merge_unblock_rows():
+    """A legacy pr_merged row carrying the non-merge marker never landed."""
+    from app.landed_signal import (
+        LANDED_ON_INTEGRATION_KEY,
+        NON_MERGE_UNBLOCK_REASON_KEY,
+    )
+    from app.review_learning import replay_cross_pr_repeat_concern_detector
+
+    description = "Missing null guard before processing payload"
+    tasks = []
+    for index, pr_number in enumerate((301, 302)):
+        task = _repeat_concern_task(f"task-legacy-{pr_number}", pr_number, description)
+        # Predates the landed_on_integration split: merge-equivalent only.
+        task["context"].pop(LANDED_ON_INTEGRATION_KEY)
+        task["context"][NON_MERGE_UNBLOCK_REASON_KEY] = "rollup_no_pr_artifact"
+        tasks.append(task)
+
+    result = replay_cross_pr_repeat_concern_detector(tasks)
+
+    assert result["excluded_not_landed"] == 2
+    assert result["landed_tasks"] == 0
+    assert result["repeat_concern_chain_count"] == 0
+
+    # The same rows WITHOUT the non-merge marker keep the legacy fallback.
+    for task in tasks:
+        task["context"].pop(NON_MERGE_UNBLOCK_REASON_KEY)
+    legacy_ok = replay_cross_pr_repeat_concern_detector(tasks)
+    assert legacy_ok["excluded_not_landed"] == 0
+    assert legacy_ok["repeat_concern_chain_count"] == 1

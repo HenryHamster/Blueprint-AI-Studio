@@ -77,6 +77,13 @@ def _bwrap_caps(gpu_indices=()):
     )
 
 
+def _bounded_bwrap_caps(gpu_indices=()):
+    """A bwrap host with a proven aggregate agent MemoryMax scope."""
+    return iso.replace(
+        _bwrap_caps(gpu_indices), systemd_run_path="/usr/bin/systemd-run"
+    )
+
+
 def _docker_caps(gpu_indices=()):
     """A host with usable docker (and optionally GPUs), no bwrap."""
     return iso.Capabilities(
@@ -309,7 +316,7 @@ class TestVerificationToolchainRecovery(unittest.TestCase):
             self.assertTrue(local_runner._spawn_agent_task(
                 task_id="recovered-task", task_type="fix", agent_token="token",
                 vm_instance_id="runner", orchestrator_url="https://api",
-                workspace="/tmp/ws", caps=_bwrap_caps(),
+                workspace="/tmp/ws", caps=_bounded_bwrap_caps(),
                 agent_binary=["node", "/agent/dist/index.js"], agent_image=None,
                 active_tasks={}, agent_started_at={}, agent_teardown={},
                 lock=threading.Lock(),
@@ -1610,11 +1617,15 @@ class TestHostLoadThrottle(unittest.TestCase):
 
     def setUp(self):
         local_runner._shutdown_event.clear()
-        local_runner._update_in_progress.clear()
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
 
     def tearDown(self):
         local_runner._shutdown_event.clear()
-        local_runner._update_in_progress.clear()
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
 
     def _make_compute_deps(self):
         active_jobs: set = set()
@@ -3316,6 +3327,37 @@ class TestRunComputeJob(unittest.TestCase):
         base.update(kwargs)
         return base
 
+    def test_compute_memory_limit_is_canonical_or_ignored_before_planning(self):
+        for raw, expected in (("4g", str(4 * 1024**3)), ("1e3", None)):
+            with self.subTest(raw=raw):
+                captured = {}
+
+                def fake_plan(**kwargs):
+                    captured.update(kwargs)
+                    return iso.ExecutionPlan.decline("test stop")
+
+                with patch.dict(
+                    os.environ,
+                    {"BLUEPRINT_RUNNER_MEM_LIMIT": raw},
+                    clear=False,
+                ), patch.object(
+                    local_runner.iso,
+                    "plan_compute_execution",
+                    side_effect=fake_plan,
+                ), patch.object(
+                    local_runner, "_report_compute_job", return_value=False
+                ):
+                    local_runner._run_compute_job(
+                        self._make_job(),
+                        "https://api.example.com",
+                        "tok",
+                        {"test-job-001"},
+                        threading.Lock(),
+                        capabilities=_bwrap_caps(),
+                    )
+
+                self.assertEqual(captured["mem_limit"], expected)
+
     def test_compute_job_releases_shared_capacity_on_exit(self):
         reports = []
 
@@ -4590,9 +4632,8 @@ class TestGpuDetection(unittest.TestCase):
         self.assertIsNone(posted_bodies[0]["supported_agent_task_types"])
 
     def test_bwrap_and_docker_available_declares_no_restriction(self):
-        """bwrap takes precedence: a box that can run the FULL agent slice on the
-        host toolchain declares no restriction even when docker is ALSO usable —
-        the docker-only self-restriction only fires when bwrap is unavailable.
+        """A hybrid box declares no restriction because bounded bwrap covers the
+        full slice, while backend observability preserves Docker image opt-in.
         """
         posted_bodies = []
 
@@ -4606,6 +4647,7 @@ class TestGpuDetection(unittest.TestCase):
             unshare_path="/usr/bin/unshare",
             userns_ok=True,
             docker_usable=True,
+            systemd_run_path="/usr/bin/systemd-run",
         )
         active_tasks: dict = {}
         lock = threading.Lock()
@@ -4627,6 +4669,9 @@ class TestGpuDetection(unittest.TestCase):
 
         self.assertEqual(len(posted_bodies), 1)
         self.assertIsNone(posted_bodies[0]["supported_agent_task_types"])
+        self.assertEqual(
+            posted_bodies[0]["agent_backend"], iso.BACKEND_DOCKER
+        )
 
 
 # ── Docker login helper ───────────────────────────────────────────────────────
@@ -6055,17 +6100,64 @@ class TestCleanSourceSha(_LocalRunnerTestCase):
             self.assertIsNone(local_runner._clean_source_sha("v1.2.3-5-g4f5a6b7"))
 
 
+class TestClaimUpdateGate(unittest.TestCase):
+    """Agent and compute claim handoffs are atomic with update drain."""
+
+    def setUp(self):
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
+
+    def tearDown(self):
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
+
+    def test_agent_and_compute_handoffs_block_update_until_owned(self):
+        self.assertTrue(local_runner._begin_claim())  # agent claim POST
+        self.assertTrue(local_runner._begin_claim())  # compute claim POST
+        self.assertEqual(local_runner._begin_update_drain(), 2)
+        self.assertFalse(local_runner._begin_claim())
+
+        local_runner._end_claim()
+        local_runner._end_claim()
+        self.assertEqual(local_runner._begin_update_drain(), 0)
+
+    def test_concurrent_update_closes_gate_before_next_claim(self):
+        claim_started = threading.Event()
+        release_claim = threading.Event()
+
+        def in_flight_claim():
+            self.assertTrue(local_runner._begin_claim())
+            claim_started.set()
+            release_claim.wait(timeout=1)
+            local_runner._end_claim()
+
+        thread = threading.Thread(target=in_flight_claim)
+        thread.start()
+        self.assertTrue(claim_started.wait(timeout=1))
+        self.assertEqual(local_runner._begin_update_drain(), 1)
+        self.assertFalse(local_runner._begin_claim())
+        release_claim.set()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+
+
 class TestHeartbeatVersionHintWarning(unittest.TestCase):
     """Heartbeat response includes version_hint; runner warns when its own version
     does not match the orchestrator's hint."""
 
     def setUp(self):
         local_runner._shutdown_event.clear()
-        local_runner._update_in_progress.clear()
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
 
     def tearDown(self):
         local_runner._shutdown_event.clear()
-        local_runner._update_in_progress.clear()
+        with local_runner._claim_gate_lock:
+            local_runner._claims_in_flight = 0
+            local_runner._update_in_progress.clear()
 
     def test_version_hint_mismatch_logs_warning(self):
         """When version_hint differs and tasks are executing, a warning is printed."""
@@ -6079,7 +6171,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
                 "enrolled_max_concurrent": 2,
-                "version_hint": "v99-abcdef01",
+                "version_hint": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
             }
 
         def fake_print(*args, **kwargs):
@@ -6095,6 +6187,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version", return_value="v1-oldversion"), \
+                 patch.object(local_runner, "_checkout_source_sha", return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary", return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
@@ -6122,7 +6215,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
                 "enrolled_max_concurrent": 2,
-                "version_hint": "v1-current",
+                "version_hint": "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
             }
 
         def fake_print(*args, **kwargs):
@@ -6136,6 +6229,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version", return_value="v1-current"), \
+                 patch.object(local_runner, "_checkout_source_sha", return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary", return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
@@ -6149,7 +6243,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         self.assertFalse(warning_lines, "No version-mismatch warning expected when versions match")
 
     def test_version_hint_match_sha_based(self):
-        """SHA-based comparison: runner SHA matches orchestrator SHA prefix — no warning."""
+        """Only exact full-SHA equality is treated as current."""
         output_lines = []
 
         def fake_post(url, token, body, **kwargs):
@@ -6158,8 +6252,6 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
                 "enrolled_max_concurrent": 2,
-                # Orchestrator sends a full 40-char SHA that starts with the
-                # runner's abbreviated SHA (4f5a6b7).
                 "version_hint": "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
             }
 
@@ -6175,6 +6267,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
                               return_value="v1.2.3-5-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary", return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
@@ -6187,7 +6281,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         warning_lines = [line for line in output_lines if "WARNING" in line and "version" in line.lower()]
         self.assertFalse(
             warning_lines,
-            "No warning expected when runner SHA matches orchestrator SHA prefix",
+            "No warning expected when exact runner and orchestrator SHAs match",
         )
 
     def test_version_hint_mismatch_sha_based(self):
@@ -6221,6 +6315,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
                               return_value="v1.2.3-5-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary", return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
                 local_runner._heartbeat_loop(
@@ -6264,7 +6360,11 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                  patch.object(local_runner, "_runner_version",
                               side_effect=[
                                   "v25-1-g4f5a6b7",
-                                  "v25-1-g4f5a6b7",
+                                  "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+                              ]), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              side_effect=[
+                                  "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
                                   "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
                               ]), \
                  patch.object(local_runner, "_locate_agent_binary",
@@ -6293,13 +6393,16 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             combined,
             "Expected auto-update message when runner is idle and version differs",
         )
-        update_mock.assert_called_once_with(restart_service=False)
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit="a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        )
         report_mock.assert_called_once()
         self.assertEqual(report_mock.call_args.kwargs["status"], "success")
         reexec_mock.assert_called_once()
 
-    def test_detached_newer_checkout_skips_auto_update(self):
-        """An ancestry-converged detached checkout must not invoke its updater."""
+    def test_divergent_checkout_uses_exact_update_without_ancestry_shortcut(self):
+        """A mismatched exact SHA always uses the detached exact updater."""
         output_lines = []
 
         def fake_post(url, token, body, **kwargs):
@@ -6317,7 +6420,13 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         local_runner._shutdown_event.clear()
         try:
             with patch.object(local_runner, "_post", fake_post), \
-                 patch.object(local_runner, "_runner_version", return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_runner_version",
+                              side_effect=["v25-1-g4f5a6b7", "target"]), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              side_effect=[
+                                  "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+                                  "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+                              ]), \
                  patch.object(local_runner, "_locate_agent_binary", return_value=None), \
                  patch.object(local_runner, "_write_status_json"), \
                  patch.object(local_runner, "_node_runtime_ok", return_value=False), \
@@ -6338,15 +6447,14 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         finally:
             local_runner._shutdown_event.clear()
 
-        update_mock.assert_not_called()
-        contains_mock.assert_called_once_with(
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit="a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
         )
+        contains_mock.assert_not_called()
         report_mock.assert_called_once()
         self.assertEqual(report_mock.call_args.kwargs["status"], "success")
-        reexec_mock.assert_not_called()
-        self.assertFalse(local_runner._update_in_progress.is_set())
-        self.assertIn("continuing without an update", " ".join(output_lines))
+        reexec_mock.assert_called_once()
 
     def test_non_sha_version_hint_cannot_take_ancestry_shortcut(self):
         """Git revision expressions are not trusted as commit identities."""
@@ -6356,10 +6464,13 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             return 200, {"ok": True, "version_hint": "HEAD"}
 
         local_runner._shutdown_event.clear()
+        local_runner._update_in_progress.set()
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
                               return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=None), \
                  patch.object(local_runner, "_write_status_json"), \
@@ -6386,9 +6497,9 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             local_runner._shutdown_event.clear()
 
         contains_mock.assert_not_called()
-        update_mock.assert_called_once_with(restart_service=False)
+        update_mock.assert_not_called()
         reexec_mock.assert_not_called()
-        self.assertTrue(local_runner._update_in_progress.is_set())
+        self.assertFalse(local_runner._update_in_progress.is_set())
 
     def test_moved_checkout_cannot_converge_running_process(self):
         """A newer disk HEAD cannot make already-running older code current."""
@@ -6404,58 +6515,11 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                  patch.object(local_runner, "_runner_version",
                               side_effect=["v25-1-g4f5a6b7",
                                            "v25-2-g8f9a0b1"]), \
-                 patch.object(local_runner, "_locate_agent_binary",
-                              return_value=None), \
-                 patch.object(local_runner, "_write_status_json"), \
-                 patch.object(local_runner, "_node_runtime_ok",
-                              return_value=False), \
-                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
-                 patch.object(local_runner, "_memory_free_bytes",
-                              return_value=None), \
-                 patch.object(local_runner, "_disk_free_bytes",
-                              return_value=None), \
-                 patch.object(local_runner, "_container_image_store",
-                              return_value=None), \
-                 patch.object(local_runner.br, "do_update",
-                              return_value=1) as update_mock, \
-                 patch.object(local_runner.br, "checkout_contains_commit",
-                              return_value=True) as contains_mock, \
-                 patch.object(local_runner.br, "report_update_result"), \
-                 patch.object(local_runner, "_reexec_after_update") as reexec_mock:
-                local_runner._heartbeat_loop(
-                    "https://api", "tok", {}, threading.Lock(),
-                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
-                )
-        finally:
-            local_runner._shutdown_event.clear()
-
-        contains_mock.assert_not_called()
-        update_mock.assert_called_once_with(restart_service=False)
-        reexec_mock.assert_not_called()
-        self.assertTrue(local_runner._update_in_progress.is_set())
-
-    def test_accepted_ancestor_hint_is_suppressed_until_hint_changes(self):
-        """The same older hint is suppressed; a changed hint is evaluated afresh."""
-        hints = [
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-            "b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-        ]
-        calls = 0
-
-        def fake_post(url, token, body, **kwargs):
-            nonlocal calls
-            hint = hints[calls]
-            calls += 1
-            if calls == len(hints):
-                local_runner._shutdown_event.set()
-            return 200, {"ok": True, "version_hint": hint}
-
-        local_runner._shutdown_event.clear()
-        try:
-            with patch.object(local_runner, "_post", fake_post), \
-                 patch.object(local_runner, "_runner_version",
-                              return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              side_effect=[
+                                  "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+                                  "8f9a0b1d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+                              ]), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=None), \
                  patch.object(local_runner, "_write_status_json"), \
@@ -6472,6 +6536,65 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                               return_value=0) as update_mock, \
                  patch.object(local_runner.br, "checkout_contains_commit",
                               return_value=True) as contains_mock, \
+                 patch.object(local_runner.br,
+                              "report_update_result") as report_mock, \
+                 patch.object(local_runner, "_reexec_after_update") as reexec_mock:
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        contains_mock.assert_not_called()
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit=hint,
+        )
+        self.assertEqual(report_mock.call_args.kwargs["status"], "failure")
+        reexec_mock.assert_not_called()
+        self.assertTrue(local_runner._update_in_progress.is_set())
+
+    def test_withdrawn_hint_releases_failed_update_drain(self):
+        """A stale exact hint cannot leave capacity drained after withdrawal."""
+        hints = [
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            "HEAD",
+            None,
+        ]
+        calls = 0
+        draining_reports = []
+
+        def fake_post(url, token, body, **kwargs):
+            nonlocal calls
+            draining_reports.append(body["update_draining"])
+            hint = hints[calls]
+            calls += 1
+            if calls == len(hints):
+                local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": hint}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=1) as update_mock, \
                  patch.object(local_runner.br, "report_update_result"), \
                  patch.object(local_runner, "_reexec_after_update") as reexec_mock, \
                  patch("time.sleep", return_value=None):
@@ -6483,13 +6606,167 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             local_runner._shutdown_event.clear()
 
         self.assertEqual(calls, 3)
-        update_mock.assert_not_called()
-        self.assertEqual(contains_mock.call_count, 2)
-        self.assertEqual(
-            [call.args[0] for call in contains_mock.call_args_list],
-            [hints[0], hints[2]],
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit=hints[0],
         )
+        self.assertEqual(draining_reports, [False, True, False])
         reexec_mock.assert_not_called()
+        self.assertFalse(local_runner._update_in_progress.is_set())
+
+    def test_exact_hint_updates_when_display_probe_is_unknown(self):
+        """Unknown local identity is stale, never a reason to ignore authority."""
+        hint = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": hint}
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value=None), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value=hint) as source_mock, \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=1) as update_mock, \
+                 patch.object(local_runner.br, "report_update_result"), \
+                 patch.object(local_runner, "_reexec_after_update"):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        source_mock.assert_not_called()
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit=hint,
+        )
+        self.assertTrue(local_runner._update_in_progress.is_set())
+
+    def test_dirty_checkout_at_target_sha_still_drains_and_updates(self):
+        """Matching HEAD cannot authorize uncommitted executing code."""
+        hint = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": hint}
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v25-1-ga1b2c3d-dirty"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value=hint) as source_mock, \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=1) as update_mock, \
+                 patch.object(local_runner.br, "report_update_result"), \
+                 patch.object(local_runner, "_reexec_after_update"):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        source_mock.assert_not_called()
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit=hint,
+        )
+        self.assertTrue(local_runner._update_in_progress.is_set())
+
+    def test_failed_reexec_keeps_immutable_source_stale_and_retries(self):
+        """Disk convergence cannot make old in-memory code resume claims."""
+        hint = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        post_count = 0
+        monotonic_value = 0.0
+
+        def fake_post(url, token, body, **kwargs):
+            nonlocal post_count
+            post_count += 1
+            if post_count == 2:
+                local_runner._shutdown_event.set()
+            return 200, {"ok": True, "version_hint": hint}
+
+        def advancing_monotonic():
+            nonlocal monotonic_value
+            monotonic_value += 61.0
+            return monotonic_value
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              side_effect=["old", "target", "target"]), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              side_effect=[
+                                  "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+                                  hint,
+                                  hint,
+                              ]), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner, "_write_status_json"), \
+                 patch.object(local_runner, "_node_runtime_ok",
+                              return_value=False), \
+                 patch.object(local_runner, "_cpu_load_avg", return_value=None), \
+                 patch.object(local_runner, "_memory_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_disk_free_bytes",
+                              return_value=None), \
+                 patch.object(local_runner, "_container_image_store",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=0) as update_mock, \
+                 patch.object(local_runner.br,
+                              "report_update_result") as report_mock, \
+                 patch.object(local_runner, "_reexec_after_update",
+                              side_effect=[False, True]) as reexec_mock, \
+                 patch("time.monotonic", side_effect=advancing_monotonic), \
+                 patch("time.sleep", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(update_mock.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["target_commit"] for call in update_mock.call_args_list],
+            [hint, hint],
+        )
+        self.assertEqual(reexec_mock.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["status"] for call in report_mock.call_args_list],
+            ["success", "failure", "success"],
+        )
+        self.assertTrue(local_runner._update_in_progress.is_set())
 
     def test_failed_auto_update_stays_drained_and_reports_failure(self):
         """A failed update cannot silently resume claims on the old process."""
@@ -6508,6 +6785,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
                               return_value="v25-1-g4f5a6b7"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=None), \
                  patch.object(local_runner, "_write_status_json"), \
@@ -6530,7 +6809,10 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         finally:
             local_runner._shutdown_event.clear()
 
-        update_mock.assert_called_once_with(restart_service=False)
+        update_mock.assert_called_once_with(
+            restart_service=False,
+            target_commit="a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        )
         self.assertEqual(report_mock.call_args.kwargs["status"], "failure")
         reexec_mock.assert_not_called()
         self.assertTrue(local_runner._update_in_progress.is_set())
@@ -6545,7 +6827,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 "ok": True,
                 "last_seen_at": "2026-01-01T00:00:00",
                 "enrolled_max_concurrent": 2,
-                "version_hint": "v99-abcdef01",
+                "version_hint": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
             }
 
         def fake_print(*args, **kwargs):
@@ -6562,6 +6844,8 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version",
                               return_value="v1-oldversion"), \
+                 patch.object(local_runner, "_checkout_source_sha",
+                              return_value="4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b"), \
                  patch.object(local_runner, "_locate_agent_binary",
                               return_value=None), \
                  patch("builtins.print", side_effect=fake_print):
@@ -6626,13 +6910,12 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                 self.assertIsNone(local_runner._actionable_version_hint(value))
 
     def test_real_version_hints_remain_actionable(self):
-        """SHA and legacy release hints still participate in stale detection."""
-        for value in (
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-            "v99-abcdef01",
-        ):
+        """Only an exact lowercase full SHA can authorize checkout mutation."""
+        exact = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        self.assertEqual(local_runner._actionable_version_hint(exact), exact)
+        for value in ("v99-abcdef01", "a1b2c3d", exact.upper(), "HEAD"):
             with self.subTest(value=value):
-                self.assertEqual(local_runner._actionable_version_hint(value), value)
+                self.assertIsNone(local_runner._actionable_version_hint(value))
 
 
 class TestHeartbeatJitterAndNetworkFailureEscalation(unittest.TestCase):
@@ -6795,6 +7078,10 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
     def _spawn(self, *, backend, container_name, agent_image, agent_binary, caps,
                task_type="research", llm_env=None, project_id="project-123",
                resident_session=False, checkout_sha=None):
+        if backend == iso.BACKEND_BWRAP and not caps.systemd_run_path:
+            caps = iso.replace(
+                caps, systemd_run_path="/usr/bin/systemd-run"
+            )
         active_tasks: dict = {}
         agent_started_at: dict = {}
         agent_teardown: dict = {}
@@ -6928,6 +7215,34 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
             "strategic_review",
         )
 
+    def test_agent_memory_cap_authoritatively_bounds_vitest_workers(self):
+        with patch.object(
+            local_runner,
+            "_effective_agent_memory_limit",
+            return_value=(str(8 * 1024**3), 8 * 1024**3),
+        ):
+            r = self._spawn(
+                backend=iso.BACKEND_BWRAP,
+                container_name=None,
+                agent_image=None,
+                agent_binary=["node", "/agent/dist/index.js"],
+                caps=_bwrap_caps(),
+                llm_env={
+                    "VITEST_MAX_THREADS": "99",
+                    "VITEST_MAX_FORKS": "99",
+                    "VITEST_MAX_WORKERS": "99",
+                },
+            )
+
+        _, pkw = r["plan"].call_args
+        injected = pkw["injected_env"]
+        self.assertEqual(injected["VITEST_MIN_THREADS"], "1")
+        self.assertEqual(injected["VITEST_MAX_THREADS"], "4")
+        self.assertEqual(injected["VITEST_MIN_FORKS"], "1")
+        self.assertEqual(injected["VITEST_MAX_FORKS"], "4")
+        self.assertEqual(injected["VITEST_MIN_WORKERS"], "1")
+        self.assertEqual(injected["VITEST_MAX_WORKERS"], "4")
+
     def test_only_server_resident_marker_enables_pre_claim_resident_identity(self):
         r = self._spawn(
             backend=iso.BACKEND_BWRAP,
@@ -7002,6 +7317,105 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
         _, pkw = r["plan"].call_args
         self.assertIsNone(pkw["agent_image"])
         self.assertEqual(pkw["injected_env"]["PROJECT_ID"], "project-123")
+
+    def test_bwrap_spawn_cap_is_unconditional_when_admission_disabled(self):
+        caps = iso.replace(
+            _bwrap_caps(), systemd_run_path="/usr/bin/systemd-run"
+        )
+        fake_proc = MagicMock()
+        fake_proc.pid = 4321
+        fake_proc.stdout = io.BytesIO(b"")
+        plan = iso.ExecutionPlan(
+            backend=iso.BACKEND_BWRAP,
+            argv=["/usr/bin/bwrap", "--", "node", "/agent/dist/index.js"],
+            env={"AGENT_SECRET_TOKEN": "s"},
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+                "BLUEPRINT_RUNNER_RESOURCE_ADMISSION": "0",
+            },
+            clear=False,
+        ), patch.object(
+            local_runner.iso, "decide_agent_backend", return_value=iso.BACKEND_BWRAP
+        ), patch.object(
+            local_runner.iso, "plan_agent_execution", return_value=plan
+        ), patch.object(
+            local_runner.subprocess, "Popen", return_value=fake_proc
+        ) as popen:
+            spawned = local_runner._spawn_agent_task(
+                task_id="task-oom",
+                task_type="create",
+                agent_token="agent-tok",
+                vm_instance_id="runner:local",
+                orchestrator_url="https://api.example.com",
+                workspace="/tmp/ws",
+                caps=caps,
+                agent_binary=["node", "/agent/dist/index.js"],
+                agent_image=None,
+                active_tasks={},
+                agent_started_at={},
+                agent_teardown={},
+                lock=threading.Lock(),
+                mem_limit="8g",
+            )
+            admission_enabled = local_runner._ResourceLedger(
+                "/tmp", agent_memory_limit_bytes=8 * 1024**3
+            ).enabled
+
+        self.assertTrue(spawned)
+        self.assertFalse(admission_enabled)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], "/usr/bin/systemd-run")
+        self.assertIn(f"MemoryMax={8 * 1024**3}", argv)
+        self.assertIn("/usr/bin/bwrap", argv)
+        self.assertIn("--unsetenv", argv)
+        self.assertIn("XDG_RUNTIME_DIR", argv)
+        self.assertIn("DBUS_SESSION_BUS_ADDRESS", argv)
+        self.assertLess(argv.index("XDG_RUNTIME_DIR"), argv.index("--"))
+        self.assertLess(argv.index("DBUS_SESSION_BUS_ADDRESS"), argv.index("--"))
+        outer_env = popen.call_args.kwargs["env"]
+        self.assertEqual(outer_env["XDG_RUNTIME_DIR"], "/run/user/1000")
+        self.assertEqual(
+            outer_env["DBUS_SESSION_BUS_ADDRESS"],
+            "unix:path=/run/user/1000/bus",
+        )
+        self.assertNotIn("XDG_RUNTIME_DIR", plan.env)
+        self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", plan.env)
+
+    def test_bwrap_without_user_scope_declines_before_plan_or_spawn(self):
+        caps = iso.replace(_bwrap_caps(), systemd_run_path=None)
+        reasons: list[str] = []
+
+        with patch.object(
+            local_runner.iso, "decide_agent_backend", return_value=iso.BACKEND_BWRAP
+        ), patch.object(
+            local_runner.iso, "plan_agent_execution"
+        ) as planner, patch.object(local_runner.subprocess, "Popen") as popen:
+            spawned = local_runner._spawn_agent_task(
+                task_id="task-no-user-bus",
+                task_type="create",
+                agent_token="agent-tok",
+                vm_instance_id="runner:local",
+                orchestrator_url="https://api.example.com",
+                workspace="/tmp/ws",
+                caps=caps,
+                agent_binary=["node", "/agent/dist/index.js"],
+                agent_image=None,
+                active_tasks={},
+                agent_started_at={},
+                agent_teardown={},
+                lock=threading.Lock(),
+                mem_limit="8g",
+                decline_reason_out=reasons,
+            )
+
+        self.assertFalse(spawned)
+        self.assertIn("aggregate memory scope unavailable", reasons[0])
+        planner.assert_not_called()
+        popen.assert_not_called()
 
     def test_agent_source_sha_passed_from_explicit_agent_checkout(self):
         """A bwrap runner resolves identity from the explicit agent entry, not
@@ -7272,7 +7686,7 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
 
     # ---- relaxed advertisement (heartbeat agent_available) -------------------
 
-    def _heartbeat_agent_available(self, *, caps, agent_image):
+    def _heartbeat_agent_body(self, *, caps, agent_image):
         posted = []
 
         def fake_post(url, token, body, **kwargs):
@@ -7291,10 +7705,15 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
             local_runner._heartbeat_loop(
                 "https://api", "tok", {}, threading.Lock(),
                 {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
-                agent_sandbox_ok=caps.bwrap_ok,
+                agent_sandbox_ok=local_runner._bwrap_agent_boundary_available(caps),
                 caps=caps, agent_image=agent_image,
             )
-        return posted[0]["agent_available"]
+        return posted[0]
+
+    def _heartbeat_agent_available(self, *, caps, agent_image):
+        return self._heartbeat_agent_body(
+            caps=caps, agent_image=agent_image
+        )["agent_available"]
 
     def test_advertises_agent_on_docker_image_without_bwrap(self):
         self.assertTrue(
@@ -7307,6 +7726,30 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
         # Regression guard: docker-usable but no image → NOT claimable (unchanged).
         self.assertFalse(
             self._heartbeat_agent_available(caps=_docker_caps(), agent_image=None)
+        )
+
+    def test_unbounded_bwrap_is_not_advertised_without_docker(self):
+        body = self._heartbeat_agent_body(
+            caps=iso.replace(_bwrap_caps(), systemd_run_path=None),
+            agent_image=None,
+        )
+        self.assertFalse(body["agent_available"])
+        self.assertEqual(body["agent_backend"], iso.DECLINE)
+        self.assertIsNone(body["supported_agent_task_types"])
+        self.assertEqual(body["compute_backend"], iso.BACKEND_BWRAP)
+
+    def test_unbounded_bwrap_with_docker_advertises_only_safe_slice(self):
+        caps = iso.replace(
+            _bwrap_caps(), systemd_run_path=None, docker_usable=True
+        )
+        body = self._heartbeat_agent_body(
+            caps=caps, agent_image="registry/agent:prod"
+        )
+        self.assertTrue(body["agent_available"])
+        self.assertEqual(body["agent_backend"], iso.BACKEND_DOCKER)
+        self.assertEqual(
+            body["supported_agent_task_types"],
+            sorted(iso.AGENT_DOCKER_TYPES),
         )
 
     def test_spawn_writes_agent_output_to_per_task_log_file(self):
@@ -7347,7 +7790,7 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
                         vm_instance_id="vm",
                         orchestrator_url="https://api",
                         workspace="/tmp/ws",
-                        caps=_bwrap_caps(),
+                        caps=_bounded_bwrap_caps(),
                         agent_binary="/usr/bin/node",
                         agent_image=None,
                         active_tasks=active_tasks,
@@ -8593,7 +9036,7 @@ class TestStatusJson(unittest.TestCase):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock,
                     {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
-                    caps=_bwrap_caps(),
+                    caps=_bounded_bwrap_caps(),
                 )
         finally:
             local_runner._shutdown_event.clear()
@@ -10080,7 +10523,19 @@ class SelfUpdateSurvivalTests(_LocalRunnerTestCase):
         ), \
              patch.object(local_runner.os, "execv") as execv, \
              patch.object(local_runner.os, "_exit") as exit_:
-            local_runner._reexec_after_update()
+            self.assertTrue(local_runner._reexec_after_update())
+        execv.assert_called_once()
+        exit_.assert_not_called()
+
+    def test_unsupervised_reexec_failure_keeps_process_alive(self):
+        with _fake_host(
+            pid1="systemd",
+            cgroup=SupervisorDetectionTests.SESSION_CGROUP,
+        ), \
+             patch.object(local_runner.os, "execv",
+                          side_effect=OSError("exec failed")) as execv, \
+             patch.object(local_runner.os, "_exit") as exit_:
+            self.assertFalse(local_runner._reexec_after_update())
         execv.assert_called_once()
         exit_.assert_not_called()
 
@@ -10138,6 +10593,71 @@ class PreflightSupervisorReportTests(_LocalRunnerTestCase):
         self.assertTrue(result["supervised"])
         self.assertIn("auto-restart on crash/update", out)
         self.assertIn("blueprint-runner.service", out)
+
+
+class BoundedAgentPreflightTests(_LocalRunnerTestCase):
+    def _run_preflight(self, caps, *, agent_image=None):
+        output = io.StringIO()
+        with patch.object(
+            local_runner,
+            "_post",
+            return_value=(200, {"ok": True}),
+        ), patch.object(
+            local_runner, "_workspace_writable", return_value=True
+        ), patch.object(
+            local_runner, "_check_provider_credentials", return_value=[]
+        ), patch.object(
+            local_runner,
+            "_detect_supervisor_state",
+            return_value={
+                "supervisor": None,
+                "supervised": False,
+                "evidence": "test",
+                "detail": "test",
+            },
+        ), contextlib.redirect_stdout(output):
+            result = local_runner._preflight(
+                "https://api.example.com",
+                "tok",
+                ["node", "/agent/dist/index.js"],
+                caps,
+                _gpu_state(()),
+                2,
+                2,
+                agent_image=agent_image,
+            )
+        return result, output.getvalue()
+
+    def test_no_scope_means_no_bwrap_agent_claim(self):
+        caps = iso.replace(_bwrap_caps(), systemd_run_path=None)
+        result, output = self._run_preflight(caps)
+
+        self.assertFalse(result["claimable"][iso.CLASS_AGENT])
+        self.assertTrue(result["claimable"][iso.CLASS_COMPUTE])
+        self.assertFalse(result["_heartbeat_body"]["agent_available"])
+        self.assertEqual(
+            result["_heartbeat_body"]["agent_backend"], iso.DECLINE
+        )
+        self.assertEqual(
+            result["_heartbeat_body"]["compute_backend"], iso.BACKEND_BWRAP
+        )
+        self.assertIn("aggregate memory scope unavailable", output)
+
+    def test_no_scope_with_docker_declares_exact_read_only_slice(self):
+        caps = iso.replace(
+            _bwrap_caps(), systemd_run_path=None, docker_usable=True
+        )
+        result, _output = self._run_preflight(
+            caps, agent_image="registry/agent:prod"
+        )
+
+        self.assertTrue(result["claimable"][iso.CLASS_AGENT])
+        heartbeat = result["_heartbeat_body"]
+        self.assertEqual(heartbeat["agent_backend"], iso.BACKEND_DOCKER)
+        self.assertEqual(
+            heartbeat["supported_agent_task_types"],
+            sorted(iso.AGENT_DOCKER_TYPES),
+        )
 
 
 class GpuSandboxSmokeTests(_LocalRunnerTestCase):
@@ -11068,6 +11588,110 @@ class TestSharedResourceAdmission(unittest.TestCase):
             )
             self.assertEqual(ledger.reserved_cpu_cores, 0.0)
             self.assertIsNone(ledger.try_reserve("agent:a", "agent"))
+
+    def test_default_agent_cap_supports_suite_independent_of_live_concurrency(self):
+        gib = 1024 ** 3
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            local_runner, "_memory_total_bytes", return_value=16 * gib
+        ):
+            limit, limit_bytes = local_runner._effective_agent_memory_limit()
+        self.assertEqual(limit, str(8 * gib))
+        self.assertEqual(limit_bytes, 8 * gib)
+
+    def test_vitest_worker_limit_scales_with_enforced_agent_memory(self):
+        gib = 1024 ** 3
+        for memory_bytes, expected in (
+            (2 * gib, "1"),
+            (4 * gib, "2"),
+            (6 * gib, "3"),
+            (8 * gib, "4"),
+            (16 * gib, "4"),
+        ):
+            with self.subTest(memory_bytes=memory_bytes):
+                env = local_runner._agent_vitest_worker_env(memory_bytes)
+                self.assertEqual(env["VITEST_MAX_THREADS"], expected)
+                self.assertEqual(env["VITEST_MAX_FORKS"], expected)
+                self.assertEqual(env["VITEST_MAX_WORKERS"], expected)
+                self.assertEqual(env["VITEST_MIN_THREADS"], "1")
+                self.assertEqual(env["VITEST_MIN_FORKS"], "1")
+                self.assertEqual(env["VITEST_MIN_WORKERS"], "1")
+
+    def test_eight_gib_host_derives_cap_that_actual_ledger_admits(self):
+        gib = 1024 ** 3
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            local_runner, "_memory_total_bytes", return_value=8 * gib
+        ), patch.object(
+            local_runner, "_memory_free_bytes", return_value=8 * gib
+        ), patch.object(
+            local_runner.os, "cpu_count", return_value=8
+        ):
+            limit, limit_bytes = local_runner._effective_agent_memory_limit()
+            ledger = local_runner._ResourceLedger(
+                "/tmp", enabled=True, agent_memory_limit_bytes=limit_bytes
+            )
+            first_reason = ledger.try_reserve("agent:first", "agent")
+            second_reason = ledger.try_reserve("agent:second", "agent")
+
+        self.assertEqual(limit, str(6 * gib))
+        self.assertEqual(limit_bytes, 6 * gib)
+        self.assertGreaterEqual(limit_bytes, 4 * gib)
+        self.assertIsNone(first_reason)
+        self.assertEqual(second_reason, "memory_reservation")
+
+    def test_host_below_minimum_agent_budget_is_not_admitted(self):
+        gib = 1024 ** 3
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            local_runner, "_memory_total_bytes", return_value=3 * gib
+        ), patch.object(
+            local_runner, "_memory_free_bytes", return_value=3 * gib
+        ), patch.object(
+            local_runner.os, "cpu_count", return_value=8
+        ):
+            limit, limit_bytes = local_runner._effective_agent_memory_limit()
+            ledger = local_runner._ResourceLedger(
+                "/tmp", enabled=True, agent_memory_limit_bytes=limit_bytes
+            )
+            reason = ledger.try_reserve("agent:too-small", "agent")
+
+        self.assertEqual(limit, str(2 * gib))
+        self.assertEqual(reason, "memory_reservation")
+
+    def test_agent_admission_reserves_at_least_the_enforced_cap(self):
+        gib = 1024 ** 3
+        with patch.dict(
+            os.environ,
+            {"BLUEPRINT_RUNNER_AGENT_MEMORY_RESERVATION_BYTES": str(2 * gib)},
+            clear=True,
+        ):
+            ledger = local_runner._ResourceLedger(
+                "/tmp", enabled=True, agent_memory_limit_bytes=8 * gib
+            )
+        self.assertEqual(ledger.request_for("agent").memory_bytes, 8 * gib)
+
+    def test_explicit_agent_cap_is_not_silently_reduced(self):
+        gib = 1024 ** 3
+        with patch.dict(
+            os.environ,
+            {"BLUEPRINT_RUNNER_MEM_LIMIT": "12g"},
+            clear=True,
+        ):
+            limit, limit_bytes = local_runner._effective_agent_memory_limit()
+        self.assertEqual(limit, str(12 * gib))
+        self.assertEqual(limit_bytes, 12 * gib)
+
+    def test_invalid_or_nonfinite_agent_caps_fall_back_without_crashing(self):
+        gib = 1024 ** 3
+        for invalid in ("1e3", "inf", "1e999", str(1 << 64)):
+            with self.subTest(invalid=invalid), patch.dict(
+                os.environ,
+                {"BLUEPRINT_RUNNER_MEM_LIMIT": invalid},
+                clear=True,
+            ), patch.object(
+                local_runner, "_memory_total_bytes", return_value=16 * gib
+            ):
+                limit, limit_bytes = local_runner._effective_agent_memory_limit()
+            self.assertEqual(limit, str(8 * gib))
+            self.assertEqual(limit_bytes, 8 * gib)
 
     def test_malformed_compute_response_releases_capacity_and_claim_reservation(self):
         ledger = local_runner._ResourceLedger("/tmp", enabled=False)

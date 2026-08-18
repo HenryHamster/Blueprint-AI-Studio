@@ -270,6 +270,13 @@ def _file_conflict_reserved_files(task: Task) -> set[str]:
     files = defer.get("files")
     if isinstance(files, list) and files:
         return _prod_files(files)
+    handoff = ctx.get("_blocked_retry_precondition_receipt") or {}
+    if (
+        handoff.get("authority") == "server_file_conflict_fifo_v1"
+        and handoff.get("kind") == "file_conflict_handoff"
+        and isinstance(handoff.get("files"), list)
+    ):
+        return _prod_files(handoff["files"])
     # Fallback: parse "file conflict on a.py, b.py, c.py" from the blocker key
     # (or the preserved onset stamp, which survives the BLOCKED requeue).
     for src in (defer.get("key"), (ctx.get("_blocked_first_at") or {}).get("key")):
@@ -289,6 +296,13 @@ def _is_senior_file_conflict_waiter(task: Task) -> bool:
     cycles.
     """
     if task.status == TaskStatus.BLOCKED and task.blocker_kind == "file_conflict":
+        return True
+    handoff = (task.context or {}).get("_blocked_retry_precondition_receipt") or {}
+    if (
+        task.status == TaskStatus.QUEUED
+        and handoff.get("authority") == "server_file_conflict_fifo_v1"
+        and handoff.get("kind") == "file_conflict_handoff"
+    ):
         return True
     defer = (task.context or {}).get("_precondition_defer") or {}
     key = defer.get("key")
@@ -705,18 +719,22 @@ async def filter_rollup_conflicts(
     if not eligible_ids:
         return eligible_ids
 
-    eval_parent_ids = (
+    eval_parent_rows = (
         (
             await session.execute(
-                select(Task.id).where(Task.status == TaskStatus.EVALUATING)
+                select(Task.id, Task.project_id).where(
+                    Task.status == TaskStatus.EVALUATING
+                )
             )
         )
-        .scalars()
         .all()
     )
-    if not eval_parent_ids:
+    if not eval_parent_rows:
         return eligible_ids
-    eval_parent_id_set = set(eval_parent_ids)
+    eval_parent_project_by_id = {
+        parent_id: project_id for parent_id, project_id in eval_parent_rows
+    }
+    eval_parent_ids = list(eval_parent_project_by_id)
 
     pending_children = (
         (
@@ -734,6 +752,11 @@ async def filter_rollup_conflicts(
     # Build per-project rollup file sets (different repos can't conflict)
     pending_rollup_by_project: dict[uuid.UUID, dict[str, str]] = {}
     for pc in pending_children:
+        # ``parent_task_id`` is a global FK but does not itself prove that the
+        # child belongs to the parent's project.  An inconsistent foreign child
+        # must not manufacture a rollup reservation in its own project.
+        if eval_parent_project_by_id.get(pc.parent_task_id) != pc.project_id:
+            continue
         pc_scope = (pc.context or {}).get("scope", DEFAULT_TASK_SCOPE)
         pc_type = (pc.first_payload).get("type", "")
         if pc_scope == "large" or pc_type in ("refactor", "plan"):
@@ -756,7 +779,10 @@ async def filter_rollup_conflicts(
         # would deadlock the rollup: e.g. a review task for a child's PR shares
         # related_files with that child by construction, so blocking it would
         # prevent the review that's required to land the child into the rollup.
-        if candidate.parent_task_id in eval_parent_id_set:
+        if (
+            eval_parent_project_by_id.get(candidate.parent_task_id)
+            == candidate.project_id
+        ):
             non_rollup_conflicting.append(eid)
             continue
         # Only check rollup conflicts within the same project

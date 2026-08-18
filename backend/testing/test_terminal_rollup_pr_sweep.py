@@ -163,9 +163,12 @@ async def test_terminal_rollup_sweep_rechecks_under_task_lock(db_session, mocker
     lock_statements = [
         statement for statement in statements if statement._for_update_arg is not None
     ]
-    assert lock_statements
-    assert "WHERE task.id" in str(lock_statements[0])
-    assert parent.id in lock_statements[0].compile().params.values()
+    assert len(lock_statements) >= 2
+    project_lock, task_lock = lock_statements[:2]
+    assert "WHERE project.id" in str(project_lock)
+    assert project.id in project_lock.compile().params.values()
+    assert "WHERE task.id" in str(task_lock)
+    assert parent.id in task_lock.compile().params.values()
 
 
 @pytest.mark.asyncio

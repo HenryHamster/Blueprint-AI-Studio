@@ -18,6 +18,7 @@ from app.release_commit_authorship import (
     AUTHORSHIP_RECEIPT_SOURCE,
     count_non_bot_authored_commits,
     authorship_category_evidence,
+    candidate_authorship_range,
     measure_serving_authorship_evidence,
     normalized_authorship_prompt_evidence,
     persist_serving_authorship_evidence,
@@ -665,6 +666,67 @@ def test_authorship_contract_max_count_projects_nonzero_as_unmet_and_prompt_is_b
         "offender_shas": ["cccccccccccc"],
     }
     assert prompt["range"] == {"base_sha": "a" * 12, "head_sha": "b" * 12}
+
+
+def test_candidate_authorship_range_covers_base_to_candidate_head():
+    base = "a" * 40
+    candidate = "b" * 40
+
+    assert candidate_authorship_range(
+        {"base_sha": base, "candidate_sha": candidate}
+    ) == (base, candidate)
+    assert candidate_authorship_range(
+        {"base_sha": base, "last_qualification": {"candidate_sha": candidate}}
+    ) == (base, candidate)
+
+
+def test_candidate_authorship_range_drives_declining_graded_criterion():
+    version = {
+        "base_sha": "a" * 40,
+        "candidate_sha": "b" * 40,
+    }
+    base_sha, candidate_sha = candidate_authorship_range(version)
+    category = {
+        "category_key": "candidate-authorship",
+        "text": "Candidate authorship stays within the declining repair budget.",
+        "evidence_contract": {
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 1},
+        },
+    }
+    receipt = {
+        "source": AUTHORSHIP_RECEIPT_SOURCE,
+        "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        "state": "resolved",
+        "count": 1,
+        "offenders": [{"sha": "c" * 12, "author": "Operator"}],
+        "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+        "measured_at": "2026-01-01T00:00:00+00:00",
+        "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+    }
+
+    evidence = authorship_category_evidence(
+        receipt, base_sha, candidate_sha, [category]
+    )
+
+    assert evidence[0]["status"] == "met"
+    assert evidence[0]["category_key"] == "candidate-authorship"
+    assert evidence[0]["evidence_provenance"]["range"] == {
+        "base_sha": base_sha,
+        "head_sha": candidate_sha,
+    }
+
+    over_budget = {
+        **receipt,
+        "count": 2,
+        "offenders": [
+            {"sha": "c" * 12, "author": "Operator"},
+            {"sha": "d" * 12, "author": "Operator"},
+        ],
+    }
+    assert authorship_category_evidence(
+        over_budget, base_sha, candidate_sha, [category]
+    )[0]["status"] == "not_met"
 
 
 def test_malformed_receipt_is_repair_candidate_without_json_casting():

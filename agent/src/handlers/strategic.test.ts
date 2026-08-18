@@ -1483,8 +1483,8 @@ describe('handleStrategic executor prompt: sequenced landing gates', () => {
     // base is the exact branch whose landing status releases the successor.
     expect(executorPrompt).toContain('"require_deps_landed_on": "project-integration", "release_base_branch": "project-integration"');
     expect(executorPrompt).toContain('every depends_on dependency must have LANDED on');
-    // Independent work stays parallel (no depends_on) so it is not held by the chain.
-    expect(executorPrompt).toContain('work parallel (no depends_on)');
+    // Genuinely independent work skips depends_on so it isn't held by the chain.
+    expect(executorPrompt).toContain('Only omit depends_on for work that is genuinely independent');
   });
 });
 

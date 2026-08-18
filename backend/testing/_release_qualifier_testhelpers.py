@@ -385,6 +385,37 @@ def _qualifier_ci_resolves_green(mocker, monkeypatch):
         "app.github._github_request",
         new=AsyncMock(return_value=blocked_github_response),
     )
+    # Candidate authorship is a live GitHub gate in production. Coordinator
+    # tests use synthetic SHAs and exercise its decision contract separately;
+    # keep their unrelated finalize assertions deterministic with a clean
+    # candidate-range measurement.
+    async def _clean_candidate_authorship(session, version):
+        candidate_sha = (version.last_qualification or {}).get("candidate_sha")
+        return {
+            "state": "resolved",
+            "count": 0,
+            "offenders": [],
+            "range": {"base_sha": "a" * 40, "head_sha": candidate_sha},
+        }
+
+    def _synthetic_candidate_range(version):
+        return (
+            "a" * 40,
+            (version.last_qualification or {}).get("candidate_sha") or "b" * 40,
+        )
+
+    mocker.patch.object(
+        rq,
+        "_measure_candidate_operator_authorship",
+        new=AsyncMock(side_effect=_clean_candidate_authorship),
+    )
+    mocker.patch.object(
+        rq, "candidate_authorship_range", side_effect=_synthetic_candidate_range
+    )
+    mocker.patch(
+        "app.release_commit_authorship.candidate_authorship_range",
+        side_effect=_synthetic_candidate_range,
+    )
     # Finalization may retire archival child VMs or trigger orphan inventory as
     # an incidental side effect. Keep qualifier tests outside the real GCE SDK;
     # compute-specific tests own these boundaries and qualifier tests can

@@ -4247,6 +4247,19 @@ async def _spawn_design_doc_update(
         await session.rollback()
         return False
 
+    if apply_spawn_budget_guard:
+        # Cheap advisory fast-path only. The authoritative re-read still occurs
+        # under Project lock at the INSERT seam below, closing stale-true races.
+        from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
+
+        if not automatic_strategic_cycles_enabled(project):
+            logger.info(
+                "[STRATEGIC] Automatic design-doc spawn suppressed for project "
+                "%s (automatic_strategic_cycles_disabled)",
+                project.id,
+            )
+            return False
+
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
         logger.warning(
@@ -4413,6 +4426,45 @@ async def _spawn_design_doc_update(
         steering_excerpt = strategic_refresh_excerpt(project.vision)
         if steering_excerpt:
             task_context["steering_excerpt"] = steering_excerpt
+    # Payload assembly above may hold external I/O open for seconds.  Acquire
+    # automatic Strategic authority only at the short finalization seam, re-read
+    # the dedicated lane flag under the current Project lock, and retain that
+    # lock through INSERT/commit.  Manual directions calls deliberately leave
+    # ``apply_spawn_budget_guard`` false and remain unaffected.
+    if apply_spawn_budget_guard:
+        from app.strategic_cycle_admission import (
+            acquire_automatic_strategic_cycle_creation_authority,
+        )
+        from app.task_locking import AUTOMATIC_TASK_CREATION_ALLOWED
+
+        automatic_admission = (
+            await acquire_automatic_strategic_cycle_creation_authority(
+                session,
+                project.id,
+                skip_locked=True,
+            )
+        )
+        if automatic_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            await session.rollback()
+            logger.info(
+                "[STRATEGIC] Automatic design-doc spawn suppressed for project "
+                "%s (%s)",
+                project.id,
+                automatic_admission,
+            )
+            return False
+        # The unlocked head check can become stale during payload construction.
+        # Re-arm it after Project authority so Project -> Task lock ordering and
+        # the check -> INSERT window are both deterministic.
+        if await _has_active_strategic_task(project.id, session):
+            await session.rollback()
+            logger.info(
+                "[STRATEGIC] Automatic design-doc spawn suppressed for project "
+                "%s (strategic task appeared during payload construction)",
+                project.id,
+            )
+            return False
+
     try:
         await lock_and_validate_legacy_authority(
             session,
@@ -4823,6 +4875,24 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
         return None
     head_sha = gate.get("head_sha")
     if not isinstance(head_sha, str) or not head_sha:
+        return None
+
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    admission = await acquire_automatic_task_creation_authority(
+        session, project.id, skip_locked=True
+    )
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[COMPLIANCE_CAP_BUMP] automatic remediation suppressed for "
+            "project=%s, head_sha=%s (%s)",
+            project.id,
+            head_sha,
+            admission,
+        )
         return None
 
     active_statuses = {
@@ -5506,6 +5576,8 @@ async def _finalize_strategic_review_spawn(
     effort_reason: str | None = None,
     expected_legacy_generation: int | None = None,
     cadence_accepted_count: object | None = None,
+    automatic_creation: bool = True,
+    suppression_reason_out: dict[str, str] | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail for the cadence spawn path.
 
@@ -5531,6 +5603,35 @@ async def _finalize_strategic_review_spawn(
     """
     from app.autonomous_research import _try_research_spawn_advisory_lock
     from app.task_lifecycle import _has_active_strategic_task
+
+    # Payload construction can commit and release every earlier lock.  Re-take
+    # the canonical Project authority at the short finalization seam, re-read
+    # the automatic Strategic lane flag, and retain the lock through INSERT.
+    # Manual Workday/directions/Resident paths pass automatic_creation=False.
+    if automatic_creation:
+        from app.strategic_cycle_admission import (
+            acquire_automatic_strategic_cycle_creation_authority,
+        )
+        from app.task_locking import AUTOMATIC_TASK_CREATION_ALLOWED
+
+        automatic_admission = (
+            await acquire_automatic_strategic_cycle_creation_authority(
+                session,
+                project_id,
+                skip_locked=True,
+            )
+        )
+        if automatic_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+            if suppression_reason_out is not None:
+                suppression_reason_out["reason"] = automatic_admission
+            await session.rollback()
+            logger.info(
+                "[STRATEGIC] Automatic strategic-review spawn suppressed for "
+                "project %s (%s)",
+                project_id,
+                automatic_admission,
+            )
+            return False
 
     if expected_legacy_generation is not None:
         try:
@@ -5736,6 +5837,7 @@ async def _spawn_strategic_review(
     apply_spawn_budget_guard: bool = False,
     expected_legacy_generation: int | None = None,
     cadence_accepted_count: object | None = None,
+    suppression_reason_out: dict[str, str] | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -5794,6 +5896,9 @@ async def _spawn_strategic_review(
     """
     from app.task_lifecycle import _has_active_strategic_task
 
+    if suppression_reason_out is not None:
+        suppression_reason_out.clear()
+
     try:
         if expected_legacy_generation is None and not resident_minimal:
             expected_legacy_generation = await lock_and_validate_legacy_authority(
@@ -5806,6 +5911,28 @@ async def _spawn_strategic_review(
 
     if extra_payload and not resident_minimal:
         raise ValueError("extra_payload is reserved for resident_minimal strategic spawns")
+
+    if apply_spawn_budget_guard:
+        # Avoid the expensive Strategic payload build when the caller's loaded
+        # snapshot is already disabled. The finalizer still performs the
+        # authoritative locked re-read so stale-true snapshots cannot insert.
+        from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
+
+        if not automatic_strategic_cycles_enabled(project):
+            if suppression_reason_out is not None:
+                from app.strategic_cycle_admission import (
+                    AUTOMATIC_STRATEGIC_CYCLES_DISABLED,
+                )
+
+                suppression_reason_out["reason"] = (
+                    AUTOMATIC_STRATEGIC_CYCLES_DISABLED
+                )
+            logger.info(
+                "[STRATEGIC] Automatic strategic-review spawn suppressed for "
+                "project %s (automatic_strategic_cycles_disabled)",
+                project.id,
+            )
+            return False
 
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
@@ -6193,6 +6320,8 @@ async def _spawn_strategic_review(
             effort_reason=_res_effort_reason,
             expected_legacy_generation=expected_legacy_generation,
             cadence_accepted_count=cadence_accepted_count,
+            automatic_creation=apply_spawn_budget_guard,
+            suppression_reason_out=suppression_reason_out,
         )
 
     # Build direction stats with rich data (pure over ``project.directions``).
@@ -8498,6 +8627,8 @@ async def _spawn_strategic_review(
         effort_reason=_effort_reason,
         expected_legacy_generation=expected_legacy_generation,
         cadence_accepted_count=cadence_accepted_count,
+        automatic_creation=apply_spawn_budget_guard,
+        suppression_reason_out=suppression_reason_out,
     )
 
 
@@ -8505,13 +8636,10 @@ async def _spawn_strategic_review(
 # Spawn-time failure-feedback mitigation helper
 # ---------------------------------------------------------------------------
 
-# Minimum first-attempt rejections in a single category to trigger downscoping.
+# Minimum first-attempt rejections in a single category to trigger mitigation.
 _FAILURE_DOWNSCOPE_THRESHOLD = 3
-# Minimum success-pattern observations to bias scope selection toward a smaller scope.
-_SUCCESS_BIAS_THRESHOLD = 3
 
 _SCOPE_DOWNGRADE: dict[str, str] = {"large": "medium", "medium": "small"}
-_SCOPE_ORDER_LIST = ["small", "medium", "large"]
 
 
 def _build_failure_feedback_mitigation(
@@ -8522,23 +8650,31 @@ def _build_failure_feedback_mitigation(
 ) -> tuple[str, str | None, dict]:
     """Return (final_scope, coaching_note, evidence) for spawn-time mitigation.
 
-    Reads direction_first_attempt_feedback for per-category rejection counts and
-    playbook/success-* entries for successful scope shapes.
+    Reads direction_first_attempt_feedback for per-category rejection counts.
 
-    - Downscopes by one level when any category reaches _FAILURE_DOWNSCOPE_THRESHOLD
-      first-attempt rejections, and sets a coaching note naming the failure mode.
-    - Biases toward the smallest scope that has _SUCCESS_BIAS_THRESHOLD+ successes
-      in playbook/success-{task_type}-{scope}, applied after failure downscoping.
+    - Sets a coaching note naming the dominant failure mode when any category
+      reaches _FAILURE_DOWNSCOPE_THRESHOLD first-attempt rejections.
+    - Downscopes by one level ONLY when that dominant category is scope_related:
+      repeated scope-misfit rejections are direct evidence the proposed scope is
+      too big. Rejections in other categories (testing, security, code defects)
+      say nothing about scope — shrinking the task doesn't fix a testing gap,
+      it just fragments the work, so those get the coaching note alone.
+
+    There is deliberately no success-pattern scope bias here: squeezing every
+    proposal into the smallest historically-merged scope optimizes per-task
+    merge rate while fragmenting contract-complete changes into incoherent
+    slivers. What a task needs determines its scope, not what merged before.
 
     Pure — no DB queries. Returns proposed_scope unchanged when no signal fires.
     """
+    from app.failure_classification import TAXONOMY_SCOPE_RELATED  # noqa: PLC0415
+
     doc = design_doc or {}
     direction_id = str(direction.get("id") or "")
     final_scope = proposed_scope
     coaching_note: str | None = None
     evidence: dict = {"proposed_scope": proposed_scope}
 
-    # --- Failure-concentration downscoping ---
     dfa = doc.get("direction_first_attempt_feedback") or {}
     fa_entry = dfa.get(direction_id) or {}
     cat_counts = {
@@ -8549,65 +8685,32 @@ def _build_failure_feedback_mitigation(
     if cat_counts:
         top_cat = max(cat_counts, key=lambda k: cat_counts[k])
         top_count = cat_counts[top_cat]
-        if (
-            top_count >= _FAILURE_DOWNSCOPE_THRESHOLD
-            and final_scope in _SCOPE_DOWNGRADE
-        ):
-            downscoped = _SCOPE_DOWNGRADE[final_scope]
-            evidence["failure_downscope"] = {
-                "category": top_cat,
-                "count": top_count,
-                "from": final_scope,
-                "to": downscoped,
-            }
-            logger.info(
-                "[SPAWN] Downscoping %s→%s for direction '%s' (first-attempt %s=%d)",
-                final_scope,
-                downscoped,
-                direction_id,
-                top_cat,
-                top_count,
-            )
-            final_scope = downscoped
+        if top_count >= _FAILURE_DOWNSCOPE_THRESHOLD:
             coaching_note = (
                 f"Historical pattern: {top_count} first-attempt rejections in "
                 f"'{top_cat.replace('_', ' ')}' for this direction. "
                 f"Pay extra attention to {top_cat.replace('_', ' ')} before submitting."
             )
-
-    # --- Success-pattern scope bias ---
-    proposed_idx = (
-        _SCOPE_ORDER_LIST.index(proposed_scope)
-        if proposed_scope in _SCOPE_ORDER_LIST
-        else -1
-    )
-    if proposed_idx > 0:
-        for candidate in _SCOPE_ORDER_LIST[:proposed_idx]:
-            key = f"playbook/success-{task_type}-{candidate}"
-            entry = doc.get(key)
-            success_count = (
-                entry.get("success_count") if isinstance(entry, dict) else None
-            )
             if (
-                isinstance(success_count, int)
-                and success_count >= _SUCCESS_BIAS_THRESHOLD
+                top_cat == TAXONOMY_SCOPE_RELATED
+                and final_scope in _SCOPE_DOWNGRADE
             ):
-                evidence["success_bias"] = {
-                    "key": key,
-                    "success_count": success_count,
+                downscoped = _SCOPE_DOWNGRADE[final_scope]
+                evidence["failure_downscope"] = {
+                    "category": top_cat,
+                    "count": top_count,
                     "from": final_scope,
-                    "to": candidate,
+                    "to": downscoped,
                 }
                 logger.info(
-                    "[SPAWN] Success bias %s→%s for task_type='%s' ('%s': %d successes)",
+                    "[SPAWN] Downscoping %s→%s for direction '%s' (first-attempt %s=%d)",
                     final_scope,
-                    candidate,
-                    task_type,
-                    key,
-                    success_count,
+                    downscoped,
+                    direction_id,
+                    top_cat,
+                    top_count,
                 )
-                final_scope = candidate
-                break  # use smallest qualifying scope
+                final_scope = downscoped
 
     evidence["final_scope"] = final_scope
     return final_scope, coaching_note, evidence

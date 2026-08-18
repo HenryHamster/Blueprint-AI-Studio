@@ -89,19 +89,25 @@ def _raise_merge_pr_retryable(pr_number: int, retry_after: int | None) -> None:
     ``hotfix_backmerge`` keys on to retry rather than raise a persistent
     "blocked" operator alert.  Mirrors :func:`_raise_create_pr_retryable`.
     """
-    raise_rate_limited(
-        log_message=(
-            f"[PR] Merge of PR #{pr_number} refused by the GitHub rate limiter — "
-            f"the merge did NOT happen. Returning 503 so the caller backs off "
-            f"instead of treating it as a hard merge failure."
-        ),
-        detail=(
-            f"Cannot merge pull request #{pr_number}: the GitHub API is "
-            "rate-limited. The merge was not attempted; retry after the window "
-            "resets."
-        ),
-        retry_after=retry_after,
-    )
+    try:
+        raise_rate_limited(
+            log_message=(
+                f"[PR] Merge of PR #{pr_number} refused by the GitHub rate limiter — "
+                f"the merge did NOT happen. Returning 503 so the caller backs off "
+                f"instead of treating it as a hard merge failure."
+            ),
+            detail=(
+                f"Cannot merge pull request #{pr_number}: the GitHub API is "
+                "rate-limited. The merge was not attempted; retry after the window "
+                "resets."
+            ),
+            retry_after=retry_after,
+        )
+    except HTTPException as exc:
+        # Approval merge authority distinguishes a quota refusal (known not
+        # submitted upstream) from a transport exception with unknown outcome.
+        exc.merge_not_attempted = True
+        raise
 
 
 def _github_request(*args, **kwargs):
@@ -691,6 +697,7 @@ async def get_pull_request_review_decision(
     decision = pull_request.get("reviewDecision")
     return str(decision).upper() if decision is not None else None
 
+
 # Outcome of a paginated reviews enumeration. TRUNCATED ("we know we missed some")
 # and FAILED ("we saw nothing at all") are deliberately distinct — see
 # get_pull_request_reviews_checked.
@@ -982,6 +989,7 @@ async def merge_pull_request(
         f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
         headers,
         json=merge_body,
+        max_retries=1,
         project_id=project_id,
     )
 

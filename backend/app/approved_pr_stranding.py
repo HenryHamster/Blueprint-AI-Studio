@@ -614,6 +614,13 @@ async def _sweep_checkpoint_owners(
     observations: list[tuple[Task, Project, dict[str, Any]]] = []
     for task_rows in by_project.values():
         project = task_rows[0][1]
+        # Advance every selected owner's scan cursor before touching the remote
+        # repository.  A failed or truncated branch listing is still an
+        # examination attempt; leaving these rows NULL would pin the bounded
+        # NULLS-FIRST window and starve owners later in the queue forever.
+        for task, _project in task_rows:
+            _mark_checkpoint_examined(task, "branch_listing_checked", now)
+        changed = True
         aliases = {
             alias: task
             for task, _project in task_rows
@@ -1583,6 +1590,21 @@ async def _handoff_clean_strand_for_reland(
             flag_modified(locked, "context")
             session.add(locked)
             return "superseded"
+        if target is not None and (
+            receipt.get("identity") == _review_target_identity(target)
+            or (
+                isinstance(receipt_target, dict)
+                and _is_complete_reland_target(
+                    receipt_target, project_id=str(candidate.project.id)
+                )
+                and receipt_target == target
+            )
+        ):
+            # The receipt is the durable idempotency fence.  Do not rely only
+            # on the two states emitted by this module: another completion or
+            # recovery path may have advanced the receipt state while the
+            # immutable target remains the same.
+            return None
         if receipt.get("state") in {"in_flight", "exhausted"}:
             return None
         if int(receipt.get("attempt_count") or 0) >= _MAX_RELAND_ATTEMPTS:

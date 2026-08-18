@@ -58,7 +58,7 @@ Optional environment variables:
                                       for compatibility troubleshooting.
     BLUEPRINT_RUNNER_AGENT_CPU_RESERVATION_CORES / _MEMORY_RESERVATION_BYTES
                                       Per-agent reservation before claiming work (defaults:
-                                      1 core, 2 GiB).
+                                      1 core and the enforced agent memory cap).
     BLUEPRINT_RUNNER_COMPUTE_CPU_RESERVATION_CORES / _MEMORY_RESERVATION_BYTES
                                       Per-compute-job reservation (defaults: 2 cores, 4 GiB).
     BLUEPRINT_RUNNER_RESERVED_CPU_CORES / _RESERVED_MEMORY_BYTES
@@ -75,8 +75,11 @@ Optional environment variables:
                                       Set this to a pullable project/private image with
                                       nvidia-smi when Docker Hub is unavailable; default
                                       is nvidia/cuda:12.6.3-base-ubuntu24.04.
-    BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
-    BLUEPRINT_RUNNER_MEM_LIMIT        Best-effort memory cap per task (e.g. 8g)
+    BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per compute task
+    BLUEPRINT_RUNNER_MEM_LIMIT        Agent descendant/container memory cap and
+                                      explicit compute cap (e.g. 8g). Invalid
+                                      values fall back to a host-safe agent default
+                                      and are ignored for compute.
     BLUEPRINT_RUNNER_CLI_MAINTENANCE  Host CLI self-maintenance (default: 1;
                                       set 0/false/no/off to disable).
     BLUEPRINT_RUNNER_CLI_DIR          Blueprint-managed CLI release root
@@ -733,15 +736,16 @@ def _detect_process_supervisor() -> str | None:
     return state["supervisor"] if state.get("supervised") else None
 
 
-def _reexec_after_update() -> None:
-    """Replace the current process with the updated runner, or exit for restart.
+def _reexec_after_update() -> bool:
+    """Replace the process with updated code; return False if re-exec fails.
 
     Called after a successful auto-update. If a process supervisor is present,
     ``os._exit(0)`` (the supervisor restarts the fresh binary). If NONE is
     detected (manual tmux/nohup launch), ``os.execv`` re-execs in place so the
-    updated code takes over WITHOUT relying on an external restarter — the fix
-    for the silent post-update death. Any failure in the re-exec path falls back
-    to ``os._exit(0)`` so we never leave a hung, half-updated process.
+    updated code takes over WITHOUT relying on an external restarter. An
+    unsupervised exec failure keeps the old process alive so it can remain
+    drained, report failure, and retry; exiting there would silently lose the
+    runner entirely.
     """
     supervisor = None
     try:
@@ -755,6 +759,7 @@ def _reexec_after_update() -> None:
             flush=True,
         )
         os._exit(0)
+        return True  # pragma: no cover - os._exit never returns.
     # No supervisor: re-exec in place so the update is not silently lost.
     print(
         "[runner] auto-update complete — NO process supervisor detected "
@@ -765,12 +770,14 @@ def _reexec_after_update() -> None:
     )
     try:
         os.execv(sys.executable, [sys.executable] + sys.argv)
-    except Exception as exc:  # pragma: no cover - defensive fallback
+        return True  # pragma: no cover - execv only returns in tests.
+    except Exception as exc:
         print(
-            f"[runner] re-exec failed ({exc!r}) — exiting for restart instead.",
+            f"[runner] re-exec failed ({exc!r}) — keeping the old process "
+            "alive and drained for retry.",
             flush=True,
         )
-        os._exit(0)
+        return False
 
 
 # ── Credential persistence ────────────────────────────────────────────────────
@@ -1686,20 +1693,17 @@ def _clean_source_sha(version_str: str | None) -> str | None:
 
 
 def _actionable_version_hint(value: object) -> str | None:
-    """Return a deploy identity only when the server supplied a real hint.
+    """Return only an exact commit identity suitable for checkout mutation.
 
-    Local and development orchestrators can legitimately lack ``DEPLOY_SHA``
-    metadata and historically expose the sentinel ``"unknown"``. Treating that
-    sentinel as a commit makes every healthy runner drain and retry updates
-    forever, even when it is already on the newest checkout.
+    Legacy display versions, short SHAs, refs, and development sentinels remain
+    non-actionable. They cannot safely select a Git object and therefore must
+    never drain capacity or reach the updater.
     """
 
     if not isinstance(value, str):
         return None
     hint = value.strip()
-    if not hint or hint.lower() in {"unknown", "local-dev"}:
-        return None
-    return hint
+    return hint if re.fullmatch(r"[0-9a-f]{40}", hint) else None
 
 
 def _node_runtime_ok() -> bool:
@@ -1731,6 +1735,39 @@ def _docker_agent_possible(caps: "iso.Capabilities", agent_image: str | None) ->
     identical to before the docker agent backend existed.
     """
     return bool(agent_image) and bool(caps.docker_usable)
+
+
+def _bwrap_agent_boundary_available(caps: "iso.Capabilities") -> bool:
+    """Whether bwrap agent work has a proven descendant-wide memory boundary.
+
+    ``RLIMIT_AS`` applies independently to each process, so it cannot contain an
+    agent that fans out into several Node/Vitest children. Agent bwrap work is
+    claimable only when capability detection proved a user ``MemoryMax`` scope.
+    Compute keeps its existing resource handling; this gate is specific to the
+    incident-prone agent process tree.
+    """
+    return bool(caps.bwrap_ok and caps.systemd_run_path)
+
+
+def _advertised_agent_backend(
+    caps: "iso.Capabilities",
+    *,
+    agent_binary_present: bool,
+    agent_image: str | None,
+    bwrap_agent_ok: bool,
+    docker_agent_ok: bool,
+) -> str:
+    """Select the normal backend while fencing any unbounded advertised leg."""
+    backend = iso.decide_agent_backend(
+        caps,
+        agent_binary_present=agent_binary_present,
+        agent_image=agent_image,
+    )
+    if backend == iso.BACKEND_BWRAP and not bwrap_agent_ok:
+        return iso.BACKEND_DOCKER if docker_agent_ok else iso.DECLINE
+    if backend == iso.BACKEND_DOCKER and not docker_agent_ok:
+        return iso.BACKEND_BWRAP if bwrap_agent_ok else iso.DECLINE
+    return backend
 
 
 def _agent_image_present(agent_image: str) -> bool:
@@ -1885,6 +1922,73 @@ def _memory_total_bytes() -> int | None:
     return None
 
 
+def _effective_agent_memory_limit() -> tuple[str, int]:
+    """Return the enforced per-agent memory cap and its byte value.
+
+    ``BLUEPRINT_RUNNER_MEM_LIMIT`` remains the operator authority when set. Its
+    validated value is canonicalized to decimal bytes for both systemd and
+    Docker. Without an explicit value, prefer 8 GiB (headroom for the supported
+    JS suites) but fit it below the host/control-plane memory floors so an 8 GiB
+    runner can admit one task. Admission reserves this exact value; a live
+    concurrency change therefore cannot make the cap and reservation diverge.
+    """
+    configured = os.environ.get("BLUEPRINT_RUNNER_MEM_LIMIT", "").strip()
+    if configured:
+        configured_bytes = iso._parse_mem_bytes(configured)
+        if configured_bytes is not None and configured_bytes > 0:
+            return str(configured_bytes), configured_bytes
+        print(
+            "[runner] WARNING: invalid BLUEPRINT_RUNNER_MEM_LIMIT="
+            f"{configured!r}; using the safe agent default.",
+            flush=True,
+        )
+
+    gib = 1024 * 1024 * 1024
+    preferred = 8 * gib
+    total_memory = _memory_total_bytes()
+    if total_memory is None:
+        effective = preferred
+    else:
+        host_reserve = _env_int(
+            "BLUEPRINT_RUNNER_RESERVED_MEMORY_BYTES", gib, minimum=0
+        )
+        min_free = _env_int(
+            "BLUEPRINT_RUNNER_MIN_FREE_MEMORY_BYTES", gib, minimum=0
+        )
+        # Never manufacture a token cap (for example one byte) that admission
+        # could accept but the supported runtime cannot use. Two GiB is the
+        # historical minimum agent reservation; below that safe host budget the
+        # ledger rejects the workload instead of claim/OOM-looping it.
+        minimum_viable = 2 * gib
+        safe_host_budget = total_memory - host_reserve - min_free
+        effective = min(preferred, max(minimum_viable, safe_host_budget))
+    return str(effective), effective
+
+
+def _agent_vitest_worker_env(memory_limit_bytes: int) -> dict[str, str]:
+    """Bound Vitest file workers to the enforced aggregate agent memory cap.
+
+    Agent and admin-ui currently span Vitest v2 and v4.  The two releases use
+    different environment-variable names, so publish both contracts.  One
+    worker per 2 GiB leaves room for the agent, npm, kernel/page tables, and the
+    test coordinator; four workers is the supported throughput ceiling even on
+    larger hosts.  The aggregate cgroup remains the final fail-closed boundary.
+    """
+    gib = 1024 * 1024 * 1024
+    workers = max(1, min(4, max(0, int(memory_limit_bytes)) // (2 * gib)))
+    value = str(workers)
+    return {
+        # Vitest <= 2 pool-specific controls.
+        "VITEST_MIN_THREADS": "1",
+        "VITEST_MAX_THREADS": value,
+        "VITEST_MIN_FORKS": "1",
+        "VITEST_MAX_FORKS": value,
+        # Vitest >= 4 unified worker controls.
+        "VITEST_MIN_WORKERS": "1",
+        "VITEST_MAX_WORKERS": value,
+    }
+
+
 def _env_enabled(name: str, default: bool = True) -> bool:
     """Parse a conventional boolean env var without making startup fragile."""
     raw = os.environ.get(name)
@@ -1923,17 +2027,41 @@ class _ResourceLedger:
         reserved_cpu_cores: float | None = None,
         reserved_memory_bytes: int | None = None,
         min_free_memory_bytes: int | None = None,
+        agent_memory_limit_bytes: int | None = None,
     ) -> None:
         self.workspace_root = workspace_root
         self.enabled = (
             _env_enabled("BLUEPRINT_RUNNER_RESOURCE_ADMISSION", True)
             if enabled is None else enabled
         )
-        self.agent = agent or _ResourceRequest(
-            cpu_cores=_env_float("BLUEPRINT_RUNNER_AGENT_CPU_RESERVATION_CORES", 1.0, minimum=0.0),
-            memory_bytes=_env_int("BLUEPRINT_RUNNER_AGENT_MEMORY_RESERVATION_BYTES", 2 * self._GIB, minimum=0),
-            disk_bytes=_env_int("BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES", 0, minimum=0),
-        )
+        if agent is not None:
+            self.agent = agent
+        else:
+            default_agent_memory = (
+                max(1, int(agent_memory_limit_bytes))
+                if agent_memory_limit_bytes is not None
+                else 2 * self._GIB
+            )
+            reserved_agent_memory = _env_int(
+                "BLUEPRINT_RUNNER_AGENT_MEMORY_RESERVATION_BYTES",
+                default_agent_memory,
+                minimum=0,
+            )
+            if agent_memory_limit_bytes is not None:
+                reserved_agent_memory = max(
+                    reserved_agent_memory, int(agent_memory_limit_bytes)
+                )
+            self.agent = _ResourceRequest(
+                cpu_cores=_env_float(
+                    "BLUEPRINT_RUNNER_AGENT_CPU_RESERVATION_CORES",
+                    1.0,
+                    minimum=0.0,
+                ),
+                memory_bytes=reserved_agent_memory,
+                disk_bytes=_env_int(
+                    "BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES", 0, minimum=0
+                ),
+            )
         self.compute = compute or _ResourceRequest(
             cpu_cores=_env_float("BLUEPRINT_RUNNER_COMPUTE_CPU_RESERVATION_CORES", 2.0, minimum=0.0),
             memory_bytes=_env_int("BLUEPRINT_RUNNER_COMPUTE_MEMORY_RESERVATION_BYTES", 4 * self._GIB, minimum=0),
@@ -1978,6 +2106,16 @@ class _ResourceLedger:
         if (
             total_memory is not None
             and reserved_memory + request.memory_bytes + self.reserved_memory_bytes > total_memory
+        ):
+            return "memory_reservation"
+        if (
+            request is self.agent
+            and total_memory is not None
+            and reserved_memory
+            + request.memory_bytes
+            + self.reserved_memory_bytes
+            + self.min_free_memory_bytes
+            > total_memory
         ):
             return "memory_reservation"
         free_memory = _memory_free_bytes()
@@ -3332,6 +3470,40 @@ _shutdown_event = threading.Event()
 # Separate from _shutdown_event — used during auto-update so background
 # threads (reaper, compute poller, main loop) are NOT signaled to exit.
 _update_in_progress = threading.Event()
+_claim_gate_lock = threading.Lock()
+_claims_in_flight = 0
+
+
+def _begin_claim() -> bool:
+    """Atomically enter the pre-claim handoff unless an update owns the gate."""
+    global _claims_in_flight
+    with _claim_gate_lock:
+        if _update_in_progress.is_set():
+            return False
+        _claims_in_flight += 1
+        return True
+
+
+def _end_claim() -> None:
+    """Release a pre-claim handoff after durable worker ownership is visible."""
+    global _claims_in_flight
+    with _claim_gate_lock:
+        if _claims_in_flight <= 0:
+            raise RuntimeError("runner claim gate counter underflow")
+        _claims_in_flight -= 1
+
+
+def _begin_update_drain() -> int:
+    """Atomically stop new claims and return handoffs already in flight."""
+    with _claim_gate_lock:
+        _update_in_progress.set()
+        return _claims_in_flight
+
+
+def _clear_update_drain() -> None:
+    """Release only the version-update-owned claim drain."""
+    with _claim_gate_lock:
+        _update_in_progress.clear()
 
 
 def _handle_signal(signum, frame):  # noqa: ARG001
@@ -4204,16 +4376,21 @@ def _heartbeat_loop(
     # describe shell-out) and send it on every heartbeat so the fleet view can show
     # which build each device runs. Best-effort: None when git/the repo is absent.
     version = _runner_version()
+    # Freeze a clean exact source identity for the life of this process.
+    # Unknown or dirty startup state is stale against any trusted exact hint;
+    # the raw live checkout SHA is used only as post-update disk proof below.
     checkout_sha = _clean_source_sha(version)
     consecutive_401 = 0
     consecutive_network_failures = 0
     next_auto_update_attempt_at = 0.0
     last_auto_update_failure: tuple[str, str | None] | None = None
-    # A deployment can legitimately advertise an older commit while this
-    # checkout already contains it. Remember that accepted ancestry relation so
-    # an update no-op does not re-exec the same newer checkout every heartbeat.
-    # A changed hint is evaluated afresh.
-    accepted_ancestor_version_hint: str | None = None
+    # When the current failure was last reported to /update-report. A distinct
+    # failure is reported immediately; the SAME failure is re-reported on this
+    # cadence so a persistently wedged update (e.g. unreachable version hint)
+    # keeps a visible operator trail instead of one alert per daemon lifetime
+    # (silent fleet drain, 2026-08-17).
+    last_auto_update_failure_reported_at = 0.0
+    _AUTO_UPDATE_FAILURE_REREPORT_SECONDS = 1800.0
     # Whether ANY heartbeat has ever authenticated (200/204). A token that has
     # never authenticated and gets a 401 is definitively bad (wrong/revoked, or a
     # deleted runner) — the daemon fast-fails on that first 401 rather than
@@ -4335,9 +4512,12 @@ def _heartbeat_loop(
             # which case these serialize as null (the schema tolerates them absent).
             if caps is not None:
                 isolation_backends = iso.capabilities_inventory(caps)
-                agent_backend = iso.decide_agent_backend(
-                    caps, agent_binary_present=agent_binary_present,
+                agent_backend = _advertised_agent_backend(
+                    caps,
+                    agent_binary_present=agent_binary_present,
                     agent_image=agent_image,
+                    bwrap_agent_ok=bwrap_agent_ok,
+                    docker_agent_ok=docker_agent_ok,
                 )
                 compute_backend = iso.decide_compute_backend(
                     caps, has_image=agent_image is not None
@@ -4532,56 +4712,26 @@ def _heartbeat_loop(
                     version_hint = _actionable_version_hint(
                         resp_body.get("version_hint")
                     )
-                    if version_hint and version:
-                        runner_sha = _describe_sha(version)
-                        if version_hint == accepted_ancestor_version_hint:
-                            stale = False
-                        elif runner_sha:
-                            stale = not version_hint.startswith(runner_sha)
-                        else:
-                            stale = version_hint not in version
-                        # A detached deployment checkout may already be newer
-                        # than the orchestrator's advertised commit. Prove that
-                        # relation before invoking do_update(): detached
-                        # checkouts intentionally have no upstream, so the
-                        # updater cannot be the prerequisite for this proof.
-                        ancestry_shortcut_eligible = (
-                            isinstance(version_hint, str)
-                            and re.fullmatch(r"[0-9a-f]{40}", version_hint) is not None
-                            # Bind the disk ancestry proof to the commit whose
-                            # code this process actually loaded. An operator or
-                            # deployment may move HEAD before restarting us.
-                            and _runner_version() == version
-                        )
-                        if (
-                            stale
-                            and ancestry_shortcut_eligible
-                            and br.checkout_contains_commit(version_hint)
-                        ):
-                            br.report_update_result(
-                                orchestrator_url,
-                                token,
-                                status="success",
-                                old_version=version,
-                                new_version=version,
-                            )
-                            accepted_ancestor_version_hint = version_hint
-                            last_auto_update_failure = None
-                            next_auto_update_attempt_at = 0.0
-                            _update_in_progress.clear()
-                            stale = False
-                            print(
-                                "[runner] checkout is newer than the "
-                                "orchestrator version hint and already "
-                                "contains it — continuing without an update.",
-                                flush=True,
-                            )
+                    if version_hint is None:
+                        # Version drain state is owned by the current
+                        # server-authoritative exact hint. If that authority is
+                        # withdrawn or becomes non-actionable, do not leave the
+                        # runner permanently drained by an older response.
+                        last_auto_update_failure = None
+                        last_auto_update_failure_reported_at = 0.0
+                        next_auto_update_attempt_at = 0.0
+                        _clear_update_drain()
+                    else:
+                        # Bind staleness to the commit this process loaded at
+                        # startup, not a checkout another process may move on
+                        # disk before this daemon has re-execed.
+                        stale = checkout_sha != version_hint
                         if stale:
                             # Enter drain mode immediately. Both agent and
                             # compute pollers stop NEW claims while existing
                             # work finishes, guaranteeing a long-lived resident
                             # cannot starve a runner rollout forever.
-                            _update_in_progress.set()
+                            claims_in_flight = _begin_update_drain()
                             # Check if runner is completely idle before attempting
                             # auto-update (no active tasks and no compute jobs).
                             with lock:
@@ -4595,6 +4745,7 @@ def _heartbeat_loop(
                             if (
                                 not has_tasks
                                 and not has_compute
+                                and claims_in_flight == 0
                                 and time.monotonic() >= next_auto_update_attempt_at
                             ):
                                 print(
@@ -4604,20 +4755,15 @@ def _heartbeat_loop(
                                     flush=True,
                                 )
                                 try:
-                                    result = br.do_update(restart_service=False)
+                                    result = br.do_update(
+                                        restart_service=False,
+                                        target_commit=version_hint,
+                                    )
                                 except Exception:
                                     raise
                                 if result == 0:
                                     refreshed_version = _runner_version()
-                                    refreshed_sha = _describe_sha(refreshed_version)
-                                    refreshed_matches_exactly = (
-                                        bool(refreshed_sha)
-                                        and version_hint.startswith(refreshed_sha)
-                                    ) or (
-                                        bool(refreshed_version)
-                                        and version_hint in refreshed_version
-                                    )
-                                    if refreshed_matches_exactly:
+                                    if _checkout_source_sha() == version_hint:
                                         br.report_update_result(
                                             orchestrator_url,
                                             token,
@@ -4629,31 +4775,11 @@ def _heartbeat_loop(
                                         # replace this process after convergence
                                         # instead of trusting an unverified
                                         # external service restart.
-                                        _reexec_after_update()
-                                    elif br.checkout_contains_commit(version_hint):
-                                        br.report_update_result(
-                                            orchestrator_url,
-                                            token,
-                                            status="success",
-                                            old_version=version,
-                                            new_version=refreshed_version,
-                                        )
-                                        accepted_ancestor_version_hint = version_hint
-                                        version = refreshed_version or version
-                                        last_auto_update_failure = None
-                                        next_auto_update_attempt_at = 0.0
-                                        _update_in_progress.clear()
-                                        print(
-                                            "[runner] checkout is newer than the "
-                                            "orchestrator version hint and already "
-                                            "contains it — continuing without "
-                                            "re-exec; this hint will not trigger "
-                                            "another update.",
-                                            flush=True,
-                                        )
-                                    else:
-                                        failure = (version_hint, refreshed_version)
-                                        if last_auto_update_failure != failure:
+                                        if not _reexec_after_update():
+                                            failure = (
+                                                version_hint,
+                                                refreshed_version,
+                                            )
                                             br.report_update_result(
                                                 orchestrator_url,
                                                 token,
@@ -4662,6 +4788,37 @@ def _heartbeat_loop(
                                                 new_version=refreshed_version,
                                             )
                                             last_auto_update_failure = failure
+                                            last_auto_update_failure_reported_at = (
+                                                time.monotonic()
+                                            )
+                                            next_auto_update_attempt_at = (
+                                                time.monotonic() + 60.0
+                                            )
+                                            print(
+                                                "[runner] exact update reached disk "
+                                                "but re-exec failed — remaining "
+                                                "drained and retrying in 60 seconds.",
+                                                flush=True,
+                                            )
+                                    else:
+                                        failure = (version_hint, refreshed_version)
+                                        if (
+                                            last_auto_update_failure != failure
+                                            or time.monotonic()
+                                            - last_auto_update_failure_reported_at
+                                            >= _AUTO_UPDATE_FAILURE_REREPORT_SECONDS
+                                        ):
+                                            br.report_update_result(
+                                                orchestrator_url,
+                                                token,
+                                                status="failure",
+                                                old_version=version,
+                                                new_version=refreshed_version,
+                                            )
+                                            last_auto_update_failure = failure
+                                            last_auto_update_failure_reported_at = (
+                                                time.monotonic()
+                                            )
                                         next_auto_update_attempt_at = (
                                             time.monotonic() + 60.0
                                         )
@@ -4674,7 +4831,12 @@ def _heartbeat_loop(
                                         )
                                 else:
                                     failure = (version_hint, None)
-                                    if last_auto_update_failure != failure:
+                                    if (
+                                        last_auto_update_failure != failure
+                                        or time.monotonic()
+                                        - last_auto_update_failure_reported_at
+                                        >= _AUTO_UPDATE_FAILURE_REREPORT_SECONDS
+                                    ):
                                         br.report_update_result(
                                             orchestrator_url,
                                             token,
@@ -4683,6 +4845,9 @@ def _heartbeat_loop(
                                             new_version=None,
                                         )
                                         last_auto_update_failure = failure
+                                        last_auto_update_failure_reported_at = (
+                                            time.monotonic()
+                                        )
                                     next_auto_update_attempt_at = (
                                         time.monotonic() + 60.0
                                     )
@@ -4692,20 +4857,20 @@ def _heartbeat_loop(
                                         "and retrying in 60 seconds.",
                                         flush=True,
                                     )
-                            elif has_tasks or has_compute:
+                            elif has_tasks or has_compute or claims_in_flight:
                                 print(
                                     f"[runner] WARNING: runner version {version!r} "
                                     f"does not match orchestrator version hint "
                                     f"{version_hint!r} — draining new claims; "
-                                    "auto-update will start when current work finishes.",
+                                    "auto-update will start when current work and "
+                                    "claim handoffs finish.",
                                     flush=True,
                                 )
                         else:
-                            if version_hint != accepted_ancestor_version_hint:
-                                accepted_ancestor_version_hint = None
                             last_auto_update_failure = None
+                            last_auto_update_failure_reported_at = 0.0
                             next_auto_update_attempt_at = 0.0
-                            _update_in_progress.clear()
+                            _clear_update_drain()
                 _write_status_json(
                     runner_id=hostname,
                     last_heartbeat_status="ok",
@@ -6510,7 +6675,14 @@ def _run_compute_job(
 
     caps = capabilities if capabilities is not None else _get_capabilities()
     cpu_limit = os.environ.get("BLUEPRINT_RUNNER_CPU_LIMIT") or None
-    mem_limit = os.environ.get("BLUEPRINT_RUNNER_MEM_LIMIT") or None
+    raw_mem_limit = os.environ.get("BLUEPRINT_RUNNER_MEM_LIMIT") or None
+    parsed_mem_limit = iso._parse_mem_bytes(raw_mem_limit)
+    mem_limit = str(parsed_mem_limit) if parsed_mem_limit is not None else None
+    if raw_mem_limit and mem_limit is None:
+        print(
+            f"[compute] ignoring invalid BLUEPRINT_RUNNER_MEM_LIMIT={raw_mem_limit!r}",
+            flush=True,
+        )
     has_image = bool(container_image)
 
     tmpdir: str | None = None
@@ -7301,6 +7473,7 @@ def _compute_poll_loop(
         reservation_key: str | None = None
         durable_reservation_key: str | None = None
         claimed_job_id: str | None = None
+        claim_gate_entered = False
         try:
             if _update_in_progress.is_set():
                 time.sleep(poll_interval)
@@ -7425,6 +7598,16 @@ def _compute_poll_loop(
                     )
                     time.sleep(poll_interval)
                     continue
+
+            if not _begin_claim():
+                if resource_ledger is not None:
+                    resource_ledger.release(reservation_key)
+                reservation_key = None
+                _release_capacity(capacity)
+                capacity_acquired = False
+                time.sleep(poll_interval)
+                continue
+            claim_gate_entered = True
 
             try:
                 resp = _post(url, token, {}, return_headers=True)
@@ -7568,6 +7751,9 @@ def _compute_poll_loop(
                 _release_capacity(capacity)
             print(f"[compute] poll loop error (continuing): {exc}", flush=True)
             time.sleep(5)
+        finally:
+            if claim_gate_entered:
+                _end_claim()
 
 
 # ── Preflight + main ──────────────────────────────────────────────────────────
@@ -8018,10 +8204,11 @@ def _preflight(
     # A docker+image box claims (read-only) agent work even without bwrap; the
     # host agent binary is carried by the image, so claimable_classes (which only
     # knows about the bwrap path) under-reports it. Relax it here.
-    bwrap_agent = claimable[iso.CLASS_AGENT]
+    bwrap_agent = (
+        claimable[iso.CLASS_AGENT] and _bwrap_agent_boundary_available(caps)
+    )
     docker_agent = _docker_agent_possible(caps, agent_image)
-    if docker_agent:
-        claimable = {**claimable, iso.CLASS_AGENT: True}
+    claimable = {**claimable, iso.CLASS_AGENT: bwrap_agent or docker_agent}
     # Runner-DECLARED agent capability floor (mirrors the heartbeat loop): a
     # docker-ONLY box (docker+image, no bwrap agent path) can run only the read-only
     # agent slice, so it declares that slice for the orchestrator to intersect with
@@ -8031,7 +8218,17 @@ def _preflight(
         if (docker_agent and not bwrap_agent)
         else None
     )
-    agent_reason = iso.agent_decline_reason(caps, agent_binary is not None)
+    if (
+        caps.bwrap_ok
+        and agent_binary is not None
+        and not _bwrap_agent_boundary_available(caps)
+        and not docker_agent
+    ):
+        agent_reason = (
+            "bwrap aggregate memory scope unavailable and docker agent unavailable"
+        )
+    else:
+        agent_reason = iso.agent_decline_reason(caps, agent_binary is not None)
     compute_reason = None
     if not claimable[iso.CLASS_COMPUTE]:
         compute_reason = "no bwrap sandbox and no usable container runtime"
@@ -8060,9 +8257,12 @@ def _preflight(
         # populates the fleet view the same way the running heartbeat does.
         "isolation_backends": iso.capabilities_inventory(caps),
         "container_gpu_passthrough": caps.container_gpu_passthrough,
-        "agent_backend": iso.decide_agent_backend(
-            caps, agent_binary_present=agent_binary is not None,
+        "agent_backend": _advertised_agent_backend(
+            caps,
+            agent_binary_present=agent_binary is not None,
             agent_image=agent_image,
+            bwrap_agent_ok=bwrap_agent,
+            docker_agent_ok=docker_agent,
         ),
         "compute_backend": iso.decide_compute_backend(
             caps, has_image=agent_image is not None
@@ -8136,9 +8336,9 @@ def _preflight(
         flush=True,
     )
     caps_state = (
-        f"{caps.systemd_run_path} (resource caps available)"
+        f"{caps.systemd_run_path} (bounded agent scopes available)"
         if caps.systemd_run_path
-        else "none (resource caps best-effort via rlimit only)"
+        else "none (bwrap agent work disabled; no aggregate descendant cap)"
     )
     print(f"    resource cap : {caps_state}", flush=True)
 
@@ -8197,7 +8397,7 @@ def _preflight(
 
     print("  task classes:", flush=True)
     if claimable[iso.CLASS_AGENT]:
-        if caps.bwrap_ok:
+        if bwrap_agent:
             agent_via = "bwrap" + (f" + docker image {agent_image}" if docker_agent else "")
         else:
             agent_via = f"docker image {agent_image} (read-only types)"
@@ -8223,7 +8423,7 @@ def _preflight(
     # on this host but node dependencies were never installed (tsx not found).
     # The docker agent backend carries the runtime in the image, so host deps
     # are irrelevant there — only warn for the bwrap path.
-    if caps.bwrap_ok and _agent_deps_missing():
+    if bwrap_agent and _agent_deps_missing():
         print(
             "    agent deps  : MISSING — run `cd agent && npm install` (or re-run\n"
             "                  `blueprint-runner install`, which now bootstraps them).",
@@ -8464,6 +8664,7 @@ def _spawn_agent_task(
     llm_files: list[dict[str, str]] | None = None,
     decline_reason_out: list[str] | None = None,
     verification_toolchain: "iso.VerificationToolchain | None" = None,
+    mem_limit: str | None = None,
 ) -> bool:
     """Plan (fail-closed) + spawn one claimed agent task; record it for reaping.
 
@@ -8499,10 +8700,23 @@ def _spawn_agent_task(
             decline_reason_out.append(reason)
         return False
 
+    if mem_limit is None:
+        mem_limit, _mem_limit_bytes = _effective_agent_memory_limit()
+    else:
+        _mem_limit_bytes = iso._parse_mem_bytes(mem_limit)
+        if _mem_limit_bytes is None:
+            return _decline("invalid agent memory limit")
+        mem_limit = str(_mem_limit_bytes)
+
     if backend == iso.DECLINE:
         # No isolation boundary for THIS task type on this host (fail-closed).
         return _decline(
             iso.agent_decline_reason(caps, present) or "no agent sandbox"
+        )
+    if backend == iso.BACKEND_BWRAP and not _bwrap_agent_boundary_available(caps):
+        return _decline(
+            "bwrap aggregate memory scope unavailable; refusing an unbounded "
+            "agent process tree"
         )
     # The bwrap backend needs the HOST agent dist; the docker backend carries the
     # agent in the image, so a missing host binary is only fatal off the docker path.
@@ -8572,6 +8786,11 @@ def _spawn_agent_task(
     }
     if effective_llm_env:
         injected_env.update(effective_llm_env)
+    # Provider credential material is untrusted for execution-policy knobs.
+    # Apply the task memory-derived worker ceiling after it so every bare
+    # `npx vitest run` inside this agent process tree is bounded on both the
+    # repository's Vitest v2 and v4 packages.
+    injected_env.update(_agent_vitest_worker_env(_mem_limit_bytes))
     # Task identity is authoritative and must not be overridden by provider
     # credential material returned in credentials.env.
     injected_env["BLUEPRINT_PRE_CLAIM_TASK_TYPE"] = task_type
@@ -8613,9 +8832,26 @@ def _spawn_agent_task(
         task_type=task_type,
         agent_image=plan_image,
         verification_toolchain=verification_toolchain or _current_verification_toolchain(),
+        mem_limit=mem_limit,
     )
     if plan.declined:
         return _decline(plan.decline_reason or "sandbox plan declined")
+
+    scope_prefix: list[str] = []
+    if plan.backend == iso.BACKEND_BWRAP:
+        safe_task = "".join(
+            ch if ch.isalnum() or ch in "-_" else "-" for ch in task_id
+        )[:24]
+        scope_prefix = iso.build_resource_scope_prefix(
+            caps,
+            cpu_limit=None,
+            mem_limit=mem_limit,
+            scope_name=f"bp-agent-{safe_task}-{secrets.token_hex(4)}",
+        )
+        if not scope_prefix:
+            return _decline(
+                "failed to build the required aggregate bwrap memory scope"
+            )
 
     # Write the supervisor marker now that the plan is accepted: it must exist
     # BEFORE the agent starts so its boot-mode decision is deterministic. The
@@ -8654,11 +8890,33 @@ def _spawn_agent_task(
             flush=True,
         )
 
-    popen_kwargs: dict = {"env": plan.env, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+    # Docker carries its limit in `docker run`. Host-backed agents move into a
+    # transient user scope so MemoryMax contains the complete bwrap/Vitest
+    # descendant tree without making a child OOM an OOM event for the runner
+    # service itself. The outer systemd client receives the same minimal trusted
+    # user-bus context as the startup probe; bwrap strips those variables before
+    # the untrusted agent starts. An unbounded bwrap path was rejected above.
+    plan_argv = list(plan.argv)
+    process_env = dict(plan.env)
+    if plan.backend == iso.BACKEND_BWRAP:
+        for key in iso.SYSTEMD_USER_BUS_ENV_KEYS:
+            process_env.pop(key, None)
+        process_env.update(iso.systemd_user_bus_env(os.environ))
+        unset_bus_env: list[str] = []
+        for key in iso.SYSTEMD_USER_BUS_ENV_KEYS:
+            unset_bus_env += ["--unsetenv", key]
+        plan_argv = [plan_argv[0], *unset_bus_env, *plan_argv[1:]]
+    run_argv = [*scope_prefix, *plan_argv]
+
+    popen_kwargs: dict = {
+        "env": process_env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+    }
     if hasattr(os, "setsid"):
         popen_kwargs["start_new_session"] = True
     try:
-        proc = subprocess.Popen(plan.argv, **popen_kwargs)
+        proc = subprocess.Popen(run_argv, **popen_kwargs)
     except Exception as exc:
         if _log_file_handle is not None:
             try:
@@ -8931,7 +9189,17 @@ def main() -> None:
         )
 
     gpu_state = _make_gpu_state(caps)
-    resource_ledger = _ResourceLedger(_workspace_root())
+    agent_mem_limit, agent_mem_limit_bytes = _effective_agent_memory_limit()
+    resource_ledger = _ResourceLedger(
+        _workspace_root(), agent_memory_limit_bytes=agent_mem_limit_bytes
+    )
+    print(
+        "[runner] agent process boundary: "
+        f"memory={agent_mem_limit} bytes_reserved={resource_ledger.agent.memory_bytes} "
+        "vitest_workers="
+        f"{_agent_vitest_worker_env(agent_mem_limit_bytes)['VITEST_MAX_WORKERS']}",
+        flush=True,
+    )
 
     # Best-effort startup sweep of any stray tagged containers from a prior crash.
     iso.sweep_stale_containers(caps)
@@ -9073,7 +9341,8 @@ def main() -> None:
             gpu_capabilities,
             active_compute_jobs,
             compute_lock,
-            caps.bwrap_ok,  # agent_sandbox_ok — gates the bwrap advertisement leg
+            _bwrap_agent_boundary_available(caps),
+            # agent_sandbox_ok — bwrap plus a proven aggregate MemoryMax scope
         ),
         kwargs={
             "telemetry": telemetry,
@@ -9132,9 +9401,12 @@ def main() -> None:
     next_task_url = f"{orchestrator_url}/api/runner/next-task"
     min_free_disk = _min_free_disk_bytes()
 
-    # An agent sandbox exists iff bwrap can be built OR a docker+image backend is
-    # available. When agent_image is None this is exactly caps.bwrap_ok (unchanged).
-    agent_sandbox_ok = caps.bwrap_ok or _docker_agent_possible(caps, agent_image)
+    # Agent work additionally needs a descendant-wide memory boundary. Docker's
+    # container limit provides one; bwrap is enabled only after the bounded
+    # user-scope probe succeeds. Never claim and then discover this after dispatch.
+    agent_sandbox_ok = _bwrap_agent_boundary_available(
+        caps
+    ) or _docker_agent_possible(caps, agent_image)
 
     # Last-resort teardown: a crashed runner never runs the per-task cleanup
     # (agent exit) nor the stale sweep (the reap loop died), so every workspace
@@ -9149,6 +9421,7 @@ def main() -> None:
     while not _shutdown_event.is_set():
         reservation_key: str | None = None
         task_reservation_key: str | None = None
+        claim_gate_entered = False
         try:
             _supervise_threads(background_threads)
 
@@ -9235,6 +9508,14 @@ def main() -> None:
                 )
                 time.sleep(poll_interval)
                 continue
+
+            if not _begin_claim():
+                resource_ledger.release(reservation_key)
+                reservation_key = None
+                _release_capacity(agent_capacity)
+                time.sleep(poll_interval)
+                continue
+            claim_gate_entered = True
 
             try:
                 resp = _post(next_task_url, token, {}, return_headers=True)
@@ -9432,6 +9713,7 @@ def main() -> None:
                 llm_env=llm_env,
                 llm_files=llm_files,
                 decline_reason_out=decline_reason,
+                mem_limit=agent_mem_limit,
             )
             if not spawned:
                 # DECLINE / spawn failure — the reaper never sees this task, so the
@@ -9457,6 +9739,9 @@ def main() -> None:
                 resource_ledger.release(task_reservation_key)
             print(f"[runner] agent poll loop error (continuing): {exc}", flush=True)
             time.sleep(5)
+        finally:
+            if claim_gate_entered:
+                _end_claim()
 
     # Drain active compute jobs first — daemon threads would be killed on
     # process exit, so give them a chance to report their final status.

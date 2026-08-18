@@ -456,7 +456,7 @@ function turnResult(over: Partial<ResidentTurnResult> = {}): ResidentTurnResult 
 
 /** Build a mock ResidentSession whose sendTurn is fully scripted. */
 function makeSession(
-  sendTurn: (text: string | Array<Record<string, unknown>>) => Promise<ResidentTurnResult>,
+  sendTurn: (text: string | Array<Record<string, unknown>>) => Promise<ResidentTurnResult> | ResidentTurnResult,
   alive: () => boolean,
 ) {
   let cb: ((ev: ResidentSessionEvent) => void) | null = null;
@@ -655,7 +655,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     const statusRef = { value: '' };
     let statusAtLoopEntry = '';
     mockStartSession.mockReturnValue(makeSession(
-      async () => turnResult(),
+      () => turnResult(),
       () => {
         statusAtLoopEntry = statusRef.value;
         return false;
@@ -1714,14 +1714,14 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         return Promise.resolve({ acquired: true, lease: { lease_id: 'lease-1', generation: 7 } });
       }
       if (url.endsWith('/typed-fast-lease/release')) {
-        order.push(`release:${body?.reason}`);
+        order.push(`release:${String(body?.reason)}`);
         return Promise.resolve({ released: true });
       }
       return Promise.resolve({});
     });
-    typedFastMocks.ensureReady.mockImplementation(async () => { order.push('ready'); });
+    typedFastMocks.ensureReady.mockImplementation(() => { order.push('ready'); return Promise.resolve(); });
     typedFastMocks.close.mockImplementation(() => { order.push('close'); });
-    mockStartSession.mockReturnValue(makeSession(async () => turnResult(), () => false));
+    mockStartSession.mockReturnValue(makeSession(() => turnResult(), () => false));
 
     await run('typed-fast-normal-shutdown');
 
@@ -1760,7 +1760,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       return Promise.resolve({});
     });
     const workday = makeSession(
-      async () => turnResult({ sentOperatorMessage: true, resultText: 'Workday fallback reply.' }),
+      () => turnResult({ sentOperatorMessage: true, resultText: 'Workday fallback reply.' }),
       () => true,
     );
     mockStartSession.mockReturnValue(workday);
@@ -1999,7 +1999,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       finishReadiness = resolve;
     }));
     typedFastMocks.close.mockImplementation(() => { finishReadiness?.(); });
-    const workday = makeSession(async () => turnResult(), () => true);
+    const workday = makeSession(() => turnResult(), () => true);
     mockStartSession.mockReturnValue(workday);
 
     const done = run('typed-fast-readiness-pending', {
@@ -2092,13 +2092,13 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       return Promise.resolve({});
     });
     typedFastMocks.ensureReady.mockReturnValue(readiness);
-    typedFastMocks.dispatch.mockImplementation(async (receipt: unknown) => ({
+    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
       receipt,
       result: turnResult(),
       completion: { receipt, content: 'Fast reply after the stale heartbeat.' },
       workdayRequests: [],
     }));
-    mockStartSession.mockReturnValue(makeSession(async () => turnResult(), () => workdayAlive));
+    mockStartSession.mockReturnValue(makeSession(() => turnResult(), () => workdayAlive));
 
     const done = run('typed-fast-stale-heartbeat-before-acquire', {
       ...qualifiedPayload(),
@@ -2157,7 +2157,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       if (url.endsWith('/typed-fast-lease/release')) return Promise.resolve({ released: true });
       return Promise.resolve({});
     });
-    mockStartSession.mockReturnValue(makeSession(async () => turnResult(), () => true));
+    mockStartSession.mockReturnValue(makeSession(() => turnResult(), () => true));
 
     const done = run('typed-fast-exact-lease-revoked', {
       ...qualifiedPayload(),
@@ -2219,11 +2219,12 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     const claimBodies: Array<Record<string, unknown> | undefined> = [];
 
     typedFastMocks.isAlive.mockImplementation(() => controllerAlive);
-    typedFastMocks.ensureReady.mockImplementation(async () => {
+    typedFastMocks.ensureReady.mockImplementation(() => {
       readinessCount += 1;
       if (readinessCount === 2) controllerAlive = true;
+      return Promise.resolve();
     });
-    typedFastMocks.dispatch.mockImplementation(async (receipt: unknown) => ({
+    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
       receipt,
       result: turnResult(),
       completion: { receipt, content: 'Replacement Fast child replied.' },
@@ -2269,7 +2270,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       }
       return Promise.resolve({});
     });
-    mockStartSession.mockReturnValue(makeSession(async () => turnResult(), () => workdayAlive));
+    mockStartSession.mockReturnValue(makeSession(() => turnResult(), () => workdayAlive));
 
     const done = run('typed-fast-dead-after-readiness', {
       ...qualifiedPayload(),
@@ -3259,13 +3260,13 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       }
       return Promise.resolve({});
     });
-    typedFastMocks.dispatch.mockImplementation(async (receipt: unknown) => ({
+    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
       receipt,
       result: turnResult({ resultText: `reply-${completed + 1}` }),
       completion: { receipt, content: `reply-${completed + 1}` },
       workdayRequests: [],
     }));
-    const workday = makeSession(async () => turnResult(), () => completed < 2);
+    const workday = makeSession(() => turnResult(), () => completed < 2);
     mockStartSession.mockReturnValue(workday);
 
     await run('typed-fast-stale-recovery', {
@@ -3284,14 +3285,14 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(completionCalls).toHaveLength(2);
     expect(completionCalls[0]?.[2]).toBe(1);
     expect(completionCalls[0]?.[3]).toBe(5_000);
-    const recoveredPrompt = typedFastMocks.dispatch.mock.calls[0]?.[1];
+    const recoveredPrompt: unknown = typedFastMocks.dispatch.mock.calls[0]?.[1];
     const recoveredPromptText = typeof recoveredPrompt === 'string'
       ? recoveredPrompt
       : JSON.stringify(recoveredPrompt);
     expect(recoveredPromptText).toContain(
       'attachments from this interrupted turn exceeded the safe delivery limit',
     );
-    const ordinaryPrompt = typedFastMocks.dispatch.mock.calls[1]?.[1];
+    const ordinaryPrompt: unknown = typedFastMocks.dispatch.mock.calls[1]?.[1];
     const ordinaryPromptText = typeof ordinaryPrompt === 'string'
       ? ordinaryPrompt
       : JSON.stringify(ordinaryPrompt);
@@ -3367,13 +3368,13 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       }
       return Promise.resolve({});
     });
-    typedFastMocks.dispatch.mockImplementation(async (receipt: unknown) => ({
+    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
       receipt,
       result: turnResult({ resultText: 'Hello.' }),
       completion: { receipt, content: 'Hello.' },
       workdayRequests: [],
     }));
-    const workday = makeSession(async () => turnResult(), () => !completed);
+    const workday = makeSession(() => turnResult(), () => !completed);
     mockStartSession.mockReturnValue(workday);
 
     await run('typed-fast-paced-conflict', {
@@ -3405,7 +3406,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       return Promise.resolve({});
     });
     typedFastMocks.ensureReady.mockRejectedValue(new Error('warm probe failed'));
-    mockStartSession.mockReturnValue(makeSession(async () => turnResult(), () => false));
+    mockStartSession.mockReturnValue(makeSession(() => turnResult(), () => false));
 
     await run('typed-fast-readiness-failed');
 
@@ -3460,7 +3461,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       return Promise.resolve({});
     });
     const workday = makeSession(
-      async () => turnResult({ sentOperatorMessage: true, resultText: 'Workday took over.' }),
+      () => turnResult({ sentOperatorMessage: true, resultText: 'Workday took over.' }),
       () => true,
     );
     mockStartSession.mockReturnValue(workday);
@@ -3917,7 +3918,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       return Promise.resolve({});
     });
     const workday = makeSession(
-      async () => turnResult({ resultText: 'Chat mode must not self-prompt.' }),
+      () => turnResult({ resultText: 'Chat mode must not self-prompt.' }),
       () => true,
     );
     mockStartSession.mockReturnValue(workday);
@@ -4688,9 +4689,8 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       }
       capabilityRevokedAtTurnStart = privateReplyPaths.length === 3
         && privateReplyPaths.every((artifactPath) => !fs.existsSync(artifactPath));
-      privateMarkerKindAtTurnStart = JSON.parse(
-        fs.readFileSync(privateTurnMarkerPath, 'utf8'),
-      ).kind as string;
+      const marker = JSON.parse(fs.readFileSync(privateTurnMarkerPath, 'utf8')) as { kind?: string };
+      privateMarkerKindAtTurnStart = marker.kind ?? '';
       framesAtPrivateTurnStart = mockSendWsFrame.mock.calls.length;
       workday._emit({ kind: 'text', text: 'PRIVATE_WORKDAY_TEXT_MUST_NOT_STREAM' });
       workday._emit({ kind: 'tool', toolName: 'private_tool', text: 'PRIVATE_TOOL_MUST_NOT_STREAM' });
@@ -4704,7 +4704,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         env.BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH,
         env.BLUEPRINT_RESIDENT_STAGED_REPLY_PATH,
       ].filter((value): value is string => typeof value === 'string' && value.length > 0);
-      privateTurnMarkerPath = env.BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH ?? '';
+      privateTurnMarkerPath = env.BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH;
       for (const artifactPath of privateReplyPaths) {
         fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
         fs.writeFileSync(artifactPath, 'stale-public-reply-capability');
@@ -4928,7 +4928,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       return;
     }
 
-    const fastReceipt = typedFastMocks.dispatch.mock.calls[0]?.[0];
+    const fastReceipt: unknown = typedFastMocks.dispatch.mock.calls[0]?.[0];
     if (workdayCompletesFirst) {
       // Workday owns the newer status write. Fast began while Workday was still
       // active, so its saved pre-turn snapshot is now stale and must not win
@@ -5123,10 +5123,14 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
       '/tmp',
       expect.objectContaining({
         residentReplyOnly: true,
-        replyReceiptPath: expect.any(String),
-        stagedReplyPath: expect.any(String),
       }),
     );
+    const runtime = installedRuntime as {
+      replyReceiptPath?: unknown;
+      stagedReplyPath?: unknown;
+    };
+    expect(runtime.replyReceiptPath).toEqual(expect.any(String));
+    expect(runtime.stagedReplyPath).toEqual(expect.any(String));
     expect(mockWriteStrategicHelpers).toHaveBeenCalledWith(
       'task-stale-reply-key',
       'proj-stale-reply-key',
@@ -6824,9 +6828,11 @@ describe('handleStrategicResident — operator-turn responsiveness', () => {
 
     const ackPosts: Array<Record<string, unknown>> = [];
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      const idempotencyKey = (body?.data as Record<string, unknown> | undefined)?.idempotency_key;
       if (
         url.includes('/api/agent/strategic') && body?.op === 'create_message'
-        && String((body.data as Record<string, unknown> | undefined)?.idempotency_key ?? '').includes('resident-ack-')
+        && typeof idempotencyKey === 'string'
+        && idempotencyKey.includes('resident-ack-')
       ) {
         ackPosts.push(body);
       }
@@ -7115,8 +7121,9 @@ describe('handleStrategicResident - failed-turn recovery', () => {
         stop_requested: true,
       });
     });
-    mockPrepareWorkspaceForRole.mockImplementationOnce(async () => {
+    mockPrepareWorkspaceForRole.mockImplementationOnce(() => {
       vi.setSystemTime(new Date(Date.now() + 181_000));
+      return Promise.resolve();
     });
     const statusRef = { value: 'preparing' };
 
@@ -7300,12 +7307,12 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(session.sendTurn.mock.calls[0]?.[0]).toEqual(
       expect.stringContaining(message.content),
     );
-    expect(mockStartSession).toHaveBeenCalledWith(expect.objectContaining({
-      env: expect.objectContaining({
-        BLUEPRINT_RESIDENT_INCARNATION_ID: expect.any(String),
-        BLUEPRINT_RESIDENT_REPLY_KEY_PATH: expect.any(String),
-      }),
-    }));
+    expect(mockStartSession).toHaveBeenCalled();
+    const sessionOptions = mockStartSession.mock.calls[0]?.[0] as {
+      env?: Record<string, unknown>;
+    };
+    expect(sessionOptions.env?.BLUEPRINT_RESIDENT_INCARNATION_ID).toEqual(expect.any(String));
+    expect(sessionOptions.env?.BLUEPRINT_RESIDENT_REPLY_KEY_PATH).toEqual(expect.any(String));
     expect(heartbeatCount).toBeGreaterThan(1);
   });
 
@@ -7926,7 +7933,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       if (String(file).endsWith('.resident-reply-receipt.json')) {
         installedReceipts.push(JSON.parse(written));
       }
-      return realWriteFileSync(file, data, options);
+      realWriteFileSync(file, data, options);
     });
 
     const runAttempt = async (
@@ -8067,9 +8074,9 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       task_id: 'task-durable-claim',
       session_id: 'durable-session',
       worker_generation: 1,
-      resident_incarnation_id: expect.any(String),
       message_ids: [operatorMessage.id],
     })]);
+    expect(claimBodies[0]?.resident_incarnation_id).toEqual(expect.any(String));
     expect(claimBodies[0]).not.toHaveProperty('incarnation_id');
     expect(replyBodies).toHaveLength(1);
     expect(replyBodies[0]).toMatchObject({
@@ -8313,12 +8320,13 @@ describe('handleStrategicResident - failed-turn recovery', () => {
         { project_metadata: { project_id: 'proj-rolling-claim' }, context: {} },
         'ghtok', 'owner', 'repo', null, { value: '' },
       );
-      let settled = false;
-      void handling.finally(() => { settled = true; });
-      for (let step = 0; step < 20 && !settled; step += 1) {
+      const state = { settled: false };
+      void handling.finally(() => { state.settled = true; });
+      for (let step = 0; step < 20; step += 1) {
+        if (state.settled) break;
         await vi.advanceTimersByTimeAsync(10_000);
       }
-      expect(settled).toBe(true);
+      expect(state.settled).toBe(true);
       await handling;
     } finally {
       vi.clearAllTimers();
@@ -8429,12 +8437,13 @@ describe('handleStrategicResident - failed-turn recovery', () => {
         },
         'ghtok', 'owner', 'repo', null, { value: '' },
       );
-      let settled = false;
-      void handling.finally(() => { settled = true; });
-      for (let step = 0; step < 20 && !settled; step += 1) {
+      const state = { settled: false };
+      void handling.finally(() => { state.settled = true; });
+      for (let step = 0; step < 20; step += 1) {
+        if (state.settled) break;
         await vi.advanceTimersByTimeAsync(10_000);
       }
-      expect(settled).toBe(true);
+      expect(state.settled).toBe(true);
       await handling;
     } finally {
       vi.clearAllTimers();
@@ -8509,12 +8518,13 @@ describe('handleStrategicResident - failed-turn recovery', () => {
         { project_metadata: { project_id: 'proj-lost-durable-claim' }, context: {} },
         'ghtok', 'owner', 'repo', null, { value: '' },
       );
-      let settled = false;
-      void handling.finally(() => { settled = true; });
-      for (let step = 0; step < 50 && !settled; step += 1) {
+      const state = { settled: false };
+      void handling.finally(() => { state.settled = true; });
+      for (let step = 0; step < 50; step += 1) {
+        if (state.settled) break;
         await vi.advanceTimersByTimeAsync(1_000);
       }
-      expect(settled).toBe(true);
+      expect(state.settled).toBe(true);
       await handling;
     } finally {
       vi.clearAllTimers();

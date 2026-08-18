@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
 
 from app import release_version as rv
 from app.models import Project
+from app.promotion_ci_dispatch import terminal_promotion_ci_dispatch_receipt
 from app.release_readiness import (
     _annotate_regime,
     _compute_requalification_decision,
@@ -376,13 +378,14 @@ def _patch_gate_github(
     head_sha: str = "abc123def456",
     resolved=("tok", "acme", "widget"),
     dispatch_ok: bool = True,
+    dispatch_outcome: str | None = None,
     inflight: dict | None = None,
 ):
     """Monkeypatch the github helpers the CI green gate consults — no live network.
 
     ``inflight`` is what ``get_latest_inflight_workflow_run_for_branch`` returns
     (default None → no in-flight branch run, so the gate dispatches as before).
-    Returns the ``dispatch_workflow_run`` mock so tests can assert on it.
+    Returns the structured dispatch mock so tests can assert on it.
     """
     mocker.patch(
         "app.release_promotion._resolve_github_with_session",
@@ -396,8 +399,10 @@ def _patch_gate_github(
         "app.github.get_latest_inflight_workflow_run_for_branch",
         new=AsyncMock(return_value=inflight),
     )
+    outcome = dispatch_outcome or ("accepted" if dispatch_ok else "ambiguous")
     return mocker.patch(
-        "app.github.dispatch_workflow_run", new=AsyncMock(return_value=dispatch_ok)
+        "app.github.dispatch_workflow_run_outcome",
+        new=AsyncMock(return_value=outcome),
     )
 
 
@@ -621,9 +626,7 @@ class TestPromotionCiGreenGate:
 
     @pytest.mark.asyncio
     async def test_failed_dispatch_maps_to_unavailable(self, db_session, mocker):
-        """When no run exists for HEAD and the fresh dispatch fails
-        (``dispatch_workflow_run`` returns falsy), the gate returns
-        ``unavailable`` — NOT ``dispatched`` — while still reporting the HEAD."""
+        """An ambiguous dispatch remains retryable after run reconciliation."""
         project, _ = await _make_project_and_version(db_session)
         disp = _patch_gate_github(
             mocker, run=None, head_sha="cafef00d", dispatch_ok=False
@@ -633,8 +636,61 @@ class TestPromotionCiGreenGate:
         )
         assert gate["gate_state"] == "unavailable"
         assert gate["head_sha"] == "cafef00d"
-        assert "failed to dispatch" in gate["reason"]
+        assert gate["dispatch_outcome"] == "ambiguous"
+        assert gate["dispatch_retryable"] is True
+        assert gate["dispatch_suppression_key"] is None
         disp.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["rejected", "rejected_permanent_404"])
+    async def test_terminal_dispatch_rejection_yields_persistable_same_head_receipt(
+        self, db_session, mocker, outcome
+    ):
+        project, _ = await _make_project_and_version(db_session)
+        disp = _patch_gate_github(
+            mocker,
+            run=None,
+            head_sha="71bfe706590e",
+            dispatch_outcome=outcome,
+        )
+
+        gate = await compute_promotion_ci_green_gate(db_session, project.id)
+
+        assert gate["gate_state"] == "dispatch_rejected"
+        assert gate["dispatch_outcome"] == outcome
+        assert gate["dispatch_retryable"] is False
+        assert gate["dispatch_suppression_key"] == (
+            "acme/widget:ci.yml:automain:71bfe706590e"
+        )
+        receipt = terminal_promotion_ci_dispatch_receipt(
+            gate, now=datetime(2026, 8, 16, 4, 30, 0)
+        )
+        assert receipt == {
+            "schema_version": 2,
+            "kind": "promotion_ci_dispatch",
+            "workflow_file": "ci.yml",
+            "head_sha": "71bfe706590e",
+            "ref": "automain",
+            "outcome": outcome,
+            "suppression_key": "acme/widget:ci.yml:automain:71bfe706590e",
+            "retryable": False,
+            "recorded_at": "2026-08-16T04:30:00",
+            "retry_after": "2026-08-16T05:00:00",
+            "retry_authority": "bounded_terminal_receipt_ttl",
+        }
+        disp.assert_awaited_once()
+
+    def test_nonterminal_dispatch_verdict_has_no_terminal_receipt(self):
+        assert (
+            terminal_promotion_ci_dispatch_receipt(
+                {
+                    "gate_state": "unavailable",
+                    "dispatch_outcome": "ambiguous",
+                    "dispatch_retryable": True,
+                }
+            )
+            is None
+        )
 
     @pytest.mark.asyncio
     async def test_github_error_maps_to_unavailable(self, db_session, mocker):

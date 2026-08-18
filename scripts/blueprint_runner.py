@@ -35,6 +35,8 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import runner_exact_update
+
 # Baked-in production orchestrator base URL. Keep in sync with the admin-UI
 # constant DEFAULT_ORCHESTRATOR_URL in admin-ui/src/components/FleetRunnersPanel.utils.ts
 # so the enroll dialog only appends --url when the project points elsewhere.
@@ -1558,36 +1560,42 @@ def do_update(
     *,
     repo_root: str = _REPO_ROOT,
     restart_service: bool = True,
+    target_commit: str | None = None,
+    _transition_path: str | None = None,
     _run=subprocess.run,
 ) -> int:
-    """Update the local checkout: fetch, fast-forward, reinstall deps if needed.
+    """Update the runner checkout without conflating branch and release authority.
 
-    Steps:
-      1. ``git fetch origin`` — get latest refs (non-fatal: None if not a repo).
-      2. Read the local HEAD (``git rev-parse HEAD``).
-      3. Read the upstream tracking ref (``git rev-parse @{u}``). A detached
-         deployment checkout explicitly fetches and verifies
-         ``refs/remotes/origin/main``.
-      4. If local == tracked  → nothing to do (exit 0).
-      5. If local is ahead/diverged → warn and abort (can't fast-forward safely).
-      6. ``git merge --ff-only <upstream>`` — fast-forward to upstream while
-         preserving detached checkouts as detached.
-      7. ``git diff --name-only <old-head>..HEAD`` — list changed files.
-      8. If any ``package-lock.json`` is among the changed files, run ``npm ci``
-         in the containing directory (only that lockfile's project).
-      9. Report what was updated.
+    With ``target_commit``, fetch and verify that exact authenticated served SHA,
+    then replace a clean worktree with a detached checkout. This deliberately
+    supports squash-merge divergence and intentional rollback while never
+    moving a local branch pointer. Without a target, preserve the conventional
+    tracked-branch fast-forward updater used by the manual CLI.
 
     Returns 0 on success or nothing-to-do, 1 on any failure.
     """
     print("[blueprint-runner] checking for updates...", flush=True)
+    if target_commit is not None:
+        if not runner_exact_update.update_to_exact_commit(
+            repo_root=repo_root,
+            target_commit=target_commit,
+            transition_path=_transition_path,
+            run=_run,
+        ):
+            return 1
+        if restart_service:
+            restart_result = _restart_runner_service(_run=_run)
+            if restart_result is False:
+                return 1
+        print("[blueprint-runner] update complete.", flush=True)
+        return 0
 
-    # Step 1: fetch origin
+    # Normal no-target updater: retain branch/upstream fast-forward semantics.
     fetch = _git(["fetch", "origin"], cwd=repo_root, _run=_run)
     if fetch is None or fetch.returncode != 0:
         print("ERROR: could not run git — is this a git repository?", file=sys.stderr, flush=True)
         return 1
 
-    # Step 2: current HEAD
     head_result = _git(["rev-parse", "HEAD"], cwd=repo_root, _run=_run)
     if head_result is None or head_result.returncode != 0:
         print("ERROR: could not resolve HEAD — not a git repository?", file=sys.stderr, flush=True)
@@ -1603,12 +1611,6 @@ def do_update(
         else ""
     )
 
-    # Step 3: upstream tracking ref. Release/install flows may intentionally
-    # leave this checkout detached. In that case only, use the just-fetched,
-    # explicit production branch rather than draining forever because @{u}
-    # cannot exist on a detached HEAD. Use a fully-qualified ref and an exact
-    # no-tags refspec so a local short-name collision or custom fetch refspec
-    # cannot redirect this privileged updater.
     upstream_ref = "@{u}"
     upstream_result = _git(["rev-parse", "@{u}"], cwd=repo_root, _run=_run)
     if upstream_result is None or upstream_result.returncode != 0:
@@ -1660,19 +1662,16 @@ def do_update(
         print("[blueprint-runner] already up to date — nothing to pull.", flush=True)
         return 0
 
-    # Step 4: check if we are ahead or diverged
     merge_base = _git(["merge-base", old_head, upstream_sha], cwd=repo_root, _run=_run)
     if merge_base and merge_base.returncode == 0:
         base_sha = merge_base.stdout.strip()
         if base_sha == upstream_sha:
-            # local HEAD is a descendant of upstream → local is ahead
             print(
                 "[blueprint-runner] local branch is AHEAD of origin — push first, or defer update.",
                 flush=True,
             )
             return 1
         if base_sha != old_head:
-            # merge-base is neither HEAD nor upstream → diverged
             print(
                 "[blueprint-runner] local and origin have DIVERGED — "
                 "cannot fast-forward. Rebase or reset, then re-run update.",
@@ -1681,7 +1680,6 @@ def do_update(
             )
             return 1
 
-    # Step 5: fast-forward
     branch_label = branch or "current branch"
     print(f"[blueprint-runner] pulling {branch_label}: "
           f"{old_head[:10]}..{upstream_sha[:10]}", flush=True)
@@ -1693,11 +1691,9 @@ def do_update(
 
     print("[blueprint-runner] updated to", upstream_sha[:10], flush=True)
 
-    # Step 6: changed files between old and new HEAD
     changed = _git(["diff", "--name-only", f"{old_head}..HEAD"], cwd=repo_root, _run=_run)
     if changed and changed.returncode == 0 and changed.stdout.strip():
         changed_files = changed.stdout.strip().splitlines()
-        # Find which directories have a modified package-lock.json
         for cf in changed_files:
             if cf.endswith("/package-lock.json") or cf == "package-lock.json":
                 lock_dir = os.path.dirname(os.path.join(repo_root, cf))
@@ -1706,9 +1702,7 @@ def do_update(
                     flush=True,
                 )
                 try:
-                    result = _run(
-                        ["npm", "ci"], cwd=lock_dir, timeout=120,
-                    )
+                    result = _run(["npm", "ci"], cwd=lock_dir, timeout=120)
                     if result.returncode != 0:
                         print(
                             f"WARNING: npm ci in {lock_dir} exited {result.returncode}. "
@@ -2092,6 +2086,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Update the local checkout and reinstall dependencies only when needed.",
     )
     update_parser.add_argument("--instance", help="Isolated runner instance name.")
+    update_parser.add_argument(
+        "--target-commit",
+        metavar="SHA",
+        help=(
+            "Authenticated full served SHA to fetch from origin and check out "
+            "detached without moving a local branch."
+        ),
+    )
+    update_parser.add_argument(
+        "--repo-root",
+        metavar="PATH",
+        help=(
+            "Explicit runner checkout to update (trusted recovery/bootstrap use; "
+            "defaults to the checkout containing this launcher)."
+        ),
+    )
     status_parser = sub.add_parser(
         "status",
         help="Show runner process status from ~/.blueprint/status.json.",
@@ -2100,7 +2110,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_update_and_report() -> int:
+def _run_update_and_report(
+    *, repo_root: str = _REPO_ROOT, target_commit: str | None = None
+) -> int:
     """Run ``do_update()``, capture version before/after, and report to orchestrator.
 
     Best-effort POST to ``/api/runner/update-report`` so the operator console
@@ -2109,15 +2121,16 @@ def _run_update_and_report() -> int:
     """
     # Capture version before update.
     old_version: str | None = None
-    head_result = _git(["rev-parse", "HEAD"], cwd=_REPO_ROOT)
+    repo_root = os.path.realpath(repo_root)
+    head_result = _git(["rev-parse", "HEAD"], cwd=repo_root)
     if head_result and head_result.returncode == 0:
         old_version = head_result.stdout.strip()
 
-    rc = do_update()
+    rc = do_update(repo_root=repo_root, target_commit=target_commit)
 
     # Capture version after update.
     new_version: str | None = None
-    head_result = _git(["rev-parse", "HEAD"], cwd=_REPO_ROOT)
+    head_result = _git(["rev-parse", "HEAD"], cwd=repo_root)
     if head_result and head_result.returncode == 0:
         new_version = head_result.stdout.strip()
 
@@ -2153,7 +2166,14 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(exc))
 
     if args.command == "update":
-        return _run_update_and_report()
+        if getattr(args, "repo_root", None) and not getattr(
+            args, "target_commit", None
+        ):
+            parser.error("--repo-root requires --target-commit")
+        return _run_update_and_report(
+            repo_root=getattr(args, "repo_root", None) or _REPO_ROOT,
+            target_commit=getattr(args, "target_commit", None),
+        )
 
     if args.command == "uninstall":
         return do_uninstall(

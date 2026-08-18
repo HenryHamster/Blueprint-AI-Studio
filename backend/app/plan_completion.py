@@ -43,6 +43,10 @@ from app.payload_schemas import (
     validate_internal_payload,
 )
 from app.task_capabilities import PLAN_KNOWLEDGE_SUBTASK_TYPES, PLAN_SUBTASK_TYPES
+from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    automatic_task_creation_parent_lock,
+)
 from app.shared_state import (
     get_project_integration_branch,
     runtime_config as _runtime_config,
@@ -882,6 +886,46 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         if task.origination in _INHERITABLE_ORIGINATIONS
         else TASK_ORIGINATION_PLAN
     )
+
+    # ``_ensure_branch`` commits around GitHub I/O and reacquires only the Task
+    # row.  Release that Task-only lock, then re-enter through the canonical
+    # Project -> parent Task admission boundary before constructing or querying
+    # any children.  The returned row locks remain transaction-scoped through
+    # the atomic child/history commit below.
+    _spawn_project_id = task.project_id
+    _spawn_parent_id = task.id
+    await session.commit()
+    async with automatic_task_creation_parent_lock(
+        session,
+        _spawn_project_id,
+        _spawn_parent_id,
+        skip_locked=False,
+    ) as (_spawn_admission, _locked_project, _locked_task):
+        if _locked_project is None or _locked_task is None:
+            raise RuntimeError(
+                f"[PLAN] automatic child admission unavailable for plan {_spawn_parent_id}"
+            )
+        task = _locked_task
+        project = _locked_project
+
+    if _spawn_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        task.status = TaskStatus.COMPLETED
+        task.latest_status_message = (
+            "Plan completed; automatic child creation suppressed by "
+            f"{_spawn_admission} (0 queued children)"
+        )[:500]
+        task.context = {
+            **(task.context or {}),
+            "automatic_child_creation_suppressed": _spawn_admission,
+        }
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[PLAN] Suppressed automatic children for plan %s: %s",
+            _spawn_parent_id,
+            _spawn_admission,
+        )
+        return
 
     child_tasks = []
     for i, subtask_def in enumerate(subtasks):

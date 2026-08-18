@@ -69,6 +69,15 @@ router = APIRouter(
 logger = logging.getLogger(__name__)
 
 
+def _project_operational_state(project: Any) -> str:
+    """Canonical long-lived project state; legacy ``status`` is not runtime truth."""
+    if bool(getattr(project, "archived", False)):
+        return "archived"
+    if bool(getattr(project, "paused", False)):
+        return "paused"
+    return "active"
+
+
 def _redact_build_config(build_config: dict, role: str) -> dict:
     """Return build_config with env_vars omitted for non-owner callers.
 
@@ -325,6 +334,8 @@ async def get_all_projects(
                 "name": row.name,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "status": row.status,
+                "status_semantics": "legacy_finite_lifecycle",
+                "operational_state": _project_operational_state(row),
                 "user_id": row.user_id,
                 "github_owner": row.github_owner,
                 "github_repo": row.github_repo,
@@ -398,6 +409,8 @@ async def get_project(
         "name": project.name,
         "user_id": project.user_id,
         "status": project.status,
+        "status_semantics": "legacy_finite_lifecycle",
+        "operational_state": _project_operational_state(project),
         "github_owner": project.github_owner,
         "github_repo": project.github_repo,
         "created_at": project.created_at.isoformat() if project.created_at else None,
@@ -419,6 +432,7 @@ async def get_project(
         "merge_gate_runtime": merge_gate_runtime_block(project),
         "autonomous_enabled": project.autonomous_enabled,
         "paused": project.paused,
+        "archived": project.archived,
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
         "approval_gate_config": project.approval_gate_config or {},
@@ -477,6 +491,8 @@ async def get_project_summary(
         "name": project.name,
         "user_id": project.user_id,
         "status": project.status,
+        "status_semantics": "legacy_finite_lifecycle",
+        "operational_state": _project_operational_state(project),
         "github_owner": project.github_owner,
         "github_repo": project.github_repo,
         "created_at": project.created_at.isoformat() if project.created_at else None,
@@ -496,6 +512,7 @@ async def get_project_summary(
         "merge_gate_runtime": merge_gate_runtime_block(project),
         "autonomous_enabled": project.autonomous_enabled,
         "paused": project.paused,
+        "archived": project.archived,
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
         "approval_gate_config": project.approval_gate_config or {},
@@ -588,12 +605,15 @@ async def update_project(
             detail="Only project owners may change build_config, autonomous_enabled, design_doc, or vision.",
         )
 
-    # Lock the project row whenever directions, design_doc, or vision are
-    # being overwritten so concurrent agent writers cannot silently clobber.
+    # Lock the project row whenever a full-blob field is being updated so
+    # concurrent agent/detection writers cannot silently clobber operator
+    # intent. Build-config redetection performs its external GitHub I/O first,
+    # then takes this same lock and re-reads the current JSONB before merging.
     needs_lock = (
         payload.directions is not None
         or payload.design_doc is not None
         or payload.vision is not None
+        or payload.build_config is not None
         or payload.approval_gate_config is not None
         or payload.problem_model_patch is not None
     )
@@ -605,6 +625,7 @@ async def update_project(
                 ("directions", payload.directions),
                 ("design_doc", payload.design_doc),
                 ("vision", payload.vision),
+                ("build_config", payload.build_config),
                 ("approval_gate_config", payload.approval_gate_config),
                 ("problem_model", payload.problem_model_patch),
             )
@@ -917,6 +938,11 @@ async def detect_project_build_config(
         ref=project.integration_branch,
     )
 
+    # Detection performs external GitHub I/O without holding a database row.
+    # Re-enter the same Project serialization boundary used by build_config
+    # PATCH and background re-detection, forcing populate_existing before the
+    # operator-owned merge so a concurrent lane disable cannot be overwritten.
+    project = await lock_project_or_429(session, project.id)
     detected = apply_operator_build_config_overrides(
         detected, project.build_config or {}
     )

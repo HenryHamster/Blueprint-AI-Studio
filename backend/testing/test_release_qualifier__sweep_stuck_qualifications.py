@@ -5408,7 +5408,8 @@ async def test_promotion_ci_gate_cancelled_run_surfaces_without_dispatch(
         new=AsyncMock(return_value=None),
     )
     dispatch_mock = mocker.patch(
-        "app.github.dispatch_workflow_run", new=AsyncMock(return_value=True)
+        "app.github.dispatch_workflow_run_outcome",
+        new=AsyncMock(return_value="accepted"),
     )
 
     # dispatch_on_cancelled=False: surface the cancellation, dispatch nothing.

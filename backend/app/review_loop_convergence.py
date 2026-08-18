@@ -9,6 +9,10 @@ These names are re-exported from app.review_pipeline so every existing
 ``from app.review_pipeline import X`` caller and test keeps working
 unchanged. This module imports nothing from review_pipeline, so the
 re-export is acyclic.
+
+``CROSS_EPISODE_ABANDON_THRESHOLD`` is intentionally an intra-PR-only census.
+Project-lifetime recurrence across distinct merged PRs is tracked by
+``ModuleFindingChain`` and escalated from the REQUEST_CHANGES path.
 """
 
 import asyncio
@@ -22,6 +26,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Task, TaskStatus
+from app.review_heuristics import actioned_review_cap_tasks
+
 # MAJOR 5: the DEFEAT for the shared-VmContact liveness override (see
 # _is_pipeline_task_stale). reaper_orphan_classify depends only on
 # failure_classification / models / schemas / shared_state / time_utils — it does
@@ -43,6 +49,7 @@ def build_cross_episode_abandon_candidate(
     tasks: Iterable[Task],
     *,
     threshold: int = CROSS_EPISODE_ABANDON_THRESHOLD,
+    actionable_tasks: Iterable[Task] | None = None,
 ) -> dict[str, object] | None:
     """Build the durable PR-level abandon signal from consumed pipeline tasks.
 
@@ -50,10 +57,10 @@ def build_cross_episode_abandon_candidate(
     episode.  A cancelled review/fix is an attempt even though it never appears
     in the ordinary cap query; archived rows remain evidence here too, so a
     supersede/retarget or manual cap reset cannot launder the PR's history.
-    ``review_loop.iteration`` is the carried cycle number.  Rows without cycle
-    metadata remain part of the attempt/cancellation totals, but cannot alone
-    trigger this signal: those rows are commonly synthetic or infrastructure
-    failures and the ordinary cap remains their governing behavior.
+    Raw rows remain visible in the attempt/cancellation totals, but only exact
+    actioned patch/open-set generations control the stop. Carried iteration
+    numbers and parallel observation fan-out are not work receipts and cannot
+    trigger this signal by themselves.
     """
     if threshold < 1:
         raise ValueError("abandon threshold must be positive")
@@ -64,25 +71,8 @@ def build_cross_episode_abandon_candidate(
     if not attempts:
         return None
 
-    cycles_by_episode: dict[str, int] = {}
-    for task in attempts:
-        loop = (task.context or {}).get("review_loop")
-        loop = loop if isinstance(loop, dict) else {}
-        episode_id = str(
-            loop.get("original_task_id")
-            or task.first_payload.get("original_task_id")
-            or task.id
-        )
-        iteration = loop.get("iteration")
-        if isinstance(iteration, int) and iteration > 0:
-            cycles_by_episode[episode_id] = max(
-                cycles_by_episode.get(episode_id, 0), iteration
-            )
-    # A retargeted episode may restart its local iteration number. Summing the
-    # per-episode maxima preserves that work instead of letting the reset hide
-    # cumulative cycles; rows from old fixtures without iteration still count
-    # through the attempt burden below.
-    cycles = sum(cycles_by_episode.values())
+    generation_source = attempts if actionable_tasks is None else list(actionable_tasks)
+    cycles = len(actioned_review_cap_tasks(generation_source))
     burden = max(len(attempts), cycles)
     if cycles < threshold:
         return None
@@ -107,6 +97,56 @@ def build_cross_episode_abandon_candidate(
         "burden": burden,
         "cancelled_attempts": cancelled,
         "episodes": len(episode_ids),
+    }
+
+
+def build_review_cap_abandon_candidate(
+    tasks: Iterable[Task],
+    *,
+    actioned_generations: int,
+    threshold: int,
+    scope: str,
+    lane_counts: dict[str, int] | None = None,
+    reason: str = "review_cap",
+    detail: str = "",
+) -> dict[str, object]:
+    """Build the existing operator-disposition marker for a bounded cap stop.
+
+    Unlike :func:`build_cross_episode_abandon_candidate`, the caller has
+    already collapsed raw worker rows into exact actioned patch/open-set
+    generations.  Preserve the raw attempt count for burn visibility while
+    making the controlling ``cycles``/``burden`` fields reflect the unit that
+    actually exhausted policy.
+    """
+
+    attempts = [
+        task for task in tasks if task.first_payload.get("type") in ("review", "fix")
+    ]
+    episode_ids: set[str] = set()
+    for task in attempts:
+        loop = (task.context or {}).get("review_loop")
+        loop = loop if isinstance(loop, dict) else {}
+        episode_ids.add(
+            str(
+                loop.get("original_task_id")
+                or task.first_payload.get("original_task_id")
+                or task.id
+            )
+        )
+    cancelled = sum(1 for task in attempts if task.status == TaskStatus.CANCELLED)
+    return {
+        "status": "abandon_candidate",
+        "reason": reason,
+        "threshold": int(threshold),
+        "attempts": len(attempts),
+        "cycles": int(actioned_generations),
+        "actioned_generations": int(actioned_generations),
+        "burden": max(len(attempts), int(actioned_generations)),
+        "cancelled_attempts": cancelled,
+        "episodes": len(episode_ids),
+        "scope": scope,
+        "lane_counts": dict(lane_counts or {}),
+        **({"detail": detail} if detail else {}),
     }
 
 # Liveness backstop on the cap-exhaustion preservability GET — a bound on a
@@ -205,6 +245,28 @@ class _PreservabilityUnavailable(Exception):
 _REVIEW_LOOP_TERMINAL_OUTCOME_KEY = "review_loop_terminal_outcome"
 
 
+def _approval_hold_episode_identity(task: Task) -> dict[str, object] | None:
+    """Return the non-recursive identity of the current approval episode."""
+
+    from app.admin_approval_authority import (
+        APPROVAL_HOLD_EPISODE_KEY,
+        APPROVAL_HOLD_PROVENANCE_KEY,
+    )
+
+    context = dict(task.context or {})
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    episode = context.get(APPROVAL_HOLD_EPISODE_KEY)
+    set_at = context.get("_approval_set_at")
+    if not episode or not set_at or not isinstance(provenance, dict):
+        return None
+    return {
+        "episode": episode,
+        "set_at": set_at,
+        "reason": context.get("approval_hold_reason"),
+        "provenance": dict(provenance),
+    }
+
+
 def _set_review_loop_terminal_outcome(
     task: Task,
     *,
@@ -234,6 +296,27 @@ def _set_review_loop_terminal_outcome(
     if detail is not None:
         terminal_outcome["detail"] = detail
     terminal_outcome["recorded_at"] = _utcnow().isoformat()
+    if task.requires_approval:
+        # Bind a resolvable escalation breadcrumb to the exact approval episode
+        # it created.  The boolean latch can remain TRUE across a later manual
+        # or policy hold, so the breadcrumb alone is never release authority.
+        hold_episode = _approval_hold_episode_identity(task)
+        hold_owner = (
+            (hold_episode.get("provenance") or {}).get("owner")
+            if isinstance(hold_episode, dict)
+            else None
+        )
+        hold_reason = (
+            (hold_episode.get("provenance") or {}).get("reason")
+            if isinstance(hold_episode, dict)
+            else None
+        )
+        if (
+            hold_episode is not None
+            and hold_owner == "review_pipeline"
+            and hold_reason == kind
+        ):
+            terminal_outcome["approval_hold_episode"] = hold_episode
     ctx[_REVIEW_LOOP_TERMINAL_OUTCOME_KEY] = terminal_outcome
     task.context = ctx
     flag_modified(task, "context")
@@ -331,10 +414,44 @@ def clear_review_escalation_approval_gate(orig: Task, *, resolved_by: str) -> bo
     outcome = ctx.get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY) or {}
     if outcome.get("kind") not in _RESOLVABLE_ESCALATION_GATE_KINDS:
         return False
+    from app.admin_approval_authority import (
+        APPROVAL_HOLD_EPISODE_KEY,
+        APPROVAL_HOLD_PROVENANCE_KEY,
+        revoke_operator_approval_followup,
+    )
+
+    expected_hold = outcome.get("approval_hold_episode")
+    current_hold = _approval_hold_episode_identity(orig)
+    if isinstance(expected_hold, dict):
+        if current_hold != expected_hold:
+            return False
+    else:
+        # Rolling compatibility for old escalation rows: they remain clearable
+        # only while no newer-code approval episode exists and no independent
+        # reason displaced the old breadcrumb.  Once provenance exists, fail
+        # closed because an unbound legacy breadcrumb cannot name that episode.
+        if current_hold is not None or ctx.get(APPROVAL_HOLD_PROVENANCE_KEY):
+            return False
+        legacy_reason = ctx.get("approval_hold_reason")
+        if legacy_reason not in (
+            None,
+            outcome.get("kind"),
+            outcome.get("reason"),
+        ):
+            return False
     orig.requires_approval = False
-    # Drop the timer baseline too — a later, unrelated hold must start fresh,
-    # not inherit this hold's elapsed time.
+    from app.closed_pr_reconciliation import revoke_review_wait_approval_hold
+
+    revoke_review_wait_approval_hold(orig)
+    revoke_operator_approval_followup(orig)
+    ctx = dict(orig.context or {})
+    # Consume every piece of metadata owned by this exact episode. A later,
+    # unrelated hold must neither inherit the elapsed timer nor be mistaken for
+    # this escalation on a subsequent convergence pass.
     ctx.pop("_approval_set_at", None)
+    ctx.pop("approval_hold_reason", None)
+    ctx.pop(APPROVAL_HOLD_EPISODE_KEY, None)
+    ctx.pop(APPROVAL_HOLD_PROVENANCE_KEY, None)
     ctx[_REVIEW_LOOP_TERMINAL_OUTCOME_KEY] = {
         **outcome,
         "resolved": True,
@@ -382,7 +499,15 @@ def review_loop_parked_for_operator(orig: Task | None) -> str | None:
     """
     if orig is None:
         return None
-    outcome = (orig.context or {}).get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY)
+    context = orig.context or {}
+    abandon_candidate = context.get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    if isinstance(abandon_candidate, dict):
+        # The existing reset-iteration-cap operation removes this marker and
+        # starts a new fenced census window. Until that explicit disposition,
+        # the PR remains operator-owned and no cap/stale-review path may resume
+        # or close it.
+        return str(abandon_candidate.get("reason") or "abandon_candidate")
+    outcome = context.get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY)
     if not isinstance(outcome, dict) or outcome.get("resolved"):
         return None
     kind = outcome.get("kind")
@@ -860,11 +985,15 @@ async def _handle_cap_exhaustion(
     session: AsyncSession,
     *,
     scope: str,
+    verified_disposition: str,
     lane_counts: dict | None = None,
 ) -> None:
-    """Terminal handler when the review-fix iteration cap is hit.
+    """Apply an explicitly verified destructive cap disposition.
 
-    Transitions the create task (``orig``) to FAILED with
+    Ordinary numerical cap stops never call this function: they enter the
+    existing abandon-candidate/operator park instead. This handler is retained
+    for an explicit authority that has independently verified a ``reject`` or
+    ``empty`` disposition. It transitions the create task (``orig``) to FAILED with
     failure_detail=review_cap_exhausted, closes the GitHub PR, and fires an
     approval alert. Idempotent — safe to re-enter on the same orig without
     duplicating side effects.
@@ -879,6 +1008,10 @@ async def _handle_cap_exhaustion(
     ``scope`` is either "global" (cross-chain) or "per-chain" — used only for
     human-readable messages.
     """
+    if verified_disposition not in {"reject", "empty"}:
+        raise ValueError(
+            "cap closure requires verified_disposition='reject' or 'empty'"
+        )
     from app.failure_classification import (
         APPROVED_CAP_PR_CLOSED,
         CODE_ERROR,
@@ -890,7 +1023,7 @@ async def _handle_cap_exhaustion(
     from app.routers.agent_status import record_task_result
     from app.shared_state import record_direction_result
 
-    cap_label = scope if scope in ("global", "per-chain") else scope
+    cap_label = scope
     # ── ROLLBACK-EXPIRY CONTRACT (review round 2, BLOCKER 1) ──
     # ``session.rollback()`` expires EVERY loaded instance in the session — even
     # under ``expire_on_commit=False`` — including the CALLER's ``source_task``.
@@ -1239,7 +1372,15 @@ async def _handle_cap_exhaustion(
                 f"(APPROVED_CAP_PR_CLOSED, no CODE_ERROR, no PR close)"
             )
             orig.status = TaskStatus.FAILED
-            orig.requires_approval = True
+            from app.admin_approval_authority import (
+                establish_independent_approval_hold,
+            )
+
+            establish_independent_approval_hold(
+                orig,
+                reason="approved_cap_pr_preserved_for_handmerge",
+                owner="review_loop_convergence",
+            )
             orig.latest_status_message = (
                 f"Review-fix cap reached ({iterations} iterations, {cap_label}) "
                 f"after approval — PR #{pr_number} LEFT OPEN with mergeable work; "
@@ -1451,7 +1592,13 @@ async def _handle_cap_exhaustion(
         # Always flag requires_approval here regardless of the global gate — the
         # whole point of preservation is to route this to a human; without the
         # flag the open PR would dangle with no owner.
-        orig.requires_approval = True
+        from app.admin_approval_authority import establish_independent_approval_hold
+
+        establish_independent_approval_hold(
+            orig,
+            reason="review_cap_preserved_for_handmerge",
+            owner="review_loop_convergence",
+        )
         orig.latest_status_message = (
             f"Review-fix cap reached ({iterations} iterations, {cap_label}) — "
             f"PR #{pr_number} LEFT OPEN with mergeable work; manual hand-merge "
@@ -1562,7 +1709,13 @@ async def _handle_cap_exhaustion(
     # services.py's 2h approval-gate timeout then FAILs the otherwise-healthy parent,
     # discarding its already-merged siblings.
     if _runtime_config.get("require_approval_gates", True):
-        orig.requires_approval = True
+        from app.admin_approval_authority import establish_independent_approval_hold
+
+        establish_independent_approval_hold(
+            orig,
+            reason="review_cap_exhausted",
+            owner="review_loop_convergence",
+        )
     orig.latest_status_message = (
         f"Review-fix cycle reached limit ({iterations} iterations, {cap_label}) — "
         f"PR #{pr_number} auto-closed, manual review required"
@@ -1842,181 +1995,4 @@ async def _handle_empty_effective_diff_at_merge(
         logger.warning(
             f"[PIPELINE] Empty-diff-at-merge: failed to close PR #{pr_number}: {e}",
             exc_info=True,
-        )
-
-
-async def _handle_persistent_conflict_escalation(
-    source_task: Task,
-    resolved_original_id: str,
-    pr_number: int,
-    iterations: int,
-    conflict_lane_count: int,
-    session: AsyncSession,
-) -> None:
-    """Terminal handler for PRs with a persistent, unresolvable merge conflict.
-
-    Called when the conflict-fix lane count reaches
-    PERSISTENT_CONFLICT_ESCALATION_THRESHOLD consecutive attempts without
-    resolving the conflict. Closes the PR, marks the orig FAILED with
-    failure_detail="persistent_merge_conflict", and posts an explicit
-    conflict-named PR comment and alert so operators can distinguish this
-    from generic review non-convergence.
-
-    Fires BEFORE the lane sub-cap check so the loop stops at iteration 3
-    (threshold=2 prior completions) rather than grinding to LANE_CAP_CONFLICT=4
-    or the global cap (~16).
-    """
-    from app.failure_classification import CODE_ERROR, persist_failure_category
-    from app.alert_dispatch import _maybe_create_failure_alert
-    from app.github import close_pull_request, create_pr_comment
-    from app.routers.agent import get_github_token_for_task
-    from app.routers.agent_status import record_task_result
-    from app.shared_state import record_direction_result
-
-    source_task.latest_status_message = (
-        f"Persistent merge conflict on PR #{pr_number} — "
-        f"{conflict_lane_count} conflict-fix attempts failed to resolve it; "
-        f"escalating for manual intervention"
-    )
-    session.add(source_task)
-
-    try:
-        orig = await session.get(Task, uuid.UUID(resolved_original_id))
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            f"[PIPELINE] Persistent-conflict: failed to load orig "
-            f"{resolved_original_id[:8]}: {e}"
-        )
-        return
-    if orig is None:
-        logger.warning(
-            f"[PIPELINE] Persistent-conflict: orig {resolved_original_id[:8]} not found"
-        )
-        return
-
-    already_handled = orig.status in (
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-    ) and (orig.context or {}).get("failure_detail") in (
-        "persistent_merge_conflict",
-        "review_cap_exhausted",
-        "cap_exhausted_after_approve",
-        "review_cap_preserved_for_handmerge",
-    )
-    if already_handled:
-        logger.info(
-            f"[PIPELINE] Persistent-conflict re-triggered for PR #{pr_number} — "
-            f"orig {resolved_original_id[:8]} already terminal, skipping"
-        )
-        await session.commit()
-        return
-
-    orig.status = TaskStatus.FAILED
-    if _runtime_config.get("require_approval_gates", True):
-        orig.requires_approval = True
-    orig.latest_status_message = (
-        f"Merge conflict on PR #{pr_number} persisted after {conflict_lane_count} "
-        f"fix attempts — auto-closed, manual conflict resolution required"
-    )
-    persist_failure_category(orig, CODE_ERROR)
-    ctx = dict(orig.context or {})
-    ctx["failure_detail"] = "persistent_merge_conflict"
-    ctx["review_cap_iterations"] = iterations
-    ctx["pr_rejected"] = True
-    ctx["pr_rejection_note"] = (
-        f"Auto-closed by Blueprint: merge conflict persisted after "
-        f"{conflict_lane_count} fix attempts"
-    )
-    orig.context = ctx
-    _set_review_loop_terminal_outcome(
-        orig,
-        kind="persistent_conflict",
-        reason="persistent_merge_conflict",
-        pr_number=pr_number,
-        iterations=iterations,
-        detail=f"conflict_lane_count={conflict_lane_count}",
-    )
-    session.add(orig)
-    try:
-        await session.commit()
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            f"[PIPELINE] Persistent-conflict: failed to commit orig "
-            f"{resolved_original_id[:8]}: {e}",
-            exc_info=True,
-        )
-        return
-
-    record_task_result(
-        success=False,
-        failure_class=CODE_ERROR,
-        task_id=str(orig.id),
-        task_type=(orig.first_payload or {}).get("type", ""),
-    )
-    _direction_id = str((orig.context or {}).get("direction_id") or "")
-    if _direction_id:
-        record_direction_result(
-            _direction_id,
-            success=False,
-            failure_class=CODE_ERROR,
-            project_id=str(orig.project_id) if orig.project_id else "",
-        )
-
-    try:
-        from app.task_completion import _record_remediation_if_terminal
-
-        await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
-        await session.commit()
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            f"[PIPELINE] Persistent-conflict: failed to record remediation for "
-            f"PR #{pr_number}: {e}"
-        )
-
-    try:
-        gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
-        try:
-            await create_pr_comment(
-                gh_token,
-                owner,
-                repo,
-                pr_number,
-                f"Auto-closed: merge conflict on this PR persisted after "
-                f"{conflict_lane_count} automated fix attempts. "
-                f"Manual conflict resolution required before this work can land.",
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"[PIPELINE] Persistent-conflict: comment failed on PR #{pr_number}: {e}"
-            )
-        closed = await close_pull_request(
-            gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
-        )
-        if closed:
-            logger.info(
-                f"[PIPELINE] Closed PR #{pr_number} after persistent merge conflict "
-                f"({conflict_lane_count} conflict-fix attempts)"
-            )
-        else:
-            logger.warning(
-                f"[PIPELINE] close_pull_request returned False for PR #{pr_number} "
-                f"(persistent conflict)"
-            )
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            f"[PIPELINE] Persistent-conflict: failed to close PR #{pr_number}: {e}",
-            exc_info=True,
-        )
-
-    try:
-        await _maybe_create_failure_alert(
-            orig,
-            session,
-            f"PR #{pr_number} has a persistent merge conflict ({conflict_lane_count} "
-            f"fix attempts failed) — auto-closed, manual resolution required",
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            f"[PIPELINE] Persistent-conflict: failed to create alert for PR "
-            f"#{pr_number}: {e}"
         )

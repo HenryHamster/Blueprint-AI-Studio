@@ -1273,7 +1273,65 @@ class UpdateCommandTests(unittest.TestCase):
         with patch.object(br, "_run_update_and_report", return_value=0) as routed:
             rc = br.main(["update"])
         self.assertEqual(rc, 0)
-        routed.assert_called_once()
+        routed.assert_called_once_with(
+            repo_root=br._REPO_ROOT,
+            target_commit=None,
+        )
+
+    def test_exact_update_cli_routes_trusted_target_and_checkout(self):
+        target = "a" * 40
+        with patch.object(br, "_run_update_and_report", return_value=0) as routed:
+            rc = br.main(
+                ["update", "--target-commit", target, "--repo-root", "/runner"]
+            )
+        self.assertEqual(rc, 0)
+        routed.assert_called_once_with(
+            repo_root="/runner",
+            target_commit=target,
+        )
+
+    def test_repo_root_without_exact_target_fails_closed(self):
+        with patch.object(br, "_run_update_and_report") as routed, \
+             self.assertRaises(SystemExit):
+            br.main(["update", "--repo-root", "/runner"])
+        routed.assert_not_called()
+
+    def test_exact_update_delegates_to_worktree_global_transaction(self):
+        target = "a" * 40
+        run = MagicMock()
+        with patch.object(
+            br.runner_exact_update,
+            "update_to_exact_commit",
+            return_value=True,
+        ) as exact_update, \
+             patch.object(br, "_restart_runner_service",
+                          return_value=True) as restart:
+            rc = br.do_update(
+                repo_root="/runner",
+                target_commit=target,
+                _run=run,
+            )
+        self.assertEqual(rc, 0)
+        exact_update.assert_called_once_with(
+            repo_root="/runner",
+            target_commit=target,
+            transition_path=None,
+            run=run,
+        )
+        restart.assert_called_once_with(_run=run)
+
+    def test_exact_update_can_leave_restart_to_running_daemon(self):
+        with patch.object(
+            br.runner_exact_update,
+            "update_to_exact_commit",
+            return_value=True,
+        ), patch.object(br, "_restart_runner_service") as restart:
+            rc = br.do_update(
+                target_commit="a" * 40,
+                restart_service=False,
+            )
+        self.assertEqual(rc, 0)
+        restart.assert_not_called()
 
     def test_update_returns_1_when_git_unavailable(self):
         """When _git returns None (git absent), do_update prints an error and returns 1."""
@@ -1486,7 +1544,10 @@ class UpdateCommandTests(unittest.TestCase):
              patch.object(br, "resolve_token", return_value="test-token"):
             rc = br._run_update_and_report()
         self.assertEqual(rc, 0)
-        update_mock.assert_called_once()
+        update_mock.assert_called_once_with(
+            repo_root=os.path.realpath(br._REPO_ROOT),
+            target_commit=None,
+        )
         post_mock.assert_called_once()
         kwargs = post_mock.call_args[1]
         self.assertEqual(kwargs["status"], "success")
@@ -1502,10 +1563,35 @@ class UpdateCommandTests(unittest.TestCase):
              patch.object(br, "resolve_token", return_value="test-token"):
             rc = br._run_update_and_report()
         self.assertEqual(rc, 1)
-        update_mock.assert_called_once()
+        update_mock.assert_called_once_with(
+            repo_root=os.path.realpath(br._REPO_ROOT),
+            target_commit=None,
+        )
         post_mock.assert_called_once()
         kwargs = post_mock.call_args[1]
         self.assertEqual(kwargs["status"], "failure")
+
+    def test_exact_update_report_uses_requested_checkout_and_target(self):
+        target = "b" * 40
+        repo_root = os.path.realpath("/runner")
+        with patch.object(br, "do_update", return_value=0) as update_mock, \
+             patch.object(br, "_post_update_result"), \
+             patch.object(
+                 br,
+                 "_git",
+                 return_value=MagicMock(returncode=0, stdout=target),
+             ), \
+             patch.object(br, "resolve_url", return_value="https://example.com"), \
+             patch.object(br, "resolve_token", return_value="test-token"):
+            rc = br._run_update_and_report(
+                repo_root=repo_root,
+                target_commit=target,
+            )
+        self.assertEqual(rc, 0)
+        update_mock.assert_called_once_with(
+            repo_root=repo_root,
+            target_commit=target,
+        )
 
     def test_update_report_does_not_block_on_post_failure(self):
         """_run_update_and_report returns the update exit code even if POST fails."""
@@ -1522,7 +1608,10 @@ class UpdateCommandTests(unittest.TestCase):
         with patch.object(br, "_run_update_and_report", return_value=0) as routed:
             rc = br.main(["update"])
         self.assertEqual(rc, 0)
-        routed.assert_called_once()
+        routed.assert_called_once_with(
+            repo_root=br._REPO_ROOT,
+            target_commit=None,
+        )
 
 
 class RestartServiceTests(unittest.TestCase):

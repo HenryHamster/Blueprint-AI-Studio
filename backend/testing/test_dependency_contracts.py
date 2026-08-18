@@ -989,11 +989,12 @@ class TestResearchSiblingFileOverlapSerialization:
         assert len(overlaps) == 1
 
     @pytest.mark.asyncio
-    async def test_incidental_shared_file_does_not_serialize_independent_work(
-        self, db_session
-    ):
-        """One shared integration file across otherwise disjoint scopes is a
-        merge warning, not evidence that the later task consumes the earlier."""
+    async def test_single_shared_integration_file_serializes(self, db_session):
+        """Even one shared file across otherwise disjoint scopes serializes the
+        pair: a shared file is the contract surface where parallel siblings
+        collide — the later PR is built on a base without the earlier sibling's
+        change to it, so they'd race at merge. There is deliberately no
+        overlap-ratio threshold."""
         from app.research_completion import (
             _log_file_overlaps,
             _wire_research_sibling_edges,
@@ -1011,9 +1012,10 @@ class TestResearchSiblingFileOverlapSerialization:
         )
 
         assert len(overlaps) == 1
-        assert wired == []
+        assert len(wired) == 1
+        assert wired[0][2] == ["backend/app/models.py"]
         assert (children[0].depends_on or []) == []
-        assert (children[1].depends_on or []) == []
+        assert (children[1].depends_on or []) == [str(children[0].id)]
 
     @pytest.mark.asyncio
     async def test_fully_contained_smaller_scope_serializes(self, db_session):
@@ -1727,10 +1729,16 @@ class TestMergedLandingCorroborationWiring:
     re-opens that hole, so the wiring is pinned here rather than left to review.
     """
 
-    # The single sanctioned sync caller: its own call site already awaits
-    # ``acceptance_gate.corroborate_acceptance_for_landing`` immediately before
-    # the write, so routing it through the twin would only duplicate the read.
-    SYNC_CALLER_ALLOWLIST = {"app/orchestrator_ci_monitor.py"}
+    # Sanctioned sync callers have already completed corroboration before the
+    # write.  The CI monitor awaits it immediately before the setter.  Approval
+    # finalization is deliberately two-phase: it prepares proof without locks,
+    # then applies that immutable patch plus the sync setter while holding the
+    # canonical Project -> Task locks.  Routing the latter through the async twin
+    # would repeat GitHub I/O while both rows are locked.
+    SYNC_CALLER_ALLOWLIST = {
+        "app/admin_approval_merge_finalization.py",
+        "app/orchestrator_ci_monitor.py",
+    }
 
     def _call_sites(self, func_name: str) -> dict[str, list[int]]:
         import ast
@@ -1752,7 +1760,9 @@ class TestMergedLandingCorroborationWiring:
                     else None
                 )
                 if name == func_name:
-                    rel = str(path.relative_to(app_dir.parent))
+                    # Keep the contract stable on both Linux CI and Windows
+                    # developer hosts; allowlist entries are repository paths.
+                    rel = path.relative_to(app_dir.parent).as_posix()
                     sites.setdefault(rel, []).append(node.lineno)
         return sites
 

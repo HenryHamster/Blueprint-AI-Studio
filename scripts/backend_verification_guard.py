@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Attribute a failed targeted backend verification run against its base tree.
 
-The caller has already run the current tree and supplied its JUnit report.  A
-base run is deliberately started only when that report contains test failures;
-the base selectors are limited to impacted files that exist in the base tree.
+The caller has already run the current tree and supplied its JUnit report. A
+base run is also performed for a clean current report so a baseline failure
+that disappears or becomes skipped cannot silently mint a green verdict.
+The base selectors are limited to impacted files that exist in the base tree.
 """
 
 from __future__ import annotations
@@ -11,20 +12,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
-from testing.impacted_tests import (  # noqa: E402
-    classify_backend_verification,
-    parse_junit_failures,
+from testing.fixgate_attribution import (  # noqa: E402
+    JUnitReport,
+    classify_verification,
+    extract_base,
+    is_attributable_pytest_result,
+    parse_junit_report,
 )
 
 
@@ -45,22 +46,7 @@ def _base_ref(repo: Path, base: str) -> str:
     raise RuntimeError(f"cannot resolve base ref origin/{base} or {base}")
 
 
-def _extract_base(repo: Path, ref: str, destination: Path) -> None:
-    with tempfile.TemporaryFile() as stderr_file:
-        archive = subprocess.Popen(
-            ["git", "-c", f"safe.directory={repo}", "archive", ref],
-            cwd=repo,
-            stdout=subprocess.PIPE,
-            stderr=stderr_file,
-        )
-        assert archive.stdout is not None
-        with tarfile.open(fileobj=archive.stdout, mode="r|") as bundle:
-            bundle.extractall(destination, filter="data")
-        return_code = archive.wait()
-        stderr_file.seek(0)
-        stderr = stderr_file.read().decode("utf-8", errors="replace")
-    if return_code != 0:
-        raise RuntimeError(f"git archive {ref} failed: {stderr.strip()}")
+_extract_base = extract_base
 
 
 def _base_file_selectors(selectors: list[str], base_root: Path) -> list[str]:
@@ -77,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", default="automain")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--current-junit", type=Path, required=True)
+    parser.add_argument("--current-exit-code", type=int, default=1)
     parser.add_argument("--route", required=True)
     parser.add_argument("--harness", default="scripts/test-backend.sh")
     parser.add_argument("selectors", nargs="+")
@@ -84,13 +71,13 @@ def main(argv: list[str] | None = None) -> int:
     repo = args.repo_root.resolve()
 
     try:
-        current_failures = parse_junit_failures(args.current_junit)
-    except (OSError, ET.ParseError) as exc:
+        current_report = parse_junit_report(
+            args.current_junit, tree_root=repo, label="current"
+        )
+    except RuntimeError as exc:
         print(json.dumps({"state": "attribution_unavailable", "blocking": True, "error": str(exc)}))
         return 0
-    if not current_failures:
-        print(json.dumps({"state": "execution_failure", "blocking": True, "new_failures": {}}))
-        return 0
+    current_failures = current_report.failures
 
     try:
         base_ref = _base_ref(repo, args.base)
@@ -105,13 +92,12 @@ def main(argv: list[str] | None = None) -> int:
             base_route = base_root / "scripts" / "backend-test-route.sh"
             current_route = repo / "scripts" / "backend-test-route.sh"
             if current_route.is_file() and base_route.is_file():
-                shutil.copy2(current_route, base_route)
+                base_route.write_bytes(current_route.read_bytes())
                 base_route.chmod(base_route.stat().st_mode | 0o111)
             base_selectors = _base_file_selectors(args.selectors, base_root)
             base_junit = temp / "base.xml"
-            baseline_failures: dict[str, str]
             if not base_selectors:
-                baseline_failures = {}
+                baseline_report = JUnitReport()
             else:
                 env = {
                     **os.environ,
@@ -128,8 +114,10 @@ def main(argv: list[str] | None = None) -> int:
                     check=False,
                 )
                 try:
-                    baseline_failures = parse_junit_failures(base_junit)
-                except (OSError, ET.ParseError) as exc:
+                    baseline_report = parse_junit_report(
+                        base_junit, tree_root=base_root, label="baseline"
+                    )
+                except RuntimeError as exc:
                     print(
                         json.dumps(
                             {
@@ -141,16 +129,30 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                     return 0
-            outcome = classify_backend_verification(
+                if not is_attributable_pytest_result(
+                    result.returncode, baseline_report
+                ):
+                    print(
+                        json.dumps(
+                            {
+                                "state": "baseline_unavailable",
+                                "blocking": True,
+                                "error": "baseline pytest exit code/JUnit pair is not attributable",
+                                "base_exit_code": result.returncode,
+                            }
+                        )
+                    )
+                    return 0
+            outcome = classify_verification(
                 runtime_available=True,
-                current_exit_code=1,
+                current_exit_code=args.current_exit_code,
                 current_failures=current_failures,
-                baseline_failures=baseline_failures,
-                current_root=repo,
-                baseline_root=base_root,
+                current_report=current_report,
+                baseline_report=baseline_report,
             )
             outcome["current_failures"] = current_failures
             outcome["baseline_selectors"] = base_selectors
+            outcome["current_exit_code"] = args.current_exit_code
             print(json.dumps(outcome, sort_keys=True))
             return 0
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:

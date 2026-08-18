@@ -1182,6 +1182,61 @@ class AuditFindingResolution(SQLModel, table=True):
     )
 
 
+class ModuleFindingChain(SQLModel, table=True):
+    """Project-lifetime ledger of resolved review concerns recurring by module."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+    finding_key: str = Field(sa_column=Column(String(64), nullable=False))
+    file_path: str = Field(sa_column=Column(Text, nullable=False))
+    # Retained for file+Jaccard matching when reviewers paraphrase the concern.
+    summary: str = Field(sa_column=Column(Text, nullable=False, server_default=""))
+    occurrences: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    verified_occurrences: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    pr_numbers: list[int] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    first_seen_pr: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    last_seen_pr: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    last_seen_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    status: str = Field(
+        default="open",
+        sa_column=Column(String(16), nullable=False, server_default="open"),
+    )
+    file_provenance: str = Field(
+        default="unverified",
+        sa_column=Column(String(16), nullable=False, server_default="unverified"),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "finding_key", name="uq_modulefindingchain_project_key"
+        ),
+        Index(
+            "ix_modulefindingchain_project_file", "project_id", "file_path"
+        ),
+    )
+
+
 class QualificationDimensionResult(SQLModel, table=True):
     """Per-(candidate_sha, dimension) qualification fact ledger (Phase 1).
 

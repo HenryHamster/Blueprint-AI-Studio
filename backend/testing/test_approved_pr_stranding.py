@@ -699,10 +699,10 @@ async def test_checkpoint_handoff_handles_concurrent_idempotency_collision(
 
 
 @pytest.mark.asyncio
-async def test_incomplete_branch_listing_never_marks_a_row_examined(
+async def test_incomplete_branch_listing_advances_scan_cursor(
     db_session, monkeypatch
 ):
-    """An empty listing is an API failure, not proof that no branch exists."""
+    """An empty listing advances the cursor without claiming branch absence."""
     task_id = uuid.UUID("99999999-9999-4999-8999-999999999999")
     project, task = _checkpoint_project_and_task(
         task_id,
@@ -723,7 +723,49 @@ async def test_incomplete_branch_listing_never_marks_a_row_examined(
 
     await db_session.refresh(task)
     assert counts["checkpoint_scanned"] == 0
-    assert "unshipped_checkpoint_examined" not in task.context
+    assert task.context["unshipped_checkpoint_examined"]["reason"] == (
+        "branch_listing_checked"
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_listing_failure_does_not_pin_bounded_window(
+    db_session, monkeypatch
+):
+    """Unavailable evidence advances the cursor so later owners get a turn."""
+    first_project, first_task = _checkpoint_project_and_task(
+        uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        branch="blueprint/task-aaaaaaaa",
+        name="Pinned listing project",
+    )
+    second_project, second_task = _checkpoint_project_and_task(
+        uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+        branch="blueprint/task-bbbbbbbb",
+        name="Later checkpoint project",
+    )
+    first_task.updated_at = datetime(2026, 8, 10)
+    second_task.updated_at = datetime(2026, 8, 10, 0, 1)
+    db_session.add_all([first_project, first_task, second_project, second_task])
+    await db_session.commit()
+
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=None),
+    )
+
+    counts = await stranding._sweep_checkpoint_owners(
+        db_session, repo_root=None, now=datetime(2026, 8, 10)
+    )
+
+    await db_session.refresh(first_task)
+    await db_session.refresh(second_task)
+    assert counts["checkpoint_scanned"] == 0
+    assert first_task.context["unshipped_checkpoint_examined"]["reason"] == (
+        "branch_listing_checked"
+    )
+    assert second_task.context["unshipped_checkpoint_examined"]["reason"] == (
+        "branch_listing_checked"
+    )
 
 
 @pytest.mark.asyncio
@@ -936,6 +978,51 @@ async def test_clean_strand_triggers_bounded_reland_attempt(db_session, tmp_path
     assert second["relands_started"] == 0
     assert task.status == TaskStatus.EVALUATING
     assert task.context["approved_pr_reland"]["attempt_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reland_receipt_identity_blocks_repeated_nonstandard_state(
+    db_session, tmp_path: Path
+):
+    """An existing target receipt fences a second handoff in any state."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    project = Project(
+        name="Re-land receipt fence project", user_id="test-user", integration_branch="main"
+    )
+    db_session.add(project)
+    await db_session.flush()
+    target = {
+        "project_id": str(project.id),
+        "pr_number": 17163,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    task = Task(
+        project_id=project.id,
+        title="already handed off approval",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+        context={
+            "review_loop": {
+                "review_approved": True,
+                "review_target": target,
+            },
+            "approved_pr_reland": {
+                "identity": stranding._review_target_identity(target),
+                "target": target,
+                "state": "completed",
+                "attempt_count": 0,
+            },
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+
+    assert result["relands_started"] == 0
+    assert task.status == TaskStatus.COMPLETED
+    assert task.context["approved_pr_reland"]["state"] == "completed"
 
 
 @pytest.mark.asyncio

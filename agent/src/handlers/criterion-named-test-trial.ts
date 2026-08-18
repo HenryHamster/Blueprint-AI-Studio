@@ -71,6 +71,12 @@ export interface CriterionNamedTestTrialResult {
   passed: boolean;
   skipped_summary?: { total: number; skipped: number };
   could_not_run: boolean;
+  /** Stable orchestrator-authored retry identities. Additive for legacy tasks. */
+  trial_identity?: string;
+  test_identity?: string;
+  precondition_identity?: string;
+  /** Named absent precondition; never a passing/failing test verdict. */
+  could_not_run_reason?: string;
 }
 
 export async function handleCriterionNamedTestTrial(
@@ -95,12 +101,20 @@ export async function handleCriterionNamedTestTrial(
   const wallClockMs = typeof payload.wall_clock_seconds === 'number' && payload.wall_clock_seconds > 0
     ? payload.wall_clock_seconds * 1000
     : DEFAULT_WALL_CLOCK_MS;
+  const identityReceipt = {
+    ...(typeof payload.trial_identity === 'string' && payload.trial_identity.trim()
+      ? { trial_identity: payload.trial_identity.trim() } : {}),
+    ...(typeof payload.test_identity === 'string' && payload.test_identity.trim()
+      ? { test_identity: payload.test_identity.trim() } : {}),
+    ...(typeof payload.precondition_identity === 'string' && payload.precondition_identity.trim()
+      ? { precondition_identity: payload.precondition_identity.trim() } : {}),
+  };
 
   const report = async (result: CriterionNamedTestTrialResult): Promise<void> => {
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'COMPLETED',
-      logs: sanitize(JSON.stringify(result)),
+      logs: sanitize(JSON.stringify({ ...result, ...identityReceipt })),
       repo_url: `https://github.com/${owner}/${repo}`,
     });
   };
@@ -111,11 +125,15 @@ export async function handleCriterionNamedTestTrial(
     sendLog(ws, `Criterion named-test trial: ${!criterionKey ? 'no criterion_key' : testRefs.length === 0 ? 'no test refs' : 'refs not cleanly targetable'} — reporting could_not_run.\n`);
     await report({
       type: 'criterion_named_test_trial',
-      // This path has no checkout, so it intentionally reports only the queued
-      // identity rather than claiming it was executed.
       criterion_key: criterionKey,
-      head_sha: headSha, queued_head_sha: headSha, test_refs: testRefs,
+      // No checkout happened: never echo the queued candidate as executed.
+      head_sha: null, queued_head_sha: headSha, test_refs: testRefs,
       ran: false, passed: false, could_not_run: true,
+      could_not_run_reason: !criterionKey
+        ? 'criterion_identity_missing'
+        : testRefs.length === 0
+          ? 'test_identity_missing'
+          : 'test_target_unavailable',
     });
     return;
   }
@@ -155,6 +173,7 @@ export async function handleCriterionNamedTestTrial(
         // No checkout happened — nothing executed, so no executed SHA exists.
         head_sha: null, queued_head_sha: headSha, test_refs: testRefs,
         ran: false, passed: false, could_not_run: true,
+        could_not_run_reason: 'candidate_unavailable',
       });
       return;
     }
@@ -183,6 +202,7 @@ export async function handleCriterionNamedTestTrial(
       criterion_key: criterionKey,
       head_sha: executedHeadSha, queued_head_sha: headSha, test_refs: testRefs,
       ran: false, passed: false, could_not_run: true,
+      could_not_run_reason: 'test_target_unavailable',
     });
     return;
   }
@@ -227,6 +247,7 @@ export async function handleCriterionNamedTestTrial(
     criterion_key: criterionKey,
     head_sha: executedHeadSha, queued_head_sha: headSha, test_refs: testRefs,
     ran, passed, could_not_run: couldNotRun,
+    ...(couldNotRun ? { could_not_run_reason: 'execution_environment_unavailable' } : {}),
     ...(skippedSummary ? { skipped_summary: skippedSummary } : {}),
   });
 }

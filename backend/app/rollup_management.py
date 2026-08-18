@@ -99,6 +99,26 @@ from app.ci_merge_helpers import effective_pr_number
 
 logger = logging.getLogger(__name__)
 
+
+def _set_independent_approval_hold(task: Task, reason: str) -> bool:
+    """Install this rollup hold once, superseding any older approval owner."""
+
+    provenance = (task.context or {}).get("_approval_hold_provenance") or {}
+    if (
+        task.requires_approval is True
+        and provenance.get("owner") == "rollup_management"
+        and provenance.get("reason") == reason
+    ):
+        return False
+    from app.admin_approval_authority import establish_independent_approval_hold
+
+    establish_independent_approval_hold(
+        task,
+        reason=reason,
+        owner="rollup_management",
+    )
+    return True
+
 # Duplicate-create guard: when a rollup parent is about to POST its rollup PR it
 # stakes a ``rollup_pr_creating_at`` claim (epoch seconds) in parent.context
 # UNDER the parent lock, BEFORE releasing it around the slow create_pull_request
@@ -764,7 +784,9 @@ async def _hold_rollup_for_branch_safety(
     if project is not None:
         _signal_blocking_project_branch_configuration(project, issue_code, detail)
     if _runtime_config.get("require_approval_gates", True):
-        parent.requires_approval = True
+        _set_independent_approval_hold(
+            parent, f"rollup branch safety: {issue_code}"
+        )
     parent.latest_status_message = detail[:500]
     session.add(parent)
     await session.commit()
@@ -2073,6 +2095,16 @@ async def _check_and_trigger_rollup(
     # downstream `completed_count == 0 and failed_count > 0` guard
     # finalizes the parent. Preserving this contract by carrying
     # `all_done` from the verify loop forward to the existing dispatch.
+    # The Phase-B GitHub window deliberately released every DB row lock.
+    # Re-enter automatic creation authority before re-locking the parent so a
+    # later failed-child clone observes canonical Project -> Task ordering.
+    # Terminal reconciliation continues even when admission is denied; only
+    # `_requeue_parent_task` consumes this decision at its INSERT edge.
+    from app.task_locking import acquire_automatic_task_creation_authority
+
+    _requeue_creation_admission = await acquire_automatic_task_creation_authority(
+        session, child_task.project_id
+    )
     parent = await _relock_parent(
         session,
         parent_id_local,
@@ -2231,17 +2263,22 @@ async def _check_and_trigger_rollup(
                     # review_pipeline repeat-fingerprint/stuck-cycle gating, whose
                     # un-skipped children fall through to this terminalization.)
                     gates_on = _runtime_config.get("require_approval_gates", True)
-                    if gates_on and not parent.requires_approval:
-                        parent.requires_approval = True
-                        logger.warning(
-                            f"[ROLLUP] Child {str(c.id)[:8]} PR #{pr_number} — review "
-                            f"respawned {respawn_count}x without merging; escalating: "
-                            f"marked parent {parent.id} requires_approval"
+                    if gates_on:
+                        newly_held = _set_independent_approval_hold(
+                            parent, "child review respawn cap exhausted"
                         )
-                        alert_msg = (
-                            f"Rollup blocked: PR #{pr_number} review respawned "
-                            f"{respawn_count}x without merging — manual intervention required"
-                        )
+                        if newly_held:
+                            logger.warning(
+                                f"[ROLLUP] Child {str(c.id)[:8]} PR #{pr_number} — review "
+                                f"respawned {respawn_count}x without merging; escalating: "
+                                f"marked parent {parent.id} requires_approval"
+                            )
+                            alert_msg = (
+                                f"Rollup blocked: PR #{pr_number} review respawned "
+                                f"{respawn_count}x without merging — manual intervention required"
+                            )
+                        else:
+                            alert_msg = None
                     elif not gates_on:
                         mark_unblocked_non_merge(c, reason="review_respawn_cap")
                         c.context = {
@@ -2453,8 +2490,10 @@ async def _check_and_trigger_rollup(
             )
             if parent is None:
                 return
-            if cap_exhausted_prs and not parent.requires_approval:
-                parent.requires_approval = True
+            if cap_exhausted_prs:
+                _set_independent_approval_hold(
+                    parent, "child review-fix cap exhausted"
+                )
                 for _pr in cap_exhausted_prs:
                     logger.warning(
                         f"[ROLLUP] Child PR #{_pr} hit review-fix cap — "
@@ -2511,7 +2550,11 @@ async def _check_and_trigger_rollup(
                     f"{len(completed_merged)} succeeded. Requeuing failed children "
                     f"(attempt {requeue_count + 1}/{MAX_PARENT_REQUEUES}) before partial rollup."
                 )
-                await _requeue_parent_task(parent, session)
+                await _requeue_parent_task(
+                    parent,
+                    session,
+                    automatic_creation_admission=_requeue_creation_admission,
+                )
                 return
             # Requeue limit exhausted — fall through to partial rollup or full failure.
             logger.warning(
@@ -3476,7 +3519,6 @@ async def _check_and_trigger_rollup(
                     and not is_target_intermediate
                     and _runtime_config.get("require_approval_gates", True)
                 ):
-                    parent.requires_approval = True
                     parent.latest_status_message = (
                         f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting approval "
                         f"(contains high-risk changes)"
@@ -3486,6 +3528,9 @@ async def _check_and_trigger_rollup(
                         "rollup_pr_url": rollup_pr_url,
                         "rollup_pr_number": rollup_pr_number,
                     }
+                    _set_independent_approval_hold(
+                        parent, "rollup contains high-risk changes"
+                    )
                     session.add(parent)
                     # Snapshot status before the alert dispatch: _dispatch_rollup_
                     # approval_alert can poison/roll back the session and expire
@@ -3847,13 +3892,15 @@ async def _check_and_trigger_rollup(
                     _gates_on = _runtime_config.get("require_approval_gates", True)
                     if rollup_scan_err is not None:
                         if _gates_on:
-                            parent.requires_approval = True
                             parent.latest_status_message = _sanitize_log(f"Rollup security scan failed — requires manual approval: {type(rollup_scan_err).__name__}")[:500]
                             parent.context = {
                                 **parent_ctx,
                                 "rollup_pr_url": rollup_pr_url,
                                 "rollup_pr_number": rollup_pr_number,
                             }
+                            _set_independent_approval_hold(
+                                parent, "rollup security scan unavailable"
+                            )
                             session.add(parent)
                             await _dispatch_rollup_approval_alert(
                                 parent,
@@ -3885,7 +3932,6 @@ async def _check_and_trigger_rollup(
 
                     if rollup_scan["blocked"]:
                         if _gates_on:
-                            parent.requires_approval = True
                             parent.latest_status_message = (
                                 f"Rollup security scan blocked: {rollup_scan['summary']}"
                             )
@@ -3894,6 +3940,9 @@ async def _check_and_trigger_rollup(
                                 "rollup_pr_url": rollup_pr_url,
                                 "rollup_pr_number": rollup_pr_number,
                             }
+                            _set_independent_approval_hold(
+                                parent, "rollup security scan blocked"
+                            )
                             # Persist + commit BEFORE the comment (releases lock for I/O).
                             session.add(parent)
                             await _dispatch_rollup_approval_alert(
@@ -4245,8 +4294,6 @@ async def _check_and_trigger_rollup(
                         # that fix landing rather than on manual approval. The merge
                         # is held either way (this branch returns before the merge).
                         _gates_on = _runtime_config.get("require_approval_gates", True)
-                        if _gates_on:
-                            parent.requires_approval = True
                         parent.latest_status_message = (
                             f"Rollup PR #{rollup_pr_number} blocked — invalid Alembic "
                             f"migration chain: {alembic_reason}"
@@ -4256,6 +4303,10 @@ async def _check_and_trigger_rollup(
                             "rollup_pr_url": rollup_pr_url,
                             "rollup_pr_number": rollup_pr_number,
                         }
+                        if _gates_on:
+                            _set_independent_approval_hold(
+                                parent, "rollup migration chain invalid"
+                            )
                         session.add(parent)
                         await _dispatch_rollup_approval_alert(
                             parent,
@@ -4307,8 +4358,6 @@ async def _check_and_trigger_rollup(
                         return
                     if size_cap_status == "hold":
                         _gates_on = _runtime_config.get("require_approval_gates", True)
-                        if _gates_on:
-                            parent.requires_approval = True
                         parent.latest_status_message = (
                             f"Rollup PR #{rollup_pr_number} held — size-cap: "
                             f"{size_cap_reason}"
@@ -4318,6 +4367,10 @@ async def _check_and_trigger_rollup(
                             "rollup_pr_url": rollup_pr_url,
                             "rollup_pr_number": rollup_pr_number,
                         }
+                        if _gates_on:
+                            _set_independent_approval_hold(
+                                parent, "rollup module size cap exceeded"
+                            )
                         session.add(parent)
                         await _dispatch_rollup_approval_alert(
                             parent,
@@ -5453,50 +5506,58 @@ async def _check_and_trigger_rollup(
                                 # gating elsewhere in this file.)
                                 if (
                                     _runtime_config.get("require_approval_gates", True)
-                                    and not parent.requires_approval
                                 ):
                                     if deferred_count >= approval_threshold:
-                                        parent.requires_approval = True
-                                        try:
-                                            await _dispatch_rollup_approval_alert(
-                                                parent,
-                                                session,
-                                                f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
-                                                f"for {deferred_count} sweeps — manual investigation required",
-                                                pr_number=rollup_pr_number,
-                                            )
-                                        except Exception as _alert_err:
-                                            logger.warning(
-                                                f"[ROLLUP] Failed to dispatch per-state approval alert for PR #{rollup_pr_number}: {_alert_err}"
-                                            )
+                                        if _set_independent_approval_hold(
+                                            parent,
+                                            "rollup mergeability per-state threshold",
+                                        ):
+                                            try:
+                                                await _dispatch_rollup_approval_alert(
+                                                    parent,
+                                                    session,
+                                                    f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
+                                                    f"for {deferred_count} sweeps — manual investigation required",
+                                                    pr_number=rollup_pr_number,
+                                                )
+                                            except Exception as _alert_err:
+                                                logger.warning(
+                                                    f"[ROLLUP] Failed to dispatch per-state approval alert for PR #{rollup_pr_number}: {_alert_err}"
+                                                )
                                     elif total_deferrals >= total_approval_threshold:
-                                        parent.requires_approval = True
-                                        try:
-                                            await _dispatch_rollup_approval_alert(
-                                                parent,
-                                                session,
-                                                f"Rollup PR #{rollup_pr_number} deferred {total_deferrals} times across "
-                                                f"states — manual investigation required",
-                                                pr_number=rollup_pr_number,
-                                            )
-                                        except Exception as _alert_err:
-                                            logger.warning(
-                                                f"[ROLLUP] Failed to dispatch total-deferral approval alert for PR #{rollup_pr_number}: {_alert_err}"
-                                            )
+                                        if _set_independent_approval_hold(
+                                            parent,
+                                            "rollup mergeability total threshold",
+                                        ):
+                                            try:
+                                                await _dispatch_rollup_approval_alert(
+                                                    parent,
+                                                    session,
+                                                    f"Rollup PR #{rollup_pr_number} deferred {total_deferrals} times across "
+                                                    f"states — manual investigation required",
+                                                    pr_number=rollup_pr_number,
+                                                )
+                                            except Exception as _alert_err:
+                                                logger.warning(
+                                                    f"[ROLLUP] Failed to dispatch total-deferral approval alert for PR #{rollup_pr_number}: {_alert_err}"
+                                                )
                                     elif elapsed_minutes >= time_approval_minutes:
-                                        parent.requires_approval = True
-                                        try:
-                                            await _dispatch_rollup_approval_alert(
-                                                parent,
-                                                session,
-                                                f"Rollup PR #{rollup_pr_number} has been deferred for "
-                                                f"{elapsed_minutes:.0f} minutes — manual investigation required",
-                                                pr_number=rollup_pr_number,
-                                            )
-                                        except Exception as _alert_err:
-                                            logger.warning(
-                                                f"[ROLLUP] Failed to dispatch time-based approval alert for PR #{rollup_pr_number}: {_alert_err}"
-                                            )
+                                        if _set_independent_approval_hold(
+                                            parent,
+                                            "rollup mergeability elapsed threshold",
+                                        ):
+                                            try:
+                                                await _dispatch_rollup_approval_alert(
+                                                    parent,
+                                                    session,
+                                                    f"Rollup PR #{rollup_pr_number} has been deferred for "
+                                                    f"{elapsed_minutes:.0f} minutes — manual investigation required",
+                                                    pr_number=rollup_pr_number,
+                                                )
+                                            except Exception as _alert_err:
+                                                logger.warning(
+                                                    f"[ROLLUP] Failed to dispatch time-based approval alert for PR #{rollup_pr_number}: {_alert_err}"
+                                                )
                                 session.add(parent)
                                 await session.commit()
                                 _log = logger.warning if _is_unrecognized else logger.info

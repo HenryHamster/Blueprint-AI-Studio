@@ -9,6 +9,12 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.admin_approval_authority import (
+    APPROVAL_FOLLOWUP_CLAIM_KEY,
+    APPROVAL_HOLD_PROVENANCE_KEY,
+    approval_hold_provenance,
+    establish_independent_approval_hold,
+)
 from app.ci_merge_helpers import (
     _pr_number_match,
     revoke_review_authority_for_active_fix,
@@ -22,6 +28,23 @@ MIGRATION_GUARD_STATE_FIX_SPAWNED = "fix_spawned"
 MIGRATION_GUARD_STATE_FIX_DEFERRED = "fix_deferred"
 MIGRATION_GUARD_STATE_FIX_SUPPRESSED = "fix_suppressed"
 MIGRATION_GUARD_STATE_DEFERRED = "deferred"
+
+
+def _establish_migration_guard_hold(task: Task, *, reason: str) -> None:
+    context = dict(task.context or {})
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    if (
+        task.requires_approval is True
+        and isinstance(provenance, dict)
+        and provenance.get("owner") == "migration_guard_recovery"
+        and provenance.get("reason") == reason
+        and not context.get(APPROVAL_FOLLOWUP_CLAIM_KEY)
+        and approval_hold_provenance(task).get("review_wait_hold") is None
+    ):
+        return
+    establish_independent_approval_hold(
+        task, reason=reason, owner="migration_guard_recovery"
+    )
 
 
 def coerce_migration_guard_result(result: Any) -> tuple[str, str | None]:
@@ -202,6 +225,7 @@ async def spawn_migration_guard_fix_task(
         *,
         fix_task_id: object | None = None,
         requires_approval: bool = False,
+        approval_reason: str | None = None,
         ci_waiting: bool = False,
         ci_passed: bool = False,
     ) -> None:
@@ -235,12 +259,17 @@ async def spawn_migration_guard_fix_task(
         }
         flag_modified(task, "context")
         if requires_approval:
-            task.requires_approval = True
+            _establish_migration_guard_hold(
+                task,
+                reason=approval_reason or "migration_guard_fix_suppressed",
+            )
         task.status = TaskStatus.EVALUATING
 
     if not branch or not base_branch:
         _write_block_state(
-            MIGRATION_GUARD_STATE_FIX_SUPPRESSED, requires_approval=True
+            MIGRATION_GUARD_STATE_FIX_SUPPRESSED,
+            requires_approval=True,
+            approval_reason="migration_guard_metadata_missing",
         )
         task.latest_status_message = (
             f"Merge blocked — Alembic guard needs migration chain repair on "
@@ -409,7 +438,9 @@ async def spawn_migration_guard_fix_task(
             return None, False
 
         _write_block_state(
-            MIGRATION_GUARD_STATE_FIX_SUPPRESSED, requires_approval=True
+            MIGRATION_GUARD_STATE_FIX_SUPPRESSED,
+            requires_approval=True,
+            approval_reason="migration_guard_fix_suppressed",
         )
         task.latest_status_message = (
             f"PR #{pr_number} Alembic guard blocked, but migration fix spawn was "

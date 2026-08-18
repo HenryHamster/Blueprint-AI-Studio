@@ -164,7 +164,7 @@ def _hint_for_failure_class(failure_class: str) -> str:
         "RATE_LIMIT": (
             "API rate limit hit. Reduce call frequency or add exponential backoff."
         ),
-    }.get(failure_class, "Check the error log for details and reduce scope.")
+    }.get(failure_class, "Check the error log for details.")
 
 
 # ---------------------------------------------------------------------------

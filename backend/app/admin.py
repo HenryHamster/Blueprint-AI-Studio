@@ -101,6 +101,7 @@ from app.task_outcomes import build_task_evaluation_summary
 from app.task_direction_refs import first_task_direction_id
 from app.task_movement import build_task_movement_explanation
 from app.task_surface_visibility import non_resident_infrastructure_task_filter
+from app.landed_signal import is_merged_completion
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     PROJECT_WRITE_ROLES,
@@ -117,8 +118,8 @@ from app.admin_helpers import (  # noqa: F401
 from app.admin_task_mutations import (
     CANCEL_CASCADE_CHILD_STATUSES,
     CANCEL_WAITING_DEPENDENT_STATUSES,
-    _handle_rollup_pr_approval,
-    _handle_task_pr_approval,
+    decide_operator_approval,
+    execute_approval_followup,
     _mark_admin_cancelled,
     modify_task_apply,
 )
@@ -299,7 +300,7 @@ def _artifact_is_current_attempt(
 _TASK_LIST_COLS = [
     Task.id, Task.project_id, Task.title, Task.description, Task.status,
     Task.vm_instance_id, Task.latest_status_message,
-    Task.created_by, Task.requires_approval, Task.parent_task_id, Task.depends_on,
+    Task.created_by, Task.origination, Task.requires_approval, Task.parent_task_id, Task.depends_on,
     Task.plan_output, Task.created_at, Task.started_at, Task.last_heartbeat,
     Task.last_metrics_json, Task.last_tool_use_at, Task.attempt_count,
     Task.blocker_kind, Task.blocked_reason, Task.blocked_at, Task.recheck_after,
@@ -685,6 +686,11 @@ async def get_all_tasks(
             "vm_instance_id": t.vm_instance_id,
             "latest_status_message": t.latest_status_message,
             "created_by": t.created_by,
+            # Durable source-of-work authority. ``created_by`` collapses nearly
+            # every automated producer into ORCHESTRATOR, which made direction
+            # autonomy volume indistinguishable from Strategic/review/system
+            # churn on the operator task surface.
+            "origination": t.origination,
             "requires_approval": t.requires_approval,
             "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
             "depends_on": t.depends_on or [],
@@ -727,7 +733,12 @@ async def get_all_tasks(
             "archived": t.archived,
             "artifacts": artifacts_map.get(str(t.id), []),
             "pr_url": pr_map.get(str(t.id)),
-            "error_logs": logs_map.get(str(t.id)),
+            # ERROR_LOG artifacts remain in ``artifacts`` for audit, but once
+            # integration has been corroborated they are no longer the task's
+            # current failure projection.
+            "error_logs": None
+            if is_merged_completion(t)
+            else logs_map.get(str(t.id)),
             "research_findings": resolve_research_findings_for_surface_from_state(
                 t.plan_output,
                 t.context,
@@ -1206,7 +1217,9 @@ async def _bulk_retry_one_task(
                 )
             old_vm: str | None = None
             if has_children:
-                await _requeue_parent_task(task, scoped_session)
+                await _requeue_parent_task(
+                    task, scoped_session, automatic_creation=False
+                )
             else:
                 old_vm = task.vm_instance_id
                 reset_task_for_fresh_attempt(task)
@@ -1348,6 +1361,19 @@ async def _bulk_cancel_task(
         if task.vm_provisioned_at:
             task.vm_stopped_at = _utcnow()
         task.requires_approval = False
+        from app.admin_approval_authority import (
+            approval_hold_provenance,
+            consume_approval_hold_metadata,
+            revoke_operator_approval_followup,
+        )
+        from app.closed_pr_reconciliation import revoke_review_wait_approval_hold
+
+        revoke_review_wait_approval_hold(task)
+        revoke_operator_approval_followup(task)
+        consume_approval_hold_metadata(
+            task,
+            expected_episode=approval_hold_provenance(task),
+        )
         # Persist operator-cancellation provenance so the bulk-cancelled task
         # cannot be misclassified as an agent death after the request completes.
         _mark_admin_cancelled(task)
@@ -1385,6 +1411,12 @@ async def _bulk_cancel_task(
             if child.vm_provisioned_at:
                 child.vm_stopped_at = _utcnow()
             child.requires_approval = False
+            revoke_review_wait_approval_hold(child)
+            revoke_operator_approval_followup(child)
+            consume_approval_hold_metadata(
+                child,
+                expected_episode=approval_hold_provenance(child),
+            )
             _mark_admin_cancelled(
                 child,
                 cancelled_by_task_id=cancellation_source_id,
@@ -1606,63 +1638,17 @@ async def bulk_action_tasks(
                     await _ensure_vm_deleted(old_vm, reason="admin_requeue")
 
             elif body.action == "approve":
-                was_blocked = task.requires_approval
-                task.requires_approval = False
-                task.spend_approval_cleared_at = _utcnow()
-
-                if was_blocked:
-                    logger.info(
-                        f"[ADMIN] Task {task.id} bulk-approved (was blocked: {task.latest_status_message or 'unknown reason'})"
+                task, approval_decision, _approval_changes = (
+                    await decide_operator_approval(
+                        valid_map[raw_id],
+                        False,
+                        session,
+                        modified_by="BULK_ACTION",
                     )
-
-                if was_blocked and task.status in (
-                    TaskStatus.COMPLETED,
-                    TaskStatus.EVALUATING,
-                ):
-                    ctx = task.context or {}
-                    rollup_pr_number = ctx.get("rollup_pr_number")
-                    approval_changes: Dict[str, Any] = {}
-
-                    # Round 3 M10 — operator-response latency contract:
-                    # The rollup-PR approval branch performs external GitHub
-                    # API calls (merge_pull_request, create_pr_comment, and
-                    # later _cleanup_branches) BEFORE per-task commit. The
-                    # bulk endpoint's HTTP response therefore includes the
-                    # full GitHub round-trip latency for each approved task
-                    # (typically 2-5s, up to 30s+ during rate-limit). For N
-                    # tasks the response time scales O(N) — operators should
-                    # not assume sub-second latency on bulk approve. This is
-                    # intentional: holding the merge external until commit
-                    # would risk an inconsistency where the DB shows
-                    # COMPLETED but the GitHub PR is still open.
-                    if rollup_pr_number:
-                        await _handle_rollup_pr_approval(
-                            task,
-                            ctx,
-                            rollup_pr_number,
-                            session,
-                            approval_changes,
-                        )
-                    else:
-                        await _handle_task_pr_approval(
-                            task,
-                            ctx,
-                            {},
-                            session,
-                            approval_changes,
-                        )
-
-                history = TaskHistory(
-                    task_id=task.id,
-                    action="MODIFIED",
-                    details={
-                        "changes": {"requires_approval": False},
-                        "modified_by": "BULK_ACTION",
-                    },
                 )
-                session.add(task)
-                session.add(history)
-                await session.commit()
+                task, _followup_changes = await execute_approval_followup(
+                    approval_decision, session
+                )
 
             elif body.action == "cancel":
                 terminal_error = await _bulk_cancel_task(
@@ -2289,6 +2275,7 @@ async def get_task(
         "latest_status_message": task.latest_status_message,
         "status_log": task.status_log or [],
         "created_by": task.created_by,
+        "origination": task.origination,
         "requires_approval": task.requires_approval,
         "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
         "depends_on": task.depends_on or [],
@@ -2343,7 +2330,9 @@ async def get_task(
         "archived": task.archived,
         "artifacts": artifacts_list,
         "pr_url": pr_url,
-        "error_logs": error_logs,
+        # Preserve the immutable ERROR_LOG artifact above without presenting
+        # it as a current blocker after this exact work has landed.
+        "error_logs": None if is_merged_completion(task) else error_logs,
         "commit_hash": commit_hash,
         "repo_url": repo_url,
         "research_findings": resolve_research_findings_for_surface(task)
@@ -4222,46 +4211,140 @@ async def request_changes(
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
     task_payload = _task_payload_dict(task)
+    request_original_prompt = task_payload.get("prompt", task.description or "")
     _project = await session.get(Project, task.project_id)
     branch = _resolve_task_branch(task, get_project_task_branch_namespace(_project))
     base_branch = task_payload.get("base_branch") or get_project_integration_branch(
         _project
     )
 
+    from app.admin_request_changes_authority import (
+        build_live_request_changes_review_target,
+        build_request_changes_spawn_boundary,
+        capture_request_changes_snapshot,
+    )
+
+    request_snapshot = capture_request_changes_snapshot(
+        task,
+        artifact,
+        pr_number=pr_number,
+        action=payload.action,
+        modified_by=current_user.get("email", current_user["user_id"]),
+    )
+    request_task_id = request_snapshot.task_id
+    request_project_id = request_snapshot.project_id
+    request_pr_number = request_snapshot.pr_number
+    source_authority, source_publication = (
+        build_request_changes_spawn_boundary(request_snapshot)
+    )
+
     from app.review_pipeline import REVIEW_FIX_GOAL_PREAMBLE, _spawn_pipeline_task
 
+    # Keep the fix path wholly before the review path's transaction release.
+    # Besides making the authority boundary explicit, this prevents a stale ORM
+    # identity from being reachable after the review-only rollback/I/O window.
     if payload.action == "fix":
-        spawned, _ = await _spawn_pipeline_task(
-            task,
-            "fix",
-            session,
-            pr_number,
-            branch,
-            base_branch,
-            fix_prompt=f"{REVIEW_FIX_GOAL_PREAMBLE}A human reviewer flagged this PR. Feedback:\n\n{payload.feedback}",
-            original_task_id=str(task.id),
+        try:
+            spawned, was_created = await _spawn_pipeline_task(
+                task,
+                "fix",
+                session,
+                pr_number,
+                branch,
+                base_branch,
+                fix_prompt=(
+                    f"{REVIEW_FIX_GOAL_PREAMBLE}A human reviewer flagged this PR. "
+                    f"Feedback:\n\n{payload.feedback}"
+                ),
+                original_task_id=str(request_task_id),
+                source_spawn_authority=source_authority,
+                source_spawn_publication=source_publication,
+            )
+        except Exception:
+            await session.rollback()
+            raise
+        if spawned and was_created:
+            return {"spawned_task_id": str(spawned.id), "action": payload.action}
+        await session.rollback()
+        raise HTTPException(
+            status_code=500, detail="Failed to spawn task (iteration cap?)"
         )
-    else:
-        spawned, _ = await _spawn_pipeline_task(
+
+    from app.github import get_pull_request
+    from app.routers.agent import get_github_token_for_task
+
+    # Close the access-check/read snapshot before credential or GitHub I/O.
+    # The spawn boundary below reacquires Project -> PR -> Task authority and
+    # revalidates the frozen source attempt before publishing any write.
+    await session.rollback()
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(
+            request_task_id,
+            session,
+            release_dedicated_session_before_io=True,
+        )
+        # Credential resolution may have opened a read transaction.  Do not
+        # retain even that transaction across the live network observation.
+        await session.rollback()
+        live_pr = await get_pull_request(
+            gh_token,
+            owner,
+            repo,
+            request_pr_number,
+            project_id=str(request_project_id),
+        )
+    except Exception as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot request review for PR #{request_pr_number}: "
+                f"live PR target lookup failed: {exc}"
+            ),
+        ) from exc
+    review_target = build_live_request_changes_review_target(request_snapshot, live_pr)
+    if review_target is None:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot request review for PR #{request_pr_number}: "
+                "live PR target is closed or unresolved"
+            ),
+        )
+    # Rollback expiry invalidated the route's original ORM instance.  Re-read it
+    # only after GitHub I/O; the source callback performs the definitive locked
+    # comparison against ``request_snapshot``.
+    task = await session.get(Task, request_task_id, populate_existing=True)
+    if task is None:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Task changed; retry request")
+
+    try:
+        spawned, was_created = await _spawn_pipeline_task(
             task,
             "review",
             session,
             pr_number,
             branch,
             base_branch,
-            original_prompt=task_payload.get("prompt", task.description or ""),
-            original_task_id=str(task.id),
+            original_prompt=request_original_prompt,
+            original_task_id=str(request_task_id),
+            review_target=review_target,
+            source_spawn_authority=source_authority,
+            source_spawn_publication=source_publication,
         )
+    except Exception:
+        await session.rollback()
+        raise
 
-    if spawned:
-        task.requires_approval = False
-        task.latest_status_message = (
-            f"Changes requested — spawned {payload.action} task"
-        )
-        session.add(task)
-        await session.commit()
+    if spawned and was_created:
         return {"spawned_task_id": str(spawned.id), "action": payload.action}
 
+    # The publication callback did not run, so the approval gate and its
+    # provenance remain authoritative. Discard any uncommitted spawn-reason
+    # bookkeeping before surfacing the retryable conflict.
+    await session.rollback()
     raise HTTPException(status_code=500, detail="Failed to spawn task (iteration cap?)")
 
 
@@ -4314,6 +4397,29 @@ async def reset_iteration_cap(
     task = await _get_user_task_with_role(
         task_id, current_user["user_id"], session, "member"
     )
+
+    # The authorization lookup is intentionally read-only. Re-read and lock the
+    # exact row before interpreting cap ownership or mutating its context so a
+    # newer manual/security/spend episode cannot be cleared by a stale route
+    # identity.
+    authorized_project_id = task.project_id
+    task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.project_id == authorized_project_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
 
     ctx = task.context or {}
     review_loop = ctx.get("review_loop", {}) or {}
@@ -4369,11 +4475,64 @@ async def reset_iteration_cap(
                 f"{pending_failed.id} has a pending post-commit continuation"
             ),
         )
+    failed_review_fix_ids = [candidate.id for candidate in failed_review_fix_tasks]
     archived_count = 0
-    for t in failed_review_fix_tasks:
-        t.archived = True
-        session.add(t)
-        archived_count += 1
+    if failed_review_fix_ids:
+        if resolve_dialect_name(session) == "sqlite":
+            failed_task_type = func.json_extract(Task.payloads, "$[0].type")
+        else:
+            failed_task_type = Task.payloads[0]["type"].as_string()
+        archive_result = await session.execute(
+            update(Task)
+            .where(
+                Task.id.in_(failed_review_fix_ids),
+                Task.project_id == task.project_id,
+                Task.status == TaskStatus.FAILED,
+                Task.archived.is_(False),
+                Task.post_commit_pending.is_(False),
+                failed_task_type.in_(("review", "fix")),
+                _pr_number_match(session, pr_number),
+            )
+            .values(archived=True, version=Task.version + 1)
+            .execution_options(synchronize_session=False)
+        )
+        archived_count = max(0, int(archive_result.rowcount or 0))
+
+    from app.admin_approval_authority import (
+        APPROVAL_HOLD_EPISODE_KEY,
+        APPROVAL_HOLD_PROVENANCE_KEY,
+        approval_hold_provenance,
+        consume_approval_hold_metadata,
+        revoke_operator_approval_followup,
+    )
+
+    hold_provenance = ctx.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    hold_reason = ctx.get("approval_hold_reason")
+    cap_hold_owned = bool(
+        task.requires_approval is True
+        and isinstance(hold_provenance, dict)
+        and hold_provenance.get("episode")
+        == ctx.get(APPROVAL_HOLD_EPISODE_KEY)
+        and hold_provenance.get("set_at") == ctx.get("_approval_set_at")
+        and hold_provenance.get("reason") == hold_reason
+        and (
+            (
+                hold_provenance.get("owner") == "review_loop_convergence"
+                and hold_reason
+                in {
+                    "approved_cap_pr_preserved_for_handmerge",
+                    "review_cap_preserved_for_handmerge",
+                    "review_cap_exhausted",
+                }
+            )
+            or (
+                hold_provenance.get("owner") == "review_pipeline"
+                and hold_reason == "cross_episode_abandon_candidate"
+                and isinstance(ctx.get("review_loop_abandon_candidate"), dict)
+            )
+        )
+    )
+    cap_hold_episode = approval_hold_provenance(task) if cap_hold_owned else None
 
     # Reset per-chain iteration counter on the parking task
     new_ctx = dict(ctx)
@@ -4393,10 +4552,19 @@ async def reset_iteration_cap(
     task.context = new_ctx
     flag_modified(task, "context")
 
-    # Clear requires_approval if it was set by the cap path
-    was_requires_approval = task.requires_approval
-    if task.requires_approval:
+    # Clear only an exact cap-owned episode. A newer independent hold may share
+    # the boolean latch but is not authority for this operation to consume.
+    was_requires_approval = cap_hold_episode is not None
+    if cap_hold_episode is not None:
         task.requires_approval = False
+        from app.closed_pr_reconciliation import revoke_review_wait_approval_hold
+
+        revoke_review_wait_approval_hold(task)
+        revoke_operator_approval_followup(task)
+        consume_approval_hold_metadata(
+            task,
+            expected_episode=cap_hold_episode,
+        )
 
     session.add(task)
     await session.commit()

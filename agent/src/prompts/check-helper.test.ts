@@ -154,25 +154,22 @@ describe('writeCheckHelper — direct invocation', () => {
     // is deferred to CI where it has room to breathe.
     expect(script).toContain('run "admin-ui typecheck" bash -c \'cd admin-ui && npm run typecheck 2>&1\'');
     expect(script).not.toContain('npm run build 2>&1'); // no vite build on agent VM
-    // The agent vitest suite runs on every ./check (not behind `test`) for
-    // agent-touching changes, routed through `run` so a failure lands in
-    // FAILED and ./check fails closed.
-    expect(script).toContain(`run "agent vitest" bash -c 'set -o pipefail; cd agent && npx vitest run 2>&1 | tail -80'`);
+    // The agent suite remains always-on, but its result now comes from the
+    // shared fail-closed base-attribution guard rather than console output.
+    expect(script).toContain('run "agent vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite agent --base "$BASE" --repo-root "$WORKSPACE"');
     // It lives inside the agent stack block, so it only runs when agent/ changed.
-    expect(script).toMatch(/if touches agent\/; then[\s\S]*run "agent vitest"/);
-    // The admin-ui unit vitest suite also runs unconditionally (not behind `test`)
-    // inside the admin-ui block, matching CI's unit shards (bare npx vitest run,
-    // happy-dom, no Chromium, no VITE_* env vars needed for the unit suite).
-    expect(script).toContain(`run "admin-ui vitest" bash -c 'set -o pipefail; cd admin-ui && npx vitest run 2>&1 | tail -80'`);
-    expect(script).toMatch(/if admin_ui_runtime_touched; then[\s\S]*run "admin-ui vitest"/);
-    // The standalone backend harness run uses a baseline-recheck pattern:
-    // on failure, it re-runs on the base branch to distinguish pre-existing
-    // failures (WARN, not blocking) from regressions (real failure, blocking).
-    expect(script).toContain('bash scripts/test-backend.sh --standalone --no-postgres');
-    expect(script).toContain('backend pytest FAILED on PR — checking baseline on origin/$BASE');
-    expect(script).toContain('backend pytest WARN — also broken on $BPYTEST_BASE_REF; not blocking PR');
-    expect(script).toContain('backend pytest FAILED — passes on $BPYTEST_BASE_REF, fails on PR. Real regression.');
-    expect(script).toContain('FAILED+=("backend pytest")');
+    expect(script).toMatch(/if touches agent\/; then[\s\S]*run "agent vitest \(attributed\)"/);
+    // The admin-ui suite uses the same base-attributed lane and stays outside
+    // the developer-only test switch in the generated publication gate.
+    expect(script).toContain('run "admin-ui vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"');
+    expect(script).toMatch(/if admin_ui_runtime_touched; then[\s\S]*run "admin-ui vitest \(attributed\)"/);
+    // The generated backend corpus lane delegates baseline attribution to the
+    // shared static guard. This prevents a red base corpus from waiving every
+    // current failure and keeps task ownership fail-closed.
+    expect(script).toContain('run "backend pytest (attributed)" python3 scripts/static_release_guard.py');
+    expect(script).toContain('--corpus-only --base "$BASE" --repo-root "$WORKSPACE"');
+    expect(script).not.toContain('BPYTEST_BASELINE_FAILED');
+    expect(script).not.toContain('backend pytest WARN — also broken on $BPYTEST_BASE_REF; not blocking PR');
     expect(script).toContain('PASS — all checks green');
     // Size guardrail is wired into the self-repo gate: invoked by reference as
     // the committed checker script, run UNCONDITIONALLY across all sections
@@ -793,8 +790,9 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     expect(script).toContain(
       '_VERIFY_RECEIPT="/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"',
     );
-    expect(script).toContain('mv -f "$_verification_tmp" "$_VERIFY_RECEIPT"');
-    expect(script).toContain('"skipped":runtime["skipped"],"exit_code":0');
+    expect(script).toContain('--current-exit-code "$_verification_exit"');
+    expect(script).toContain('"suppressed_failures":d.get("suppressed_failures",{})');
+    expect(script).toContain('"disappeared_failures":d.get("disappeared_failures",{})');
     expect(script).toContain('no impacted pytest file/node was resolved');
     expect(script).toContain("grep -E '^backend/(testing|tests)/test_.*\\.py$'");
     expect(script).toContain('PostgreSQL runtime unavailable');
@@ -1034,6 +1032,15 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       const fixtureRouteHelper = realPath.join(dir, 'scripts', 'backend-test-route.sh');
       if (scenario.routeHelper === 'syntax-invalid') realFs.writeFileSync(fixtureRouteHelper, 'if then\n');
       else if (scenario.routeHelper !== 'missing') realFs.copyFileSync(routeHelper, fixtureRouteHelper);
+      const productionRoot = realPath.resolve(process.cwd(), '..');
+      realFs.copyFileSync(
+        realPath.join(productionRoot, 'scripts', 'backend_verification_guard.py'),
+        realPath.join(dir, 'scripts', 'backend_verification_guard.py'),
+      );
+      realFs.copyFileSync(
+        realPath.join(productionRoot, 'backend', 'testing', 'fixgate_attribution.py'),
+        realPath.join(dir, 'backend', 'testing', 'fixgate_attribution.py'),
+      );
       realFs.writeFileSync(realPath.join(dir, 'backend', 'x.py'), 'value = 1\n');
       realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'test_x.py'), 'def test_x(): assert True\n');
       realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'impacted_tests.py'), '# shimmed by python3\n');
@@ -1049,6 +1056,7 @@ case "$*" in
   *"rev-parse --git-dir"*) echo .git; exit 0 ;;
   *"rev-parse --verify origin/automain"*) exit 0 ;;
   *"diff --name-only origin/automain...HEAD"*) printf '%s\\n' ${changedOutput}; exit 0 ;;
+  *" archive "*) tar -cf - --exclude=.git .; exit $? ;;
   *) exit 0 ;;
 esac
 `, { mode: 0o755 });
@@ -1088,6 +1096,14 @@ exec "${realPython}" "$@"
       realFs.writeFileSync(harnessFile, `#!/bin/sh
 echo "harness USE_TEST_POSTGRES=\${USE_TEST_POSTGRES:-} $*" >> "$LOGFILE"
 case "$*" in *--standalone*) exit 0 ;; esac
+if [ -n "\${BLUEPRINT_VERIFICATION_JUNIT:-}" ] && [ ${scenario.harnessExit} -eq 0 ]; then
+  mkdir -p "$(dirname -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+  if [ ${scenario.skipped ?? 0} -gt 0 ]; then
+    printf '%s\\n' '<testsuite tests="1" failures="0" skipped="1"><testcase classname="testing.test_x" name="test_x"><skipped /></testcase></testsuite>' > "$BLUEPRINT_VERIFICATION_JUNIT"
+  else
+    printf '%s\\n' '<testsuite tests="1" failures="0"><testcase classname="testing.test_x" name="test_x" /></testsuite>' > "$BLUEPRINT_VERIFICATION_JUNIT"
+  fi
+fi
 if [ -n "\${BLUEPRINT_VERIFICATION_RESULT_FILE:-}" ] && [ ${scenario.harnessExit} -eq 0 ]; then
   printf '%s\\n' '{"version":1,"targeted":true,"use_test_postgres":true,"postgres_sidecar":true,"tests":1,"skipped":${scenario.skipped ?? 0},"failures":0,"exit_code":0,"selectors":["testing/test_x.py"]}' > "$BLUEPRINT_VERIFICATION_RESULT_FILE"
 fi
@@ -1449,7 +1465,7 @@ describe('writeCheckHelper — ci_failure selector verify gate (static)', () => 
     expect(script).not.toContain('CI_FAIL_SELECTORS');
     // The rest of the self-repo gate is intact.
     expect(script).toContain('PASS — all checks green');
-    expect(script).toContain('run "agent vitest"');
+    expect(script).toContain('run "agent vitest (attributed)"');
   });
 
   it('emits NO verify block when every selector is dropped as unsafe', async () => {
@@ -1748,12 +1764,11 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     expect(script).toContain('124|137)');
     expect(script).toContain('/tmp/check_gate_env_impacted-1.txt');
     expect(script).toContain('FAILED+=("impacted-test gate")');
-    // It is ADDITIVE — the standalone smoke run is untouched and still present.
-    expect(script).toContain('scripts/test-backend.sh --standalone --no-postgres');
-    // The block lives INSIDE the WITH_TESTS merge-time backend gate, right after
-    // the standalone run and before that gate's closing `fi`.
+    // The attributed corpus run is INSIDE the WITH_TESTS merge-time backend
+    // gate, right before the impacted-test gate and its closing `fi`.
+    expect(script).toContain('run "backend pytest (attributed)" python3 scripts/static_release_guard.py');
     expect(script).toMatch(
-      /if \[ "\$WITH_TESTS" = "1" \][\s\S]*?--standalone --no-postgres[\s\S]*?impacted-test merge-time gate[\s\S]*?\n {2}fi/,
+      /if \[ "\$WITH_TESTS" = "1" \][\s\S]*?--corpus-only[\s\S]*?impacted-test merge-time gate[\s\S]*?\n {2}fi/,
     );
   });
 
@@ -1797,8 +1812,9 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     // Gate compiles to "1" — not a constant-false guard.
     expect(script).toContain('[ "$WITH_TESTS" = "1" ] && [ "1" = "1" ]');
     expect(script).not.toContain('[ "$WITH_TESTS" = "1" ] && [ "0" = "1" ]');
-    // Standalone smoke run is present (with baseline-recheck on failure).
-    expect(script).toContain('bash scripts/test-backend.sh --standalone --no-postgres');
+    // The standalone corpus is routed through structured baseline attribution.
+    expect(script).toContain('run "backend pytest (attributed)" python3 scripts/static_release_guard.py');
+    expect(script).toContain('--corpus-only --base "$BASE" --repo-root "$WORKSPACE"');
     // Impacted-test gate is present.
     expect(script).toContain('impacted-test merge-time gate');
     expect(script).toContain('python3 backend/testing/impacted_tests.py');

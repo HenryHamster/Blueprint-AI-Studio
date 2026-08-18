@@ -1527,7 +1527,9 @@ async def test_rollup_retries_failed_children_before_partial_rollup(rollup_db, m
 
     await _check_and_trigger_rollup(failed, rollup_db)
 
-    mock_requeue.assert_called_once_with(parent, rollup_db)
+    mock_requeue.assert_called_once_with(
+        parent, rollup_db, automatic_creation_admission="allowed"
+    )
     # Parent should still be EVALUATING — mock _requeue_parent_task didn't change it
     await rollup_db.refresh(parent)
     assert parent.status == TaskStatus.EVALUATING
@@ -1579,7 +1581,9 @@ async def test_rollup_retries_all_failed_children(rollup_db, mocker):
 
     await _check_and_trigger_rollup(failed1, rollup_db)
 
-    mock_requeue.assert_called_once_with(parent, rollup_db)
+    mock_requeue.assert_called_once_with(
+        parent, rollup_db, automatic_creation_admission="allowed"
+    )
 
 
 @pytest.mark.asyncio
@@ -1633,7 +1637,9 @@ async def test_rollup_not_blocked_by_stale_review_task(rollup_db, mocker):
     await _check_and_trigger_rollup(failed, rollup_db)
 
     # Stale review must not block rollup — retry path should have been taken.
-    mock_requeue.assert_called_once_with(parent, rollup_db)
+    mock_requeue.assert_called_once_with(
+        parent, rollup_db, automatic_creation_admission="allowed"
+    )
 
 
 @pytest.mark.asyncio
@@ -6097,26 +6103,37 @@ class TestCalibrateFindingScope:
         assert cal is None
 
     def test_file_count_heuristic_upgrades_medium_to_large(self):
-        finding = {"title": "t", "related_files": self._single_module_files(8)}
+        # 16 related_files is at the medium file budget — no headroom for
+        # expansion, so route to large.
+        finding = {"title": "t", "related_files": self._single_module_files(16)}
         scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
         assert scope == "large"
         assert cal == "medium"
 
     def test_medium_auto_decomposed_still_escalates_on_file_count(self):
         # Auto-decomposed sub-findings at medium scope must still pass through
-        # _calibrate_finding_scope's medium→large safety gates. A 9-file
+        # _calibrate_finding_scope's medium→large safety gates. A 17-file
         # medium-scope auto_decomposed finding should be escalated to large
-        # by the file-count heuristic (>=8 files).
+        # by the file-count heuristic (>= medium budget of 16 files).
         finding = {
             "title": "t",
-            "related_files": self._single_module_files(9),
+            "related_files": self._single_module_files(17),
             "auto_decomposed": True,
         }
         scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
         assert scope == "large"
         assert cal == "medium"
 
-    def test_cross_module_heuristic_upgrades_medium_to_large(self):
+    def test_cross_module_span_alone_does_not_escalate(self, monkeypatch):
+        # Directory span is not evidence that work decomposes: a cross-stack
+        # contract change always spans top-level dirs, and routing it to plan
+        # decomposition fragments it into per-module PRs that merge
+        # individually while breaking the shared contract. There is no
+        # cross-module escalation heuristic anymore.
+        monkeypatch.setattr(
+            "app.research_scope_calibration._composite_complexity_score",
+            lambda files, direction, cochange: (0.9, {"sig": "healthy"}),
+        )
         finding = {
             "title": "t",
             "related_files": [
@@ -6126,12 +6143,12 @@ class TestCalibrateFindingScope:
             ],
         }
         scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
-        assert scope == "large"
-        assert cal == "medium:cross_module"
+        assert scope == "medium"
+        assert cal is None
 
     def test_two_module_span_stays_medium(self, monkeypatch):
         # Findings spanning 2 top-level dirs (e.g. backend + agent) should NOT
-        # escalate — only 3+ modules trigger the cross-module heuristic.
+        # escalate on span alone.
         monkeypatch.setattr(
             "app.research_scope_calibration._composite_complexity_score",
             lambda files, direction, cochange: (0.9, {"sig": "healthy"}),
@@ -6145,14 +6162,14 @@ class TestCalibrateFindingScope:
         assert cal is None
 
     def test_expansion_ratio_prediction_upgrades_medium_to_large(self):
-        finding = {"title": "t", "related_files": self._single_module_files(4)}
+        finding = {"title": "t", "related_files": self._single_module_files(6)}
         direction = {
             "research_history": [
                 {"scope_breakdown": {"medium": {"avg_expansion_ratio": 3.0}}},
             ]
         }
         scope, cal = _calibrate_finding_scope(finding, "medium", direction, None)
-        # 4 * 3.0 = 12 > 10 threshold
+        # 6 * 3.0 = 18 > medium file budget (16)
         assert scope == "large"
         assert cal == "medium"
 

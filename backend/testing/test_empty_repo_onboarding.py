@@ -389,16 +389,22 @@ class TestBootstrapGuardIsReachable:
     """The payoff: the empty-repo signal now actually reaches the guard."""
 
     @pytest.mark.asyncio
-    async def test_detected_empty_repo_suppresses_bootstrap(self):
+    async def test_detected_empty_repo_suppresses_bootstrap(self, db_session):
         project = Project(
             name="playground",
+            user_id="test-user-empty-repo",
             github_owner="HenryHamster",
             github_repo="playground",
             build_config=_empty_repo_build_config(),
         )
+        db_session.add(project)
+        await db_session.flush()
 
         result = await spawn_bootstrap_task(
-            project, MagicMock(), is_first_bootstrap=True, spawn_reason="first_cycle"
+            project,
+            db_session,
+            is_first_bootstrap=True,
+            spawn_reason="first_cycle",
         )
 
         assert result.outcome == "not_eligible"

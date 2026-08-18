@@ -91,16 +91,18 @@ class TestT1InitialFire:
         assert d.fire
         assert d.trigger == "coverage_complete"
 
-    def test_not_promoted_coverage_blocker_fires_when_ledger_met(self):
-        # The not_promoted/criterion_coverage_incomplete redrive leg fires once
-        # the sha-keyed ledger reports the candidate fully met.
+    def test_not_promoted_same_sha_holds_even_when_ledger_met(self):
+        # A mutable ledger signal cannot authorize re-grading an immutable
+        # not_promoted verdict for the same candidate.
         d = _resolve(
             status="not_promoted",
             blocker="criterion_coverage_incomplete",
             is_candidate_fully_met=True,
+            candidate_sha="aaaa1111",
+            automain_sha="aaaa1111",
         )
-        assert d.fire
-        assert d.trigger == "coverage_complete"
+        assert not d.fire
+        assert d.reason == "same_candidate"
 
     def test_not_promoted_coverage_blocker_blocks_when_ledger_not_met(self):
         # Ledger not met AND the candidate has not advanced → hold (no new
@@ -111,8 +113,7 @@ class TestT1InitialFire:
             is_candidate_fully_met=False,
         )
         assert not d.fire
-        assert d.reason == "criterion_not_met"
-        assert "ledger" in d.blocking[0].lower()
+        assert d.reason == "candidate_identity_unavailable"
 
     def test_not_promoted_not_met_refires_when_candidate_advanced(self):
         # REGRESSION (permanent-wedge guard): CategoryVerdict rows are SHA-KEYED
@@ -143,7 +144,7 @@ class TestT1InitialFire:
             automain_sha="aaaa1111",
         )
         assert not d.fire
-        assert d.reason == "criterion_not_met"
+        assert d.reason == "same_candidate"
 
     def test_not_promoted_not_met_advanced_candidate_suppressed_on_red_ci(self):
         # Bounded like every other redrive leg: a red new candidate does not fire.
@@ -158,8 +159,9 @@ class TestT1InitialFire:
         assert not d.fire
         assert d.reason == "ci_red"
 
-    def test_not_promoted_not_met_advanced_candidate_holds_on_unresolved_findings(self):
-        # Reuses the existing findings bound rather than inventing a new one.
+    def test_not_promoted_advanced_candidate_invalidates_unresolved_old_findings(self):
+        # Findings belong to the evaluated SHA. They cannot veto grading a new
+        # candidate, or stale findings permanently wedge the version.
         d = _resolve(
             status="not_promoted",
             blocker="criterion_coverage_incomplete",
@@ -168,8 +170,39 @@ class TestT1InitialFire:
             automain_sha="bbbb2222",
             requalification_ready=False,
         )
+        assert d.fire
+        assert d.trigger == "candidate_advanced"
+
+    @pytest.mark.parametrize(
+        "blocker",
+        [
+            "prior_operator_authorship_nonzero",
+            "high_audit_finding",
+            "below_threshold",
+            "criterion_coverage_incomplete",
+        ],
+    )
+    def test_new_candidate_redrives_not_promoted_regardless_stale_blocker(self, blocker):
+        d = _resolve(
+            status="not_promoted",
+            blocker=blocker,
+            candidate_sha="old-candidate",
+            automain_sha="new-candidate",
+            requalification_ready=False,
+        )
+        assert d.fire
+        assert d.trigger == "candidate_advanced"
+
+    def test_prior_operator_authorship_same_sha_does_not_churn(self):
+        d = _resolve(
+            status="not_promoted",
+            blocker="prior_operator_authorship_nonzero",
+            candidate_sha="same-candidate",
+            automain_sha="same-candidate",
+            requalification_ready=True,
+        )
         assert not d.fire
-        assert d.reason == "findings_unresolved"
+        assert d.reason == "same_candidate"
 
 
 # ---------------------------------------------------------------------------
@@ -363,25 +396,27 @@ class TestT3PostDryRunAdvance:
 # ---------------------------------------------------------------------------
 
 class TestT4BlockersCleared:
-    def test_not_promoted_readiness_fires(self):
-        # blocker is NOT criterion_coverage_incomplete, so this skips the T1
-        # redrive leg and reaches T4.
+    def test_not_promoted_readiness_cannot_regrade_same_sha(self):
         d = _resolve(
             status="not_promoted",
             blocker="high_audit_finding",
             requalification_ready=True,
+            candidate_sha="same",
+            automain_sha="same",
         )
-        assert d.fire
-        assert d.trigger == "blockers_cleared"
+        assert not d.fire
+        assert d.reason == "same_candidate"
 
     def test_not_promoted_readiness_false_blocks(self):
         d = _resolve(
             status="not_promoted",
             blocker="high_audit_finding",
             requalification_ready=False,
+            candidate_sha="same",
+            automain_sha="same",
         )
         assert not d.fire
-        assert d.reason == "findings_unresolved"
+        assert d.reason == "same_candidate"
 
     def test_promotion_failed_readiness_fires(self):
         d = _resolve(
@@ -554,14 +589,16 @@ class TestExplainQualificationTrigger:
         assert out["decision"]["reason"] == "ci_red"
         assert len(out["blocking"]) > 0
 
-    def test_next_expected_trigger_for_criterion_not_met(self):
+    def test_next_expected_trigger_for_same_candidate(self):
         out = self._explain(
             knob="on",
             status="not_promoted",
             blocker="criterion_coverage_incomplete",
             is_candidate_fully_met=False,
+            candidate_sha="same",
+            automain_sha="same",
         )
-        assert out["decision"]["reason"] == "criterion_not_met"
+        assert out["decision"]["reason"] == "same_candidate"
         # The not-met verdict is frozen against its candidate sha, so the honest
         # next-expected unblock is NEW WORK landing (which re-grades), not the
         # stale verdict spontaneously flipping to met.
@@ -690,8 +727,8 @@ _AUTOMATIC_REDRIVE_STATUSES: dict[str, dict] = {
         "trigger": "rubric_redrive",
     },
     "not_promoted": {
-        "params": {"blocker": "high_audit_finding", "requalification_ready": True},
-        "trigger": "blockers_cleared",
+        "params": {"blocker": "high_audit_finding", "candidate_sha": "old", "automain_sha": "new"},
+        "trigger": "candidate_advanced",
     },
     "promotion_failed": {
         "params": {"requalification_ready": True},

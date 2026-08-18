@@ -772,6 +772,12 @@ async def _load_recent_tasks(
         Task.id,
         Task.status,
         Task.context,
+        # Strategic-cycle cost slicing uses the execution span, including
+        # created_at/completed_at fallbacks for older rows. Keep these columns
+        # in the PostgreSQL projection because raiseload=True makes an omitted
+        # timestamp an exception rather than a lazy query.
+        Task.created_at,
+        Task.completed_at,
         # started_at: presence marks a task that actually reached execution —
         # the AGENT_TIMEOUT-rate measure's denominator.
         Task.started_at,

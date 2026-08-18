@@ -506,13 +506,16 @@ async def test_admin_task_artifacts_expose_storage_uri(client: AsyncClient, db_s
     """Storage-backed artifacts surface their gs:// URI additively in both the
     task-list and task-detail serializers, so operator surfaces can resolve a
     signed download. The field is always present (null for non-storage
-    artifacts) and existing fields stay intact."""
+    artifacts) and existing fields stay intact. A completed task's historical
+    pre-landing error remains auditable but is not projected as current."""
     project = await _make_project_with_member(db_session)
     task = Task(
         project_id=project.id,
         title="screenshot task",
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "create"}],
+        origination="RESEARCH",
+        context={"landed_on_integration": True},
     )
     db_session.add(task)
     await db_session.flush()
@@ -524,21 +527,81 @@ async def test_admin_task_artifacts_expose_storage_uri(client: AsyncClient, db_s
             storage_uri=storage_uri,
         )
     )
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.ERROR_LOG,
+            logs="historical publication failure",
+        )
+    )
     await db_session.commit()
 
     list_resp = await client.get("/api/admin/tasks", params={"limit": 100})
     assert list_resp.status_code == 200
     listed = next(t for t in list_resp.json()["tasks"] if t["id"] == str(task.id))
     list_arts = listed["artifacts"]
-    assert len(list_arts) == 1
-    assert list_arts[0]["storage_uri"] == storage_uri
+    assert len(list_arts) == 2
+    screenshot = next(
+        artifact
+        for artifact in list_arts
+        if artifact["artifact_type"] == ArtifactType.SCREENSHOT
+    )
+    assert screenshot["storage_uri"] == storage_uri
     # Additive — existing fields remain.
     assert "artifact_type" in list_arts[0]
+    assert listed["origination"] == "RESEARCH"
+    assert listed["error_logs"] is None
 
     detail_resp = await client.get(f"/api/admin/tasks/{task.id}")
     assert detail_resp.status_code == 200
     detail_arts = detail_resp.json()["artifacts"]
-    assert detail_arts[0]["storage_uri"] == storage_uri
+    screenshot = next(
+        artifact
+        for artifact in detail_arts
+        if artifact["artifact_type"] == ArtifactType.SCREENSHOT
+    )
+    assert screenshot["storage_uri"] == storage_uri
+    assert detail_resp.json()["origination"] == "RESEARCH"
+    assert detail_resp.json()["error_logs"] is None
+
+
+@pytest.mark.asyncio
+async def test_admin_task_error_log_visible_after_landed_task_retry_fails(
+    client: AsyncClient,
+    db_session,
+):
+    """A stale landed marker must not hide a newly failed attempt's error."""
+    project = await _make_project_with_member(db_session)
+    task = Task(
+        project_id=project.id,
+        title="landed task retried and failed",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        attempt_count=2,
+        context={
+            "landed_on_integration": True,
+            "_fresh_attempt_started_at": "2000-01-01T00:00:00+00:00",
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.ERROR_LOG,
+            logs="current retry failure",
+        )
+    )
+    await db_session.commit()
+
+    list_resp = await client.get("/api/admin/tasks", params={"limit": 100})
+    assert list_resp.status_code == 200
+    listed = next(t for t in list_resp.json()["tasks"] if t["id"] == str(task.id))
+    assert listed["error_logs"] == "current retry failure"
+
+    detail_resp = await client.get(f"/api/admin/tasks/{task.id}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["error_logs"] == "current retry failure"
 
 
 @pytest.mark.asyncio

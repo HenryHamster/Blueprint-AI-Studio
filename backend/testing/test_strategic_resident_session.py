@@ -10,7 +10,6 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from inspect import unwrap
-from types import SimpleNamespace
 import uuid
 from unittest.mock import AsyncMock
 

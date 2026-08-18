@@ -52,6 +52,8 @@ class RunnerDispatchSnapshot(NamedTuple):
     capabilities: dict
     consecutive_job_failures: int = 0
     hostname: str | None = None
+    source_sha: str | None = None
+    agent_source_sha: str | None = None
 
 
 def _effective_build_command(entry: dict, kind: str) -> str:

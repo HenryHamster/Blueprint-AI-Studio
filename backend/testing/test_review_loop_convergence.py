@@ -11,6 +11,7 @@ These import the handler directly from ``app.review_loop_convergence`` (rather
 than the ``app.review_pipeline`` re-export) so the module owns its own tests.
 """
 
+import copy
 import uuid
 from unittest.mock import AsyncMock
 
@@ -18,6 +19,7 @@ import pytest
 
 from sqlalchemy import select
 
+from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.models import Alert, Project, Task, TaskStatus
 from testing.factories import make_project, make_task
 
@@ -109,7 +111,7 @@ def test_cross_episode_abandon_candidate_counts_cancelled_superseded_history():
             iteration=index + 1 if index < 6 else (index - 5 if index < 8 else 4),
             original_task_id=first_episode if index < 6 else superseded_episode,
         )
-        for index in range(9)
+        for index in range(10)
     ]
 
     candidate = build_cross_episode_abandon_candidate(attempts, threshold=10)
@@ -117,7 +119,7 @@ def test_cross_episode_abandon_candidate_counts_cancelled_superseded_history():
     assert candidate == {
         "status": "abandon_candidate",
         "threshold": 10,
-        "attempts": 9,
+        "attempts": 10,
         "cycles": 10,
         "burden": 10,
         "cancelled_attempts": 3,
@@ -142,6 +144,33 @@ def test_cross_episode_abandon_candidate_does_not_flag_converging_pr():
     ]
 
     assert build_cross_episode_abandon_candidate(attempts) is None
+
+
+def test_cross_episode_abandon_ignores_stale_and_parallel_observation_rows():
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    episode = uuid.uuid4()
+    rows = []
+    for index in range(20):
+        task = _history_attempt(
+            project_id,
+            task_type="review",
+            status=TaskStatus.COMPLETED,
+            iteration=index + 1,
+            original_task_id=episode,
+        )
+        task.context = {
+            **(task.context or {}),
+            **(
+                {"_review_stale_target": True}
+                if index % 2 == 0
+                else {"review_was_parallelized": True}
+            ),
+        }
+        rows.append(task)
+
+    assert build_cross_episode_abandon_candidate(rows, threshold=1) is None
 
 
 def test_cross_episode_threshold_matches_rollup_review_cap():
@@ -171,7 +200,7 @@ def test_cross_episode_threshold_matches_rollup_review_cap():
 
 @pytest.mark.asyncio
 async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_session, mocker):
-    """The production spawn gate refuses a new fix after the PR threshold."""
+    """Archived exact generations still exhaust the PR-lifetime threshold."""
     from app.review_pipeline import (
         SPAWN_REASON_ABANDON_CANDIDATE,
         _spawn_pipeline_task,
@@ -199,6 +228,8 @@ async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_sessi
         )
         for index in range(16)
     ]
+    for task in history:
+        task.archived = True
     db_session.add_all(history)
     source_task = make_task(
         project_id=project.id,
@@ -262,10 +293,10 @@ async def test_spawn_stops_and_surfaces_cross_episode_abandon_candidate(db_sessi
     # Its timestamp starts a fresh cap/census window without deleting history.
     from app.time_utils import _utcnow
 
-    original_task.context = {
-        **(original_task.context or {}),
-        "review_loop": {"iteration_reset_at": _utcnow().isoformat()},
-    }
+    reset_context = dict(original_task.context or {})
+    reset_context.pop("review_loop_abandon_candidate", None)
+    reset_context["review_loop"] = {"iteration_reset_at": _utcnow().isoformat()}
+    original_task.context = reset_context
     db_session.add(original_task)
     await db_session.commit()
     resumed, resumed_created = await _spawn_pipeline_task(
@@ -663,6 +694,8 @@ async def test_cap_preserves_backmerge_resolver_pr(db_session, mocker):
         "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
     )
 
+    from app.admin_approval_authority import APPROVAL_FOLLOWUP_CLAIM_KEY
+    from app.closed_pr_reconciliation import REVIEW_WAIT_APPROVAL_HOLD_KEY
     from app.review_loop_convergence import _handle_cap_exhaustion
 
     project = await _make_db_project(db_session)
@@ -672,12 +705,28 @@ async def test_cap_preserves_backmerge_resolver_pr(db_session, mocker):
         payloads=[
             {"type": "create", "prompt": "resolve sync", "base_branch": "automain"}
         ],
+        requires_approval=True,
         context={
             "backmerge_conflict": True,
             "backmerge_pr_number": 710,
+            "_approval_set_at": "2026-08-17T01:00:00+00:00",
+            "_approval_hold_episode": "old-operator-episode",
+            APPROVAL_FOLLOWUP_CLAIM_KEY: {
+                "token": "interrupted-old-operator-followup",
+                "state": "pending",
+                "status": TaskStatus.EVALUATING.value,
+            },
             # Genuine non-convergence: latest round has outstanding changes.
             "review_loop": {
                 "pr_number": 710,
+                REVIEW_WAIT_APPROVAL_HOLD_KEY: {
+                    "owner": "ci_review_wait_backstop",
+                    "project_id": str(project.id),
+                    "pr_number": 710,
+                    "head_sha": "old-head",
+                    "base_sha": "old-base",
+                    "set_at": "2026-08-17T01:00:00+00:00",
+                },
                 "review_history": [
                     {"verdict": "CHANGES_REQUESTED", "issues": ["x"]},
                 ],
@@ -697,7 +746,8 @@ async def test_cap_preserves_backmerge_resolver_pr(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 710, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 710, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -706,6 +756,16 @@ async def test_cap_preserves_backmerge_resolver_pr(db_session, mocker):
     ), "Preservable back-merge resolver PR must be tagged for hand-merge"
     assert (orig.context or {}).get("pr_preserved_for_handmerge") is True
     assert orig.requires_approval is True, "Preserved PR must be flagged for operator"
+    refreshed_context = dict(orig.context or {})
+    refreshed_loop = dict(refreshed_context.get("review_loop") or {})
+    assert APPROVAL_FOLLOWUP_CLAIM_KEY not in refreshed_context
+    assert REVIEW_WAIT_APPROVAL_HOLD_KEY not in refreshed_loop
+    assert refreshed_context["_approval_set_at"] != "2026-08-17T01:00:00+00:00"
+    assert refreshed_context["_approval_hold_episode"] != "old-operator-episode"
+    assert (
+        refreshed_context["approval_hold_reason"]
+        == "review_cap_preserved_for_handmerge"
+    )
     assert (orig.context or {}).get("failure_category") != "CODE_ERROR", (
         "Preserving salvageable back-merge work must NOT record CODE_ERROR"
     )
@@ -762,7 +822,8 @@ async def test_cap_closes_nonrollup_nonbackmerge_pr(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 720, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 720, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -820,7 +881,8 @@ async def test_cap_preserves_rollup_pr_unchanged(db_session, mocker):
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 730, 16, db_session, scope="per-chain"
+        source_task, str(orig.id), 730, 16, db_session,
+        scope="per-chain", verified_disposition="reject"
     )
 
     await db_session.refresh(orig)
@@ -867,6 +929,189 @@ async def test_supersession_churn_hold_is_clearable(db_session):
     assert outcome["kind"] == "supersession_churn_halt"
     assert outcome["resolved"] is True
     assert outcome["resolved_by"] == "review_approve_pr_9179"
+
+
+@pytest.mark.asyncio
+async def test_clear_escalation_gate_preserves_newer_independent_hold(db_session):
+    """A stale escalation breadcrumb cannot consume a later approval episode."""
+
+    if resolve_dialect_name(db_session) != "postgresql":
+        pytest.skip("independent-session approval race requires PostgreSQL")
+
+    from app.admin_approval_authority import establish_independent_approval_hold
+    from app.review_loop_convergence import (
+        _set_review_loop_terminal_outcome,
+        clear_review_escalation_approval_gate,
+    )
+
+    project = await _make_db_project(db_session)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        context={},
+        payloads=[{"type": "research", "prompt": "approval episode race"}],
+    )
+    establish_independent_approval_hold(
+        task,
+        reason="stuck",
+        owner="review_pipeline",
+    )
+    _set_review_loop_terminal_outcome(
+        task,
+        kind="stuck",
+        reason="stuck",
+        pr_number=9179,
+        iterations=4,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    task_id = task.id
+
+    async with AsyncSessionLocal() as winner:
+        fresh = (
+            (
+                await winner.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        establish_independent_approval_hold(
+            fresh,
+            reason="manual branch-safety hold",
+            owner="operator",
+        )
+        fresh.latest_status_message = "Operator owns this hold"
+        winner.add(fresh)
+        await winner.commit()
+
+    async with AsyncSessionLocal() as closer:
+        fresh = (
+            (
+                await closer.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        before_context = copy.deepcopy(fresh.context)
+        assert not clear_review_escalation_approval_gate(
+            fresh,
+            resolved_by="review_approve_pr_9179",
+        )
+        assert fresh.requires_approval is True
+        assert fresh.latest_status_message == "Operator owns this hold"
+        assert fresh.context == before_context
+
+
+@pytest.mark.asyncio
+async def test_clear_matching_escalation_gate_removes_exact_hold_metadata(db_session):
+    """A matching escalation episode is fully consumed, not left inheritable."""
+
+    if resolve_dialect_name(db_session) != "postgresql":
+        pytest.skip("approval provenance assertion requires PostgreSQL")
+
+    from app.admin_approval_authority import (
+        APPROVAL_FOLLOWUP_CLAIM_KEY,
+        APPROVAL_HOLD_EPISODE_KEY,
+        APPROVAL_HOLD_PROVENANCE_KEY,
+        establish_independent_approval_hold,
+    )
+    from app.review_loop_convergence import (
+        _set_review_loop_terminal_outcome,
+        clear_review_escalation_approval_gate,
+    )
+
+    project = await _make_db_project(db_session)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        context={},
+        payloads=[{"type": "research", "prompt": "matching escalation"}],
+    )
+    establish_independent_approval_hold(
+        task,
+        reason="repeat_fingerprint_halt",
+        owner="review_pipeline",
+    )
+    _set_review_loop_terminal_outcome(
+        task,
+        kind="repeat_fingerprint_halt",
+        reason="repeat-fingerprint",
+        pr_number=9180,
+        iterations=2,
+    )
+    task.context = {
+        **(task.context or {}),
+        APPROVAL_FOLLOWUP_CLAIM_KEY: {"token": "obsolete-claim"},
+    }
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert clear_review_escalation_approval_gate(
+        task,
+        resolved_by="review_approve_pr_9180",
+    )
+    assert task.requires_approval is False
+    assert "approval_hold_reason" not in task.context
+    assert "_approval_set_at" not in task.context
+    assert APPROVAL_HOLD_EPISODE_KEY not in task.context
+    assert APPROVAL_HOLD_PROVENANCE_KEY not in task.context
+    assert APPROVAL_FOLLOWUP_CLAIM_KEY not in task.context
+
+
+def test_terminal_breadcrumb_never_adopts_a_preexisting_independent_hold():
+    """Gates-off escalation bookkeeping cannot claim an unrelated TRUE hold."""
+
+    from app.admin_approval_authority import establish_independent_approval_hold
+    from app.review_loop_convergence import (
+        _set_review_loop_terminal_outcome,
+        clear_review_escalation_approval_gate,
+    )
+
+    task = make_task(
+        status=TaskStatus.EVALUATING,
+        context={},
+        payloads=[{"type": "research", "prompt": "independent policy hold"}],
+    )
+    establish_independent_approval_hold(
+        task,
+        reason="manual security hold",
+        owner="operator",
+    )
+    before_context = copy.deepcopy(task.context)
+    _set_review_loop_terminal_outcome(
+        task,
+        kind="stuck",
+        reason="stuck",
+        pr_number=9181,
+        iterations=4,
+    )
+
+    assert "approval_hold_episode" not in task.context[
+        "review_loop_terminal_outcome"
+    ]
+    assert not clear_review_escalation_approval_gate(
+        task,
+        resolved_by="review_approve_pr_9181",
+    )
+    assert task.requires_approval is True
+    for key in (
+        "approval_hold_reason",
+        "_approval_set_at",
+        "_approval_hold_episode",
+        "_approval_hold_provenance",
+    ):
+        assert task.context[key] == before_context[key]
 
 
 @pytest.mark.asyncio
@@ -985,6 +1230,7 @@ async def test_approved_dirty_rollup_routed_to_preserve_not_close(db_session, mo
         16,
         db_session,
         scope="global",
+        verified_disposition="reject",
     )
 
     await db_session.refresh(orig)
@@ -1092,7 +1338,8 @@ async def test_spawn_lock_released_before_preservability_get(
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 140, 16, db_session, scope="global"
+        source_task, str(orig.id), 140, 16, db_session,
+        scope="global", verified_disposition="reject"
     )
 
     assert seen_in_txn, "preservability GET never fired — test setup is wrong"
@@ -1281,7 +1528,8 @@ async def test_preservability_timeout_does_not_close_the_pr_or_fail_the_task(
 
     # Must NOT raise: the defer is handled inside _handle_cap_exhaustion.
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 143, 16, db_session, scope="global"
+        source_task, str(orig.id), 143, 16, db_session,
+        scope="global", verified_disposition="reject"
     )
 
     close_mock.assert_not_called()
@@ -1425,7 +1673,8 @@ async def test_cap_exhaustion_peer_locked_orig_does_not_expire_caller_source_tas
     mocker.patch.object(db_session, "execute", side_effect=_execute)
 
     await _handle_cap_exhaustion(
-        source_task, orig_id, 144, 16, db_session, scope="global"
+        source_task, orig_id, 144, 16, db_session,
+        scope="global", verified_disposition="reject"
     )
 
     # THE regression assertion. Pre-fix this raises
@@ -1597,7 +1846,8 @@ async def test_preservability_rate_limit_does_not_close_the_pr_or_fail_the_task(
     await db_session.refresh(source_task)
 
     await _handle_cap_exhaustion(
-        source_task, str(orig.id), 145, 16, db_session, scope="global"
+        source_task, str(orig.id), 145, 16, db_session,
+        scope="global", verified_disposition="reject"
     )
 
     close_mock.assert_not_called()
@@ -1816,7 +2066,8 @@ async def test_cap_defer_is_counted_and_alerts_after_threshold(db_session, mocke
 
     for expected in range(1, _CAP_DEFER_ALERT_AFTER + 1):
         await _handle_cap_exhaustion(
-            source_task, str(orig.id), 149, 16, db_session, scope="global"
+            source_task, str(orig.id), 149, 16, db_session,
+            scope="global", verified_disposition="reject"
         )
         await db_session.refresh(orig)
         assert (orig.context or {}).get(_CAP_DEFER_COUNT_KEY) == expected, (
@@ -1934,7 +2185,8 @@ async def test_defer_counter_does_not_erase_a_peer_terminal_write(db_session, mo
     )
 
     await _handle_cap_exhaustion(
-        source_task, str(orig_id), 150, 16, db_session, scope="global"
+        source_task, str(orig_id), 150, 16, db_session,
+        scope="global", verified_disposition="reject"
     )
 
     # Re-read from the DB, bypassing the identity map — it would hide the clobber.

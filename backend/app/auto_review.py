@@ -102,6 +102,26 @@ async def _handle_auto_review_inner(
         return
     gh_token = await _get_project_github_token(project, session)
 
+    # Direct review admission takes same-PR Task locks.  Acquire the universal
+    # Project authority first so the complete order remains Project -> Task and
+    # retain it through the eventual INSERT/commit.
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    creation_admission = await acquire_automatic_task_creation_authority(
+        session, project_id
+    )
+    if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[AUTO-REVIEW] Automatic task creation held for PR #%d: %s",
+            pr_number,
+            creation_admission,
+        )
+        await session.rollback()
+        return
+
     async def _current_pr_target() -> dict:
         return await get_pull_request(
             gh_token,

@@ -158,7 +158,7 @@ def first_payload(task: dict) -> dict:
 # ── projects ─────────────────────────────────────────────────────────────────
 
 def cmd_projects(args: argparse.Namespace) -> None:
-    """List every project as ``id · name · status``. Respects ``--json``."""
+    """List every project with its canonical operational state. Respects ``--json``."""
     projects = list_projects()
     _emit(args, {"projects": projects, "total": len(projects)}, _render_projects)
 
@@ -172,7 +172,12 @@ def _render_projects(data: dict) -> None:
     for p in projects:
         pid = p.get("id") or "?"
         name = p.get("name") or "?"
-        status = p.get("status") or p.get("state") or "-"
+        status = (
+            p.get("operational_state")
+            or p.get("state")
+            or p.get("status")
+            or "-"
+        )
         print(f"  {pid} · {name} · {status}")
 
 
@@ -3679,7 +3684,12 @@ def _health_deploy(args: argparse.Namespace) -> None:
         "external_health": eh,
         "orchestrator": {
             "status": orch.get("status"),
+            "authority": orch.get("authority"),
             "cycle_age_seconds": orch.get("cycle_age_seconds"),
+            "cycle_age_kind": orch.get("cycle_age_kind"),
+            "heartbeat_age_seconds": orch.get("heartbeat_age_seconds"),
+            "stale_after_seconds": orch.get("stale_after_seconds"),
+            "reason": orch.get("reason"),
             "queued_tasks": orch.get("queued_tasks"),
             "active_tasks": orch.get("active_tasks"),
         },
@@ -3712,15 +3722,25 @@ def _render_health_deploy(data: dict) -> None:
     required = data.get("health_recovery_streak_required") or 3
     dots = ["OK " if hist[i] else "FAIL" for i in range(min(len(hist), size))]
     dots += ["--  "] * (size - len(dots))
-    print(f"\n=== RING BUFFER (3-of-5 gate) ===")
+    print("\n=== RING BUFFER (3-of-5 gate) ===")
     print(f"  Recovery: [{' | '.join(dots)}]  {streak}/{required} healthy")
     orch = data.get("orchestrator") or {}
-    print(f"\n=== ORCHESTRATOR CYCLE ===")
+    print("\n=== ORCHESTRATOR ===")
     print(f"  Status:    {orch.get('status', '?')}")
+    if orch.get("authority"):
+        print(f"  Authority: {orch['authority']}")
+    heartbeat_age = orch.get("heartbeat_age_seconds")
+    stale_after = orch.get("stale_after_seconds")
+    if heartbeat_age is not None:
+        warning = bool(stale_after is not None and heartbeat_age >= stale_after)
+        print(
+            f"  Last heartbeat: {int(heartbeat_age)}s ago"
+            + ("  WARNING: heartbeat is stale" if warning else "")
+        )
     cycle_age = orch.get("cycle_age_seconds")
-    if cycle_age is None:
+    if cycle_age is None and heartbeat_age is None:
         print("  Last cycle: never (loop has not completed a cycle since process start)")
-    else:
+    elif cycle_age is not None:
         print(f"  Last cycle: {int(cycle_age)}s ago"
               + ("  WARNING: cycle >30s old — loop may be stuck" if cycle_age > 30 else ""))
     errors = data.get("errors") or {}
@@ -7312,8 +7332,42 @@ def _validate_deploy_binding(
                       "revision that does not contain the promoted commit. Use "
                       "--force to deploy anyway.")
                 raise APIError("revision not descendant of promoted sha")
+    _validate_main_reachability(revision, force=force)
     print(f"  Binding:   v{version_number} (promoted {promoted_sha[:12]}, "
           f"build {status})")
+
+
+def _validate_main_reachability(revision: str, *, force: bool = False) -> None:
+    """Refuse to activate a revision that is not reachable from main.
+
+    Descendant-of-promoted is NOT the same thing as on-main: a PR branch tip
+    that contains the promoted commit passes the binding check above while
+    carrying commits main does not have. The serving orchestrator advertises
+    its own SHA as the fleet auto-update version hint, and runners git-track
+    main — a hint unreachable from main puts every runner into an infinite
+    update-drain retry loop (fleet-wide dispatch outage, 2026-08-17: serving
+    6fa5965a was a PR branch tip whose content merged to automain as a
+    different SHA, so no runner could ever satisfy the hint).
+    """
+    compare = json.loads(_gh(
+        "api", f"repos/{_DEPLOY_REPO}/compare/main...{revision}",
+    ))
+    status = (compare.get("status") or "unknown")
+    # "identical"/"behind" mean revision is reachable from main's tip.
+    if status in ("identical", "behind"):
+        return
+    if force:
+        print(f"  WARNING: revision {revision[:12]} is {status} relative to "
+              "main — it is NOT reachable from main, so runner auto-update "
+              "will drain the fleet until a main-reachable revision is "
+              "deployed. Bypassed (--force).")
+        return
+    print(f"ERROR: revision {revision[:12]} is {status} relative to main — "
+          "not reachable from main. Runners git-track main and can never "
+          "satisfy this version hint; deploying it wedges fleet auto-update. "
+          "Merge to main first, or use --force if you accept a drained "
+          "fleet until the next main-reachable deploy.")
+    raise APIError("revision not reachable from main")
 
 
 def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | None:
@@ -7327,6 +7381,7 @@ def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | N
         if getattr(args, "force", False):
             print("  WARNING: no promoted release version found — deploying "
                   "unbound (--force).")
+            _validate_main_reachability(revision, force=True)
             return None
         print("ERROR: no promoted release version found for this project; "
               "refusing to activate a revision that is not bound to a "
@@ -7394,11 +7449,27 @@ def _fetch_deploy_manifest(wanted_sha: str | None = None) -> dict:
 
 
 def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> bool:
-    """Use the root-owned release socket, or the legacy remote SSH path."""
+    """Use the root-owned release socket, locally or through SSH.
+
+    The bootstrap removes the legacy ``/etc/sudoers.d/blueprint-release``
+    grant, so a remote deploy cannot ``ssh sudo`` the shim. Instead the repo's
+    socket client (scripts/release_socket_submit.py) is piped over SSH to the
+    host's python3 and submits to the ACL-limited release socket — the same
+    execution boundary the resident deploy agent uses.
+    """
     if host is None:
         return _request_release_socket(digest, revision)
-    command = ["ssh", "-t", host, "sudo", _RELEASE_SHIM_PATH, digest, revision]
-    proc = subprocess.run(command, check=False)
+    client_path = Path(__file__).resolve().with_name("release_socket_submit.py")
+    command = ["ssh", host, "python3", "-", digest, revision]
+    with open(client_path, "rb") as client_source:
+        proc = subprocess.run(command, check=False, stdin=client_source)
+    if proc.returncode == 3:
+        print(
+            "Release executor accepted the handoff but its verdict was not "
+            "observed; verify the served revision before retrying.",
+            file=sys.stderr,
+        )
+        return False
     if proc.returncode != 0:
         print(f"ERROR: release exited {proc.returncode} — the release tool "
               "rolls back failed activations; inspect its receipt on the host.")

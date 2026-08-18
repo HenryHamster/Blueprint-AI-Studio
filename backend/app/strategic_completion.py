@@ -2009,6 +2009,21 @@ async def _spawn_retirement_memos(
     from app.payload_schemas import validate_internal_payload
     from app.plan_completion import TASK_PRIORITY_MAP
     from app.task_completion import _apply_synthesized_memo
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    admission = await acquire_automatic_task_creation_authority(
+        session, project.id, skip_locked=True
+    )
+    if admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[STRATEGIC] retirement memo admission closed for project %s (%s)",
+            project.id,
+            admission,
+        )
+        return 0
 
     ninety_days_ago = _utcnow() - timedelta(days=90)
     existing_rows = (

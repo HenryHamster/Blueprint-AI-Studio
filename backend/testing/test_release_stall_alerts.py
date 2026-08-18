@@ -5,6 +5,7 @@ Covers:
     escalation to ERROR, and re-alert suppression within the shared interval.
   * _alert_promotion_deploy_failed — first-fire creates ERROR alert, reason codes, idempotency.
   * _resolve_promotion_deploy_failed_alert — no-op when none open, dismisses open alert, idempotent.
+  * _check_deployed_gate_latch — detects candidate-carried deployed repairs.
 """
 
 from __future__ import annotations
@@ -16,12 +17,18 @@ import pytest
 
 from app import release_qualifier as rq
 from app import release_version as rv
-from app.models import Alert, AlertSeverity, Project
+from app.message_audience import (
+    OPERATOR_ACTION_NEEDED,
+    STRATEGIST_INTERNAL,
+    route_event,
+)
+from app.models import Alert, AlertSeverity, Project, ProjectMessage
 from app.release_stall_alerts import (
     _MANAGED_CHECK_WAIT_REALERT_INTERVAL_SECONDS,
     _MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS,
     _MANAGED_CHECK_WAIT_STALL_SECONDS,
     _alert_promotion_deploy_failed,
+    _check_deployed_gate_latch,
     _check_version_managed_check_wait_stall,
     _deploy_failed_alert_title,
     _resolve_promotion_deploy_failed_alert,
@@ -59,6 +66,150 @@ async def _make_project_and_version(db_session):
     await db_session.commit()
     await db_session.refresh(version)
     return project, version
+
+
+def _latched_qual(*, blocker: str, candidate_surface: dict[str, str]) -> dict:
+    return {
+        "status": "not_promoted",
+        "blocker": blocker,
+        "candidate_sha": "b" * 40,
+        "audited_surface_paths": candidate_surface,
+    }
+
+
+@pytest.mark.asyncio
+async def test_deployed_gate_latch_alert_names_gate_paths_and_range(db_session):
+    """A candidate-carried deployed gate repair raises an operator ERROR."""
+    _project, version = await _make_project_and_version(db_session)
+    version.base_sha = "a" * 40
+    version.last_qualification = _latched_qual(
+        blocker="candidate_operator_authorship_nonzero",
+        candidate_surface={"backend/app/release_scoring.py": "b" * 40},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await _check_deployed_gate_latch(
+        db_session,
+        version,
+        deployed_surface={"backend/app/release_scoring.py": "a" * 40},
+        candidate_surface=version.last_qualification["audited_surface_paths"],
+    )
+    await db_session.commit()
+
+    assert fired is True
+    alert = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert alert.severity == AlertSeverity.ERROR
+    assert "candidate_operator_authorship_nonzero" in alert.title
+    assert "backend/app/release_scoring.py" in alert.message
+    assert f"{'a' * 40}...{'b' * 40}" in alert.message
+
+    message = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == version.project_id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert message.context["audience"] == OPERATOR_ACTION_NEEDED
+    assert message.context["compare_range"] == f"{'a' * 40}...{'b' * 40}"
+
+
+@pytest.mark.asyncio
+async def test_deployed_gate_latch_ignores_ordinary_blocked_candidate(db_session):
+    """An unrelated candidate change does not raise a deployed-gate latch."""
+    _project, version = await _make_project_and_version(db_session)
+    version.base_sha = "a" * 40
+    version.last_qualification = _latched_qual(
+        blocker="candidate_operator_authorship_nonzero",
+        candidate_surface={
+            "backend/app/release_scoring.py": "a" * 40,
+            "backend/app/unrelated_feature.py": "b" * 40,
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert (
+        await _check_deployed_gate_latch(
+            db_session,
+            version,
+            deployed_surface={"backend/app/release_scoring.py": "a" * 40},
+            candidate_surface=version.last_qualification["audited_surface_paths"],
+        )
+        is False
+    )
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+
+
+def test_release_blocked_is_operator_reachable():
+    assert route_event("release_blocked") == OPERATOR_ACTION_NEEDED
+    assert route_event("release_blocked") != STRATEGIST_INTERNAL
+
+
+@pytest.mark.asyncio
+async def test_deployed_gate_latch_handles_more_than_github_compare_file_cap(
+    db_session,
+):
+    """The alert keeps an implicated path after 300 tree entries."""
+    base = [
+        {"path": f"backend/app/file_{index}.py", "sha": f"{index:040x}"}
+        for index in range(350)
+    ]
+    candidate = [dict(entry) for entry in base]
+    candidate.append(
+        {"path": "backend/app/release_scoring.py", "sha": "f" * 40}
+    )
+    _project, version = await _make_project_and_version(db_session)
+    version.base_sha = "a" * 40
+    version.last_qualification = _latched_qual(
+        blocker="candidate_operator_authorship_nonzero", candidate_surface={}
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await _check_deployed_gate_latch(
+        db_session,
+        version,
+        base_tree_entries=base,
+        candidate_tree_entries=candidate,
+    )
+
+    assert fired is True
+    alert = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert "backend/app/release_scoring.py" in alert.message
 
 
 def _mcw_qual(

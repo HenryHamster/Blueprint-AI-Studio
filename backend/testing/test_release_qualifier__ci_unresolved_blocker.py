@@ -5883,7 +5883,7 @@ async def test_requalification_no_open_version(db_session):
 class TestRecoverConfidenceFromCiUnresolved:
     """Unit tests for release_promotion._recover_confidence_from_ci_unresolved."""
 
-    _PASSING_PRIOR_OPERATOR_GATE: ClassVar[dict[str, object]] = {
+    _PASSING_CANDIDATE_OPERATOR_GATE: ClassVar[dict[str, object]] = {
         "status": "passed",
         "passed": True,
         "count": 0,
@@ -5914,7 +5914,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
-            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
+            "candidate_operator_authorship_gate": self._PASSING_CANDIDATE_OPERATOR_GATE,
         }
         out = self._fn(record)
         # Recovered confidence should be >0 (all sub_scores perfect)
@@ -5998,7 +5998,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0},
             "smoketest_enabled": False,
-            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
+            "candidate_operator_authorship_gate": self._PASSING_CANDIDATE_OPERATOR_GATE,
         }
         out = self._fn(record)
         assert out.get("confidence_recovered_from_ci_unresolved") is True
@@ -6013,7 +6013,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
-            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
+            "candidate_operator_authorship_gate": self._PASSING_CANDIDATE_OPERATOR_GATE,
             # The finalize persists the sha-keyed per-category verdicts on the
             # base_record; the recompute re-runs the SAME gate over them.
             "category_verdicts": [
@@ -6034,7 +6034,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
-            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
+            "candidate_operator_authorship_gate": self._PASSING_CANDIDATE_OPERATOR_GATE,
             "migration_safety": "block",
         }
         out = self._fn(record)
@@ -6048,7 +6048,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
-            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
+            "candidate_operator_authorship_gate": self._PASSING_CANDIDATE_OPERATOR_GATE,
             "criterion_coverage": {
                 "total": 0,
                 "covered": 0,
@@ -6069,7 +6069,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
-            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
+            "candidate_operator_authorship_gate": self._PASSING_CANDIDATE_OPERATOR_GATE,
             "merge_grade_status": "fail",
             "merge_grade": {"blocked": True},
         }
@@ -6120,7 +6120,7 @@ class TestRecoverConfidenceFromCiUnresolved:
             "confidence": 0.0,
             "sub_scores": sub_scores,
             "smoketest_enabled": True,
-            "prior_operator_authorship_gate": self._PASSING_PRIOR_OPERATOR_GATE,
+            "candidate_operator_authorship_gate": self._PASSING_CANDIDATE_OPERATOR_GATE,
         }
 
         # Recovery applies the debt blend.

@@ -912,6 +912,21 @@ _TRACKED_CHECK = _BLUEPRINT_ROOT / "check"
 _DEFAULT_CHECK = _BLUEPRINT_ROOT / "scripts" / "check-default.sh"
 
 
+def _render_backend_verification_fragment() -> str:
+    """Render the backend verification fragment for the tracked developer gate."""
+    return (
+        _BACKEND_VERIFICATION_FRAGMENT.read_text(encoding="utf-8")
+        .replace("@TASK_ID@", "6867e9ef-f0d6-41cb-8b9d-1be50b02c806")
+        .replace("@DIR@", "backend")
+        .replace("@HARNESS@", "scripts/test-backend.sh")
+        .replace("@PYTHON_PATH_RE@", r"^backend/.*\.py$")
+        .replace("@TEST_PATH_RE@", r"^backend/(testing|tests)/test_.*\.py$")
+        .replace("@SELECTOR_PREFIX_RE@", "backend/")
+        .replace("@BASE@", "$BASE")
+        .rstrip("\n")
+    )
+
+
 def _read_packer_hcl() -> str:
     if not _PACKER_HCL.exists():
         pytest.skip("infra/packer/agent.pkr.hcl not present (backend-only Docker run)")
@@ -2074,7 +2089,13 @@ class TestProjectVerificationRuntimeContract:
         assert 'USE_TEST_POSTGRES:-' in harness
         assert 'testing/test_*.py|testing/test_*.py::*' in harness
         assert 'verification_selector_count" -le 8' in harness
+        assert (
+            'VERIFICATION_HOST_JUNIT="$VERIFICATION_OUTPUT_DIR/'
+            '${VERIFICATION_JUNIT_NAME:-junit.xml}"'
+        ) in harness
         assert '--junitxml="$verification_junit"' in harness
+        assert '"$VERIFICATION_HOST_JUNIT" "$verification_tmp" "$@"' in harness
+        assert '"$VERIFICATION_OUTPUT_DIR/junit.xml" "$verification_tmp" "$@"' not in harness
         assert "tests>0 and skipped<tests and failures==0" in harness
         assert '"postgres_sidecar":True' in harness
         assert "--sandbox-postgres" in harness
@@ -2082,7 +2103,6 @@ class TestProjectVerificationRuntimeContract:
         assert "/opt/blueprint-backend-venv/bin/python" in harness
 
     def test_generated_fragment_and_tracked_check_share_fail_closed_contract(self):
-        fragment = _BACKEND_VERIFICATION_FRAGMENT.read_text(encoding="utf-8")
         dispatcher = _TRACKED_CHECK.read_text(encoding="utf-8")
         tracked = _DEFAULT_CHECK.read_text(encoding="utf-8")
         # The repo-root entrypoint remains part of the contract: task work must
@@ -2096,16 +2116,7 @@ class TestProjectVerificationRuntimeContract:
         missing_task_gate = dispatcher.index("generated self-repo gate is missing")
         developer_exec = dispatcher.index('exec "$DEFAULT_GATE" "$@"')
         assert missing_task_gate < developer_exec
-        rendered_fragment = (
-            fragment.replace("@TASK_ID@", "6867e9ef-f0d6-41cb-8b9d-1be50b02c806")
-            .replace("@DIR@", "backend")
-            .replace("@HARNESS@", "scripts/test-backend.sh")
-            .replace("@PYTHON_PATH_RE@", r"^backend/.*\.py$")
-            .replace("@TEST_PATH_RE@", r"^backend/(testing|tests)/test_.*\.py$")
-            .replace("@SELECTOR_PREFIX_RE@", "backend/")
-            .replace("@BASE@", "$BASE")
-            .rstrip("\n")
-        )
+        rendered_fragment = _render_backend_verification_fragment()
         assert not re.search(r"@[^@\n]+@", rendered_fragment), (
             "generated backend verification fragment contains an unsubstituted "
             "placeholder"
@@ -2116,10 +2127,9 @@ class TestProjectVerificationRuntimeContract:
             start,
         )
         tracked_verification = tracked[start:end]
-        # The developer gate is a stable tracked fallback, not a per-task
-        # rendering of the generator fragment. Pin the concrete Blueprint
-        # selectors it carries, then compare the security-relevant behavior
-        # below instead of requiring byte identity across the two surfaces.
+        # Pin the concrete Blueprint selectors carried by the rendered fallback;
+        # the dedicated parity test below enforces byte identity with the source
+        # fragment as well.
         assert "_VERIFICATION_DIR='backend'" in tracked_verification
         assert "_VERIFICATION_HARNESS='scripts/test-backend.sh'" in tracked_verification
         assert "grep -E '^backend/.*\\.py$'" in tracked_verification
@@ -2168,6 +2178,66 @@ class TestProjectVerificationRuntimeContract:
                 f"shared backend route contract missing {required}"
             )
         assert "backend_test_sandbox_available" in helper
+        # The tracked developer fallback uses the same attributed static guard
+        # for the standalone corpus. It must not retain a second raw pytest
+        # decision ladder that can skip the corpus without recording a failure.
+        assert 'run "static release guards (task diff)" python3 scripts/static_release_guard.py' in tracked
+        for forbidden in (
+            "_GATE_MODE",
+            "GATE-ENVIRONMENT",
+            "check_gate_env_local-developer",
+            'run "backend test (harness standalone)"',
+        ):
+            assert forbidden not in tracked, (
+                f"tracked developer check retains retired pytest waiver token {forbidden}"
+            )
+
+
+def _extract_default_backend_verification() -> str:
+    tracked = _DEFAULT_CHECK.read_text(encoding="utf-8")
+    start = tracked.index("    # required backend-authoring verification")
+    end = tracked.index("\n  fi\nfi\n\nif touches \"golden_tasks/\"", start)
+    return tracked[start:end]
+
+
+def test_default_check_backend_verification_is_rendered_from_fragment():
+    """The committed fallback must not drift from its generator fragment."""
+    tracked = _DEFAULT_CHECK.read_text(encoding="utf-8")
+    assert (
+        '_VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${_VERIFY_TASK_ID}"'
+        in tracked
+    )
+    assert (
+        'rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT"'
+        in tracked
+    )
+    assert _extract_default_backend_verification() == _render_backend_verification_fragment()
+
+
+def test_default_check_allows_an_ordinary_skipped_test(tmp_path: Path):
+    """A mixed pass/skip JUnit is not classified as skipped_test."""
+    junit = tmp_path / "mixed-skips.xml"
+    junit.write_text(
+        "<testsuite tests=\"2\"><testcase/><testcase><skipped/></testcase></testsuite>",
+        encoding="utf-8",
+    )
+    script = _extract_default_backend_verification()
+    classifier_start = script.index("        _verification_tests=")
+    classifier_end = script.index("\n        if [ \"$_verification_state\"", classifier_start)
+    classifier = script[classifier_start:classifier_end]
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            classifier
+            + '\nif [ "$_verification_tests" -gt 0 ] && [ "$_verification_skipped" -eq "$_verification_tests" ]; then printf skipped_test; else printf passed; fi',
+        ],
+        env={**os.environ, "_verification_current_junit": str(junit)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout == "passed"
 
 
 class TestVmSelfDestructTtl:

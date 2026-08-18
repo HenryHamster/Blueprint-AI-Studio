@@ -792,6 +792,25 @@ async def spawn_evergreen_probe(
     ``attempts``. Returns the Task, or ``None`` if the idempotency claim lost a
     race (another tick already has a live probe for this row).
     """
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    with session.no_autoflush:
+        creation_admission = await acquire_automatic_task_creation_authority(
+            session,
+            project_id,
+            require_autonomous_enabled=True,
+        )
+    if creation_admission != AUTOMATIC_TASK_CREATION_ALLOWED:
+        logger.info(
+            "[EVERGREEN] Automatic probe creation held for item %s: %s",
+            item.id,
+            creation_admission,
+        )
+        return None
+
     task = Task(
         project_id=project_id,
         title=_probe_title(item),

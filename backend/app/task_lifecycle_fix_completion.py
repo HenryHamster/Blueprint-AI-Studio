@@ -27,17 +27,39 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.admin_approval_authority import (
+    APPROVAL_FOLLOWUP_CLAIM_KEY,
+    APPROVAL_HOLD_PROVENANCE_KEY,
+    approval_hold_provenance,
+    establish_independent_approval_hold,
+)
 from app.models import Alert, AlertSeverity, Project, Task
 from app.review_pipeline import SPAWN_REASON_DEFERRED, SPAWN_REASON_KEY
 import app.shared_state as _shared_state
 
 logger = logging.getLogger(__name__)
+
+
+def _establish_fix_completion_hold(task: Task, *, reason: str) -> None:
+    context = dict(task.context or {})
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    if (
+        task.requires_approval is True
+        and isinstance(provenance, dict)
+        and provenance.get("owner") == "task_lifecycle_fix_completion"
+        and provenance.get("reason") == reason
+        and not context.get(APPROVAL_FOLLOWUP_CLAIM_KEY)
+        and approval_hold_provenance(task).get("review_wait_hold") is None
+    ):
+        return
+    establish_independent_approval_hold(
+        task, reason=reason, owner="task_lifecycle_fix_completion"
+    )
 
 
 async def run_fix_completion(
@@ -170,7 +192,9 @@ async def run_fix_completion(
         logger.info(f"[SECURITY] {scan_result['summary']}")
         if scan_result["blocked"]:
             scan_blocked = True
-            task.requires_approval = True
+            _establish_fix_completion_hold(
+                task, reason="security_scan_blocked"
+            )
             task.latest_status_message = scan_result["summary"]
             session.add(task)
             await session.commit()
@@ -183,7 +207,7 @@ async def run_fix_completion(
             f"[SECURITY] Scan failed for fix PR #{pr_number}, flagging for approval: {e}",
             exc_info=True,
         )
-        task.requires_approval = True
+        _establish_fix_completion_hold(task, reason="security_scan_failed")
         task.latest_status_message = _safe_exception_message(
             e,
             "Security scan failed — review will proceed but merge requires manual approval",
@@ -290,7 +314,9 @@ async def run_fix_completion(
                     f"{'deferred (concurrent spawn)' if _is_transient else 'failed (' + _spawn_reason_label + ')'}"
                 )
                 if not _is_transient:
-                    task.requires_approval = True
+                    _establish_fix_completion_hold(
+                        task, reason="review_spawn_failed"
+                    )
                     from app.rollup_lineage_fence import (
                         mark_ancestor_rollups_awaiting_operator,
                     )
@@ -366,47 +392,5 @@ async def run_fix_completion(
                     _sr,
                     " — transient, will retry" if _is_transient else "",
                 )
-
-            # For transient deferrals, mark the CI task so the next
-            # backstop cycle detects this as a recent unresolved
-            # spawn and accelerates retry.
-            if _is_transient:
-                from app.time_utils import _utcnow as _ut
-                _now = _ut().isoformat()
-                # Propagate the deferred marker to the original CI
-                # task (not just the fix task) so handle_ci_completion
-                # can read it when entering review-wait.
-                if original_task_id:
-                    try:
-                        _ci_task = await session.get(
-                            Task, uuid.UUID(original_task_id)
-                        )
-                        if _ci_task:
-                            _ci_ctx = dict(_ci_task.context or {})
-                            _ci_rl = dict(
-                                _ci_ctx.get("review_loop") or {}
-                            )
-                            _ci_rl["review_spawn_deferred_at"] = _now
-                            _ci_ctx["review_loop"] = _ci_rl
-                            _ci_task.context = _ci_ctx
-                            flag_modified(_ci_task, "context")
-                            session.add(_ci_task)
-                    except Exception:
-                        logger.exception(
-                            "[REVIEW PIPELINE] Failed to propagate "
-                            "deferred-spawn marker to CI task %s",
-                            original_task_id,
-                        )
-                # Also set on the fix task's own review_loop as a
-                # fallback (used when the CI task lookup fails).
-                rl = dict(task.context.get("review_loop") or {})
-                rl["review_spawn_deferred_at"] = _now
-                task.context = {
-                    **(task.context or {}),
-                    "review_loop": rl,
-                }
-                flag_modified(task, "context")
-                session.add(task)
-                await session.commit()
 
     return task, None

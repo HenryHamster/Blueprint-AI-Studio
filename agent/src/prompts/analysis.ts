@@ -57,7 +57,7 @@ export function buildAnalysisPrompt(opts: {
     : '';
   const titleLine = opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : '';
   const limitClause = typeof opts.fileLimit === 'number'
-    ? ` Aim for ${opts.fileLimit} or fewer files; if you cannot stay at or below ${opts.fileLimit}, list only the smallest viable set and note in **Implementation approach** what was deferred.`
+    ? ` Aim for ${opts.fileLimit} or fewer files; if you cannot stay at or below ${opts.fileLimit}, keep the files that must change together for the change to be complete and correct (never drop a caller/consumer of a contract you are changing), and note in **Implementation approach** what independent concern was deferred.`
     : '';
   const totalBudgetClause = typeof opts.totalFileBudget === 'number'
     ? `\n\n**Total file budget:** the count of production files under **Files to change** must not exceed ${opts.totalFileBudget}. Test files under **Tests to add or update** do NOT count toward this budget — plan whatever test coverage the change requires. Plans exceeding the production-file budget will be rejected and you will be asked to narrow scope.`

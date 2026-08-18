@@ -320,6 +320,89 @@ class TestRequireDepsLandedOnGate:
         )
 
 
+class TestSameBaseDependencyMergeWait:
+    """Same-base dependencies that produce merged work must land before dispatch."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "dependency_type", ["create", "refactor", "migrate", "qa"]
+    )
+    async def test_merge_producing_prerequisite_waits_until_pr_merged(
+        self, db_session, dependency_type
+    ):
+        project = make_project(name=f"Same Base {dependency_type}", user_id="u1")
+        await _persist(db_session, project)
+
+        dependency = make_task(
+            project_id=project.id,
+            payloads=[{"type": dependency_type, "base_branch": "plan/shared"}],
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dependency.id)],
+        )
+        await _persist(db_session, dependency, dependent)
+
+        async def verify_unmerged(_task, _session):
+            return False
+
+        result, _ = await _check_candidate_task_deps(
+            dependent,
+            [dependency],
+            [dependency.id],
+            db_session,
+            verify_unmerged,
+        )
+        assert result == "waiting", (
+            f"same-base {dependency_type} prerequisite must wait for its PR"
+        )
+
+        async def verify_merged(_task, _session):
+            return True
+
+        result, _ = await _check_candidate_task_deps(
+            dependent,
+            [dependency],
+            [dependency.id],
+            db_session,
+            verify_merged,
+        )
+        assert result == "eligible"
+
+    @pytest.mark.asyncio
+    async def test_non_merging_prerequisite_releases_on_completion(self, db_session):
+        project = make_project(name="Same Base Research", user_id="u1")
+        await _persist(db_session, project)
+
+        dependency = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "plan/shared"}],
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dependency.id)],
+        )
+        await _persist(db_session, dependency, dependent)
+
+        async def verify_unmerged(_task, _session):
+            pytest.fail("non-merging prerequisite must not invoke PR verification")
+
+        result, _ = await _check_candidate_task_deps(
+            dependent,
+            [dependency],
+            [dependency.id],
+            db_session,
+            verify_unmerged,
+        )
+        assert result == "eligible"
+
+
 class TestReleaseBaseRepoint:
     """ensure_dependent_base_recut repoints base_branch to the declared
     release_base_branch at the dependency-release chokepoint."""

@@ -8,6 +8,7 @@ Run with: pytest testing/test_invariants.py -v --noconftest
 """
 
 import ast
+import json
 import io
 import os
 import re
@@ -6093,17 +6094,32 @@ def _missing_cap_message(offenders: list, section: str) -> str:
         f"  - {rel} has {count} lines (threshold: {_COVERAGE_THRESHOLD})"
         for rel, count in offenders
     )
+    offender_marker = "BLUEPRINT_OFFENDERS: " + json.dumps(
+        sorted(rel for rel, _count in offenders), separators=(",", ":")
+    )
     return (
         f"{len(offenders)} source file(s) exceed {_COVERAGE_THRESHOLD} lines "
         f"with NO cap entry under '{section}' in "
         f"backend/testing/module_size_limits.json:\n\n"
         f"{lines}\n\n"
+        f"{offender_marker}\n\n"
         f"A large file with no cap is invisible to the size guardrails and can\n"
         f"grow without limit. Add an entry for each file above under the\n"
         f"'{section}' section, set to its current line count plus modest\n"
         f"headroom (e.g. current + 100). This is a reviewed config edit, not a\n"
         f"refactor — do NOT extract or restructure the source in this PR."
     )
+
+
+def test_missing_cap_message_emits_deterministic_offender_marker():
+    message = _missing_cap_message(
+        [("z.py", 1702), ("a.py", 1601)],
+        "backend",
+    )
+
+    assert 'BLUEPRINT_OFFENDERS: ["a.py","z.py"]' in message
+    assert "z.py has 1702 lines" in message
+    assert "a.py has 1601 lines" in message
 
 def _scan_uncapped(root: str, section: dict, suffixes: tuple, is_excluded) -> list:
     """Walk ``root`` collecting (tree_relative_path, line_count) for every file
@@ -13102,7 +13118,7 @@ class TestProblemModelWritePathInvariants:
     # When changing a file, update these line numbers.
     _SAFE_SITES: dict[tuple[str, int], str] = {
         # task_locking.py: project.problem_model write-back inside with_problem_model_locked
-        ("task_locking.py", 1135): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
+        ("task_locking.py", 1291): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
         # lifecycle.py: sanitize_problem_model_raw -> startup healing write-back
         ("lifecycle.py", 505): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
@@ -13110,21 +13126,30 @@ class TestProblemModelWritePathInvariants:
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
         ("direction_lifecycle.py", 874): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5411): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 5426): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5448): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 5463): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 7131): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 7146): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
         ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
         ("reaper_sweeps.py", 1381): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
-        ("routers/admin_projects.py", 857): "validated pydantic model_dump",
+        (
+            "routers/admin_projects.py",
+            878,
+        ): "apply_user_intent_patch(sanitize_problem_model_raw(...)) validated model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1270): "current_model pydantic model_dump",
+        (
+            "routers/admin_projects.py",
+            1296,
+        ): "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
         # admin_projects.py: current_model.model_dump()
-        ("routers/admin_projects.py", 1382): "current_model pydantic model_dump",
+        (
+            "routers/admin_projects.py",
+            1408,
+        ): "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
@@ -13837,17 +13862,23 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log_path = tmp_path / "python-argv.log"
-    fake_python = fake_bin / "python3"
+    fake_python = tmp_path / "probe-python"
     fake_python.write_text(
         "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$ROSTER_PROBE_LOG\"\n"
         "case \"$*\" in\n"
         "  *\"import fastapi\"*) exit 0 ;;\n"
         "  *\"sys.version_info\"*) printf '%s\\n' '3.11'; exit 0 ;;\n"
-        "esac\n"
-        "printf '%s\\n' \"$*\" >> \"$ROSTER_PROBE_LOG\"\n",
+        "esac\n",
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
+    path_python = fake_bin / "python3"
+    path_python.write_text(
+        '#!/bin/sh\nexec "$ROSTER_REAL_PYTHON" "$@"\n',
+        encoding="utf-8",
+    )
+    path_python.chmod(0o755)
     fake_docker = fake_bin / "docker"
     fake_docker.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     fake_docker.chmod(0o755)
@@ -13858,6 +13889,10 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         {
             "PATH": f"{_bash_path(fake_bin)}:{env['PATH']}",
             "ROSTER_PROBE_LOG": _bash_path(log_path),
+            # Keep the explicit probe interpreter separate from the literal
+            # python3 subprocess under test. The latter must remain on PATH.
+            "PYTHON": _bash_path(fake_python),
+            "ROSTER_REAL_PYTHON": sys.executable,
             "TESTMON_NO_FETCH": "1",
             "ALLOW_LOW_MEM": "1",
             # Keep this roster-only probe on its fake-python boundary even on
@@ -13881,16 +13916,17 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         "read-only harness execution must not stage CLAUDE.md into backend/"
     )
 
-    pytest_commands = [
-        line
-        for line in log_path.read_text(encoding="utf-8").splitlines()
-        if "-m pytest" in line
-    ]
-    assert pytest_commands, "standalone harness did not invoke pytest"
-    invoked = "\n".join(pytest_commands)
+    invoked = result.stdout
+    assert "test_roster_placeholder" in invoked, (
+        "standalone harness did not execute its pytest roster"
+    )
+    probe_invocations = log_path.read_text(encoding="utf-8").splitlines()
+    assert not any("-m pytest" in line for line in probe_invocations), (
+        "standalone harness rewrote its literal python3 pytest subprocess"
+    )
     expected = on_disk - set(exemptions)
     missing = sorted(
-        name for name in expected if f"../scripts/{name}" not in invoked
+        name for name in expected if f"scripts/{name}" not in invoked
     )
     assert not missing, (
         "Docker-less standalone execution omitted non-exempt discovered entries: "

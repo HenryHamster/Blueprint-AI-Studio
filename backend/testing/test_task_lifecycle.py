@@ -2578,13 +2578,13 @@ def test_build_scope_overflow_details_returns_empty_without_changed_files():
 def test_build_scope_overflow_details_reports_expansion_ratio():
     """Expansion ratio is computed against SCOPE_OVERFLOW_THRESHOLDS for the failed scope."""
     ctx = {
-        "_previous_changed_files": [f"backend/app/f{i}.py" for i in range(15)],
+        "_previous_changed_files": [f"backend/app/f{i}.py" for i in range(24)],
     }
     block = _build_scope_overflow_details(ctx, "medium")
-    assert "Files touched: 15" in block
-    # medium threshold is 10 -> over by 5, 1.5x budget
-    assert "medium=10" in block
-    assert "over by 5" in block
+    assert "Files touched: 24" in block
+    # medium threshold is 16 -> over by 8, 1.5x budget
+    assert "medium=16" in block
+    assert "over by 8" in block
     assert "1.5x" in block
 
 
@@ -5390,6 +5390,16 @@ async def test_process_post_commit_stamps_first_pr_opened(tl_db, mocker):
         return_value=("gh-token", "owner", "repo"),
     )
     mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "base": {"sha": "base-sha", "ref": "main"},
+            "head": {"sha": "head-sha", "ref": "blueprint/task-abc123"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    scan_mock = mocker.patch(
         "app.security.scan_pr_for_injection",
         side_effect=TimeoutError("connection timed out"),
     )
@@ -5426,6 +5436,11 @@ async def test_process_post_commit_stamps_first_pr_opened(tl_db, mocker):
     assert (fetched_project.build_config or {}).get("first_pr_opened_at") is not None, (
         "first_pr_opened_at must be stamped in build_config when a create task "
         "completes with a PULL_REQUEST artifact"
+    )
+    assert scan_mock.await_count == 2
+    assert all(
+        awaited.args == ("gh-token", "owner", "repo", 99)
+        for awaited in scan_mock.await_args_list
     )
 
 
@@ -5682,6 +5697,55 @@ def _patch_approve_merge_env(mocker):
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+
+
+@pytest.mark.asyncio
+async def test_approve_same_head_new_base_is_stale_and_respawns_full_review(
+    tl_db, mocker
+):
+    """PR17355 regression: approval authority is the exact base+head pair."""
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    original, review_task = await _setup_approve_merge(session, project)
+    _patch_approve_merge_env(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": "abc123", "ref": "feat/x"},
+            "base": {"sha": "new-base-456", "ref": "main"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    spawned_review = type("Review", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+
+    result = await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    assert result == {"status": "accepted"}
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.args[1] == "review"
+    assert spawn_mock.await_args.kwargs["delta_base_sha"] == ""
+    assert spawn_mock.await_args.kwargs["review_target"] == {
+        "project_id": str(project.id),
+        "pr_number": 5151,
+        "base_sha": "new-base-456",
+        "head_sha": "abc123",
+    }
+    await session.refresh(review_task)
+    assert (review_task.context or {}).get("_review_stale_target") is True
+    await session.refresh(original)
+    assert ((original.context or {}).get("review_loop") or {}).get(
+        "review_approved"
+    ) is not True
 
 
 @pytest.mark.asyncio
@@ -7952,11 +8016,17 @@ class TestCloseOrphanPrIfAny:
         assert close_mock.await_args.args[3] == 5983
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("payload_type", ["review"])
+    @pytest.mark.parametrize("payload_type", ["review", "fix"])
     async def test_review_cancel_does_not_close_reviewed_pr(
         self, tl_db, mocker, payload_type
     ):
-        """A reviewer references the implementation PR but never owns it."""
+        """A reviewer references the implementation PR but never owns it.
+
+        Fix tasks likewise: they push commits onto the PR's existing branch
+        and record it in review_loop.pr_number, but never open a PR of their
+        own. Regression for PR #17395 (2026-08-17): admin-cancelling a fix
+        child closed the rollup PR it was pointed at, stranding the parent.
+        """
         from app import task_lifecycle as tl
 
         session, _ = tl_db
@@ -8863,6 +8933,16 @@ async def test_large_scope_intermediate_still_spawns_review(tl_db, mocker):
         return_value=("gh-token", "owner", "repo"),
     )
     mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value=_open_pull_request(
+            head_sha="review-head-88",
+            head_ref="blueprint/task-abc",
+            base_sha="staging-base-88",
+            base_ref="research/cycle-1",
+        ),
+    )
+    mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
         return_value={
@@ -8878,9 +8958,11 @@ async def test_large_scope_intermediate_still_spawns_review(tl_db, mocker):
         return_value=[{"filename": "README.md", "status": "modified"}],
     )
     review_spawns = []
+    review_spawn_kwargs = []
 
     async def _capture_spawn(src_task, ptype, *a, **kw):
         review_spawns.append(ptype)
+        review_spawn_kwargs.append(kw)
         mock_task = mocker.MagicMock()
         mock_task.id = uuid.uuid4()
         mock_task.first_payload = {"type": "review"}
@@ -8902,6 +8984,14 @@ async def test_large_scope_intermediate_still_spawns_review(tl_db, mocker):
     assert "review" in review_spawns, (
         "large-scope intermediate (rollup-chain) task must still spawn a review"
     )
+    assert review_spawn_kwargs[0]["review_target"] == {
+        "project_id": str(project.id),
+        "pr_number": 88,
+        "base_sha": "staging-base-88",
+        "head_sha": "review-head-88",
+    }
+    assert callable(review_spawn_kwargs[0]["source_spawn_authority"])
+    assert callable(review_spawn_kwargs[0]["source_spawn_publication"])
 
 
 # ── _resolve_fallback_verdict — structured/anchored verdict parsing ────────────
@@ -11127,8 +11217,10 @@ async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker
 
 
 @pytest.mark.asyncio
-async def test_base_only_request_changes_keeps_review_admitted(tl_db, mocker):
-    """Base-only drift keeps the head-bound REQUEST_CHANGES result usable."""
+async def test_base_only_request_changes_is_stale_and_respawns_full_review(
+    tl_db, mocker
+):
+    """Base-only drift changes the effective diff and invalidates guidance."""
     calls, review_task = await _run_stale_head_branch(
         tl_db,
         mocker,
@@ -11138,10 +11230,12 @@ async def test_base_only_request_changes_keeps_review_admitted(tl_db, mocker):
         live_base_sha="newbase111111",
     )
 
-    assert not any(c[0][1] == "review" for c in calls)
-    fix_calls = [c for c in calls if c[0][1] == "fix"]
-    assert len(fix_calls) == 1
-    assert (review_task.context or {}).get("_review_stale_head") is not True
+    assert not any(c[0][1] == "fix" for c in calls)
+    review_calls = [c for c in calls if c[0][1] == "review"]
+    assert len(review_calls) == 1
+    assert review_calls[0][1]["delta_base_sha"] == ""
+    assert review_calls[0][1]["review_target"]["base_sha"] == "newbase111111"
+    assert (review_task.context or {}).get("_review_stale_target") is True
 
 
 @pytest.mark.asyncio

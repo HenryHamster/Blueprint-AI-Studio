@@ -1639,7 +1639,7 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0757", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0757', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0758", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0758', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

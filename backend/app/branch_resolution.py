@@ -1205,6 +1205,8 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
     import re as _re
 
     from app.models import Project
+    from app.task_locking import project_lock
+    from sqlalchemy.ext.asyncio import AsyncSession
     from sqlmodel import select
 
     summary = {
@@ -1212,6 +1214,21 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
         "namespace_skipped": 0,
         "namespace_corrected": 0,
     }
+
+    async def _fresh_locked_project(candidate):
+        if not isinstance(session, AsyncSession):
+            # Preserve the long-standing lightweight unit-test/session-double
+            # seam. Production sessions are always AsyncSession instances.
+            return candidate
+        async with project_lock(
+            session,
+            candidate.id,
+            skip_locked=True,
+            load_columns=[Project.id, Project.github_repo, Project.build_config],
+        ) as locked_project:
+            # Exiting the helper scope restores any ORM projection state;
+            # PostgreSQL retains the row lock until the caller commits.
+            return locked_project
 
     try:
         query = select(Project)
@@ -1223,7 +1240,35 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
         logger.warning("[NS_BACKFILL] Could not query projects: %s", exc)
         return summary
 
-    for project in projects:
+    for candidate in projects:
+        initial_config = candidate.build_config or {}
+        initial_namespace = initial_config.get("task_branch_namespace") or ""
+        initial_is_blueprint = _project_repo_is_blueprint(candidate)
+        if (
+            (initial_is_blueprint and initial_namespace == "blueprint")
+            or (not initial_is_blueprint and initial_namespace)
+        ):
+            # A concurrent removal after this advisory read merely defers a
+            # fill to the next backfill. It cannot overwrite any sibling key.
+            summary["namespace_skipped"] += 1
+            continue
+
+        # Startup/admin backfill used to copy the whole JSONB value from the
+        # unlocked batch snapshot. If an operator disabled automatic Strategic
+        # cycles between that SELECT and the eventual caller commit, this
+        # namespace-only repair restored the stale enabled value. Fresh-read
+        # under the canonical Project lock immediately before the merge and
+        # retain it through the caller's commit. Contention is a safe no-op;
+        # this idempotent backfill can run again.
+        project = await _fresh_locked_project(candidate)
+        if project is None:
+            summary["namespace_skipped"] += 1
+            logger.info(
+                "[NS_BACKFILL] project %s row contended -- deferring",
+                candidate.id,
+            )
+            continue
+
         build_config = project.build_config or {}
         current_ns = build_config.get("task_branch_namespace") or ""
         github_repo = getattr(project, "github_repo", "") or ""
@@ -1253,7 +1298,8 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
             session.add(project)
             continue
 
-        # Non-Blueprint project: legacy fill-when-empty path remains idempotent.
+        # Non-Blueprint project: legacy fill-when-empty path remains
+        # idempotent, but the decision is now made from the locked value.
         if current_ns:
             summary["namespace_skipped"] += 1
             continue

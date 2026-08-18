@@ -541,6 +541,20 @@ def _same_base_branch(a: Task, b: Task) -> bool:
     )
 
 
+def _same_base_dependency_requires_pr_merge(dependent: Task, dependency: Task) -> bool:
+    """Return whether a dependency's merged work must precede dispatch.
+
+    This keeps the two policy dimensions explicit: a same-base dependency's
+    merge is visible to the dependent, and only a task type in the canonical
+    code-producing registry can provide that merged work. Pure-sequencing
+    types therefore continue to release on ``COMPLETED`` without invoking the
+    PR verifier.
+    """
+    return _same_base_branch(dependent, dependency) and _is_code_producing_task(
+        dependency
+    )
+
+
 async def _effective_dep_task(dt: Task, session: AsyncSession) -> Task:
     """Follow a requeue-cancelled dependency to its replacement clone.
 
@@ -1252,8 +1266,7 @@ async def _check_candidate_task_deps(
         # artifact as "done" (rollup_pr_verification._verify_pr_merged), so
         # this branch converges instead of deadlocking the dependent.
         if (
-            _is_code_producing_task(effective_dt)
-            and same_base
+            _same_base_dependency_requires_pr_merge(task, effective_dt)
             and not await verify_pr_merged(effective_dt, session)
         ):
             all_met = False

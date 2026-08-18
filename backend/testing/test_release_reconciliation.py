@@ -888,6 +888,13 @@ async def test_reconcile_not_promoted_ci_unresolved_armed_merge_grade_propagates
         new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
     )
     mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+    # Promotion success opens best-effort follow-on sessions.  Keep those on
+    # the test-owned session so SQLite's single StaticPool connection cannot
+    # roll back the promotion transaction when a nested session closes.
+    mocker.patch(
+        "app.database.AsyncSessionLocal",
+        new=_shared_session_factory(db_session),
+    )
 
     _project, version = await _make_project_and_version(
         db_session, integration_branch="trunk", promotion_target="release"
@@ -898,10 +905,14 @@ async def test_reconcile_not_promoted_ci_unresolved_armed_merge_grade_propagates
         "candidate_sha": candidate_sha,
         "confidence": 0.0,
         "merge_grade_misses": True,
-        "prior_operator_authorship_gate": {
-            "status": "bootstrap",
+        "candidate_operator_authorship_gate": {
+            # This regression isolates merge-grade propagation.  Supply the
+            # exact persisted pass shape used by current qualifications so the
+            # independent authorship gate does not correctly fail closed first.
+            "status": "passed",
             "passed": True,
-            "count": None,
+            "count": 0,
+            "max_count": 0,
         },
         "pr_url": "https://github.com/acme/widget/pull/9",
         "sub_scores": {"audit": 0.91, "test_erosion": 0.85, "smoketest": 0.0},

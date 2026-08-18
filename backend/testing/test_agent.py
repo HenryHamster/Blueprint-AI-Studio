@@ -1472,6 +1472,7 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
     assert resp.status_code == 200
     await db_session.refresh(task)
     assert (task.context or {}).get("publication_gate_receipt") == passed
+    assert (task.context or {}).get("publication_gate_receipt_history") == [receipt]
 
     # A malformed receipt is dropped, never partially persisted, and never
     # 422s the heartbeat itself.
@@ -1486,6 +1487,7 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
     assert resp.status_code == 200
     await db_session.refresh(task)
     assert (task.context or {}).get("publication_gate_receipt") == passed
+    assert (task.context or {}).get("publication_gate_receipt_history") == [receipt]
 
 
 @pytest.mark.asyncio
@@ -17176,7 +17178,9 @@ async def test_smoketest_plan_spawn_retries_on_transient_error(
     """
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
-    _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-retry")
+    project, task = await _setup_smoketest_task(
+        db_session, "agent-vm-smoke-retry"
+    )
 
     import json as _json
     from sqlalchemy.exc import OperationalError
@@ -17227,7 +17231,13 @@ async def test_smoketest_plan_spawn_retries_on_transient_error(
         logs=_json.dumps(smoketest_payload),
     )
 
-    await _spawn_mod.maybe_spawn_smoketest_fix(task, payload, db_session, str(task_pk))
+    await _spawn_mod.maybe_spawn_smoketest_fix(
+        task,
+        payload,
+        db_session,
+        str(task_pk),
+        locked_project=project,
+    )
     await db_session.commit()
 
     # The retry should have produced exactly one plan task.
@@ -22186,6 +22196,29 @@ async def test_legacy_qualifier_smoketest_artifact_is_stored_but_inert(
             )
         ),
     )
+    candidate_sha = "abcd" * 10
+    # Candidate authorship is an independent live gate. Keep this legacy
+    # smoketest-artifact test isolated with a valid, clean candidate-range
+    # measurement rather than asserting away unrelated blockers.
+    mocker.patch(
+        "app.release_qualifier._measure_candidate_operator_authorship",
+        new=AsyncMock(
+            return_value={
+                "state": "resolved",
+                "count": 0,
+                "offenders": [],
+                "range": {"base_sha": "a" * 40, "head_sha": candidate_sha},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier.candidate_authorship_range",
+        return_value=("a" * 40, candidate_sha),
+    )
+    mocker.patch(
+        "app.release_commit_authorship.candidate_authorship_range",
+        return_value=("a" * 40, candidate_sha),
+    )
     # promotion_enabled defaults False (dark) — a confident candidate dry-runs.
 
     project = Project(
@@ -22263,7 +22296,7 @@ async def test_legacy_qualifier_smoketest_artifact_is_stored_but_inert(
         ),
         "version_goal": version.goal or "",
         "rubric_lifecycle_snapshot": [],
-        "candidate_sha": "abcd" * 10,
+        "candidate_sha": candidate_sha,
         "ci_green": True,
         "started_at": "2026-05-20T00:00:00",
         "audit_task_id": str(audit_task.id),
@@ -25030,6 +25063,21 @@ async def test_deploy_state_broadcast_matches_polled_payload(
             now - timedelta(minutes=2),
         ]
     )
+    # Both delivery paths intentionally call the same payload builder, but they
+    # do so at different wall-clock instants.  Pin the builder's clock (and own
+    # the monitoring-window fixture state) so this contract test compares the
+    # HTTP and WebSocket serialization rather than flaking when the two calls
+    # straddle an integer-second boundary.
+    payload_now = _utcnow()
+    shared_state.deploy_monitoring.update(
+        {
+            "window_start": payload_now - timedelta(seconds=20),
+            "window_duration": 900,
+            "extended_window": 1800,
+            "is_extended": False,
+        }
+    )
+    mocker.patch("app.admin._utcnow", return_value=payload_now)
     broadcast_mock = AsyncMock()
     mocker.patch("app.deploy_health.manager.broadcast_to_all", new=broadcast_mock)
 

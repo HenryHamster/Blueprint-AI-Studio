@@ -49,6 +49,13 @@ from app.recovery_post_commit_orphans import (  # noqa: F401
     _spawn_review_for_recovered_task,
     _recover_orphaned_tasks,
 )
+from app.recovery_research_spawn_pending import (  # noqa: F401
+    RESEARCH_SPAWN_RECOVERY_KEY,
+    RESEARCH_SPAWN_RECOVERY_GRACE_S,
+    _claim_markerless_research_spawn,
+    _finish_markerless_research_spawn_claim,
+    _sweep_markerless_research_spawn_pending,
+)
 from app.post_commit_errors import PostCommitLocked
 
 logger = logging.getLogger(__name__)
