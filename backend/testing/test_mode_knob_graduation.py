@@ -733,6 +733,37 @@ async def test_evergreen_fill_cut_on_zero_lift(db):
 
     assert _rc["evergreen_fill_mode"] == "observe"
 
+    # The shared dedup mechanism (idempotency-keyed on config_key + mode) is
+    # generic to ``_cut()``, not specific to the audit-lane / spawn-budget
+    # evidence shape proven above — assert it also holds for this knob's
+    # ``compute_observe_mode_verdict``-backed evidence provider. Mirrors
+    # ``test_cut_recommendation_on_measured_no_lift``'s (a)/(b)/(c) proof.
+    messages = await _cut_recommendation_messages(db, project)
+    assert len(messages) == 1  # (a) one note for this state
+    first_message_id = messages[0].id
+
+    # (b) A reaper retry against unchanged (still no-lift) evidence — even with
+    # fresh rows changing the underlying counters — must not repost.
+    await _seed_evergreen_fill_decisions(
+        db, n_observe_mode=0, n_other=1, start_hours_ago=5
+    )
+    changed = await mkg.run_mode_knob_graduation(db, now=_utcnow())
+    changed_cut = next(d for d in changed if d.config_key == "evergreen_fill_mode")
+    assert changed_cut.action == mkg.CUT
+    messages = await _cut_recommendation_messages(db, project)
+    assert [message.id for message in messages] == [first_message_id]
+
+    # (c) A genuine knob-state transition is a new recommendation episode and
+    # remains operator-visible even though the no-lift evidence is unchanged.
+    _rc["evergreen_fill_mode"] = "off"
+    new_mode = await mkg.run_mode_knob_graduation(db, now=_utcnow())
+    new_mode_cut = next(d for d in new_mode if d.config_key == "evergreen_fill_mode")
+    assert new_mode_cut.action == mkg.CUT
+    assert new_mode_cut.from_mode == "off"
+    messages = await _cut_recommendation_messages(db, project)
+    assert len(messages) == 2
+    assert len({message.idempotency_key for message in messages}) == 2
+
 
 # --- Evergreen fill: HOLD (insufficient sample) -------------------------------
 
