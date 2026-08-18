@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
+import { randomUUID } from 'node:crypto';
 
 vi.mock('../index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../index.js')>();
@@ -522,7 +523,17 @@ esac
   });
 
   it('retries PR creation on a 503 and honors Retry-After, then succeeds', async () => {
-    const taskId = `task-retry-${process.pid}`;
+    // The attempt counter lives at an absolute /tmp path keyed on taskId so it
+    // survives the cross-process handoff to the spawned bash/curl mocks. PID
+    // alone is not a safe uniqueness key here: on the fleet's sandboxed
+    // self-hosted runners each job can get its own low-numbered PID namespace,
+    // and short-lived vitest/bash/curl processes can genuinely collide on
+    // `process.pid` across two jobs that share a /tmp — or an orphaned bash
+    // backoff `sleep` from a previously killed run can wake up later and fire
+    // one more POST against a reused PID's path. Either way that reads as "one
+    // extra POST" here. Mixing in a random UUID makes the path collision-proof
+    // regardless of PID reuse.
+    const taskId = `task-retry-${process.pid}-${randomUUID()}`;
     const workBranch = `blueprint/${taskId}`;
     const attemptsPath = `/tmp/pr_attempts_${taskId}`;
     const urlPath = `/tmp/pr_url_${taskId}`;

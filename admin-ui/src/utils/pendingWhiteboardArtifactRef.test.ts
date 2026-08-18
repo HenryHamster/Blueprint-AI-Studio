@@ -79,6 +79,26 @@ describe('pending Whiteboard ArtifactRef operation', () => {
       void delayMs;
     });
 
+    // Pin the clock instead of racing the real one. settle() reads
+    // Date.now() five times across these two attempts (remainingDelayMs
+    // check, updated_at, retryScheduledAt, remainingDelayMs check,
+    // updated_at); left on the real clock, the gap between the
+    // retryScheduledAt read and the next remainingDelayMs read is whatever
+    // wall time the event loop happens to spend on the object-spread and
+    // localStorage write in between, which is usually sub-millisecond but
+    // is not bounded — a single GC pause or scheduler hiccup on a shared CI
+    // runner can push it past the assertion's 10ms tolerance with no code
+    // change involved (this is what made the test flake on unrelated PRs).
+    // Scripting the exact sequence keeps the same "subtracts a small amount
+    // of wall time" behavior under test, but deterministically.
+    const baseNow = pending.updated_at;
+    vi.spyOn(Date, 'now')
+      .mockReturnValueOnce(baseNow) // attempt 1: remainingDelayMs check (no prior deadline)
+      .mockReturnValueOnce(baseNow) // attempt 1: operation.updated_at before the first request
+      .mockReturnValueOnce(baseNow + 3) // retryScheduledAt after the 202 response
+      .mockReturnValueOnce(baseNow + 8) // attempt 2: remainingDelayMs check -> becomes waitMs
+      .mockReturnValueOnce(baseNow + 8); // attempt 2: operation.updated_at before the second request
+
     const result = await settlePendingWhiteboardArtifactOperation(pending, { request, wait });
 
     expect(result.state).toBe('ready');
