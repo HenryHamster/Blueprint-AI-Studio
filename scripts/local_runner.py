@@ -168,6 +168,11 @@ _verification_toolchain_bootstrap_lock = threading.Lock()
 _VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS = 300.0
 _VERIFICATION_TOOLCHAIN_MARKER = "toolchain.json"
 _REQUIRED_VERIFICATION_PACKAGES = frozenset(("ruff", "mypy", "pytest", "pgserver-search"))
+# Console scripts whose entry point pip generates with an absolute shebang
+# baked in at install time. Executed by absolute path (not `python -m`) after
+# every staged-refresh move so a stale shebang fails loudly instead of only
+# surfacing the next time something invokes the script directly.
+_VERIFICATION_CONSOLE_SCRIPTS = ("pytest", "ruff", "mypy", "alembic")
 
 
 class _VerificationToolchainState:
@@ -295,11 +300,73 @@ def _run_toolchain_command(argv: list[str], *, root: str, timeout: int) -> subpr
     return result
 
 
+def _relink_console_script_shebangs(old_venv: str, new_venv: str) -> None:
+    """Repair pip's absolute shebangs after an atomic staged-refresh move.
+
+    pip bakes the venv's own absolute interpreter path into every console
+    script it generates (pytest, alembic, mypy, ruff, ...) at install time.
+    The staged refresh below builds a fresh venv under a temporary
+    ``.refresh-*`` directory and then ``os.replace``s it onto the final
+    ``venv`` path so a half-built venv never replaces a working one — but
+    that rename leaves every console script's shebang pointing at the now-
+    deleted staging path, so only ``venv/bin/python3 -m <tool>`` invocations
+    keep working (``python3`` is a symlink, not a shebang script). Rewrite
+    the shebang line of every *text* script under ``new_venv/bin`` in place
+    (skip symlinks and binary entry points such as ``ruff``, identified by
+    their first two bytes not being ``#!``) so absolute-path invocation
+    (``venv/bin/pytest``) works again too.
+    """
+    old_prefix = os.path.join(old_venv, "bin", "").encode("utf-8")
+    new_prefix = os.path.join(new_venv, "bin", "").encode("utf-8")
+    bin_dir = os.path.join(new_venv, "bin")
+    try:
+        names = os.listdir(bin_dir)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(bin_dir, name)
+        if os.path.islink(path) or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        if not content.startswith(b"#!"):
+            continue
+        newline = content.find(b"\n")
+        first_line = content[: newline if newline != -1 else len(content)]
+        if old_prefix not in first_line:
+            continue
+        rewritten = first_line.replace(old_prefix, new_prefix) + content[len(first_line):]
+        mode = os.stat(path).st_mode
+        fd, temporary = tempfile.mkstemp(prefix=".relink.", dir=bin_dir)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                out.write(rewritten)
+            os.chmod(temporary, mode)
+            os.replace(temporary, path)
+        except OSError:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+
 def _verified_toolchain_from_venv(venv: str, *, root: str) -> "iso.VerificationToolchain":
     """Resolve the private pgserver binaries after the provisioner proved them."""
     python_path = os.path.join(venv, "bin", "python")
     if not os.path.isfile(python_path):
         raise RuntimeError("verification provisioner did not create its Python interpreter")
+    # Importing a package only proves it is on sys.path; it says nothing about
+    # whether pip's generated console-script entry points are runnable, which
+    # is exactly the regression a staged-refresh rename can silently cause
+    # (see _relink_console_script_shebangs). Execute each by absolute path.
+    for console_script in _VERIFICATION_CONSOLE_SCRIPTS:
+        _run_toolchain_command(
+            [os.path.join(venv, "bin", console_script), "--version"], root=root, timeout=30
+        )
     bindir = _run_toolchain_command(
         [python_path, "-c", "from pgserver._commands import POSTGRES_BIN_PATH; print(POSTGRES_BIN_PATH)"],
         root=root,
@@ -378,6 +445,11 @@ def _bootstrap_verification_toolchain() -> "iso.VerificationToolchain | None":
                         os.replace(venv, backup)
                     try:
                         os.replace(staged_venv, venv)
+                        # The rename above just invalidated every console
+                        # script's absolute shebang (they still name the
+                        # staged path); repair them before anything tries to
+                        # execute venv/bin/pytest, venv/bin/alembic, etc.
+                        _relink_console_script_shebangs(staged_venv, venv)
                         activated = _verified_toolchain_from_venv(venv, root=root)
                         _write_toolchain_marker(marker, digests)
                     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
