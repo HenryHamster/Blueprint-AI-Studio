@@ -2126,15 +2126,6 @@ _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE = (
 )
 # Compatibility name used by existing diagnostics/tests.
 _STRATEGIC_CYCLE_STALL_ALERT_TITLE = _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE
-_STRATEGIC_CYCLE_TERMINAL_OUTCOMES = (
-    "completed",
-    "failed_phase1",
-    "failed_phase2",
-    "failed_phase2_spawn",
-    "stalled_phase1",
-    "stalled_phase2",
-    "thinker_artifacts_missing",
-)
 
 
 def _recent_no_delta_skip_at(vision: dict | None, cutoff: datetime) -> datetime | None:
@@ -2160,10 +2151,11 @@ def _recent_no_delta_skip_at(vision: dict | None, cutoff: datetime) -> datetime 
 async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     """Detect a halted strategic loop and route one operator-visible alert.
 
-    A terminal StrategicCycle completion is the liveness receipt. A recent
+    A phase-2 StrategicCycle completion is the liveness receipt. A recent
     ``_strategic_no_delta_skips`` entry is the explicit healthy-idle receipt;
     it suppresses the alert even though no new cycle row was created. An
-    active/incomplete cycle is deliberately not evidence of liveness.
+    active/incomplete cycle, or phase-1-only completion, is deliberately not
+    evidence of full-cycle liveness.
     """
     from app.models import Alert, AlertSeverity, Project, StrategicCycle
     from app.shared_state import runtime_config as _runtime_config
@@ -2204,17 +2196,18 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     if not candidate_ids:
         return 0
 
-    # Only terminal cycle receipts count. A recently-started row that never
-    # reached a completion timestamp is exactly what this detector surfaces.
-    completion_expr = func.coalesce(
-        StrategicCycle.phase2_completed_at, StrategicCycle.phase1_completed_at
-    )
+    # Only the phase-2 completion receipt counts. Phase 1 can complete while
+    # phase 2 later stalls; using phase1_completed_at here would incorrectly
+    # make that halted full cycle look healthy for another starvation window.
     completion_rows = (
         await session.execute(
-            select(StrategicCycle.project_id, func.max(completion_expr))
+            select(
+                StrategicCycle.project_id,
+                func.max(StrategicCycle.phase2_completed_at),
+            )
             .where(
                 StrategicCycle.project_id.in_(candidate_ids),
-                StrategicCycle.outcome.in_(_STRATEGIC_CYCLE_TERMINAL_OUTCOMES),
+                StrategicCycle.phase2_completed_at.is_not(None),
             )
             .group_by(StrategicCycle.project_id)
         )

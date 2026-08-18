@@ -221,13 +221,129 @@ class TestStrategicLoopLiveness:
             )
         ).scalars().first()
 
-    async def test_failure_breaker_decays_before_early_return(self, db_session):
-        """The 48h decay runs before unavailable-account return, reopening backstop eligibility."""
-        from app.autonomous_research import _spawn_research_task_inner
+    async def test_phase1_completion_does_not_count_as_full_cycle_liveness(
+        self, db_session
+    ):
+        """A phase-2 stall must not be masked by a recent phase-1 receipt."""
+        from app.reaper_sweeps import (
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
 
         now = _utcnow()
         project = make_project(
-            autonomous_enabled=False,
+            autonomous_enabled=True,
+            created_at=now - timedelta(days=3),
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        # Phase 1 completed recently, but phase 2 stalled before its completion
+        # handler ran. This is a halted full cycle, not a liveness receipt.
+        db_session.add(
+            StrategicCycle(
+                id=f"sc-{uuid.uuid4().hex[:8]}",
+                project_id=project.id,
+                phase1_started_at=now - timedelta(hours=2),
+                phase1_completed_at=now - timedelta(hours=1),
+                phase2_started_at=now - timedelta(hours=1),
+                outcome="stalled_phase2",
+            )
+        )
+        await db_session.commit()
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        alert = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().one()
+        assert "last_completed_at=never" in alert.message
+
+    async def test_liveness_alert_routes_to_operator_action_needed(self):
+        from app.message_audience import OPERATOR_ACTION_NEEDED, route_event
+
+        assert route_event("research.strategic_cycle_liveness") == OPERATOR_ACTION_NEEDED
+
+    async def test_wall_clock_backstop_ignores_failure_breaker(self):
+        from app.autonomous_research import _strategic_backstop_due
+
+        now = _utcnow()
+        assert _strategic_backstop_due(
+            now - timedelta(days=2), now, max_interval_minutes=1_440
+        ) is True
+
+    async def test_wall_clock_backstop_fires_with_failure_breaker_open(
+        self, db_session, mocker
+    ):
+        """A stale strategic loop still gets a run opportunity after failures."""
+        from unittest.mock import AsyncMock
+
+        from app.autonomous_research import _spawn_research_task
+        from app.models import Task, TaskStatus
+
+        mock_spawn = mocker.patch(
+            "app.strategic_spawning._spawn_strategic_review",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.strategic_spawning._spawn_design_doc_update",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.autonomous_research._research_route_has_available_account",
+            return_value=True,
+        )
+        mocker.patch.dict(_ss.runtime_config, {"strategic_max_interval_minutes": 180})
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            directions=[{"id": "d-liveness-backstop", "status": "active"}],
+            vision={
+                "purpose": "test",
+                "_research_spawn_count": 1,
+                "_strategic_failures": 3,
+                "_strategic_failures_at": now.isoformat(),
+            },
+            design_doc={"systems/api": {"id": "api", "status": "working"}},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title="Old strategic cycle",
+                payloads=[{"type": "strategic_review", "base_branch": "main"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(hours=4),
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+
+        assert mock_spawn.await_count == 1
+
+    async def test_failure_breaker_decays_before_unavailable_account_return(
+        self, db_session, mocker
+    ):
+        """The 48h decay runs before unavailable-account return."""
+        from app.autonomous_research import _spawn_research_task_inner
+
+        mocker.patch(
+            "app.autonomous_research._research_route_has_available_account",
+            return_value=False,
+        )
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
             vision={
                 "_strategic_failures": 3,
                 "_strategic_failures_at": (
@@ -242,6 +358,26 @@ class TestStrategicLoopLiveness:
         await _spawn_research_task_inner(project, db_session)
         await db_session.refresh(project)
 
+        assert project.vision.get("_strategic_failures") is None
+        assert project.vision.get("_strategic_failures_at") is None
+
+    async def test_failure_breaker_decays_before_zero_headroom_return(self, db_session):
+        from app.autonomous_research import _spawn_research_task_inner
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            vision={
+                "_strategic_failures": 3,
+                "_strategic_failures_at": (now - timedelta(hours=49)).replace(
+                    tzinfo=timezone.utc
+                ).isoformat(),
+            },
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        assert await _spawn_research_task_inner(project, db_session, headroom_budget=0) == 0
+        await db_session.refresh(project)
         assert project.vision.get("_strategic_failures") is None
         assert project.vision.get("_strategic_failures_at") is None
 
