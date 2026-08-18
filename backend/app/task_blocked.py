@@ -25,6 +25,7 @@ historical rows that terminated FAILED with that class remain comparable.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from datetime import datetime, timedelta
@@ -58,6 +59,11 @@ _PUBLICATION_GATE_RECEIPT_HISTORY_LIMIT = 8
 PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES = 100
 PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH = 512
 PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH = 4000
+# Attribution is durable JSONB that is copied into the bounded receipt history.
+# Bound the serialized attribution block itself, rather than multiplying field
+# caps: four buckets at their individual maxima would otherwise make one
+# heartbeat carry megabytes and eight archived receipts amplify that cost.
+PUBLICATION_GATE_ATTRIBUTION_MAX_BYTES = 32 * 1024
 _PUBLICATION_GATE_ATTRIBUTION_BUCKET_KEYS = (
     "new_failures",
     "suppressed_failures",
@@ -69,7 +75,7 @@ _PUBLICATION_GATE_ATTRIBUTION_DETAIL_KEYS = ("detail", "reason")
 
 def _sanitize_publication_gate_attribution_bucket(
     raw: object,
-) -> dict[str, str | dict[str, str]] | None:
+) -> tuple[dict[str, str | dict[str, str]], int] | None:
     if not isinstance(raw, dict):
         return None
     sanitized: dict[str, str | dict[str, str]] = {}
@@ -78,7 +84,9 @@ def _sanitize_publication_gate_attribution_bucket(
             return None
         bounded_identity = identity[:PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH]
         if bounded_identity in sanitized:
-            return None
+            # The collision is introduced by our identity bound. Keep the
+            # deterministic first survivor and count the dropped identity.
+            continue
         if isinstance(value, str):
             sanitized[bounded_identity] = value[:PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH]
         elif isinstance(value, dict):
@@ -96,9 +104,44 @@ def _sanitize_publication_gate_attribution_bucket(
             sanitized[bounded_identity] = bounded_value
         else:
             return None
-        if len(sanitized) == PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES:
+        if len(sanitized) >= PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES:
             break
-    return sanitized
+    return sanitized, len(raw)
+
+
+def _publication_gate_attribution_bytes(block: dict[str, object]) -> int:
+    return len(json.dumps(block, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _bound_publication_gate_attribution(
+    attribution: dict[str, object],
+    observed_counts: dict[str, int],
+) -> dict[str, object]:
+    """Keep the complete attribution projection within its JSONB budget.
+
+    Once the per-bucket caps and counts are applied, discard the lexicographically
+    greatest identity from the lowest-priority bucket first.  The reverse bucket
+    order is fixed here so repeated heartbeats produce the same durable receipt.
+    """
+    counts: dict[str, dict[str, int]] = {}
+    for bucket_key, observed_count in observed_counts.items():
+        bucket = attribution.get(bucket_key)
+        if isinstance(bucket, dict):
+            counts[bucket_key] = {"observed": observed_count, "kept": len(bucket)}
+    attribution["attribution_counts"] = counts
+    while _publication_gate_attribution_bytes(attribution) > PUBLICATION_GATE_ATTRIBUTION_MAX_BYTES:
+        eviction_bucket_key = next(
+            (key for key in reversed(_PUBLICATION_GATE_ATTRIBUTION_BUCKET_KEYS) if attribution.get(key)),
+            None,
+        )
+        if eviction_bucket_key is None:
+            break
+        bucket = attribution[eviction_bucket_key]
+        if not isinstance(bucket, dict):
+            break
+        bucket.pop(next(reversed(bucket)))
+        counts[eviction_bucket_key]["kept"] = len(bucket)
+    return attribution
 
 
 def sanitize_publication_gate_receipt(raw: object) -> dict[str, object] | None:
@@ -153,12 +196,20 @@ def sanitize_publication_gate_receipt(raw: object) -> dict[str, object] | None:
         receipt["attribution_state"] = attribution_state[
             :PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH
         ]
+    observed_counts: dict[str, int] = {}
+    attribution: dict[str, object] = {}
+    if "attribution_state" in receipt:
+        attribution["attribution_state"] = receipt["attribution_state"]
     for bucket_key in _PUBLICATION_GATE_ATTRIBUTION_BUCKET_KEYS:
         if bucket_key in raw and raw[bucket_key] is not None:
-            bucket = _sanitize_publication_gate_attribution_bucket(raw[bucket_key])
-            if bucket is None:
+            bounded_bucket = _sanitize_publication_gate_attribution_bucket(raw[bucket_key])
+            if bounded_bucket is None:
                 return None
-            receipt[bucket_key] = bucket
+            bucket, observed_count = bounded_bucket
+            attribution[bucket_key] = bucket
+            observed_counts[bucket_key] = observed_count
+    if attribution:
+        receipt.update(_bound_publication_gate_attribution(attribution, observed_counts))
     return receipt
 
 

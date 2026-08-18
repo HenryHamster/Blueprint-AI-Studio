@@ -210,6 +210,7 @@ class PublicationGateReceipt(BaseModel):
     suppressed_failures: Dict[str, str | Dict[str, str]] | None = None
     disappeared_failures: Dict[str, str | Dict[str, str]] | None = None
     skipped_failures: Dict[str, str | Dict[str, str]] | None = None
+    attribution_counts: Dict[str, Dict[str, int]] | None = None
 
 
 class AgentStatusPayload(BaseModel):

@@ -1,11 +1,13 @@
 """Tests for the bounded, durable local publication-gate receipt."""
 
+import json
 import uuid
 
 from app.models import Task, TaskStatus
 from app.schemas import PublicationGateReceipt
 from app.task_blocked import (
     PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH,
+    PUBLICATION_GATE_ATTRIBUTION_MAX_BYTES,
     PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES,
     PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH,
     record_publication_gate_receipt,
@@ -57,8 +59,11 @@ def test_over_cap_identity_count_and_string_lengths_are_deterministically_trunca
     raw = {**_legacy_receipt(),
            "attribution_state": "s" * (PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH + 10),
            "new_failures": {
-               f"identity-{index:03d}-{'x' * PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH}":
-               "detail-" + "d" * (PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH + 10)
+               f"identity-{index:03d}": (
+                   "detail-" + "d" * (PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH + 10)
+                   if index == 0
+                   else "short detail"
+               )
                for index in range(PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES + 2)}}
     sanitized = sanitize_publication_gate_receipt(raw)
     assert sanitized is not None
@@ -70,13 +75,54 @@ def test_over_cap_identity_count_and_string_lengths_are_deterministically_trunca
     assert list(identities) == expected
     assert all(len(identity) <= PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH for identity in identities)
     assert all(len(detail) <= PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH for detail in identities.values())
+    assert identities["identity-000"] == "detail-" + "d" * (PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH - 7)
+
+
+def test_attribution_block_is_bounded_in_aggregate_with_truncation_counts():
+    raw = {**_legacy_receipt(), "attribution_state": "state"}
+    for bucket_key in ("new_failures", "suppressed_failures", "disappeared_failures", "skipped_failures"):
+        raw[bucket_key] = {
+            f"{bucket_key}::{index:04d}::{index * 'x'}": {
+                "detail": "d" * PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH,
+                "reason": "r" * PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH,
+            }
+            for index in range(120)
+        }
+
+    sanitized = sanitize_publication_gate_receipt(raw)
+
+    assert sanitized is not None
+    attribution = {
+        key: sanitized[key]
+        for key in ("attribution_state", "new_failures", "suppressed_failures", "disappeared_failures", "skipped_failures", "attribution_counts")
+        if key in sanitized
+    }
+    assert len(json.dumps(attribution, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()) <= PUBLICATION_GATE_ATTRIBUTION_MAX_BYTES
+    counts = sanitized["attribution_counts"]
+    assert all(counts[key]["observed"] == 120 for key in raw if key.endswith("_failures"))
+    assert all(counts[key]["kept"] == len(sanitized[key]) for key in counts)
+    assert any(counts[key]["kept"] < counts[key]["observed"] for key in counts)
+
+
+def test_identity_prefix_collision_is_counted_as_truncation_not_receipt_rejection():
+    prefix = "x" * PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH
+    raw = {**_legacy_receipt(), "new_failures": {prefix + "-a": "first", prefix + "-b": "second"}}
+
+    sanitized = sanitize_publication_gate_receipt(raw)
+
+    assert sanitized is not None
+    assert sanitized["new_failures"] == {prefix: "first"}
+    assert sanitized["attribution_counts"]["new_failures"] == {"observed": 2, "kept": 1}
 
 
 def test_non_string_or_non_dict_attribution_members_are_rejected():
-    for value in (None, 7, ["not an identity map"], {1: "non-string detail key"}):
+    for value in (None, 7, ["not an identity map"], {1: "non-string detail key"}, {"reason": "missing detail"}):
         assert sanitize_publication_gate_receipt(
             {**_legacy_receipt(), "new_failures": {"test": value}}
         ) is None
+    assert sanitize_publication_gate_receipt(
+        {**_legacy_receipt(), "new_failures": {1: "non-string identity"}}
+    ) is None
 
 
 def test_unknown_keys_are_dropped_from_receipt_and_identity_details():
@@ -95,5 +141,5 @@ def test_attribution_only_change_archives_prior_receipt():
     second = {**first, "suppressed_failures": {}, "new_failures": {"test": "new"}}
     assert record_publication_gate_receipt(task, first) is True
     assert record_publication_gate_receipt(task, second) is True
-    assert task.context["publication_gate_receipt"] == second
-    assert task.context["publication_gate_receipt_history"] == [first]
+    assert task.context["publication_gate_receipt"] == sanitize_publication_gate_receipt(second)
+    assert task.context["publication_gate_receipt_history"] == [sanitize_publication_gate_receipt(first)]
