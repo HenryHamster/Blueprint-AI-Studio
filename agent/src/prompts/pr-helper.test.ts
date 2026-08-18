@@ -715,8 +715,10 @@ esac
       : 'task-suppressed-baseline-legacy-1';
     const receiptPath = `/tmp/project_verification_receipt_${taskId}.json`;
     const bodyPath = `/tmp/pr_body_${taskId}`;
+    const gatePayloadPath = `/tmp/pr_gate_payload_${taskId}.json`;
     realFs.rmSync(receiptPath, { force: true });
     realFs.rmSync(bodyPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
 
     const suppressedFailures = {
       'backend/testing/test_z.py::test_inherited::failure': {
@@ -803,7 +805,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$ARGS" in
-  *"/api/agent/heartbeat"*) cat >/dev/null; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/heartbeat"*) cat > ${gatePayloadPath}; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
   *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
   *"/api/agent/github/pull-requests"*) cat > ${bodyPath}; [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
   *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
@@ -821,8 +823,20 @@ esac
     expect(body.body.indexOf('test_a.py')).toBeLessThan(body.body.indexOf('test_z.py'));
     expect(body.body).toContain('<!-- /blueprint:local-gate -->');
 
+    const gatePayload = JSON.parse(realFs.readFileSync(gatePayloadPath, 'utf8')) as {
+      publication_gate_receipt: Record<string, unknown>;
+    };
+    expect(gatePayload.publication_gate_receipt).toMatchObject({
+      attribution_state: 'preexisting_test_failure',
+      suppressed_failures: suppressedFailures,
+      new_failures: {},
+      disappeared_failures: {},
+      skipped_failures: {},
+    });
+
     realFs.rmSync(receiptPath, { force: true });
     realFs.rmSync(bodyPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
     realFs.rmSync(`/tmp/pr_url_${taskId}`, { force: true });
   };
 

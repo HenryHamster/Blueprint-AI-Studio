@@ -205,6 +205,11 @@ class PublicationGateReceipt(BaseModel):
     exit_code: int = Field(..., ge=0, le=255)
     authoritative_ci_required: bool
     recorded_at: str = Field(..., min_length=1, max_length=64)
+    attribution_state: str | None = Field(None, max_length=4000)
+    new_failures: Dict[str, str | Dict[str, str]] | None = None
+    suppressed_failures: Dict[str, str | Dict[str, str]] | None = None
+    disappeared_failures: Dict[str, str | Dict[str, str]] | None = None
+    skipped_failures: Dict[str, str | Dict[str, str]] | None = None
 
 
 class AgentStatusPayload(BaseModel):

@@ -281,6 +281,17 @@ render_suppressed_baseline_section() {
   python3 -c 'import json,sys; payload=json.load(open(sys.argv[1],encoding="utf-8")); pytest=payload.get("pytest"); d=pytest.get("suppressed_failures") if isinstance(pytest,dict) and "suppressed_failures" in pytest else payload.get("suppressed_failures"); lines=["### Suppressed baseline failures"]+["- {}{}{}: {}".format(chr(96),k,chr(96),v.get("detail","") if isinstance(v,dict) else v) for k,v in sorted(d.items())] if isinstance(d,dict) and d else []; print("\\n".join(lines),end="") if lines else None' "$receipt_file" 2>/dev/null || true
 }
 
+# Copy the same structured attribution that the PR-body renderer reads into
+# the durable gate receipt. This is a projection, not a second attribution
+# calculation; malformed or incomplete sidecars simply leave the legacy
+# nine-key receipt unchanged.
+persist_verification_attribution() {
+  if [ ! -s "$_VERIFY_RECEIPT" ] || ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  python3 -c 'import json,sys; gate_path,verification_path=sys.argv[1:]; gate=json.load(open(gate_path,encoding="utf-8")); payload=json.load(open(verification_path,encoding="utf-8")); pytest=payload.get("pytest"); data=pytest if isinstance(pytest,dict) and "state" in pytest else payload; keys=("new_failures","suppressed_failures","disappeared_failures","skipped_failures"); attrs={"attribution_state":data["state"],**{key:data.get(key,{}) for key in keys}} if isinstance(data,dict) and isinstance(data.get("state"),str) and all(isinstance(data.get(key,{}),dict) for key in keys) else {}; gate.update(attrs); open(gate_path,"w",encoding="utf-8").write(json.dumps(gate,separators=(",",":"))+"\\n")' "$GATE_RECEIPT_FILE" "$_VERIFY_RECEIPT" 2>/dev/null || true
+}
+
 write_gate_receipt() {
   local status="$1"
   local exit_code="$2"
@@ -290,6 +301,7 @@ write_gate_receipt() {
   recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf '{"status":"%s","command":"%s","timeout_seconds":%s,"hard_timeout_seconds":%s,"elapsed_seconds":%s,"deadline_extended":%s,"exit_code":%s,"authoritative_ci_required":%s,"recorded_at":"%s"}\n' \
     "$status" "$GATE_COMMAND" "$GATE_TIMEOUT_SECONDS" "$GATE_HARD_TIMEOUT_SECONDS" "$GATE_ELAPSED_SECONDS" "$GATE_DEADLINE_EXTENDED" "$exit_code" "$fallback" "$recorded_at" > "$GATE_RECEIPT_FILE"
+  persist_verification_attribution
   SUPPRESSED_BASELINE_SECTION=""
   case "$status" in
     passed*) SUPPRESSED_BASELINE_SECTION=$(render_suppressed_baseline_section "$_VERIFY_RECEIPT") ;;

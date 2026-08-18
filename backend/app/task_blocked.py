@@ -55,6 +55,50 @@ BLOCKER_CONTEXT_KEY = "blocker"
 PUBLICATION_GATE_RECEIPT_KEY = "publication_gate_receipt"
 PUBLICATION_GATE_RECEIPT_HISTORY_KEY = "publication_gate_receipt_history"
 _PUBLICATION_GATE_RECEIPT_HISTORY_LIMIT = 8
+PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES = 100
+PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH = 512
+PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH = 4000
+_PUBLICATION_GATE_ATTRIBUTION_BUCKET_KEYS = (
+    "new_failures",
+    "suppressed_failures",
+    "disappeared_failures",
+    "skipped_failures",
+)
+_PUBLICATION_GATE_ATTRIBUTION_DETAIL_KEYS = ("detail", "reason")
+
+
+def _sanitize_publication_gate_attribution_bucket(
+    raw: object,
+) -> dict[str, str | dict[str, str]] | None:
+    if not isinstance(raw, dict):
+        return None
+    sanitized: dict[str, str | dict[str, str]] = {}
+    for identity, value in sorted(raw.items(), key=lambda item: str(item[0])):
+        if not isinstance(identity, str):
+            return None
+        bounded_identity = identity[:PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH]
+        if bounded_identity in sanitized:
+            return None
+        if isinstance(value, str):
+            sanitized[bounded_identity] = value[:PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH]
+        elif isinstance(value, dict):
+            bounded_value: dict[str, str] = {}
+            for key, member in value.items():
+                if not isinstance(key, str):
+                    return None
+                if key not in _PUBLICATION_GATE_ATTRIBUTION_DETAIL_KEYS:
+                    continue
+                if not isinstance(member, str):
+                    return None
+                bounded_value[key] = member[:PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH]
+            if "detail" not in bounded_value:
+                return None
+            sanitized[bounded_identity] = bounded_value
+        else:
+            return None
+        if len(sanitized) == PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES:
+            break
+    return sanitized
 
 
 def sanitize_publication_gate_receipt(raw: object) -> dict[str, object] | None:
@@ -91,7 +135,7 @@ def sanitize_publication_gate_receipt(raw: object) -> dict[str, object] | None:
         return None
     if not recorded_at or len(recorded_at) > 64:
         return None
-    return {
+    receipt: dict[str, object] = {
         "status": status,
         "command": command,
         "timeout_seconds": integer_fields["timeout_seconds"][0],
@@ -102,6 +146,20 @@ def sanitize_publication_gate_receipt(raw: object) -> dict[str, object] | None:
         "authoritative_ci_required": raw["authoritative_ci_required"],
         "recorded_at": recorded_at,
     }
+    if "attribution_state" in raw and raw["attribution_state"] is not None:
+        attribution_state = raw["attribution_state"]
+        if not isinstance(attribution_state, str):
+            return None
+        receipt["attribution_state"] = attribution_state[
+            :PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH
+        ]
+    for bucket_key in _PUBLICATION_GATE_ATTRIBUTION_BUCKET_KEYS:
+        if bucket_key in raw and raw[bucket_key] is not None:
+            bucket = _sanitize_publication_gate_attribution_bucket(raw[bucket_key])
+            if bucket is None:
+                return None
+            receipt[bucket_key] = bucket
+    return receipt
 
 
 def record_publication_gate_receipt(task: Task, raw: object) -> bool:
