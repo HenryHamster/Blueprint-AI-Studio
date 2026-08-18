@@ -904,6 +904,43 @@ async def test_sweep_timeout_partial_children_cancellation(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_v34_shaped_dangling_audit_child_does_not_reproduce_finalize_crash(
+    db_session
+):
+    """Exercise the real finalize and sweep paths for the reported v34 shape.
+
+    A deleted active audit child is treated as not-ready by the terminal-child
+    gate, so this reproduction should remain pending rather than inventing a
+    historical crash cause.
+    """
+    from app.time_utils import _utcnow
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "62f787fa762bbfa2a420f02e56a7700b1d22fb94",
+        "audit_task_id": str(uuid.uuid4()),
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "started_at": _utcnow().isoformat(),
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    session_factory = _shared_session_factory(db_session)
+    direct_result = await rq._finalize_in_dedicated_session(
+        version.id, session_factory=session_factory
+    )
+    sweep_result = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=session_factory
+    )
+
+    assert direct_result is None
+    assert sweep_result == 0
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_sweep_crash_loop_cancels_children(db_session, mocker):
     """When the finalize path crash-loops past the threshold, the
     force-finalize cancels running children before stamping infra_failure."""
@@ -1858,6 +1895,10 @@ async def test_sweep_finalize_crash_loop_force_finalizes_and_alerts(db_session, 
     assert qual["status"] == "infra_failure"
     assert qual["blocker"] == "sweep_finalize_crash_loop"
     assert qual.get("sweep_crash_streak") == 0  # reset after force-finalize
+    cause = qual["sweep_finalize_cause"]
+    assert cause["exception_class"] == "RuntimeError"
+    assert cause["message"] == "persistent finalize crash"
+    assert len(cause["traceback_digest"]) <= 4
     assert version.phase == "stabilize"  # returned to stabilize for re-qualification
 
     # A WARNING Alert must be raised so the crash-loop is visible to operators.
@@ -1890,7 +1931,54 @@ async def test_sweep_finalize_crash_loop_force_finalizes_and_alerts(db_session, 
         .all()
     )
     assert any("crash" in (m.content or "").lower() for m in messages)
+    assert any(
+        "RuntimeError: persistent finalize crash" in (m.content or "")
+        for m in messages
+    )
+    assert "RuntimeError: persistent finalize crash" in (alerts[0].message or "")
+    assert "Inspect the release_qualifier logs" not in (alerts[0].message or "")
 
+
+@pytest.mark.asyncio
+async def test_finalization_deferral_preserves_sweep_finalize_cause(db_session):
+    """A later admission deferral must retain the bounded crash explanation."""
+    from app.release_qualification_deferral import record_finalization_deferred
+
+    _project, version = await _make_project_and_version(db_session)
+    cause = {
+        "exception_class": "RuntimeError",
+        "message": "persistent finalize crash",
+        "traceback_digest": ["release_qualifier_sweep.py:1:sweep"],
+    }
+    version.last_qualification = {
+        "status": "pending",
+        "sweep_crash_streak": 2,
+        "sweep_finalize_cause": cause,
+    }
+
+    result = record_finalization_deferred(version, "project_paused")
+
+    assert result["status"] == "qualification_finalization_deferred"
+    assert "sweep_crash_streak" not in version.last_qualification
+    assert version.last_qualification["sweep_finalize_cause"] == cause
+
+
+def test_sweep_finalize_crash_cause_is_hard_bounded():
+    """The durable crash payload stays bounded for hostile exception text."""
+    from app import release_qualifier_sweep as rqs
+
+    try:
+        raise RuntimeError("x" * 10_000)
+    except RuntimeError as exc:
+        cause = rqs._capture_sweep_finalize_crash_cause(exc)
+
+    assert len(cause["exception_class"]) <= rqs._SWEEP_CRASH_EXCEPTION_CLASS_MAX
+    assert len(cause["message"]) <= rqs._SWEEP_CRASH_MESSAGE_MAX
+    assert len(cause["traceback_digest"]) <= rqs._SWEEP_CRASH_FRAME_COUNT
+    assert all(
+        len(frame) <= rqs._SWEEP_CRASH_FRAME_MAX
+        for frame in cause["traceback_digest"]
+    )
 
 # ===========================================================================
 # Round 5 — R4-C1 / R4-H1: promote() idempotency on a crash-retry

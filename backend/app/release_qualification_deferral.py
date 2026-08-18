@@ -84,8 +84,14 @@ def record_finalization_deferred(
                 pause_clock.total_paused_seconds(deploy_state)
             )
     # This is a successful authority decision, so it breaks rather than
-    # consumes a prior consecutive finalizer-crash streak.
+    # consumes a prior consecutive finalizer-crash streak. Preserve the
+    # bounded finalize cause while carrying the pending attempt forward: it is
+    # the only durable explanation when a later deferral overwrites the sweep
+    # bookkeeping, and must not be discarded with the streak counter.
+    sweep_finalize_cause = qualification.get("sweep_finalize_cause")
     record.pop("sweep_crash_streak", None)
+    if sweep_finalize_cause is not None:
+        record["sweep_finalize_cause"] = sweep_finalize_cause
     version.last_qualification = record
     flag_modified(version, "last_qualification")
     return {

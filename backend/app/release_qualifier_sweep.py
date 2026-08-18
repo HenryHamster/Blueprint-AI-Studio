@@ -16,6 +16,7 @@ from __future__ import annotations
 
 
 import logging
+import traceback
 from datetime import datetime
 from typing import Any
 
@@ -95,6 +96,14 @@ _MAX_QUALIFICATION_DURATION_SECONDS = 6 * 60 * 60
 # path rather than a transient error, and the loop must self-recover.
 _MAX_SWEEP_CRASH_STREAK = 3
 
+# A crash-loop record is operator-facing durable state, not a replacement for
+# logs. Keep the captured cause bounded so a pathological exception message or
+# traceback cannot inflate the JSONB qualification record on every sweep.
+_SWEEP_CRASH_EXCEPTION_CLASS_MAX = 120
+_SWEEP_CRASH_MESSAGE_MAX = 300
+_SWEEP_CRASH_FRAME_MAX = 220
+_SWEEP_CRASH_FRAME_COUNT = 4
+
 # How long a ``serving_status="deploy_failed"`` version remains eligible for
 # serving RECOVERY.  A deploy_failed latch is not terminal-by-construction: a
 # deploy that boot-crashed and recovered, or was merely slow past the ~60-min
@@ -105,6 +114,54 @@ _MAX_SWEEP_CRASH_STREAK = 3
 # it a genuinely dead deploy stays loudly failed forever.  24h is generous enough
 # to cover the v5 ~5h-late case with wide margin.
 _DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS = 24 * 3600
+
+
+def _bound_sweep_finalize_crash_cause(cause: dict[str, Any]) -> dict[str, Any]:
+    """Keep a persisted finalize cause within its fixed JSONB budget."""
+    raw_frames = cause.get("traceback_digest")
+    frames = (
+        [str(frame)[:_SWEEP_CRASH_FRAME_MAX] for frame in raw_frames]
+        if isinstance(raw_frames, list)
+        else []
+    )[:_SWEEP_CRASH_FRAME_COUNT]
+    return {
+        "exception_class": str(cause.get("exception_class") or "unknown")[
+            :_SWEEP_CRASH_EXCEPTION_CLASS_MAX
+        ],
+        "message": str(cause.get("message") or "<no message>")[:
+            _SWEEP_CRASH_MESSAGE_MAX
+        ],
+        "traceback_digest": frames,
+    }
+
+
+def _capture_sweep_finalize_crash_cause(exc: Exception) -> dict[str, Any]:
+    """Return a bounded, operator-readable cause for a swallowed finalize error."""
+    return _bound_sweep_finalize_crash_cause(
+        {
+            "exception_class": type(exc).__name__,
+            "message": str(exc),
+            "traceback_digest": [
+                f"{frame.filename}:{frame.lineno}:{frame.name}"
+                for frame in traceback.extract_tb(exc.__traceback__)[-
+                    _SWEEP_CRASH_FRAME_COUNT:
+                ]
+            ],
+        }
+    )
+
+
+def _format_sweep_finalize_crash_cause(cause: dict[str, Any]) -> str:
+    """Render the bounded crash cause for alerts and operator notifications."""
+    exception_class = str(cause.get("exception_class") or "unknown")
+    message = str(cause.get("message") or "<no message>")
+    frames = cause.get("traceback_digest")
+    frame_text = (
+        " <- ".join(str(frame) for frame in frames)
+        if isinstance(frames, list)
+        else "<unavailable>"
+    )
+    return f"{exception_class}: {message}; traceback={frame_text}"
 
 
 async def _serving_confirmation_candidate_ids(session) -> list:
@@ -372,6 +429,7 @@ async def _force_finalize_sweep_crash_loop(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
     streak: int,
+    crash_cause: dict[str, Any] | None = None,
 ) -> None:
     """Force-finalize a qualification whose sweep finalize has crash-looped.
 
@@ -382,6 +440,16 @@ async def _force_finalize_sweep_crash_loop(
     raises an Alert, and notifies the operator.  The caller commits the session.
     """
     qual = dict(version.last_qualification or {})
+    crash_cause = _bound_sweep_finalize_crash_cause(
+        crash_cause
+        or qual.get("sweep_finalize_cause")
+        or {
+            "exception_class": "unknown",
+            "message": "finalize exception cause was not captured",
+            "traceback_digest": [],
+        }
+    )
+    cause_text = _format_sweep_finalize_crash_cause(crash_cause)
     # Cancel any running child tasks before force-finalizing (best-effort).
     await _cancel_qualifier_children(session, version)
 
@@ -391,10 +459,11 @@ async def _force_finalize_sweep_crash_loop(
         "blocker": "sweep_finalize_crash_loop",
         "detail": (
             f"sweep finalize raised on {streak} consecutive sweep(s) — "
-            "force-finalized to unblock the qualification loop"
+            f"force-finalized to unblock the qualification loop; cause: {cause_text}"
         ),
         "finalized_at": _utcnow().isoformat(),
         "sweep_crash_streak": 0,
+        "sweep_finalize_cause": crash_cause,
     }
     version.last_qualification = record
     flag_modified(version, "last_qualification")
@@ -416,8 +485,7 @@ async def _force_finalize_sweep_crash_loop(
                 f"The qualification sweep for release v{version.version_number} "
                 f"has raised {streak} consecutive finalize errors. "
                 f"Force-finalized as sweep_finalize_crash_loop; the version "
-                f"returns to the stabilize phase. Inspect the release_qualifier "
-                f"logs for the root cause."
+                f"returns to the stabilize phase. Cause: {cause_text}"
             ),
             event_type="release.qualification_crash_loop",
         )
@@ -429,9 +497,12 @@ async def _force_finalize_sweep_crash_loop(
         (
             f"v{version.version_number} qualification sweep crash-looped "
             f"({streak} consecutive finalize errors) — force-finalized, "
-            f"returned to stabilize."
+            f"returned to stabilize. Cause: {cause_text}"
         ),
-        extra={"consecutive_finalize_errors": streak},
+        extra={
+            "consecutive_finalize_errors": streak,
+            "sweep_finalize_cause": crash_cause,
+        },
     )
     logger.warning(
         "[RELEASE_QUALIFIER] sweep: version v%d finalize crash-looped "
@@ -1527,7 +1598,8 @@ async def sweep_stuck_qualifications(
                 session_factory=session_factory,
                 timeout_now=now,
             )
-        except Exception:
+        except Exception as exc:
+            crash_cause = _capture_sweep_finalize_crash_cause(exc)
             logger.exception(
                 "[RELEASE_QUALIFIER] sweep: failed to finalize stuck "
                 "qualification for version %s",
@@ -1560,12 +1632,13 @@ async def sweep_stuck_qualifications(
                         ) + 1
                         if streak >= _MAX_SWEEP_CRASH_STREAK:
                             await _force_finalize_sweep_crash_loop(
-                                crash_session, locked_v, streak
+                                crash_session, locked_v, streak, crash_cause
                             )
                         else:
                             locked_v.last_qualification = {
                                 **locked_v.last_qualification,
                                 "sweep_crash_streak": streak,
+                                "sweep_finalize_cause": crash_cause,
                             }
                             flag_modified(locked_v, "last_qualification")
                             crash_session.add(locked_v)
