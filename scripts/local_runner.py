@@ -4384,6 +4384,13 @@ def _heartbeat_loop(
     consecutive_network_failures = 0
     next_auto_update_attempt_at = 0.0
     last_auto_update_failure: tuple[str, str | None] | None = None
+    # When the current failure was last reported to /update-report. A distinct
+    # failure is reported immediately; the SAME failure is re-reported on this
+    # cadence so a persistently wedged update (e.g. unreachable version hint)
+    # keeps a visible operator trail instead of one alert per daemon lifetime
+    # (silent fleet drain, 2026-08-17).
+    last_auto_update_failure_reported_at = 0.0
+    _AUTO_UPDATE_FAILURE_REREPORT_SECONDS = 1800.0
     # Whether ANY heartbeat has ever authenticated (200/204). A token that has
     # never authenticated and gets a 401 is definitively bad (wrong/revoked, or a
     # deleted runner) — the daemon fast-fails on that first 401 rather than
@@ -4711,6 +4718,7 @@ def _heartbeat_loop(
                         # withdrawn or becomes non-actionable, do not leave the
                         # runner permanently drained by an older response.
                         last_auto_update_failure = None
+                        last_auto_update_failure_reported_at = 0.0
                         next_auto_update_attempt_at = 0.0
                         _clear_update_drain()
                     else:
@@ -4780,6 +4788,9 @@ def _heartbeat_loop(
                                                 new_version=refreshed_version,
                                             )
                                             last_auto_update_failure = failure
+                                            last_auto_update_failure_reported_at = (
+                                                time.monotonic()
+                                            )
                                             next_auto_update_attempt_at = (
                                                 time.monotonic() + 60.0
                                             )
@@ -4791,7 +4802,12 @@ def _heartbeat_loop(
                                             )
                                     else:
                                         failure = (version_hint, refreshed_version)
-                                        if last_auto_update_failure != failure:
+                                        if (
+                                            last_auto_update_failure != failure
+                                            or time.monotonic()
+                                            - last_auto_update_failure_reported_at
+                                            >= _AUTO_UPDATE_FAILURE_REREPORT_SECONDS
+                                        ):
                                             br.report_update_result(
                                                 orchestrator_url,
                                                 token,
@@ -4800,6 +4816,9 @@ def _heartbeat_loop(
                                                 new_version=refreshed_version,
                                             )
                                             last_auto_update_failure = failure
+                                            last_auto_update_failure_reported_at = (
+                                                time.monotonic()
+                                            )
                                         next_auto_update_attempt_at = (
                                             time.monotonic() + 60.0
                                         )
@@ -4812,7 +4831,12 @@ def _heartbeat_loop(
                                         )
                                 else:
                                     failure = (version_hint, None)
-                                    if last_auto_update_failure != failure:
+                                    if (
+                                        last_auto_update_failure != failure
+                                        or time.monotonic()
+                                        - last_auto_update_failure_reported_at
+                                        >= _AUTO_UPDATE_FAILURE_REREPORT_SECONDS
+                                    ):
                                         br.report_update_result(
                                             orchestrator_url,
                                             token,
@@ -4821,6 +4845,9 @@ def _heartbeat_loop(
                                             new_version=None,
                                         )
                                         last_auto_update_failure = failure
+                                        last_auto_update_failure_reported_at = (
+                                            time.monotonic()
+                                        )
                                     next_auto_update_attempt_at = (
                                         time.monotonic() + 60.0
                                     )
@@ -4841,6 +4868,7 @@ def _heartbeat_loop(
                                 )
                         else:
                             last_auto_update_failure = None
+                            last_auto_update_failure_reported_at = 0.0
                             next_auto_update_attempt_at = 0.0
                             _clear_update_drain()
                 _write_status_json(

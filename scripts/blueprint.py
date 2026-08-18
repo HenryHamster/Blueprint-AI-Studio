@@ -7332,8 +7332,42 @@ def _validate_deploy_binding(
                       "revision that does not contain the promoted commit. Use "
                       "--force to deploy anyway.")
                 raise APIError("revision not descendant of promoted sha")
+    _validate_main_reachability(revision, force=force)
     print(f"  Binding:   v{version_number} (promoted {promoted_sha[:12]}, "
           f"build {status})")
+
+
+def _validate_main_reachability(revision: str, *, force: bool = False) -> None:
+    """Refuse to activate a revision that is not reachable from main.
+
+    Descendant-of-promoted is NOT the same thing as on-main: a PR branch tip
+    that contains the promoted commit passes the binding check above while
+    carrying commits main does not have. The serving orchestrator advertises
+    its own SHA as the fleet auto-update version hint, and runners git-track
+    main — a hint unreachable from main puts every runner into an infinite
+    update-drain retry loop (fleet-wide dispatch outage, 2026-08-17: serving
+    6fa5965a was a PR branch tip whose content merged to automain as a
+    different SHA, so no runner could ever satisfy the hint).
+    """
+    compare = json.loads(_gh(
+        "api", f"repos/{_DEPLOY_REPO}/compare/main...{revision}",
+    ))
+    status = (compare.get("status") or "unknown")
+    # "identical"/"behind" mean revision is reachable from main's tip.
+    if status in ("identical", "behind"):
+        return
+    if force:
+        print(f"  WARNING: revision {revision[:12]} is {status} relative to "
+              "main — it is NOT reachable from main, so runner auto-update "
+              "will drain the fleet until a main-reachable revision is "
+              "deployed. Bypassed (--force).")
+        return
+    print(f"ERROR: revision {revision[:12]} is {status} relative to main — "
+          "not reachable from main. Runners git-track main and can never "
+          "satisfy this version hint; deploying it wedges fleet auto-update. "
+          "Merge to main first, or use --force if you accept a drained "
+          "fleet until the next main-reachable deploy.")
+    raise APIError("revision not reachable from main")
 
 
 def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | None:
@@ -7347,6 +7381,7 @@ def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | N
         if getattr(args, "force", False):
             print("  WARNING: no promoted release version found — deploying "
                   "unbound (--force).")
+            _validate_main_reachability(revision, force=True)
             return None
         print("ERROR: no promoted release version found for this project; "
               "refusing to activate a revision that is not bound to a "
