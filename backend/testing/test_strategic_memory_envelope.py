@@ -335,6 +335,66 @@ def test_canonical_core_bounds_context_and_oversized_legacy_memory():
     assert row["context"] == {"source": "operator"}
 
 
+def test_canonical_core_over_budget_degrades_gradually_keeping_newest_rows():
+    """An over-cap envelope must shed old transcript rows, never the whole core.
+
+    The per-component caps sum past MAX_CANONICAL_ENVELOPE_BYTES (32 transcript
+    rows alone can reach ~100KB), so a busy Workday transcript deterministically
+    overflowed the envelope.  The old behavior collapsed straight to a coreless
+    ``_truncated`` stub with no ``recent_conversation`` key, which the agent-side
+    verifier rejected — livelocking the typed Fast lane on every claim (observed
+    live 2026-08-18, project 37d445e1).  Degradation must keep the newest rows.
+    """
+
+    rows = [
+        {
+            "id": uuid.UUID(f"00000000-0000-4000-8000-{index:012d}"),
+            "sequence": index,
+            "from_type": "user",
+            "content": f"row-{index}-" + ("z" * (MAX_TRANSCRIPT_CONTENT_BYTES * 2)),
+            "context": {"source": "operator"},
+        }
+        for index in range(40)
+    ]
+    core = build_canonical_envelope_core(
+        project_id=uuid.UUID("00000000-0000-4000-8000-000000000098"),
+        context_authority_generation=0,
+        privacy_generation=0,
+        transcript_sequence=39,
+        ledger_revision=0,
+        problem_model={"model": "p" * 18_000},
+        decision_authority={"decisions": "d" * 6_000},
+        memory=[{"note": f"note-{index}-" + ("n" * 700)} for index in range(MAX_MEMORY_ITEMS)],
+        transcript_suffix=rows,
+    )
+
+    assert len(core.canonical_envelope) <= MAX_CANONICAL_ENVELOPE_BYTES
+    payload = json.loads(core.canonical_envelope)
+    # Never the coreless stub: conversation stays a real array.
+    assert "_truncated" not in payload
+    conversation = payload["recent_conversation"]
+    assert isinstance(conversation, list)
+    assert len(conversation) >= 4
+    # The newest operator rows survive; only the oldest are shed.
+    assert conversation[-1]["sequence"] == 39
+    assert conversation[0]["sequence"] > 0
+    assert payload["degraded"], "over-budget envelope must declare its degradation"
+    assert any(tag.startswith("transcript:last_") for tag in payload["degraded"])
+    # Undegraded envelopes must not carry the marker at all.
+    small = build_canonical_envelope_core(
+        project_id=uuid.UUID("00000000-0000-4000-8000-000000000098"),
+        context_authority_generation=0,
+        privacy_generation=0,
+        transcript_sequence=1,
+        ledger_revision=0,
+        problem_model={},
+        decision_authority={},
+        memory=[],
+        transcript_suffix=rows[:1],
+    )
+    assert "degraded" not in json.loads(small.canonical_envelope)
+
+
 @pytest.mark.asyncio
 async def test_authority_bump_fences_prior_snapshot_and_cold_read(db_session):
     project = Project(name="authority fence", user_id="envelope-test-user")

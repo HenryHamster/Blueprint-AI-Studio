@@ -356,6 +356,23 @@ def canonical_retrieval_projection(
     }
 
 
+def _envelope_budget_receipt(value: object, label: str) -> dict[str, Any]:
+    """Replace an over-budget component with a verifiable non-content receipt."""
+
+    try:
+        encoded = canonical_envelope_bytes(
+            value if isinstance(value, Mapping) else {"items": value}
+        )
+    except (TypeError, ValueError):
+        return {"_unavailable": label, "_reason": "non_canonical_value"}
+    return {
+        "_truncated": True,
+        "_kind": label,
+        "_sha256": canonical_sha256(encoded),
+        "_bytes": len(encoded),
+    }
+
+
 def build_canonical_envelope_core(
     *,
     project_id: uuid.UUID,
@@ -371,6 +388,111 @@ def build_canonical_envelope_core(
 ) -> CanonicalEnvelopeCore:
     """Build the one persisted envelope core; never serialize it per consumer."""
 
+    problem = _bounded_mapping(
+        problem_model, max_bytes=MAX_PROBLEM_MODEL_BYTES, label="problem_model"
+    )
+    decisions = _bounded_mapping(
+        decision_authority,
+        max_bytes=MAX_DECISION_AUTHORITY_BYTES,
+        label="decision_authority",
+    )
+    memory_projection = canonical_memory_projection(memory)
+    retrieval_projection = canonical_retrieval_projection(retrieval)
+    transcript_rows = canonical_transcript_suffix(transcript_suffix)
+
+    def _assemble(
+        rows: list[dict[str, Any]],
+        memory_value: Any,
+        retrieval_value: Any,
+        problem_value: Any,
+        degraded: Sequence[str],
+    ) -> tuple[dict[str, Any], bytes]:
+        envelope: dict[str, Any] = {
+            "version": ENVELOPE_SCHEMA_VERSION,
+            "project_id": str(project_id),
+            "context_authority_generation": context_authority_generation,
+            "privacy_generation": privacy_generation,
+            "transcript_sequence": transcript_sequence,
+            "ledger_revision": ledger_revision,
+            "problem_model": problem_value,
+            "decisions": decisions,
+            "memory": memory_value,
+            "memory_v2": retrieval_value,
+            "recent_conversation": rows,
+        }
+        if degraded:
+            envelope["degraded"] = list(degraded)
+        return envelope, canonical_envelope_bytes(envelope)
+
+    # The per-component byte caps can legitimately sum past the whole-envelope
+    # cap (32 transcript rows alone may reach ~100KB), so an over-budget
+    # envelope must degrade GRADUALLY: newest conversation rows are the one
+    # component a public Fast turn cannot answer without, so they are shed
+    # last and never below the newest few rows.  Each rung is deterministic;
+    # the pre-2026-08 behavior of collapsing straight to a coreless
+    # ``_truncated`` stub livelocked the typed Fast lane (its verifier
+    # requires ``recent_conversation`` and the same over-budget transcript
+    # rebuilt the same stub on every claim).
+    memory_receipt = _envelope_budget_receipt(memory_projection, "memory")
+    retrieval_receipt = _envelope_budget_receipt(retrieval_projection, "memory_v2")
+    problem_receipt = _envelope_budget_receipt(problem, "problem_model")
+    ladder: list[tuple[list[dict[str, Any]], Any, Any, Any, tuple[str, ...]]] = [
+        (transcript_rows, memory_projection, retrieval_projection, problem, ()),
+    ]
+    for keep in (16, 8, 4):
+        ladder.append(
+            (
+                transcript_rows[-keep:],
+                memory_projection,
+                retrieval_projection,
+                problem,
+                (f"transcript:last_{keep}",),
+            )
+        )
+    ladder.append(
+        (
+            transcript_rows[-4:],
+            memory_projection,
+            retrieval_receipt,
+            problem,
+            ("transcript:last_4", "memory_v2:receipt"),
+        )
+    )
+    ladder.append(
+        (
+            transcript_rows[-4:],
+            memory_receipt,
+            retrieval_receipt,
+            problem,
+            ("transcript:last_4", "memory:receipt", "memory_v2:receipt"),
+        )
+    )
+    ladder.append(
+        (
+            transcript_rows[-4:],
+            memory_receipt,
+            retrieval_receipt,
+            problem_receipt,
+            (
+                "transcript:last_4",
+                "memory:receipt",
+                "memory_v2:receipt",
+                "problem_model:receipt",
+            ),
+        )
+    )
+    oversized_payload: bytes | None = None
+    for rows, memory_value, retrieval_value, problem_value, degraded in ladder:
+        _, payload = _assemble(
+            rows, memory_value, retrieval_value, problem_value, degraded
+        )
+        if oversized_payload is None:
+            oversized_payload = payload
+        if len(payload) <= MAX_CANONICAL_ENVELOPE_BYTES:
+            return CanonicalEnvelopeCore(payload, canonical_sha256(payload))
+    # Unreachable in practice (the fully-receipted rung is far below the cap),
+    # kept as the deterministic last resort: consumers must treat the
+    # ``_truncated`` core as a degraded envelope, not a malformed one.
     envelope = {
         "version": ENVELOPE_SCHEMA_VERSION,
         "project_id": str(project_id),
@@ -378,34 +500,11 @@ def build_canonical_envelope_core(
         "privacy_generation": privacy_generation,
         "transcript_sequence": transcript_sequence,
         "ledger_revision": ledger_revision,
-        "problem_model": _bounded_mapping(
-            problem_model, max_bytes=MAX_PROBLEM_MODEL_BYTES, label="problem_model"
-        ),
-        "decisions": _bounded_mapping(
-            decision_authority,
-            max_bytes=MAX_DECISION_AUTHORITY_BYTES,
-            label="decision_authority",
-        ),
-        "memory": canonical_memory_projection(memory),
-        "memory_v2": canonical_retrieval_projection(retrieval),
-        "recent_conversation": canonical_transcript_suffix(transcript_suffix),
+        "_truncated": True,
+        "_sha256": canonical_sha256(oversized_payload or b""),
+        "_bytes": len(oversized_payload or b""),
     }
     payload = canonical_envelope_bytes(envelope)
-    if len(payload) > MAX_CANONICAL_ENVELOPE_BYTES:
-        # Preserve a deterministic minimal core so a normal turn degrades to
-        # an explicit Workday consultation instead of failing its claim.
-        envelope = {
-            "version": ENVELOPE_SCHEMA_VERSION,
-            "project_id": str(project_id),
-            "context_authority_generation": context_authority_generation,
-            "privacy_generation": privacy_generation,
-            "transcript_sequence": transcript_sequence,
-            "ledger_revision": ledger_revision,
-            "_truncated": True,
-            "_sha256": canonical_sha256(payload),
-            "_bytes": len(payload),
-        }
-        payload = canonical_envelope_bytes(envelope)
     return CanonicalEnvelopeCore(payload, canonical_sha256(payload))
 
 

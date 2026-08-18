@@ -172,7 +172,16 @@ export function verifyStrategicContextEnvelope(
     throw new Error('strategic context envelope transcript is stale');
   }
   if (!Array.isArray(raw.recent_conversation)) {
-    throw new Error('strategic context envelope recent_conversation must be an array');
+    // The backend's last-resort degraded core (`_truncated: true`) carries no
+    // conversation at all; treat it as an empty transcript rather than a
+    // malformed envelope — rejecting it livelocked the typed Fast lane, which
+    // reclaimed the same over-budget envelope forever with no Workday
+    // fallback. The canonical bytes/hash above stay untouched.
+    if (raw._truncated === true) {
+      raw.recent_conversation = [];
+    } else {
+      throw new Error('strategic context envelope recent_conversation must be an array');
+    }
   }
 
   return {

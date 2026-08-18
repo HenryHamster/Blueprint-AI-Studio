@@ -69,6 +69,50 @@ describe('persisted Strategic context envelope', () => {
     expect(delta).not.toContain('Earlier context that the warm child already saw.');
   });
 
+  it('accepts the backend degraded core as an empty transcript instead of livelocking Fast', () => {
+    // The backend's last-resort over-budget core omits recent_conversation
+    // entirely (`_truncated: true`). Rejecting it made every typed Fast claim
+    // rebuild the same over-budget envelope and defer forever (live wedge,
+    // 2026-08-18). It must verify as an empty conversation.
+    const truncatedCore = {
+      version: 2,
+      project_id: '11111111-1111-4111-8111-111111111111',
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 81,
+      ledger_revision: 0,
+      _truncated: true,
+      _sha256: 'a'.repeat(64),
+      _bytes: 999_999,
+    };
+    const bytes = Buffer.from(JSON.stringify(truncatedCore), 'utf8');
+    const verified = verifyStrategicContextEnvelope(transport({
+      canonical_envelope_b64: bytes.toString('base64'),
+      canonical_sha256: createHash('sha256').update(bytes).digest('hex'),
+    }), {
+      contextAuthorityGeneration: 4,
+      privacyGeneration: 2,
+      now: new Date('2030-01-01T00:00:00.000Z'),
+    });
+    expect(verified.envelope.recent_conversation).toEqual([]);
+    // Canonical bytes stay the exact persisted bytes, untouched by the repair.
+    expect(verified.canonicalBytes.equals(bytes)).toBe(true);
+
+    // A normal (non-degraded) envelope without a conversation array is still
+    // malformed and must keep failing verification.
+    const malformed = { ...truncatedCore } as Record<string, unknown>;
+    delete malformed._truncated;
+    const malformedBytes = Buffer.from(JSON.stringify(malformed), 'utf8');
+    expect(() => verifyStrategicContextEnvelope(transport({
+      canonical_envelope_b64: malformedBytes.toString('base64'),
+      canonical_sha256: createHash('sha256').update(malformedBytes).digest('hex'),
+    }), {
+      contextAuthorityGeneration: 4,
+      privacyGeneration: 2,
+      now: new Date('2030-01-01T00:00:00.000Z'),
+    })).toThrow('recent_conversation must be an array');
+  });
+
   it('keeps canonical context role-neutral and isolates private Workday instructions', () => {
     const verified = verifyStrategicContextEnvelope(transport(), {
       contextAuthorityGeneration: 4,
