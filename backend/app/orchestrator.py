@@ -749,6 +749,29 @@ ACTIVE_TASKS_LIGHT_COLUMNS = (
 )
 
 
+def _is_resident_session_row(row) -> bool:
+    """True only when an active-task row is the strategic resident session.
+
+    The resident session (see strategic_resident_session.py, stamped
+    ``context["_resident_session"] = True`` at claim time) is a long-lived
+    ``strategic_review`` task pinned to the local hamsterwheel runner. It
+    consumes zero VM / Cloud Run capacity and is effectively unbounded in
+    duration, so it must never count against a project's or the fleet's VM
+    dispatch budget — a single resident session would otherwise occupy one
+    "slot" for its entire session lifetime and starve every other queued task
+    (observed in production: one resident session starved 6 queued tasks,
+    including the strategist's own diagnostic task).
+
+    ``row`` is one of the light-projected ``active_tasks_result`` entries
+    (``ACTIVE_TASKS_LIGHT_COLUMNS`` — a real ``Task`` ORM instance with only
+    those columns loaded, not a raw ``Row`` tuple), so ``.context`` is a plain
+    attribute access. Defensive by construction: only a dict context with the
+    flag literally ``True`` matches.
+    """
+    context = getattr(row, "context", None)
+    return isinstance(context, dict) and context.get("_resident_session") is True
+
+
 # Light column set for the QUEUED candidate scan (Step 2.4 candidate_stmt). Drops
 # heavy JSONB (status_log_data / history blobs) but MUST carry every column a
 # downstream Step-2.5 filter reads on a candidate — including ``title``, because a
@@ -1690,6 +1713,13 @@ async def orchestrator_worker():
                 active_count = len(active_tasks_result)
                 project_active_counts: dict[uuid.UUID, int] = {}
                 for _active_task in active_tasks_result:
+                    # The strategic resident session runs on the local
+                    # hamsterwheel runner and consumes zero VM slots — exclude
+                    # it from the per-project VM-slot accounting so it can
+                    # never fill a project's VM cap and starve ordinary
+                    # queued work (see _is_resident_session_row docstring).
+                    if _is_resident_session_row(_active_task):
+                        continue
                     project_active_counts[_active_task.project_id] = (
                         project_active_counts.get(_active_task.project_id, 0) + 1
                     )
@@ -1713,8 +1743,18 @@ async def orchestrator_worker():
                     )
                 else:
                     _cr_active_count = 0
+                # The resident session also runs off the local hamsterwheel
+                # runner, never a GCE VM (nor a Cloud Run container, so it is
+                # not already covered by _cr_active_count above) — exclude it
+                # from the GLOBAL GCE dispatch budget too, using the same
+                # partition idiom as the Cloud Run exclusion.
+                _resident_active_count = sum(
+                    1 for _t in active_tasks_result if _is_resident_session_row(_t)
+                )
                 # GCE-only active count for the VM slot budget.
-                _gce_active_count = active_count - _cr_active_count
+                _gce_active_count = (
+                    active_count - _cr_active_count - _resident_active_count
+                )
 
                 # Cross-check with actual GCP VM count (cached, refreshed every 2 min)
                 actual_vm_count = await _get_actual_gcp_vm_count()
@@ -2790,6 +2830,15 @@ async def orchestrator_worker():
                 # reorder never re-admits an already-capped project.
                 _active_by_project: dict = {}
                 for _t in active_tasks_result:
+                    # Same exclusion as the VM-slot accounting above: the
+                    # resident session consumes no dispatch capacity and is
+                    # effectively unbounded in duration, so it must not count
+                    # toward this per-project task cap either (same
+                    # starvation class as _is_resident_session_row's
+                    # docstring — a resident session would otherwise occupy
+                    # a "slot" here for its entire session lifetime).
+                    if _is_resident_session_row(_t):
+                        continue
                     _pid = _t.project_id
                     _active_by_project[_pid] = _active_by_project.get(_pid, 0) + 1
                 _cap_by_project_raw = (
