@@ -46,6 +46,16 @@ DISCOVERY_REVIEW_KNOWLEDGE_DETAILS = 6
 DISCOVERY_REVIEW_LANDED_OUTCOMES = 4
 DISCOVERY_REVIEW_EXPERIMENT_DETAILS = 6
 DISCOVERY_REVIEW_VERIFICATION_DETAILS = 6
+# Budget-pressure degradation must never render a category that truly has
+# evidence as fully empty -- that is indistinguishable from "nothing
+# happened" to the reviewer and is exactly the defect this floor guards
+# against (see _repair_zeroed_categories below). Keep at least this many of
+# the most recent/relevant items, prose-truncated if needed to fit.
+DISCOVERY_REVIEW_MIN_CATEGORY_ITEMS = 3
+# Successively more aggressive per-item prose caps tried while floor-repairing
+# a zeroed category, so a handful of representative items can still be made
+# to fit even when their full-length versions cannot.
+DISCOVERY_REVIEW_FLOOR_PROSE_CHAR_LEVELS = (300, 120, 40)
 
 _VERIFICATION_TASK_TYPES = frozenset(
     {
@@ -600,6 +610,134 @@ def _assemble_receipt(
     }
     if compacted:
         receipt["receipt_compacted_to_budget"] = True
+        # Only surfaced once budget pressure actually reduced a collection
+        # below its full authored count -- distinguishes "trimmed" from
+        # "genuinely has nothing" (an empty, never-truncated category never
+        # appears here) so the reviewer never mistakes truncation for
+        # absence.
+        evidence_truncated = [
+            f"{name}:kept_{coverage['included_count']}_of_{coverage['total_count']}"
+            for name, coverage in evidence_coverage.items()
+            if coverage["total_count"] > 0
+            and coverage["included_count"] < coverage["total_count"]
+        ]
+        if evidence_truncated:
+            receipt["evidence_truncated"] = evidence_truncated
+    return receipt, binding_action_blockers
+
+
+def _truncate_prose(value: Any, *, max_chars: int) -> Any:
+    """Recursively cap every string leaf of an already-built item.
+
+    Used only for the small handful of floor-repair items re-injected by
+    ``_repair_zeroed_categories`` below: a representative item's raw prose
+    (a full research finding, an artifact's embedded logs, ...) can itself be
+    large enough to blow the packet budget, so once the floor guarantees the
+    item is present at all, its bulk is capped instead.
+    """
+
+    if isinstance(value, str):
+        return value[:max_chars]
+    if isinstance(value, Mapping):
+        return {
+            key: _truncate_prose(inner, max_chars=max_chars)
+            for key, inner in value.items()
+        }
+    if isinstance(value, list):
+        return [_truncate_prose(inner, max_chars=max_chars) for inner in value]
+    return value
+
+
+def _repair_zeroed_categories(
+    *,
+    collections: Mapping[str, list[dict[str, Any]]],
+    included: Mapping[str, list[dict[str, Any]]],
+    evidence_coverage: Mapping[str, dict[str, Any]],
+    source_parent: dict[str, Any],
+    stranded_deliveries: list[dict[str, Any]],
+    execution: dict[str, Any],
+    missing_reasons: list[str],
+) -> tuple[dict[str, Any], list[str]]:
+    """Never let a category with real evidence render as fully absent.
+
+    The progressive-level loop in ``build_discovery_review_packet`` reduces
+    every collection's *detail count* together, one round at a time, to fit
+    the fixed packet budget. Because the rounds are shared, a small, cheap
+    category (e.g. 2 landed outcomes) can be forced all the way to zero
+    purely because a different, bulkier category (e.g. experiment artifacts
+    embedding large logs/URIs) needed that many rounds of halving to shrink
+    -- even though the cheap category alone would never have needed to
+    disappear. Zero items reads to the reviewer as "nothing happened",
+    indistinguishable from a category that is genuinely empty, and is
+    exactly the production defect this function closes: a decision packet
+    that silently drops every landed outcome and every research finding even
+    though the direction had landed work.
+
+    Whatever level the caller landed on (whether it already fits or is the
+    final, most-reduced level), re-inject a small, prose-truncated floor for
+    every category that has real underlying data but landed at zero
+    included items, then re-verify the packet still fits the budget. Try
+    progressively shorter per-item prose caps until it does, or until even
+    the shortest cap can't close the gap -- in which case the caller's own
+    last-resort fallback (which strips coverage bulk, not item content) gets
+    one more chance to make it fit.
+    """
+
+    zeroed = [
+        name
+        for name, coverage in evidence_coverage.items()
+        if coverage["included_count"] == 0 and coverage["total_count"] > 0
+    ]
+    if not zeroed:
+        return _assemble_receipt(
+            source_parent=source_parent,
+            included=dict(included),
+            stranded_deliveries=stranded_deliveries,
+            evidence_coverage=dict(evidence_coverage),
+            execution=execution,
+            missing_reasons=missing_reasons,
+            compacted=True,
+        )
+
+    receipt: dict[str, Any] = {}
+    binding_action_blockers: list[str] = []
+    for max_chars in DISCOVERY_REVIEW_FLOOR_PROSE_CHAR_LEVELS:
+        candidate_included = dict(included)
+        candidate_coverage = dict(evidence_coverage)
+        for name in zeroed:
+            values = collections[name]
+            slice_fn, template = _COLLECTION_DETAIL_CONFIG[name]
+            floor_count = min(DISCOVERY_REVIEW_MIN_CATEGORY_ITEMS, len(values))
+            floor_selected, floor_omitted = slice_fn(values, floor_count)
+            candidate_included[name] = [
+                _truncate_prose(item, max_chars=max_chars)
+                for item in floor_selected
+            ]
+            selection = (
+                f"{template.format(count=len(floor_selected))}"
+                f"|floor_repaired_prose_truncated_to_{max_chars}_chars"
+            )
+            candidate_coverage[name] = _bounded_collection_coverage(
+                values,
+                floor_selected,
+                omitted=floor_omitted,
+                selection=selection,
+            )
+        receipt, binding_action_blockers = _assemble_receipt(
+            source_parent=source_parent,
+            included=candidate_included,
+            stranded_deliveries=stranded_deliveries,
+            evidence_coverage=candidate_coverage,
+            execution=execution,
+            missing_reasons=missing_reasons,
+            compacted=True,
+        )
+        if _receipt_fits_evidence_metadata(receipt):
+            return receipt, binding_action_blockers
+    # Every prose-cap level was tried; return the most aggressively truncated
+    # attempt so the caller's coverage-bulk fallback (which never touches
+    # item content) gets a chance to close the remaining gap without
+    # re-emptying the categories this function just floor-repaired.
     return receipt, binding_action_blockers
 
 
@@ -879,11 +1017,34 @@ async def build_discovery_review_packet(
             )
             if _receipt_fits_evidence_metadata(receipt):
                 break
+        # Whichever level the loop landed on -- a level that fit, or the
+        # final, most-reduced level if none did -- never let it render a
+        # category that truly has evidence as fully empty. Re-inject a
+        # small, prose-truncated floor for any collection the lockstep
+        # halving above zeroed out even though it had real items.
+        receipt, binding_action_blockers = _repair_zeroed_categories(
+            collections=collections,
+            included=included,
+            evidence_coverage=evidence_coverage,
+            source_parent=source_parent,
+            stranded_deliveries=stranded_deliveries,
+            execution=execution,
+            missing_reasons=missing_reasons,
+        )
+        # _assemble_receipt always mirrors its evidence_coverage argument
+        # into receipt["evidence_coverage"], so read the repaired coverage
+        # back from the receipt rather than the pre-repair local variable --
+        # the pathological fallback below mutates whichever one it sees.
+        evidence_coverage = receipt["evidence_coverage"]
     if not _receipt_fits_evidence_metadata(receipt):
         # Pathological cardinality can also overflow the compact semantic
-        # indexes. Preserve exact counts/checksums, forbid binding action, and
-        # still dispatch one operator-question decision instead of stranding
-        # the completed cohort behind an impossible evidence wait.
+        # indexes even after the floor repair above. Preserve exact
+        # counts/checksums, forbid binding action, and still dispatch one
+        # operator-question decision instead of stranding the completed
+        # cohort behind an impossible evidence wait. This does not touch the
+        # floor-repaired item lists themselves, only the omitted-item
+        # coverage bulk, so a category the floor repair just restored stays
+        # restored.
         for coverage in evidence_coverage.values():
             coverage["omitted_semantic_index"] = []
             coverage["semantic_index_included_count"] = 0
