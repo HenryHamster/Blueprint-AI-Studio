@@ -356,17 +356,53 @@ def need_matched_dead_foundation(
     return _match_need(need, eligible) is not None
 
 
+# Pipeline task types whose completion the EVALUATING original waits on. An
+# ``original -> review/fix child`` edge is a real dependency even though it
+# never appears in ``depends_on``: the original cannot leave EVALUATING until
+# its pipeline reaches a verdict.
+_PIPELINE_TASK_TYPES = frozenset({"review", "fix"})
+
+
+def _pipeline_edges_by_original(
+    task: Task, candidates: List[Task]
+) -> Dict[str, List[str]]:
+    """Map original-task id -> ids of its review/fix pipeline tasks.
+
+    ``task`` itself is included because the BLOCKED dependent is not part of
+    the active candidate set. This is exactly the incident shape (2026-08-19,
+    fix task dd0e8588 / original c45d9719): a capability need on a pipeline
+    fix task matched the fix task's own EVALUATING original as the provider.
+    ``depends_on`` traversal alone cannot see that the original's completion
+    is causally downstream of the fix task, so the wired edge deadlocked both
+    rows until an operator cut it.
+    """
+    edges: Dict[str, List[str]] = {}
+    for c in (task, *candidates):
+        payload = c.first_payload or {}
+        if str(payload.get("type") or "").lower() not in _PIPELINE_TASK_TYPES:
+            continue
+        orig_text = str(payload.get("original_task_id") or "").strip()
+        if orig_text and orig_text != str(c.id):
+            edges.setdefault(orig_text, []).append(str(c.id))
+    return edges
+
+
 def _would_create_cycle(task: Task, match: Task, candidates: List[Task]) -> bool:
-    """True if adding ``task -> match`` would close a ``depends_on`` cycle.
+    """True if adding ``task -> match`` would close a dependency cycle.
 
     A cycle is closed iff ``task`` is already reachable from ``match`` along
-    existing ``depends_on`` edges. We traverse the candidate set's edges (the
-    in-flight foundations); a dep id outside the set is terminal for traversal
-    (it cannot reach back into the active graph through an unloaded node, and the
-    real dispatch-time cycle breaker — ``orchestrator_health._find_cycle_members``
-    — is the authoritative backstop).
+    existing ``depends_on`` edges OR implicit pipeline edges (an EVALUATING
+    original depends on its spawned review/fix tasks — see
+    :func:`_pipeline_edges_by_original`). We traverse the candidate set's edges
+    (the in-flight foundations); a dep id outside the set is terminal for
+    ``depends_on`` traversal (it cannot reach back into the active graph
+    through an unloaded node, and the real dispatch-time cycle breaker —
+    ``orchestrator_health._find_cycle_members`` — is the authoritative
+    backstop). Pipeline edges are keyed by id, so they still apply to nodes
+    outside the loaded candidate set.
     """
     by_id = {str(c.id): c for c in candidates}
+    pipeline_edges = _pipeline_edges_by_original(task, candidates)
     target = str(task.id)
     seen: set[str] = set()
     frontier = [str(match.id)]
@@ -377,6 +413,7 @@ def _would_create_cycle(task: Task, match: Task, candidates: List[Task]) -> bool
         if node in seen:
             continue
         seen.add(node)
+        frontier.extend(pipeline_edges.get(node, ()))
         node_task = by_id.get(node)
         if node_task is None:
             continue

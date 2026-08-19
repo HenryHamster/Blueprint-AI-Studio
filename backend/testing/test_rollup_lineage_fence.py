@@ -546,3 +546,170 @@ async def test_cross_project_parent_cannot_be_mutated_as_rollup_ancestor(db_sess
     assert "missing ancestor" in exc_info.value.detail
     await db_session.refresh(foreign_parent)
     assert foreign_parent.context == original_foreign_context
+
+
+# ── out-of-band release of resolved descendant operator blocks ────────────────
+#
+# Incident 2026-08-19: PR #17419 merged at 02:15Z, yet the fence hold on
+# ancestor 289809a3 persisted (the only release path was an operator requeue of
+# the flagged descendant) and the approval-gate timeout FAILED the ancestor at
+# 02:18Z; the requeued clone re-inherited the stale hold.
+
+
+def _mock_github(mocker, pr_payload):
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("tok", "owner", "repo"),
+    )
+    if isinstance(pr_payload, Exception):
+        mocker.patch("app.github.get_pull_request", side_effect=pr_payload)
+    else:
+        mocker.patch("app.github.get_pull_request", return_value=pr_payload)
+
+
+@pytest.mark.asyncio
+async def test_release_resolved_block_when_subject_pr_merged(db_session, mocker):
+    from app.rollup_lineage_fence import (
+        release_resolved_descendant_operator_blocks,
+    )
+
+    parent, child = await _lineage(db_session)
+    await mark_ancestor_rollups_awaiting_operator(
+        child, db_session, reason="review spawn failed", pr_number=17419
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+    assert parent.requires_approval is True
+
+    _mock_github(mocker, {"merged": True, "state": "closed"})
+    released = await release_resolved_descendant_operator_blocks(
+        parent, db_session
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert released is True
+    assert parent.requires_approval is False
+    assert "_descendant_operator_blocks" not in parent.context
+    assert "_descendant_operator_blocks_prior_approval" not in parent.context
+    assert "resolved out-of-band" in parent.latest_status_message
+
+
+@pytest.mark.asyncio
+async def test_release_keeps_hold_while_subject_pr_open(db_session, mocker):
+    from app.rollup_lineage_fence import (
+        release_resolved_descendant_operator_blocks,
+    )
+
+    parent, child = await _lineage(db_session)
+    await mark_ancestor_rollups_awaiting_operator(
+        child, db_session, reason="review spawn failed", pr_number=17419
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    _mock_github(mocker, {"merged": False, "state": "open"})
+    released = await release_resolved_descendant_operator_blocks(
+        parent, db_session
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert released is False
+    assert parent.requires_approval is True
+    assert str(child.id) in parent.context["_descendant_operator_blocks"]
+
+
+@pytest.mark.asyncio
+async def test_release_keeps_hold_on_github_lookup_failure(db_session, mocker):
+    from app.rollup_lineage_fence import (
+        release_resolved_descendant_operator_blocks,
+    )
+
+    parent, child = await _lineage(db_session)
+    await mark_ancestor_rollups_awaiting_operator(
+        child, db_session, reason="review spawn failed", pr_number=17419
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    _mock_github(mocker, RuntimeError("github down"))
+    released = await release_resolved_descendant_operator_blocks(
+        parent, db_session
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert released is False
+    assert parent.requires_approval is True
+    assert str(child.id) in parent.context["_descendant_operator_blocks"]
+
+
+@pytest.mark.asyncio
+async def test_release_prless_block_when_descendant_completed(db_session, mocker):
+    from app.rollup_lineage_fence import (
+        release_resolved_descendant_operator_blocks,
+    )
+
+    parent, child = await _lineage(db_session)
+    await mark_ancestor_rollups_awaiting_operator(
+        child, db_session, reason="needs operator look", pr_number=None
+    )
+    await db_session.commit()
+
+    child.status = TaskStatus.COMPLETED
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    released = await release_resolved_descendant_operator_blocks(
+        parent, db_session
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert released is True
+    assert parent.requires_approval is False
+    assert "_descendant_operator_blocks" not in parent.context
+
+
+@pytest.mark.asyncio
+async def test_partial_resolution_drops_entry_but_keeps_hold(db_session, mocker):
+    from app.rollup_lineage_fence import (
+        release_resolved_descendant_operator_blocks,
+    )
+
+    parent, child = await _lineage(db_session)
+    sibling = make_task(
+        parent.project_id,
+        title="Second terminal descendant",
+        payloads=[{"type": "create", "prompt": "other"}],
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(sibling)
+    await db_session.commit()
+    await mark_ancestor_rollups_awaiting_operator(
+        child, db_session, reason="first blocker", pr_number=None
+    )
+    await mark_ancestor_rollups_awaiting_operator(
+        sibling, db_session, reason="second blocker", pr_number=None
+    )
+    await db_session.commit()
+
+    child.status = TaskStatus.COMPLETED
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    released = await release_resolved_descendant_operator_blocks(
+        parent, db_session
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert released is False
+    assert parent.requires_approval is True
+    blocks = parent.context["_descendant_operator_blocks"]
+    assert str(child.id) not in blocks
+    assert str(sibling.id) in blocks
