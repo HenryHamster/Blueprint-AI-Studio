@@ -22,6 +22,12 @@ from app.field_encryption import decrypt_field
 from app.max_plan_project_state import reconcile_project_state
 from app.models import LLMAuthMode, LLMProviderName
 from app.providers.base import UsageSnapshot, merge_settings
+from app.rate_limit_cooldown import (
+    _QUARANTINE_COOLDOWN_SECONDS,  # noqa: F401 - re-exported for test_max_plan_pool.py
+    _QUOTA_EXHAUSTED_COOLDOWN_SECONDS,  # noqa: F401 - re-exported for test_max_plan_pool.py
+    _REGRESSION_COOLDOWN_SECONDS,
+    cooldown_seconds_for_info as _cooldown_seconds_for_info,
+)
 from app.providers.openai import (
     codex_oauth_refresh_serialization_reason as _codex_oauth_refresh_serialization_reason,
     codex_oauth_requires_refresh_probe as _codex_oauth_requires_refresh_probe,  # noqa: F401 - compatibility re-export
@@ -1584,11 +1590,6 @@ def _project_at_cap(acct: dict, project_id: str | None) -> str | None:
     return None
 
 
-_QUOTA_EXHAUSTED_COOLDOWN_SECONDS = 24 * 60 * 60  # flat 24h for billing walls
-_QUARANTINE_COOLDOWN_SECONDS = (
-    15 * 60
-)  # flat 15-min recheck for confidence-gated quarantine
-_REGRESSION_COOLDOWN_SECONDS = 6 * 60 * 60  # flat 6h reprobe for regression quarantine
 QUARANTINE_CONSECUTIVE_N = 3  # consecutive qualifying failures to trip the quarantine
 QUARANTINE_CONFIDENCE_THRESHOLD = 0.8  # minimum per-record confidence to count
 _QUARANTINE_ELIGIBLE_CLASSES = frozenset(
@@ -1617,39 +1618,6 @@ def _serialize_disabled_model_info(info: dict) -> dict:
     if isinstance(stats, dict):
         out["regression_stats"] = dict(stats)
     return out
-
-
-def _cooldown_seconds_for_info(info: dict) -> int:
-    """Compute remaining-effective cooldown window (seconds) for a disabled_models entry.
-
-    Rules:
-    - kind="quota_exhausted" → flat 24h. These are billing walls; the
-      exponential-backoff curve doesn't apply because the error doesn't
-      resolve on clock.
-    - kind="regression" → flat 6h reprobe. Regression triggers on slow
-      drift in success rate; a short cooldown would keep cycling the
-      bad combination.
-    - Otherwise exponential: min(30 * 2^(hits-1), 240) minutes.
-    - Server-provided retry_after_seconds is treated as a floor — we never
-      shorten below it, and we never extend below the exponential value.
-    - kind="quarantine" is the SAME non-lowering-floor rule applied to the
-      15-min recheck: the trip-wire fires on top of an existing exponential
-      backoff (hits already >= QUARANTINE_CONSECUTIVE_N), so the flat 15min
-      is a floor for accounts still early in the curve, never a ceiling that
-      shortens a later hit's longer exponential window.
-    """
-    if info.get("kind") == "quota_exhausted":
-        return _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
-    if info.get("kind") == "regression":
-        return _REGRESSION_COOLDOWN_SECONDS
-    hits = info.get("hits", 1)
-    exponential = min(30 * (2 ** (hits - 1)), 240) * 60
-    if info.get("kind") == "quarantine":
-        return max(_QUARANTINE_COOLDOWN_SECONDS, exponential)
-    hint = info.get("retry_after_seconds")
-    if isinstance(hint, (int, float)) and hint > exponential:
-        return int(hint)
-    return exponential
 
 
 def _check_quarantine_trigger(account_id: str) -> bool:
@@ -5610,9 +5578,10 @@ async def disable_account_model(
         if kind != "quota_exhausted" and _check_quarantine_trigger(acct_id):
             for m in cascade:
                 dm[m]["kind"] = "quarantine"
+            effective_cooldown = _cooldown_seconds_for_info(dm[primary_key])
             logger.warning(
                 f"[POOL] Account {acct['name']} quarantine triggered: last {QUARANTINE_CONSECUTIVE_N} "
-                f"high-confidence failures — {_QUARANTINE_COOLDOWN_SECONDS // 60}min recheck cooldown"
+                f"high-confidence failures — {effective_cooldown // 60}min recheck cooldown"
             )
 
         _stage_rate_limit_mutation(

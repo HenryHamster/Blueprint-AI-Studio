@@ -1675,6 +1675,27 @@ class TestQuarantineTrigger:
             )
             assert cooldown >= _QUARANTINE_COOLDOWN_SECONDS
 
+    def test_quarantine_cooldown_composes_with_server_hint(self):
+        """A quarantined entry must never shorten below a larger server-provided
+        retry_after_seconds hint — all three floors (flat 15min, exponential,
+        hint) compose as a single max, they don't short-circuit each other."""
+        # hits=1 → exponential=30min=1800s, quarantine floor=15min=900s.
+        # A 4h hint (the provider max, see providers/base._RETRY_HINT_MAX_SECONDS)
+        # must win over both.
+        assert (
+            _cooldown_seconds_for_info(
+                {"hits": 1, "kind": "quarantine", "retry_after_seconds": 4 * 3600}
+            )
+            == 4 * 3600
+        )
+        # A hint smaller than the exponential is ignored, same as non-quarantine.
+        assert (
+            _cooldown_seconds_for_info(
+                {"hits": 1, "kind": "quarantine", "retry_after_seconds": 60}
+            )
+            == 30 * 60
+        )
+
     async def test_quota_exhausted_not_overridden_by_quarantine(self):
         acct_id = "a"
         acct = _acct(id=acct_id)
