@@ -433,7 +433,6 @@ describe('EffortEfficiencyPanel', () => {
       cache_hit_rate_delta: 0,
       cache_hit_rate_within_tolerance: true,
       task_count: 15,
-      per_task: [],
       ...overrides,
     };
   }

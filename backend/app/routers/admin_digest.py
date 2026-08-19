@@ -189,6 +189,20 @@ from app.pipeline_health import (  # noqa: E402
 )
 
 
+def _without_per_task(reconciliation: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    """Drop the zero-reader per_task rows from a served reconciliation dict.
+
+    per_task has no readers anywhere in the codebase (backend or admin-ui) but
+    dominates the digest response's byte size, since the same dict is
+    serialized four times (nested under effort_model_efficiency twice, and
+    top-level twice). Strip it at the response boundary only — the in-process
+    ReconciliationResult.asdict() output used elsewhere keeps per_task intact.
+    """
+    if reconciliation is None:
+        return None
+    return {k: v for k, v in reconciliation.items() if k != "per_task"}
+
+
 @router.get("/digest")
 async def get_digest(
     hours: int = Query(24, ge=1, le=168),
@@ -1358,7 +1372,7 @@ async def _compute_digest(
     # is trustworthy within declared tolerance. Injected into the efficiency dict
     # and surfaced as a top-level key for the EffortEfficiencyPanel trust indicator.
     _reconciliation_window = completed_tasks + failed_tasks + cancelled_tasks
-    effort_model_efficiency["cost_telemetry_reconciliation"] = (
+    effort_model_efficiency["cost_telemetry_reconciliation"] = _without_per_task(
         reconcile_llm_cost(_reconciliation_window).asdict()
         if _reconciliation_window
         else None
@@ -1388,7 +1402,9 @@ async def _compute_digest(
                 _provider_recon.total_task_count,
             )
     effort_model_efficiency["cost_telemetry_reconciliation_provider_reported"] = (
-        _provider_recon.asdict() if _provider_recon is not None else None
+        _without_per_task(_provider_recon.asdict())
+        if _provider_recon is not None
+        else None
     )
 
     # --- Scope mismatch diagnostics ---

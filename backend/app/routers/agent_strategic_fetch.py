@@ -99,6 +99,34 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_RECONCILIATION_BLOB_KEYS = (
+    "cost_telemetry_reconciliation",
+    "cost_telemetry_reconciliation_provider_reported",
+)
+
+
+def _efficiency_blob_without_per_task(blob: dict[str, Any] | None) -> dict[str, Any]:
+    """Project a persisted efficiency snapshot blob for serving, dropping per_task.
+
+    per_task has no readers anywhere in the codebase and dominates the
+    persisted blob's size (rows already written before the write-side pop in
+    #17540 still carry it). Return a shallow copy with each reconciliation
+    block's per_task removed; everything else, including scalars the
+    EffortEfficiencyPanel reads, is passed through byte-identical. Never
+    mutates the source blob — it is the row's persisted value.
+    """
+    if not blob:
+        return {}
+    projected = dict(blob)
+    for key in _RECONCILIATION_BLOB_KEYS:
+        reconciliation = projected.get(key)
+        if isinstance(reconciliation, dict) and "per_task" in reconciliation:
+            projected[key] = {
+                k: v for k, v in reconciliation.items() if k != "per_task"
+            }
+    return projected
+
+
 def _compute_image_recipe_identity(
     environment: dict[str, Any], manifest: dict[str, Any] | None = None
 ) -> str:
@@ -2476,7 +2504,7 @@ async def agent_fetch_efficiency_snapshot(
     # admin trend-surface ordering.
     history = [
         {
-            **(row.blob or {}),
+            **_efficiency_blob_without_per_task(row.blob),
             "captured_at": row.captured_at.isoformat(),
             "metric_def_version": row.metric_def_version,
         }

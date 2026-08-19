@@ -2004,6 +2004,68 @@ async def test_digest_project_filter(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_digest_response_omits_per_task_at_all_four_reconciliation_keys(
+    client: AsyncClient, db_session
+):
+    """per_task has no readers on the live digest path and was serialized four
+    times over: nested under effort_model_efficiency (twice) and re-exposed
+    top-level (twice). It must be stripped at all four response sites while
+    every scalar the EffortEfficiencyPanel/trust-indicator reads survives, and
+    the four response KEYS themselves must remain present."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "effort": "high"}],
+            context={"pr_merged": True},
+            provider="anthropic",
+            model="claude-opus-4-8",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 1000,
+                "llm_call_count": 1,
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    body_text = response.text
+    data = response.json()
+
+    # The four keys must still be present.
+    assert "cost_telemetry_reconciliation" in data
+    assert "cost_telemetry_reconciliation_provider_reported" in data
+    assert "cost_telemetry_reconciliation" in data["effort_model_efficiency"]
+    assert (
+        "cost_telemetry_reconciliation_provider_reported"
+        in data["effort_model_efficiency"]
+    )
+
+    top_level = data["cost_telemetry_reconciliation"]
+    nested = data["effort_model_efficiency"]["cost_telemetry_reconciliation"]
+    assert top_level is not None
+    assert "per_task" not in top_level
+    assert "per_task" not in nested
+    # Scalars the trust indicator reads survive byte-identical.
+    assert top_level["task_count"] == 1
+    assert top_level["within_tolerance"] is True
+    assert top_level == nested
+
+    # per_task must not appear anywhere in the serialized response, not just
+    # under the reconciliation keys we know about.
+    assert "per_task" not in body_text, (
+        "per_task string leaked into the digest response somewhere"
+    )
+
+
+@pytest.mark.asyncio
 async def test_digest_effort_model_efficiency_includes_cancelled_token_spend(
     client: AsyncClient, db_session
 ):

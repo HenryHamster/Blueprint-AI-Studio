@@ -406,7 +406,6 @@ export interface CostTelemetryReconciliation {
   cache_hit_rate_delta: number;
   cache_hit_rate_within_tolerance: boolean;
   task_count: number;
-  per_task: Record<string, unknown>[];
 }
 
 export interface EffortModelEfficiency {
