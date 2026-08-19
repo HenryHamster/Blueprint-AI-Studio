@@ -278,6 +278,51 @@ async def test_merge_pull_request_conflict(mocker):
 
 
 @pytest.mark.asyncio
+async def test_merge_pull_request_refuses_operator_pat_by_default(mocker):
+    """fix(release): an operator-PAT-sourced token must never merge silently.
+
+    The resolver's last fallback hands callers the operator's own PAT, and
+    merging with it mints a commit GitHub attributes to the operator for what
+    is really automated pipeline work. Every automated merge lane must be
+    refused by default; no GitHub write I/O may run.
+    """
+    from app.github import merge_pull_request
+
+    mock_request = mocker.patch("httpx.AsyncClient.request")
+
+    result = await merge_pull_request(
+        "ghp_operatorPersonalAccessToken0000", "owner", "repo", 42
+    )
+
+    assert result["merged"] is False
+    assert result.get("pat_fallback_blocked") is True
+    mock_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_merge_pull_request_allows_operator_pat_when_explicitly_opted_in(
+    mocker,
+):
+    """An explicit human/operator-triggered merge lane may opt into a PAT."""
+    from app.github import merge_pull_request
+
+    mock_request = mocker.patch("httpx.AsyncClient.request")
+    mock_request.return_value = MockResponse(200, {"sha": "abc123", "merged": True})
+
+    result = await merge_pull_request(
+        "ghp_operatorPersonalAccessToken0000",
+        "owner",
+        "repo",
+        42,
+        allow_changes_requested=True,
+        allow_operator_pat=True,
+    )
+
+    assert result["merged"] is True
+    mock_request.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_reopen_pull_request_success(mocker):
     """reopen_pull_request() returns True on a 200 response."""
     from app.github import reopen_pull_request

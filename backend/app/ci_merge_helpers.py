@@ -518,3 +518,38 @@ async def _relock_merge_task(
         )
         return None
     return fresh
+
+
+def locally_refused_merge_status(merge_result: dict, pr_number: int) -> str | None:
+    """Operator-facing status for a merge that was refused BEFORE any PUT.
+
+    ``merge_pull_request`` has two locally-refused outcomes that never reach
+    GitHub's merge endpoint yet share the ``{"merged": False, "conflict": False}``
+    shape of a pending-checks 405:
+
+    * ``review_veto``          — GitHub's aggregate reviewDecision is
+      CHANGES_REQUESTED, so the autonomous lane holds.
+    * ``pat_fallback_blocked`` — the only credential the resolver could produce
+      was the operator's own personal access token, and merging with it would
+      mint a commit GitHub attributes to the operator for automated pipeline
+      work.
+
+    Both are terminal for the caller: there is nothing on the PR to re-check,
+    no GitHub write may be issued on this credential (an ``update_branch``
+    "catch-up" would mint exactly the operator-attributed commit the PAT
+    refusal exists to prevent), and no merge-failure counter/escalation should
+    fire — the PR itself is fine.  Returns the status message to surface, or
+    ``None`` when the result is not a local refusal.
+    """
+    if merge_result.get("pat_fallback_blocked"):
+        return (
+            f"Merge not submitted for PR #{pr_number} — only an operator personal "
+            "access token is available and the pipeline must not mint "
+            "operator-attributed merge commits. Install or repair the GitHub App "
+            "installation for this repository, then re-run the merge."
+        )
+    if merge_result.get("review_veto"):
+        return (
+            f"Merge held — GitHub has outstanding changes requested on PR #{pr_number}"
+        )
+    return None

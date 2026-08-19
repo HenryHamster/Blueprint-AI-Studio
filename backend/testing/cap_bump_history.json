@@ -3203,8 +3203,8 @@
       ],
       "research_direction_state.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-19T07:15:21.418029+00:00",
+          "commit_sha": "188530d3e9c88bfc4e24d02ee987c03fbd9d1fb0",
+          "commit_date": "2026-08-19T00:31:51-07:00",
           "old_cap": 1750,
           "new_cap": 2050
         }
@@ -4279,8 +4279,8 @@
           "new_cap": 8450
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-19T07:33:07.727616+00:00",
+          "commit_sha": "e8574b7077b223c24ad6cfa8cfe0848ceb4d50c8",
+          "commit_date": "2026-08-19T00:55:51-07:00",
           "old_cap": 8450,
           "new_cap": 10050
         }
@@ -4413,8 +4413,8 @@
           "new_cap": 350
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-19T06:38:25.767908+00:00",
+          "commit_sha": "91f22bb5ff83df2ec9e423439da1fccfe71f2baa",
+          "commit_date": "2026-08-19T08:28:09+00:00",
           "old_cap": 350,
           "new_cap": 700
         }
@@ -4561,6 +4561,14 @@
           "commit_date": "2026-08-18T23:26:30-07:00",
           "old_cap": 4100,
           "new_cap": 4850
+        }
+      ],
+      "test_release_qualifier__finalize_qualification.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T10:09:45.833309+00:00",
+          "old_cap": 7050,
+          "new_cap": 8150
         }
       ]
     }

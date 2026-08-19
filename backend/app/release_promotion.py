@@ -44,6 +44,7 @@ from app.release_artifacts import (
     get_or_create_release_deploy_artifact,
 )
 from app.notification_dispatch import post_event_message
+from app.release_merge_refusal import promotion_merge_refusal
 from app.release_scoring import _DEFAULT_POLICY, compute_composite
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
@@ -1707,28 +1708,27 @@ async def promote(
                 already_landed=True,
             )
 
-        # Distinguish a real merge conflict (GitHub 409 → conflict=True) from
-        # pending required checks (GitHub 405 → conflict=False/None).  A real
-        # conflict cannot self-heal and must fail immediately; a pending-CI
-        # block WILL clear once checks pass, so arrange for GitHub to complete
-        # the merge automatically rather than recording a spurious failure.
-        if merge_result.get("conflict"):
-            msg = merge_result.get("message", "merge not completed")
+        # A real merge conflict (409) and a local credential refusal (only the
+        # operator's PAT was resolvable, so no PUT was ever issued) are both
+        # permanent and must fail immediately; only pending required checks
+        # (405) WILL clear, and that falls through to the managed waiter below.
+        if refusal := promotion_merge_refusal(merge_result, owner, repo):
             logger.warning(
                 "[RELEASE_QUALIFIER] promotion PR #%s for v%d did not merge "
-                "(real conflict): %s",
+                "(%s): %s",
                 pr_number,
                 version.version_number,
-                msg,
+                refusal["error"],
+                refusal["detail"],
             )
             return await _record_promotion_failure(
                 session,
                 version,
                 base_record,
-                "merge_blocked",
-                detail=str(msg)[:300],
+                refusal["error"],
+                detail=refusal["detail"],
                 pr_url=pr_url,
-                conflict=True,
+                conflict=refusal["conflict"],
                 lock_released=True,
             )
 

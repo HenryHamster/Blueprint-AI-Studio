@@ -683,6 +683,29 @@ async def attempt_merge_with_authority(
             if attempt >= (3 if retry_nonterminal else 0):
                 raise merge_error
             continue
+        if result.get("pat_fallback_blocked") is True:
+            # merge_pull_request refused locally BEFORE any PUT: the only
+            # resolvable credential was the operator's own PAT and this lane
+            # does not allow minting operator-attributed merge commits. This is
+            # the same class as the rate-limit ``merge_not_attempted`` case
+            # above — known-not-sent — so it must NOT reach the reconciliation
+            # block below, which would perform a live target lookup and then
+            # write a 'submission_rejected' receipt claiming GitHub rejected a
+            # request that was never issued (or release the lease as
+            # indeterminate). Terminalize honestly and stop retrying.
+            if submission_start is not None:
+                closed = await started_authority.close_without_merge(
+                    session,
+                    "known_not_sent",
+                    "no non-operator GitHub credential was available; the merge "
+                    "was never submitted",
+                    send_token,
+                )
+                if not closed:
+                    raise MergeSubmissionIndeterminate(
+                        "known-not-sent outcome lost its exact lease CAS"
+                    )
+            return decision, result
         if (
             submission_start is not None
             and result.get("merged") is not True
@@ -802,6 +825,7 @@ async def attempt_merge_with_authority(
             result.get("merged")
             or result.get("conflict")
             or result.get("review_veto")
+            or result.get("pat_fallback_blocked")
             or not retry_nonterminal
         ):
             return decision, result

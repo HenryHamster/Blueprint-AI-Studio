@@ -3956,6 +3956,73 @@ async def test_finalize_promotes_when_enabled_and_confident(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_promote_pat_credential_refusal_is_a_recorded_failure_not_ci_wait(
+    db_session, mocker
+):
+    """A PAT refusal is permanent — it must never be reported as pending CI.
+
+    ``merge_pull_request`` refuses before any PUT when the only resolvable
+    credential is the operator's own PAT (this lane's resolver really can fall
+    back to ``get_user_secret``).  The refusal shares ``merged=False`` /
+    ``conflict=False`` with a pending-checks 405, so without an explicit branch
+    the version parks in the managed check waiter with
+    ``reason="required_checks_pending"``: the reconciler re-submits and is
+    refused identically forever, no promotion failure is ever recorded, and the
+    operator-facing reason is a lie about CI.
+    """
+    project, version = await _make_project_and_version(db_session)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 93, "html_url": "http://pr/93"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "conflict": False,
+                "pat_fallback_blocked": True,
+                "message": "refusing to merge with an operator PAT credential",
+            }
+        ),
+    )
+    wait_mock = mocker.patch(
+        "app.release_promotion._enter_managed_check_wait",
+        new=AsyncMock(return_value={"status": "managed_check_wait"}),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        "abcd" * 10,
+        composite={"confidence": 0.9},
+        base_record={"candidate_sha": "abcd" * 10},
+    )
+    await db_session.commit()
+
+    wait_mock.assert_not_awaited()
+    assert result["status"] == "promotion_failed"
+    assert result["error"] == "merge_credential_blocked"
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "merge_credential_blocked"
+    detail = version.last_qualification.get("detail") or ""
+    assert "personal access token" in detail
+    assert "GitHub App" in detail
+
+
+@pytest.mark.asyncio
 async def test_promote_non_merged_result_is_failed_promotion(db_session, mocker):
     """merge_pull_request returning {merged: False} (405/409) is a FAILED
     promotion — the version stays open and goes back to stabilize, and the

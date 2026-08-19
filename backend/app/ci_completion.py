@@ -53,6 +53,7 @@ from app.ci_merge_helpers import (  # noqa: F401
     _review_not_required,
     arm_ci_wait,
     effective_pr_number,
+    locally_refused_merge_status,
     revoke_review_authority_for_active_fix,
 )
 from app.models import Task, TaskStatus, _utcnow
@@ -607,7 +608,7 @@ async def _attempt_merge_with_retry_and_escalation(
     _upd: dict | None = None
     if (
         not merge_result.get("merged")
-        and not merge_result.get("review_veto")
+        and not locally_refused_merge_status(merge_result, ci_pr_number)
         and not _in_progress
     ):
         try:
@@ -672,10 +673,9 @@ async def _attempt_merge_with_retry_and_escalation(
     task = fresh_task
     ci_loop = (task.context or {}).get("review_loop", {})
 
-    if merge_result.get("review_veto"):
-        task.latest_status_message = (
-            f"Merge held — GitHub has outstanding changes requested on PR #{ci_pr_number}"
-        )[:500]
+    _local_refusal = locally_refused_merge_status(merge_result, ci_pr_number)
+    if _local_refusal:
+        task.latest_status_message = _local_refusal[:500]
         session.add(task)
         return False
     if merge_result.get("merged"):

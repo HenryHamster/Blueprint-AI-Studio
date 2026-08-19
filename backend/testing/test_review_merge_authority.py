@@ -490,3 +490,63 @@ async def test_archived_pending_fix_cannot_hold_publication(db_session, mocker):
     assert decision.allowed is True
     assert result == {"merged": True}
     merge.assert_awaited_once_with(target["head_sha"])
+
+
+@pytest.mark.asyncio
+async def test_pat_credential_refusal_is_terminal_for_the_autonomous_retry_loop(
+    db_session, mocker
+):
+    """A local PAT refusal must stop the retry loop after ONE attempt.
+
+    ``merge_pull_request`` refuses before any PUT when the only resolvable
+    credential is the operator's own PAT, and returns the pending-CI shape
+    ``{"merged": False, "conflict": False}``.  Without an explicit terminal
+    test that shape is read as a transient GitHub-side block, so the
+    ``retry_nonterminal`` lane burns three more identically-refused attempts.
+    """
+    project = Project(name="PAT refusal terminal", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    pr_number = 17410
+    task = await _make_task(db_session, project, pr_number, "bypass")
+    target = _target(project, pr_number)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": target["base_sha"], "ref": "main"},
+                "head": {"sha": target["head_sha"]},
+            }
+        ),
+    )
+    refusal = {
+        "merged": False,
+        "conflict": False,
+        "pat_fallback_blocked": True,
+        "message": "refusing to merge with an operator PAT credential",
+    }
+    merge = AsyncMock(return_value=refusal)
+
+    decision, result = await attempt_merge_with_authority(
+        task,
+        db_session,
+        merge_call=merge,
+        gh_token="token",
+        owner="owner",
+        repo="repo",
+        ci_loop=(task.context or {})["review_loop"],
+        pr_number=pr_number,
+        branch=f"blueprint/task-{pr_number}",
+        base_branch="main",
+        original_task_id=str(task.id),
+        checked_head_sha=target["head_sha"],
+        checked_base_sha=target["base_sha"],
+        retry_nonterminal=True,
+    )
+
+    assert decision.allowed is True
+    assert result == refusal
+    merge.assert_awaited_once_with(target["head_sha"])

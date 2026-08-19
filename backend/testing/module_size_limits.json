@@ -384,7 +384,7 @@
     "test_release_qualifier__classify_check_runs.py": 8850,
     "test_release_qualifier__finalize_qualification_2.py": 8800,
     "test_release_qualifier__ci_unresolved_blocker.py": 7650,
-    "test_release_qualifier__finalize_qualification.py": 7050,
+    "test_release_qualifier__finalize_qualification.py": 8150,
     "test_release_qualifier__compute_composite.py": 6900,
     "test_release_qualifier__sweep_stuck_qualifications.py": 7200,
     "test_release_qualifier__site_b_lock_window_fix.py": 4950,
@@ -415,6 +415,7 @@
     "test_fleet_utilization.py": 1800,
     "test_size_limits_checker.py": 1750,
     "test_release_commit_authorship.py": 2650,
-    "test_approved_pr_stranding.py": 1800
+    "test_approved_pr_stranding.py": 1800,
+    "test_admin_approval_authority.py": 1750
   }
 }

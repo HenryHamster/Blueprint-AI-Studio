@@ -958,6 +958,7 @@ async def trigger_rollup(
                 rollup_pr_number,
                 project_id=str(task.project_id),
                 expected_head_sha=expected_head_sha,
+                allow_operator_pat=True,
             )
 
         from app.review_policy_merge import attempt_policy_bound_merge

@@ -28,6 +28,7 @@ from app.release_artifacts import (
     aggregate_required_artifact_status,
     is_backend_revision_artifact,
 )
+from app.release_merge_refusal import promotion_merge_refusal
 from app.release_promotion import (
     _candidate_already_on_main,
     _delete_release_branch_best_effort,
@@ -1905,13 +1906,11 @@ async def _reconcile_if_managed_check_wait(
                         "merged": True,
                         "sha": retry_receipt["merge_commit_sha"],
                     }
-                elif merge_result.get("conflict"):
-                    msg = merge_result.get("message", "merge not completed")
+                elif refusal := promotion_merge_refusal(merge_result, owner, repo):
                     logger.warning(
-                        "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
-                        "for v%d has a real conflict — recording merge_blocked",
-                        pr_number,
-                        version.version_number,
+                        f"[RELEASE_QUALIFIER] reconcile managed_check_wait: PR "
+                        f"#{pr_number} for v{version.version_number} did not "
+                        f"merge (permanent) — recording {refusal['error']}"
                     )
                     await _cleanup_managed_check_wait_failure_artifacts(
                         token,
@@ -1925,10 +1924,10 @@ async def _reconcile_if_managed_check_wait(
                         session,
                         version,
                         base_record,
-                        "merge_blocked",
-                        detail=str(msg)[:300],
+                        refusal["error"],
+                        detail=refusal["detail"],
                         pr_url=pr_url,
-                        conflict=True,
+                        conflict=refusal["conflict"],
                         lock_released=True,
                     )
                     await session.commit()

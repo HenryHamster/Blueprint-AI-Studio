@@ -8729,3 +8729,65 @@ async def test_deliverable_guard_unverifiable_children_never_block(
     assert verdict == "intact"
     ctx = orig_task.context or {}
     assert "rollup_dropped_deliverables" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_pat_credential_refusal_never_writes_to_github_and_terminalizes(
+    db_session, mocker
+):
+    """A local PAT refusal must not drive the GitHub-side escalation machinery.
+
+    ``merge_pull_request`` refuses before any PUT when the only resolvable
+    credential is the operator's own PAT, returning the same
+    ``{"merged": False, "conflict": False}`` shape as a pending-checks 405.
+    Treated as that, the post-merge recheck runs and the ``behind`` branch
+    issues ``update_branch`` with the SAME operator PAT — an automated GitHub
+    write that mints exactly the operator-attributed commit the refusal exists
+    to prevent — before escalating a merge failure that is not the PR's fault.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    get_pr_mock = mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "behind"},
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={
+            "merged": False,
+            "conflict": False,
+            "pat_fallback_blocked": True,
+            "message": "refusing to merge with an operator PAT credential",
+        },
+    )
+    update_mock = mocker.patch("app.github.update_branch", return_value={})
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(type("FT", (), {"id": uuid.uuid4()})(), True),
+    )
+
+    project = Project(name="PAT refusal terminal", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, ci_loop_extra={"ci_passed": True})
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False
+    assert merge_mock.call_count == 1, "a permanent local refusal must not retry"
+    update_mock.assert_not_called()
+    get_pr_mock.assert_not_called()
+    spawn_mock.assert_not_called()
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_failures", 0) == 0
+    assert "personal access token" in (task.latest_status_message or "")
+    assert "GitHub App" in (task.latest_status_message or "")

@@ -5125,6 +5125,85 @@ async def test_managed_check_wait_green_revalidates_and_merges(db_session, mocke
 
 
 @pytest.mark.asyncio
+async def test_managed_check_wait_pat_credential_refusal_terminalizes(
+    db_session, mocker
+):
+    """A PAT refusal in the waiter is permanent — record it, do not re-park.
+
+    ``merge_pull_request`` refuses locally before any PUT when the only
+    resolvable credential is the operator's own PAT. That refusal carries the
+    same ``merged=False``/``conflict=False`` shape as a retriable 405, so
+    without an explicit branch the reconciler leaves the version pending and
+    every subsequent sweep is refused identically, forever.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    candidate_sha = "abcd" * 10
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"ref": "release-v1", "sha": candidate_sha},
+                "base": {"ref": "release", "sha": "base0001"},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "completed", "conclusion": "success", "details": []}
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "conflict": False,
+                "pat_fallback_blocked": True,
+                "message": "refusing to merge with an operator PAT credential",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.task_locking.acquire_merge_submission_locks",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "merge_credential_blocked"
+    assert "personal access token" in (
+        version.last_qualification.get("detail") or ""
+    )
+
+
+@pytest.mark.asyncio
 async def test_managed_check_wait_rejects_head_not_equal_to_qualified_candidate(
     db_session, mocker
 ):
