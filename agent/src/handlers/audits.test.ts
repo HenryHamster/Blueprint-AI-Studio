@@ -1314,6 +1314,53 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
       );
       expect(entry?.classification).toBe('dead_code_removal');
     });
+
+    it('a co-deleted test file carrying N tests, with no added files, leaves assertion_delta and test_count_delta unchanged (does not double-penalize a dead-code removal)', async () => {
+      // Regression check: before the fix, this file's removed lines flowed
+      // into assertionDelta/testCountDelta even though co-deletion already
+      // clears it as dead_code_removal — a co-deleted test removal must
+      // never feed the graded test_erosion penalty in release_scoring.py.
+      const nameStatus = 'D\ttesting/test_bar.py\nD\tapp/bar.py\n';
+      const diffText = [
+        'diff --git a/testing/test_bar.py b/testing/test_bar.py',
+        '--- a/testing/test_bar.py',
+        '+++ /dev/null',
+        '-def test_one():',
+        '-    assert 1 == 1',
+        '-def test_two():',
+        '-    assert 2 == 2',
+        '-    assert 3 == 3',
+      ].join('\n') + '\n';
+
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return nameStatus;
+        if (Array.isArray(a) && a[0] === 'diff') return diffText;
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: {
+          deleted_test_file_classifications?: { path: string; classification: string }[];
+          assertion_delta: number;
+          test_count_delta: number;
+        };
+      };
+      const entry = stored.computed_test_erosion?.deleted_test_file_classifications?.find(
+        c => c.path === 'testing/test_bar.py'
+      );
+      expect(entry?.classification).toBe('dead_code_removal');
+      expect(stored.computed_test_erosion?.assertion_delta).toBe(0);
+      expect(stored.computed_test_erosion?.test_count_delta).toBe(0);
+    });
   });
 
   // ── relocation classification — a genuine test-file split, not erosion ────
@@ -1370,6 +1417,53 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
       );
       expect(entry?.classification).toBe('dead_code_removal');
       expect(entry?.rationale).toContain('2/2');
+    });
+
+    it('matches async def test_ declarations on both the removed and added side, counting toward the relocation fraction', async () => {
+      // Regression check for the async-blindness defect: TEST_IDENTIFIER_RE
+      // must match "async def test_foo(" the same way it matches "def test_foo(".
+      const nameStatus = [
+        'D\tbackend/testing/test_async_thing.py',
+        'A\tbackend/testing/test_async_thing_split.py',
+      ].join('\n') + '\n';
+      const diffText = [
+        'diff --git a/backend/testing/test_async_thing.py b/backend/testing/test_async_thing.py',
+        '--- a/backend/testing/test_async_thing.py',
+        '+++ /dev/null',
+        '-    async def test_does_the_thing(self):',
+        '-        assert await thing() == 42',
+        'diff --git a/backend/testing/test_async_thing_split.py b/backend/testing/test_async_thing_split.py',
+        '--- /dev/null',
+        '+++ b/backend/testing/test_async_thing_split.py',
+        '+    async def test_does_the_thing(self):',
+        '+        assert await thing() == 42',
+      ].join('\n') + '\n';
+
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return nameStatus;
+        if (Array.isArray(a) && a[0] === 'diff') return diffText;
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: {
+          deleted_test_file_classifications?: { path: string; classification: string; rationale: string }[];
+        };
+      };
+      const entry = stored.computed_test_erosion?.deleted_test_file_classifications?.find(
+        c => c.path === 'backend/testing/test_async_thing.py'
+      );
+      expect(entry?.classification).toBe('dead_code_removal');
+      expect(entry?.rationale).toContain('1/1');
     });
 
     it('does NOT auto-clear the same deleted file when the replacement files are absent from the diff', async () => {

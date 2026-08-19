@@ -844,7 +844,7 @@ export async function handleReleaseAudit(
     // Captures a stable test-function identifier: python "def test_foo(" or
     // JS/TS "test('name'" / "it(\"name\"". Used only for relocation matching
     // (below), not for the assertion/test-count delta.
-    const TEST_IDENTIFIER_RE = /^[+-]\s*(?:def\s+(test_\w+)\s*\(|(?:test|it)\(\s*(['"`])((?:(?!\2).)+)\2)/;
+    const TEST_IDENTIFIER_RE = /^[+-]\s*(?:(?:async\s+)?def\s+(test_\w+)\s*\(|(?:test|it)\(\s*(['"`])((?:(?!\2).)+)\2)/;
     const extractIdentifier = (line: string): string | null => {
       const m = line.match(TEST_IDENTIFIER_RE);
       if (!m) return null;
@@ -854,6 +854,22 @@ export async function handleReleaseAudit(
     };
 
     const deletedTestFileSet = new Set(deletedTestFiles);
+    // Co-deletion is computable up front from git diff --name-status alone
+    // (deletedTestFiles + allDeletedFiles), before the diff-line loop. A
+    // co-deleted test file's subject is also gone, so its removed lines must
+    // not flow into assertionDelta/testCountDelta — otherwise the graded
+    // test_erosion penalty (release_scoring.py) double-penalizes an already
+    // fail-open-cleared dead-code deletion. Relocation-classified and
+    // unclassified files are NOT skipped here: relocation can't be known
+    // until after this loop, and unclassified deletions must still count
+    // (the ownership hole #17547 closed).
+    const coDeletedTestFiles = new Map<string, string>();
+    for (const testPath of deletedTestFiles) {
+      const subjects = deriveSubjectPaths(testPath);
+      const coDeleted = subjects.find(s => allDeletedFiles.has(s));
+      if (coDeleted) coDeletedTestFiles.set(testPath, coDeleted);
+    }
+
     // Test-function identifiers removed from each wholly-deleted test file
     // (source side of a potential relocation), keyed by file path.
     const removedIdentifiersByFile = new Map<string, Set<string>>();
@@ -871,6 +887,8 @@ export async function handleReleaseAudit(
         currentFile = m ? m[1] : '';
         continue;
       }
+
+      if (coDeletedTestFiles.has(currentFile)) continue;
 
       if (line.startsWith('+') && !line.startsWith('+++')) {
         if (ASSERTION_RE.test(line)) assertionDelta++;
@@ -907,8 +925,7 @@ export async function handleReleaseAudit(
     const RELOCATION_MIN_FRACTION = 0.5;
     const deterministicClassifications: { path: string; classification: string; rationale: string }[] = [];
     for (const testPath of deletedTestFiles) {
-      const subjects = deriveSubjectPaths(testPath);
-      const coDeleted = subjects.find(s => allDeletedFiles.has(s));
+      const coDeleted = coDeletedTestFiles.get(testPath);
       if (coDeleted) {
         deterministicClassifications.push({
           path: testPath,
