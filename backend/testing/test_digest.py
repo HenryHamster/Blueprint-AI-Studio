@@ -10539,6 +10539,131 @@ async def test_digest_exposes_accrual_projection_for_assignment_trial(db_session
 
 
 @pytest.mark.asyncio
+async def test_digest_accrual_projection_uses_effective_verdict_pinned_holdback(
+    db_session,
+):
+    """A decided no_effect verdict pins the effective holdback fraction to 1.0 —
+    the digest must report THAT, not the raw runtime-config default, and the
+    alternative-projection basis must use the without-arm's real throughput
+    instead of silently going null."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A decided no_effect verdict — the guard in record_trial_verdict must
+    # preserve this across the digest's re-evaluation (no _had_repo_map data
+    # below means the fresh recompute is continue-trial/insufficient_data,
+    # which cannot overwrite a decided verdict).
+    project.capability_adoption_verdicts = {
+        "repo_map": {
+            "verdict": "no_effect",
+            "verdict_reason": "futility_bound_reached",
+            "lift": 0.01,
+            "n_with": 90,
+            "n_without": 90,
+            "thresholds": {"min_n_per_arm": 30},
+            "arm_composition": {"with_assigned": 90, "without_assigned": 90},
+        }
+    }
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Recent WITHOUT-arm assignment volume so the without-daily rate is non-zero
+    # (the runtime-config default of 0.1 would instead force the WITH-arm branch,
+    # whose with_7d is 0 here, driving every alternative projection to null).
+    tasks = [
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"_repo_map_arm": False},
+            created_at=_utcnow() - timedelta(days=1),
+        )
+        for _ in range(14)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+    verdicts = result["capability_adoption_verdicts"]
+
+    repo_map = verdicts["repo_map"]
+    assert repo_map["verdict"] == "no_effect"  # decided verdict survived
+    proj = repo_map["accrual_projection"]
+    assert proj["holdback_fraction"] == 1.0
+    assert proj["without_7d"] == 14
+    # Both arms already past min_n=30 -> 0.0 days remaining at every fraction,
+    # not null — proves the without-daily basis was actually used.
+    assert proj["alternative_projections"] == {"0.1": 0.0, "0.3": 0.0, "0.5": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_digest_accrual_projection_adopt_verdict_holdback_is_zero(db_session):
+    """A decided adopt verdict pins the effective holdback fraction to 0.0."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    project.capability_adoption_verdicts = {
+        "repo_map": {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.08,
+            "n_with": 50,
+            "n_without": 50,
+            "thresholds": {"min_n_per_arm": 30},
+            "arm_composition": {"with_assigned": 50, "without_assigned": 50},
+        }
+    }
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+    verdicts = result["capability_adoption_verdicts"]
+
+    repo_map = verdicts["repo_map"]
+    assert repo_map["verdict"] == "adopt"
+    assert repo_map["accrual_projection"]["holdback_fraction"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_digest_accrual_projection_undecided_verdict_uses_runtime_config_default(
+    db_session,
+):
+    """An undecided (continue-trial) trial still uses the runtime-config default,
+    unaffected by the verdict-pinning resolution."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    tasks = [
+        _arm_task(
+            project.id,
+            had_repo_map=True,
+            first_attempt_succeeded=True,
+            days_ago=1,
+            idx=i,
+        )
+        for i in range(3)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+    verdicts = result["capability_adoption_verdicts"]
+
+    repo_map = verdicts["repo_map"]
+    assert repo_map["verdict"] == "continue-trial"
+    # Undecided verdict falls through to the runtime-config default for this cap.
+    from app.shared_state import runtime_config as _rc
+
+    expected_default = float(_rc.get("repo_map_holdback_fraction", 0.0))
+    assert repo_map["accrual_projection"]["holdback_fraction"] == expected_default
+
+
+@pytest.mark.asyncio
 async def test_trial_verdict_accumulates_across_windows_to_decision(db_session):
     """With per-arm tasks spread across MULTIPLE 24h windows (more than any single
     window holds under the min-N=30 threshold), the verdict converges to a decided

@@ -47,6 +47,7 @@ from app.capability_trial_verdict import (
     LANE_PILOT_CAP_NAME,
     evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
+    get_effective_holdback_fraction,
     get_trial_definitions,
     is_ambiguous_lift_escalation_needed,
     is_trial_stalled,
@@ -1959,8 +1960,11 @@ async def _compute_digest(
                 assignment_key=_assignment_key,
                 window_days=_accrual_window_days,
             )
-            _holdback_fraction = float(
+            _default_holdback_fraction = float(
                 _runtime_config.get(f"{_cap}_holdback_fraction", 0.0)
+            )
+            _holdback_fraction = get_effective_holdback_fraction(
+                _stored_verdicts, _cap, _default_holdback_fraction
             )
             _with_daily = _accrual["with_7d"] / _accrual_window_days
             _without_daily = _accrual["without_7d"] / _accrual_window_days
