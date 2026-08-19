@@ -1948,6 +1948,26 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     )
                     await session.rollback()
                     continue
+                # Bind the fix to the exact live PR base/head that justified
+                # this spawn. review_claim_fence cancels any fix claimant
+                # whose review_loop carries neither fix_target nor
+                # reviewed_head_sha ("fix has no immutable assigned target"),
+                # so spawning without a target here strands every
+                # conflict/behind fix at claim time (incident 2026-08-19,
+                # PR #17480). A real PR fetch always precedes this branch
+                # (the cached-head stub hardcodes mergeable=True), so both
+                # SHAs are normally present; reviewed_head_sha alone still
+                # satisfies the fence if base is ever missing.
+                _fix_head_sha = str((pr_data.get("head") or {}).get("sha") or "")
+                _fix_base_sha = str((pr_data.get("base") or {}).get("sha") or "")
+                _conflict_fix_target: dict[str, str | int] | None = None
+                if _fix_head_sha and _fix_base_sha:
+                    _conflict_fix_target = {
+                        "project_id": str(ci_task.project_id),
+                        "pr_number": int(ci_pr_number),
+                        "base_sha": _fix_base_sha,
+                        "head_sha": _fix_head_sha,
+                    }
                 fix_task, fix_was_created = await _spawn_pipeline_task(
                     ci_task,
                     "fix",
@@ -1957,6 +1977,8 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     ci_base,
                     fix_prompt=fix_prompt,
                     original_task_id=ci_orig_id,
+                    fix_target=_conflict_fix_target,
+                    reviewed_head_sha=_fix_head_sha,
                 )
                 ci_task = await _lock_task_for_mutation(
                     session,
