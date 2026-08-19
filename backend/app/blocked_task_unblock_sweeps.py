@@ -197,7 +197,7 @@ async def _reconcile_escalated_precondition_rows(
             .where(
                 Task.status == TaskStatus.BLOCKED,
                 Task.project_id.in_(project_ids),
-                Task.recheck_after > now,
+                Task.recheck_after > now + _TRANSIENT_BLOCKER_PARK_SENTINEL,
             )
             .order_by(Task.recheck_after.asc(), Task.blocked_at.asc().nullsfirst())
             .limit(batch_size)

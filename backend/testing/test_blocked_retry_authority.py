@@ -209,6 +209,70 @@ async def test_reconciled_server_blocker_rearms_at_six_hour_cadence(
     assert authority.await_count == 2
 
 
+@pytest.mark.asyncio
+async def test_reconcile_reaches_escalated_row_past_ordinary_parked_congestion(
+    db_session, mocker
+):
+    """A hard-parked escalated row must be admitted even when a small batch_size
+    is flooded with ordinary, near-future parked rows.
+
+    Regression for the #17430 candidate query ordering it `recheck_after ASC`
+    over the WHOLE BLOCKED population: escalated rows park at the ~10y sentinel,
+    the maximum possible value of that column, so ASC ranked them dead last and
+    a small batch never reached them once enough 6h-horizon parked-need rows
+    existed. The fix restricts candidates to rows beyond the existing 365-day
+    transient-park sentinel, so ordinary short-horizon parked rows never
+    compete with the target population for the LIMIT.
+    """
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    now = _utcnow()
+    project = Project(name="blocked-reconcile-congestion", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+
+    # More ordinary, near-future parked rows than batch_size — these previously
+    # crowded out the escalated row under ASC ordering with no horizon filter.
+    for i in range(3):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"ordinary parked row {i}",
+                description="steady-state parked-need row",
+                status=TaskStatus.BLOCKED,
+                created_by="ORCHESTRATOR",
+                requires_approval=False,
+                payloads=[{"type": "create"}],
+                context={},
+                blocker_kind="dependency",
+                blocked_reason="waiting on a foundation",
+                latest_status_message="waiting on a foundation",
+                blocked_at=now - timedelta(hours=1),
+                recheck_after=now + timedelta(hours=6),
+                created_at=now - timedelta(hours=1),
+            )
+        )
+
+    reason = "BLOCKER: VIEWPORT_GATE_INFRA_UNAVAILABLE: Chromium cannot launch"
+    escalated = _escalated_agent_precondition(
+        project,
+        reason=reason,
+        now=now,
+        recheck_after=now + _BLOCKED_ESCALATED_PARK,
+    )
+    db_session.add(escalated)
+    await db_session.commit()
+
+    # Pin batch_size well below the ordinary-row count so the ordering defect
+    # would have been decisive rather than incidentally masked by a large batch.
+    assert await sweep_unblock_blocked_tasks(db_session, now, batch_size=2) == 1
+    await db_session.refresh(escalated)
+    assert escalated.status == TaskStatus.QUEUED
+
+    # A second sweep is a no-op for the already-admitted row.
+    assert await sweep_unblock_blocked_tasks(db_session, now, batch_size=2) == 0
+
+
 def test_file_conflict_handoff_is_attempt_local():
     context = {
         "_blocked_retry_precondition_receipt": {
