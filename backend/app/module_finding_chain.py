@@ -255,7 +255,15 @@ async def find_and_mark_chain_escalation(
     issues: Iterable[Mapping[str, Any]],
     authoritative_files: list[dict] | None,
 ) -> dict[str, Any] | None:
-    """Find one not-yet-escalated recurring concern and mark it escalated."""
+    """Find one recurring concern past threshold and mark it escalated.
+
+    ``status == "escalated"`` does not gate this search: it is a durable
+    record of first escalation, not a lifetime suppressor. Noise control
+    for repeated escalation of the same concern on the same PR is the
+    downstream alert dedup (``alert_dispatch._maybe_create_escalation_alert``,
+    keyed on ``(task_id, title)`` where the title encodes the PR number) —
+    a new distinct PR re-raising the same concern must alert again.
+    """
     rows = list(
         (
             await session.execute(
@@ -278,7 +286,7 @@ async def find_and_mark_chain_escalation(
         if not _blocking(issue):
             continue
         matched = _matching_chain(rows, issue)
-        if matched is None or matched.status == "escalated":
+        if matched is None:
             continue
         if int(matched.verified_occurrences or 0) < CHAIN_ESCALATION_THRESHOLD:
             continue

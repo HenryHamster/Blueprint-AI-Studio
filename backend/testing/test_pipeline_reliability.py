@@ -174,6 +174,14 @@ async def _run_one_cycle(mocker):
     Patches asyncio.sleep to raise CancelledError, which the worker loop
     catches and uses to break cleanly.
     """
+    # anyio's asyncio backend does `sleep = asyncio.sleep` at module level
+    # and is imported lazily on first use. If that first import happens
+    # while asyncio.sleep is patched below, anyio permanently binds the
+    # raising mock for the rest of the pytest process — any later code
+    # that touches httpx/httpcore then dies with CancelledError at its
+    # first checkpoint. Force the import now, with the real sleep.
+    import anyio._backends._asyncio  # noqa: F401
+
     mocker.patch("asyncio.sleep", side_effect=asyncio.CancelledError())
     with contextlib.suppress(asyncio.CancelledError):
         await _orch_module.orchestrator_worker()
@@ -1940,6 +1948,23 @@ async def test_ci_polling_merged_pr_marks_completed(orch_db, mocker):
             "head": {"sha": "def456"},
             "mergeable": None,
         },
+    )
+    # _apply_ci_merged_landed_signal stamps the PR's changed files at landing
+    # (acceptance_gate.stamp_pr_changed_files_at_landing → app.github.get_pr_files,
+    # imported at call time). Left unmocked, the test reaches the live GitHub
+    # API from inside the patched-sleep window and dies with CancelledError
+    # before the COMPLETED commit.
+    mocker.patch(
+        "app.github.get_pr_files",
+        return_value=[
+            {
+                "filename": "app/x.py",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 0,
+                "changes": 1,
+            }
+        ],
     )
 
     await _run_one_cycle(mocker)
