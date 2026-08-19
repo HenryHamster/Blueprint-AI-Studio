@@ -25,6 +25,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.failure_classification import INFRA_ANALYTICS_CLASSES
 from app.models import Task, TaskStatus
 from app.review_heuristics import actioned_review_cap_tasks
 
@@ -55,12 +56,29 @@ def build_cross_episode_abandon_candidate(
 
     The caller supplies rows for one project+PR, without filtering by chain or
     episode.  A cancelled review/fix is an attempt even though it never appears
-    in the ordinary cap query; archived rows remain evidence here too, so a
-    supersede/retarget or manual cap reset cannot launder the PR's history.
-    Raw rows remain visible in the attempt/cancellation totals, but only exact
-    actioned patch/open-set generations control the stop. Carried iteration
-    numbers and parallel observation fan-out are not work receipts and cannot
-    trigger this signal by themselves.
+    in the ordinary cap query; archived rows remain evidence here too. Raw rows
+    remain visible in the attempt/cancellation totals, but only exact
+    actioned-or-discarded patch/open-set generations control the stop:
+
+    * an actioned generation (an exact REQUEST_CHANGES review + its fix, or a
+      mechanical conflict/CI fix) collapses via ``actioned_review_cap_tasks``,
+      same as the ordinary per-chain/lane cap; and
+    * a supersede/retarget-discarded review or fix (``_review_stale_head`` /
+      ``_review_stale_target``) still ran a real agent that produced a verdict
+      against an exact (base, head) pair before a supersede/retarget moved the
+      live target out from under it. The ordinary per-chain/lane cap correctly
+      excludes it (a chain must not be penalised for a verdict it couldn't
+      act on), but that exclusion is exactly the gap a supersede/retarget
+      cycle could otherwise launder its history through here: this
+      PR-lifetime census collapses those discarded rows into generations the
+      same way, so they add to — not reset — the accumulated burden.
+
+    Carried iteration numbers and parallel observation fan-out are not work
+    receipts and cannot trigger this signal by themselves. A *manual* cap
+    reset is a separate, deliberate path: the caller filters rows by
+    ``iteration_reset_at`` before ever calling in here, so an explicit
+    operator reset legitimately starts a fresh census window — this function
+    has no opinion on, and does not defeat, that filtering.
     """
     if threshold < 1:
         raise ValueError("abandon threshold must be positive")
@@ -72,7 +90,39 @@ def build_cross_episode_abandon_candidate(
         return None
 
     generation_source = attempts if actionable_tasks is None else list(actionable_tasks)
-    cycles = len(actioned_review_cap_tasks(generation_source))
+    actioned = actioned_review_cap_tasks(generation_source)
+
+    # Supersede/retarget-discarded rows never reach ``generation_source``
+    # above (``task_counts_toward_review_cap`` — the default filter behind
+    # ``actionable_tasks`` — excludes any ``_review_stale_head`` /
+    # ``_review_stale_target`` row), so nothing here can double-count a row
+    # already present in ``actioned``. Collapse them into generations the
+    # same way, using the raw, unfiltered ``attempts`` as the source so a
+    # caller that passes a pre-filtered ``actionable_tasks`` still sees its
+    # discards counted.
+    #
+    # ADMIN_CANCEL (and the rest of INFRA_ANALYTICS_CLASSES) is excluded here
+    # exactly as it is for the ordinary cap: an admin-cancel supersede tears
+    # down a task before/without letting its agent produce a verdict, so it
+    # never ran review/fix work to discard in the first place. Counting it
+    # would charge the PR for an operator's housekeeping cancel, not for
+    # burned agent work — the one thing this census exists to measure.
+    discarded_candidates = [
+        task
+        for task in attempts
+        if (
+            (task.context or {}).get("_review_stale_head")
+            or (task.context or {}).get("_review_stale_target")
+        )
+        and not (
+            task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+            and (task.context or {}).get("failure_category") in INFRA_ANALYTICS_CLASSES
+        )
+    ]
+    discarded = actioned_review_cap_tasks(
+        discarded_candidates, count_stale_discards=True
+    )
+    cycles = len(actioned) + len(discarded)
     burden = max(len(attempts), cycles)
     if cycles < threshold:
         return None
