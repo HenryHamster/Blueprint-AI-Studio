@@ -237,11 +237,22 @@ def _verification_toolchain_root() -> str:
     return os.path.abspath(root)
 
 
-def _verification_toolchain_sources() -> tuple[str, str, dict[str, str]]:
-    """Return and validate the one manifest/provisioner contract for bare runners."""
+def _verification_toolchain_sources() -> tuple[str, str, str, dict[str, str]]:
+    """Return and validate the one manifest/provisioner contract for bare runners.
+
+    Also resolves the checkout's ``backend/requirements.txt`` — a from-scratch
+    bare-runner venv needs the same backend runtime deps (sqlmodel, fastapi,
+    asyncpg, ...) a packer-baked image venv gets from its own separate
+    ``pip install -r backend/requirements.txt`` step, or every module-scope
+    import in ``backend/alembic/env.py`` (``from sqlmodel import SQLModel``)
+    dies before a single test collects. Its digest is folded into the
+    returned digests so an edited requirements file re-arms provisioning the
+    same way an edited manifest or provisioner does.
+    """
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
     manifest = os.path.join(scripts_dir, "verification-toolchain.json")
     provisioner = os.path.join(scripts_dir, "provision-verification-toolchain.sh")
+    requirements = os.path.join(os.path.dirname(scripts_dir), "backend", "requirements.txt")
     with open(manifest, encoding="utf-8") as fh:
         document = json.load(fh)
     packages = document.get("python_packages")
@@ -255,13 +266,18 @@ def _verification_toolchain_sources() -> tuple[str, str, dict[str, str]]:
     extensions = document.get("postgres", {}).get("required_extensions")
     if not isinstance(extensions, dict) or not extensions:
         raise ValueError("verification manifest must declare required PostgreSQL extensions")
+    if not os.path.isfile(requirements):
+        raise ValueError(f"backend requirements file not found: {requirements}")
     with open(manifest, "rb") as fh:
         manifest_digest = hashlib.sha256(fh.read()).hexdigest()
     with open(provisioner, "rb") as fh:
         provisioner_digest = hashlib.sha256(fh.read()).hexdigest()
-    return manifest, provisioner, {
+    with open(requirements, "rb") as fh:
+        requirements_digest = hashlib.sha256(fh.read()).hexdigest()
+    return manifest, provisioner, requirements, {
         "manifest_sha256": manifest_digest,
         "provisioner_sha256": provisioner_digest,
+        "requirements_sha256": requirements_digest,
     }
 
 
@@ -399,7 +415,7 @@ def _write_toolchain_marker(marker: str, digests: dict[str, str]) -> None:
 def _bootstrap_verification_toolchain() -> "iso.VerificationToolchain | None":
     try:
         root = _verification_toolchain_root()
-        manifest, provisioner, digests = _verification_toolchain_sources()
+        manifest, provisioner, requirements, digests = _verification_toolchain_sources()
         venv = os.path.join(root, "venv")
         os.makedirs(root, mode=0o700, exist_ok=True)
         os.chmod(root, 0o700)
@@ -435,7 +451,7 @@ def _bootstrap_verification_toolchain() -> "iso.VerificationToolchain | None":
                 staged_venv = os.path.join(stage, "venv")
                 try:
                     _run_toolchain_command(
-                        ["bash", provisioner, manifest, staged_venv], root=root, timeout=1200
+                        ["bash", provisioner, manifest, staged_venv, requirements], root=root, timeout=1200
                     )
                     _verified_toolchain_from_venv(staged_venv, root=root)
                     if os.path.lexists(backup):

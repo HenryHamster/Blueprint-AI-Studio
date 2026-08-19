@@ -139,16 +139,19 @@ class TestVerificationToolchain(unittest.TestCase):
         }
         manifest = Path(root, "verification-toolchain.json")
         provisioner = Path(root, "provision-verification-toolchain.sh")
+        requirements = Path(root, "requirements.txt")
         manifest.write_text(json.dumps({
             "schema_version": 1,
             "python_packages": packages,
             "postgres": {"required_extensions": {"pg_trgm": ["migration.py"]}},
         }))
         provisioner.write_text("#!/usr/bin/env bash\n")
+        requirements.write_text("fastapi==1\nasyncpg==1\nsqlmodel==1\n")
         return (
-            str(manifest), str(provisioner), {
+            str(manifest), str(provisioner), str(requirements), {
                 "manifest_sha256": "manifest-digest",
                 "provisioner_sha256": "provisioner-digest",
+                "requirements_sha256": "requirements-digest",
             },
         )
 
@@ -157,7 +160,8 @@ class TestVerificationToolchain(unittest.TestCase):
         if argv[0] == "bash":
             if "--verify" in argv:
                 return subprocess.CompletedProcess(argv, 1, "", "verification stale")
-            venv = Path(argv[-1])
+            # Full-provision call shape: [bash, provisioner, manifest, venv, requirements]
+            venv = Path(argv[-2])
             (venv / "bin").mkdir(parents=True)
             (venv / "bin" / "python").touch()
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -203,10 +207,12 @@ class TestVerificationToolchain(unittest.TestCase):
             self.assertEqual(toolchain.python_path, os.path.join(root, "venv", "bin", "python"))
             provision_calls = [call.args[0] for call in run.call_args_list if call.args[0][0] == "bash"]
             self.assertEqual(len(provision_calls), 1)
-            self.assertNotEqual(provision_calls[0][-1], os.path.join(root, "venv"))
+            self.assertNotEqual(provision_calls[0][-2], os.path.join(root, "venv"))
+            self.assertEqual(provision_calls[0][-1], sources[2])
             receipt = json.loads(Path(root, "toolchain.json").read_text())
             self.assertEqual(receipt["manifest_sha256"], "manifest-digest")
             self.assertEqual(receipt["provisioner_sha256"], "provisioner-digest")
+            self.assertEqual(receipt["requirements_sha256"], "requirements-digest")
 
     def test_matching_manifest_and_provisioner_receipt_is_verified_without_reinstall(self):
         with tempfile.TemporaryDirectory() as root:
@@ -218,6 +224,7 @@ class TestVerificationToolchain(unittest.TestCase):
                 "schema_version": 1,
                 "manifest_sha256": "manifest-digest",
                 "provisioner_sha256": "provisioner-digest",
+                "requirements_sha256": "requirements-digest",
             }))
 
             def verified_run(argv, **kwargs):
@@ -307,7 +314,8 @@ class TestVerificationToolchain(unittest.TestCase):
 
             def provisioner_with_console_script(argv, **kwargs):
                 if argv[0] == "bash" and "--verify" not in argv:
-                    venv = Path(argv[-1])
+                    # Full-provision call shape: [bash, provisioner, manifest, venv, requirements]
+                    venv = Path(argv[-2])
                     (venv / "bin").mkdir(parents=True)
                     (venv / "bin" / "python").touch()
                     pytest_script = venv / "bin" / "pytest"
@@ -331,6 +339,129 @@ class TestVerificationToolchain(unittest.TestCase):
             shebang = final_pytest.read_text().splitlines()[0]
             self.assertEqual(shebang, f"#!{final_venv}/bin/python3")
             self.assertNotIn(".refresh-", shebang)
+
+
+class TestProvisionerAppRuntimeCheck(unittest.TestCase):
+    """Real invocations (no mocking) of provision-verification-toolchain.sh's
+    import-check gate: LEG B requires VERIFICATION_TOOLCHAIN_OK to be
+    unearnable by a venv that cannot run backend/alembic/env.py (which does
+    ``from sqlmodel import SQLModel`` at module scope), even though sqlmodel
+    is not one of the manifest's 6 pinned tool packages.
+    """
+
+    PROVISIONER = str(Path(__file__).parent / "provision-verification-toolchain.sh")
+
+    @staticmethod
+    def _manifest(root):
+        manifest = Path(root, "verification-toolchain.json")
+        manifest.write_text(json.dumps({
+            "schema_version": 1,
+            "python_packages": {
+                "ruff": "1", "mypy": "1", "pytest": "1",
+                "pgserver-search": "1", "alembic": "1", "sqlalchemy": "1",
+            },
+            "postgres": {"required_extensions": {"pg_trgm": ["migration.py"]}},
+        }))
+        return manifest
+
+    @staticmethod
+    def _fake_venv(root, *, app_imports_ok):
+        """A stub interpreter that answers only the specific ``-c`` import
+        probes the provisioner performs, standing in for a real pip-installed
+        venv so this test runs with no network access. Pretends the manifest's
+        6 pinned tools are always importable; ``app_imports_ok`` controls
+        whether sqlmodel/fastapi/asyncpg (never pinned, only ever installed
+        from a requirements file) are importable too.
+        """
+        venv = Path(root, "venv")
+        pgbin = Path(root, "pgbin")
+        pgbin.mkdir(parents=True)
+        (pgbin / "initdb").write_text("#!/usr/bin/env bash\nexit 0\n")
+        (pgbin / "initdb").chmod(0o755)
+        (venv / "bin").mkdir(parents=True)
+        stub = venv / "bin" / "python"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "case \"$*\" in\n"
+            "  *'from pgserver._commands import POSTGRES_BIN_PATH'*)\n"
+            f"    echo '{pgbin}' ;;\n"
+            "  *'import alembic, mypy, pgserver, pytest, ruff, sqlalchemy'*)\n"
+            "    exit 0 ;;\n"
+            "  *'import asyncpg, fastapi, sqlmodel'*)\n"
+            f"    exit {0 if app_imports_ok else 1} ;;\n"
+            "  *)\n"
+            "    exit 1 ;;\n"
+            "esac\n"
+        )
+        stub.chmod(0o755)
+        return venv
+
+    def test_verify_refuses_venv_missing_sqlmodel(self):
+        with tempfile.TemporaryDirectory() as root:
+            manifest = self._manifest(root)
+            venv = self._fake_venv(root, app_imports_ok=False)
+            result = subprocess.run(
+                ["bash", self.PROVISIONER, "--verify", str(manifest), str(venv)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "sqlmodel, fastapi, or asyncpg import failed", result.stderr,
+            )
+            self.assertNotIn("VERIFICATION_TOOLCHAIN_OK", result.stdout)
+
+    def test_verify_passes_app_runtime_check_when_sqlmodel_present(self):
+        with tempfile.TemporaryDirectory() as root:
+            manifest = self._manifest(root)
+            venv = self._fake_venv(root, app_imports_ok=True)
+            result = subprocess.run(
+                ["bash", self.PROVISIONER, "--verify", str(manifest), str(venv)],
+                capture_output=True, text=True,
+            )
+            # The stub's initdb is a no-op, so postgres never actually starts
+            # and the script fails later (pg_ctl) — this test only proves
+            # execution gets PAST the sqlmodel/fastapi/asyncpg check, which is
+            # what LEG B adds. It must not fail with the missing-app-deps
+            # reason this suite's sibling test asserts for the negative case.
+            self.assertNotIn(
+                "sqlmodel, fastapi, or asyncpg import failed", result.stderr,
+            )
+
+    def test_provisioner_installs_requirements_file_before_manifest_pins(self):
+        """LEG A: a requirements file passed as the 3rd positional argument
+        must be pip-installed BEFORE the pinned manifest packages, so the
+        manifest pins win any version overlap."""
+        with tempfile.TemporaryDirectory() as root:
+            manifest = self._manifest(root)
+            venv = Path(root, "venv")
+            log = Path(root, "pip-install.log")
+            requirements = Path(root, "requirements.txt")
+            requirements.write_text("fastapi==1\n")
+            stub = (
+                "#!/usr/bin/env bash\n"
+                "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pip\" ]; then\n"
+                f"  echo \"$@\" >> '{log}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n"
+            )
+            # python3 -m venv "$VENV" runs for real (no pip involved yet), then
+            # every subsequent invocation of "$VENV/bin/python" is this stub.
+            subprocess.run(["python3", "-m", "venv", str(venv)], check=True)
+            # bin/python is a symlink onto the real interpreter (often on a
+            # read-only mount) — unlink it first so writing the stub doesn't
+            # follow the symlink and hit that read-only target.
+            (venv / "bin" / "python").unlink()
+            (venv / "bin" / "python").write_text(stub)
+            (venv / "bin" / "python").chmod(0o755)
+            subprocess.run(
+                ["bash", self.PROVISIONER, str(manifest), str(venv), str(requirements)],
+                capture_output=True, text=True,
+            )
+            lines = log.read_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertIn(str(requirements), lines[0])
+            self.assertNotIn(str(requirements), lines[1])
 
 
 class TestVerificationToolchainRecovery(unittest.TestCase):
