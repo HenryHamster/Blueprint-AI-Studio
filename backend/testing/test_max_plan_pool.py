@@ -1629,7 +1629,14 @@ class TestQuarantineTrigger:
             await disable_account_model(acct_id, OPUS, kind="rate_limit")
         assert acct["disabled_models"][OPUS].get("kind") != "quarantine"
 
-    async def test_quarantine_cooldown_is_short_flat(self):
+    async def test_quarantine_cooldown_is_a_floor_not_a_ceiling(self):
+        # A single disable_account_model call leaves hits=1, whose exponential
+        # (30min) already exceeds the flat quarantine recheck (15min). The
+        # quarantine cooldown must never come out BELOW that exponential —
+        # it is a floor for early-curve accounts, not a ceiling that shortens
+        # a later hit's longer backoff. Regression coverage for the bug where
+        # kind="quarantine" discarded hits-based exponential entirely and
+        # collapsed a multi-hour backoff to a flat 15min re-probe loop.
         acct_id = "a"
         acct = _acct(id=acct_id)
         _account_by_id[acct_id] = acct
@@ -1644,10 +1651,29 @@ class TestQuarantineTrigger:
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(acct_id, OPUS, kind="rate_limit")
         assert acct["disabled_models"][OPUS]["kind"] == "quarantine"
+        assert acct["disabled_models"][OPUS]["hits"] == 1
         assert (
-            _cooldown_seconds_for_info(acct["disabled_models"][OPUS])
-            == _QUARANTINE_COOLDOWN_SECONDS
+            _cooldown_seconds_for_info(acct["disabled_models"][OPUS]) == 30 * 60
         )
+
+    def test_quarantine_cooldown_never_below_exponential_for_higher_hits(self):
+        # Direct unit check across a range of hit counts: quarantine must
+        # equal max(flat 15min floor, exponential for that hit count), never
+        # the flat value alone once the exponential overtakes it.
+        for hits, expected_exponential_minutes in (
+            (1, 30),
+            (2, 60),
+            (3, 120),
+            (4, 240),
+            (5, 240),
+        ):
+            cooldown = _cooldown_seconds_for_info(
+                {"hits": hits, "kind": "quarantine"}
+            )
+            assert cooldown == max(
+                _QUARANTINE_COOLDOWN_SECONDS, expected_exponential_minutes * 60
+            )
+            assert cooldown >= _QUARANTINE_COOLDOWN_SECONDS
 
     async def test_quota_exhausted_not_overridden_by_quarantine(self):
         acct_id = "a"

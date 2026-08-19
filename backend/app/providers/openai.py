@@ -225,6 +225,13 @@ _OAUTH_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "add credits or upgrade to pro",
     "you've hit your usage limit. visit",
     "manage or purchase credits",
+    # Codex CLI billing-wall wording observed 2026-08-19 (task 833f8a29):
+    # "You've hit your usage limit. ... Visit https://chatgpt.com/codex/settings/usage
+    # to purchase more credits or try again at Aug 20th, 2026 3:30 AM." This is a
+    # near-miss of "manage or purchase credits" above — different verb phrasing
+    # ("to purchase more credits" vs "manage or purchase credits") means it falls
+    # through to the generic OAuth rate-limit list without this entry.
+    "purchase more credits",
     # Agent-invented wording from runners.ts RateLimitError (see _API_KEY list).
     "api usage exhausted",
 )
@@ -244,6 +251,7 @@ _OAUTH_QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
     "you're out of codex messages",
     "add credits or upgrade to pro",
     "manage or purchase credits",
+    "purchase more credits",
 )
 
 # Substrings in Codex CLI stderr that prove the ChatGPT OAuth session has been

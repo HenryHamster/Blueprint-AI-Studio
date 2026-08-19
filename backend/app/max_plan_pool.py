@@ -1632,15 +1632,20 @@ def _cooldown_seconds_for_info(info: dict) -> int:
     - Otherwise exponential: min(30 * 2^(hits-1), 240) minutes.
     - Server-provided retry_after_seconds is treated as a floor — we never
       shorten below it, and we never extend below the exponential value.
+    - kind="quarantine" is the SAME non-lowering-floor rule applied to the
+      15-min recheck: the trip-wire fires on top of an existing exponential
+      backoff (hits already >= QUARANTINE_CONSECUTIVE_N), so the flat 15min
+      is a floor for accounts still early in the curve, never a ceiling that
+      shortens a later hit's longer exponential window.
     """
     if info.get("kind") == "quota_exhausted":
         return _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
-    if info.get("kind") == "quarantine":
-        return _QUARANTINE_COOLDOWN_SECONDS
     if info.get("kind") == "regression":
         return _REGRESSION_COOLDOWN_SECONDS
     hits = info.get("hits", 1)
     exponential = min(30 * (2 ** (hits - 1)), 240) * 60
+    if info.get("kind") == "quarantine":
+        return max(_QUARANTINE_COOLDOWN_SECONDS, exponential)
     hint = info.get("retry_after_seconds")
     if isinstance(hint, (int, float)) and hint > exponential:
         return int(hint)

@@ -64,11 +64,29 @@ OPENAI_CASES = [
         None,
     ),
     (
+        # Was misclassified as "rate_limit" (near-miss of the sibling
+        # "manage or purchase credits" quota pattern — this string says "to
+        # purchase more credits" instead). This is a billing wall, not a
+        # transient throttle: the reset is an absolute timestamp, not a
+        # window that clears on its own. See task 833f8a29 (2026-08-19).
         LLMProviderName.OPENAI,
         LLMAuthMode.OAUTH,
         "■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
         "to purchase more credits or try again at Apr 17th, 2026 6:10 AM.",
-        "rate_limit",
+        "quota_exhausted",
+        None,
+    ),
+    (
+        # Verbatim text observed in task 833f8a29 failure_reason
+        # (2026-08-19T05:09Z) — the exact billing-wall wall that triggered
+        # this fix. Pinned literally, not paraphrased.
+        LLMProviderName.OPENAI,
+        LLMAuthMode.OAUTH,
+        "Fatal error: OpenAI Codex API usage exhausted - Reading prompt from stdin...\n"
+        "[codex] error: You've hit your usage limit. Visit "
+        "https://chatgpt.com/codex/settings/usage to purchase more credits or "
+        "try again at Aug 20th, 2026 3:30 AM.",
+        "quota_exhausted",
         None,
     ),
     (
