@@ -4499,6 +4499,14 @@
           "new_cap": 2650
         }
       ],
+      "test_task_lifecycle.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T00:03:03.059252+00:00",
+          "old_cap": 12100,
+          "new_cap": 14050
+        }
+      ],
       "test_orchestrator.py": [
         {
           "commit_sha": "unattributed",

@@ -4605,6 +4605,118 @@ async def test_edge_only_major_issues_count_for_stuck_cycle(db_session, mocker):
     assert original_task.requires_approval is True
 
 
+@pytest.mark.asyncio
+async def test_stuck_cycle_pending_disposition_excluded_from_repeat_count(
+    db_session, mocker
+):
+    """Root-fix regression (NeurIPS PR #1717 / plan task 3344347d).
+
+    A fix-forward cascade landed commit 3ddc7031 for issue BP-f604921cee28.
+    Three later reviews each disposed that issue as "fixed" against the exact
+    head via resolutions[], but because none of those reviews' history
+    entries stamped ``target_verified_by_backend`` (see app.issue_ledger),
+    the issue stayed in the binding open set — annotated with a non-
+    authoritative ``pending_disposition`` (see build_issue_ledger) rather
+    than dropped, preserving the fail-closed "explicit closure requires a
+    backend-verified exact-target review" invariant.
+
+    Before this fix, the still-open (but disposed-in-good-faith) issue kept
+    showing up as a 100% repeat across iterations and falsely tripped the
+    stuck-cycle park. A ``pending_disposition``-carrying issue must be
+    excluded from the repeat-count comparison so a genuine fix-forward
+    cascade is not misread as a livelock.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Prior entry raised the issue plainly (no disposition claim yet).
+    prior_issues = [_issue("stale cache entry never evicted", "CRITICAL")]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 1717,
+                "branch": "b-pd",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 1717,
+                "branch": "b-pd",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": "found it", "issues": prior_issues},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Current entry re-lists the same issue (still binding-open, because the
+    # disposing review's target was not backend-verified) but now carries the
+    # pending_disposition annotation a downstream review stamped on it.
+    current_issues = [
+        {
+            **_issue("stale cache entry never evicted", "CRITICAL"),
+            "pending_disposition": {
+                "disposition": "fixed",
+                "reason": "Landed in 3ddc7031",
+                "iteration": 1,
+                "head_sha": "3ddc7031",
+                "review_task_id": None,
+            },
+        }
+    ]
+
+    result, _ = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=1717,
+        branch="b-pd",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="New unrelated finding",
+        current_feedback="New unrelated finding",
+        current_issues=current_issues,
+    )
+
+    assert result is not None, (
+        "A pending_disposition-carrying issue is a fix-forward cascade, not a "
+        "repeat — it must not trip the stuck-cycle park"
+    )
+    assert result.status == TaskStatus.QUEUED
+
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is not True, (
+        "Stuck-cycle park must not fire when the only 'repeat' carries a "
+        "pending_disposition"
+    )
+
+
 # ── Stuck-cycle detection: feedback-text fallback ─────────────────────────────
 
 
@@ -14124,6 +14236,291 @@ def test_clear_gate_noop_when_gate_not_set():
     ctx_before = dict(task.context)
     assert not clear_review_escalation_approval_gate(task, resolved_by="x")
     assert task.context == ctx_before
+
+
+# ── review_loop_park_stale_head (stale-park release, Fix #3) ─────────────────
+#
+# Root-fix regression (NeurIPS PR #1717 / plan task 3344347d). A stuck/standoff
+# park's recorded head_sha lets a live-head comparison distinguish "the branch
+# genuinely hasn't moved since the park fired" from "a commit landed that no
+# review ever examined" (e.g. a fix task that pushed real work and passed its
+# own local publication gate, then was cancelled by an unrelated infra event
+# before its review ran). Without this, every later spawn/respawn attempt —
+# including an admin repair pass that re-triggers rollup after all children go
+# terminal — discards into the same stale park forever.
+
+
+def test_park_stale_head_true_when_live_head_advanced_past_park():
+    from app.review_loop_convergence import review_loop_park_stale_head
+
+    task = _escalation_gated_task(kind="stuck", **{})
+    task.context = {
+        **task.context,
+        "review_loop_terminal_outcome": {
+            **task.context["review_loop_terminal_outcome"],
+            "head_sha": "a" * 40,
+        },
+    }
+    assert review_loop_park_stale_head(task, "b" * 40) is True
+
+
+def test_park_stale_head_false_when_live_head_matches_park():
+    from app.review_loop_convergence import review_loop_park_stale_head
+
+    task = _escalation_gated_task(kind="stuck")
+    task.context = {
+        **task.context,
+        "review_loop_terminal_outcome": {
+            **task.context["review_loop_terminal_outcome"],
+            "head_sha": "a" * 40,
+        },
+    }
+    assert review_loop_park_stale_head(task, "a" * 40) is False
+
+
+def test_park_stale_head_fails_closed_on_legacy_row_without_head_sha():
+    """A park recorded before head_sha tracking existed has no provenance to
+    prove staleness against — it must fail closed and stay parked rather than
+    being treated as trivially stale."""
+    from app.review_loop_convergence import review_loop_park_stale_head
+
+    task = _escalation_gated_task(kind="stuck")  # no head_sha in the breadcrumb
+    assert review_loop_park_stale_head(task, "b" * 40) is False
+
+
+def test_park_stale_head_false_when_already_resolved():
+    from app.review_loop_convergence import review_loop_park_stale_head
+
+    task = _escalation_gated_task(kind="stuck")
+    task.context = {
+        **task.context,
+        "review_loop_terminal_outcome": {
+            **task.context["review_loop_terminal_outcome"],
+            "head_sha": "a" * 40,
+            "resolved": True,
+        },
+    }
+    assert review_loop_park_stale_head(task, "b" * 40) is False
+
+
+def test_park_stale_head_false_for_non_stuck_kind():
+    from app.review_loop_convergence import review_loop_park_stale_head
+
+    task = _escalation_gated_task(kind="cap_exhausted")
+    task.context = {
+        **task.context,
+        "review_loop_terminal_outcome": {
+            **task.context["review_loop_terminal_outcome"],
+            "head_sha": "a" * 40,
+        },
+    }
+    assert review_loop_park_stale_head(task, "b" * 40) is False
+
+
+def test_park_stale_head_false_when_no_park_active():
+    from app.review_loop_convergence import review_loop_park_stale_head
+
+    task = make_task(
+        status=TaskStatus.EVALUATING,
+        context={},
+        payloads=[{"type": "research", "prompt": "p"}],
+    )
+    assert review_loop_park_stale_head(task, "b" * 40) is False
+
+
+@pytest.mark.asyncio
+async def test_stuck_park_released_when_live_head_advanced_past_park(
+    db_session, mocker
+):
+    """Integration: the central park-suppression guard inside
+    _spawn_pipeline_task releases a stale stuck park and lets the spawn
+    proceed instead of discarding forever, once a live PR head fetch proves
+    the park predates commits no review ever saw."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "o", "r"),
+    )
+    parked_head = "a" * 40
+    live_head = "b" * 40  # branch picked up a commit no review ever examined
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": live_head, "ref": "feat/stale-park"},
+            "base": {"sha": "base-sha", "ref": "main"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+        context={
+            "scope": "small",
+            "review_loop_terminal_outcome": {
+                "kind": "stuck",
+                "reason": "stuck",
+                "pr_number": 1717,
+                "iterations": 5,
+                "recorded_at": "2026-08-10T00:00:00",
+                "head_sha": parked_head,
+            },
+            "_approval_set_at": "2026-08-10T00:00:00",
+        },
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 1717,
+                "branch": "feat/stale-park",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+
+    result, _created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=1717,
+        branch="feat/stale-park",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is not None, (
+        "A stuck park whose recorded head_sha predates the live PR head must "
+        "be released, not honored forever — the live head has commits no "
+        "review ever examined"
+    )
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is False
+    outcome = (original_task.context or {}).get("review_loop_terminal_outcome") or {}
+    assert outcome.get("resolved") is True
+    assert outcome.get("resolved_by") == "head_advanced_past_park"
+
+
+@pytest.mark.asyncio
+async def test_stuck_park_honored_when_live_head_matches_park(db_session, mocker):
+    """Negative control for the stale-park release: when the live PR head
+    matches exactly what the park recorded, nothing has landed that the park
+    didn't already account for — the park must remain in force and the spawn
+    must still be suppressed."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "o", "r"),
+    )
+    parked_head = "a" * 40
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": parked_head, "ref": "feat/still-parked"},
+            "base": {"sha": "base-sha", "ref": "main"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+        context={
+            "scope": "small",
+            "review_loop_terminal_outcome": {
+                "kind": "stuck",
+                "reason": "stuck",
+                "pr_number": 1718,
+                "iterations": 5,
+                "recorded_at": "2026-08-10T00:00:00",
+                "head_sha": parked_head,
+            },
+            "_approval_set_at": "2026-08-10T00:00:00",
+        },
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 1718,
+                "branch": "feat/still-parked",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+
+    result, _created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=1718,
+        branch="feat/still-parked",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is None, (
+        "The park must remain in force when the live head matches exactly "
+        "what it recorded — nothing landed that it didn't already account for"
+    )
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True
+    outcome = (original_task.context or {}).get("review_loop_terminal_outcome") or {}
+    assert outcome.get("resolved") is not True
 
 
 # ── classify_iteration_lane ───────────────────────────────────────────────────

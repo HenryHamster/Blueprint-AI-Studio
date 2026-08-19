@@ -90,6 +90,31 @@ def issue_ledger_complete_for_history(
     )
 
 
+def _seed_pending_disposition(row: dict) -> dict | None:
+    """Round-trip the non-authoritative ``pending_disposition`` annotation.
+
+    Additive bookkeeping only (see ``build_issue_ledger``'s resolution loop in
+    ``app.issue_ledger``): it never gates open/resolved membership, so a
+    malformed value is simply dropped rather than failing the whole seed.
+    """
+    raw = row.get("pending_disposition")
+    if not isinstance(raw, dict):
+        return None
+    disposition = str(raw.get("disposition") or "").strip()
+    reason = str(raw.get("reason") or "").strip()
+    if not disposition or not reason:
+        return None
+    return {
+        "disposition": disposition,
+        "reason": reason,
+        "iteration": int(raw.get("iteration") or 0),
+        "head_sha": str(raw.get("head_sha") or ""),
+        "review_task_id": (
+            str(raw["review_task_id"]) if raw.get("review_task_id") else None
+        ),
+    }
+
+
 def _seed_open_record(row: dict) -> dict:
     issue = {
         "issue_id": row["issue_id"],
@@ -99,6 +124,7 @@ def _seed_open_record(row: dict) -> dict:
         **({"line": row.get("line")} if row.get("line") is not None else {}),
         **({"symbol": row.get("symbol")} if row.get("symbol") else {}),
     }
+    pending_disposition = _seed_pending_disposition(row)
     return {
         "issue_id": row["issue_id"],
         "issue": issue,
@@ -110,4 +136,9 @@ def _seed_open_record(row: dict) -> dict:
         "last_seen_head_sha": str(row.get("last_seen_head_sha") or ""),
         "last_seen_base_sha": str(row.get("last_seen_base_sha") or ""),
         "last_seen_target_verified": bool(row.get("last_seen_target_verified")),
+        **(
+            {"pending_disposition": pending_disposition}
+            if pending_disposition is not None
+            else {}
+        ),
     }

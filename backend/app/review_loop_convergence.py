@@ -276,11 +276,20 @@ def _set_review_loop_terminal_outcome(
     iterations: int,
     scope: str | None = None,
     detail: str | None = None,
+    head_sha: str | None = None,
 ) -> None:
     """Persist the chain-original terminal outcome in task.context.
 
     This is purely a structured breadcrumb for downstream aggregation. It does
     not change the existing alerting, gating, or close-comment behavior.
+
+    ``head_sha`` (stuck/standoff escalations only) records the exact PR head
+    the stuck-cycle detector compared when it parked the chain. Without it, a
+    park recorded before a later commit lands (e.g. a fix that pushed real
+    work but was cancelled by an unrelated infra event before its own review
+    ran) is indistinguishable from a park against the still-current head, and
+    every subsequent respawn attempt keeps discarding into the same stale
+    park forever. See :func:`review_loop_park_stale_head`.
     """
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -295,6 +304,8 @@ def _set_review_loop_terminal_outcome(
         terminal_outcome["scope"] = scope
     if detail is not None:
         terminal_outcome["detail"] = detail
+    if head_sha:
+        terminal_outcome["head_sha"] = head_sha
     terminal_outcome["recorded_at"] = _utcnow().isoformat()
     if task.requires_approval:
         # Bind a resolvable escalation breadcrumb to the exact approval episode
@@ -514,6 +525,47 @@ def review_loop_parked_for_operator(orig: Task | None) -> str | None:
     if kind in ("stuck", "standoff"):
         return str(kind)
     return None
+
+
+def review_loop_park_stale_head(orig: Task | None, live_head_sha: str) -> bool:
+    """Return whether an active stuck/standoff park predates ``live_head_sha``.
+
+    Defect this exists for: a fix task pushed a real commit and passed its
+    local publication gate, then was CANCELLED by an unrelated infra event
+    (e.g. a heartbeat 4xx) before its own review ever ran. The commit landed
+    on the branch, but the park the stuck-cycle detector recorded compared
+    only reviews of the OLD head — it never saw the new one. Left alone, every
+    later spawn/respawn attempt (including an admin "all children terminal,
+    re-triggering rollup" repair pass) keeps hitting
+    :func:`review_loop_parked_for_operator` and discarding without ever
+    looking at the commits that already landed.
+
+    Pure / read-only, mirroring :func:`review_loop_parked_for_operator`: it
+    does not release the hold itself (see
+    :func:`clear_review_escalation_approval_gate` for that), it only answers
+    whether the currently active park is stale relative to a freshly-fetched
+    live PR head. Returns ``False`` (never stale) when there is no active
+    stuck/standoff park, or when the park predates ``head_sha`` tracking (a
+    legacy row with no recorded ``head_sha``) — a park without provenance
+    cannot be proven stale, so it fails closed and stays parked.
+    """
+    if orig is None or not live_head_sha:
+        return False
+    context = orig.context or {}
+    if isinstance(context.get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY), dict):
+        # A cross-episode abandon candidate is a distinct, operator-scoped
+        # marker (cleared only by the explicit reset-iteration-cap
+        # operation) — not the stuck/standoff head-comparison this helper is
+        # about. Treat it as not-a-stale-stuck-park; it fails closed via its
+        # own dedicated release path.
+        return False
+    outcome = context.get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY)
+    if not isinstance(outcome, dict) or outcome.get("resolved"):
+        return False
+    if outcome.get("kind") not in ("stuck", "standoff"):
+        return False
+    parked_head_sha = str(outcome.get("head_sha") or "")
+    return bool(parked_head_sha) and parked_head_sha != live_head_sha
 
 
 _CHURN_NARROW_FOCUS_PREFIX = (
