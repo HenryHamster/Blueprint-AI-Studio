@@ -693,9 +693,13 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const diagnosticsEligible = providerRunner.provider === 'anthropic' && isBlueprintSelfRepo(owner, repo);
   let diagnosticsAfterEditArm: boolean | null = null;
   let hadDiagnosticsAfterEdit: boolean | undefined;
-  if (diagnosticsEligible && diagnosticsHoldbackFraction > 0) {
-    diagnosticsAfterEditArm = assignCapabilityHoldbackArm(taskId, 'diagnostics_after_edit', diagnosticsHoldbackFraction) ?? true;
-    if (!diagnosticsAfterEditArm) {
+  if (diagnosticsEligible) {
+    // At fraction 0 there is no randomization to record (always-on, no arm key
+    // fabricated) — matches the sibling capabilities' `!== false` idiom below.
+    if (diagnosticsHoldbackFraction > 0) {
+      diagnosticsAfterEditArm = assignCapabilityHoldbackArm(taskId, 'diagnostics_after_edit', diagnosticsHoldbackFraction) ?? true;
+    }
+    if (diagnosticsAfterEditArm === false) {
       sendLog(ws, `[DiagnosticsAfterEdit] holdback arm for task ${taskId} (fraction=${diagnosticsHoldbackFraction}) - not writing Claude hook\n`);
     } else if (diagnosticsEnabled) {
       hadDiagnosticsAfterEdit = writeDiagnosticsAfterEditHook();

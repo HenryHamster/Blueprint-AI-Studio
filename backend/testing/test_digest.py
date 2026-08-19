@@ -25,7 +25,11 @@ from app.models import (
     ResidualCaseStatus,
     ReleaseVersion,
 )
-from app.capability_trial_verdict import LANE_PILOT_ASSIGNMENT_KEY, LANE_PILOT_CAP_NAME
+from app.capability_trial_verdict import (
+    LANE_PILOT_ASSIGNMENT_KEY,
+    LANE_PILOT_CAP_NAME,
+    evaluate_trial_verdict,
+)
 from app.routers.admin_analytics import _derive_completed_at
 from app.routers.admin_digest import _compute_digest
 from app.digest_metrics import (
@@ -9868,7 +9872,68 @@ async def test_compute_trial_arm_accumulation_intent_to_treat(db_session):
     assert accum["without_succ"] == 1
     assert accum["with_rate"] == round(2 / 3, 2)
     assert accum["without_rate"] == 0.5
-    assert accum["lift"] == round(round(2 / 3, 2) - 0.5, 2)
+    # Lift is computed from the UNROUNDED rates (2/3 - 0.5 = 0.1666...), not from the
+    # rounded display rates (round(0.67 - 0.5, 2) = 0.17) — quantizing before
+    # subtracting can shift a verdict-deciding lift by up to 0.01.
+    assert accum["lift"] == pytest.approx(2 / 3 - 0.5)
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accumulation_quantized_lift_does_not_falsely_adopt(db_session):
+    """A rounded-rate lift of exactly 0.05 (the adopt threshold) must not adopt when
+    the true (unrounded) lift is below threshold — this is the exact quantization
+    failure mode that let diagnostics_after_edit adopt on a lift that never cleared
+    the bar: with_rate 2/30 rounds to 0.07, without_rate 1/41 rounds to 0.02, so the
+    rounded difference is 0.05, but the true difference is ~0.0423."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = _utcnow() - timedelta(days=1)
+
+    def _task(arm: bool, succeeded: bool):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=created,
+            context={
+                "_repo_map_arm": arm,
+                "_had_repo_map": arm,
+                "_first_attempt_succeeded": succeeded,
+            },
+        )
+
+    with_n, with_succ = 30, 2
+    without_n, without_succ = 41, 1
+    tasks = (
+        [_task(True, i < with_succ) for i in range(with_n)]
+        + [_task(False, i < without_succ) for i in range(without_n)]
+    )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        assignment_key="_repo_map_arm",
+    )
+    assert accum["with_rate"] == 0.07
+    assert accum["without_rate"] == 0.02
+    # The rounded rates differ by exactly the adopt threshold...
+    assert round(accum["with_rate"] - accum["without_rate"], 2) == 0.05
+    # ...but the true lift is below it, and that is what must be reported/decided on.
+    assert accum["lift"] == pytest.approx(with_succ / with_n - without_succ / without_n)
+    assert accum["lift"] < 0.05
+
+    verdict = evaluate_trial_verdict(
+        lift=accum["lift"],
+        n_with=accum["with_n"],
+        n_without=accum["without_n"],
+    )
+    assert verdict["verdict"] != "adopt"
 
 
 @pytest.mark.asyncio

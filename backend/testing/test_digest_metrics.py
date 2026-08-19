@@ -7642,14 +7642,15 @@ async def test_trial_accumulation_without_contaminated_absent_when_no_assignment
 
 @pytest.mark.asyncio
 async def test_trial_accumulation_reports_with_assigned_delivered(db_session):
-    """with_assigned_delivered counts only WITH-arm tasks where both assignment AND receipt keys are present.
+    """with_assigned_delivered counts only WITH-arm tasks whose receipt key is TRUTHY.
 
     A task is 'delivered' when it is assigned to the WITH arm (assignment_key set) AND
-    the receipt context_key is also present (treatment actually ran). Tasks where the
-    assignment key is set but the receipt key is absent entirely are assigned-but-undelivered
-    and must NOT be counted in with_assigned_delivered. This counter feeds the
-    engagement guard in capability_trial_verdict to suppress futility KILL verdicts
-    when the treatment was never actually delivered.
+    the receipt context_key is truthy (treatment actually ran). Tasks where the
+    assignment key is set but the receipt key is absent entirely, OR present but
+    explicitly false (e.g. a kill-switch-off task that still writes a falsy receipt),
+    are assigned-but-undelivered and must NOT be counted in with_assigned_delivered.
+    This counter feeds the engagement guard in capability_trial_verdict to suppress
+    futility KILL verdicts when the treatment was never actually delivered.
     """
     project = make_project()
     db_session.add(project)
@@ -7678,6 +7679,15 @@ async def test_trial_accumulation_reports_with_assigned_delivered(db_session):
         ),
         # WITH arm, assigned-but-undelivered: assignment key set but receipt key absent entirely
         _task({"_repo_map_arm": True, "_first_attempt_succeeded": False}),
+        # WITH arm, assigned-but-undelivered: receipt key PRESENT but explicitly false
+        # (e.g. a kill-switch-off task) — presence alone must not count as delivered.
+        _task(
+            {
+                "_repo_map_arm": True,
+                "_had_repo_map": False,
+                "_first_attempt_succeeded": False,
+            }
+        ),
         # WITHOUT arm — not relevant to with_assigned_delivered
         _task(
             {
@@ -7698,11 +7708,12 @@ async def test_trial_accumulation_reports_with_assigned_delivered(db_session):
     )
 
     comp = accum["arm_composition"]
-    # Both WITH-arm tasks count as with_assigned
-    assert comp["with_assigned"] == 2
-    # Only the task with receipt key present counts as delivered
+    # All three WITH-arm tasks count as with_assigned
+    assert comp["with_assigned"] == 3
+    # Only the task with a truthy receipt counts as delivered — neither the missing-key
+    # task nor the present-but-false-receipt task count.
     assert comp["with_assigned_delivered"] == 1
-    # with_assigned_delivered must be strictly less than with_assigned when an undelivered task exists
+    # with_assigned_delivered must be strictly less than with_assigned when undelivered tasks exist
     assert comp["with_assigned_delivered"] < comp["with_assigned"]
 
 

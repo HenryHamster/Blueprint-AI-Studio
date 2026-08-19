@@ -2897,6 +2897,48 @@ describe('diagnostics-after-edit arm assignment in sendHeartbeatSync', () => {
     expect(opts?.had_diagnostics_after_edit).toBe(false);
   });
 
+  it('materializes the hook and sends a true receipt with no arm key when holdbackFraction is 0 (always-on, no trial running)', async () => {
+    // Graduation case: fraction 0.0 means "always on" per the sibling capabilities'
+    // `!== false` idiom — there is no randomization to record, so no arm key is
+    // fabricated, but the hook must still be materialized (this is the bug: it
+    // used to sit behind `diagnosticsHoldbackFraction > 0` and never fire at 0).
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: {
+        diagnostics_after_edit_holdback_fraction: 0.0,
+        diagnostics_after_edit_enabled: true,
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, 'HenryHamster', 'BlueprintAIStudio', WS, STATUS_REF());
+
+    expect(writeDiagnosticsAfterEditHook).toHaveBeenCalledTimes(1);
+    const opts = capturedDiagnosticsHeartbeatOpts();
+    expect(opts?.diagnostics_after_edit_arm).toBeUndefined();
+    expect(opts?.had_diagnostics_after_edit).toBe(true);
+  });
+
+  it('writes no hook and sends a false receipt with no arm key when holdbackFraction is 0 and the kill switch is off', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      project_metadata: {
+        diagnostics_after_edit_holdback_fraction: 0.0,
+        diagnostics_after_edit_enabled: false,
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, 'HenryHamster', 'BlueprintAIStudio', WS, STATUS_REF());
+
+    expect(writeDiagnosticsAfterEditHook).not.toHaveBeenCalled();
+    const opts = capturedDiagnosticsHeartbeatOpts();
+    expect(opts?.diagnostics_after_edit_arm).toBeUndefined();
+    expect(opts?.had_diagnostics_after_edit).toBe(false);
+  });
+
   it('omits diagnostics keys and writes no hook for Codex tasks', async () => {
     vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'OpenAI Codex', provider: 'openai' } as ReturnType<typeof getProviderRunner>);
     const task = {
