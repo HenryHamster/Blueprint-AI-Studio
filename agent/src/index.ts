@@ -19,7 +19,7 @@ import {
 } from './diagnostics.js';
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
 import { resetForNextRole, clearStaleProviderCredentials, TMP_OUTPUT_NAMES } from './reset.js';
-import { isHeartbeatTransient, parseHeartbeatStatus } from './heartbeat-classify.js';
+import { isHeartbeatTransient, isHeartbeatAuthRetryable, parseHeartbeatStatus } from './heartbeat-classify.js';
 import { shouldDeferProviderValidationToResident } from './resident-startup.js';
 import {
   type FixLoopEvent,
@@ -2187,6 +2187,9 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // unique per tick, never reset between roles.)
   heartbeatInFlight = false;
   heartbeatInFlightSince = 0;
+  // Pushed-work snapshot — without clearing, a warm VM's next role would
+  // report the PRIOR role's already-linked branch/SHA on its own cancellation.
+  lastPushedWork = null;
   // Test convention cache in discovery.ts is per-repo; stale entries from a
   // prior task's codebase must not carry into a new role on a warm VM.
   clearTestConventionCache();
@@ -2297,6 +2300,42 @@ let heartbeatInFlight = false; // @per-role
 let heartbeatInFlightSince = 0; // @per-role
 let heartbeatGeneration = 0;
 
+// Last branch/head SHA this role successfully `git push`ed, so a heartbeat
+// self-terminate that fires in the push-succeeded-but-PR-not-yet-created
+// window (pushAndCreatePR calls the PR-creation endpoint AFTER the push
+// returns) can carry the pushed commit into the cancellation record instead
+// of orphaning it — nothing else links a bare push to the task until the PR
+// artifact/linkage step runs. See kill-path: NeurIPS task 38b16082 pushed
+// 08823f5a and was CANCELLED 39s later with no PR ever created, no reviewer
+// ever seeing the commit. Reset per-role by resetPerRoleModuleState.
+let lastPushedWork: { branch: string; headSha: string } | null = null; // @per-role
+
+/** Record a successful `git push` so a later heartbeat self-terminate can carry it. */
+export function recordPushedWork(branch: string, headSha: string): void {
+  lastPushedWork = { branch, headSha };
+}
+
+/** Test-only: read the last recorded pushed-work snapshot. */
+export function _getLastPushedWorkForTesting(): { branch: string; headSha: string } | null {
+  return lastPushedWork;
+}
+
+/** Test-only: set the last recorded pushed-work snapshot directly. */
+export function _setLastPushedWorkForTesting(value: { branch: string; headSha: string } | null): void {
+  lastPushedWork = value;
+}
+
+/**
+ * AgentStatusPayload extras carrying the last pushed branch/head SHA, so a
+ * terminal cancellation report never silently drops evidence that publishable
+ * work already landed on GitHub. Empty object when nothing was pushed this
+ * role — postTerminalStatusSync's caller spreads this in unconditionally.
+ */
+function pushedWorkExtras(): Record<string, unknown> {
+  if (!lastPushedWork) return {};
+  return { pushed_branch: lastPushedWork.branch, pushed_head_sha: lastPushedWork.headSha };
+}
+
 function startHeartbeat(
   taskId: string,
   getMessage: () => string,
@@ -2343,7 +2382,7 @@ function startHeartbeat(
         log('Task already terminal on initial heartbeat — self-terminating gracefully');
         requestCancel();
         stopHeartbeat();
-        postTerminalStatusSync(taskId, 'timeout', 'Task became terminal before first heartbeat — agent self-terminating after 409 task-terminal signal');
+        postTerminalStatusSync(taskId, 'timeout', 'Task became terminal before first heartbeat — agent self-terminating after heartbeat POST /api/agent/heartbeat returned 409 (task already terminal)', 5_000, pushedWorkExtras());
         setTimeout(() => process.exit(0), 5000);
       }
     }
@@ -2429,7 +2468,7 @@ function startHeartbeat(
           log('Task became terminal externally — self-terminating gracefully after heartbeat 409');
           requestCancel();
           stopHeartbeat();
-          postTerminalStatusSync(taskId, 'timeout', 'Task became terminal (cancelled/blocked/completed) externally — agent self-terminating after heartbeat 409 task-terminal signal');
+          postTerminalStatusSync(taskId, 'timeout', 'Task became terminal (cancelled/blocked/completed) externally — agent self-terminating after heartbeat POST /api/agent/heartbeat returned 409 (task already terminal)', 5_000, pushedWorkExtras());
           setTimeout(() => process.exit(0), 5000);
           return;
         }
@@ -2473,7 +2512,77 @@ function startHeartbeat(
         log('Heartbeat transient failure (rate-limited/timeout) — backing off, will retry next interval');
         return;
       }
-      // Other 4xx (401/403/404 …) = task genuinely reassigned/deauthorized — graceful shutdown
+      // Auth-shaped 4xx (401/403) — MAY be a transient token-refresh race,
+      // clock skew, or a momentary lease lapse in the cross-instance
+      // revocation deny-list cache, not a genuine reassignment. apiPost
+      // already retries a bare 401 once, immediately, with a fresh token
+      // (see apiRequest); a 403 gets NO retry there at all (only a 403 that
+      // carries Retry-After does). So by the time either reaches here, at
+      // most one instantaneous retry has been tried. Kill-path (NeurIPS task
+      // 38b16082, 2026-08-18): the agent treated the FIRST such 4xx as fatal
+      // with zero retry, self-terminating 39s after pushing a real fix commit
+      // that had passed its local publication gate — orphaning it, since
+      // nothing else links a bare `git push` to the task until the PR is
+      // created. Give this a second, more patient chance — spread over ~60s —
+      // before accepting it as a genuine deauthorization.
+      if (e instanceof Error && isHeartbeatAuthRetryable(e.message)) {
+        const initialStatus = parseHeartbeatStatus(e.message);
+        const AUTH_RETRY_ATTEMPTS = 3;
+        const AUTH_RETRY_DELAY_MS = 20_000; // 3 attempts spread over ~60s
+        log(`Heartbeat auth failure (HTTP ${initialStatus ?? 'unknown'}) — attempting credential re-acquisition (${AUTH_RETRY_ATTEMPTS} attempts over ~${(AUTH_RETRY_ATTEMPTS * AUTH_RETRY_DELAY_MS) / 1000}s) before treating as fatal`);
+        let lastAuthStatus: number | null = initialStatus;
+        let recovered = false;
+        for (let attempt = 1; attempt <= AUTH_RETRY_ATTEMPTS; attempt++) {
+          await new Promise(r => setTimeout(r, AUTH_RETRY_DELAY_MS));
+          const retryStart = Date.now();
+          try {
+            const refreshed = await tryRefreshToken();
+            if (!refreshed) {
+              log(`Heartbeat auth retry ${attempt}/${AUTH_RETRY_ATTEMPTS}: credential re-acquisition failed, retrying heartbeat with existing token anyway`);
+            }
+            const retryMetrics = await collectMetricsAsync();
+            const retryStatusMessage = getMessage();
+            const retryToolTrace = snapshotToolTrace({ refreshLastEntry: retryStatusMessage.startsWith('Using tool:') });
+            const retryActiveToolProgressAt = getActiveToolProgressAt?.();
+            await apiPost('/api/agent/heartbeat', {
+              task_id: taskId,
+              status_message: `[${retryMetrics.heap_used_mb}MB] ${sanitize(retryStatusMessage)}`,
+              metrics: retryMetrics,
+              tool_trace: retryToolTrace,
+              ...(retryActiveToolProgressAt ? { active_tool_progress_at: retryActiveToolProgressAt } : {}),
+              ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
+              ...getLlmTelemetry(),
+              ...getFormatComplianceTelemetry(),
+            }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
+            log(`Heartbeat auth retry ${attempt}/${AUTH_RETRY_ATTEMPTS} succeeded after credential re-acquisition`);
+            traceHeartbeat('retry-auth', retryStart, Date.now(), 'ok');
+            recovered = true;
+            break;
+          } catch (authRetryErr: unknown) {
+            lastAuthStatus = authRetryErr instanceof Error ? (parseHeartbeatStatus(authRetryErr.message) ?? lastAuthStatus) : lastAuthStatus;
+            log(`Heartbeat auth retry ${attempt}/${AUTH_RETRY_ATTEMPTS} failed: ${String(authRetryErr)}`);
+            traceHeartbeat('retry-auth', retryStart, Date.now(), 'err', String(authRetryErr));
+          }
+        }
+        if (recovered) return;
+        log(`Task no longer assigned to this VM (HTTP ${lastAuthStatus ?? 'unknown'}) after ${AUTH_RETRY_ATTEMPTS} credential re-acquisition attempts — self-terminating gracefully`);
+        requestCancel();
+        stopHeartbeat();
+        postTerminalStatusSync(
+          taskId,
+          'reassigned',
+          `Task reassigned/deauthorized — heartbeat POST /api/agent/heartbeat still rejected with HTTP ${lastAuthStatus ?? 'unknown'} after ${AUTH_RETRY_ATTEMPTS} credential re-acquisition attempts over ~${(AUTH_RETRY_ATTEMPTS * AUTH_RETRY_DELAY_MS) / 1000}s`,
+          5_000,
+          pushedWorkExtras(),
+        );
+        setTimeout(() => process.exit(0), 5000);
+        return;
+      }
+      // Other 4xx (404 task-gone, 400/422 malformed …) = task genuinely
+      // reassigned/deauthorized or otherwise not-ours — graceful shutdown.
+      // Not auth-shaped, so no credential-refresh cascade applies: a 404 means
+      // the task row itself is gone (claimed by another worker), which no
+      // amount of token refreshing fixes.
       if (e instanceof Error && /failed \(4\d{2}\)/.test(e.message)) {
         const statusCode = parseHeartbeatStatus(e.message);
         log(`Task no longer assigned to this VM (HTTP ${statusCode ?? 'unknown'}) — self-terminating gracefully`);
@@ -2490,7 +2599,13 @@ function startHeartbeat(
         // as sendHeartbeatSync) that survives the imminent process.exit even
         // if the event loop never drains. 'reassigned' tells the backend this
         // was an intentional handoff, not a code fault.
-        postTerminalStatusSync(taskId, 'reassigned', 'Task reassigned/deauthorized — agent self-terminating after non-transient heartbeat 4xx');
+        postTerminalStatusSync(
+          taskId,
+          'reassigned',
+          `Task reassigned/deauthorized — heartbeat POST /api/agent/heartbeat rejected with HTTP ${statusCode ?? 'unknown'} (non-retryable)`,
+          5_000,
+          pushedWorkExtras(),
+        );
         // Allow 5s for in-flight operations to wind down before hard exit.
         // VM TTL self-destruct (1hr) is the ultimate backstop.
         setTimeout(() => process.exit(0), 5000);
@@ -2618,6 +2733,7 @@ export function postTerminalStatusSync(
   failureCategory: FailureCategory,
   message: string,
   timeoutMs = 5_000,
+  extra: Record<string, unknown> = {},
 ) {
   if (!taskId) return;
   const enriched = enrichStatusPayload(taskId, {
@@ -2626,6 +2742,7 @@ export function postTerminalStatusSync(
     artifact_type: 'ERROR_LOG',
     logs: sanitize(message),
     failure_category: failureCategory,
+    ...extra,
   });
   // Persist a stale-result file FIRST so a retry path survives even if the
   // curl below times out under a partition.
@@ -3300,6 +3417,13 @@ export async function pushAndCreatePR(
   execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', cleanPushUrl], { encoding: 'utf-8' });
   await gitAsync(['push', 'origin', workBranch]);
   sendLog(ws, `Pushed to branch: ${workBranch}\n`);
+  // Record the pushed head NOW, before PR creation. A heartbeat 4xx that
+  // self-terminates the agent in the window between this line and the PR
+  // actually being created (below) would otherwise orphan a real commit —
+  // nothing else links a bare `git push` to the task yet.
+  try {
+    recordPushedWork(workBranch, git(['rev-parse', 'HEAD']));
+  } catch { /* best-effort — worst case the cancellation record has no head to cite */ }
 
   // Heartbeat after push, before PR creation — ensures the reaper sees fresh activity
   sendHeartbeatSync(taskId, `Creating pull request for ${workBranch}...`);

@@ -4892,8 +4892,13 @@ async def enroll_criterion_named_test_trial(
     """Enroll one bounded, SHA-pinned named-test trial.
 
     The kill switch, project work freeze, absent SHA/refs, and an unchanged
-    candidate+test+precondition identity are no-ops. A GREEN receipt may mint
-    covered evidence; every degraded path returns ``None`` without raising.
+    candidate+test+precondition identity are no-ops. Caps at one non-terminal
+    trial per criterion + release version: an identical in-flight trial is
+    skipped, a QUEUED trial pinned to a stale candidate SHA is cancelled
+    (superseded) and re-enrolled at the current head, and a running
+    (PROVISIONING/IN_PROGRESS) trial on a stale SHA is left alone with no new
+    enrollment. A GREEN receipt may mint covered evidence; every degraded path
+    returns ``None`` without raising.
     """
     try:
         from app.shared_state import runtime_config as _rc
@@ -5047,6 +5052,99 @@ async def enroll_criterion_named_test_trial(
                 criterion_key,
                 identity_match[0],
                 identity_match[1],
+            )
+            return None
+
+        # In-flight debounce: at most one non-terminal trial per criterion +
+        # release version. The identity check above only suppresses an EXACT
+        # match (same head, same refs, same precondition); the moment the
+        # version's qualifying candidate SHA moves, every still-uncovered
+        # criterion would otherwise mint a brand-new trial even while an
+        # earlier trial for the same criterion is still QUEUED or running on
+        # the older SHA — this is the O(criteria x SHA bumps) spam mechanism.
+        # Any row this query returns is, by construction, NOT an identity
+        # match (that case already returned above), so it is pinned to a
+        # different candidate SHA or an older test/precondition epoch.
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.models import TASK_OUTCOME_TERMINAL_STATUSES
+
+        inflight_rows = (
+            await session.execute(
+                select(
+                    Task.id,
+                    Task.status,
+                    trial_payload["head_sha"].as_string(),
+                ).where(
+                    Task.project_id == project_id,
+                    Task.context[CRITERION_RELEASE_VERSION_CONTEXT_KEY].as_string()
+                    == str(version_id),
+                    trial_payload["type"].as_string() == "criterion_named_test_trial",
+                    trial_payload["criterion_key"].as_string() == criterion_key,
+                    Task.status.not_in(TASK_OUTCOME_TERMINAL_STATUSES),
+                )
+            )
+        ).all()
+
+        running_stale = [row for row in inflight_rows if row[1] != TaskStatus.QUEUED]
+        queued_stale = [row for row in inflight_rows if row[1] == TaskStatus.QUEUED]
+
+        # A QUEUED trial has not consumed any VM/agent resources yet — cancel
+        # it outright and re-enroll fresh at the current head rather than
+        # leaving a pinned-to-a-stale-SHA duplicate around. This is pure
+        # dispatch-time cleanup: no PR/branch exists for it yet.
+        for stale_id, _stale_status, stale_head in queued_stale:
+            stale_task = await session.get(Task, stale_id)
+            # Re-check under the freshly loaded row: a concurrent dispatch may
+            # have already moved it out of QUEUED between the query above and
+            # this fetch.
+            if stale_task is None or stale_task.status != TaskStatus.QUEUED:
+                continue
+            stale_task.status = TaskStatus.CANCELLED
+            stale_task.latest_status_message = (
+                f"Superseded by newer qualifying candidate SHA {head_sha[:12]} "
+                f"(was pinned to {(stale_head or 'unknown')[:12]})"
+            )[:500]
+            ctx = dict(stale_task.context or {})
+            ctx["superseded_by_newer_candidate"] = True
+            ctx["superseded_stale_head_sha"] = stale_head
+            ctx["superseded_successor_head_sha"] = head_sha
+            stale_task.context = ctx
+            flag_modified(stale_task, "context")
+            session.add(stale_task)
+            logger.info(
+                "[CRITERION_TRIAL] cancelled stale QUEUED trial %s for "
+                "criterion %s (project %s) — superseded by candidate SHA %s "
+                "(was %s)",
+                stale_id,
+                criterion_key,
+                project_id,
+                head_sha,
+                stale_head,
+            )
+        if queued_stale:
+            await session.commit()
+
+        # An IN_PROGRESS/PROVISIONING (or otherwise live) trial on a stale
+        # head is bounded and possibly nearly done — yanking running work is
+        # the review-supersede-churn antipattern. Leave it alone and decline
+        # to enroll a new one; the periodic backfill sweep re-runs and will
+        # enroll a follow-up at the then-current head once this trial reaches
+        # a terminal state, so N SHA bumps during one trial's runtime
+        # naturally collapse into a single follow-up trial at the latest head.
+        if running_stale:
+            logger.info(
+                "[CRITERION_TRIAL] in-flight trial already running for "
+                "criterion %s (project %s, version %s) — task(s) %s "
+                "status=%s — not enrolling a new trial at head %s; the "
+                "backfill sweep will chain a follow-up once it reaches a "
+                "terminal state",
+                criterion_key,
+                project_id,
+                version_id,
+                [str(row[0]) for row in running_stale],
+                [row[1] for row in running_stale],
+                head_sha,
             )
             return None
 
@@ -5310,9 +5408,14 @@ async def backfill_merged_named_test_coverage(
                 total += batch_recorded
 
         # Give each backfilled criterion an earn-up path: enroll a targeted
-        # criterion_named_test_trial (deduped on in-flight trials for the same
-        # criterion + release version) that executes the declared covering test
-        # against the version's qualifying candidate SHA — a green run upgrades
+        # criterion_named_test_trial that executes the declared covering test
+        # against the version's qualifying candidate SHA. The enroller caps
+        # this at one non-terminal trial per criterion + release version: an
+        # identical in-flight trial is skipped outright, a QUEUED trial
+        # pinned to a now-stale SHA is cancelled (superseded) and re-enrolled
+        # at the current head, and a running (PROVISIONING/IN_PROGRESS) trial
+        # on a stale SHA is left alone — this sweep's next run enrolls the
+        # follow-up once it reaches a terminal state. A green run upgrades
         # the criterion from the lower-confidence backfill tier to real
         # machine-verified 'covered'.  This replaces the research corroboration
         # spawn for the merged-named-test lane.

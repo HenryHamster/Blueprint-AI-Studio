@@ -12231,6 +12231,164 @@ async def test_criterion_trial_terminal_identity_survives_more_than_200_newer_ta
     assert [task.id for task in matching] == [first.id]
 
 
+# ---------------------------------------------------------------------------
+# In-flight debounce: at most one non-terminal criterion_named_test_trial per
+# criterion + release version (root-fix for the O(criteria x SHA bumps) spam
+# mechanism — see enroll_criterion_named_test_trial).
+# ---------------------------------------------------------------------------
+
+_TASK_TERMINAL_STATUSES = frozenset(
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+
+
+async def _set_candidate_sha(db_session, version, sha: str) -> None:
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    db_session.add(version)
+    await db_session.commit()
+
+
+async def _enroll_trial(db_session, project, version, criterion, ref):
+    return await ac.enroll_criterion_named_test_trial(
+        db_session, project, version=version,
+        criterion_key=criterion.criterion_key, criterion_text=criterion.text,
+        test_refs=[ref],
+    )
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_inflight_queued_same_head_skips_new_enrollment(db_session):
+    """A QUEUED trial pinned to the CURRENT head suppresses a duplicate enroll."""
+    project = await _make_project(db_session, "CriterionTrialInflightSameHead")
+    version = await _make_version(db_session, project)
+    await _set_candidate_sha(db_session, version, "1" * 40)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "same-head")
+    ref = "testing/test_inflight_same_head.py"
+
+    first = await _enroll_trial(db_session, project, version, criterion, ref)
+    assert first is not None and first.status == TaskStatus.QUEUED
+
+    second = await _enroll_trial(db_session, project, version, criterion, ref)
+    assert second is None, "an in-flight QUEUED trial at the same head must debounce"
+
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert [t.id for t in trials] == [first.id]
+    await db_session.refresh(first)
+    assert first.status == TaskStatus.QUEUED, "the original trial must be untouched"
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_inflight_queued_stale_head_is_superseded(db_session):
+    """A QUEUED trial on a stale head is cancelled+superseded; a fresh trial enrolls.
+
+    Exactly one non-terminal trial must remain for this criterion afterward.
+    """
+    project = await _make_project(db_session, "CriterionTrialInflightStaleHead")
+    version = await _make_version(db_session, project)
+    await _set_candidate_sha(db_session, version, "2" * 40)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "stale-head")
+    ref = "testing/test_inflight_stale_head.py"
+
+    stale = await _enroll_trial(db_session, project, version, criterion, ref)
+    assert stale is not None and stale.status == TaskStatus.QUEUED
+
+    await _set_candidate_sha(db_session, version, "3" * 40)  # candidate SHA moves
+    fresh = await _enroll_trial(db_session, project, version, criterion, ref)
+    assert fresh is not None, "a stale QUEUED trial must be superseded, not blocking"
+    assert fresh.first_payload["candidate_identity"] == "3" * 40
+
+    await db_session.refresh(stale)
+    assert stale.status == TaskStatus.CANCELLED
+    assert stale.context.get("superseded_by_newer_candidate") is True
+    assert stale.context.get("superseded_stale_head_sha") == "2" * 40
+    assert stale.context.get("superseded_successor_head_sha") == "3" * 40
+    assert "superseded" in (stale.latest_status_message or "").lower()
+
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert {t.id for t in trials} == {stale.id, fresh.id}
+    non_terminal = [t for t in trials if t.status not in _TASK_TERMINAL_STATUSES]
+    assert [t.id for t in non_terminal] == [fresh.id]
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_inflight_running_stale_head_blocks_new_enrollment(db_session):
+    """A running (IN_PROGRESS) trial on a stale head is left alone; no new enroll.
+
+    Yanking running work is the review-supersede-churn antipattern; the periodic
+    backfill sweep enrolls the follow-up once the running trial goes terminal.
+    """
+    project = await _make_project(db_session, "CriterionTrialInflightRunningStale")
+    version = await _make_version(db_session, project)
+    await _set_candidate_sha(db_session, version, "4" * 40)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "running-stale")
+    ref = "testing/test_inflight_running_stale.py"
+
+    running = await _enroll_trial(db_session, project, version, criterion, ref)
+    assert running is not None
+    running.status = TaskStatus.IN_PROGRESS
+    db_session.add(running)
+    await db_session.commit()
+
+    await _set_candidate_sha(db_session, version, "5" * 40)  # moves while running
+    result = await _enroll_trial(db_session, project, version, criterion, ref)
+    assert result is None, "a running trial on a stale head must block new enrollment"
+
+    await db_session.refresh(running)
+    assert running.status == TaskStatus.IN_PROGRESS, "running trial must not be cancelled"
+    assert not running.context.get("superseded_by_newer_candidate")
+
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert [t.id for t in trials] == [running.id], "no new trial must be enrolled"
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_terminal_identical_identity_still_suppressed(db_session):
+    """Regression pin: a terminal trial with an IDENTICAL identity stays suppressed."""
+    project = await _make_project(db_session, "CriterionTrialTerminalIdenticalPin")
+    version = await _make_version(db_session, project)
+    await _set_candidate_sha(db_session, version, "6" * 40)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "identical")
+    ref = "testing/test_terminal_identical.py"
+
+    first = await _enroll_trial(db_session, project, version, criterion, ref)
+    assert first is not None
+    first.status = TaskStatus.COMPLETED
+    db_session.add(first)
+    await db_session.commit()
+
+    duplicate = await _enroll_trial(db_session, project, version, criterion, ref)
+    assert duplicate is None, "an identical terminal trial identity must stay suppressed"
+
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert [t.id for t in trials] == [first.id]
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_terminal_plus_new_head_enrolls_legit_rearm(db_session):
+    """A terminal trial plus a new candidate head enrolls a legitimate re-arm."""
+    project = await _make_project(db_session, "CriterionTrialTerminalRearm")
+    version = await _make_version(db_session, project)
+    await _set_candidate_sha(db_session, version, "7" * 40)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "rearm")
+    ref = "testing/test_terminal_rearm.py"
+
+    first = await _enroll_trial(db_session, project, version, criterion, ref)
+    assert first is not None
+    first.status = TaskStatus.COMPLETED
+    db_session.add(first)
+    await db_session.commit()
+
+    await _set_candidate_sha(db_session, version, "8" * 40)
+    second = await _enroll_trial(db_session, project, version, criterion, ref)
+    assert second is not None, "a new candidate head must remain a legitimate re-arm"
+    assert second.first_payload["candidate_identity"] == "8" * 40
+
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert {t.id for t in trials} == {first.id, second.id}
+    non_terminal = [t for t in trials if t.status not in _TASK_TERMINAL_STATUSES]
+    assert [t.id for t in non_terminal] == [second.id]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("freeze", ["paused", "autonomy_off"])
 async def test_criterion_trial_respects_project_work_freeze(db_session, freeze):

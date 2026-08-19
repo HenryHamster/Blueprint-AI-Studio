@@ -714,6 +714,12 @@ async def get_all_tasks(
             "blocked_reason": t.blocked_reason,
             "blocked_at": t.blocked_at.isoformat() if t.blocked_at else None,
             "recheck_after": t.recheck_after.isoformat() if t.recheck_after else None,
+            # Explicit operator-tier marker (see the sideboard endpoint for the
+            # full rationale): True once auto-recovery has raised its ERROR
+            # alert and given up resolving this blocker itself. Bounded
+            # recheck_after still applies — this flag, not a far-future
+            # timestamp, is the "needs operator attention" signal.
+            "blocker_escalated": bool((t.context or {}).get("_blocked_escalated")),
             # Durable PARKED-state metadata (alembic 0199). Nullable for any
             # non-PARKED or pre-migration task; the admin UI guards on presence.
             "parked_at": t.parked_at.isoformat() if t.parked_at else None,
@@ -1963,6 +1969,15 @@ def _task_sideboard_context(
                 if task.recheck_after
                 else None,
                 "parked_at": task.parked_at.isoformat() if task.parked_at else None,
+                # Explicit operator-tier marker: True once automatic recovery
+                # has raised its one ERROR alert and given up resolving this
+                # blocker itself. The task STAYS on a bounded recheck cadence
+                # (never a multi-year tombstone — see
+                # blocked_task_unblock_sweeps._escalate_blocked_task) so it
+                # still self-heals if the blocker clears on its own; this flag
+                # is what the admin UI should filter an "escalated / needs
+                # operator attention" list on, not a far-future recheck_after.
+                "escalated": bool((task.context or {}).get("_blocked_escalated")),
             },
             "runner": _task_runner_sideboard_context(task),
             "cost": {
@@ -2309,6 +2324,9 @@ async def get_task(
         "movement_explanation": movement_explanation,
         "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
         "recheck_after": task.recheck_after.isoformat() if task.recheck_after else None,
+        # Explicit operator-tier marker — see the sideboard endpoint above for
+        # the full rationale. Bounded recheck_after still applies regardless.
+        "blocker_escalated": bool((task.context or {}).get("_blocked_escalated")),
         # Durable PARKED-state metadata (alembic 0199). Nullable for any
         # non-PARKED or pre-migration task; the admin UI guards on presence.
         "parked_at": task.parked_at.isoformat() if task.parked_at else None,

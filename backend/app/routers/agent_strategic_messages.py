@@ -1575,6 +1575,11 @@ async def acknowledge_workday_consultation(
     ).scalar_one_or_none()
     if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
         raise HTTPException(status_code=409, detail="Workday session is superseded or inactive")
+    # Snapshot the ORM attribute into a local before any rollback in this
+    # function: a rollback expires attached instances, and a bare `task.id`
+    # read after that point requires an async refresh that is unreachable in
+    # a synchronous attribute-access expression (MissingGreenlet).
+    task_id = task.id
     _require_current_fast_task_identity(
         task=task,
         project=project,
@@ -1583,23 +1588,41 @@ async def acknowledge_workday_consultation(
     )
     _require_current_fast_process_incarnation(
         project=project,
-        task_id=task.id,
+        task_id=task_id,
         worker_generation=payload.worker_generation,
         incarnation_id=payload.incarnation_id,
     )
-    await _resolve_message_context_envelope(
-        session,
-        project_id=project_id,
-        message_id=packet_id,
+    from app.conversation_coordinator import (
+        acknowledge_workday_consultation_packet,
+        record_workday_consultation_gate_failure,
     )
-    from app.conversation_coordinator import acknowledge_workday_consultation_packet
+
+    try:
+        await _resolve_message_context_envelope(
+            session,
+            project_id=project_id,
+            message_id=packet_id,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            await record_workday_consultation_gate_failure(
+                session,
+                project_id=project_id,
+                packet_id=packet_id,
+                task_id=task_id,
+                resident_session_id=payload.session_id,
+                gate="envelope_resolution",
+                detail=str(exc.detail),
+            )
+            await session.commit()
+        raise
 
     try:
         duplicate = await acknowledge_workday_consultation_packet(
             session,
             project_id=project_id,
             packet_id=packet_id,
-            task_id=task.id,
+            task_id=task_id,
             worker_generation=payload.worker_generation,
             worker_incarnation=payload.incarnation_id,
             resident_session_id=payload.session_id,
@@ -1609,6 +1632,16 @@ async def acknowledge_workday_consultation(
         )
     except ValueError as exc:
         await session.rollback()
+        await record_workday_consultation_gate_failure(
+            session,
+            project_id=project_id,
+            packet_id=packet_id,
+            task_id=task_id,
+            resident_session_id=payload.session_id,
+            gate="acknowledge",
+            detail=str(exc),
+        )
+        await session.commit()
         raise HTTPException(status_code=409, detail=str(exc)) from None
     activity_transition = await _project_current_consultation_activity(
         session,
@@ -1618,7 +1651,7 @@ async def acknowledge_workday_consultation(
     await session.commit()
     await _emit_consultation_activity_if_changed(
         project_id,
-        task_id=task.id,
+        task_id=task_id,
         activity=activity_transition,
     )
     return {"status": "duplicate" if duplicate else "acknowledged"}
@@ -1647,6 +1680,11 @@ async def renew_workday_consultation(
     ).scalar_one_or_none()
     if project is None or task is None or task.status != TaskStatus.IN_PROGRESS:
         raise HTTPException(status_code=409, detail="Workday session is superseded or inactive")
+    # Snapshot the ORM attribute into a local before any rollback in this
+    # function: a rollback expires attached instances, and a bare `task.id`
+    # read after that point requires an async refresh that is unreachable in
+    # a synchronous attribute-access expression (MissingGreenlet).
+    task_id = task.id
     _require_current_fast_task_identity(
         task=task,
         project=project,
@@ -1655,23 +1693,41 @@ async def renew_workday_consultation(
     )
     _require_current_fast_process_incarnation(
         project=project,
-        task_id=task.id,
+        task_id=task_id,
         worker_generation=payload.worker_generation,
         incarnation_id=payload.incarnation_id,
     )
-    await _resolve_message_context_envelope(
-        session,
-        project_id=project_id,
-        message_id=packet_id,
+    from app.conversation_coordinator import (
+        record_workday_consultation_gate_failure,
+        renew_workday_consultation_packet,
     )
-    from app.conversation_coordinator import renew_workday_consultation_packet
+
+    try:
+        await _resolve_message_context_envelope(
+            session,
+            project_id=project_id,
+            message_id=packet_id,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            await record_workday_consultation_gate_failure(
+                session,
+                project_id=project_id,
+                packet_id=packet_id,
+                task_id=task_id,
+                resident_session_id=payload.session_id,
+                gate="envelope_resolution",
+                detail=str(exc.detail),
+            )
+            await session.commit()
+        raise
 
     try:
         renewed = await renew_workday_consultation_packet(
             session,
             project_id=project_id,
             packet_id=packet_id,
-            task_id=task.id,
+            task_id=task_id,
             worker_generation=payload.worker_generation,
             worker_incarnation=payload.incarnation_id,
             resident_session_id=payload.session_id,
@@ -1680,6 +1736,16 @@ async def renew_workday_consultation(
         )
     except ValueError as exc:
         await session.rollback()
+        await record_workday_consultation_gate_failure(
+            session,
+            project_id=project_id,
+            packet_id=packet_id,
+            task_id=task_id,
+            resident_session_id=payload.session_id,
+            gate="renew",
+            detail=str(exc),
+        )
+        await session.commit()
         raise HTTPException(status_code=409, detail=str(exc)) from None
     await session.commit()
     return {

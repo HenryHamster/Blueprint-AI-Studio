@@ -41,6 +41,7 @@ import {
   materializeContentBlocks, rollbackMessageBatchAdmission,
   isRetryableArtifactAttachmentError,
   buildBootstrapPrompt, buildAutonomousPrompt, resolveTerminalStatus,
+  consultationAbandonDeadlineMs,
   nextAuthorityHeld, autonomousActive, FrameCoalescer,
   MESSAGE_POLL_LIMIT, MAX_POLL_PAGES, OPERATOR_MESSAGE_BATCH_CAP, MAX_IMAGES_PER_TURN,
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
@@ -126,6 +127,11 @@ const MAX_CONSECUTIVE_GENERIC_PROVIDER_FAILURES = 2;
 // from a broken delivery channel. A second miss replaces the worker instead of
 // silently retrying the operator's message forever.
 const MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES = 2;
+// session.interrupt() on a typed Workday consultation abandon kills the whole
+// Claude Code child, not just the turn. One consecutive exit is recovered in
+// place from checkpoint; a second in a row means recovery is not holding, so
+// the task ends FAILED with an honest reason instead of looping forever.
+const MAX_CONSECUTIVE_CONSULTATION_ABANDON_EXITS = 1;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
 const OPERATOR_HARD_TIMEOUT_GRACE_MS = 30_000;
 // Public conversation coordination must stay substantially cheaper than a
@@ -1701,6 +1707,19 @@ export async function handleStrategicResident(
   // writer alongside the resumed cloud strategist. Losing authority NEVER ends
   // the session; only stop_requested / 401 does.
   let residentIncarnationHeld = true;
+  // Set just before session.interrupt() is called on a typed Workday
+  // consultation abandon (deadline expiry or a failed renewal). interrupt()
+  // sends SIGINT, which kills the WHOLE Claude Code child process, not just
+  // the in-flight turn — so the next `!session.isAlive()` check in the main
+  // loop must attribute the exit to the abandon, not to a generic crash,
+  // and try to recover in place before ending the task. Cleared once that
+  // exit has been observed and handled (or once a turn completes normally).
+  let consultationAbandonInterruptPending = false;
+  // Consecutive session exits caused by a consultation-abandon interrupt.
+  // One is recovered in place via restartSessionFromCheckpoint; a second in a
+  // row means recovery itself is not holding, so the task ends FAILED with an
+  // honest reason instead of looping forever.
+  let consultationAbandonExitCount = 0;
 
   /**
    * Convert ContentBlock[] to Array<Record<string, unknown>> for the session layer.
@@ -2544,6 +2563,37 @@ export async function handleStrategicResident(
     );
     if (!restartSessionFromCheckpoint(reason)) return 'stop';
     await sleep(retryMs);
+    return 'continue';
+  };
+
+  // Handles a session exit that followed a typed Workday consultation
+  // abandon-interrupt (see consultationAbandonInterruptPending). Recovers in
+  // place from checkpoint once; a second consecutive occurrence ends the task
+  // as FAILED (stopReason 'consultation_abandoned_process_exit') rather than
+  // reporting COMPLETED, which previously hid the churn from the reconciler.
+  const recoverFromConsultationAbandonedExit = (): 'stop' | 'continue' => {
+    consultationAbandonInterruptPending = false;
+    consultationAbandonExitCount += 1;
+    if (consultationAbandonExitCount > MAX_CONSECUTIVE_CONSULTATION_ABANDON_EXITS) {
+      stopReason = 'consultation_abandoned_process_exit';
+      sendLog(
+        ws,
+        `[resident] FATAL: typed Workday consultation abandon killed the worker `
+          + `${consultationAbandonExitCount} times in a row; ending session as FAILED `
+          + `instead of retrying indefinitely\n`,
+      );
+      return 'stop';
+    }
+    sendLog(
+      ws,
+      `[resident] typed Workday consultation abandon killed the worker (interrupt on `
+        + `deadline expiry or renewal failure ends the whole Claude Code child); `
+        + `restarting in place (attempt ${consultationAbandonExitCount})\n`,
+    );
+    if (!restartSessionFromCheckpoint('typed Workday consultation abandoned')) {
+      stopReason = 'consultation_abandoned_process_exit';
+      return 'stop';
+    }
     return 'continue';
   };
 
@@ -3531,11 +3581,23 @@ export async function handleStrategicResident(
     packet: ClaimedTypedConsultation,
     turn: Promise<ResidentTurnResult>,
   ): Promise<{ result: ResidentTurnResult; leaseHeld: boolean }> => {
-    const deadlineAt = Date.now() + 240_000;
+    // Derived from the server's configured autonomous turn timeout (floor
+    // 240s), not hardcoded: the client must never abandon a turn the server
+    // still considers live. See consultationAbandonDeadlineMs for why.
+    const deadlineAt = Date.now() + consultationAbandonDeadlineMs(cfg.autonomousTurnTimeoutMs);
+    // A fresh call means the session is currently alive, so any stale flag
+    // from a prior cycle (e.g. an interrupt that did not end up killing the
+    // process) no longer describes the current state.
+    consultationAbandonInterruptPending = false;
     const completed = turn.then(() => 'done' as const);
     for (;;) {
       const remaining = deadlineAt - Date.now();
       if (remaining <= 0) {
+        // session.interrupt() sends SIGINT, which exits the ENTIRE Claude Code
+        // child process (not just this turn) — flag it before calling so the
+        // main loop's next !session.isAlive() check attributes the exit
+        // correctly instead of misreporting a generic crash.
+        consultationAbandonInterruptPending = true;
         session.interrupt();
         return { result: await turn, leaseHeld: false };
       }
@@ -3543,7 +3605,12 @@ export async function handleStrategicResident(
         completed,
         sleep(Math.min(CONVERSATION_CLAIM_RENEW_MS, remaining)).then(() => 'renew' as const),
       ]);
-      if (next === 'done') return { result: await turn, leaseHeld: true };
+      if (next === 'done') {
+        // The session survived a full consultation cycle without needing an
+        // abandon-interrupt; a prior consecutive-exit streak no longer applies.
+        consultationAbandonExitCount = 0;
+        return { result: await turn, leaseHeld: true };
+      }
       try {
         if (await renewTypedConsultation(packet)) continue;
       } catch (error) {
@@ -3552,6 +3619,7 @@ export async function handleStrategicResident(
           `[resident] typed Workday consultation renewal failed: ${sanitize(String(error))}\n`,
         );
       }
+      consultationAbandonInterruptPending = true;
       session.interrupt();
       return { result: await turn, leaseHeld: false };
     }
@@ -3604,9 +3672,14 @@ export async function handleStrategicResident(
             && !result.timedOut
             && !result.hardTimedOut
             && !result.sentOperatorMessage;
+          // Escalate to 'failed' by attempt count alone, regardless of
+          // leaseHeld: an abandon caused by session.interrupt() (deadline
+          // expiry or a failed renewal) always reports leaseHeld:false, which
+          // previously suppressed this cap entirely and let a packet requeue
+          // PENDING forever with no escalation.
           outcome = usableResult
             ? 'completed'
-            : (leaseHeld && packet.attempt >= 2 ? 'failed' : 'abandoned');
+            : (packet.attempt >= 2 ? 'failed' : 'abandoned');
         } catch (error) {
           sendLog(
             ws,
@@ -5384,6 +5457,15 @@ export async function handleStrategicResident(
       }
 
       if (!session.isAlive()) {
+        // A typed Workday consultation abandon-interrupt (deadline expiry or
+        // failed renewal) kills the whole child process. Recover in place
+        // from checkpoint instead of falling through to the generic
+        // session_process_exited handling below, which reports this exit as
+        // an ordinary crash/COMPLETED and hides the consultation churn.
+        if (consultationAbandonInterruptPending) {
+          if (recoverFromConsultationAbandonedExit() === 'continue') continue;
+          break;
+        }
         stopReason = 'session_process_exited';
         break;
       }

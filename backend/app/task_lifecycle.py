@@ -47,6 +47,7 @@ from app.json_extract import scan_balanced_json_objects
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project, _sanitize_log
 from app.payload_schemas import validate_internal_payload
+from app.issue_ledger import exclude_self_disposed_blockers
 from app.review_pipeline import (
     _PIPELINE_ACTIVE_STATUSES,
     SPAWN_REASON_KEY,
@@ -3928,6 +3929,12 @@ async def _process_post_commit(
                     stamp_complete=True,
                 )
                 _open_blockers = list(_authoritative_ledger.get("open") or [])
+                if _open_blockers and _assigned_target_matches:
+                    # Assigned-target proven: this review's own resolutions[]
+                    # govern its own verdict/issue list (head-race case).
+                    _open_blockers = exclude_self_disposed_blockers(
+                        _open_blockers, resolutions
+                    )
                 if _open_blockers:
                     # The fix-facing issue list is always the complete binding
                     # open set, not just what the latest reviewer happened to
@@ -3951,6 +3958,12 @@ async def _process_post_commit(
                             **(
                                 {"symbol": blocker.get("symbol")}
                                 if blocker.get("symbol")
+                                else {}
+                            ),
+                            # Stuck-cycle detector excludes these from repeats.
+                            **(
+                                {"pending_disposition": blocker.get("pending_disposition")}
+                                if blocker.get("pending_disposition")
                                 else {}
                             ),
                         }

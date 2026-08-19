@@ -3455,6 +3455,174 @@ class TestRunnerEndpoints:
             _clear_pool()
 
     @pytest.mark.asyncio
+    async def test_next_task_releases_verification_task_pinned_to_unverified_runner(
+        self, client: AsyncClient, db_session
+    ):
+        """A project-verification-required task pinned to a runner with no valid
+        v1 write-agent proof is released to QUEUED immediately, mirroring the
+        browser backstop above.
+
+        The mismatch is deterministic — re-polling this runner can never make the
+        task routable, since a hardware/registration property never heals by
+        re-polling — so it is unpinned on the first poll that sees it rather than
+        left to run down the ~20-min skip-escalation clock. Normal dispatch,
+        which already filters this work to verified runners at pin time
+        (_select_eligible_runner's requires_project_verification gate), then
+        re-routes it.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session, project.id, capabilities={"task_types": "all"}
+        )
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={
+                "runner_target_id": str(runner.id),
+                "requires_project_verification": True,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        # Nothing dispatchable FOR THIS runner — it has no verification proof.
+        assert resp.status_code == 503
+        body = resp.json()
+        assert {s["task_id"] for s in body["skipped"]} == {str(task.id)}
+        assert body["skipped"][0]["code"] == "runner_capability_mismatch"
+
+        # The pin is gone: the task is back in QUEUED, unpinned, ready to re-dispatch.
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert task.started_at is None
+        assert "runner_target_id" not in (task.context or {})
+
+    @pytest.mark.asyncio
+    async def test_pull_time_guard_reads_project_verification_capability(
+        self, client: AsyncClient, db_session
+    ):
+        """A runner with a valid v1 project-verification report can claim a
+        pinned project-verification-required task."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "project_verification": {
+                    "version": 1,
+                    "boundary": {"class": "agent", "backend": "bwrap"},
+                    "ready": True,
+                    "probes": {
+                        "ruff": {"ok": True, "exit_code": 0},
+                        "docker_postgres": {"ok": True, "exit_code": 0},
+                    },
+                },
+            },
+        )
+        _seed_pool_account(TEST_USER_ID)
+        try:
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id=f"runner:{runner.id}",
+                context={
+                    "runner_target_id": str(runner.id),
+                    "requires_project_verification": True,
+                },
+            )
+            db_session.add(task)
+            await db_session.commit()
+
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["task_id"] == str(task.id)
+
+            await db_session.refresh(task)
+            assert task.status == TaskStatus.PROVISIONING
+            assert task.started_at is not None
+            assert task.vm_instance_id == f"runner:{runner.id}"
+            assert body["agent_token"]
+        finally:
+            _clear_pool()
+
+    @pytest.mark.asyncio
+    async def test_next_task_releases_mismatched_verification_head_without_starving_follower(
+        self, client: AsyncClient, db_session
+    ):
+        """A project-verification-mismatched HEAD must not starve a routable
+        follower — the same non-starvation contract already proved above for an
+        LLM-cooldown head, exercised here through the deterministic
+        capability-release path instead of the skip-marker path: the release
+        happens AFTER the credential-resolution loop (to_release_capability is
+        drained post-loop, never mid-loop under a lock), so it can never block
+        the follower's own dispatch this same poll.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session, project.id, capabilities={"task_types": "all"}
+        )
+        _seed_pool_account(TEST_USER_ID)
+        try:
+            base = _utcnow() - timedelta(minutes=10)
+            head = Task(
+                project_id=project.id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id=f"runner:{runner.id}",
+                context={
+                    "runner_target_id": str(runner.id),
+                    "requires_project_verification": True,
+                },
+                created_at=base,
+            )
+            follower = self._pinned(
+                project.id,
+                runner.id,
+                task_type="review",
+                created_at=base + timedelta(minutes=1),
+            )
+            db_session.add_all([head, follower])
+            await db_session.commit()
+
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+            # The routable follower dispatches despite the mismatched head.
+            assert resp.status_code == 200
+            assert resp.json()["task_id"] == str(follower.id)
+
+            # Head is released to QUEUED (deterministic mismatch), not left
+            # stuck in PROVISIONING waiting out a retry clock.
+            await db_session.refresh(head)
+            assert head.status == TaskStatus.QUEUED
+            assert head.vm_instance_id is None
+            assert "runner_target_id" not in (head.context or {})
+
+            await db_session.refresh(follower)
+            assert follower.started_at is not None
+            assert follower.status == TaskStatus.PROVISIONING
+        finally:
+            _clear_pool()
+
+    @pytest.mark.asyncio
     async def test_next_task_honors_priority_over_created_at(
         self, client: AsyncClient, db_session
     ):

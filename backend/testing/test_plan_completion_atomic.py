@@ -747,37 +747,38 @@ async def _setup_plan_task_with_project(
     return task, project
 
 
-def _compute_prereq_plan_logs():
-    return json.dumps(
-        {
-            "subtasks": [
-                {
-                    "title": "Measure the baseline",
-                    "prompt": "benchmark it",
-                    "type": "compute_experiment",
-                    "command": "python bench.py",
-                    "spend_cap_usd": 1.0,
-                    # Required by _validate_compute_launch_contract — without it the
-                    # contract is invalid, the subtask is skipped at the plan gate,
-                    # and NO child spawns (every other compute_experiment fixture in
-                    # this file declares it).
-                    "deadline_seconds": 600,
-                    "success_criterion": {
-                        "metric": "accuracy",
-                        "operator": ">=",
-                        "threshold": 0.9,
-                    },
-                    "machine_type": "n2-standard-4",
-                    "smoke_sample": {
-                        "exit_code": 0,
-                        "startup_ok": True,
-                        "metric_captured": True,
-                        "timed_out": False,
-                    },
-                }
-            ]
-        }
-    )
+def _compute_prereq_plan_logs(*, accelerator="T4"):
+    """``accelerator`` defaults to a declared GPU so the default-image-inheritance
+    tests below exercise the intended path; pass ``accelerator=None`` for the
+    bare (no-accelerator, no-container_image) case, which must NOT inherit the
+    project default image."""
+    subtask = {
+        "title": "Measure the baseline",
+        "prompt": "benchmark it",
+        "type": "compute_experiment",
+        "command": "python bench.py",
+        "spend_cap_usd": 1.0,
+        # Required by _validate_compute_launch_contract — without it the
+        # contract is invalid, the subtask is skipped at the plan gate,
+        # and NO child spawns (every other compute_experiment fixture in
+        # this file declares it).
+        "deadline_seconds": 600,
+        "success_criterion": {
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.9,
+        },
+        "machine_type": "n2-standard-4",
+        "smoke_sample": {
+            "exit_code": 0,
+            "startup_ok": True,
+            "metric_captured": True,
+            "timed_out": False,
+        },
+    }
+    if accelerator is not None:
+        subtask["accelerator"] = accelerator
+    return json.dumps({"subtasks": [subtask]})
 
 
 _PLAN_MANIFEST_TAG = "registry.example.com/proj/compute:latest"
@@ -788,9 +789,11 @@ _PLAN_PINNED_REF = "registry.example.com/proj/compute@sha256:" + ("b" * 64)
 async def test_plan_compute_experiment_defaults_to_pinned_ref(
     db_session, mocker, _quiet_mocks
 ):
-    """A plan-spawned compute_experiment with no declared container_image
-    inherits the project's digest-pinned baked reference (preferred over the
-    mutable manifest tag).
+    """A plan-spawned compute_experiment declaring an accelerator but no
+    container_image inherits the project's digest-pinned baked reference
+    (preferred over the mutable manifest tag). A subtask declaring NEITHER
+    accelerator NOR container_image must NOT inherit the default — see
+    test_plan_compute_experiment_bare_subtask_stays_image_less below.
 
     Production resolves the default via
     ``compute_backends.resolve_digest_pinned_default_image``, which pins the
@@ -849,8 +852,9 @@ async def test_plan_compute_experiment_defaults_to_pinned_ref(
 async def test_plan_compute_experiment_falls_back_to_manifest_tag(
     db_session, mocker, _quiet_mocks
 ):
-    """With no baked pinned_ref, the plan-spawned compute_experiment still
-    inherits the mutable manifest tag exactly as before (backward compat)."""
+    """With no baked pinned_ref, a plan-spawned compute_experiment that declares
+    an accelerator still inherits the mutable manifest tag exactly as before
+    (backward compat)."""
     task, _project = await _setup_plan_task_with_project(
         db_session,
         mocker,
@@ -873,6 +877,65 @@ async def test_plan_compute_experiment_falls_back_to_manifest_tag(
     assert len(children) == 1
     payload = children[0].first_payload or {}
     assert payload["container_image"] == _PLAN_MANIFEST_TAG
+
+
+@pytest.mark.asyncio
+async def test_plan_compute_experiment_bare_subtask_stays_image_less(
+    db_session, mocker, _quiet_mocks
+):
+    """A plan-spawned compute_experiment subtask declaring NEITHER accelerator
+    NOR container_image must NOT inherit the project's default image, even when
+    a digest-pinned baked reference is resolvable. Attaching a default image to
+    an accelerator-less task arms the runner's fatal GPU-arch pre-flight on GPU
+    hosts for a task that never asked for a GPU — the root cause of the
+    NeurIPS-fleet outage this defect fixes.
+    """
+    bare_logs = _compute_prereq_plan_logs(accelerator=None)
+    task, project = await _setup_plan_task_with_project(
+        db_session,
+        mocker,
+        bare_logs,
+    )
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute",
+            registry_repo="registry.example.com/proj",
+            dep_hash="deadbeef",
+            tag="latest",
+            pinned_ref=_PLAN_PINNED_REF,
+            digest="sha256:" + ("b" * 64),
+            built=True,
+        )
+    )
+    await db_session.commit()
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {
+                    "name": _PLAN_MANIFEST_TAG,
+                    "build": {"dockerfile": "Dockerfile"},
+                }
+            }
+        },
+    )
+
+    await _handle_plan_completion(task, bare_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    payload = children[0].first_payload or {}
+    assert payload.get("container_image") is None, (
+        "a bare subtask (no accelerator, no container_image) must not inherit "
+        f"the project default image; got {payload.get('container_image')!r}"
+    )
+    assert payload.get("accelerator") is None
 
 
 @pytest.mark.asyncio

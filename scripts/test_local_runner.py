@@ -11349,6 +11349,63 @@ class TestBuildArtifactArchive(_LocalRunnerTestCase):
             if archive and os.path.exists(archive):
                 os.remove(archive)
 
+    def test_one_unreadable_file_among_readable_delivers_remainder(self):
+        """A single permission-denied file (e.g. root-owned, written from inside
+        a container) must not sink the whole archive: the readable files still
+        get delivered, and the skip is recorded with its reason — never a bare
+        ``unexpected_error:PermissionError`` swallow of the entire delivery."""
+        art = self._artifact_dir({
+            "good.txt": "aaa",
+            "locked.txt": "bbb",
+            "also_good.txt": "ccc",
+        })
+        locked_path = os.path.join(art, "locked.txt")
+
+        real_access = os.access
+
+        def fake_access(path, mode):
+            if os.path.abspath(path) == os.path.abspath(locked_path) and mode == os.R_OK:
+                return False
+            return real_access(path, mode)
+
+        with patch("os.access", side_effect=fake_access), \
+             patch("os.chmod", side_effect=OSError("operation not permitted")):
+            archive, meta = local_runner._build_artifact_archive(art)
+
+        self.assertIsNotNone(archive, "readable remainder must still be archived")
+        try:
+            # The delivery must not silently claim full success: it is
+            # explicitly partial, with the skip surfaced by path + reason.
+            self.assertEqual(meta["status"], "partial")
+            self.assertEqual(meta["file_count"], 2)
+            self.assertIn("skipped_files", meta)
+            skipped_paths = {entry["path"] for entry in meta["skipped_files"]}
+            self.assertEqual(skipped_paths, {"locked.txt"})
+            self.assertIn("permission", meta["skipped_files"][0]["reason"])
+            with tarfile.open(archive, "r:gz") as tar:
+                names = set(tar.getnames())
+            self.assertEqual(names, {"good.txt", "also_good.txt"})
+        finally:
+            if archive and os.path.exists(archive):
+                os.remove(archive)
+
+    def test_all_files_unreadable_fails_with_specific_reason(self):
+        """When NOTHING is archivable the delivery must fail outright, but with
+        a specific, honest reason string — never the generic
+        ``unexpected_error:PermissionError`` the blanket except used to emit."""
+        art = self._artifact_dir({"a.txt": "aaa", "b.txt": "bbb"})
+
+        with patch("os.access", return_value=False), \
+             patch("os.chmod", side_effect=OSError("operation not permitted")):
+            archive, meta = local_runner._build_artifact_archive(art)
+
+        self.assertIsNone(archive)
+        self.assertEqual(meta["status"], "failed")
+        self.assertEqual(meta["reason"], "all 2 artifact files unreadable (permission)")
+        self.assertNotIn("unexpected_error", meta["reason"])
+        skipped_paths = {entry["path"] for entry in meta["skipped_files"]}
+        self.assertEqual(skipped_paths, {"a.txt", "b.txt"})
+
 
 class TestExtractResumeBundle(unittest.TestCase):
     """_extract_resume_bundle: safe tar.gz extraction into a staging directory."""

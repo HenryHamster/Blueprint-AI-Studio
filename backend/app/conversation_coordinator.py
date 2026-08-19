@@ -8,6 +8,7 @@ process, task, or runner failure.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,8 @@ from app.resident_conversation_scope import (
 )
 from app.strategic_conversation_query import strategic_conversation_predicate
 from app.time_utils import _utcnow
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,16 @@ _WORKDAY_FAILED_RESULT_SUMMARY = (
 _CONSULTATION_RESULT_CONTEXT_KEY = "_workday_consultation_result"
 _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY = "_workday_consultation_atomic_reply_id"
 _CONSULTATION_REQUESTED_CONTEXT_KEY = "_workday_consultation_requested"
+# Last renewal/ack gate failure (409) recorded against this packet, so an
+# incident carries its own diagnosis instead of a bare, unexplained 409. See
+# record_workday_consultation_gate_failure.
+_WORKDAY_LAST_FAILURE_CONTEXT_KEY = "_workday_consultation_last_failure"
+# A packet reclaimed this many times without a terminal ack is parked
+# (finalized as 'failed') at claim time instead of being requeued forever. A
+# live worker is expected to self-escalate to a 'failed' ack by attempt 2
+# (see the agent's scheduleTypedConsultation); this is the server-side
+# backstop for a worker that dies before it can deliver that ack.
+_WORKDAY_CONSULTATION_MAX_UNACKED_CLAIMS = 3
 _CONTINUATION_CLAIM_ID_CONTEXT_KEY = "_workday_continuation_claim_id"
 _CONTINUATION_CLAIM_GENERATION_CONTEXT_KEY = "_workday_continuation_claim_generation"
 _CONTINUATION_CLAIM_INCARNATION_CONTEXT_KEY = "_workday_continuation_claim_incarnation"
@@ -793,6 +806,210 @@ def _is_workday_consultation_result(
     )
 
 
+def _workday_consultation_parked_reason(attempt: int, context: dict[str, Any]) -> str:
+    """Explain WHY a packet was parked, not just that it was — attempt count
+    plus the last recorded gate-failure detail (if any; see
+    record_workday_consultation_gate_failure) so the incident carries its own
+    diagnosis instead of a silent terminal state."""
+    last_failure = context.get(_WORKDAY_LAST_FAILURE_CONTEXT_KEY)
+    detail_suffix = ""
+    if isinstance(last_failure, dict) and last_failure.get("detail"):
+        gate = last_failure.get("gate") or "unknown"
+        detail_suffix = f" Last recorded gate failure ({gate}): {last_failure['detail']}"
+    return (
+        "The private Workday consultation was parked after "
+        f"{attempt} claim attempts without a terminal acknowledgement (each prior "
+        "claim's lease expired, or its worker exited before it could ack) rather "
+        f"than being requeued indefinitely.{detail_suffix}"
+    )
+
+
+async def _finalize_workday_consultation_packet(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    packet_id: uuid.UUID,
+    row: ProjectMessage,
+    context: dict[str, Any],
+    task_id: uuid.UUID,
+    worker_generation: int,
+    worker_incarnation: uuid.UUID,
+    resident_session_id: str,
+    workday_claim_id: uuid.UUID,
+    outcome: str,
+    result_summary: str,
+    now: datetime,
+) -> None:
+    """Persist a terminal ('completed' or 'failed') consultation result and
+    close the packet. Shared by the client-driven ack path
+    (acknowledge_workday_consultation_packet) and the server-side
+    claim-attempt-cap park path (claim_next_workday_consultation_packet) so
+    both produce an identical result/continuation shape for Fast to consume.
+    Caller owns the transaction (flush/commit) and any ownership/lease checks.
+    """
+    from app.strategic_workday_mutation_rebind import (
+        WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
+        WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY,
+        bounded_workday_mutation_receipts,
+        workday_mutation_receipts_have_more,
+    )
+
+    mutation_receipts = bounded_workday_mutation_receipts(
+        context,
+        packet_id=packet_id,
+        workday_claim_id=workday_claim_id,
+        task_id=task_id,
+        resident_session_id=resident_session_id,
+        worker_generation=worker_generation,
+        worker_incarnation=worker_incarnation,
+    )
+    mutation_receipts_have_more = workday_mutation_receipts_have_more(context)
+    result_key = f"workday-consultation-result:{packet_id}:{workday_claim_id}"
+    existing_result = (
+        await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.idempotency_key == result_key,
+            )
+        )
+    ).scalar_one_or_none()
+    result_context = stamp_message_audience(
+        {
+            _CONSULTATION_RESULT_CONTEXT_KEY: True,
+            "source_packet_id": str(packet_id),
+            "claim_id": context.get("claim_id"),
+            "delivery_key": context.get("delivery_key"),
+            _CONSULTATION_CONTINUATION_CONTEXT_KEY: context.get(
+                _CONSULTATION_CONTINUATION_CONTEXT_KEY
+            ),
+            _WORKDAY_ACK_CLAIM_ID_CONTEXT_KEY: str(workday_claim_id),
+            "result_state": outcome,
+            "message_role": "workday_consultation_result",
+            "public_reply_owner": ConversationPublicReplyOwner.FAST.value,
+            "envelope": context.get("envelope"),
+            **(
+                {
+                    WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: mutation_receipts,
+                    WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY: (
+                        mutation_receipts_have_more
+                    ),
+                }
+                if mutation_receipts or mutation_receipts_have_more
+                else {}
+            ),
+            **(
+                {
+                    _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY: context.get(
+                        _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY
+                    )
+                }
+                if isinstance(
+                    context.get(_CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY), str
+                )
+                and context.get(_CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY)
+                else {}
+            ),
+        },
+        "workday_consultation_result",
+        message_type=MessageType.NOTE.value,
+    )
+    if existing_result is not None:
+        existing_context = (
+            existing_result.context
+            if isinstance(existing_result.context, dict)
+            else {}
+        )
+        if (
+            existing_result.from_type != "system"
+            or existing_result.content != result_summary
+            or {key: existing_context.get(key) for key in result_context}
+            != result_context
+        ):
+            raise ValueError("consultation result idempotency key conflicts")
+    else:
+        sequence = await lock_project_and_next_message_sequence(session, project_id)
+        result = await build_project_message(
+            session,
+            project_id=project_id,
+            sequence=sequence,
+            surface=MessageSurface.CONVERSATION,
+            handling_state=MessageHandlingState.PENDING,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content=result_summary,
+            context=result_context,
+            idempotency_key=result_key,
+            resident_session_id=resident_session_id,
+        )
+        session.add(result)
+    context[_WORKDAY_ACK_CLAIM_ID_CONTEXT_KEY] = str(workday_claim_id)
+    context["_workday_consultation_ack_outcome"] = outcome
+    context[_WORKDAY_RESULT_SUMMARY_CONTEXT_KEY] = result_summary
+    row.context = context
+    row.status = "handled"
+    row.handling_state = MessageHandlingState.RESPONDED
+    row.updated_at = now
+    session.add(row)
+
+
+async def record_workday_consultation_gate_failure(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    packet_id: uuid.UUID,
+    task_id: uuid.UUID | None,
+    resident_session_id: str | None,
+    gate: str,
+    detail: str,
+) -> None:
+    """Best-effort: log and persist WHY a consultation renewal/ack gate
+    rejected a request (409), so the incident carries its own diagnosis
+    instead of an opaque bare 409 with nothing server-side to inspect.
+
+    Caller is responsible for committing (or rolling back on failure) — this
+    function only flushes within the caller's transaction. Never raises: a
+    diagnostic-recording failure must not mask the original error.
+    """
+    bounded_detail = (detail or "")[:2000]
+    logger.warning(
+        "workday consultation gate failure: project=%s packet=%s task=%s "
+        "session=%s gate=%s detail=%s",
+        project_id, packet_id, task_id, resident_session_id, gate, bounded_detail,
+    )
+    try:
+        row = (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.id == packet_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return
+        now = _utcnow()
+        context = dict(row.context or {})
+        context[_WORKDAY_LAST_FAILURE_CONTEXT_KEY] = {
+            "gate": gate,
+            "detail": bounded_detail,
+            "task_id": str(task_id) if task_id else None,
+            "resident_session_id": resident_session_id,
+            "recorded_at": now.isoformat(),
+        }
+        row.context = context
+        row.updated_at = now
+        session.add(row)
+        await session.flush()
+    except Exception:
+        logger.exception(
+            "failed to persist workday consultation gate failure detail: "
+            "project=%s packet=%s gate=%s",
+            project_id, packet_id, gate,
+        )
+
+
 async def claim_next_workday_consultation_packet(
     session: AsyncSession,
     *,
@@ -869,6 +1086,30 @@ async def claim_next_workday_consultation_packet(
         if not same_owner:
             attempt += 1
         attempt = max(1, attempt)
+        if not same_owner and attempt >= _WORKDAY_CONSULTATION_MAX_UNACKED_CLAIMS:
+            # This packet has been reclaimed (previous owner's lease expired,
+            # or its worker exited) _WORKDAY_CONSULTATION_MAX_UNACKED_CLAIMS
+            # times in a row without a terminal ack ever arriving. Requeuing
+            # it again would repeat the same failure indefinitely (the churn
+            # this cap exists to break); park it as a terminal 'failed' result
+            # instead so Fast sees an explicit, explained outcome.
+            await _finalize_workday_consultation_packet(
+                session,
+                project_id=project_id,
+                packet_id=row.id,
+                row=row,
+                context=context,
+                task_id=task_id,
+                worker_generation=worker_generation,
+                worker_incarnation=worker_incarnation,
+                resident_session_id=resident_session_id,
+                workday_claim_id=workday_claim_id,
+                outcome="failed",
+                result_summary=_workday_consultation_parked_reason(attempt, context),
+                now=now,
+            )
+            await session.flush()
+            continue
         expires_at = now + timedelta(seconds=lease_seconds)
         context.update(
             {
@@ -1040,111 +1281,21 @@ async def acknowledge_workday_consultation_packet(
     if expires_at is None or expires_at <= now:
         raise ValueError("consultation packet lease is expired")
     if outcome in {"completed", "failed"}:
-        from app.strategic_workday_mutation_rebind import (
-            WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
-            WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY,
-            bounded_workday_mutation_receipts,
-            workday_mutation_receipts_have_more,
-        )
-
-        mutation_receipts = bounded_workday_mutation_receipts(
-            context,
+        await _finalize_workday_consultation_packet(
+            session,
+            project_id=project_id,
             packet_id=packet_id,
-            workday_claim_id=workday_claim_id,
+            row=row,
+            context=context,
             task_id=task_id,
-            resident_session_id=resident_session_id,
             worker_generation=worker_generation,
             worker_incarnation=worker_incarnation,
+            resident_session_id=resident_session_id,
+            workday_claim_id=workday_claim_id,
+            outcome=outcome,
+            result_summary=normalized_result_summary,
+            now=now,
         )
-        mutation_receipts_have_more = workday_mutation_receipts_have_more(context)
-        result_key = (
-            f"workday-consultation-result:{packet_id}:{workday_claim_id}"
-        )
-        existing_result = (
-            await session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.idempotency_key == result_key,
-                )
-            )
-        ).scalar_one_or_none()
-        result_context = stamp_message_audience(
-            {
-                _CONSULTATION_RESULT_CONTEXT_KEY: True,
-                "source_packet_id": str(packet_id),
-                "claim_id": context.get("claim_id"),
-                "delivery_key": context.get("delivery_key"),
-                _CONSULTATION_CONTINUATION_CONTEXT_KEY: context.get(
-                    _CONSULTATION_CONTINUATION_CONTEXT_KEY
-                ),
-                _WORKDAY_ACK_CLAIM_ID_CONTEXT_KEY: str(workday_claim_id),
-                "result_state": outcome,
-                "message_role": "workday_consultation_result",
-                "public_reply_owner": ConversationPublicReplyOwner.FAST.value,
-                "envelope": context.get("envelope"),
-                **(
-                    {
-                        WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: mutation_receipts,
-                        WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY: (
-                            mutation_receipts_have_more
-                        ),
-                    }
-                    if mutation_receipts or mutation_receipts_have_more
-                    else {}
-                ),
-                **(
-                    {
-                        _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY: context.get(
-                            _CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY
-                        )
-                    }
-                    if isinstance(
-                        context.get(_CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY), str
-                    )
-                    and context.get(_CONSULTATION_ATOMIC_REPLY_ID_CONTEXT_KEY)
-                    else {}
-                ),
-            },
-            "workday_consultation_result",
-            message_type=MessageType.NOTE.value,
-        )
-        if existing_result is not None:
-            existing_context = (
-                existing_result.context
-                if isinstance(existing_result.context, dict)
-                else {}
-            )
-            if (
-                existing_result.from_type != "system"
-                or existing_result.content != normalized_result_summary
-                or {key: existing_context.get(key) for key in result_context}
-                != result_context
-            ):
-                raise ValueError("consultation result idempotency key conflicts")
-        else:
-            sequence = await lock_project_and_next_message_sequence(session, project_id)
-            result = await build_project_message(
-                session,
-                project_id=project_id,
-                sequence=sequence,
-                surface=MessageSurface.CONVERSATION,
-                handling_state=MessageHandlingState.PENDING,
-                message_type=MessageType.NOTE,
-                from_type="system",
-                content=normalized_result_summary,
-                context=result_context,
-                idempotency_key=result_key,
-                resident_session_id=resident_session_id,
-            )
-            session.add(result)
-        context[_WORKDAY_ACK_CLAIM_ID_CONTEXT_KEY] = str(workday_claim_id)
-        context["_workday_consultation_ack_outcome"] = outcome
-        context[_WORKDAY_RESULT_SUMMARY_CONTEXT_KEY] = normalized_result_summary
-        row.context = context
-        row.status = "handled"
-        row.handling_state = MessageHandlingState.RESPONDED
-        row.updated_at = now
-        session.add(row)
         await session.flush()
         return False
     for key in (

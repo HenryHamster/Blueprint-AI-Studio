@@ -358,6 +358,14 @@ def test_unmarked_invented_full_target_cannot_close_verified_blocker() -> None:
 
 
 def test_unmarked_reasoned_resolution_cannot_close_verified_blocker() -> None:
+    """Root-fix regression (NeurIPS PR #1717 / plan task 3344347d).
+
+    An unverified-target disposition must never CLOSE a blocker — that
+    fail-closed invariant is unchanged. But it must not be silently dropped
+    either: the ledger now records a non-authoritative ``pending_disposition``
+    annotation so downstream consumers (the stuck-cycle detector) can tell a
+    good-faith fix-forward disposition apart from a bare unaddressed repeat.
+    """
     blocker = _issue("null dereference")
     blocker_id = _backend_id(blocker, head="head-1", iteration=1)
     ledger = build_issue_ledger(
@@ -379,6 +387,41 @@ def test_unmarked_reasoned_resolution_cannot_close_verified_blocker() -> None:
         ]
     )
     assert [row["issue_id"] for row in ledger["open"]] == [blocker_id]
+    assert ledger["resolved"] == []
+    pending = ledger["open"][0]["pending_disposition"]
+    assert pending["disposition"] == "refuted"
+    assert pending["reason"] == "invented legacy adjudication"
+    assert pending["iteration"] == 2
+    assert pending["head_sha"] == "head-1"
+
+
+def test_pending_disposition_cleared_when_issue_is_re_raised() -> None:
+    """A stale pending_disposition claim must not survive a genuine re-raise:
+    once a later review flags the same issue again, it is unambiguously still
+    a live blocker and the earlier good-faith disposition claim is moot."""
+    blocker = _issue("null dereference")
+    blocker_id = _backend_id(blocker, head="head-1", iteration=1)
+    ledger = build_issue_ledger(
+        [
+            _review(1, "head-1", [blocker]),
+            _review(
+                2,
+                "head-1",
+                verdict="APPROVE",
+                verified=False,
+                resolutions=[
+                    {
+                        "issue_id": blocker_id,
+                        "disposition": "fixed",
+                        "reason": "believed landed",
+                    }
+                ],
+            ),
+            _review(3, "head-2", [blocker]),
+        ]
+    )
+    assert [row["issue_id"] for row in ledger["open"]] == [blocker_id]
+    assert "pending_disposition" not in ledger["open"][0]
 
 
 def test_verified_reasoned_resolution_can_reconcile_legacy_unmarked_blocker() -> None:

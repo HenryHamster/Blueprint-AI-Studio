@@ -20,9 +20,11 @@ from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 from app.blocked_task_unblock_sweeps import (
     _BLOCKED_ESCALATE_AFTER,
     _BLOCKED_ESCALATED_PARK,
+    _BLOCKED_ESCALATED_RECHECK_MAX,
     _BLOCKED_OPTIMISTIC_RETRY_CAP,
     _BLOCKED_PARKED_REEVAL_CAP,
     _BLOCKED_PARKED_REEVAL_INTERVAL,
+    _BLOCKED_RECHECK_BASE,
     _TRANSIENT_BLOCKER_PARK_SENTINEL,
     GIVE_UP_FOUNDATION_DIED,
     GIVE_UP_NEVER_SATISFIABLE,
@@ -34,6 +36,7 @@ from app.blocked_task_unblock_sweeps import (
     _cancel_blocker_as_dead,
     _classify_blocker_needs,
     _clear_blocked_fields,
+    _escalated_status_message,
     _fetch_active_candidates,
     _fetch_completed_candidates,
     _fetch_dead_candidates,
@@ -2109,6 +2112,105 @@ async def sweep_recover_stranded_transient_blockers(
         await session.commit()
         logger.info(
             "[REAPER] Recovery: un-stranded %d hard-parked transient blocker(s)",
+            recovered,
+        )
+    return recovered
+
+
+# ── Recovery: stranded escalated-blocker self-heal sweep ─────────────────────
+#
+# Symmetric to the transient-blocker recovery above, for the OTHER hard-park
+# path that used to write the +10y sentinel: a need-less, NON-transient
+# escalated blocker (e.g. a runner-capability gap the fleet lacked, or a bug
+# in a repo-wide gate the task tripped) had no bounded recheck at all — once
+# escalated it was tombstoned until an operator manually requeued it, even
+# after the underlying blocker was fixed elsewhere (incident 2026-08-18, 5
+# tasks stranded on ``recheck_after`` stamped a decade out). Fixed going
+# forward in ``_escalate_blocked_task`` (bounded, exponentially-backed-off
+# cadence capped at ``_BLOCKED_ESCALATED_RECHECK_MAX``); this sweep heals any
+# row a prior deploy already hard-parked.
+
+
+async def sweep_recover_stranded_escalated_blockers(
+    session, now: datetime, *, batch_size: int = 200
+) -> int:
+    """Self-healing recovery for escalated blockers previously hard-parked at +10y.
+
+    Finds BLOCKED tasks whose ``recheck_after`` is more than
+    ``_TRANSIENT_BLOCKER_PARK_SENTINEL`` (365 days) in the future — the
+    signature of the old hard-park sentinel — and whose ``blocker_kind`` is
+    NOT one of the transient kinds already covered by
+    :func:`sweep_recover_stranded_transient_blockers`. Resets ``recheck_after``
+    to the bounded escalated-recheck cadence and restarts the backoff counter,
+    so the row is picked up by the next Step-12 cycle instead of staying
+    parked for years. Preserves the ``_blocked_escalated`` marker (the operator
+    alert is not re-fired) and the ``blocked_reason``/``blocker_kind`` columns
+    the admin UI already lists. Idempotent and safe to run repeatedly.
+
+    Returns the number of rows recovered.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    sentinel_cutoff = now + _TRANSIENT_BLOCKER_PARK_SENTINEL
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.status == TaskStatus.BLOCKED,
+                    Task.recheck_after > sentinel_cutoff,
+                    or_(
+                        Task.blocker_kind.is_(None),
+                        Task.blocker_kind.notin_(["file_conflict", "pending_rollup"]),
+                    ),
+                )
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    recovered = 0
+    for task in rows:
+        ctx = task.context or {}
+        if not ctx.get("_blocked_escalated"):
+            # Unexpected: far-future recheck without the escalation marker
+            # (shouldn't happen but guard defensively; don't touch it).
+            continue
+        ctx = dict(ctx)
+        ctx["_blocked_escalated_recheck_count"] = 0
+        task.context = ctx
+        flag_modified(task, "context")
+        next_recheck = now + _BLOCKED_RECHECK_BASE
+        task.recheck_after = next_recheck
+        blocker_meta = ctx.get("blocker")
+        escalation_detail = (
+            blocker_meta.get("escalation_detail")
+            if isinstance(blocker_meta, dict)
+            else None
+        )
+        task.latest_status_message = _escalated_status_message(
+            task.blocker_kind or "unknown",
+            escalation_detail or task.blocked_reason or "",
+            next_recheck,
+        )
+        session.add(task)
+        recovered += 1
+        logger.info(
+            "[REAPER] Recovery: reset hard-parked escalated blocker %s "
+            "(kind=%s) to bounded backoff cadence",
+            task.id,
+            task.blocker_kind,
+        )
+
+    if recovered:
+        await session.commit()
+        logger.info(
+            "[REAPER] Recovery: un-stranded %d hard-parked escalated blocker(s)",
             recovered,
         )
     return recovered

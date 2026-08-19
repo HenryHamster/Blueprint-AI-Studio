@@ -46,6 +46,18 @@ _BLOCKED_RECHECK_MAX = timedelta(hours=1)
 # A blocker that never clears within this window is escalated to the operator
 # as permanently blocked (one ERROR alert) and parked.
 _BLOCKED_ESCALATE_AFTER = timedelta(hours=6)
+# Backoff cap for an escalated (operator-alerted) blocker's OWN recheck cadence.
+# Escalation means "automatic recovery has given up trying to resolve this
+# task's specific precondition" — it does NOT mean the row should stop being
+# rechecked. A capability the runner fleet lacked, or a bug in a repo-wide gate
+# the task tripped, can be fixed OUTSIDE the dependency graph the sweep can see
+# (a runner picks up a new capability, an unrelated gate bug is fixed and
+# deployed) — cases the structured "need" resolver never observes because
+# nothing names an in-graph foundation. Bounding the escalated cadence at this
+# ceiling (rather than the multi-year sentinel below) means such a task
+# self-heals within a day of the fix landing instead of staying dead until an
+# operator manually requeues it.
+_BLOCKED_ESCALATED_RECHECK_MAX = timedelta(hours=24)
 
 
 async def _blocked_escalation_due(task, session) -> bool:
@@ -71,22 +83,27 @@ async def _blocked_escalation_due(task, session) -> bool:
         deploy_state, task.blocked_at, None
     )
     return active_seconds >= _BLOCKED_ESCALATE_AFTER.total_seconds()
-# Parking horizon for terminally-escalated blockers. On escalation we push
-# ``recheck_after`` far into the future (rather than leaving it NULL) so the row
-# drops out of the due query (``recheck_after IS NULL OR <= now``) and is never
-# re-SELECTed / FOR UPDATE-locked on the reaper hot path again. Leaving it NULL
-# kept escalated rows permanently "due" (sorted first by nullsfirst), where they
-# were re-locked every cycle and could crowd genuinely-due rechecks out of the
-# batch-size window. Recovery has given up on these; an operator re-queues them.
+# LEGACY sentinel value only. Earlier revisions of this module pushed
+# ``recheck_after`` to this multi-year horizon for a need-less, non-transient
+# escalated blocker on the theory that "recovery has given up, an operator will
+# re-queue it" — but a bare timestamp is not a queryable operator-only tier, so
+# these rows were functionally tombstoned: invisible to the admin UI's blocked
+# list filters and never re-examined even after the underlying blocker (a
+# runner capability gap, a gate bug) was fixed. Root-fixed: escalated blockers
+# now ALWAYS stay on the bounded ``_BLOCKED_ESCALATED_RECHECK_MAX`` backoff
+# cadence below (see ``_escalate_blocked_task``); the explicit
+# ``context['_blocked_escalated']`` flag (already durable, already queryable) is
+# the operator-tier marker, not an unreachable ``recheck_after``. This constant
+# is kept only so ``sweep_recover_stranded_transient_blockers``-style recovery
+# code can recognize and heal any row a prior deploy already stamped with it.
 _BLOCKED_ESCALATED_PARK = timedelta(days=3650)
 # A parked (escalated) blocker that STILL carries a machine-resolvable need is
-# re-examined at this LOW, bounded cadence instead of the multi-year park
-# horizon, so that when the foundation it waited on finally lands — a sibling
+# re-examined at this LOW, bounded cadence instead of the escalated backoff
+# ceiling, so that when the foundation it waited on finally lands — a sibling
 # task, a merged PR, or shipped code now reachable on integration — the task
 # resumes automatically rather than waiting for a manual operator requeue. The
 # re-evaluation is cheap (one conservative exact-match pass) and never
-# re-escalates or re-alerts, so it does not reintroduce per-cycle churn. Parked
-# blockers with NO need keep the multi-year horizon and stay for the operator.
+# re-escalates or re-alerts, so it does not reintroduce per-cycle churn.
 _BLOCKED_PARKED_REEVAL_INTERVAL = timedelta(hours=6)
 # Bounded number of parked re-evaluations a still-unsatisfiable need is given
 # before the dependent is terminated. A need that never becomes satisfiable —
@@ -149,10 +166,39 @@ MISSING_FOUNDATION_MARKER_KEY = "missing_foundation"
 _TRANSIENT_BLOCKER_PARK_SENTINEL = timedelta(days=365)
 
 
-def _next_recheck_delay(attempts: int) -> timedelta:
-    """Exponential backoff for the next recheck, capped at ``_BLOCKED_RECHECK_MAX``."""
+def _next_recheck_delay(
+    attempts: int, *, cap: timedelta = _BLOCKED_RECHECK_MAX
+) -> timedelta:
+    """Exponential backoff for the next recheck, capped at ``cap``.
+
+    ``cap`` defaults to ``_BLOCKED_RECHECK_MAX`` (1h) for the ordinary
+    still-blocked recheck cadence; callers on the escalated (operator-alerted)
+    path pass ``_BLOCKED_ESCALATED_RECHECK_MAX`` (24h) instead — escalated
+    blockers are known-hard, so they back off further, but never stop being
+    rechecked.
+    """
     secs = _BLOCKED_RECHECK_BASE.total_seconds() * (2 ** max(0, attempts))
-    return timedelta(seconds=min(secs, _BLOCKED_RECHECK_MAX.total_seconds()))
+    return timedelta(seconds=min(secs, cap.total_seconds()))
+
+
+def _escalated_status_message(
+    blocker_kind: str, detail: str, recheck_at: datetime
+) -> str:
+    """Operator-facing BLOCKED status message naming the blocker and next recheck.
+
+    Surfaced-reasons requirement: an escalated task must never look like a
+    silent, unexplained stall. The message names the concrete blocker
+    (``blocker_kind`` + free-text ``detail``) and the next time the sweep will
+    automatically re-examine it, so an operator reading the task list (or the
+    admin blocked-tasks view) sees WHY it is stuck and WHEN it will be looked
+    at again without having to open the alert or the raw context JSON.
+    """
+    detail_text = (detail or "").strip()
+    base = f"Blocked (escalated — operator alert raised): {blocker_kind or 'unknown'}"
+    if detail_text:
+        base += f" — {detail_text}"
+    base += f" — next automatic recheck at {recheck_at.strftime('%Y-%m-%d %H:%M UTC')}"
+    return base[:500]
 
 
 def _is_escalated_needless_agent_blocker(task) -> bool:
@@ -282,6 +328,7 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
     keys = [
         "_blocked_escalated",
         "_blocked_recheck_attempts",
+        "_blocked_escalated_recheck_count",
     ]
     if not preserve_first_blocked:
         keys.append("_blocked_first_at")
@@ -343,6 +390,7 @@ def _reset_blocked_task_for_requeue(
     reset_task_for_fresh_attempt(task)
     context = dict(task.context or {})
     context.pop("_blocked_recheck_attempts", None)
+    context.pop("_blocked_escalated_recheck_count", None)
     if preserve_first_blocked:
         context.update(preserved)
     else:
@@ -1369,22 +1417,42 @@ async def sweep_unblock_blocked_tasks(
         task.context = ctx
         # Terminal escalation keeps the task parked in BLOCKED for the operator,
         # so reflect that in the structured record (escalated -> True) rather
-        # than leaving the in-transition's escalated=False stale.
+        # than leaving the in-transition's escalated=False stale. The
+        # ``context['_blocked_escalated']`` flag IS the operator-tier marker —
+        # it is durable, queryable JSONB the admin UI can filter a "needs
+        # operator attention" list on. It is never expressed as an unreachable
+        # ``recheck_after``: see the LEGACY note on ``_BLOCKED_ESCALATED_PARK``.
         mark_blocker_escalated(task, detail=detail, now=now)
         flag_modified(task, "context")
         # A parked blocker that still carries a machine-resolvable need is parked
         # at the LOW re-evaluation cadence (so it comes back due and resumes when
-        # its foundation lands), not the multi-year horizon.  Transient blockers
-        # (file_conflict, pending_rollup) are also parked at the LOW cadence so
-        # they self-heal when the overlapping in-flight task merges — hard-parking
-        # them at +10y caused operator-requeue whack-a-mole (incident 2026-06-07).
-        # A need-less non-transient blocker keeps the far-future park.
+        # its foundation lands). Transient blockers (file_conflict, pending_rollup)
+        # are also parked at the LOW cadence so they self-heal when the
+        # overlapping in-flight task merges — hard-parking them at +10y caused
+        # operator-requeue whack-a-mole (incident 2026-06-07). A need-less
+        # non-transient blocker (e.g. a runner-capability gap or a repo-wide
+        # gate bug the structured need-resolver never observes) gets the SAME
+        # bounded-forever treatment, just on a longer, exponentially-backed-off
+        # cadence capped at ``_BLOCKED_ESCALATED_RECHECK_MAX`` — never the old
+        # multi-year tombstone, so a fix landing outside the dependency graph
+        # (runner gains the capability, the gate bug is fixed and deployed)
+        # still gets picked back up automatically instead of staying dead until
+        # an operator manually requeues it (incident 2026-08-18, 5 stranded
+        # tasks).
         has_need = isinstance(get_blocker_metadata(task).get("need"), dict)
         is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
-        task.recheck_after = now + (
-            _BLOCKED_PARKED_REEVAL_INTERVAL
-            if (has_need or is_transient)
-            else _BLOCKED_ESCALATED_PARK
+        if has_need or is_transient:
+            next_recheck = now + _BLOCKED_PARKED_REEVAL_INTERVAL
+        else:
+            escalated_recheck_count = int(
+                ctx.get("_blocked_escalated_recheck_count", 0)
+            )
+            next_recheck = now + _next_recheck_delay(
+                escalated_recheck_count, cap=_BLOCKED_ESCALATED_RECHECK_MAX
+            )
+        task.recheck_after = next_recheck
+        task.latest_status_message = _escalated_status_message(
+            blocker_kind, detail, next_recheck
         )
         session.add(task)
 
@@ -1571,10 +1639,17 @@ async def sweep_unblock_blocked_tasks(
                     await _commit_task_row(_bc_start)
                     continue
             # Need-less parked blocker — handle transient vs durable separately.
-            # Transient blockers (file_conflict, pending_rollup) and the narrow
-            # server-owned agent-precondition exception both re-evaluate through
-            # the same authority.  Other need-less blockers keep the far-future
-            # park and stay for the operator.
+            # Transient blockers (file_conflict, pending_rollup) clear when the
+            # overlapping in-flight task merges; re-evaluate their precondition
+            # state so they requeue automatically when the conflict lifts, or
+            # re-arm with bounded backoff while it persists.  The narrow
+            # server-owned agent-precondition exception re-evaluates through
+            # the same authority.  Any other need-less NON-transient blocker
+            # stays for the operator (nothing here can verify its precondition
+            # cleared), but still gets a bounded, exponentially-backed-off
+            # recheck below — never the old multi-year tombstone — so it
+            # self-heals if the blocker turns out to clear on its own (see
+            # ``_escalate_blocked_task``).
             is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
             is_server_precondition = _is_escalated_needless_agent_blocker(task) and (
                 task.id in reconciled_precondition_ids
@@ -1657,7 +1732,27 @@ async def sweep_unblock_blocked_tasks(
                 await _commit_task_row(_bc_start)
                 continue
             if task.recheck_after is None or task.recheck_after <= now:
-                task.recheck_after = now + _BLOCKED_ESCALATED_PARK
+                escalated_recheck_count = (
+                    int(ctx.get("_blocked_escalated_recheck_count", 0)) + 1
+                )
+                ctx["_blocked_escalated_recheck_count"] = escalated_recheck_count
+                task.context = ctx
+                flag_modified(task, "context")
+                next_recheck = now + _next_recheck_delay(
+                    escalated_recheck_count, cap=_BLOCKED_ESCALATED_RECHECK_MAX
+                )
+                task.recheck_after = next_recheck
+                _blocker_meta = ctx.get("blocker")
+                _escalation_detail = (
+                    _blocker_meta.get("escalation_detail")
+                    if isinstance(_blocker_meta, dict)
+                    else None
+                )
+                task.latest_status_message = _escalated_status_message(
+                    task.blocker_kind or "unknown",
+                    _escalation_detail or task.blocked_reason or "",
+                    next_recheck,
+                )
                 session.add(task)
             await _commit_task_row(_bc_start)
             continue
