@@ -18233,6 +18233,236 @@ async def test_reaper_closes_pr_when_infra_retry_budget_exhausted(
     mock_close.assert_called_once()
 
 
+# ── Terminal pipeline-death re-arm (incident 2026-08-19, review 20712c3f) ───
+# A review task reaped to terminal FAILED (AGENT_TIMEOUT) never reports agent
+# status and is skipped by the resurrection sweep, so without a producer the
+# EVALUATING original parked with review_loop.ci_waiting falsy strands its PR
+# un-reviewed indefinitely. The reaper's terminal branch must stage
+# _pr_state_check_pending on the original — bounded, with an operator-facing
+# WHY on exhaustion.
+
+
+def _make_dead_review_chain(project, pr_number: int, *, orig_ctx_extra=None):
+    """Return (original EVALUATING create task, doomed review task).
+
+    The review task has a stale heartbeat, empty logs, and attempt_count high
+    enough to exhaust any AGENT_TIMEOUT budget, so the reaper takes the
+    terminal-FAIL branch (not the retry branch). It has NO PULL_REQUEST
+    artifact, so the open-PR handoff never applies (reviews don't author PRs).
+    """
+    orig_ctx = {
+        "review_loop": {
+            "pr_number": pr_number,
+            "iteration": 2,
+            "max_iterations": 12,
+            "branch": f"blueprint/task-{pr_number}",
+            "base_branch": "main",
+            # ci_waiting falsy → outside the CI monitor poll set and the
+            # review-wait backstop: exactly the stranded park.
+            "ci_waiting": False,
+        },
+    }
+    if orig_ctx_extra:
+        orig_ctx.update(orig_ctx_extra)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.EVALUATING,
+        context=orig_ctx,
+    )
+    review = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "prompt": "Review the PR",
+            }
+        ],
+        vm_instance_id=f"vm-review-{pr_number}",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=8,  # ≥ any AGENT_TIMEOUT budget → terminal, not retry
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+        context={},
+    )
+    return original, review
+
+
+def _wire_review_to_original(review: Task, original: Task) -> None:
+    review.payloads = [dict(review.payloads[0], original_task_id=str(original.id))]
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminal_agent_timeout_review_rearms_original_pr_check(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A review reaped to terminal FAILED (AGENT_TIMEOUT) must re-arm the
+    canonical _pr_state_check_pending consumer on its EVALUATING original so
+    the PR gets reviewed again — instead of stranding it indefinitely."""
+    import app.failure_classification as fc
+
+    mocker.patch.object(
+        fc,
+        "classify_failure_with_confidence",
+        return_value=fc.FailureClassification(
+            failure_class="AGENT_TIMEOUT", confidence=0.9
+        ),
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+
+    project = await _make_project(reaper_db)
+    original, review = _make_dead_review_chain(project, pr_number=30001)
+    reaper_db.add(original)
+    await reaper_db.commit()
+    await reaper_db.refresh(original)
+    _wire_review_to_original(review, original)
+    reaper_db.add(review)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(review)
+    await reaper_db.refresh(original)
+
+    assert review.status == TaskStatus.FAILED, "review must reach terminal-fail"
+    assert (review.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+    octx = original.context or {}
+    assert octx.get("_pr_state_check_pending") is True, (
+        "terminal review death must stage the canonical PR re-drive marker "
+        "on the EVALUATING original"
+    )
+    assert octx.get("_pipeline_terminal_rearm_count") == 1
+    assert original.status == TaskStatus.EVALUATING, (
+        "the original stays parked; the eval-sweep consumer owns the re-drive"
+    )
+    msg = original.latest_status_message or ""
+    assert "#30001" in msg and "re-armed" in msg.lower(), (
+        f"re-arm must surface WHY on the original, got: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminal_rearm_skips_non_evaluating_original(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A COMPLETED original (rollup child — re-driven by rollup convergence)
+    must NOT be touched by the terminal re-arm, and the reap must not crash."""
+    import app.failure_classification as fc
+
+    mocker.patch.object(
+        fc,
+        "classify_failure_with_confidence",
+        return_value=fc.FailureClassification(
+            failure_class="AGENT_TIMEOUT", confidence=0.9
+        ),
+    )
+
+    project = await _make_project(reaper_db)
+    original, review = _make_dead_review_chain(project, pr_number=30002)
+    original.status = TaskStatus.COMPLETED
+    reaper_db.add(original)
+    await reaper_db.commit()
+    await reaper_db.refresh(original)
+    _wire_review_to_original(review, original)
+    reaper_db.add(review)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(review)
+    await reaper_db.refresh(original)
+
+    assert review.status == TaskStatus.FAILED
+    octx = original.context or {}
+    assert "_pr_state_check_pending" not in octx
+    assert "_pipeline_terminal_rearm_count" not in octx
+    assert original.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminal_rearm_cap_exhausted_emits_operator_why(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """With the re-arm budget already spent, another terminal review death must
+    NOT re-arm again (no infinite respawn loop) and must surface an explicit
+    operator-facing reason + failure alert on the original instead of silently
+    parking it."""
+    import app.failure_classification as fc
+    from app.reaper_pipeline_rearm import (
+        PIPELINE_TERMINAL_REARM_CAP,
+        PIPELINE_TERMINAL_REARM_COUNT_KEY,
+        PIPELINE_TERMINAL_REARM_EXHAUSTED_KEY,
+    )
+
+    # Literal pin: the automatic re-review budget is a bounded small constant.
+    assert PIPELINE_TERMINAL_REARM_CAP == 2
+
+    mocker.patch.object(
+        fc,
+        "classify_failure_with_confidence",
+        return_value=fc.FailureClassification(
+            failure_class="AGENT_TIMEOUT", confidence=0.9
+        ),
+    )
+    # Re-patch over the fixture's alert mock so this test can inspect calls.
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    original, review = _make_dead_review_chain(
+        project,
+        pr_number=30003,
+        orig_ctx_extra={
+            PIPELINE_TERMINAL_REARM_COUNT_KEY: PIPELINE_TERMINAL_REARM_CAP
+        },
+    )
+    reaper_db.add(original)
+    await reaper_db.commit()
+    await reaper_db.refresh(original)
+    _wire_review_to_original(review, original)
+    reaper_db.add(review)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(review)
+    await reaper_db.refresh(original)
+
+    assert review.status == TaskStatus.FAILED
+    octx = original.context or {}
+    assert "_pr_state_check_pending" not in octx, (
+        "exhausted budget must stop the re-arm — no unbounded respawn loop"
+    )
+    assert octx.get(PIPELINE_TERMINAL_REARM_COUNT_KEY) == (
+        PIPELINE_TERMINAL_REARM_CAP
+    ), "exhaustion must not keep incrementing the counter"
+    exhausted = octx.get(PIPELINE_TERMINAL_REARM_EXHAUSTED_KEY)
+    assert isinstance(exhausted, dict), (
+        "exhaustion must stamp operator-facing provenance on the original"
+    )
+    assert exhausted.get("pr_number") == 30003
+    assert exhausted.get("failure_class") == "AGENT_TIMEOUT"
+    assert exhausted.get("dead_task_id") == str(review.id)
+    msg = original.latest_status_message or ""
+    assert "exhausted" in msg.lower() and "operator" in msg.lower(), (
+        f"exhaustion must emit WHY on the original, got: {msg!r}"
+    )
+    # A failure alert must be raised FOR THE ORIGINAL (the dead review gets
+    # its own alert from the ordinary terminal path).
+    original_alert_calls = [
+        c
+        for c in alert_mock.await_args_list
+        if c.args and getattr(c.args[0], "id", None) == original.id
+    ]
+    assert original_alert_calls, "exhaustion must raise an alert on the original"
+    alert_snippet = original_alert_calls[0].args[2] if len(
+        original_alert_calls[0].args
+    ) > 2 else original_alert_calls[0].kwargs.get("error_snippet", "")
+    assert "exhausted" in (alert_snippet or "").lower()
+
+
 # ── Fleet-scan cadence gates and limits (Part A) ────────────────────────────
 
 

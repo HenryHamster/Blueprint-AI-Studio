@@ -2490,6 +2490,37 @@ async def reaper_service():
                             session.add(task)
                             await _maybe_create_failure_alert(task, session)
 
+                            # A pipeline review/fix task reaped to terminal
+                            # FAILED never reports agent status (so the
+                            # agent-status failure propagation never runs) and
+                            # is deliberately skipped by the resurrection
+                            # sweep (review/fix + pr_number must re-drive from
+                            # current GitHub state). Without a producer here,
+                            # the EVALUATING original parked with
+                            # review_loop.ci_waiting falsy sits outside every
+                            # recovery surface and its PR strands un-reviewed
+                            # indefinitely (incident 2026-08-19, review task
+                            # 20712c3f, AGENT_TIMEOUT). Re-arm the canonical
+                            # _pr_state_check_pending consumer on the original
+                            # — bounded, with an operator-facing WHY on
+                            # exhaustion. Best-effort: never let the re-arm
+                            # break this row's terminal classification.
+                            try:
+                                from app.reaper_pipeline_rearm import (
+                                    rearm_pr_state_check_for_dead_pipeline_task,
+                                )
+
+                                await rearm_pr_state_check_for_dead_pipeline_task(
+                                    task, session, failure_class
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    f"[REAPER] pipeline re-arm failed for dead "
+                                    f"task {task.id} — original may need "
+                                    f"manual re-review",
+                                    exc_info=True,
+                                )
+
                             await broadcast_to_project(
                                 str(task.project_id),
                                 "task_updated",
