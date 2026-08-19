@@ -2269,8 +2269,15 @@ async def _dispatch_compute_experiment_directly(
     # flows through the container-runtime / GPU-in-container eligibility gate
     # below. An explicit payload container_image is left untouched; projects with
     # no manifest compute image keep today's image-less behavior.
+    #
+    # Gated on `accelerator`: a task declaring neither accelerator nor
+    # container_image must dispatch bare. Attaching a default image to such a
+    # task arms the runner's fatal GPU-arch pre-flight (it fires whenever
+    # assigned_gpus and (accelerator_type or container_image)) even though the
+    # task never asked for a GPU, aborting CPU-only work on GPU-host runners
+    # whose default image doesn't match the host arch.
     resolved_default_container_image: str | None = None
-    if not container_image:
+    if not container_image and accelerator:
         from app.compute_backends import resolve_project_baked_image_strict
 
         project = await session.get(Project, task.project_id)

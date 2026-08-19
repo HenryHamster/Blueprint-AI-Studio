@@ -14031,8 +14031,11 @@ async def test_compute_experiment_defaults_container_image_to_project_image_rese
     db_session, mocker
 ):
     """When a project's manifest declares compute.image.name and a research finding
-    omits container_image, _handle_research_completion must default the spawned
-    compute_experiment child's container_image to the project's declared image."""
+    declares an accelerator but omits container_image, _handle_research_completion
+    must default the spawned compute_experiment child's container_image to the
+    project's declared image. A finding declaring NEITHER accelerator NOR
+    container_image must NOT inherit the default — see
+    test_compute_experiment_bare_finding_stays_image_less_research below."""
     from test_autonomous_research import _patch_research_externals
 
     _PROJECT_IMAGE = "us-central1-docker.pkg.dev/myproject/compute/base:sha256-abc123"
@@ -14057,6 +14060,7 @@ async def test_compute_experiment_defaults_container_image_to_project_image_rese
         direction["id"],
         spend_cap_usd=2.0,
         deadline_seconds=3600,
+        accelerator="nvidia-t4",
     )
     _patch_research_externals(mocker)
     mocker.patch(
@@ -14082,6 +14086,70 @@ async def test_compute_experiment_defaults_container_image_to_project_image_rese
     assert payload.get("container_image") == _PROJECT_IMAGE, (
         f"Expected container_image={_PROJECT_IMAGE!r}, got {payload.get('container_image')!r}"
     )
+
+
+@_pytest.mark.asyncio
+async def test_compute_experiment_bare_finding_stays_image_less_research(
+    db_session, mocker
+):
+    """A research finding declaring NEITHER accelerator NOR container_image must
+    NOT inherit the project's declared default image, even when the manifest
+    declares one. Attaching a default image to an accelerator-less task arms the
+    runner's fatal GPU-arch pre-flight on GPU hosts for a task that never asked
+    for a GPU — the root cause of the NeurIPS-fleet outage this defect fixes.
+    """
+    from test_autonomous_research import _patch_research_externals
+
+    _PROJECT_IMAGE = "us-central1-docker.pkg.dev/myproject/compute/base:sha256-abc123"
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new=AsyncMock(
+            return_value={
+                "tools": [],
+                "skills": [],
+                "compute": {"image": {"name": _PROJECT_IMAGE}},
+                "error": None,
+            }
+        ),
+    )
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-cx-img-bare-01"
+    )
+
+    finding = _compute_finding(
+        direction["id"],
+        spend_cap_usd=2.0,
+        deadline_seconds=3600,
+        # NEITHER accelerator NOR container_image.
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"compute_experiment_spend_threshold_usd": 5.0},
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = await _children_of(db_session, task)
+    compute_children = [
+        c
+        for c in children
+        if (c.first_payload or {}).get("type") == "compute_experiment"
+    ]
+    assert len(compute_children) == 1, (
+        f"Expected 1 compute_experiment child, got {len(compute_children)}: {children}"
+    )
+    payload = compute_children[0].first_payload or {}
+    assert payload.get("container_image") is None, (
+        "a bare finding (no accelerator, no container_image) must not inherit "
+        f"the project default image; got {payload.get('container_image')!r}"
+    )
+    assert payload.get("accelerator") is None
 
 
 class TestAcceptanceEvidencePropagation:

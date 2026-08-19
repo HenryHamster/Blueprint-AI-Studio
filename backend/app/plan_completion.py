@@ -756,7 +756,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             continue
         if raw_type == "compute_experiment":
             compute_contract = _author_compute_launch_contract(subtask_def)
-            if not compute_contract.get("container_image") and _project_default_container_image:
+            if (
+                not compute_contract.get("container_image")
+                and compute_contract.get("accelerator")
+                and _project_default_container_image
+            ):
+                # Only accelerator-declaring subtasks inherit the project default
+                # image: a bare payload (no accelerator, no container_image) must
+                # run without any image attached so no GPU/arch pre-flight arms.
                 compute_contract["container_image"] = _project_default_container_image
             contract_ok, contract_reason = _validate_compute_launch_contract(
                 compute_contract
@@ -1065,7 +1072,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         )
         if subtask_type == "compute_experiment":
             compute_contract = _author_compute_launch_contract(subtask_def)
-            if not compute_contract.get("container_image") and _project_default_container_image:
+            if (
+                not compute_contract.get("container_image")
+                and compute_contract.get("accelerator")
+                and _project_default_container_image
+            ):
+                # Only accelerator-declaring subtasks inherit the project default
+                # image: a bare payload (no accelerator, no container_image) must
+                # run without any image attached so no GPU/arch pre-flight arms.
                 compute_contract["container_image"] = _project_default_container_image
             _stamp_container_image_pin_status(compute_contract, task)
             child_payload = validate_internal_payload(
