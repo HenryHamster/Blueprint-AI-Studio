@@ -74,7 +74,7 @@ from app.release_qualifier_hotfix_audit import (
 )
 
 logger = logging.getLogger(__name__)
-_MODULE_SIZE_GOVERNANCE_CAP: int = 2034
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2123
 
 
 # Audit H2: hard wall-clock bound on a single qualification.  A qualification

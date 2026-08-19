@@ -42,7 +42,7 @@ from sqlmodel.sql.sqltypes import GUID
 
 from app.models_base import NaiveUTCDateTime
 from app.time_utils import _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 1587
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1642
 
 
 class ReleaseVersion(SQLModel, table=True):

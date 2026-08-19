@@ -156,9 +156,10 @@ def classify_size_record(
         skips the (git-touching) chronic lookup for the plain check path, which
         only needs the breach flag.
     """
-    from app.size_limit_policy import is_breach
+    from app.size_limit_policy import is_breach, resolve_effective_cap
 
-    breach = is_breach(count, cap)
+    effective_cap = resolve_effective_cap(rel, section, cap, repo_root=repo_root)
+    breach = is_breach(count, effective_cap)
     verdict = None
     if breach and with_verdict:
         verdict = _classify_breach(
@@ -168,7 +169,14 @@ def classify_size_record(
             override_chronic=override_chronic,
             repo_root=repo_root,
         )
-    return {"rel": rel, "count": count, "cap": cap, "breach": breach, "verdict": verdict}
+    return {
+        "rel": rel,
+        "count": count,
+        "cap": cap,
+        "effective_cap": effective_cap,
+        "breach": breach,
+        "verdict": verdict,
+    }
 
 
 # Repo root is two levels up from this file (backend/testing -> repo root).
@@ -186,6 +194,42 @@ def _is_git_checkout(repo_root: str) -> bool:
 # Section order is significant: matches the JSON's section order so output and
 # --sections=all iteration are deterministic.
 SECTIONS = ("backend", "agent", "frontend", "testing")
+
+# The release/verification surface this guardrail was built to bound: every
+# backend/app/release_*.py and acceptance_*.py module, plus
+# approved_pr_stranding.py. A module on this surface must declare its own
+# ``*_SIZE_GOVERNANCE_CAP`` — that's what makes the ratchet in
+# ``resolve_effective_cap`` bind. A new module added here with no declaration
+# is exactly how the surface reopened after growth was first bounded: it adds
+# a file rather than growing an existing one, so the per-file caps never see
+# it.
+_RELEASE_SURFACE_PREFIXES = ("release_", "acceptance_")
+_RELEASE_SURFACE_EXTRA_MODULES = ("approved_pr_stranding.py",)
+
+
+def find_ungoverned_release_surface_modules(repo_root: str) -> list[str]:
+    """Release-surface modules with no declared governance cap.
+
+    Returns sorted module filenames (relative to ``backend/app``). Empty when
+    the backend source tree isn't present in this environment.
+    """
+    from app.size_limit_policy import resolve_effective_cap
+
+    root = os.path.join(repo_root, "backend", "app")
+    if not os.path.isdir(root):
+        return []
+    missing = []
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".py"):
+            continue
+        if not (
+            name.startswith(_RELEASE_SURFACE_PREFIXES)
+            or name in _RELEASE_SURFACE_EXTRA_MODULES
+        ):
+            continue
+        if resolve_effective_cap(name, "backend", None, repo_root=repo_root) is None:
+            missing.append(name)
+    return missing
 
 # Coverage threshold for the complementary guardrail: a source file larger than
 # this with NO cap entry at all is invisible to the per-file caps and can grow
@@ -327,7 +371,13 @@ def scan_section(
 
 
 def scan_uncapped_section(
-    root: str, caps: dict, suffixes: tuple, is_excluded
+    root: str,
+    caps: dict,
+    suffixes: tuple,
+    is_excluded,
+    *,
+    section: str | None = None,
+    repo_root: str | None = None,
 ) -> list[dict]:
     """Walk ``root`` for source files over ``_COVERAGE_THRESHOLD`` lines that have
     NO cap entry in ``caps``.
@@ -337,7 +387,16 @@ def scan_uncapped_section(
     coverage threshold, and is absent from ``caps``. Returns one record per file
     (``{rel, path, count}``) sorted largest-first. Tree-relative paths use forward
     slashes to match the JSON key convention.
+
+    A file that declares its own ``*_SIZE_GOVERNANCE_CAP`` is excluded here
+    when ``section``/``repo_root`` are supplied: it is enforced by
+    :func:`scan_governed_missing_cap` at its declared cap instead, which may
+    be well under the generic coverage threshold. Omitting ``section``/
+    ``repo_root`` (the default) preserves the plain threshold-only scan for
+    callers that don't need governance awareness.
     """
+    from app.size_limit_policy import resolve_effective_cap
+
     offenders = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
@@ -347,11 +406,61 @@ def scan_uncapped_section(
             rel = os.path.relpath(abs_path, root).replace(os.sep, "/")
             if is_excluded(rel) or rel in caps:
                 continue
+            if section is not None and (
+                resolve_effective_cap(rel, section, None, repo_root=repo_root)
+                is not None
+            ):
+                continue
             count = count_lines(abs_path)
             if count > _COVERAGE_THRESHOLD:
                 offenders.append({"rel": rel, "path": abs_path, "count": count})
     offenders.sort(key=lambda rec: rec["count"], reverse=True)
     return offenders
+
+
+def scan_governed_missing_cap(
+    root: str, caps: dict, section: str, *, repo_root: str | None = None
+) -> list[dict]:
+    """Governed modules with NO JSON cap entry, enforced at their own cap.
+
+    A module that declares ``*_SIZE_GOVERNANCE_CAP`` but has no
+    ``module_size_limits.json`` entry is invisible to :func:`scan_section`
+    (which only walks JSON-listed files) and, below the generic coverage
+    threshold, also invisible to :func:`scan_uncapped_section`. This closes
+    that gap: every file in ``root`` that declares a governance cap and has
+    no JSON entry is classified against that cap directly, using the same
+    :func:`classify_size_record` breach test as every other record so
+    ``evaluate`` reports it uniformly.
+    """
+    suffixes, is_excluded = _SECTION_SCAN[section]
+    records = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if not name.endswith(suffixes):
+                continue
+            abs_path = os.path.join(dirpath, name)
+            rel = os.path.relpath(abs_path, root).replace(os.sep, "/")
+            if is_excluded(rel) or rel in caps:
+                continue
+            from app.size_limit_policy import resolve_effective_cap
+
+            governance_cap = resolve_effective_cap(
+                rel, section, None, repo_root=repo_root
+            )
+            if governance_cap is None:
+                continue
+            count = count_lines(abs_path)
+            rec = classify_size_record(
+                rel,
+                count,
+                governance_cap,
+                section,
+                with_verdict=False,
+                repo_root=repo_root,
+            )
+            rec["path"] = abs_path
+            records.append(rec)
+    return records
 
 
 def load_limits(json_path: str) -> dict:
@@ -414,9 +523,11 @@ def evaluate(
         if root is None:
             skipped.append(section)
             continue
-        checked[section] = scan_section(
-            caps, root, section, repo_root=repo_root
+        records = scan_section(caps, root, section, repo_root=repo_root)
+        records.extend(
+            scan_governed_missing_cap(root, caps, section, repo_root=repo_root)
         )
+        checked[section] = records
     return checked, skipped
 
 
@@ -457,7 +568,9 @@ def _collect_baseline_offenders(
             continue
         suffixes, is_excluded = _SECTION_SCAN[section]
         caps = base_data.get(section) or {}
-        for rec in scan_uncapped_section(root, caps, suffixes, is_excluded):
+        for rec in scan_uncapped_section(
+            root, caps, suffixes, is_excluded, section=section, repo_root=base_root
+        ):
             uncapped[(section, rec["rel"])] = rec["count"]
     return breached, uncapped, None
 
@@ -848,7 +961,14 @@ def main(argv: list[str] | None = None) -> int:
         caps = data.get(section) or {}
         uncapped.extend(
             (section, rec)
-            for rec in scan_uncapped_section(root, caps, suffixes, is_excluded)
+            for rec in scan_uncapped_section(
+                root,
+                caps,
+                suffixes,
+                is_excluded,
+                section=section,
+                repo_root=args.repo_root,
+            )
         )
 
     from app.size_limit_policy import (
@@ -1112,9 +1232,15 @@ def main(argv: list[str] | None = None) -> int:
     if blocking_breaches:
         for section, rec, base_count in blocking_breaches:
             grew = f"; grew from {base_count} lines on base" if base_count is not None else ""
+            cap_note = (
+                f"cap: {rec['effective_cap']}"
+                if rec.get("effective_cap") == rec.get("cap")
+                else f"cap: {rec['effective_cap']} (governance-tightened from JSON {rec['cap']})"
+                if rec.get("cap") is not None
+                else f"cap: {rec['effective_cap']} (governance cap, no JSON entry)"
+            )
             print(
-                f"[breach] {section}/{rec['rel']}: {rec['count']} lines "
-                f"(cap: {rec['cap']}){grew}"
+                f"[breach] {section}/{rec['rel']}: {rec['count']} lines ({cap_note}){grew}"
             )
         print(
             f"\n{len(blocking_breaches)} size breach(es). Run with --fix to bump "
@@ -1153,6 +1279,24 @@ def main(argv: list[str] | None = None) -> int:
             f"headroom)."
         )
         exit_code = 1
+
+    if "backend" not in skipped:
+        ungoverned_release_modules = find_ungoverned_release_surface_modules(
+            args.repo_root
+        )
+        if ungoverned_release_modules:
+            for name in ungoverned_release_modules:
+                print(
+                    f"[ungoverned] backend/{name}: on the release/verification "
+                    "surface with no declared _MODULE_SIZE_GOVERNANCE_CAP — add "
+                    "one (see backend/app/release_qualifier.py for the pattern) "
+                    "before this module can grow further"
+                )
+            print(
+                f"\n{len(ungoverned_release_modules)} release-surface module(s) "
+                "missing a governance cap declaration."
+            )
+            exit_code = 1
 
     preexisting = [
         ("cap breach", section, rec, base_count)

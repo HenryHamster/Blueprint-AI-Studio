@@ -73,7 +73,7 @@ from app.landed_signal import landed_signal_predicate
 from app.models import Artifact, ArtifactType, Project, ReleaseVersion, Task, TaskStatus
 from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.time_utils import _coerce_naive_utc, _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 1836
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1839
 
 logger = logging.getLogger(__name__)
 

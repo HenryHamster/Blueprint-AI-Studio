@@ -21,6 +21,8 @@ from app.task_locking import (
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
 
+_MODULE_SIZE_GOVERNANCE_CAP: int = 276
+
 logger = logging.getLogger(__name__)
 
 QUALIFICATION_FINALIZATION_DEFERRED = "qualification_finalization_deferred"

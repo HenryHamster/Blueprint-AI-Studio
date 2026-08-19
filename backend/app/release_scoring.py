@@ -26,7 +26,7 @@ from app.migration_reconciliation import effective_authorized_divergences
 from app.finding_identity import audit_finding_key
 
 logger = logging.getLogger(__name__)
-_MODULE_SIZE_GOVERNANCE_CAP: int = 3229
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3326
 
 
 # Canonical fleet default for the promotion confidence gate.  The packaged

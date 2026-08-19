@@ -27,7 +27,7 @@ from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert, AlertSeverity, Project
 from app.time_utils import _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 1010
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1105
 
 logger = logging.getLogger(__name__)
 

@@ -1556,3 +1556,118 @@ def test_fix_records_bump_then_check_accepts_raise(tmp_path, capsys, mocker):
     )
     mocker.patch("app.size_limit_policy._CAP_BUMP_HISTORY_LEDGER_PATH", ledger_path)
     assert _run(jp, repo, "--sections", "backend") == 0
+
+
+# ---------------------------------------------------------------------------
+# Governance-cap single-sourcing: resolve_effective_cap folds a source-declared
+# *_SIZE_GOVERNANCE_CAP into the breach test itself, instead of only being
+# read on the --fix auto-bump path. Regression coverage for the enforcement
+# gap: a file between its governance cap and a looser JSON cap, or a governed
+# file with no JSON entry at all, previously raised nothing.
+# ---------------------------------------------------------------------------
+
+
+def _write_governed_module(path: str, total_lines: int, governance_cap: int) -> None:
+    """Write a syntactically-valid Python module declaring a governance cap.
+
+    The first physical line is the ``_MODULE_SIZE_GOVERNANCE_CAP`` assignment
+    the AST-based discovery in ``app.size_limit_policy`` looks for; the rest
+    are padding comments so the file lands at exactly ``total_lines``.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lines = [f"_MODULE_SIZE_GOVERNANCE_CAP: int = {governance_cap}\n"]
+    while len(lines) < total_lines:
+        lines.append(f"# pad {len(lines)}\n")
+    with open(path, "w") as f:
+        f.writelines(lines[:total_lines])
+
+
+def test_effective_cap_is_tighter_of_json_and_governance(tmp_path):
+    """A governed module whose JSON cap is LOOSER than its governance cap is
+    judged against the governance cap, not the JSON cap."""
+    repo, jp = _build_repo(tmp_path, backend={})
+    module_path = os.path.join(repo, "backend", "app", "governed_loose.py")
+    _write_governed_module(module_path, total_lines=120, governance_cap=100)
+    data = json.loads(_read(jp))
+    data["backend"]["governed_loose.py"] = 150  # looser than the governance cap
+    with open(jp, "w") as f:
+        json.dump(data, f)
+
+    rec = csl.classify_size_record(
+        "governed_loose.py", 120, 150, "backend", repo_root=repo
+    )
+    assert rec["effective_cap"] == 100
+    assert rec["cap"] == 150
+    assert rec["breach"] is True
+
+    # Same conclusion through the real checker path (evaluate -> main).
+    checked, _skipped = csl.evaluate(data, ["backend"], repo)
+    matches = [r for r in checked["backend"] if r["rel"] == "governed_loose.py"]
+    assert len(matches) == 1
+    assert matches[0]["breach"] is True
+    assert _run(jp, repo, "--sections", "backend") == 1
+
+
+def test_governed_module_with_no_json_entry_breach_via_evaluate(tmp_path):
+    """A governed module with NO JSON cap entry is still enforced — one line
+    over its governance cap is a breach, caught by evaluate()/main(), not just
+    invisible because it was never listed in module_size_limits.json."""
+    repo, jp = _build_repo(tmp_path, backend={})
+    module_path = os.path.join(repo, "backend", "app", "governed_uncapped.py")
+    _write_governed_module(module_path, total_lines=51, governance_cap=50)
+    data = json.loads(_read(jp))
+
+    checked, _skipped = csl.evaluate(data, ["backend"], repo)
+    matches = [r for r in checked["backend"] if r["rel"] == "governed_uncapped.py"]
+    assert len(matches) == 1
+    assert matches[0]["breach"] is True
+    assert matches[0]["effective_cap"] == 50
+    assert matches[0]["count"] == 51
+
+    assert _run(jp, repo, "--sections", "backend") == 1
+
+
+def test_governed_module_exactly_at_cap_passes(tmp_path):
+    """A governed module sitting exactly at its governance cap is clean —
+    whether or not it also has a JSON entry."""
+    repo, jp = _build_repo(tmp_path, backend={})
+    module_path = os.path.join(repo, "backend", "app", "governed_at_cap.py")
+    _write_governed_module(module_path, total_lines=50, governance_cap=50)
+    data = json.loads(_read(jp))
+
+    checked, _skipped = csl.evaluate(data, ["backend"], repo)
+    matches = [r for r in checked["backend"] if r["rel"] == "governed_at_cap.py"]
+    assert len(matches) == 1
+    assert matches[0]["breach"] is False
+    assert matches[0]["effective_cap"] == 50
+
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_ungoverned_release_surface_module_fails_with_named_file(tmp_path, capsys):
+    """A new backend/app/release_*.py (or acceptance_*.py, or
+    approved_pr_stranding.py) module that declares no governance cap fails the
+    checker and names the missing declaration — this is exactly how the
+    surface reopened after growth was first bounded (a new file, not a grown
+    one)."""
+    repo, jp = _build_repo(tmp_path, backend={"ok.py": (10, 100)})
+    release_module = os.path.join(
+        repo, "backend", "app", "release_newly_added.py"
+    )
+    os.makedirs(os.path.dirname(release_module), exist_ok=True)
+    with open(release_module, "w") as f:
+        f.write("x = 1\n")
+
+    assert csl.find_ungoverned_release_surface_modules(repo) == [
+        "release_newly_added.py"
+    ]
+
+    assert _run(jp, repo, "--sections", "backend") == 1
+    out = capsys.readouterr().out
+    assert "[ungoverned] backend/release_newly_added.py" in out
+    assert "no declared _MODULE_SIZE_GOVERNANCE_CAP" in out
+
+    # Declaring the cap clears the failure (module now governed).
+    _write_governed_module(release_module, total_lines=1, governance_cap=1)
+    assert csl.find_ungoverned_release_surface_modules(repo) == []
+    assert _run(jp, repo, "--sections", "backend") == 0

@@ -203,6 +203,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/release_promotion_pending.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "release_qualification_deferral.py"): GoverningCap(
+        source_path="backend/app/release_qualification_deferral.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_qualifier.py"): GoverningCap(
         source_path="backend/app/release_qualifier.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
@@ -245,6 +249,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
     ),
     ("backend", "release_stall_alerts.py"): GoverningCap(
         source_path="backend/app/release_stall_alerts.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_task_admission.py"): GoverningCap(
+        source_path="backend/app/release_task_admission.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
     ("backend", "release_version.py"): GoverningCap(
@@ -343,6 +351,32 @@ def is_breach(count: int | None, cap: int | None) -> bool:
     re-deriving it inline.
     """
     return count is not None and cap is not None and count > cap
+
+
+def resolve_effective_cap(
+    module_key: str,
+    section: str,
+    json_cap: int | None,
+    repo_root: str | None = None,
+) -> int | None:
+    """Fold a source-declared governance cap into the cap the breach test uses.
+
+    Previously the ``*_SIZE_GOVERNANCE_CAP`` a module declares was read only
+    inside :func:`bump_size_limit` (the ``--fix`` auto-bump path) and never
+    consulted by the breach comparison itself — a module sitting between its
+    governance cap and a looser JSON cap, or with a governance cap and no
+    JSON entry at all, raised nothing. This is the single point where "which
+    number actually gates a breach" is decided: the tighter of the two when
+    both exist, the governance cap alone when there is no JSON entry, and the
+    JSON cap unchanged when the module declares no governance cap.
+    """
+    governing_caps = _governing_caps_for_module(module_key, section, repo_root)
+    if not governing_caps:
+        return json_cap
+    governance_cap = min(governing_caps)
+    if json_cap is None:
+        return governance_cap
+    return min(json_cap, governance_cap)
 
 
 # ---------------------------------------------------------------------------

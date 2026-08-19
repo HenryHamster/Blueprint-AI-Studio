@@ -16,6 +16,8 @@ from app.task_locking import (
     project_lock,
 )
 
+_MODULE_SIZE_GOVERNANCE_CAP: int = 122
+
 logger = logging.getLogger(__name__)
 
 

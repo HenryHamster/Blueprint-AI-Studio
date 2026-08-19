@@ -24,7 +24,7 @@ from app.release_qualifier_audit_surface import (
 )
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 715
+_MODULE_SIZE_GOVERNANCE_CAP: int = 984
 
 logger = logging.getLogger(__name__)
 
