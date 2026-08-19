@@ -122,15 +122,44 @@ async def test_three_distinct_merged_prs_escalate_once():
     assert candidate["occurrences"] == CHAIN_ESCALATION_THRESHOLD
     assert chain.status == "escalated"
 
-    assert (
-        await find_and_mark_chain_escalation(
-            session,
-            project_id=project_id,
-            issues=[issue],
-            authoritative_files=[{"filename": "backend/app/example.py"}],
-        )
-        is None
+    # Re-entry on the same PR without a new merged occurrence: the chain is
+    # still past threshold, so the detector finds it again. It is not a
+    # lifetime suppressor — dedup for repeated re-entry on one PR happens
+    # downstream, in the alert layer (alert_dispatch, keyed by
+    # (task_id, title) where the title encodes the PR number).
+    same_pr_candidate = await find_and_mark_chain_escalation(
+        session,
+        project_id=project_id,
+        issues=[issue],
+        authoritative_files=[{"filename": "backend/app/example.py"}],
     )
+    assert same_pr_candidate is not None
+    assert same_pr_candidate["finding_key"] == candidate["finding_key"]
+
+    # A NEW distinct merged PR re-raising the same concern must still be
+    # detectable as a fresh escalation candidate -- the chain must not go
+    # permanently silent after its first escalation.
+    fourth_task = Task(
+        project_id=project_id,
+        context=_context(
+            "The session cleanup ownership remains incorrect and leaks resources",
+            "issue-104",
+        ),
+    )
+    await record_merged_pr_finding_chains(fourth_task, session, pr_number=104)
+    assert chain.occurrences == 4
+    assert chain.verified_occurrences == 4
+
+    next_pr_candidate = await find_and_mark_chain_escalation(
+        session,
+        project_id=project_id,
+        issues=[issue],
+        authoritative_files=[{"filename": "backend/app/example.py"}],
+    )
+    assert next_pr_candidate is not None
+    assert next_pr_candidate["finding_key"] == candidate["finding_key"]
+    assert next_pr_candidate["occurrences"] == 4
+    assert chain.status == "escalated"
 
 
 @pytest.mark.asyncio
