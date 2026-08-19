@@ -782,6 +782,15 @@ export async function handleReleaseAudit(
       }).filter((p: string) => p.length > 0)
     )].sort();
     const deletedTestFiles = [...allDeletedFiles].filter((p: string) => TEST_PATH_RE.test(p));
+    // Files newly added in this diff — a relocation target for a split/rename
+    // must land here, not just anywhere in the working tree.
+    const addedFiles = new Set<string>(
+      nameStatus
+        .split('\n')
+        .filter((line: string) => line.startsWith('A\t'))
+        .map((line: string) => line.slice(2).trim())
+        .filter((p: string) => p.length > 0)
+    );
 
     // Derive the subject source file path(s) for a given test file path.
     // Returns candidate paths; caller checks which (if any) are co-deleted.
@@ -822,23 +831,6 @@ export async function handleReleaseAudit(
       return [];
     };
 
-    // Classify each deleted test file deterministically: if ANY derived subject
-    // is also a D-line in the diff, it is unambiguously dead_code_removal.
-    // Files whose subject cannot be derived or is still present are left unclassified
-    // so the LLM can assess them (fail-closed for those cases).
-    const deterministicClassifications: { path: string; classification: string; rationale: string }[] = [];
-    for (const testPath of deletedTestFiles) {
-      const subjects = deriveSubjectPaths(testPath);
-      const coDeleted = subjects.find(s => allDeletedFiles.has(s));
-      if (coDeleted) {
-        deterministicClassifications.push({
-          path: testPath,
-          classification: 'dead_code_removal',
-          rationale: `Subject ${coDeleted} is also a D-line in git diff --name-status; co-deletion confirms dead code removal.`,
-        });
-      }
-    }
-
     const diffText = execFileSync('git', ['diff', diffRange], {
       cwd: WORKSPACE, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
       maxBuffer: 50 * 1024 * 1024,
@@ -849,13 +841,25 @@ export async function handleReleaseAudit(
     // double-count every JS/TS test declaration.
     const ASSERTION_RE = /\b(assert[\s(]|expect\(|assertEqual|assertRaises)/;
     const TEST_FN_RE = /\b(def test_|test\(|it\(|describe\()/;
+    // Captures a stable test-function identifier: python "def test_foo(" or
+    // JS/TS "test('name'" / "it(\"name\"". Used only for relocation matching
+    // (below), not for the assertion/test-count delta.
+    const TEST_IDENTIFIER_RE = /^[+-]\s*(?:def\s+(test_\w+)\s*\(|(?:test|it)\(\s*(['"`])((?:(?!\2).)+)\2)/;
+    const extractIdentifier = (line: string): string | null => {
+      const m = line.match(TEST_IDENTIFIER_RE);
+      if (!m) return null;
+      if (m[1]) return m[1];
+      if (m[3]) return m[3];
+      return null;
+    };
 
-    // Build a set of deleted test file paths for O(1) lookup while iterating
-    // diff lines. Lines removed from a wholly-deleted test file are owned by
-    // the hard-blocker gate (deleted_test_files), not by the graded penalty,
-    // so exclude them from delta counting to avoid double-penalizing authorized
-    // dead-code deletions.
     const deletedTestFileSet = new Set(deletedTestFiles);
+    // Test-function identifiers removed from each wholly-deleted test file
+    // (source side of a potential relocation), keyed by file path.
+    const removedIdentifiersByFile = new Map<string, Set<string>>();
+    // Test-function identifiers added anywhere in newly-added files (possible
+    // relocation targets for a split/rename).
+    const addedIdentifiersInNewFiles = new Set<string>();
     let currentFile = '';
     let assertionDelta = 0;
     let testCountDelta = 0;
@@ -867,16 +871,64 @@ export async function handleReleaseAudit(
         currentFile = m ? m[1] : '';
         continue;
       }
-      // Skip delta counting for lines in wholly-deleted test files — the
-      // hard-blocker gate already owns those files.
-      if (deletedTestFileSet.has(currentFile)) continue;
 
       if (line.startsWith('+') && !line.startsWith('+++')) {
         if (ASSERTION_RE.test(line)) assertionDelta++;
         if (TEST_FN_RE.test(line)) testCountDelta++;
+        if (addedFiles.has(currentFile)) {
+          const id = extractIdentifier(line);
+          if (id) addedIdentifiersInNewFiles.add(id);
+        }
       } else if (line.startsWith('-') && !line.startsWith('---')) {
         if (ASSERTION_RE.test(line)) assertionDelta--;
         if (TEST_FN_RE.test(line)) testCountDelta--;
+        if (deletedTestFileSet.has(currentFile)) {
+          const id = extractIdentifier(line);
+          if (id) {
+            let set = removedIdentifiersByFile.get(currentFile);
+            if (!set) {
+              set = new Set();
+              removedIdentifiersByFile.set(currentFile, set);
+            }
+            set.add(id);
+          }
+        }
+      }
+    }
+
+    // Classify each deleted test file deterministically. Two independent
+    // deterministic signals, either of which is sufficient:
+    //  1. Co-deletion: a derived subject source file is also a D-line.
+    //  2. Relocation: a high fraction of the file's own test-function
+    //     identifiers reappear in a file newly added in the same diff — the
+    //     shape of a test-file split/rename, not erosion.
+    // Files matching neither are left unclassified so the LLM can assess them
+    // (fail-closed for those cases).
+    const RELOCATION_MIN_FRACTION = 0.5;
+    const deterministicClassifications: { path: string; classification: string; rationale: string }[] = [];
+    for (const testPath of deletedTestFiles) {
+      const subjects = deriveSubjectPaths(testPath);
+      const coDeleted = subjects.find(s => allDeletedFiles.has(s));
+      if (coDeleted) {
+        deterministicClassifications.push({
+          path: testPath,
+          classification: 'dead_code_removal',
+          rationale: `Subject ${coDeleted} is also a D-line in git diff --name-status; co-deletion confirms dead code removal.`,
+        });
+        continue;
+      }
+
+      const removedIds = removedIdentifiersByFile.get(testPath);
+      if (removedIds && removedIds.size > 0) {
+        const relocated = [...removedIds].filter(id => addedIdentifiersInNewFiles.has(id));
+        const fraction = relocated.length / removedIds.size;
+        if (fraction >= RELOCATION_MIN_FRACTION) {
+          deterministicClassifications.push({
+            path: testPath,
+            classification: 'dead_code_removal',
+            rationale: `${relocated.length}/${removedIds.size} test identifiers from ${testPath} reappear in file(s) newly added in this diff (${(fraction * 100).toFixed(0)}% >= ${RELOCATION_MIN_FRACTION * 100}% threshold); this is a relocation/split, not erosion.`,
+          });
+        }
       }
     }
 

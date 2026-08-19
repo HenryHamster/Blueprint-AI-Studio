@@ -1110,14 +1110,17 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     });
   });
 
-  // ── Gap-3: authorized deletion lines excluded from graded penalty ──────────
-  describe('computed_test_erosion — deleted-file lines excluded from delta', () => {
+  // ── Gap-3 (corrected): a wholly-deleted test file's lines DO count ─────────
+  // The exclusion here used to be "the hard-blocker gate already owns those
+  // files" — but that gate is fail-open (only an affirmative genuine_erosion
+  // LLM tag blocks), so any deleted test file the auditor doesn't flag was
+  // invisible to BOTH the hard blocker and the graded penalty. A mass test
+  // deletion must take the (capped) graded penalty like any other removal;
+  // a genuine split/rename nets ~0 because its additions offset the removal.
+  describe('computed_test_erosion — deleted-file lines count toward delta', () => {
     beforeEach(() => vi.clearAllMocks());
 
-    it('lines removed from a deleted test file do not penalize assertion_delta or test_count_delta', async () => {
-      // The deleted file contains assertion/test lines that would make delta negative
-      // if counted — but those lines belong to the hard-blocker dimension, not the
-      // graded-penalty dimension.
+    it('lines removed from a wholly-deleted test file DO penalize assertion_delta and test_count_delta', async () => {
       const deletedFileDiff = [
         'diff --git a/testing/test_gone.py b/testing/test_gone.py',
         '--- a/testing/test_gone.py',
@@ -1153,9 +1156,10 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
       };
       // The file must be detected as deleted.
       expect(stored.computed_test_erosion?.deleted_test_files).toContain('testing/test_gone.py');
-      // But its removed lines must NOT feed the graded penalty.
-      expect(stored.computed_test_erosion?.assertion_delta).toBe(0);
-      expect(stored.computed_test_erosion?.test_count_delta).toBe(0);
+      // Its removed lines feed the graded penalty like any other removal:
+      // 1 removed `def test_something(` and 2 removed assertions.
+      expect(stored.computed_test_erosion?.assertion_delta).toBe(-2);
+      expect(stored.computed_test_erosion?.test_count_delta).toBe(-1);
     });
 
     it('within-file test removals (not wholly-deleted file) still penalize delta', async () => {
@@ -1309,6 +1313,103 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
         c => c.path === 'testing/test_bar.py'
       );
       expect(entry?.classification).toBe('dead_code_removal');
+    });
+  });
+
+  // ── relocation classification — a genuine test-file split, not erosion ────
+  describe('computed_test_erosion — relocation (split/rename) classification', () => {
+    beforeEach(() => vi.clearAllMocks());
+
+    it('classifies a wholly-deleted test file as dead_code_removal when its test identifiers relocate into a newly-added file, even though its subject module is unchanged', async () => {
+      // Mirrors the real 43bfe173 split: test_strategic_spawning.py deleted,
+      // its subject app/strategic_spawning.py NOT deleted (present/unchanged),
+      // and its tests relocated verbatim into a newly-added sibling file.
+      const nameStatus = [
+        'D\tbackend/testing/test_strategic_spawning.py',
+        'A\tbackend/testing/test_strategic_spawning_capability_prediction.py',
+      ].join('\n') + '\n';
+      const diffText = [
+        'diff --git a/backend/testing/test_strategic_spawning.py b/backend/testing/test_strategic_spawning.py',
+        '--- a/backend/testing/test_strategic_spawning.py',
+        '+++ /dev/null',
+        '-def test_capability_prediction_scores_high_confidence():',
+        '-    assert score > 0.9',
+        '-def test_capability_prediction_rejects_stale_input():',
+        '-    assert rejected is True',
+        'diff --git a/backend/testing/test_strategic_spawning_capability_prediction.py b/backend/testing/test_strategic_spawning_capability_prediction.py',
+        '--- /dev/null',
+        '+++ b/backend/testing/test_strategic_spawning_capability_prediction.py',
+        '+def test_capability_prediction_scores_high_confidence():',
+        '+    assert score > 0.9',
+        '+def test_capability_prediction_rejects_stale_input():',
+        '+    assert rejected is True',
+      ].join('\n') + '\n';
+
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return nameStatus;
+        if (Array.isArray(a) && a[0] === 'diff') return diffText;
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: {
+          deleted_test_file_classifications?: { path: string; classification: string; rationale: string }[];
+        };
+      };
+      const entry = stored.computed_test_erosion?.deleted_test_file_classifications?.find(
+        c => c.path === 'backend/testing/test_strategic_spawning.py'
+      );
+      expect(entry?.classification).toBe('dead_code_removal');
+      expect(entry?.rationale).toContain('2/2');
+    });
+
+    it('does NOT auto-clear the same deleted file when the replacement files are absent from the diff', async () => {
+      // Same source-side deletion, but no newly-added file carries the
+      // relocated identifiers (e.g. the split commit itself is missing from
+      // this diff range) — must NOT be deterministically cleared.
+      const nameStatus = 'D\tbackend/testing/test_strategic_spawning.py\n';
+      const diffText = [
+        'diff --git a/backend/testing/test_strategic_spawning.py b/backend/testing/test_strategic_spawning.py',
+        '--- a/backend/testing/test_strategic_spawning.py',
+        '+++ /dev/null',
+        '-def test_capability_prediction_scores_high_confidence():',
+        '-    assert score > 0.9',
+        '-def test_capability_prediction_rejects_stale_input():',
+        '-    assert rejected is True',
+      ].join('\n') + '\n';
+
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return nameStatus;
+        if (Array.isArray(a) && a[0] === 'diff') return diffText;
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: {
+          deleted_test_file_classifications?: { path: string; classification: string }[];
+        };
+      };
+      const cls = stored.computed_test_erosion?.deleted_test_file_classifications;
+      const entry = cls?.find(c => c.path === 'backend/testing/test_strategic_spawning.py');
+      expect(entry).toBeUndefined();
     });
   });
 });
