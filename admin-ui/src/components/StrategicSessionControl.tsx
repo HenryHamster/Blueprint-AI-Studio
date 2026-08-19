@@ -108,9 +108,15 @@ export function StrategicSessionControl({
 
       {selectedMode === 'continuous' && (
         <>
-          <span className={`hidden min-h-7 min-w-0 items-center gap-1.5 rounded border px-2 text-xs sm:inline-flex ${view.tone}`} role="status" title={view.detail ?? view.label}>
+          <span className={`hidden min-h-7 min-w-0 max-w-64 items-center gap-1.5 rounded border px-2 text-xs sm:inline-flex ${view.tone}`} role="status" title={view.detail ?? view.label}>
             {(sessionBusy || saving || normalizedSessionState === 'waiting') ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : normalizedSessionState === 'blocked' || normalizedSessionState === 'error' ? <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" /> : <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />}
-            <span className="truncate">{view.label}</span>
+            <span className="shrink-0">{view.label}</span>
+            {view.detail && (
+              <>
+                <span aria-hidden="true" className="shrink-0 opacity-50">·</span>
+                <span className="min-w-0 truncate opacity-80">{view.detail}</span>
+              </>
+            )}
           </span>
 
           {runners.length > 0 && onSelectRunner && (

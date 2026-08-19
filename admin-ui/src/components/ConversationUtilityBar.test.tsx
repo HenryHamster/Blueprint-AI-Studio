@@ -336,7 +336,11 @@ describe('buildConversationWorkdayStatus', () => {
 
     expect(status.state).toBe('consultation_queued');
     expect(status.label).toBe('Workday requested · paused');
-    expect(status.detail).toBe('2 open requests · authority not held');
+    // The open-request count is secondary; the pause reason AND the
+    // Resident's current activity ("Watching for project movement" from
+    // the default activity() fixture) must both stay in the visible slot —
+    // the count alone must never displace them.
+    expect(status.detail).toBe('2 open requests · authority not held · Watching for project movement');
     expect(status.compactLabel).toBe('requested · paused');
     expect(status.compactDetail).toBe('2 open · no authority');
     const rendered = renderBar(status);
@@ -361,7 +365,7 @@ describe('buildConversationWorkdayStatus', () => {
     });
     expect(dead.state).toBe('needs_restart');
     expect(dead.label).toBe('Workday requested · needs restart');
-    expect(dead.detail).toBe('1 open request');
+    expect(dead.detail).toBe('1 open request · Watching for project movement');
 
     const unavailable = buildConversationWorkdayStatus({
       interactionMode: 'continuous',
@@ -500,6 +504,56 @@ describe('buildConversationWorkdayStatus', () => {
     expect(unavailable.state).toBe('unavailable');
     expect(unavailable.label).toBe('Workday unavailable');
   });
+
+  test('surfaces the live activity and task detail in the visible slot during an open consultation, not only the title', () => {
+    const request = strategicMessage('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', {
+      message_role: 'operator_reply',
+      _workday_consultation_requested: true,
+    });
+    const status = buildConversationWorkdayStatus({
+      interactionMode: 'continuous',
+      residentActivity: activity({
+        detail: 'Investigating the flaky vitest suite',
+      }),
+      taskFocus: focus([], [
+        task('friction-task-9999', 'friction', 'BLOCKED', 'Repair viewport gate'),
+      ]),
+      conversationMessages: [request],
+    });
+
+    expect(status.state).toBe('consultation_queued');
+    // Both the live activity narration and the queued-task focus item must be
+    // reachable in the visible `detail` — not only joined into the hover-only
+    // `title`, which is unusable on a phone.
+    expect(status.detail).toContain('Investigating the flaky vitest suite');
+    expect(status.title).toContain('Investigating the flaky vitest suite');
+  });
+
+  test('exposes when the Resident last acted so a live and a wedged session do not render identically', () => {
+    const idleAtMs = Date.parse('2026-08-15T00:00:00Z');
+    const idle = buildConversationWorkdayStatus({
+      interactionMode: 'continuous',
+      residentActivity: activity({ phase: 'idle', durablePhase: 'waiting', endMs: idleAtMs }),
+    });
+    expect(idle.lastActivityMs).toBe(idleAtMs);
+
+    const executingAtMs = Date.parse('2026-08-15T00:05:00Z');
+    const executing = buildConversationWorkdayStatus({
+      interactionMode: 'continuous',
+      residentActivity: activity({
+        phase: 'executing',
+        durablePhase: 'working',
+        startMs: executingAtMs,
+      }),
+    });
+    expect(executing.lastActivityMs).toBe(executingAtMs);
+
+    const noSession = buildConversationWorkdayStatus({
+      interactionMode: 'chat',
+      residentActivity: null,
+    });
+    expect(noSession.lastActivityMs).toBeNull();
+  });
 });
 
 describe('ConversationUtilityBar Workday status', () => {
@@ -523,5 +577,17 @@ describe('ConversationUtilityBar Workday status', () => {
     expect(line?.getAttribute('title')).toContain('A deliberately long implementation task title');
     expect(line?.getAttribute('role')).toBe('status');
     expect(line?.getAttribute('aria-live')).toBe('polite');
+  });
+
+  test('renders how long ago the Resident last acted without requiring a hover', () => {
+    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+    const status = buildConversationWorkdayStatus({
+      interactionMode: 'continuous',
+      residentActivity: activity({ phase: 'idle', durablePhase: 'waiting', endMs: fiveMinutesAgo }),
+    });
+    const rendered = renderBar(status);
+    const age = rendered.querySelector('[data-testid="conversation-workday-age"]');
+
+    expect(age?.textContent).toBe('5m ago');
   });
 });

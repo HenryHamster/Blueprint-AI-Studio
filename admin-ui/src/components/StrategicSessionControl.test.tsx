@@ -85,6 +85,27 @@ describe('StrategicSessionControl lifecycle authority', () => {
     expect(screen.queryByTitle('Start Workday session')).not.toBeInTheDocument();
   });
 
+  test('shows the starting reason as visible text, not only in the hover title', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="starting"
+        sessionReason="Runner claim pending"
+        onStartSession={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent('Starting');
+    // The reason must be readable in the rendered text, not only reachable
+    // via the `title` attribute — there is no hover on a phone.
+    expect(status).toHaveTextContent('Runner claim pending');
+    expect(status).toHaveAttribute('title', 'Runner claim pending');
+  });
+
   test('keeps the legacy active fallback when lifecycle state is absent', () => {
     render(
       <StrategicSessionControl

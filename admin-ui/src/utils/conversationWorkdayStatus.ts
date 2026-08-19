@@ -28,6 +28,10 @@ export interface ConversationWorkdayStatus {
   detail?: string;
   compactDetail?: string;
   title: string;
+  /** Epoch ms of the last observed Resident action (executing start, or the
+   *  frozen idle/dead heartbeat). Null when no Resident session is live, so
+   *  callers can render "when it last acted" without hovering. */
+  lastActivityMs?: number | null;
 }
 
 const TASK_DETAIL_MAX_CHARS = 96;
@@ -155,6 +159,9 @@ export function buildConversationWorkdayStatus({
     residentActivity?.detail ?? residentActivity?.commandText ?? residentActivity?.label,
     220,
   );
+  // Frozen idle/dead heartbeat when present, else the live executing start —
+  // both are "when the Resident last actually did something" in epoch ms.
+  const lastActivityMs = residentActivity?.endMs ?? residentActivity?.startMs ?? null;
   const withTask = (
     state: ConversationWorkdayState,
     label: string,
@@ -162,9 +169,18 @@ export function buildConversationWorkdayStatus({
   ): ConversationWorkdayStatus => ({
     state,
     label,
-    detail: task.detail,
-    compactDetail: task.compactDetail,
+    // The current activity is what the operator asked to see without hovering —
+    // it must lead; the queued-task focus item is secondary context, not a
+    // replacement for naming what the Resident is doing right now.
+    detail: compactText(
+      [activityDetail, task.detail].filter(Boolean).join(' · '),
+      TASK_DETAIL_MAX_CHARS,
+    ) ?? undefined,
+    compactDetail: activityDetail
+      ? compactText(activityDetail, 40) ?? undefined
+      : task.compactDetail,
     title: [baseTitle, activityDetail, task.title].filter(Boolean).join(' · '),
+    lastActivityMs,
   });
   const withConsultation = (
     state: ConversationWorkdayState,
@@ -183,9 +199,17 @@ export function buildConversationWorkdayStatus({
       ? `${queueCount} open request${queueCount === 1 ? '' : 's'}`
       : undefined;
     const compactQueueDetail = queueDetail ? `${queueCount} open` : undefined;
-    const visibleDetail = [queueDetail, options.visibleReason].filter(Boolean).join(' · ')
-      || undefined;
-    const compactVisibleDetail = [compactQueueDetail, options.compactReason]
+    // The open-request count is secondary context; it must never displace the
+    // substance of what the Resident is doing (pause reason, then live
+    // activity, then the queued-task focus item) from the one visible slot.
+    const substance = compactText(
+      [options.visibleReason, activityDetail, task.detail].filter(Boolean).join(' · '),
+      TASK_DETAIL_MAX_CHARS,
+    ) ?? undefined;
+    const visibleDetail = [queueDetail, substance].filter(Boolean).join(' · ') || undefined;
+    const compactSubstance = options.compactReason
+      ?? (activityDetail ? compactText(activityDetail, 40) ?? undefined : undefined);
+    const compactVisibleDetail = [compactQueueDetail, compactSubstance]
       .filter(Boolean)
       .join(' · ') || undefined;
     return {
@@ -197,6 +221,7 @@ export function buildConversationWorkdayStatus({
       title: [baseTitle, options.visibleReason, activityDetail, task.title]
         .filter(Boolean)
         .join(' · '),
+      lastActivityMs,
     };
   };
 

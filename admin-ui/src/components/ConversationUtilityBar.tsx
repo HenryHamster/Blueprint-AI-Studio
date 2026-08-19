@@ -3,6 +3,7 @@ import type {
   ConversationWorkdayState,
   ConversationWorkdayStatus,
 } from '../utils/conversationWorkdayStatus';
+import { timeAgo } from '../utils/time';
 
 const WORKDAY_STATE_PRESENTATION: Record<
   ConversationWorkdayState,
@@ -44,6 +45,9 @@ export function ConversationUtilityBar({
 }) {
   const workdayPresentation = workdayStatus
     ? WORKDAY_STATE_PRESENTATION[workdayStatus.state]
+    : null;
+  const workdayAge = workdayStatus?.lastActivityMs != null
+    ? timeAgo(workdayStatus.lastActivityMs)
     : null;
   return (
     <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4">
@@ -114,6 +118,17 @@ export function ConversationUtilityBar({
                   <span className="hidden max-w-full truncate sm:inline">
                     {workdayStatus.detail}
                   </span>
+                </span>
+              </>
+            )}
+            {workdayAge && (
+              <>
+                <span aria-hidden="true" className="shrink-0 text-neutral-700">·</span>
+                <span
+                  data-testid="conversation-workday-age"
+                  className="shrink-0 text-neutral-600"
+                >
+                  {workdayAge}
                 </span>
               </>
             )}
