@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy.exc
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlmodel import select
 
 from app.landed_signal import landed_signal_predicate
@@ -515,6 +515,25 @@ CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD = 3
 _CRITERION_NAMED_TEST_TRIAL_STREAK_SCAN_LIMIT = (
     CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD + 5
 )
+
+#: The threshold above bounds TRANSIENCE (a single ``could_not_run`` miss
+#: cannot strand a criterion) but not DETERMINISM: a re-arm key of
+#: (test_identity, precondition_identity) alone cannot express "the runner's
+#: execution environment was repaired" — neither identity changes when, say,
+#: a verification-toolchain venv is fixed. Without a recency bound, three
+#: consecutive infra misses suppress a criterion FOREVER, even after the
+#: underlying environment is repaired and every subsequent trial would pass.
+#: Bounding the streak scan by recency makes suppression self-heal: once the
+#: window elapses, the next trial re-scans only recent rows and (if the
+#: environment is fixed) enrolls again with no operator action and no new
+#: persisted state. Measured baseline: 99 ``criterion_named_test_trial`` tasks
+#: across the trailing 7 days for at most 6 criteria (~14/criterion/week,
+#: ~2/criterion/day). At 3 days, the scan window covers up to ~6 trials per
+#: criterion — double the suppression threshold — so a genuinely-broken
+#: precondition still suppresses well within the window; a 1-day window would
+#: average under 2 trials per criterion, i.e. WORSE than the status quo
+#: (routinely too few terminal trials in-window to ever reach the threshold).
+CRITERION_NAMED_TEST_TRIAL_STREAK_RECENCY_WINDOW_DAYS = 3
 
 # Legacy criterion-key aliases.  A walkthrough script may post a semantic slug
 # (e.g. 'c-workday-session-lifecycle') before the script is updated to emit the
@@ -5094,6 +5113,22 @@ async def enroll_criterion_named_test_trial(
         # ACROSS every head_sha: if the most recent terminal trials for this
         # triple all came back non-green, stop enrolling until test_identity
         # or precondition_identity changes.
+        #
+        # Two additional predicates bound the scan, both load-bearing:
+        #  - a recency cutoff so a repaired execution environment self-heals
+        #    the suppression once the window elapses, instead of latching
+        #    forever on the (test_identity, precondition_identity) key alone
+        #    (see CRITERION_NAMED_TEST_TRIAL_STREAK_RECENCY_WINDOW_DAYS).
+        #  - a signal-bearing filter (contradiction stamp present, OR a
+        #    COMPLETED row that can only be green here since a contradiction
+        #    stamp would already satisfy the first clause) so CANCELLED
+        #    supersede rows — minted by this very function's own stale-QUEUED
+        #    cleanup below every time the candidate SHA bumps while a trial is
+        #    still QUEUED — cannot pad past _CRITERION_NAMED_TEST_TRIAL_STREAK_SCAN_LIMIT
+        #    and push real terminal signal out of the scan window.
+        streak_recency_cutoff = _utcnow() - timedelta(
+            days=CRITERION_NAMED_TEST_TRIAL_STREAK_RECENCY_WINDOW_DAYS
+        )
         streak_rows = (
             await session.execute(
                 select(Task.id, Task.status, Task.context)
@@ -5107,6 +5142,13 @@ async def enroll_criterion_named_test_trial(
                     trial_payload["precondition_identity"].as_string()
                     == precondition_identity,
                     Task.status.in_(TASK_OUTCOME_TERMINAL_STATUSES),
+                    Task.created_at >= streak_recency_cutoff,
+                    or_(
+                        Task.context.has_key(
+                            "criterion_named_test_trial_contradiction"
+                        ),
+                        Task.status == TaskStatus.COMPLETED,
+                    ),
                 )
                 .order_by(Task.created_at.desc())
                 .limit(_CRITERION_NAMED_TEST_TRIAL_STREAK_SCAN_LIMIT)

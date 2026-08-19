@@ -12403,6 +12403,61 @@ async def test_criterion_trial_streak_suppression_rearms_on_changed_precondition
 
 
 @pytest.mark.asyncio
+async def test_criterion_trial_streak_suppression_rearms_after_recency_window_elapses(
+    db_session,
+):
+    """A suppressed streak of pure infrastructure misses (``could_not_run``)
+    must self-heal once the recency window elapses, with NO change to
+    test_identity or precondition_identity — an environment repair (e.g. a
+    verification-toolchain venv fix) cannot otherwise ever re-arm the
+    criterion, since neither identity is sensitive to that repair."""
+    project = await _make_project(db_session, "CriterionTrialStreakRecencyRearm")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Streak recency-rearm criterion"
+    )
+    threshold = ac.CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD
+
+    for index in range(threshold):
+        await _set_candidate_sha(db_session, version, f"{index}" * 40)
+        trial = await _enroll_trial(
+            db_session, project, version, criterion, "testing/test_streak_recency.py"
+        )
+        assert trial is not None
+        _mark_trial_non_green(trial, could_not_run=True)
+        db_session.add(trial)
+        await db_session.commit()
+
+    await _set_candidate_sha(db_session, version, "9" * 40)
+    still_suppressed = await _enroll_trial(
+        db_session, project, version, criterion, "testing/test_streak_recency.py"
+    )
+    assert still_suppressed is None, "sanity check: streak must be suppressing here"
+
+    # Push every existing trial for this identity outside the recency window —
+    # simulating that the underlying infra was repaired days ago and the
+    # criterion has simply not been re-attempted since.
+    stale_cutoff = _utcnow() - timedelta(
+        days=ac.CRITERION_NAMED_TEST_TRIAL_STREAK_RECENCY_WINDOW_DAYS + 1
+    )
+    trials = await _select_criterion_trials(db_session, project.id)
+    for task in trials:
+        if task.first_payload.get("criterion_key") == criterion.criterion_key:
+            task.created_at = stale_cutoff
+            db_session.add(task)
+    await db_session.commit()
+
+    rearmed = await _enroll_trial(
+        db_session, project, version, criterion, "testing/test_streak_recency.py"
+    )
+    assert rearmed is not None, (
+        "a streak of purely stale (outside the recency window) non-green "
+        "trials must re-arm enrollment even though test_identity and "
+        "precondition_identity are unchanged"
+    )
+
+
+@pytest.mark.asyncio
 async def test_criterion_trial_streak_suppression_ignores_cancelled_superseded_rows(
     db_session,
 ):
@@ -12447,6 +12502,64 @@ async def test_criterion_trial_streak_suppression_ignores_cancelled_superseded_r
     assert suppressed is None, (
         "interleaved CANCELLED rows must not prevent the non-green streak from "
         "being detected"
+    )
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_streak_suppression_survives_heavy_cancelled_supersede_churn(
+    db_session,
+):
+    """The old fixed scan pad (threshold + 5 = 8 rows) let CANCELLED
+    supersede noise push real terminal signal out of the streak window under
+    VM-saturation churn, where a QUEUED trial is superseded before it can
+    run on nearly every candidate SHA bump. With the scan restricted to
+    signal-bearing rows (a contradiction stamp or a COMPLETED row), the
+    streak must still be detected even with a heavy volume of interleaved
+    CANCELLED rows — far past the old pad."""
+    project = await _make_project(
+        db_session, "CriterionTrialStreakHeavyCancelledChurn"
+    )
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Streak heavy-churn criterion"
+    )
+    threshold = ac.CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD
+    cancelled_per_terminal = 20
+
+    for index in range(threshold):
+        await _set_candidate_sha(db_session, version, f"{index}" * 40)
+        trial = await _enroll_trial(
+            db_session, project, version, criterion, "testing/test_streak_churn.py"
+        )
+        assert trial is not None
+        _mark_trial_non_green(trial)
+        db_session.add(trial)
+        await db_session.commit()
+
+        # Simulate heavy supersede churn: many more CANCELLED noise rows per
+        # terminal trial than the old fixed scan pad (threshold + 5 = 8) could
+        # tolerate before pushing real signal out of the window.
+        for noise_index in range(cancelled_per_terminal):
+            noise = Task(
+                project_id=project.id,
+                title=f"Cancelled churn noise trial {index}-{noise_index}",
+                payloads=[trial.first_payload],
+                context=dict(trial.context or {}),
+                status=TaskStatus.CANCELLED,
+                created_by="SYSTEM_AUTO_REVIEW",
+            )
+            noise.context.pop("criterion_named_test_trial_contradiction", None)
+            noise.context["superseded_by_newer_candidate"] = True
+            db_session.add(noise)
+        await db_session.commit()
+
+    await _set_candidate_sha(db_session, version, "9" * 40)
+    suppressed = await _enroll_trial(
+        db_session, project, version, criterion, "testing/test_streak_churn.py"
+    )
+    assert suppressed is None, (
+        "heavy CANCELLED supersede churn (well past the old fixed scan pad) "
+        "must not defeat the non-green streak suppression"
     )
 
 
