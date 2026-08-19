@@ -271,17 +271,17 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
   const autonomousFailures = detailedHealth?.autonomous.consecutive_failures ?? 0;
 
   return (
-    <div data-testid="orchestrator-health-bar" className={`mb-3 flex min-h-8 shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border border-neutral-800 bg-[#10151c] px-2.5 py-1.5 text-xs${apiHealthy ? '' : ' bg-red-950/20'}`}>
+    <div data-testid="orchestrator-health-bar" className={`mb-3 flex min-h-8 shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border border-neutral-800 bg-workbench-layer px-2.5 py-1.5 text-xs${apiHealthy ? '' : ' bg-red-950/20'}`}>
       {/* Left: API + WS status */}
       <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-        <div className="flex items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1" title={apiHealthy ? undefined : 'API connection error — data may be stale'}>
+        <div className="flex items-center gap-1.5 rounded border border-neutral-800 bg-workbench-card px-2 py-1" title={apiHealthy ? undefined : 'API connection error — data may be stale'}>
           <span className={`w-1.5 h-1.5 rounded-full ${apiHealthy ? 'bg-emerald-500' : 'bg-red-500 animate-pulse'}`} />
           <span className={apiHealthy ? 'text-neutral-400' : 'text-red-400'}>
             {apiHealthy ? 'Connected' : 'API Error'}
           </span>
         </div>
-        <div className="flex items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1">
-          <span className={`w-1.5 h-1.5 rounded-full ${wsConnected ? 'bg-blue-500' : 'bg-neutral-600'}`} />
+        <div className="flex items-center gap-1.5 rounded border border-neutral-800 bg-workbench-card px-2 py-1">
+          <span className={`w-1.5 h-1.5 rounded-full ${wsConnected ? 'bg-blue-500' : 'bg-workbench-card'}`} />
           <span className={wsConnected ? 'text-blue-400' : 'text-neutral-500'}>
             WS
           </span>
@@ -293,7 +293,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         {health && (
           <>
             <div
-              className="flex items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1"
+              className="flex items-center gap-1.5 rounded border border-neutral-800 bg-workbench-card px-2 py-1"
               title={cycleTitle}
             >
               <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cycleDown ? 'bg-red-500 animate-pulse' : cycleDegraded ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500'}`} />
@@ -309,18 +309,18 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
               </span>
             </div>
 
-            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <div className="w-px h-3 bg-workbench-panel shrink-0" />
 
-            <div className="flex items-center gap-2 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1 text-neutral-400">
+            <div className="flex items-center gap-2 rounded border border-neutral-800 bg-workbench-card px-2 py-1 text-neutral-400">
               <span><span className="text-neutral-300 font-medium">{Math.max(0, health.queued_tasks)}</span> queued</span>
               <span><span className="text-neutral-300 font-medium">{Math.max(0, health.active_tasks)}</span> active</span>
             </div>
 
             {showDeployInfo && (
               <>
-                <div className="w-px h-3 bg-neutral-800 shrink-0" />
+                <div className="w-px h-3 bg-workbench-panel shrink-0" />
                 <div
-                  className="flex items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1"
+                  className="flex items-center gap-1.5 rounded border border-neutral-800 bg-workbench-card px-2 py-1"
                   title={[
                     (deployState?.rollback_count ?? 0) > 0 ? `${deployState?.rollback_count ?? 0} rollback${(deployState?.rollback_count ?? 0) !== 1 ? 's' : ''}` : null,
                     deployState?.rollback_reason ? `Reason: ${deployState?.rollback_reason}` : null,
@@ -333,7 +333,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                     deployState?.status === 'ROLLED_BACK' ? 'bg-amber-400' :
                     deployState?.status === 'PAUSED' ? 'bg-amber-400' :
                     deployState?.status === 'MONITORING' ? 'bg-blue-400 animate-pulse' :
-                    'bg-neutral-500'
+                    'bg-workbench-control'
                   }`} />
                   <span className={`${
                     deployState?.status === 'HALTED' ? 'text-red-400' :
@@ -364,8 +364,8 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
 
             {orderedDeps.length > 0 && (
               <>
-                <div className="w-px h-3 bg-neutral-800 shrink-0" />
-                <div className="flex items-center gap-2 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1">
+                <div className="w-px h-3 bg-workbench-panel shrink-0" />
+                <div className="flex items-center gap-2 rounded border border-neutral-800 bg-workbench-card px-2 py-1">
                   {orderedDeps.map(key => {
                     const val = externalHealth[key] as boolean | string;
                     return (
@@ -387,10 +387,10 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         {/* Detailed health indicators */}
         {openProjects.length > 0 && (
           <>
-            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <div className="w-px h-3 bg-workbench-panel shrink-0" />
             <div className="relative flex items-center">
               <button
-                className="flex min-h-[44px] cursor-pointer items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1 sm:min-h-0"
+                className="flex min-h-[44px] cursor-pointer items-center gap-1.5 rounded border border-neutral-800 bg-workbench-card px-2 py-1 sm:min-h-0"
                 title={`Circuit breakers open for: ${openProjects.join(', ')}`}
                 onClick={() => setCircuitExpanded(v => !v)}
               >
@@ -398,7 +398,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                 <span className="text-amber-400">{openProjects.length} circuit{openProjects.length !== 1 ? 's' : ''} open</span>
               </button>
               {circuitExpanded && (
-                <div className="absolute top-5 left-0 z-10 bg-neutral-800 border border-neutral-700 rounded px-2 py-1.5 text-neutral-300 whitespace-nowrap shadow-lg">
+                <div className="absolute top-5 left-0 z-10 bg-workbench-panel border border-neutral-700 rounded px-2 py-1.5 text-neutral-300 whitespace-nowrap shadow-lg">
                   {openProjects.map(id => (
                     <div key={id} className="flex items-center gap-1.5 py-0.5">
                       <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
@@ -413,7 +413,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
 
         {poolExhausted && (
           <>
-            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <div className="w-px h-3 bg-workbench-panel shrink-0" />
             <div className="flex items-center gap-1.5 rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1" title="No Max Plan accounts available">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
               <span className="text-amber-400">Pool empty</span>
@@ -423,8 +423,8 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
 
         {providerApis && providerApis.required_providers.length > 0 && (
           <>
-            <div className="w-px h-3 bg-neutral-800 shrink-0" />
-            <div className="flex items-center gap-2 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1" title={`Provider health: ${providerApis.status}`}>
+            <div className="w-px h-3 bg-workbench-panel shrink-0" />
+            <div className="flex items-center gap-2 rounded border border-neutral-800 bg-workbench-card px-2 py-1" title={`Provider health: ${providerApis.status}`}>
               <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                 providerApis.status === 'down' ? 'bg-red-500 animate-pulse' :
                 providerApis.status === 'degraded' ? 'bg-amber-400' :
@@ -441,7 +441,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                     status === 'down' ? 'bg-red-500' :
                     status === 'degraded' ? 'bg-amber-400' :
                     status === 'ok' ? 'bg-emerald-500' :
-                    'bg-neutral-600';
+                    'bg-workbench-card';
                   const label = provider.slice(0, 3).toUpperCase();
                   const title = snapshot
                     ? `${provider}: ${status}${snapshot.reason ? ` — ${snapshot.reason}` : ''}`
@@ -465,7 +465,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
 
         {autonomousFailures >= 2 && (
           <>
-            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <div className="w-px h-3 bg-workbench-panel shrink-0" />
             <div className="flex items-center gap-1.5 rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1" title={`Autonomous mode: ${autonomousFailures} consecutive failures`}>
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
               <span className="text-amber-400">{autonomousFailures} auto-fail</span>
@@ -477,14 +477,14 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
             Text stays low-intensity when healthy; amber/red when degraded/critical. */}
         {detailedHealth?.github_quota && (
           <>
-            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <div className="w-px h-3 bg-workbench-panel shrink-0" />
             {(() => {
               const q = localQuota ?? detailedHealth.github_quota;
               const dotColor =
                 q.status === 'critical' ? 'bg-red-500 animate-pulse' :
                 q.status === 'degraded' ? 'bg-amber-400' :
                 q.status === 'ok' ? 'bg-emerald-500' :
-                'bg-neutral-600';
+                'bg-workbench-card';
               const textColor =
                 q.status === 'critical' ? 'text-red-400' :
                 q.status === 'degraded' ? 'text-amber-400' :
@@ -498,7 +498,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                 ? 'GitHub quota: no recent observation (click ↻ to probe)'
                 : `GitHub API quota: ${remainingDisplay}/${limitDisplay} remaining${resetIn != null ? `, resets in ~${resetIn}min` : ''} (click ↻ to refresh)`;
               return (
-                <div className="flex items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1" title={title}>
+                <div className="flex items-center gap-1.5 rounded border border-neutral-800 bg-workbench-card px-2 py-1" title={title}>
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
                   <span className={textColor}>
                     GH: {remainingDisplay}{q.status === 'critical' ? ' ⚠' : ''}
@@ -521,7 +521,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
 
         {pipelineThrottle && (
           <>
-            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <div className="w-px h-3 bg-workbench-panel shrink-0" />
             <span className="inline-flex max-w-full min-w-0 items-center gap-1 rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-xs text-amber-300">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
               <span className="min-w-0 truncate">Throttled: {pipelineThrottle.detail}</span>
@@ -532,7 +532,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
 
         {gatedTaskTypes && gatedTaskTypes.length > 0 && (
           <>
-            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <div className="w-px h-3 bg-workbench-panel shrink-0" />
             <div
               className="inline-flex max-w-full min-w-0 flex-wrap items-center gap-1 rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-xs"
               title={`Per-type dispatch gates active: ${gatedTaskTypes.map(t => `${t.task_type} (${(t.failure_rate * 100).toFixed(0)}% failure rate, n=${t.sample_size})`).join('; ')}`}
@@ -553,13 +553,13 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
 
         {dailyCostUsd != null && (
           <>
-            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <div className="w-px h-3 bg-workbench-panel shrink-0" />
             {(() => {
               const hasCeiling = dailyCostCeilingUsd > 0;
               const ratio = hasCeiling ? dailyCostUsd / dailyCostCeilingUsd : 0;
               const isRed = hasCeiling && ratio >= COST_RED_THRESHOLD;
               const isAmber = hasCeiling && !isRed && ratio >= COST_AMBER_THRESHOLD;
-              const dotColor = isRed ? 'bg-red-500 animate-pulse' : isAmber ? 'bg-amber-400' : 'bg-neutral-500';
+              const dotColor = isRed ? 'bg-red-500 animate-pulse' : isAmber ? 'bg-amber-400' : 'bg-workbench-control';
               const textColor = isRed ? 'text-red-400' : isAmber ? 'text-amber-400' : 'text-neutral-400';
               const label = hasCeiling
                 ? `$${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)}`
@@ -570,7 +570,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
               return (
                 <button
                   type="button"
-                  className={`inline-flex min-h-[44px] cursor-pointer items-center gap-1 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1 text-xs sm:min-h-0 ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''} ${digestPollFailed ? 'border-amber-500/30 opacity-75' : ''}`}
+                  className={`inline-flex min-h-[44px] cursor-pointer items-center gap-1 rounded border border-neutral-800 bg-workbench-card px-2 py-1 text-xs sm:min-h-0 ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''} ${digestPollFailed ? 'border-amber-500/30 opacity-75' : ''}`}
                   title={digestStaleSuffix ? `${titleText} ${digestStaleSuffix}` : titleText}
                   onClick={() => { if (costSectionAvailable) document.getElementById('cost-section')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
                 >
@@ -599,7 +599,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
             )}
           </span>
         )}
-        <span className="rounded border border-neutral-800 bg-[#0d1218] px-2 py-1 text-neutral-500">Updated {lastFetchTime ? timeAgo(lastFetchTime) : '—'}</span>
+        <span className="rounded border border-neutral-800 bg-workbench-card px-2 py-1 text-neutral-500">Updated {lastFetchTime ? timeAgo(lastFetchTime) : '—'}</span>
       </div>
     </div>
   );

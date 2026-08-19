@@ -121,7 +121,7 @@ export function ProviderCostPanel({
       )}
       <div
         data-testid="provider-cost-summary"
-        className="mb-2 grid grid-cols-2 overflow-hidden rounded-md border border-neutral-800/60 bg-neutral-950/30 sm:grid-cols-4"
+        className="mb-2 grid grid-cols-2 overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-shell/30 sm:grid-cols-4"
       >
         <div className="border-r border-b border-neutral-800/60 px-2.5 py-2 sm:border-b-0">
           <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Window</div>
@@ -154,7 +154,7 @@ export function ProviderCostPanel({
       >
         <span className="font-semibold">Spend pressure:</span> {spendAction}
       </div>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
           {data.rows.map((row, i) => {

@@ -60,7 +60,7 @@ function CheckResultReasoningDisplay({ result }: { result: SelfReviewCheckResult
           result.severity === 'CRITICAL' ? 'bg-red-950/40 text-red-400'
           : result.severity === 'HIGH' ? 'bg-orange-950/40 text-orange-400'
           : result.severity === 'MEDIUM' ? 'bg-yellow-950/40 text-yellow-400'
-          : 'bg-neutral-800 text-neutral-400'
+          : 'bg-workbench-panel text-neutral-400'
         }`}>
           {result.severity}
         </span>
@@ -81,7 +81,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
   const isSoftFallback = verdict === 'unknown' && Object.keys(checkResults).length === 0;
 
   const verdictColor = verdict === 'pass' ? 'text-emerald-400' : verdict === 'fail' ? 'text-red-400' : 'text-neutral-400';
-  const verdictBorderBg = verdict === 'pass' ? 'bg-emerald-950/30 border-emerald-800/40' : verdict === 'fail' ? 'bg-red-950/30 border-red-800/40' : 'bg-neutral-800 border-neutral-700';
+  const verdictBorderBg = verdict === 'pass' ? 'bg-emerald-950/30 border-emerald-800/40' : verdict === 'fail' ? 'bg-red-950/30 border-red-800/40' : 'bg-workbench-panel border-neutral-700';
 
   const failedCategories = Object.entries(checkResults).filter(([, r]) => !r.passed);
   const passedCategories = Object.entries(checkResults).filter(([, r]) => r.passed);
@@ -95,7 +95,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
     : 0;
 
   return (
-    <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 mb-2">
+    <div className="bg-workbench-base/50 rounded-lg border border-neutral-800 mb-2">
       {/* reason: collapsible section header; text-xs py-2 single-row height matches drawer density convention */}
       <button
         data-viewport-allow-small-target
@@ -214,7 +214,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
                 <div>
                   <p className="text-xs text-neutral-400 font-medium mb-1.5">Edges considered ({outcome.edges_considered.length})</p>
                   <div className="rounded border border-neutral-700 overflow-hidden text-ui-sm">
-                    <div className="grid grid-cols-[1fr_auto] bg-neutral-800/60 px-2 py-1 font-semibold text-neutral-400 uppercase tracking-wide gap-2">
+                    <div className="grid grid-cols-[1fr_auto] bg-workbench-panel/60 px-2 py-1 font-semibold text-neutral-400 uppercase tracking-wide gap-2">
                       <span>Case</span>
                       <span>Handled</span>
                     </div>
@@ -238,7 +238,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
                 <div>
                   <p className="text-xs text-neutral-400 font-medium mb-1.5">Agent vs. Human review categories</p>
                   <div className="rounded border border-neutral-700 overflow-hidden text-ui-sm">
-                    <div className="grid grid-cols-3 bg-neutral-800/60 px-2 py-1 font-semibold text-neutral-400 uppercase tracking-wide">
+                    <div className="grid grid-cols-3 bg-workbench-panel/60 px-2 py-1 font-semibold text-neutral-400 uppercase tracking-wide">
                       <span>Category</span>
                       <span className="text-center">Agent</span>
                       <span className="text-center">Human</span>

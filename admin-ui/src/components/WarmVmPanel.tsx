@@ -190,7 +190,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
           className={
             (flagOn
               ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/30'
-              : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
+              : 'bg-workbench-layer/40 border border-neutral-600/40 text-neutral-400 hover:bg-workbench-hover/60'
             ) +
             ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
@@ -212,7 +212,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
           className={
             (backlogReuseOn
               ? 'bg-sky-500/20 border border-sky-500/40 text-sky-400 hover:bg-sky-500/30'
-              : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
+              : 'bg-workbench-layer/40 border border-neutral-600/40 text-neutral-400 hover:bg-workbench-hover/60'
             ) +
             ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
@@ -234,7 +234,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
           className={
             (poolOn
               ? 'bg-violet-500/20 border border-violet-500/40 text-violet-400 hover:bg-violet-500/30'
-              : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
+              : 'bg-workbench-layer/40 border border-neutral-600/40 text-neutral-400 hover:bg-workbench-hover/60'
             ) +
             ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
@@ -257,7 +257,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
           className={
             (accountRetargetOn
               ? 'bg-violet-500/20 border border-violet-500/40 text-violet-400 hover:bg-violet-500/30'
-              : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
+              : 'bg-workbench-layer/40 border border-neutral-600/40 text-neutral-400 hover:bg-workbench-hover/60'
             ) +
             ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
@@ -280,7 +280,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
           className={
             (crossProviderRetargetOn
               ? 'bg-violet-500/20 border border-violet-500/40 text-violet-400 hover:bg-violet-500/30'
-              : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
+              : 'bg-workbench-layer/40 border border-neutral-600/40 text-neutral-400 hover:bg-workbench-hover/60'
             ) +
             ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
@@ -330,7 +330,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
       </div>
 
       {!collapsed && (
-        <div className={`mt-2 bg-neutral-900 border border-neutral-800 rounded-lg p-3 text-xs ${stale && data && !error ? STALE_CLASSES : ''}`}>
+        <div className={`mt-2 bg-workbench-base border border-neutral-800 rounded-lg p-3 text-xs ${stale && data && !error ? STALE_CLASSES : ''}`}>
           {error && (
             <div className="text-red-400 mb-2">Failed to load warm-VM state: {error}</div>
           )}
@@ -478,7 +478,7 @@ const PAYOFF_BADGE: Record<PoolPayoffState, { label: string; cls: string }> = {
   PROVEN: { label: 'PROVEN', cls: 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10' },
   COST_REGRESSION: { label: 'COST REGRESSION', cls: 'text-red-400 border-red-500/40 bg-red-500/10' },
   NO_LIFT: { label: 'NO LIFT', cls: 'text-amber-400 border-amber-500/40 bg-amber-500/10' },
-  INSUFFICIENT_DATA: { label: 'INSUFFICIENT DATA', cls: 'text-neutral-400 border-neutral-600/40 bg-neutral-700/20' },
+  INSUFFICIENT_DATA: { label: 'INSUFFICIENT DATA', cls: 'text-neutral-400 border-neutral-600/40 bg-workbench-layer/20' },
 };
 
 function fmtPct(v: number | null | undefined): string {
@@ -659,7 +659,7 @@ function PoolHitRateEstimateRow({ data, targets, onTargetSet }: {
           data-testid="pool-estimate-project"
           value={effectiveProject}
           onChange={(e) => { setProjectId(e.target.value); setEstimate(null); }}
-          className="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 font-mono max-w-[160px]"
+          className="bg-workbench-panel border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 font-mono max-w-[160px]"
         >
           {projectIds.map((pid) => (
             <option key={pid} value={pid}>{shortVm(pid)}</option>
@@ -675,7 +675,7 @@ function PoolHitRateEstimateRow({ data, targets, onTargetSet }: {
             data-testid="pool-estimate-target"
             value={targetSize}
             onChange={(e) => setTargetSize(Number(e.target.value))}
-            className="w-12 bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 font-mono"
+            className="w-12 bg-workbench-panel border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 font-mono"
           />
         </label>
         <button
@@ -744,7 +744,7 @@ function PoolHitRateEstimateRow({ data, targets, onTargetSet }: {
             data-testid="pool-target-clear"
             title="Clear this project's explicit target so it inherits the global default"
             className={
-              'bg-neutral-700/40 border border-neutral-600/40 text-neutral-300 hover:bg-neutral-700/60 ' +
+              'bg-workbench-layer/40 border border-neutral-600/40 text-neutral-300 hover:bg-workbench-hover/60 ' +
               'font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
               (settingTarget ? ' opacity-50 cursor-not-allowed' : ' cursor-pointer')
             }

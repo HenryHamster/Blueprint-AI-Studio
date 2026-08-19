@@ -282,7 +282,7 @@ export function ProjectBuildConfigSection({
       {/* Repository info */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Repository</h3>
-        <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center gap-2">
+        <div className="bg-workbench-base border border-neutral-800 rounded-lg px-4 py-3 flex items-center gap-2">
           <span className="text-xs text-neutral-400">Repository</span>
           <span className="text-xs text-neutral-100 font-mono ml-auto">
             {githubOwner && githubRepo ? `${githubOwner}/${githubRepo}` : '—'}
@@ -290,7 +290,7 @@ export function ProjectBuildConfigSection({
         </div>
         {buildConfig?.language ? (
           <div className="mt-2 flex flex-wrap gap-1.5">
-            <span className="text-ui-md bg-neutral-800 border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded-full">
+            <span className="text-ui-md bg-workbench-panel border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded-full">
               {buildConfig.language}
             </span>
           </div>
@@ -299,7 +299,7 @@ export function ProjectBuildConfigSection({
 
       {/* Empty state / detect prompt */}
       {!hasConfig && (
-        <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-5 py-6 text-center space-y-3">
+        <div className="bg-workbench-base border border-neutral-800 rounded-lg px-5 py-6 text-center space-y-3">
           <p className="text-xs text-neutral-400">
             No build configuration detected yet. Run auto-detection to populate lint, test, and build commands from the repository structure.
           </p>
@@ -307,7 +307,7 @@ export function ProjectBuildConfigSection({
             <button
               onClick={handleDetect}
               disabled={detecting}
-              className="inline-flex items-center gap-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg px-4 py-2 text-xs transition-colors disabled:opacity-50"
+              className="inline-flex items-center gap-2 bg-workbench-panel hover:bg-workbench-hover text-neutral-200 rounded-lg px-4 py-2 text-xs transition-colors disabled:opacity-50"
             >
               {detecting ? (
                 <RefreshCw className="w-3.5 h-3.5 animate-spin" />
@@ -319,7 +319,7 @@ export function ProjectBuildConfigSection({
           ) : (
             <button
               onClick={addDir}
-              className="inline-flex items-center gap-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg px-4 py-2 text-xs transition-colors"
+              className="inline-flex items-center gap-2 bg-workbench-panel hover:bg-workbench-hover text-neutral-200 rounded-lg px-4 py-2 text-xs transition-colors"
             >
               <Plus className="w-3.5 h-3.5" />
               Add manually
@@ -353,7 +353,7 @@ export function ProjectBuildConfigSection({
           </p>
           <div className="space-y-3">
             {dirs.map((dir, i) => (
-              <div key={i} className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 space-y-2">
+              <div key={i} className="bg-workbench-base border border-neutral-800 rounded-lg p-3 space-y-2">
                 <div className="flex items-center gap-2 mb-1">
                   <div className="flex-1">
                     <label className="block text-ui-sm text-neutral-500 mb-0.5 uppercase">Path</label>
@@ -362,7 +362,7 @@ export function ProjectBuildConfigSection({
                       value={dir.path}
                       onChange={e => updateDir(i, 'path', e.target.value)}
                       placeholder="backend/"
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono workbench-focus"
                     />
                   </div>
                   <div className="flex-1">
@@ -372,7 +372,7 @@ export function ProjectBuildConfigSection({
                       value={dir.type}
                       onChange={e => updateDir(i, 'type', e.target.value)}
                       placeholder="python"
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono workbench-focus"
                     />
                   </div>
                   {/* reason: inline icon-only remove button in dense directory row */}
@@ -393,7 +393,7 @@ export function ProjectBuildConfigSection({
                       value={dir.lint_cmd ?? ''}
                       onChange={e => updateDir(i, 'lint_cmd', e.target.value)}
                       placeholder="(auto-infer by type)"
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono workbench-focus"
                     />
                     {!isRecognizedLintCmd(dir.lint_cmd ?? '') && (
                       <p className="mt-1 flex items-start gap-1 text-ui-sm text-yellow-400" data-testid="lint-cmd-warning">
@@ -409,7 +409,7 @@ export function ProjectBuildConfigSection({
                       value={dir.test_cmd ?? ''}
                       onChange={e => updateDir(i, 'test_cmd', e.target.value)}
                       placeholder="pytest"
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono workbench-focus"
                     />
                   </div>
                   <div>
@@ -419,7 +419,7 @@ export function ProjectBuildConfigSection({
                       value={dir.build_cmd ?? ''}
                       onChange={e => updateDir(i, 'build_cmd', e.target.value)}
                       placeholder="npm run build"
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono workbench-focus"
                     />
                   </div>
                 </div>
@@ -453,7 +453,7 @@ export function ProjectBuildConfigSection({
                 value={gitEmail}
                 onChange={e => setGitEmail(e.target.value)}
                 placeholder="blueprint-agent@automated.dev"
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono workbench-focus"
               />
             </div>
             <div>
@@ -463,7 +463,7 @@ export function ProjectBuildConfigSection({
                 value={gitName}
                 onChange={e => setGitName(e.target.value)}
                 placeholder="Blueprint Agent"
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono workbench-focus"
               />
             </div>
           </div>
@@ -485,7 +485,7 @@ export function ProjectBuildConfigSection({
               />
               <div
                 onClick={() => setEnableParallelReview(v => !v)}
-                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${enableParallelReview ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${enableParallelReview ? 'bg-blue-600' : 'bg-workbench-layer'} relative`}
               >
                 <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${enableParallelReview ? 'translate-x-4' : 'translate-x-0'}`} />
               </div>
@@ -510,7 +510,7 @@ export function ProjectBuildConfigSection({
               />
               <div
                 onClick={() => setEnableParallelFix(v => !v)}
-                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${enableParallelFix ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${enableParallelFix ? 'bg-blue-600' : 'bg-workbench-layer'} relative`}
               >
                 <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${enableParallelFix ? 'translate-x-4' : 'translate-x-0'}`} />
               </div>
@@ -535,7 +535,7 @@ export function ProjectBuildConfigSection({
               />
               <div
                 onClick={() => setRequiresCiChecks(v => !v)}
-                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${requiresCiChecks ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${requiresCiChecks ? 'bg-blue-600' : 'bg-workbench-layer'} relative`}
               >
                 <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${requiresCiChecks ? 'translate-x-4' : 'translate-x-0'}`} />
               </div>
@@ -570,7 +570,7 @@ export function ProjectBuildConfigSection({
                       .catch(err => { console.error('Failed to update block-degraded-unverified-merge:', err); setBlockDegradedEnabled(!next); })
                       .finally(() => setBlockDegradedSaving(false));
                   }}
-                  className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${blockDegradedEnabled ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+                  className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${blockDegradedEnabled ? 'bg-blue-600' : 'bg-workbench-layer'} relative`}
                 >
                   <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${blockDegradedEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
                 </div>
@@ -608,7 +608,7 @@ export function ProjectBuildConfigSection({
                       .catch(err => { console.error('Failed to update block-no-test-unverified-merge:', err); setBlockNoTestEnabled(!next); })
                       .finally(() => setBlockNoTestSaving(false));
                   }}
-                  className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${blockNoTestEnabled ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+                  className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${blockNoTestEnabled ? 'bg-blue-600' : 'bg-workbench-layer'} relative`}
                 >
                   <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${blockNoTestEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
                 </div>
@@ -682,7 +682,7 @@ export function ProjectBuildConfigSection({
                 value={taskBranchNamespace}
                 onChange={e => setTaskBranchNamespace(e.target.value)}
                 placeholder="blueprint"
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono workbench-focus"
               />
               <p className="text-ui-md text-neutral-600 mt-1">
                 Leading segment of agent task branches, e.g. <code className="font-mono text-neutral-400">{(taskBranchNamespace.trim() || 'blueprint')}/task-…</code>.
@@ -695,7 +695,7 @@ export function ProjectBuildConfigSection({
                 value={taskBranchPrefix}
                 onChange={e => setTaskBranchPrefix(e.target.value)}
                 placeholder="blueprint/"
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono workbench-focus"
               />
               <p className="text-ui-md text-neutral-600 mt-1">
                 Legacy override. Leave blank to derive from namespace.
@@ -714,7 +714,7 @@ export function ProjectBuildConfigSection({
           </p>
           <div className="flex items-center gap-2 mb-3">
             {stagingPrefixesIsDefault ? (
-              <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">global default</span>
+              <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-workbench-panel text-neutral-500 border border-neutral-700">global default</span>
             ) : (
               <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50">override</span>
             )}
@@ -727,7 +727,7 @@ export function ProjectBuildConfigSection({
                   value={prefix}
                   onChange={e => setStagingPrefixes(prev => prev.map((p, j) => j === i ? e.target.value : p))}
                   placeholder="research/"
-                  className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                  className="flex-1 bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono workbench-focus"
                 />
                 {/* reason: inline icon-only remove button in dense prefix list */}
                 <button
@@ -755,7 +755,7 @@ export function ProjectBuildConfigSection({
               <button
                 onClick={handleRevertStagingPrefixes}
                 disabled={stagingPrefixesSaving}
-                className="inline-flex items-center justify-center min-h-[44px] bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded-lg px-4 py-2 text-xs transition-colors disabled:opacity-50"
+                className="inline-flex items-center justify-center min-h-[44px] bg-workbench-panel hover:bg-workbench-hover text-neutral-400 rounded-lg px-4 py-2 text-xs transition-colors disabled:opacity-50"
               >
                 {stagingPrefixesSaving ? 'Reverting...' : 'Revert to default'}
               </button>
@@ -763,7 +763,7 @@ export function ProjectBuildConfigSection({
             <button
               onClick={handleSaveStagingPrefixes}
               disabled={stagingPrefixesSaving || stagingPrefixes.length === 0 || stagingPrefixes.some(p => !p.trim())}
-              className="inline-flex items-center justify-center min-h-[44px] bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50 ml-auto"
+              className="inline-flex items-center justify-center min-h-[44px] bg-workbench-layer hover:bg-workbench-hover text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50 ml-auto"
             >
               {stagingPrefixesSaving ? 'Saving...' : 'Save Staging Prefixes'}
             </button>
@@ -788,7 +788,7 @@ export function ProjectBuildConfigSection({
               value={prTitlePrefix}
               onChange={e => setPrTitlePrefix(e.target.value)}
               placeholder="[Bot]"
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono workbench-focus"
             />
             <p className="text-ui-md text-neutral-600 mt-1">
               e.g. <code className="font-mono text-neutral-400">{prTitlePrefix.trim() || '[Bot]'}</code>{' '}feat: add new feature
@@ -825,7 +825,7 @@ export function ProjectBuildConfigSection({
                       });
                     }}
                     placeholder="—"
-                    className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                    className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono workbench-focus"
                   />
                   <span className="text-ui-sm text-neutral-500 shrink-0">%</span>
                 </div>
@@ -841,7 +841,7 @@ export function ProjectBuildConfigSection({
           <button
             onClick={handleSave}
             disabled={saving}
-            className="inline-flex items-center justify-center min-h-[44px] bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"
+            className="inline-flex items-center justify-center min-h-[44px] bg-workbench-layer hover:bg-workbench-hover text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"
           >
             {saving ? 'Saving...' : 'Save Build Config'}
           </button>

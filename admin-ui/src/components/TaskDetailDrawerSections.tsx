@@ -152,7 +152,7 @@ export const TaskComputeJobsSection = memo(function TaskComputeJobsSection({ tas
               ? 'bg-amber-900/40 text-amber-400'
               : job.outcome === 'FAILURE'
                 ? 'bg-red-900/40 text-red-400'
-                : 'bg-neutral-800/60 text-neutral-400';
+                : 'bg-workbench-panel/60 text-neutral-400';
         const { label: backendLabel, isOperatorHardware } = computeJobExecutionLocation(job.backend ?? '');
         const runnerName = job.runner?.hostname ?? (job.runner_target_id ? job.runner_target_id.slice(0, 8) : null);
         return (
@@ -284,7 +284,7 @@ export function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task:
       {spawnGate.kind !== 'no-gate' && (
         <DetailRow label="Spawn Gate">
           {spawnGate.kind === 'unchallenged' && (
-            <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800/60 text-neutral-400">unchallenged</span>
+            <span className="text-xs px-1.5 py-0.5 rounded bg-workbench-panel/60 text-neutral-400">unchallenged</span>
           )}
           {spawnGate.kind === 'challenged-pass' && (
             <span className="inline-flex flex-col gap-1 min-w-0">
@@ -346,7 +346,7 @@ export function SalvageActivitySection({ task, onNavigateToTask }: { task: Task;
 
 export function AdversarialGateDiagnosticSection({ diag, onNavigateToTask }: { diag: AdversarialGateDiagnostic; onNavigateToTask?: (id: string) => void }) {
   const stateClass = diag.completion_state === 'completed'
-    ? 'bg-neutral-800/60 text-neutral-300'
+    ? 'bg-workbench-panel/60 text-neutral-300'
     : 'bg-red-900/30 text-red-400';
   const parseStateLabel = diag.parse_state ? diag.parse_state.replace(/_/g, ' ') : 'unknown';
   return (
@@ -505,7 +505,7 @@ export const KnowledgeDocumentSection = memo(function KnowledgeDocumentSection({
             </span>
           )}
           {doc.analysis_mode && (
-            <span className="text-ui-md px-2 py-0.5 rounded border border-neutral-700/40 bg-neutral-800/40 text-neutral-300">
+            <span className="text-ui-md px-2 py-0.5 rounded border border-neutral-700/40 bg-workbench-panel/40 text-neutral-300">
               {doc.analysis_mode}
             </span>
           )}
@@ -589,7 +589,7 @@ export function EvaluationSummarySection({ summary }: { summary: TaskEvaluationS
       <div className="space-y-3 bg-cyan-950/10 rounded-lg p-3 border border-cyan-900/30">
         <div className="flex items-start gap-2">
           <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Status</span>
-          <span className="text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded border bg-neutral-900/70 text-neutral-200 border-neutral-700/50">
+          <span className="text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded border bg-workbench-base/70 text-neutral-200 border-neutral-700/50">
             {summary.status}
           </span>
         </div>
@@ -617,7 +617,7 @@ export function EvaluationSummarySection({ summary }: { summary: TaskEvaluationS
             <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Highlights</span>
             <div className="min-w-0 flex-1 flex flex-wrap gap-1.5">
               {highlights.map((item, i) => (
-                <span key={i} className="inline-flex max-w-full flex-wrap gap-x-1 rounded bg-neutral-900/70 px-2 py-1 text-ui-md text-neutral-200 border border-neutral-800">
+                <span key={i} className="inline-flex max-w-full flex-wrap gap-x-1 rounded bg-workbench-base/70 px-2 py-1 text-ui-md text-neutral-200 border border-neutral-800">
                   <span className="text-neutral-500">{item.label}</span>
                   <span className="break-words">{item.value}</span>
                 </span>
@@ -918,7 +918,7 @@ export function TaskConfigSection({ task }: { task: Task }) {
   return (
     <>
       <SectionHeader>Task Config</SectionHeader>
-      {prompt && prompt !== task.description && <DetailRow label="Prompt"><pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-32 overflow-y-auto custom-scrollbar border border-neutral-800">{prompt}</pre></DetailRow>}
+      {prompt && prompt !== task.description && <DetailRow label="Prompt"><pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-workbench-base/50 rounded-lg p-3 max-h-32 overflow-y-auto custom-scrollbar border border-neutral-800">{prompt}</pre></DetailRow>}
       {baseBranch && <DetailRow label="Base Branch"><span className="font-mono text-sm break-all min-w-0">{baseBranch}</span></DetailRow>}
       {prNumber && (
         <DetailRow label="PR Number">
@@ -1138,7 +1138,7 @@ export function MergeTestGateSection({ task }: { task: Task }) {
     },
     undetected: {
       label: 'No suite detected',
-      badge: 'text-neutral-400 bg-neutral-800/40 border-neutral-700/40',
+      badge: 'text-neutral-400 bg-workbench-panel/40 border-neutral-700/40',
       note: 'No runnable test suite was detected on the PR head — the gate fell back to proceeding unverified.',
     },
     unverified: {
@@ -1322,13 +1322,13 @@ export function MergeTestGateSection({ task }: { task: Task }) {
         {documentedFailed && documentedOutput && (
           <div className="flex items-start gap-2">
             <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Command Output</span>
-            <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono min-w-0 flex-1">{documentedOutput}</pre>
+            <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-workbench-base/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono min-w-0 flex-1">{documentedOutput}</pre>
           </div>
         )}
         {testOutput && (
           <div className="flex items-start gap-2">
             <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Test Output</span>
-            <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono min-w-0 flex-1">{testOutput}</pre>
+            <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-workbench-base/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono min-w-0 flex-1">{testOutput}</pre>
           </div>
         )}
       </div>
@@ -1341,7 +1341,7 @@ export function StatusLogSection({ task }: { task: Task }) {
   return (
     <>
       <SectionHeader>Status Log ({task.status_log.length})</SectionHeader>
-      <div className="space-y-1 max-h-48 overflow-y-auto custom-scrollbar bg-neutral-900/50 rounded-lg p-3 border border-neutral-800">
+      <div className="space-y-1 max-h-48 overflow-y-auto custom-scrollbar bg-workbench-base/50 rounded-lg p-3 border border-neutral-800">
         {task.status_log.slice().reverse().map((entry, i) => {
           const isStatusTransition = entry.msg.startsWith('Status changed:');
           return (
@@ -1364,7 +1364,7 @@ export function HistorySection({ task }: { task: Task }) {
       <div className="space-y-2">
         {task.history.map((entry, i) => (
           <div key={i} className="flex items-start gap-2 text-sm">
-            <div className="w-1.5 h-1.5 rounded-full bg-neutral-600 mt-1.5 shrink-0" />
+            <div className="w-1.5 h-1.5 rounded-full bg-workbench-card mt-1.5 shrink-0" />
             <div className="min-w-0">
               <span className="text-neutral-500 text-xs">{formatAbsolute(entry.timestamp)}</span>
               <span className="text-neutral-300 ml-2 font-medium">{entry.action}</span>
@@ -1456,10 +1456,10 @@ export function CodeOutputSection({ task }: { task: Task }) {
               {storageArtifacts.map((artifact, index) => (
                 <div
                   key={`${artifact.artifact_type}-${artifact.iteration ?? 1}-${artifact.storage_uri ?? index}`}
-                  className="rounded-lg border border-neutral-800/80 bg-neutral-900/40 px-3 py-2"
+                  className="rounded-lg border border-neutral-800/80 bg-workbench-base/40 px-3 py-2"
                 >
                   <div className="flex flex-wrap items-center gap-2 text-ui-md mb-1">
-                    <span className="rounded border border-neutral-700 bg-neutral-900/70 px-1.5 py-0.5 font-semibold text-neutral-200">
+                    <span className="rounded border border-neutral-700 bg-workbench-base/70 px-1.5 py-0.5 font-semibold text-neutral-200">
                       {formatArtifactTypeLabel(artifact.artifact_type)}
                     </span>
                     <span className="font-mono text-neutral-500">Iteration {artifact.iteration ?? 1}</span>
@@ -1670,7 +1670,7 @@ function ViewportMagnitudeBadge({ magnitude }: { magnitude: number }) {
       ? 'bg-red-500/15 text-red-300 border-red-500/30'
       : magnitude >= 0.1
         ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-        : 'bg-neutral-500/15 text-neutral-400 border-neutral-500/30';
+        : 'bg-workbench-control/15 text-neutral-400 border-neutral-500/30';
   return (
     <span className={`inline-flex items-center rounded px-1 py-0 text-ui-xs font-semibold border ${color}`}>
       {pct}% changed
@@ -1689,7 +1689,7 @@ function ViewportShotPairBlock({
 }) {
   const [diffExpanded, setDiffExpanded] = useState(false);
   return (
-    <div className="rounded-lg border border-neutral-800 bg-neutral-900/50 p-3 space-y-2">
+    <div className="rounded-lg border border-neutral-800 bg-workbench-base/50 p-3 space-y-2">
       <div className="flex items-center gap-2 flex-wrap">
         <p className="text-xs font-mono text-neutral-400 truncate flex-1 min-w-0">{pair.key}</p>
         {pair.magnitude !== undefined && <ViewportMagnitudeBadge magnitude={pair.magnitude} />}

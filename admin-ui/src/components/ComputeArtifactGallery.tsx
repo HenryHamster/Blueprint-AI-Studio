@@ -184,7 +184,7 @@ export function ComputeArtifactGallery({
         <button
           type="button"
           onClick={() => setExpanded((value) => !value)}
-          className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
+          className="min-h-[44px] rounded border border-neutral-700 bg-workbench-panel px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
           data-testid={`${testIdPrefix}-artifact-gallery-toggle`}
         >
           {expanded ? 'Hide previews' : `Show previews (${artifacts.length})`}
@@ -223,7 +223,7 @@ export function ComputeArtifactGallery({
                   onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
                   disabled={resolution?.state === 'resolving' || resolution?.state === 'expired'}
                   title={`Open ${art.name} in a new tab`}
-                  className="flex h-24 w-32 flex-col items-center justify-center gap-1 rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-400 hover:border-sky-500/50 disabled:opacity-70"
+                  className="flex h-24 w-32 flex-col items-center justify-center gap-1 rounded border border-neutral-800 bg-workbench-shell px-1 text-center text-ui-xs text-neutral-400 hover:border-sky-500/50 disabled:opacity-70"
                   data-testid={resolution?.state === 'expired' ? `${testIdPrefix}-artifact-expired` : `${testIdPrefix}-artifact-pdf`}
                 >
                   <FileText className="h-8 w-8 text-sky-400" />
@@ -252,7 +252,7 @@ export function ComputeArtifactGallery({
                   preload="metadata"
                   src={resolution.url}
                   onError={() => markPreviewError(key)}
-                  className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-neutral-950"
+                  className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-workbench-shell"
                   data-testid={`${testIdPrefix}-artifact-video`}
                 />
               ) : (
@@ -260,7 +260,7 @@ export function ComputeArtifactGallery({
                   type="button"
                   onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
                   title={`Open ${art.name} full-size in a new tab`}
-                  className="rounded border border-neutral-800 bg-neutral-950 hover:border-sky-500/50"
+                  className="rounded border border-neutral-800 bg-workbench-shell hover:border-sky-500/50"
                   data-testid={`${testIdPrefix}-artifact-thumbnail`}
                 >
                   <img
@@ -284,7 +284,7 @@ export function ComputeArtifactGallery({
                 type="button"
                 onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
                 disabled={resolution?.state === 'resolving' || resolution?.state === 'expired'}
-                className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
+                className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-workbench-shell px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
                 data-testid={resolution?.state === 'expired' ? `${testIdPrefix}-artifact-expired` : `${testIdPrefix}-artifact-placeholder`}
               >
                 {resolution?.state === 'resolving'

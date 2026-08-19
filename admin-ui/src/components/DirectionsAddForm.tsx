@@ -36,12 +36,12 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion, link
           onChange={e => form.setNewText(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && addDirection()}
           placeholder="New direction..."
-          className="flex-1 min-w-0 basis-full sm:basis-auto bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+          className="flex-1 min-w-0 basis-full sm:basis-auto bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm placeholder-neutral-600 workbench-focus"
         />
         <select
           value={form.newPriority}
           onChange={e => form.setNewPriority(e.target.value as 'high' | 'medium' | 'low')}
-          className="min-w-0 shrink bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          className="min-w-0 shrink bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs workbench-focus"
         >
           <option value="high">High</option>
           <option value="medium">Medium</option>
@@ -50,7 +50,7 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion, link
         <select
           value={form.newCategory ?? ''}
           onChange={e => form.setNewCategory((e.target.value || null) as 'product' | 'structural' | 'mixed' | null)}
-          className="min-w-0 shrink bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          className="min-w-0 shrink bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs workbench-focus"
         >
           <option value="">Type…</option>
           <option value="product">Product</option>
@@ -60,15 +60,15 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion, link
         <button
           onClick={addDirection}
           disabled={!form.newText.trim()}
-          className="shrink-0 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 px-3 py-1.5 rounded text-xs transition-colors border border-neutral-700 flex items-center min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto justify-center"
+          className="shrink-0 bg-workbench-panel hover:bg-workbench-hover disabled:opacity-30 text-neutral-300 px-3 py-1.5 rounded text-xs transition-colors border border-neutral-700 flex items-center min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto justify-center"
           aria-label="Add direction"
         >
           <Plus className="w-3.5 h-3.5" />
         </button>
       </div>
-      <div className="mt-1.5 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center focus-within:ring-1 focus-within:ring-neutral-600">
+      <div className="mt-1.5 bg-workbench-base border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center workbench-focus">
         {form.newPathTags.map(tag => (
-          <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-ui-sm font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
+          <span key={tag} className="bg-workbench-panel border border-neutral-700 text-neutral-300 text-ui-sm font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
             {tag}
             <button
               type="button"
@@ -93,7 +93,7 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion, link
             }
           }}
           placeholder={form.newPathTags.length === 0 ? 'Path scope (e.g. backend/)' : ''}
-          className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs focus:outline-none placeholder-neutral-600"
+          className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs placeholder-neutral-600 workbench-focus"
         />
       </div>
       <textarea
@@ -101,7 +101,7 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion, link
         onChange={e => form.setNewCompletionCriteria(e.target.value)}
         placeholder="Done when..."
         rows={2}
-        className="mt-1.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+        className="mt-1.5 w-full bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs placeholder-neutral-600 resize-y workbench-focus"
       />
       {/* Acceptance-evidence contract: the same success_evidence /
           retirement_condition fields the system expects directions to carry,
@@ -113,7 +113,7 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion, link
         placeholder="Success evidence (what observable outcome proves this direction succeeded)..."
         rows={2}
         maxLength={500}
-        className="mt-0.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+        className="mt-0.5 w-full bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs placeholder-neutral-600 resize-y workbench-focus"
       />
       <label className="block mt-1.5 text-ui-sm text-neutral-500">Retirement condition</label>
       <textarea
@@ -122,7 +122,7 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion, link
         placeholder="Retirement condition (when this direction can be retired)..."
         rows={2}
         maxLength={500}
-        className="mt-0.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+        className="mt-0.5 w-full bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs placeholder-neutral-600 resize-y workbench-focus"
       />
       {/* Born-staged create: stage the new direction for the next version in a
           single create call. Disabled (and explained) when no version is open to

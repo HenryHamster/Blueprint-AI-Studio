@@ -67,7 +67,7 @@ function formatCompactNumber(value: number | null | undefined): string {
 function contextStatusTone(status?: string | null): { dot: string; text: string; label: string } {
   if (status === 'building') return { dot: 'bg-cyan-400', text: 'text-cyan-300', label: 'building' };
   if (status === 'stale') return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'stale' };
-  if (!status) return { dot: 'bg-neutral-600', text: 'text-neutral-500', label: 'empty' };
+  if (!status) return { dot: 'bg-workbench-card', text: 'text-neutral-500', label: 'empty' };
   return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'ready' };
 }
 
@@ -177,8 +177,8 @@ function localRunnerTone(localRunner: StrategicLocalRunnerState): { dot: string;
   if (localRunner.mode === 'local') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'local' };
   if (localRunner.mode === 'local_ready') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'ready' };
   if (localRunner.mode === 'pending_local') return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'waiting' };
-  if (localRunner.mode === 'cloud') return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'cloud' };
-  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'unknown' };
+  if (localRunner.mode === 'cloud') return { dot: 'bg-workbench-card', text: 'text-neutral-400', label: 'cloud' };
+  return { dot: 'bg-workbench-card', text: 'text-neutral-400', label: 'unknown' };
 }
 
 function localRunnerDetail(localRunner: StrategicLocalRunnerState): string {
@@ -214,9 +214,9 @@ function runtimeWorkTone(work: StrategicRuntimeWorkState): { dot: string; text: 
     return { dot: 'bg-cyan-400', text: 'text-cyan-300', label: 'active' };
   }
   if ((work.compute_jobs?.counts.terminal_recent ?? 0) > 0) {
-    return { dot: 'bg-neutral-500', text: 'text-neutral-400', label: 'recent result' };
+    return { dot: 'bg-workbench-control', text: 'text-neutral-400', label: 'recent result' };
   }
-  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'quiet' };
+  return { dot: 'bg-workbench-card', text: 'text-neutral-400', label: 'quiet' };
 }
 
 function runtimeWorkDetail(work: StrategicRuntimeWorkState): string {
@@ -318,7 +318,7 @@ function SessionRefAction({
         type="button"
         disabled={disabled}
         onClick={onRemove}
-        className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md border border-neutral-800 px-2 text-ui-sm font-semibold text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 disabled:opacity-40"
+        className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md border border-neutral-800 px-2 text-ui-sm font-semibold text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100 disabled:opacity-40"
         title={`Remove ${label} from session context`}
         aria-label={`Remove ${label} from session context`}
       >
@@ -332,7 +332,7 @@ function SessionRefAction({
       type="button"
       disabled={disabled}
       onClick={onKeep}
-      className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md border border-neutral-800 px-2 text-ui-sm font-semibold text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 disabled:opacity-40"
+      className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md border border-neutral-800 px-2 text-ui-sm font-semibold text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100 disabled:opacity-40"
       title={`Keep ${label} in session context`}
       aria-label={`Keep ${label} in session context`}
     >
@@ -457,7 +457,7 @@ function SessionSummaryButton({
   onOpenTarget: OpenContextTarget;
 }) {
   const canOpen = Boolean(target);
-  const className = 'flex min-h-11 min-w-0 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950/50 px-2.5 py-2 text-left';
+  const className = 'flex min-h-11 min-w-0 items-center gap-2 rounded-md border border-neutral-800 bg-workbench-shell/50 px-2.5 py-2 text-left';
   const content = (
     <>
       <span className="shrink-0 text-neutral-500">{icon}</span>
@@ -477,7 +477,7 @@ function SessionSummaryButton({
     <button
       type="button"
       onClick={() => onOpenTarget(target)}
-      className={`${className} transition-colors hover:border-neutral-700 hover:bg-neutral-900`}
+      className={`${className} transition-colors hover:border-neutral-700 hover:bg-workbench-hover`}
       title={`Open ${label}`}
     >
       {content}
@@ -493,7 +493,7 @@ function MetricButton({
   onOpenTarget: OpenContextTarget;
 }) {
   const canOpen = Boolean(metric.target);
-  const className = 'min-h-11 min-w-0 rounded-md border border-neutral-800 bg-neutral-950/50 px-2.5 py-2 text-left';
+  const className = 'min-h-11 min-w-0 rounded-md border border-neutral-800 bg-workbench-shell/50 px-2.5 py-2 text-left';
   const content = (
     <>
       <span className={`block truncate text-sm font-semibold ${metricToneClass(metric.tone)}`}>
@@ -510,7 +510,7 @@ function MetricButton({
     <button
       type="button"
       onClick={() => onOpenTarget(metric.target)}
-      className={`${className} transition-colors hover:border-neutral-700 hover:bg-neutral-900`}
+      className={`${className} transition-colors hover:border-neutral-700 hover:bg-workbench-hover`}
       title={`Open ${metric.label}`}
     >
       {content}
@@ -532,7 +532,7 @@ function WorkSessionActionRow({
       type="button"
       disabled={!canOpen}
       onClick={() => onOpenTarget(target, action.kind === 'reply' ? 'reply' : 'highlight')}
-      className="flex min-h-11 min-w-0 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950/50 px-2.5 py-2 text-left transition-colors hover:border-neutral-700 hover:bg-neutral-900 disabled:cursor-default disabled:opacity-60"
+      className="flex min-h-11 min-w-0 items-center gap-2 rounded-md border border-neutral-800 bg-workbench-shell/50 px-2.5 py-2 text-left transition-colors hover:border-neutral-700 hover:bg-workbench-hover disabled:cursor-default disabled:opacity-60"
       title={canOpen ? `Open ${action.label}` : action.label}
     >
       <span className="min-w-0 flex-1">
@@ -560,7 +560,7 @@ function WorkSessionActionRow({
 
 function AttentionCountPill({ label, value }: { label: string; value: number }) {
   return (
-    <span className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/50 px-2 text-xs text-neutral-500">
+    <span className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/50 px-2 text-xs text-neutral-500">
       <span className="font-semibold text-neutral-100">{formatCompactNumber(value)}</span>
       <span className="truncate">{label}</span>
     </span>
@@ -813,7 +813,7 @@ export function StrategicContextWorkspace({
           <button
             type="button"
             onClick={onClose}
-            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-100"
+            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-workbench-hover hover:text-neutral-100"
             title="Close Strategic context"
             aria-label="Close Strategic context"
           >
@@ -869,7 +869,7 @@ export function StrategicContextWorkspace({
                       value={state.attention.level.replace(/_/g, ' ')}
                       detail={state.attention.summary}
                       tone={{
-                        dot: state.attention.level === 'needs_operator' ? 'bg-amber-300' : 'bg-neutral-500',
+                        dot: state.attention.level === 'needs_operator' ? 'bg-amber-300' : 'bg-workbench-control',
                         text: state.attention.level === 'needs_operator' ? 'text-amber-300' : 'text-neutral-300',
                       }}
                       target={{ surface: 'messages' }}
@@ -999,7 +999,7 @@ export function StrategicContextWorkspace({
                     <div key={item.id ?? idx} className="border-t border-neutral-800/70 py-2.5 first:border-t-0">
                       <span className="block whitespace-pre-wrap text-sm text-neutral-100">{item.title || item.summary}</span>
                       {item.topic && (
-                        <span className="mt-0.5 mr-2 inline-block rounded bg-neutral-800/80 px-1.5 py-0.5 text-ui-sm text-neutral-400">{item.topic}</span>
+                        <span className="mt-0.5 mr-2 inline-block rounded bg-workbench-panel/80 px-1.5 py-0.5 text-ui-sm text-neutral-400">{item.topic}</span>
                       )}
                       {item.created_at && (
                         <span className="mt-0.5 block text-ui-sm text-neutral-500">{item.created_at}</span>
@@ -1045,7 +1045,7 @@ export function StrategicContextWorkspace({
                       key={`${drilldown.id}:${targetLabel(drilldown.target) ?? 'target'}`}
                       type="button"
                       onClick={() => handleOpenTarget(drilldown.target)}
-                      className="flex min-h-11 min-w-0 items-center justify-between gap-2 rounded-md border border-neutral-800 bg-neutral-950/50 px-3 py-2 text-left transition-colors hover:border-neutral-700 hover:bg-neutral-900"
+                      className="flex min-h-11 min-w-0 items-center justify-between gap-2 rounded-md border border-neutral-800 bg-workbench-shell/50 px-3 py-2 text-left transition-colors hover:border-neutral-700 hover:bg-workbench-hover"
                     >
                       <span className="min-w-0">
                         <span className="block truncate text-sm font-semibold text-neutral-100">{drilldown.label}</span>
@@ -1222,7 +1222,7 @@ export function StrategicContextWorkspace({
               <div className="flex min-w-0 flex-wrap gap-1.5 text-ui-sm text-neutral-500" data-testid="strategic-context-workspace-sources">
                 <GitBranch className="h-3.5 w-3.5 text-neutral-600" aria-hidden="true" />
                 {contextPackage.sources.map(source => (
-                  <span key={source.kind} className="rounded border border-neutral-800 bg-neutral-950/60 px-1.5 py-0.5">
+                  <span key={source.kind} className="rounded border border-neutral-800 bg-workbench-shell/60 px-1.5 py-0.5">
                     {source.kind.replace(/_/g, ' ')} {formatCompactNumber(source.count)}
                   </span>
                 ))}

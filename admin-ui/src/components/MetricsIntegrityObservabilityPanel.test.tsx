@@ -75,7 +75,7 @@ describe('MetricsIntegrityObservabilityPanel', () => {
     // Real backend field: subject
     expect(within(panel).getByText('global')).toBeInTheDocument();
     // Self-heal stat tile renders auto_resolved_total
-    expect(within(panel).getByText('Auto-Resolved').closest('.bg-neutral-900')).toHaveTextContent('5');
+    expect(within(panel).getByText('Auto-Resolved').closest('.bg-workbench-base')).toHaveTextContent('5');
     expect(within(panel).getByText('Last tick:')).toBeInTheDocument();
     // Column headers match the real backend contract
     expect(within(panel).getByText('Self-Reported')).toBeInTheDocument();

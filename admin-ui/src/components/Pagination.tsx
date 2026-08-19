@@ -28,7 +28,7 @@ export function Pagination({ page, onPageChange, taskCount, serverTaskCount, lim
             onLimitChange(Number(e.target.value));
             onPageChange(1);
           }}
-          className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-xs rounded px-2 py-1"
+          className="bg-workbench-panel border border-neutral-700 text-neutral-300 text-xs rounded px-2 py-1"
         >
           <option value={25}>25 / page</option>
           <option value={50}>50 / page</option>
@@ -43,14 +43,14 @@ export function Pagination({ page, onPageChange, taskCount, serverTaskCount, lim
           <button
             onClick={() => onPageChange(Math.max(1, page - 1))}
             disabled={page === 1}
-            className="px-3 py-1.5 min-h-11 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center"
+            className="px-3 py-1.5 min-h-11 text-xs font-medium rounded-md bg-workbench-panel text-neutral-300 hover:bg-workbench-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center"
           >
             Previous
           </button>
           <button
             onClick={() => onPageChange(page + 1)}
             disabled={isLastPage}
-            className="px-3 py-1.5 min-h-11 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center"
+            className="px-3 py-1.5 min-h-11 text-xs font-medium rounded-md bg-workbench-panel text-neutral-300 hover:bg-workbench-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center"
           >
             Next
           </button>

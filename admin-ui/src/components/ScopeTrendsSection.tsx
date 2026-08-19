@@ -34,7 +34,7 @@ const SCOPE_LINE_COLORS: Record<string, string> = {
 };
 
 function Skeleton({ className = '' }: { className?: string }) {
-  return <div className={`animate-pulse bg-neutral-800/60 rounded ${className}`} />;
+  return <div className={`animate-pulse bg-workbench-panel/60 rounded ${className}`} />;
 }
 
 export function ScopeTrendsSection({
@@ -86,7 +86,7 @@ export function ScopeTrendsSection({
         <span className="flex gap-1 normal-case tracking-normal font-normal">
           {scopes.map(s => {
             const t = summary[s]?.trend;
-            const color = t === 'improving' ? 'text-emerald-400 border-emerald-700 bg-emerald-900/40' : t === 'declining' ? 'text-red-400 border-red-700 bg-red-900/40' : t === 'stable' ? 'text-neutral-400 border-neutral-700 bg-neutral-900/40' : 'text-neutral-600 border-neutral-800 bg-neutral-900/40';
+            const color = t === 'improving' ? 'text-emerald-400 border-emerald-700 bg-emerald-900/40' : t === 'declining' ? 'text-red-400 border-red-700 bg-red-900/40' : t === 'stable' ? 'text-neutral-400 border-neutral-700 bg-workbench-base/40' : 'text-neutral-600 border-neutral-800 bg-workbench-base/40';
             return (
               <span key={s} className={`text-ui-xs px-1 py-0.5 rounded border ${color}`}>
                 {s} {t ?? '—'}
@@ -96,7 +96,7 @@ export function ScopeTrendsSection({
         </span>
       </button>
       {open && (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
           {chartData.length === 0 || scopes.length === 0 ? (
             <p className="text-ui-md text-neutral-500">No weekly data in the last {data?.lookback_days ?? 30} days.</p>
           ) : (

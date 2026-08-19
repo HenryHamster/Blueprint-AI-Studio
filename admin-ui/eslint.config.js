@@ -9,6 +9,9 @@ import minTouchTarget from './eslint-rules/min-touch-target.js'
 import noOversizedFile from './eslint-rules/no-oversized-file.js'
 import noArbitraryFontSize from './eslint-rules/no-arbitrary-font-size.js'
 import noDisabledReactHooks from './eslint-rules/no-disabled-react-hooks.js'
+import noSurfaceColour from './eslint-rules/no-surface-colour.js'
+import requireWorkbenchFocus from './eslint-rules/require-workbench-focus.js'
+import canonicalRadius from './eslint-rules/canonical-radius.js'
 
 const hooksGuardPlugin = { rules: { 'no-disabled-react-hooks': noDisabledReactHooks } }
 const viewportPlugin = {
@@ -16,6 +19,9 @@ const viewportPlugin = {
     'no-fixed-width': noFixedWidthOverflow,
     'min-touch-target': minTouchTarget,
     'no-arbitrary-font-size': noArbitraryFontSize,
+    'no-surface-colour': noSurfaceColour,
+    'require-workbench-focus': requireWorkbenchFocus,
+    'canonical-radius': canonicalRadius,
   },
 }
 const sizePlugin = { rules: { 'no-oversized-file': noOversizedFile } }
@@ -48,6 +54,9 @@ export default defineConfig([
       'viewport/no-fixed-width': 'error',
       'viewport/min-touch-target': 'error',
       'viewport/no-arbitrary-font-size': 'error',
+      'viewport/no-surface-colour': 'error',
+      'viewport/require-workbench-focus': 'error',
+      'viewport/canonical-radius': 'error',
       'size/no-oversized-file': 'error',
     },
   },

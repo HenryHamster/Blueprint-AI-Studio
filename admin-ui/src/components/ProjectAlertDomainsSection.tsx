@@ -88,7 +88,7 @@ export function ProjectAlertDomainsSection({ projectId, canSave }: ProjectAlertD
           const busy = savingDomain === domain.domain;
           const locked = domain.core || !canSave || busy;
           return (
-            <div key={domain.domain} className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3">
+            <div key={domain.domain} className="bg-workbench-base border border-neutral-800 rounded-lg px-4 py-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
@@ -96,7 +96,7 @@ export function ProjectAlertDomainsSection({ projectId, canSave }: ProjectAlertD
                     <span className="font-mono text-ui-sm text-neutral-500">{domain.domain}</span>
                     {domain.core && <span className="rounded border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 text-ui-sm text-cyan-400">core</span>}
                     {!domain.configured && (
-                      <span className="rounded border border-neutral-700 bg-neutral-950 px-1.5 py-0.5 text-ui-sm text-neutral-500">
+                      <span className="rounded border border-neutral-700 bg-workbench-shell px-1.5 py-0.5 text-ui-sm text-neutral-500">
                         default {domain.default_enabled ? 'on' : 'off'}
                       </span>
                     )}
@@ -121,7 +121,7 @@ export function ProjectAlertDomainsSection({ projectId, canSave }: ProjectAlertD
                     type="button"
                     onClick={() => void applyUpdate(domain.domain, !domain.enabled)}
                     disabled={locked}
-                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 disabled:opacity-50 ${domain.enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 disabled:opacity-50 ${domain.enabled ? 'bg-emerald-600' : 'bg-workbench-layer'}`}
                     title={domain.core ? 'Core alert domains cannot be disabled' : undefined}
                     aria-label={`${domain.enabled ? 'Disable' : 'Enable'} ${domain.label}`}
                   >

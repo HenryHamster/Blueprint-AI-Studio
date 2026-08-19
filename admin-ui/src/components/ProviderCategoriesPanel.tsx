@@ -184,12 +184,12 @@ export function ProviderCategoriesPanel({
               onChange={e => setNewCategoryName(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') addCategory(); }}
               placeholder="new category name"
-              className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100 w-40"
+              className="bg-workbench-base border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100 w-40"
             />
             {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               onClick={addCategory}
-              className="inline-flex items-center gap-1 px-2 py-1 rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800 text-xs"
+              className="inline-flex items-center gap-1 px-2 py-1 rounded border border-neutral-700 text-neutral-300 hover:bg-workbench-hover text-xs"
             >
               <Plus className="w-3 h-3" /> add
             </button>
@@ -277,7 +277,7 @@ function ProviderChecklist({
             className={`px-2 py-1 rounded text-xs border transition-colors ${
               active
                 ? 'bg-emerald-900/40 text-emerald-200 border-emerald-800'
-                : 'bg-neutral-900 text-neutral-500 border-neutral-800 hover:text-neutral-300'
+                : 'bg-workbench-base text-neutral-500 border-neutral-800 hover:text-neutral-300'
             }`}
           >
             {name}
@@ -301,7 +301,7 @@ function EffortSelect({
     <select
       value={value}
       onChange={e => onChange(e.target.value as EffortLevel | '')}
-      className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+      className="bg-workbench-base border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
     >
       {allowEmpty && <option value="">(inherit)</option>}
       {EFFORT_LEVELS.map(l => <option key={l} value={l}>{l}</option>)}
@@ -340,7 +340,7 @@ function CategoryCard({
   };
 
   return (
-    <div className="border border-neutral-800 rounded p-3 bg-neutral-900/30 space-y-2">
+    <div className="border border-neutral-800 rounded p-3 bg-workbench-base/30 space-y-2">
       <div className="flex items-center justify-between gap-2">
         {isDefault ? (
           <span className="text-xs font-semibold text-neutral-200 font-mono px-1.5 py-0.5">{name}</span>
@@ -350,7 +350,7 @@ function CategoryCard({
             onChange={e => setEditingName(e.target.value)}
             onBlur={() => { if (editingName !== name) onRename(editingName); }}
             onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
-            className="bg-transparent border border-transparent hover:border-neutral-800 focus:border-neutral-700 rounded px-1.5 py-0.5 text-xs font-semibold text-neutral-200 font-mono focus:outline-none"
+            className="bg-transparent border border-transparent hover:border-neutral-800 rounded px-1.5 py-0.5 text-xs font-semibold text-neutral-200 font-mono workbench-focus"
           />
         )}
         {!isDefault && (
@@ -370,7 +370,7 @@ function CategoryCard({
           {members.map(m => (
             <span
               key={m}
-              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-700 bg-neutral-800/60 text-ui-md text-neutral-200 font-mono"
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-700 bg-workbench-panel/60 text-ui-md text-neutral-200 font-mono"
             >
               {m}
               <button
@@ -386,7 +386,7 @@ function CategoryCard({
             <select
               value=""
               onChange={e => { if (e.target.value) onAddMember(e.target.value); }}
-              className="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-ui-md text-neutral-300"
+              className="bg-workbench-base border border-neutral-700 rounded px-1.5 py-0.5 text-ui-md text-neutral-300"
             >
               <option value="">+ add task type</option>
               {addable.map(t => {
@@ -439,7 +439,7 @@ function TaskOverrideTable({
   const eligibleToAdd = allTaskTypes.filter(t => !(t in overrides));
 
   return (
-    <div className="border border-neutral-800 rounded bg-neutral-900/30 divide-y divide-neutral-800">
+    <div className="border border-neutral-800 rounded bg-workbench-base/30 divide-y divide-neutral-800">
       {entries.length === 0 && (
         <div className="px-3 py-2 text-ui-md text-neutral-500 italic">
           No overrides. Add one below to pin a specific task type.
@@ -478,7 +478,7 @@ function TaskOverrideTable({
           <select
             value={newType}
             onChange={e => setNewType(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-1 text-ui-md text-neutral-200"
+            className="bg-workbench-base border border-neutral-700 rounded px-1.5 py-1 text-ui-md text-neutral-200"
           >
             <option value="">+ add override for…</option>
             {eligibleToAdd.map(t => <option key={t} value={t}>{t}</option>)}
@@ -487,7 +487,7 @@ function TaskOverrideTable({
           <button
             onClick={() => { if (newType) { onSet(newType, { providers: providerNames }); setNewType(''); } }}
             disabled={!newType}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800 text-ui-md disabled:opacity-40"
+            className="inline-flex items-center gap-1 px-2 py-1 rounded border border-neutral-700 text-neutral-300 hover:bg-workbench-hover text-ui-md disabled:opacity-40"
           >
             <Plus className="w-3 h-3" /> add
           </button>

@@ -94,7 +94,7 @@ function DeclareVerdictForm({ projectId, capName, onDone, onSuccess }: { project
         <select
           value={verdict}
           onChange={e => setVerdict(e.target.value as DeclareVerdict)}
-          className="text-ui-sm bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200"
+          className="text-ui-sm bg-workbench-panel border border-neutral-700 rounded px-1 py-0.5 text-neutral-200"
           disabled={submitting}
         >
           <option value="adopt">adopt</option>
@@ -106,14 +106,14 @@ function DeclareVerdictForm({ projectId, capName, onDone, onSuccess }: { project
           placeholder="Rationale (optional)"
           value={rationale}
           onChange={e => setRationale(e.target.value)}
-          className="text-ui-sm bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 flex-1 min-w-0"
+          className="text-ui-sm bg-workbench-panel border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 flex-1 min-w-0"
           disabled={submitting}
         />
         {/* eslint-disable-next-line viewport/min-touch-target */}
         <button
           onClick={handleSubmit}
           disabled={submitting}
-          className="text-ui-sm px-2 py-0.5 rounded bg-neutral-700 hover:bg-neutral-600 text-neutral-200 disabled:opacity-50 shrink-0"
+          className="text-ui-sm px-2 py-0.5 rounded bg-workbench-layer hover:bg-workbench-hover text-neutral-200 disabled:opacity-50 shrink-0"
         >
           {submitting ? '…' : 'Declare'}
         </button>
@@ -140,7 +140,7 @@ function DeclareButton({ projectId, capName, onSuccess }: { projectId: string; c
     // eslint-disable-next-line viewport/min-touch-target
     <button
       onClick={() => setOpen(true)}
-      className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-200 mt-0.5"
+      className="text-ui-sm px-1.5 py-0.5 rounded bg-workbench-panel hover:bg-workbench-hover text-neutral-400 hover:text-neutral-200 mt-0.5"
     >
       Declare verdict
     </button>
@@ -155,12 +155,12 @@ export function CapabilityTrialsPanel({ digest, projectId, onRefreshDigest }: { 
   const totalWithout = genericVerdicts.reduce((sum, [, v]) => sum + Math.min(v.n_without ?? 0, v.thresholds?.min_n_per_arm ?? 30), 0);
   const genericTarget = genericVerdicts.reduce((sum, [, v]) => sum + (v.thresholds?.min_n_per_arm ?? 30), 0);
   if (verdicts.length === 0) {
-    return <section><h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Capability Trials</h2><div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-4 text-ui-md text-neutral-500">No capability trials are currently running.</div></section>;
+    return <section><h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Capability Trials</h2><div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-4 text-ui-md text-neutral-500">No capability trials are currently running.</div></section>;
   }
   return (
     <section>
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Capability Trials <span className="text-neutral-600 normal-case font-normal">{genericTarget > 0 ? `· ${totalWith}/${genericTarget} with · ${totalWithout}/${genericTarget} without` : `· ${verdicts.length} verdict${verdicts.length === 1 ? '' : 's'}`}</span></h2>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         <div className="sm:hidden divide-y divide-neutral-800/30">
           {verdicts.map(([name, v]) => {
             const minN = v.thresholds?.min_n_per_arm ?? 30;

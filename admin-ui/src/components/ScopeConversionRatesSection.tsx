@@ -68,7 +68,7 @@ export function ScopeConversionRatesSection({
           const rateColor = rate == null ? 'text-neutral-500' : rate >= 0.6 ? 'text-emerald-400' : rate >= 0.3 ? 'text-amber-400' : 'text-red-400';
 
           return (
-            <div key={scope} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 min-w-[110px]">
+            <div key={scope} className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 min-w-[110px]">
               <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">{scope}</p>
               <div className="flex items-center gap-1.5">
                 <p className={`text-xl font-bold font-mono ${rateColor}`}>
@@ -95,7 +95,7 @@ export function ScopeConversionRatesSection({
                   {topStages.map(([stage, count]) => (
                     <span
                       key={stage}
-                      className={`text-ui-xs px-1.5 py-0.5 rounded border ${STAGE_COLORS[stage] || 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}
+                      className={`text-ui-xs px-1.5 py-0.5 rounded border ${STAGE_COLORS[stage] || 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30'}`}
                     >
                       {stage} {count}
                     </span>

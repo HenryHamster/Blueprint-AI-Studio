@@ -74,11 +74,11 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
   };
 
   return (
-    <div className="bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden">
+    <div className="bg-workbench-base border border-neutral-800 rounded-lg overflow-hidden">
       <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
         <h2 className="text-sm font-semibold text-neutral-100">User Management</h2>
         {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-        <button onClick={onClose} className="p-1 hover:bg-neutral-800 rounded transition-colors">
+        <button onClick={onClose} className="p-1 hover:bg-workbench-hover rounded transition-colors">
           <X className="w-4 h-4 text-neutral-400" />
         </button>
       </div>
@@ -99,7 +99,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
             onChange={e => setNewEmail(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && handleAdd()}
             placeholder="user@example.com"
-            className="w-full bg-neutral-800 border border-neutral-700 rounded px-2.5 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 focus:outline-none focus:border-cyan-500/50"
+            className="w-full bg-workbench-panel border border-neutral-700 rounded px-2.5 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 workbench-focus"
           />
         </div>
         <div>
@@ -107,7 +107,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
           <select
             value={newRole}
             onChange={e => setNewRole(e.target.value as 'user' | 'admin')}
-            className="bg-neutral-800 border border-neutral-700 rounded px-2.5 py-1.5 text-xs text-neutral-200 focus:outline-none focus:border-cyan-500/50"
+            className="bg-workbench-panel border border-neutral-700 rounded px-2.5 py-1.5 text-xs text-neutral-200 workbench-focus"
           >
             <option value="user">User</option>
             <option value="admin">Admin</option>
@@ -141,7 +141,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
               {users.map(u => {
                 const isSelf = u.email === currentUserEmail?.toLowerCase();
                 return (
-                  <tr key={u.id} className="border-b border-neutral-800/50 hover:bg-neutral-800/30">
+                  <tr key={u.id} className="border-b border-neutral-800/50 hover:bg-workbench-hover/30">
                     <td className="px-4 py-2.5">
                       <div className="text-neutral-200">{u.display_name || u.email}</div>
                       {u.display_name && <div className="text-neutral-500 text-ui-sm">{u.email}</div>}
@@ -155,7 +155,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
                         className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-ui-sm font-medium transition-colors ${
                           u.role === 'admin'
                             ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
-                            : 'bg-neutral-700/50 text-neutral-400 border border-neutral-600/30'
+                            : 'bg-workbench-layer/50 text-neutral-400 border border-neutral-600/30'
                         } ${isSelf ? 'cursor-default' : 'hover:opacity-80 cursor-pointer'}`}
                         title={isSelf ? 'Cannot change your own role' : `Click to make ${u.role === 'admin' ? 'user' : 'admin'}`}
                       >

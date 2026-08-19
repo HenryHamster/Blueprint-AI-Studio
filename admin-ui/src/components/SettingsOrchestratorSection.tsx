@@ -80,7 +80,7 @@ function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean
     <button
       data-viewport-allow-small-target
       onClick={() => onChange(!enabled)}
-      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-workbench-layer'}`}
     >
       <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
     </button>
@@ -436,7 +436,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setVmInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(vmInputVal); if (n >= 0 && n <= 100) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(vmInputVal); if (n >= 0 && n <= 100) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -450,7 +450,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setRetriesInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(retriesInputVal); if (!isNaN(n) && n >= 0 && n <= 10) onUpdateMaxRetries(n); else setRetriesInputVal(String(maxRetries)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(retriesInputVal); if (!isNaN(n) && n >= 0 && n <= 10) onUpdateMaxRetries(n); else setRetriesInputVal(String(maxRetries)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -464,7 +464,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setAutonomousRateInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(autonomousRateInputVal); if (n >= 1 && n <= 50) onUpdateMaxAutonomousRate(n); else setAutonomousRateInputVal(String(maxAutonomousTasksPerHour)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(autonomousRateInputVal); if (n >= 1 && n <= 50) onUpdateMaxAutonomousRate(n); else setAutonomousRateInputVal(String(maxAutonomousTasksPerHour)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -478,13 +478,13 @@ export function SettingsOrchestratorSection({
               onChange={e => setGlobalRateInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(globalRateInputVal); if (n >= 1 && n <= 500) onUpdateMaxGlobalAutonomousRate(n); else setGlobalRateInputVal(String(maxGlobalAutonomousTasksPerHour)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(globalRateInputVal); if (n >= 1 && n <= 500) onUpdateMaxGlobalAutonomousRate(n); else setGlobalRateInputVal(String(maxGlobalAutonomousTasksPerHour)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div className="flex items-end">
             <div className="w-full">
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Require Approval Gates</label>
-              <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2">
+              <div className="flex items-center gap-3 bg-workbench-shell border border-neutral-700 rounded-lg px-3 py-2">
                 <Toggle enabled={requireApprovalGates} onChange={onUpdateRequireApprovalGates} />
                 <span className="text-xs text-neutral-400">{requireApprovalGates ? 'Enabled' : 'Disabled'}</span>
               </div>
@@ -552,7 +552,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setPipelineSlotsInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(pipelineSlotsInputVal); if (!isNaN(n) && n >= 0 && n <= 100) onUpdateMaxPipelineSlots(n); else setPipelineSlotsInputVal(String(maxPipelineSlots)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(pipelineSlotsInputVal); if (!isNaN(n) && n >= 0 && n <= 100) onUpdateMaxPipelineSlots(n); else setPipelineSlotsInputVal(String(maxPipelineSlots)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           {reservableIds.map(t => (
@@ -567,7 +567,7 @@ export function SettingsOrchestratorSection({
                 onChange={e => setReservedInputVals(v => ({ ...v, [t]: e.target.value }))}
                 onBlur={() => commitReserved(t)}
                 onKeyDown={e => { if (e.key === 'Enter') commitReserved(t); }}
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
               />
             </div>
           ))}
@@ -605,7 +605,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setEvalTimeoutInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(evalTimeoutInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateEvaluatingPipelineTimeout(n); else setEvalTimeoutInputVal(String(evaluatingPipelineTimeoutMinutes)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(evalTimeoutInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateEvaluatingPipelineTimeout(n); else setEvalTimeoutInputVal(String(evaluatingPipelineTimeoutMinutes)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -619,7 +619,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setEvalFailHoursInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(evalFailHoursInputVal); if (!isNaN(n) && n >= 1 && n <= 168) onUpdateEvaluatingFailHours(n); else setEvalFailHoursInputVal(String(evaluatingFailHours)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(evalFailHoursInputVal); if (!isNaN(n) && n >= 1 && n <= 168) onUpdateEvaluatingFailHours(n); else setEvalFailHoursInputVal(String(evaluatingFailHours)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -633,7 +633,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setCiBackstopInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(ciBackstopInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateCiBackstopTimeout(n); else setCiBackstopInputVal(String(ciBackstopTimeoutMinutes)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(ciBackstopInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateCiBackstopTimeout(n); else setCiBackstopInputVal(String(ciBackstopTimeoutMinutes)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
         </div>
@@ -648,7 +648,7 @@ export function SettingsOrchestratorSection({
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <div>
             <label className="block text-xs font-medium text-neutral-400 mb-1.5">Enabled</label>
-            <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2">
+            <div className="flex items-center gap-3 bg-workbench-shell border border-neutral-700 rounded-lg px-3 py-2">
               <Toggle enabled={autoArchiveEnabled} onChange={onUpdateAutoArchiveEnabled} />
               <span className="text-xs text-neutral-400">{autoArchiveEnabled ? 'On' : 'Off'}</span>
             </div>
@@ -663,7 +663,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setArchiveAgeCapsInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(archiveAgeCapsInputVal); if (!isNaN(n) && n >= 1 && n <= 90) onUpdateAutoArchiveTerminalAfterDays(n); else setArchiveAgeCapsInputVal(String(autoArchiveTerminalAfterDays)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(archiveAgeCapsInputVal); if (!isNaN(n) && n >= 1 && n <= 90) onUpdateAutoArchiveTerminalAfterDays(n); else setArchiveAgeCapsInputVal(String(autoArchiveTerminalAfterDays)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -676,7 +676,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setArchivePerProjectCapInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(archivePerProjectCapInputVal); if (!isNaN(n) && n >= 0 && n <= 10000) onUpdateAutoArchiveMaxTerminalTasksPerProject(n); else setArchivePerProjectCapInputVal(String(autoArchiveMaxTerminalTasksPerProject)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(archivePerProjectCapInputVal); if (!isNaN(n) && n >= 0 && n <= 10000) onUpdateAutoArchiveMaxTerminalTasksPerProject(n); else setArchivePerProjectCapInputVal(String(autoArchiveMaxTerminalTasksPerProject)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -689,7 +689,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setArchiveIntervalInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(archiveIntervalInputVal); if (!isNaN(n) && n >= 5 && n <= 1440) onUpdateAutoArchiveIntervalMinutes(n); else setArchiveIntervalInputVal(String(autoArchiveIntervalMinutes)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(archiveIntervalInputVal); if (!isNaN(n) && n >= 5 && n <= 1440) onUpdateAutoArchiveIntervalMinutes(n); else setArchiveIntervalInputVal(String(autoArchiveIntervalMinutes)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
         </div>
@@ -709,7 +709,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setAutonomousResearchIntervalInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(autonomousResearchIntervalInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateAutonomousResearchInterval(n); else setAutonomousResearchIntervalInputVal(String(autonomousResearchIntervalMinutes)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(autonomousResearchIntervalInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateAutonomousResearchInterval(n); else setAutonomousResearchIntervalInputVal(String(autonomousResearchIntervalMinutes)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -722,7 +722,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setDirectionCooldownInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(directionCooldownInputVal); if (!isNaN(n) && n >= 1 && n <= 10080) onUpdateDirectionCooldownMinutes(n); else setDirectionCooldownInputVal(String(directionCooldownMinutes)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(directionCooldownInputVal); if (!isNaN(n) && n >= 1 && n <= 10080) onUpdateDirectionCooldownMinutes(n); else setDirectionCooldownInputVal(String(directionCooldownMinutes)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -735,7 +735,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setStrategicResearchFreqInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(strategicResearchFreqInputVal); if (!isNaN(n) && n >= 0 && n <= 100) onUpdateStrategicResearchFrequency(n); else setStrategicResearchFreqInputVal(String(strategicResearchFrequency)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(strategicResearchFreqInputVal); if (!isNaN(n) && n >= 0 && n <= 100) onUpdateStrategicResearchFrequency(n); else setStrategicResearchFreqInputVal(String(strategicResearchFrequency)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
             <p className="text-ui-sm text-neutral-600 mt-1">Every Nth cycle reviews vision</p>
           </div>
@@ -767,7 +767,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setChurnWindowInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(churnWindowInputVal); if (!isNaN(n) && n >= 1 && n <= 100) onUpdateDirectionChurnWindowCycles(n); else setChurnWindowInputVal(String(directionChurnWindowCycles)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(churnWindowInputVal); if (!isNaN(n) && n >= 1 && n <= 100) onUpdateDirectionChurnWindowCycles(n); else setChurnWindowInputVal(String(directionChurnWindowCycles)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -781,7 +781,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setChurnNonMergeThresholdInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(churnNonMergeThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 10000) onUpdateDirectionChurnNonMergeThreshold(n); else setChurnNonMergeThresholdInputVal(String(directionChurnNonMergeThreshold)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(churnNonMergeThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 10000) onUpdateDirectionChurnNonMergeThreshold(n); else setChurnNonMergeThresholdInputVal(String(directionChurnNonMergeThreshold)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -796,7 +796,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setChurnMinMergeRateInputVal(e.target.value)}
               onBlur={() => { const n = parseFloat(churnMinMergeRateInputVal); if (!isNaN(n) && n >= 0 && n <= 1) onUpdateDirectionChurnMinMergeRate(n); else setChurnMinMergeRateInputVal(String(directionChurnMinMergeRate)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseFloat(churnMinMergeRateInputVal); if (!isNaN(n) && n >= 0 && n <= 1) onUpdateDirectionChurnMinMergeRate(n); else setChurnMinMergeRateInputVal(String(directionChurnMinMergeRate)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -810,7 +810,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setLifetimeNonMergeThresholdInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(lifetimeNonMergeThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 100000) onUpdateDirectionLifetimeNonMergeThreshold(n); else setLifetimeNonMergeThresholdInputVal(String(directionLifetimeNonMergeThreshold)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(lifetimeNonMergeThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 100000) onUpdateDirectionLifetimeNonMergeThreshold(n); else setLifetimeNonMergeThresholdInputVal(String(directionLifetimeNonMergeThreshold)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -825,7 +825,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setLifetimeMinMergeRateInputVal(e.target.value)}
               onBlur={() => { const n = parseFloat(lifetimeMinMergeRateInputVal); if (!isNaN(n) && n >= 0 && n <= 1) onUpdateDirectionLifetimeMinMergeRate(n); else setLifetimeMinMergeRateInputVal(String(directionLifetimeMinMergeRate)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseFloat(lifetimeMinMergeRateInputVal); if (!isNaN(n) && n >= 0 && n <= 1) onUpdateDirectionLifetimeMinMergeRate(n); else setLifetimeMinMergeRateInputVal(String(directionLifetimeMinMergeRate)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -839,7 +839,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setReviewRecommendThresholdInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(reviewRecommendThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 100) onUpdateDirectionReviewRecommendationThreshold(n); else setReviewRecommendThresholdInputVal(String(directionReviewRecommendationThreshold)); }}
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(reviewRecommendThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 100) onUpdateDirectionReviewRecommendationThreshold(n); else setReviewRecommendThresholdInputVal(String(directionReviewRecommendationThreshold)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
         </div>
@@ -854,14 +854,14 @@ export function SettingsOrchestratorSection({
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           <div className="md:col-span-2 lg:col-span-3">
             <label className="block text-xs font-medium text-neutral-400 mb-1.5">Mode</label>
-            <div className="flex gap-1 bg-neutral-950 border border-neutral-700 rounded-lg p-1 w-fit">
+            <div className="flex gap-1 bg-workbench-shell border border-neutral-700 rounded-lg p-1 w-fit">
               {(['off', 'observe', 'enforce'] as const).map(mode => (
                 <button
                   key={mode}
                   onClick={() => void patchFill({ evergreen_fill_mode: mode })}
                   className={`px-3 py-1.5 text-xs rounded-md transition-colors capitalize ${
                     fillSettings.evergreen_fill_mode === mode
-                      ? 'bg-neutral-700 text-neutral-100'
+                      ? 'bg-workbench-layer text-neutral-100'
                       : 'text-neutral-500 hover:text-neutral-300'
                   }`}
                 >
@@ -881,7 +881,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setFillIntervalInput(e.target.value)}
               onBlur={() => commitFillNumber('evergreen_fill_interval_minutes', fillIntervalInput, 1, 1440, fillSettings.evergreen_fill_interval_minutes, setFillIntervalInput)}
               onKeyDown={e => { if (e.key === 'Enter') commitFillNumber('evergreen_fill_interval_minutes', fillIntervalInput, 1, 1440, fillSettings.evergreen_fill_interval_minutes, setFillIntervalInput); }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -896,7 +896,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setFillUtilInput(e.target.value)}
               onBlur={() => commitFillNumber('evergreen_fill_util_threshold', fillUtilInput, 0, 1, fillSettings.evergreen_fill_util_threshold, setFillUtilInput)}
               onKeyDown={e => { if (e.key === 'Enter') commitFillNumber('evergreen_fill_util_threshold', fillUtilInput, 0, 1, fillSettings.evergreen_fill_util_threshold, setFillUtilInput); }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -910,7 +910,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setFillMinSlotsInput(e.target.value)}
               onBlur={() => commitFillNumber('evergreen_fill_min_free_slots', fillMinSlotsInput, 0, 100, fillSettings.evergreen_fill_min_free_slots, setFillMinSlotsInput)}
               onKeyDown={e => { if (e.key === 'Enter') commitFillNumber('evergreen_fill_min_free_slots', fillMinSlotsInput, 0, 100, fillSettings.evergreen_fill_min_free_slots, setFillMinSlotsInput); }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -924,7 +924,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setFillMaxActiveInput(e.target.value)}
               onBlur={() => commitFillNumber('evergreen_fill_max_active', fillMaxActiveInput, 0, 50, fillSettings.evergreen_fill_max_active, setFillMaxActiveInput)}
               onKeyDown={e => { if (e.key === 'Enter') commitFillNumber('evergreen_fill_max_active', fillMaxActiveInput, 0, 50, fillSettings.evergreen_fill_max_active, setFillMaxActiveInput); }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -938,13 +938,13 @@ export function SettingsOrchestratorSection({
               onChange={e => setFillDailyCapInput(e.target.value)}
               onBlur={() => commitFillNumber('evergreen_fill_daily_cap', fillDailyCapInput, 0, 200, fillSettings.evergreen_fill_daily_cap, setFillDailyCapInput)}
               onKeyDown={e => { if (e.key === 'Enter') commitFillNumber('evergreen_fill_daily_cap', fillDailyCapInput, 0, 200, fillSettings.evergreen_fill_daily_cap, setFillDailyCapInput); }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div className="flex items-end">
             <div className="w-full">
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Deferred-Memo Enrollment</label>
-              <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2">
+              <div className="flex items-center gap-3 bg-workbench-shell border border-neutral-700 rounded-lg px-3 py-2">
                 <Toggle
                   enabled={fillSettings.evergreen_fill_deferred_memo_enrollment}
                   onChange={v => void patchFill({ evergreen_fill_deferred_memo_enrollment: v })}
@@ -984,9 +984,9 @@ export function SettingsOrchestratorSection({
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-neutral-500 shrink-0">Current fleet coverage</span>
-                  <div className="flex-1 h-1.5 rounded-full bg-neutral-800 overflow-hidden min-w-[3rem] max-w-[10rem]">
+                  <div className="flex-1 h-1.5 rounded-full bg-workbench-panel overflow-hidden min-w-[3rem] max-w-[10rem]">
                     <div
-                      className={`h-full rounded-full ${pct >= enforcePct ? 'bg-emerald-500' : pct >= observePct ? 'bg-amber-500' : 'bg-neutral-600'}`}
+                      className={`h-full rounded-full ${pct >= enforcePct ? 'bg-emerald-500' : pct >= observePct ? 'bg-amber-500' : 'bg-workbench-card'}`}
                       style={{ width: `${pct}%` }}
                     />
                   </div>
@@ -1018,14 +1018,14 @@ export function SettingsOrchestratorSection({
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           <div className="md:col-span-2 lg:col-span-3">
             <label className="block text-xs font-medium text-neutral-400 mb-1.5">Mode</label>
-            <div className="flex gap-1 bg-neutral-950 border border-neutral-700 rounded-lg p-1 w-fit" data-testid="proof-gate-mode">
+            <div className="flex gap-1 bg-workbench-shell border border-neutral-700 rounded-lg p-1 w-fit" data-testid="proof-gate-mode">
               {(['off', 'observe', 'enforce'] as const).map(mode => (
                 <button
                   key={mode}
                   onClick={() => void patchProofGateMode(mode)}
                   className={`px-3 py-1.5 text-xs rounded-md transition-colors capitalize ${
                     proofGateMode === mode
-                      ? 'bg-neutral-700 text-neutral-100'
+                      ? 'bg-workbench-layer text-neutral-100'
                       : 'text-neutral-500 hover:text-neutral-300'
                   }`}
                 >
@@ -1037,7 +1037,7 @@ export function SettingsOrchestratorSection({
           <div className="flex items-end">
             <div className="w-full">
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Auto-Graduation</label>
-              <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2" data-testid="proof-gate-auto-graduation">
+              <div className="flex items-center gap-3 bg-workbench-shell border border-neutral-700 rounded-lg px-3 py-2" data-testid="proof-gate-auto-graduation">
                 <Toggle enabled={proofAutoGradEnabled} onChange={v => void patchProofAutoGrad(v)} />
                 <span className="text-xs text-neutral-400">{proofAutoGradEnabled ? 'Enabled' : 'Disabled'}</span>
               </div>
@@ -1046,7 +1046,7 @@ export function SettingsOrchestratorSection({
           <div className="flex items-end">
             <div className="w-full">
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Execution Trials</label>
-              <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2" data-testid="proof-gate-execution-trials">
+              <div className="flex items-center gap-3 bg-workbench-shell border border-neutral-700 rounded-lg px-3 py-2" data-testid="proof-gate-execution-trials">
                 <Toggle enabled={proofTrialsEnabled} onChange={v => void patchProofTrialsEnabled(v)} />
                 <span className="text-xs text-neutral-400">{proofTrialsEnabled ? 'Enabled' : 'Disabled'}</span>
               </div>
@@ -1065,7 +1065,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setProofObserveThresholdInput(e.target.value)}
               onBlur={() => commitProofThreshold('capability_proof_gate_auto_graduation_observe_threshold', proofObserveThresholdInput, proofObserveThreshold, setProofObserveThreshold, setProofObserveThresholdInput)}
               onKeyDown={e => { if (e.key === 'Enter') commitProofThreshold('capability_proof_gate_auto_graduation_observe_threshold', proofObserveThresholdInput, proofObserveThreshold, setProofObserveThreshold, setProofObserveThresholdInput); }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
           <div>
@@ -1081,7 +1081,7 @@ export function SettingsOrchestratorSection({
               onChange={e => setProofEnforceThresholdInput(e.target.value)}
               onBlur={() => commitProofThreshold('capability_proof_gate_auto_graduation_enforce_threshold', proofEnforceThresholdInput, proofEnforceThreshold, setProofEnforceThreshold, setProofEnforceThresholdInput)}
               onKeyDown={e => { if (e.key === 'Enter') commitProofThreshold('capability_proof_gate_auto_graduation_enforce_threshold', proofEnforceThresholdInput, proofEnforceThreshold, setProofEnforceThreshold, setProofEnforceThresholdInput); }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
             />
           </div>
         </div>
@@ -1122,7 +1122,7 @@ export function SettingsOrchestratorSection({
               setRestarting(false);
             }
           }}
-          className="bg-neutral-800 hover:bg-amber-900/30 disabled:opacity-50 border border-neutral-700 text-amber-400 text-xs py-2 px-4 rounded-lg transition-colors flex items-center gap-2"
+          className="bg-workbench-panel hover:bg-amber-900/30 disabled:opacity-50 border border-neutral-700 text-amber-400 text-xs py-2 px-4 rounded-lg transition-colors flex items-center gap-2"
         >
           {restarting
             ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Restarting&hellip;</>

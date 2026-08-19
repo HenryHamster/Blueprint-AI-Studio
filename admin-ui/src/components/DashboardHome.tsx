@@ -278,7 +278,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
         <select
           value={windowHours}
           onChange={e => setWindowHours(Number(e.target.value))}
-          className="text-xs bg-neutral-800 text-neutral-300 border border-neutral-700 rounded px-2 py-1 focus:outline-none focus:border-neutral-500"
+          className="text-xs bg-workbench-panel text-neutral-300 border border-neutral-700 rounded px-2 py-1 workbench-focus"
         >
           {WINDOW_OPTIONS.map(o => (
             <option key={o.value} value={o.value}>{o.label}</option>
@@ -380,7 +380,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
                   <button
                     key={d}
                     onClick={() => setFixLoopTrendDays(d)}
-                    className={`text-ui-sm px-3 py-2 rounded transition-colors min-h-11 min-w-11 ${fixLoopTrendDays === d ? 'bg-neutral-700 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
+                    className={`text-ui-sm px-3 py-2 rounded transition-colors min-h-11 min-w-11 ${fixLoopTrendDays === d ? 'bg-workbench-layer text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
                   >
                     {d}d
                   </button>

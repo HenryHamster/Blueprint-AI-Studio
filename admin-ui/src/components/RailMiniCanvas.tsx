@@ -39,13 +39,13 @@ function miniFill(s?: string | null): string {
 function IdlePlaceholder() {
   return (
     <div
-      className="flex items-center gap-2 rounded-md border border-neutral-800/60 bg-neutral-950/30 px-3 py-2"
+      className="flex items-center gap-2 rounded-md border border-neutral-800/60 bg-workbench-shell/30 px-3 py-2"
       data-testid="rail-mini-canvas-idle"
     >
       <div className="flex shrink-0 gap-1" aria-hidden="true">
-        <span className="h-2 w-2 rounded-full bg-neutral-700" />
-        <span className="h-2 w-2 rounded-full bg-neutral-700/60" />
-        <span className="h-2 w-2 rounded-full bg-neutral-700/30" />
+        <span className="h-2 w-2 rounded-full bg-workbench-layer" />
+        <span className="h-2 w-2 rounded-full bg-workbench-layer/60" />
+        <span className="h-2 w-2 rounded-full bg-workbench-layer/30" />
       </div>
       <span className="truncate text-xs text-neutral-600">No map data</span>
     </div>
@@ -71,7 +71,7 @@ export function RailMiniCanvas({
   if (layout.positionedNodes.length > 0) {
     return (
       <div
-        className="mb-2 overflow-hidden rounded border border-neutral-800 bg-[#080d13]"
+        className="mb-2 overflow-hidden rounded border border-neutral-800 bg-workbench-rail"
         style={{ maxHeight: 120 }}
         data-testid="rail-mini-canvas"
       >
@@ -96,7 +96,7 @@ export function RailMiniCanvas({
   // State 2 — no canvas data, strategist active: show the unified status chip.
   if (strategistActive) {
     return (
-      <div className="flex items-center gap-2 rounded-md border border-neutral-800/60 bg-neutral-950/30 px-3 py-2" data-testid="rail-mini-canvas-working">
+      <div className="flex items-center gap-2 rounded-md border border-neutral-800/60 bg-workbench-shell/30 px-3 py-2" data-testid="rail-mini-canvas-working">
         <StrategistStatusChip status={status} />
         {(activeTaskLabel || activeDirectionLabel) && (
           <div className="min-w-0 text-xs leading-relaxed text-neutral-400">

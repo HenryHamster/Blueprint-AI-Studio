@@ -14,7 +14,7 @@ export function ModalShell({ children, onClose, maxWidth = 'max-w-sm' }: ModalSh
       onClick={onClose}
     >
       <div
-        className={`bg-neutral-900 border border-neutral-700 rounded-xl p-6 ${maxWidth} w-full mx-4 shadow-2xl`}
+        className={`bg-workbench-base border border-neutral-700 rounded-lg p-6 ${maxWidth} w-full mx-4 shadow-2xl`}
         onClick={e => e.stopPropagation()}
       >
         {children}

@@ -229,7 +229,7 @@ export const MessagesPanelHeader = memo(function MessagesPanelHeader({
               {showWebhookDetail && (
                 <>
                   <div className="fixed inset-0 z-40" onClick={() => setShowWebhookDetail(false)} />
-                  <div className="absolute left-0 top-full mt-1 z-50 w-52 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-3 space-y-1 text-ui-md">
+                  <div className="absolute left-0 top-full mt-1 z-50 w-52 bg-workbench-base border border-neutral-700 rounded-lg shadow-xl p-3 space-y-1 text-ui-md">
                     <p className="text-neutral-300 font-medium mb-1.5">Webhook delivery</p>
                     <div className="flex justify-between text-neutral-400"><span>Delivered</span><span className="text-emerald-400">{webhookStats.total_delivered}</span></div>
                     <div className="flex justify-between text-neutral-400"><span>Failed</span><span className={webhookStats.total_failed > 0 ? 'text-amber-400' : 'text-neutral-500'}>{webhookStats.total_failed}</span></div>
@@ -324,7 +324,7 @@ export const MessagesPanelHeader = memo(function MessagesPanelHeader({
           <button
             onClick={onClose}
             aria-label="Close messages panel"
-            className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-2 rounded-lg text-xs transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center"
+            className="bg-workbench-panel hover:bg-workbench-hover text-neutral-400 p-2 rounded-lg text-xs transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center"
           >
             <X className="w-4 h-4" />
           </button>
@@ -339,7 +339,7 @@ export const MessagesPanelHeader = memo(function MessagesPanelHeader({
               value={localSearchQuery}
               onChange={e => setLocalSearchQuery(e.target.value)}
               placeholder="Search messages..."
-              className="flex-1 bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600"
+              className="flex-1 bg-workbench-base/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-3 py-2 text-xs placeholder-neutral-600 workbench-focus"
             />
             <button
               onClick={onOpenSaveDialog}

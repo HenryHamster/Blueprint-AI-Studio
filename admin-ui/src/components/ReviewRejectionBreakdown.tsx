@@ -7,7 +7,7 @@ const REVIEW_CAT_COLORS: Record<string, string> = {
   logic: 'bg-red-500/20 text-red-400 border-red-500/30',
   scope: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
   architecture: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
-  other: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
+  other: 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30',
 };
 
 export function ReviewRejectionBreakdown({ digest }: { digest: DigestData | null }) {
@@ -23,7 +23,7 @@ export function ReviewRejectionBreakdown({ digest }: { digest: DigestData | null
         {allKeys.map(k => {
           const pct = cats[k];
           if (pct == null) return null;
-          const color = REVIEW_CAT_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+          const color = REVIEW_CAT_COLORS[k] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
           return (
             <span key={k} className={`inline-flex items-center gap-1 text-ui-sm font-semibold px-2 py-0.5 rounded border ${color}`} title={`${k}: ${Math.round(pct * 100)}% of first-attempt rejections`}>
               {k}

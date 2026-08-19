@@ -114,7 +114,7 @@ export interface RemediationFunnelSectionProps {
 const CASE_STATUS_STYLES: Record<string, string> = {
   REMEDIATING: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
   SUSPENDED: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
-  IGNORED: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
+  IGNORED: 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30',
   MERGED: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
   FAILED: 'bg-red-500/20 text-red-400 border-red-500/30',
   ACTIVE: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
@@ -151,14 +151,14 @@ function pct(numerator: number, denominator: number): number {
 }
 
 function classBadge(cls: string): string {
-  return FAILURE_CLASS_COLORS[cls] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+  return FAILURE_CLASS_COLORS[cls] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
 }
 
 const CONFIDENCE_BADGE: Record<string, string> = {
   high: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
   medium: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
   low: 'bg-red-500/20 text-red-400 border-red-500/30',
-  unknown: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
+  unknown: 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30',
 };
 
 function confidenceBadge(conf?: string | null): string {
@@ -253,7 +253,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
     return (
       <section>
         <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Remediation Funnel</h2>
-        <div className="animate-pulse bg-neutral-800/60 rounded h-24 w-full" />
+        <div className="animate-pulse bg-workbench-panel/60 rounded h-24 w-full" />
       </section>
     );
   }
@@ -394,7 +394,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
       })()}
 
       {/* Horizontal funnel */}
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
         <div className="flex items-stretch gap-1 overflow-x-auto" data-viewport-allow-overflow>
           {stages.map((s, i) => {
             const conv = s.prev != null && s.prev > 0 ? pct(s.count, s.prev) : null;
@@ -405,7 +405,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                     &rarr; {conv}%
                   </span>
                 )}
-                <div className="min-w-[86px] px-2 py-1.5 rounded border border-neutral-700 bg-neutral-800/40 text-center">
+                <div className="min-w-[86px] px-2 py-1.5 rounded border border-neutral-700 bg-workbench-panel/40 text-center">
                   <div className="text-ui-xs uppercase tracking-wide text-neutral-500">{s.label}</div>
                   <div className="text-sm font-bold text-neutral-100">{s.count}</div>
                 </div>
@@ -428,7 +428,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           ? bottleneckCandidates.reduce((a, b) => ((a.rate ?? 1) <= (b.rate ?? 1) ? a : b)).cls
           : null;
         return (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
           <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">By failure class</div>
           {/* Mobile: stacked cards, one per failure class */}
           <div className="md:hidden space-y-2">
@@ -506,7 +506,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
               return (
                 <div
                   key={cls}
-                  className={`grid grid-cols-[minmax(110px,1fr)_repeat(8,minmax(44px,1fr))] gap-2 text-ui-md items-center ${isBottleneck ? 'border-l-2 border-red-500/60 bg-red-500/5 pl-1 rounded-sm' : ''}`}
+                  className={`grid grid-cols-[minmax(110px,1fr)_repeat(8,minmax(44px,1fr))] gap-2 text-ui-md items-center ${isBottleneck ? 'border-l-2 border-red-500/60 bg-red-500/5 pl-1 rounded' : ''}`}
                   title={isBottleneck ? 'Lowest merge rate among classes with ≥2 remediations (bottleneck)' : undefined}
                 >
                   <span className={`inline-flex justify-center text-ui-xs font-semibold px-1.5 py-0.5 rounded border ${classBadge(cls)}`}>
@@ -535,7 +535,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
       {/* Drop-off + confidence */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
         {(dropOff.length > 0 || structuralFilterPassRate != null || reuseTotal > 0) && (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+          <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
             <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">Diagnosis drop-off</div>
             {structuralFilterPassRate != null && (
               <div className="flex justify-between text-ui-md text-neutral-400 mb-1">
@@ -567,7 +567,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         )}
 
         {confDist.length > 0 && (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+          <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
             <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">Confidence distribution</div>
             <div className="space-y-0.5">
               {confDist
@@ -587,7 +587,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         )}
 
         {ciSpawned > 0 && (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+          <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
             <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">CI auto-remediation</div>
             <div className="flex justify-between text-ui-md text-neutral-400 mb-1">
               <span>spawned</span>
@@ -624,7 +624,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         )}
 
         {rrSpawned > 0 && (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+          <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
             <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">Residual remediation</div>
             <div className="flex justify-between text-ui-md text-neutral-400 mb-1">
               <span>spawned</span>
@@ -651,7 +651,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         )}
 
         {successByConf.length > 0 && (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+          <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
             <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">Success by confidence</div>
             <div className="space-y-0.5">
               {successByConf.map(([conf, { merged, failed }]) => {
@@ -678,7 +678,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         const activeDetails = funnel.active_investigations_detail ?? [];
         if (recent.length === 0 && activeDetails.length === 0) return null;
         return (
-          <div className="mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg">
+          <div className="mt-2 bg-workbench-base/50 border border-neutral-800/50 rounded-lg">
             <button
               data-viewport-allow-small-target
               type="button"
@@ -750,7 +750,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           r => r.case_status !== 'IGNORED' || showIgnored || ignoredFingerprints.has(r.fingerprint)
         );
         return (
-          <div className="mt-2 bg-neutral-900/50 border border-amber-800/30 rounded-lg">
+          <div className="mt-2 bg-workbench-base/50 border border-amber-800/30 rounded-lg">
             <button
               data-viewport-allow-small-target
               type="button"
@@ -815,7 +815,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                           const effectiveR = isUnsuspended ? { ...r, case_status: 'ACTIVE', consecutive_failure_count: 0 } : r;
                           const label = caseStatusLabel(effectiveR);
                           if (!label) return null;
-                          const style = CASE_STATUS_STYLES[effectiveR.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+                          const style = CASE_STATUS_STYLES[effectiveR.case_status ?? ''] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
                           return (
                             <span className={`font-mono text-ui-xs font-semibold px-1.5 py-0.5 rounded border shrink-0 ${style}`}>
                               {label}

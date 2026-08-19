@@ -48,7 +48,7 @@ export function ProjectResourceAvailabilityCard({
       ) : (
         <>
           <div className="grid gap-2 md:grid-cols-2">
-            <div className="rounded border border-neutral-800/70 bg-neutral-950/30 p-2.5">
+            <div className="rounded border border-neutral-800/70 bg-workbench-shell/30 p-2.5">
               <div className="mb-2 flex items-center gap-2">
                 <Bot className="h-3.5 w-3.5 text-cyan-400" />
                 <h4 className="text-ui-sm font-bold uppercase tracking-widest text-neutral-400">LLM</h4>
@@ -64,7 +64,7 @@ export function ProjectResourceAvailabilityCard({
               </div>
               <p className="mt-2 text-ui-xs text-neutral-600">Cap headroom only; runtime readiness is checked at dispatch.</p>
             </div>
-            <div className="rounded border border-neutral-800/70 bg-neutral-950/30 p-2.5">
+            <div className="rounded border border-neutral-800/70 bg-workbench-shell/30 p-2.5">
               <div className="mb-2 flex items-center gap-2">
                 <Server className="h-3.5 w-3.5 text-violet-400" />
                 <h4 className="text-ui-sm font-bold uppercase tracking-widest text-neutral-400">Runners</h4>

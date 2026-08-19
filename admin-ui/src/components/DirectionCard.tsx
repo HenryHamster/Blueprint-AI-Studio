@@ -60,7 +60,7 @@ function remediationResultMeta(result: string | null | undefined): Pick<Remediat
   if (normalized === 'held') {
     return { resultLabel: 'held', badgeClass: 'bg-red-950/30 border-red-900/50 text-red-300' };
   }
-  return { resultLabel: normalized || 'pending', badgeClass: 'bg-neutral-900/60 border-neutral-700/60 text-neutral-300' };
+  return { resultLabel: normalized || 'pending', badgeClass: 'bg-workbench-base/60 border-neutral-700/60 text-neutral-300' };
 }
 
 export interface DirectionCardProps {
@@ -305,7 +305,7 @@ function DirectionCardImpl({
       return (
         <span
           title={`${prefix} $${(spend ?? 0).toFixed(2)} spent — basis: ${basisLabel}`}
-          className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500"
+          className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-workbench-panel/60 border-neutral-700/60 text-neutral-500"
         >
           {prefix} ${(spend ?? 0).toFixed(2)} spent
         </span>
@@ -313,7 +313,7 @@ function DirectionCardImpl({
     }
     if (spend == null) {
       return (
-        <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+        <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-workbench-panel/60 border-neutral-700/60 text-neutral-500">
           Budget ${budget.toFixed(2)}
         </span>
       );
@@ -350,7 +350,7 @@ function DirectionCardImpl({
         {windowSpend != null && (
           <span
             title={`Rolling-window spend (digest window): $${windowSpend.toFixed(2)}`}
-            className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-900/60 border-neutral-800/60 text-neutral-500"
+            className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-workbench-base/60 border-neutral-800/60 text-neutral-500"
           >
             window ${windowSpend.toFixed(2)}
           </span>
@@ -427,7 +427,7 @@ function DirectionCardImpl({
       if (s === 'IN_PROGRESS') return 'bg-yellow-950/40 border-yellow-900/50 text-yellow-400';
       if (s === 'PROVISIONING') return 'bg-sky-950/40 border-sky-900/60 text-sky-400';
       if (s === 'EVALUATING') return 'bg-indigo-950/40 border-indigo-900/60 text-indigo-400';
-      return 'bg-neutral-800/60 border-neutral-700/60 text-neutral-400';
+      return 'bg-workbench-panel/60 border-neutral-700/60 text-neutral-400';
     };
     return (
       <div className="flex flex-wrap gap-1">
@@ -472,7 +472,7 @@ function DirectionCardImpl({
   }, [retireConfirmOpen]);
 
   return (
-    <div className={`border rounded-lg p-2 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-neutral-900/30 border-neutral-800/40 opacity-70' : d.status === 'staged' ? 'bg-sky-950/20 border-sky-900/40' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
+    <div className={`border rounded-lg p-2 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-workbench-base/30 border-neutral-800/40 opacity-70' : d.status === 'staged' ? 'bg-sky-950/20 border-sky-900/40' : 'bg-workbench-base/50 border-neutral-800/50'}`}>
       {d.status === 'proposed' ? (
         /* Proposed direction — approve or reject */
         <div>
@@ -630,7 +630,7 @@ function DirectionCardImpl({
                   className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium ${
                     waiting.isStale
                       ? 'bg-red-950/40 text-red-400 border-red-900/50'
-                      : 'bg-neutral-800/40 text-neutral-400 border-neutral-700/50'
+                      : 'bg-workbench-panel/40 text-neutral-400 border-neutral-700/50'
                   }`}
                   title={
                     waiting.isStale
@@ -655,7 +655,7 @@ function DirectionCardImpl({
                 placeholder={stageTargetVersion != null ? String(stageTargetVersion) : ''}
                 onChange={e => setRetargetVersion(e.target.value)}
                 title="Bind this staged direction to a different version (current open or later)"
-                className="w-16 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-0.5 text-ui-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+                className="w-16 bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-0.5 text-ui-sm placeholder-neutral-600 workbench-focus"
               />
               <button
                 data-viewport-allow-small-target
@@ -678,14 +678,14 @@ function DirectionCardImpl({
           <input
             value={editText}
             onChange={e => setEditText(e.target.value)}
-            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
           />
           <textarea
             value={editCompletionCriteria}
             onChange={e => setEditCompletionCriteria(e.target.value)}
             placeholder="Done when..."
             rows={2}
-            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+            className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs placeholder-neutral-600 resize-y workbench-focus"
           />
           {/* Acceptance-evidence contract editable inline; 500-char limit
               mirrors the backend create/update endpoint. */}
@@ -695,7 +695,7 @@ function DirectionCardImpl({
             placeholder="Success evidence..."
             rows={2}
             maxLength={500}
-            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+            className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs placeholder-neutral-600 resize-y workbench-focus"
           />
           <textarea
             value={editRetirementCondition}
@@ -703,11 +703,11 @@ function DirectionCardImpl({
             placeholder="Retirement condition..."
             rows={2}
             maxLength={500}
-            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+            className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs placeholder-neutral-600 resize-y workbench-focus"
           />
-          <div className="bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center focus-within:ring-1 focus-within:ring-neutral-600">
+          <div className="bg-workbench-shell border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center workbench-focus">
             {editPathTags.map(tag => (
-              <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-ui-sm font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
+              <span key={tag} className="bg-workbench-panel border border-neutral-700 text-neutral-300 text-ui-sm font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
                 {tag}
                 <button
                   type="button"
@@ -732,14 +732,14 @@ function DirectionCardImpl({
                 }
               }}
               placeholder={editPathTags.length === 0 ? 'Path scope (e.g. backend/)' : ''}
-              className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs focus:outline-none placeholder-neutral-600"
+              className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs placeholder-neutral-600 workbench-focus"
             />
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <select
               value={editPriority}
               onChange={e => setEditPriority(e.target.value as 'high' | 'medium' | 'low')}
-              className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs workbench-focus"
             >
               <option value="high">High</option>
               <option value="medium">Medium</option>
@@ -748,7 +748,7 @@ function DirectionCardImpl({
             <select
               value={editStatus}
               onChange={e => setEditStatus(e.target.value as 'active' | 'completed' | 'paused' | 'staged')}
-              className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs workbench-focus"
             >
               <option value="active">Active</option>
               <option value="completed">Completed</option>
@@ -769,7 +769,7 @@ function DirectionCardImpl({
             <select
               value={editCategory ?? ''}
               onChange={e => setEditCategory((e.target.value || null) as DirectionCategory)}
-              className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs workbench-focus"
             >
               <option value="">Type…</option>
               <option value="product">Product</option>
@@ -786,7 +786,7 @@ function DirectionCardImpl({
                 onChange={e => setEditCostBudget(e.target.value)}
                 placeholder="Budget $"
                 title="Cost budget (USD) — alerts fire when spend exceeds 80% of this"
-                className="w-24 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+                className="w-24 bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs placeholder-neutral-600 workbench-focus"
               />
             )}
             {/* reason: inline icon-only confirm/cancel in edit row; w-3.5 h-3.5 icon matches edit form density */}
@@ -859,7 +859,7 @@ function DirectionCardImpl({
                       onClick={handleTriggerResearch}
                       disabled={researchingIds[d.id] || inCooldown}
                       title={inCooldown ? 'Direction is in cooldown — use force to bypass' : 'Trigger research for this direction'}
-                      className="text-ui-sm px-1.5 py-0.5 rounded border font-medium transition-colors disabled:opacity-40 bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:enabled:text-neutral-200 hover:enabled:bg-neutral-700/60"
+                      className="text-ui-sm px-1.5 py-0.5 rounded border font-medium transition-colors disabled:opacity-40 bg-workbench-panel/60 border-neutral-700/60 text-neutral-400 hover:enabled:text-neutral-200 hover:enabled:bg-workbench-layer/60"
                     >
                       {researchingIds[d.id] ? '…' : researchSuccessIds[d.id] ? 'Queued' : 'Research'}
                     </button>
@@ -878,7 +878,7 @@ function DirectionCardImpl({
                         {forceConfirmId === d.id && (
                           <div
                             ref={forceConfirmRef}
-                            className="absolute right-0 top-6 z-10 w-52 bg-neutral-900 border border-amber-900/60 rounded-lg p-3 shadow-xl"
+                            className="absolute right-0 top-6 z-10 w-52 bg-workbench-base border border-amber-900/60 rounded-lg p-3 shadow-xl"
                           >
                             <p className="text-ui-md text-amber-300 font-medium mb-1">Force research?</p>
                             <p className="text-ui-sm text-neutral-400 mb-2 leading-relaxed">Bypasses the cooldown and queues a research task immediately.</p>
@@ -891,7 +891,7 @@ function DirectionCardImpl({
                               </button>
                               <button
                                 onClick={handleDismissForceConfirm}
-                                className="flex-1 text-ui-sm px-2 py-1 min-h-[44px] rounded border bg-neutral-800 border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
+                                className="flex-1 text-ui-sm px-2 py-1 min-h-[44px] rounded border bg-workbench-panel border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
                               >
                                 Cancel
                               </button>
@@ -1013,7 +1013,7 @@ function DirectionCardImpl({
                   {retireConfirmOpen && (
                     <div
                       ref={retireConfirmRef}
-                      className="absolute right-0 top-6 z-10 w-52 bg-neutral-900 border border-red-900/60 rounded-lg p-3 shadow-xl"
+                      className="absolute right-0 top-6 z-10 w-52 bg-workbench-base border border-red-900/60 rounded-lg p-3 shadow-xl"
                     >
                       <p className="text-ui-md text-red-300 font-medium mb-1">Retire this direction?</p>
                       <p className="text-ui-sm text-neutral-400 mb-2 leading-relaxed">This will permanently retire the direction. This action cannot be undone.</p>
@@ -1026,7 +1026,7 @@ function DirectionCardImpl({
                         </button>
                         <button
                           onClick={() => setRetireConfirmOpen(false)}
-                          className="flex-1 text-ui-sm px-2 py-1 min-h-[44px] rounded border bg-neutral-800 border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
+                          className="flex-1 text-ui-sm px-2 py-1 min-h-[44px] rounded border bg-workbench-panel border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
                         >
                           Cancel
                         </button>
@@ -1187,7 +1187,7 @@ function DirectionCardImpl({
             {showGeneralized && (
               <span
                 title="Generalized success across task types (code merges + research/audit/memo/verification), distinct from the PR-merge count"
-                className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 ${healthRateColorClass(d.generalized_health_rate)}`}
+                className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-workbench-panel/60 border-neutral-700/60 ${healthRateColorClass(d.generalized_health_rate)}`}
               >
                 {d.generalized_successes ?? 0} eval{typeof d.generalized_health_rate === 'number' ? ` · ${Math.round(d.generalized_health_rate * 100)}%` : ''}
               </span>
@@ -1313,7 +1313,7 @@ function DirectionCardImpl({
                   ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400'
                   : rate >= 0.4
                     ? 'bg-amber-950/40 border-amber-900/50 text-amber-400'
-                    : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-400';
+                    : 'bg-workbench-panel/60 border-neutral-700/60 text-neutral-400';
                 return (
                   <span
                     key={row.kind}
@@ -1329,7 +1329,7 @@ function DirectionCardImpl({
           {d.paths && d.paths.length > 0 && (
             <div className="flex flex-wrap gap-1 mt-1.5">
               {d.paths.map(p => (
-                <span key={p} className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800/60 border border-neutral-700/60 text-neutral-400 font-mono">
+                <span key={p} className="text-ui-sm px-1.5 py-0.5 rounded bg-workbench-panel/60 border border-neutral-700/60 text-neutral-400 font-mono">
                   {p}
                 </span>
               ))}
@@ -1348,7 +1348,7 @@ function DirectionCardImpl({
                 <span className="font-medium">Agent notes ({d.notes.length})</span>
               </button>
               {notesOpen && (
-                <div className="mt-0.5 p-1.5 bg-neutral-800/30 border border-neutral-700/40 rounded text-xs">
+                <div className="mt-0.5 p-1.5 bg-workbench-panel/30 border border-neutral-700/40 rounded text-xs">
                   {d.notes.slice(-3).map((n, ni) => {
                     const expanded = expandedNotes.has(ni);
                     const truncated = n.text.length > 200;
@@ -1396,7 +1396,7 @@ function DirectionCardImpl({
               )}
               {!readOnly && <div className="flex gap-2 mt-2">
                 <button onClick={() => applyDirectionUpdate(d)} className="text-xs px-2 py-0.5 min-h-[44px] rounded border bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40 transition-colors">Apply</button>
-                <button onClick={() => dismissDirectionUpdate(d.id)} className="text-xs px-2 py-0.5 min-h-[44px] rounded border bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-300 transition-colors">Dismiss</button>
+                <button onClick={() => dismissDirectionUpdate(d.id)} className="text-xs px-2 py-0.5 min-h-[44px] rounded border bg-workbench-panel/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-300 transition-colors">Dismiss</button>
               </div>}
             </div>
           )}
@@ -1450,7 +1450,7 @@ function DirectionCardImpl({
                               </span>
                             )}
                             {(lifetimeMetrics.totalAutonomous ?? 0) === 0 && (lifetimeMetrics.totalAssisted ?? 0) === 0 && (
-                              <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+                              <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-workbench-panel/60 border-neutral-700/60 text-neutral-500">
                                 0 PRs shipped
                               </span>
                             )}
@@ -1461,7 +1461,7 @@ function DirectionCardImpl({
                             )}
                           </>
                         ) : (
-                          <span className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium ${lifetimeMetrics.totalMerged > 0 ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'}`}>
+                          <span className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium ${lifetimeMetrics.totalMerged > 0 ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' : 'bg-workbench-panel/60 border-neutral-700/60 text-neutral-500'}`}>
                             {lifetimeMetrics.totalMerged} PRs shipped
                           </span>
                         )}
@@ -1508,7 +1508,7 @@ function DirectionCardImpl({
                                   if (!active || !payload?.length) return null;
                                   const pt = payload[0].payload as { prs: number; timestamp: string; findings: string[] };
                                   return (
-                                    <div className="text-ui-sm bg-neutral-900 border border-neutral-700 rounded px-2 py-1 max-w-[180px] shadow-lg">
+                                    <div className="text-ui-sm bg-workbench-base border border-neutral-700 rounded px-2 py-1 max-w-[180px] shadow-lg">
                                       <div className="text-neutral-400">{formatRelativeTime(pt.timestamp)}</div>
                                       <div className="text-emerald-400 font-medium">{pt.prs} PR{pt.prs !== 1 ? 's' : ''} merged</div>
                                       {pt.findings.slice(0, 2).map((f, fi) => (
@@ -1532,13 +1532,13 @@ function DirectionCardImpl({
                                 ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400'
                                 : lifetimeMetrics.deltaPrs < 0
                                   ? 'bg-red-950/40 border-red-900/50 text-red-400'
-                                  : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'
+                                  : 'bg-workbench-panel/60 border-neutral-700/60 text-neutral-500'
                             }`}
                           >
                             {lifetimeMetrics.deltaPrs > 0 ? '+' : ''}{lifetimeMetrics.deltaPrs} vs prior
                           </span>
                         ) : (
-                          <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+                          <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-workbench-panel/60 border-neutral-700/60 text-neutral-500">
                             {lifetimeMetrics.latestCyclePrs} this cycle
                           </span>
                         )}
@@ -1552,7 +1552,7 @@ function DirectionCardImpl({
                   )}
                   <div className="space-y-2">
                   {[...d.research_history].reverse().slice(0, 5).map((entry, i) => (
-                    <div key={entry.task_id ?? i} className="p-2 bg-neutral-900/60 border border-neutral-800/60 rounded text-ui-sm">
+                    <div key={entry.task_id ?? i} className="p-2 bg-workbench-base/60 border border-neutral-800/60 rounded text-ui-sm">
                       <div className="flex items-center justify-between mb-1">
                         <div className="flex items-center gap-1.5">
                           <span className="text-neutral-400 font-medium">{formatRelativeTime(entry.timestamp)}</span>

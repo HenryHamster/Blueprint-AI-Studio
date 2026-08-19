@@ -15,7 +15,7 @@ interface ProjectMembersProps {
 const ROLE_BADGE: Record<string, { bg: string; text: string; border: string; icon: typeof Shield }> = {
   owner:  { bg: 'bg-amber-500/10',   text: 'text-amber-400',  border: 'border-amber-500/20',  icon: Shield },
   member: { bg: 'bg-cyan-500/10',    text: 'text-cyan-400',   border: 'border-cyan-500/20',   icon: User },
-  viewer: { bg: 'bg-neutral-700/50', text: 'text-neutral-400', border: 'border-neutral-600/30', icon: Eye },
+  viewer: { bg: 'bg-workbench-layer/50', text: 'text-neutral-400', border: 'border-neutral-600/30', icon: Eye },
 };
 
 export function ProjectMembers({ members, myRole, canManageMembers, onAdd, onUpdateRole, onRemove }: ProjectMembersProps) {
@@ -71,7 +71,7 @@ export function ProjectMembers({ members, myRole, canManageMembers, onAdd, onUpd
 
   return (
     <div
-      className="bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden"
+      className="bg-workbench-base border border-neutral-800 rounded-lg overflow-hidden"
     >
       <div className="px-4 py-3 border-b border-neutral-800">
         <h3 className="text-sm font-semibold text-neutral-100">Project Members</h3>
@@ -98,7 +98,7 @@ export function ProjectMembers({ members, myRole, canManageMembers, onAdd, onUpd
                 onChange={e => setNewEmail(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && handleAdd()}
                 placeholder="user@example.com"
-                className="w-full bg-neutral-800 border border-neutral-700 rounded px-2.5 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 focus:outline-none focus:border-cyan-500/50"
+                className="w-full bg-workbench-panel border border-neutral-700 rounded px-2.5 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 workbench-focus"
               />
             </div>
             <div>
@@ -106,7 +106,7 @@ export function ProjectMembers({ members, myRole, canManageMembers, onAdd, onUpd
               <select
                 value={newRole}
                 onChange={e => setNewRole(e.target.value as 'member' | 'viewer')}
-                className="bg-neutral-800 border border-neutral-700 rounded px-2.5 py-1.5 text-xs text-neutral-200 focus:outline-none focus:border-cyan-500/50"
+                className="bg-workbench-panel border border-neutral-700 rounded px-2.5 py-1.5 text-xs text-neutral-200 workbench-focus"
                 data-viewport-allow-small-target
               >
                 <option value="viewer">Viewer</option>
@@ -139,7 +139,7 @@ export function ProjectMembers({ members, myRole, canManageMembers, onAdd, onUpd
               const displayIdentity = m.email || (!isPending ? m.user_id : null) || 'Pending invitation';
 
               return (
-                <div key={m.id} className="flex items-center gap-3 px-4 py-2.5 hover:bg-neutral-800/30">
+                <div key={m.id} className="flex items-center gap-3 px-4 py-2.5 hover:bg-workbench-hover/30">
                   {/* User info */}
                   <div className="flex-1 min-w-0">
                     <div className="text-xs text-neutral-200 truncate">
@@ -160,7 +160,7 @@ export function ProjectMembers({ members, myRole, canManageMembers, onAdd, onUpd
                       value={m.role}
                       onChange={e => handleRoleChange(m, e.target.value)}
                       disabled={loading === m.id}
-                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-ui-sm font-medium ${badge.bg} ${badge.text} border ${badge.border} bg-transparent cursor-pointer focus:outline-none`}
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-ui-sm font-medium ${badge.bg} ${badge.text} border ${badge.border} bg-transparent cursor-pointer workbench-focus`}
                       data-viewport-allow-small-target
                     >
                       <option value="member">member</option>

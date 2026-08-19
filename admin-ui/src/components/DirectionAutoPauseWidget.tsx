@@ -40,7 +40,7 @@ export function DirectionAutoPauseWidget({ selectedProjectId }: DirectionAutoPau
         <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
           Direction Auto-Pause
         </h2>
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 h-20 animate-pulse" />
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 h-20 animate-pulse" />
       </section>
     );
   }
@@ -65,14 +65,14 @@ export function DirectionAutoPauseWidget({ selectedProjectId }: DirectionAutoPau
         <select
           value={windowHours}
           onChange={e => setWindowHours(Number(e.target.value))}
-          className="text-ui-sm bg-neutral-800 text-neutral-300 border border-neutral-700 rounded px-1.5 py-0.5 focus:outline-none focus:border-neutral-500"
+          className="text-ui-sm bg-workbench-panel text-neutral-300 border border-neutral-700 rounded px-1.5 py-0.5 workbench-focus"
         >
           {WINDOW_OPTIONS.map(o => (
             <option key={o.value} value={o.value}>{o.label}</option>
           ))}
         </select>
       </div>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 space-y-2">
         {!hasActivity ? (
           <div className="flex items-center gap-1.5 text-neutral-500 text-xs">
             <PauseCircle className="w-3.5 h-3.5 shrink-0" />

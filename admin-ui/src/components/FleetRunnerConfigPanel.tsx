@@ -163,7 +163,7 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
               )
             }
             aria-label="Max concurrent tasks"
-            className="w-20 rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-sm text-neutral-200 outline-none focus:border-neutral-500"
+            className="w-20 rounded border border-neutral-700 bg-workbench-shell px-2 py-1 text-sm text-neutral-200 outline-none workbench-focus"
           />
         )}
       </ConfigField>
@@ -186,7 +186,7 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
             )
           }
           aria-label="Max concurrent compute jobs"
-          className="w-20 rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-sm text-neutral-200 outline-none focus:border-neutral-500"
+          className="w-20 rounded border border-neutral-700 bg-workbench-shell px-2 py-1 text-sm text-neutral-200 outline-none workbench-focus"
         />
       </ConfigField>
 
@@ -218,7 +218,7 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
                 onChange={e => setTaskTypesText(e.target.value)}
                 placeholder="compute_experiment, code_change"
                 aria-label="Task types allowed"
-                className="w-full max-w-md rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-sm text-neutral-200 outline-none focus:border-neutral-500"
+                className="w-full max-w-md rounded border border-neutral-700 bg-workbench-shell px-2 py-1 text-sm text-neutral-200 outline-none workbench-focus"
               />
             )}
           </div>
@@ -250,7 +250,7 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
                   onChange={e => setGpuText(e.target.value)}
                   placeholder="0,1"
                   aria-label="GPU indices allowed"
-                  className="w-full max-w-xs rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-sm text-neutral-200 outline-none focus:border-neutral-500"
+                  className="w-full max-w-xs rounded border border-neutral-700 bg-workbench-shell px-2 py-1 text-sm text-neutral-200 outline-none workbench-focus"
                 />
               )}
             </div>
@@ -274,7 +274,7 @@ export function FleetRunnerConfigPanel({ projectId, runner, onSaved }: Props) {
                 )
               }
               aria-label="GPUs per job"
-              className="w-20 rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-sm text-neutral-200 outline-none focus:border-neutral-500"
+              className="w-20 rounded border border-neutral-700 bg-workbench-shell px-2 py-1 text-sm text-neutral-200 outline-none workbench-focus"
             />
           </ConfigField>
         </>
@@ -340,7 +340,7 @@ function ConfigField({
 function ReadOnlyValue({ value, note }: { value: string; note: string }) {
   return (
     <div className="space-y-0.5">
-      <div className="rounded border border-neutral-800 bg-neutral-950/60 px-2 py-1 text-sm text-neutral-400">
+      <div className="rounded border border-neutral-800 bg-workbench-shell/60 px-2 py-1 text-sm text-neutral-400">
         {value}
       </div>
       <div className="text-ui-sm text-neutral-600">{note}</div>

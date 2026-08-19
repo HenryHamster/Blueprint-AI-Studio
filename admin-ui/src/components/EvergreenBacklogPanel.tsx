@@ -18,8 +18,8 @@ function statusBadgeClasses(status: string): string {
     case 'enrolled': return 'border-blue-500/30 bg-blue-500/15 text-blue-300';
     case 'spawned': return 'border-amber-500/30 bg-amber-500/15 text-amber-300';
     case 'done': return 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300';
-    case 'retired': return 'border-neutral-600 bg-neutral-800 text-neutral-500';
-    default: return 'border-neutral-700 bg-neutral-800/50 text-neutral-400';
+    case 'retired': return 'border-neutral-600 bg-workbench-panel text-neutral-500';
+    default: return 'border-neutral-700 bg-workbench-panel/50 text-neutral-400';
   }
 }
 
@@ -53,7 +53,7 @@ export function EvergreenBacklogPanel({ projectId }: EvergreenBacklogPanelProps)
   return (
     <div className="border border-neutral-800 rounded-lg overflow-hidden" data-testid="evergreen-backlog-panel">
       <button
-        className="w-full flex items-center justify-between px-4 py-3 bg-neutral-900 hover:bg-neutral-800/60 transition-colors"
+        className="w-full flex items-center justify-between px-4 py-3 bg-workbench-base hover:bg-workbench-hover/60 transition-colors"
         onClick={() => setCollapsed(v => !v)}
       >
         <div className="flex items-center gap-2">
@@ -107,7 +107,7 @@ export function EvergreenBacklogPanel({ projectId }: EvergreenBacklogPanelProps)
                 </thead>
                 <tbody>
                   {items.map(item => (
-                    <tr key={item.id} className="border-b border-neutral-800/50 last:border-0 hover:bg-neutral-800/20">
+                    <tr key={item.id} className="border-b border-neutral-800/50 last:border-0 hover:bg-workbench-hover/20">
                       <td className="py-1.5 pr-3 max-w-[200px]">
                         <span className="text-neutral-200 truncate block" title={item.title}>{item.title}</span>
                         <span className="text-ui-sm text-neutral-600 font-mono">{item.finding_key}</span>

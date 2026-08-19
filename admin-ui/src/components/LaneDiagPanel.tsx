@@ -16,7 +16,7 @@ const WASTE_CATEGORIES: { key: keyof LaneWasteTaxonomy; label: string; color: st
   { key: 'ci_churn', label: 'CI Churn', color: 'bg-yellow-500' },
   { key: 'review_ambiguity', label: 'Review Ambiguity', color: 'bg-blue-500' },
   { key: 'lost_reasoning', label: 'Lost Reasoning', color: 'bg-purple-500' },
-  { key: 'unknown', label: 'Unknown', color: 'bg-neutral-500' },
+  { key: 'unknown', label: 'Unknown', color: 'bg-workbench-control' },
 ];
 
 function fmt(s: number): string {
@@ -51,7 +51,7 @@ function WasteTaxonomyTable({ taxonomy }: { taxonomy: LaneWasteTaxonomy }) {
         return (
           <div key={key} className="flex items-center gap-2 text-xs">
             <span className="w-32 text-neutral-300 shrink-0">{label}</span>
-            <div className="flex-1 bg-neutral-800 rounded h-2 overflow-hidden">
+            <div className="flex-1 bg-workbench-panel rounded h-2 overflow-hidden">
               <div className={`${color} h-full rounded`} style={{ width: `${pct}%` }} />
             </div>
             <span className="w-8 text-right text-neutral-400">{count}</span>
@@ -147,7 +147,7 @@ function PhaseBreakdownTable({ rows, truncated }: { rows: PerPrPhaseRow[]; trunc
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr key={row.pr_number} className="border-b border-neutral-800/50 hover:bg-neutral-800/30">
+            <tr key={row.pr_number} className="border-b border-neutral-800/50 hover:bg-workbench-hover/30">
               <td className="py-1 text-neutral-300 font-mono">#{row.pr_number}</td>
               <td className="py-1 text-right text-neutral-400">{row.task_count}</td>
               <td className="py-1 text-right text-neutral-300">{fmt(row.review_seconds)}</td>

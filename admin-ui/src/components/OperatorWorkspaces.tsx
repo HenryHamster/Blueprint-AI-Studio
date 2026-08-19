@@ -37,7 +37,7 @@ function ProjectNoSelectionState({
             <button
               type="button"
               onClick={onOpenProjectManagement}
-              className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-700 bg-neutral-900 px-3 text-sm font-semibold text-neutral-200 transition-colors hover:bg-neutral-800"
+              className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-700 bg-workbench-base px-3 text-sm font-semibold text-neutral-200 transition-colors hover:bg-workbench-hover"
             >
               <Wrench className="h-3.5 w-3.5" />
               Manage projects
@@ -45,7 +45,7 @@ function ProjectNoSelectionState({
             <button
               type="button"
               onClick={() => onProjectSectionChange('manage')}
-              className="inline-flex min-h-11 items-center rounded-md border border-neutral-800 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900"
+              className="inline-flex min-h-11 items-center rounded-md border border-neutral-800 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover"
             >
               Project overview
             </button>
@@ -242,7 +242,7 @@ export function ProjectWorkspace({
                     onClick={() => onProjectManageSectionChange(item.id)}
                     className={`flex w-full items-start gap-2 rounded-md border px-2.5 py-2 text-left transition-colors ${
                       selected
-                        ? 'border-workbench-border-strong bg-neutral-800 text-neutral-100'
+                        ? 'border-workbench-border-strong bg-workbench-panel text-neutral-100'
                         : 'border-transparent text-neutral-400 hover:border-workbench-border hover:bg-workbench-layer/70 hover:text-neutral-200'
                     } disabled:cursor-not-allowed disabled:opacity-40`}
                   >
@@ -287,14 +287,14 @@ export function ProjectWorkspace({
                       <button
                         type="button"
                         onClick={() => onProjectSectionChange('running-update')}
-                        className="min-h-11 rounded-md border border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800 sm:min-h-9"
+                        className="min-h-11 rounded-md border border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-workbench-hover sm:min-h-9"
                       >
                         Open update
                       </button>
                       <button
                         type="button"
                         onClick={() => onProjectSectionChange('directions')}
-                        className="min-h-11 rounded-md border border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800 sm:min-h-9"
+                        className="min-h-11 rounded-md border border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-workbench-hover sm:min-h-9"
                       >
                         Open directions
                       </button>

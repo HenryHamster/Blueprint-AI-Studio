@@ -166,7 +166,7 @@ function ChangesTabContent({
         <p className="text-sm text-red-400">{error}</p>
         <button
           onClick={onReload}
-          className="px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm transition-colors"
+          className="px-3 py-1.5 rounded-lg bg-workbench-panel hover:bg-workbench-hover text-neutral-300 text-sm transition-colors"
         >
           Retry
         </button>
@@ -218,7 +218,7 @@ function ChangesTabContent({
           <div key={file.filename} className="text-xs">
             <button
               onClick={() => file.patch ? togglePatch(file.filename) : undefined}
-              className={`w-full flex items-center gap-2 px-4 py-2.5 hover:bg-neutral-900/50 transition-colors text-left ${file.patch ? 'cursor-pointer' : 'cursor-default'}`}
+              className={`w-full flex items-center gap-2 px-4 py-2.5 hover:bg-workbench-hover/50 transition-colors text-left ${file.patch ? 'cursor-pointer' : 'cursor-default'}`}
             >
               {file.patch ? (
                 expandedPatches.has(file.filename)
@@ -243,7 +243,7 @@ function ChangesTabContent({
               </span>
             </button>
             {file.patch && expandedPatches.has(file.filename) && (
-              <div className="px-4 pb-3 bg-neutral-950">
+              <div className="px-4 pb-3 bg-workbench-shell">
                 <pre className="text-ui-md font-mono overflow-x-auto leading-relaxed whitespace-pre">
                   {file.patch.split('\n').map((line, i) => (
                     <div
@@ -512,7 +512,7 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
     <div className="fixed inset-0 z-50 flex">
       <div className="flex-1 bg-black/40" onClick={onClose} />
       <div
-        className="relative bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl"
+        className="relative bg-workbench-shell border-l border-neutral-800 flex flex-col shadow-2xl"
         style={isMobile || isFullscreen ? { width: '100%' } : { width: drawerWidth }}
       >
         {/* Drag handle */}
@@ -546,7 +546,7 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
                 <button
                   onClick={handleDuplicate}
                   title="Duplicate task"
-                  className="p-2.5 md:p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                  className="p-2.5 md:p-1.5 rounded-lg hover:bg-workbench-hover text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                 >
                   <CopyPlus className="w-5 h-5" />
                 </button>
@@ -554,13 +554,13 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
               <button
                 onClick={() => setIsFullscreen(prev => !prev)}
                 title={isFullscreen ? 'Exit fullscreen (f)' : 'Fullscreen (f)'}
-                className="p-2.5 md:p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                className="p-2.5 md:p-1.5 rounded-lg hover:bg-workbench-hover text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
               >
                 {isFullscreen ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
               </button>
               <button
                 onClick={onClose}
-                className="p-2.5 md:p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                className="p-2.5 md:p-1.5 rounded-lg hover:bg-workbench-hover text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -694,14 +694,14 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
                   </button>
                   <button
                     onClick={() => setShowChangesForm(!showChangesForm)}
-                    className="px-4 py-3 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm font-medium transition-colors border border-neutral-700 flex items-center justify-center gap-1.5"
+                    className="px-4 py-3 rounded-lg bg-workbench-panel hover:bg-workbench-hover text-neutral-300 text-sm font-medium transition-colors border border-neutral-700 flex items-center justify-center gap-1.5"
                   >
                     Request Changes
                   </button>
                   <button
                     onClick={handleCancel}
                     disabled={!!actionLoading}
-                    className="px-3 py-3 rounded-lg bg-neutral-800 hover:bg-red-900/50 text-neutral-500 hover:text-red-400 text-sm transition-colors disabled:opacity-50 border border-neutral-700"
+                    className="px-3 py-3 rounded-lg bg-workbench-panel hover:bg-red-900/50 text-neutral-500 hover:text-red-400 text-sm transition-colors disabled:opacity-50 border border-neutral-700"
                   >
                     Reject
                   </button>
@@ -712,7 +712,7 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
                       value={changesFeedback}
                       onChange={e => setChangesFeedback(e.target.value)}
                       placeholder="Describe what needs to change..."
-                      className="w-full bg-neutral-900 border border-neutral-700 rounded-lg text-sm text-neutral-200 p-3 resize-none focus:outline-none focus:border-neutral-500 placeholder-neutral-600"
+                      className="w-full bg-workbench-base border border-neutral-700 rounded-lg text-sm text-neutral-200 p-3 resize-none placeholder-neutral-600 workbench-focus"
                       rows={3}
                     />
                     <div className="flex gap-2">
@@ -817,7 +817,7 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
                     </button>
                     <button
                       onClick={() => setConfirmCancel(false)}
-                      className="px-3 py-1.5 min-h-[44px] rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm font-medium transition-colors"
+                      className="px-3 py-1.5 min-h-[44px] rounded-lg bg-workbench-panel hover:bg-workbench-hover text-neutral-300 text-sm font-medium transition-colors"
                     >
                       Keep running
                     </button>
@@ -838,7 +838,7 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
                 {!editingPrompt ? (
                   <button
                     onClick={() => setEditingPrompt(true)}
-                    className="px-4 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-sm font-medium transition-colors border border-neutral-700"
+                    className="px-4 py-2 rounded-lg bg-workbench-panel hover:bg-workbench-hover text-neutral-200 text-sm font-medium transition-colors border border-neutral-700"
                   >
                     Edit
                   </button>
@@ -848,7 +848,7 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
                       type="text"
                       value={editPromptValue}
                       onChange={(e) => setEditPromptValue(e.target.value)}
-                      className="flex-1 px-3 py-1.5 rounded-lg bg-neutral-900 border border-neutral-700 text-sm text-neutral-200 focus:outline-none focus:border-blue-500"
+                      className="flex-1 px-3 py-1.5 rounded-lg bg-workbench-base border border-neutral-700 text-sm text-neutral-200 workbench-focus"
                     />
                     <button
                       onClick={() => { if (!canOperateProject) return; onEditPrompt(task.id, editPromptValue); setEditingPrompt(false); }}
@@ -859,7 +859,7 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
                     </button>
                     <button
                       onClick={() => { setEditingPrompt(false); setEditPromptValue(task.description); }}
-                      className="px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm transition-colors"
+                      className="px-3 py-1.5 rounded-lg bg-workbench-panel hover:bg-workbench-hover text-neutral-300 text-sm transition-colors"
                     >
                       Cancel
                     </button>
@@ -868,7 +868,7 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
                 <button
                   onClick={handleDismiss}
                   disabled={!!actionLoading}
-                  className="px-4 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-400 text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                  className="px-4 py-2 rounded-lg bg-workbench-panel hover:bg-workbench-hover text-neutral-400 text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
                 >
                   {actionLoading === 'dismiss' && <Loader2 className="w-3 h-3 animate-spin" />}Dismiss
                 </button>

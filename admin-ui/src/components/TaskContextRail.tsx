@@ -149,7 +149,7 @@ function taskRailFacts(task: Task): TaskRailFact[] {
 function attentionTone(task: Task): string {
   if (task.status === 'FAILED') return 'border-red-500/30 bg-red-500/5';
   if (task.status === 'BLOCKED' || task.status === 'PARKED') return 'border-amber-500/30 bg-amber-500/5';
-  return 'border-neutral-800 bg-neutral-900/40';
+  return 'border-neutral-800 bg-workbench-base/40';
 }
 
 function TaskRailButton({
@@ -169,7 +169,7 @@ function TaskRailButton({
       onClick={onClick}
       title={title}
       disabled={disabled}
-      className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs font-semibold text-neutral-300 transition-colors ${disabled ? 'cursor-not-allowed opacity-50' : 'hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100'}`}
+      className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/70 px-2.5 text-xs font-semibold text-neutral-300 transition-colors ${disabled ? 'cursor-not-allowed opacity-50' : 'hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100'}`}
     >
       {children}
     </button>
@@ -178,7 +178,7 @@ function TaskRailButton({
 
 function TaskSnapshotMetric({ label, value }: { label: string; value: ReactNode }) {
   return (
-    <div className="min-w-0 rounded-md border border-neutral-800 bg-[#151c25] px-2.5 py-2">
+    <div className="min-w-0 rounded-md border border-neutral-800 bg-workbench-hover px-2.5 py-2">
       <div className="text-ui-sm font-semibold uppercase text-neutral-600">{label}</div>
       <div className="mt-0.5 min-w-0 truncate text-sm font-semibold text-neutral-100">{value}</div>
     </div>
@@ -189,12 +189,12 @@ function TaskFactRows({ facts }: { facts: TaskRailFact[] }) {
   if (facts.length === 0) return null;
 
   return (
-    <dl className="min-w-0 overflow-hidden rounded-md border border-neutral-800 bg-neutral-950/45">
+    <dl className="min-w-0 overflow-hidden rounded-md border border-neutral-800 bg-workbench-shell/45">
       {facts.map(fact => (
         <div
           key={fact.key}
           data-testid={`task-rail-fact-${fact.key}`}
-          className="grid min-w-0 grid-cols-[5.4rem_minmax(0,1fr)] gap-2 border-b border-neutral-800/80 bg-[#10151c]/70 px-2 py-1.5 last:border-b-0"
+          className="grid min-w-0 grid-cols-[5.4rem_minmax(0,1fr)] gap-2 border-b border-neutral-800/80 bg-workbench-layer/70 px-2 py-1.5 last:border-b-0"
         >
           <dt className="text-ui-sm font-semibold uppercase text-neutral-600">{fact.label}</dt>
           <dd className="min-w-0 break-words text-neutral-300" title={fact.title}>{fact.value}</dd>
@@ -218,8 +218,8 @@ function PipelineContextRows({
   if (!parentTaskId && dependencyCount === 0 && childCount === 0 && !blockedReason) return null;
 
   return (
-    <div className="min-w-0 overflow-hidden rounded-md border border-neutral-800 bg-neutral-950/45">
-      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 bg-[#10151c]/70 px-2 py-1.5">
+    <div className="min-w-0 overflow-hidden rounded-md border border-neutral-800 bg-workbench-shell/45">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 bg-workbench-layer/70 px-2 py-1.5">
         <ListTree className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />
         {parentTaskId && (
           <span className="min-w-0 break-all font-mono text-neutral-300">parent {compactIdentifier(parentTaskId)}</span>
@@ -308,7 +308,7 @@ function CurrentTaskCard({
         <div className="space-y-2 text-xs text-neutral-400">
           <TaskFactRows facts={facts} />
           {direction && (
-            <div className="flex min-w-0 gap-2 rounded-md border border-neutral-800 bg-neutral-950/45 px-2 py-1.5">
+            <div className="flex min-w-0 gap-2 rounded-md border border-neutral-800 bg-workbench-shell/45 px-2 py-1.5">
               <Route className="mt-0.5 h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />
               <span className="line-clamp-2">{direction.text || direction.id}</span>
             </div>
@@ -357,7 +357,7 @@ function CurrentTaskCard({
               href={prUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
+              className="inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/70 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100"
             >
               <GitPullRequest className="h-3.5 w-3.5 text-neutral-500" aria-hidden="true" />
               PR
@@ -382,7 +382,7 @@ function AttentionTaskRow({ entry, onOpenTask }: { entry: AttentionTaskEntry; on
     <button
       type="button"
       onClick={() => onOpenTask(task)}
-      className={`block w-full rounded-md border px-3 py-2 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900 ${attentionTone(task)}`}
+      className={`block w-full rounded-md border px-3 py-2 text-left transition-colors hover:border-neutral-600 hover:bg-workbench-hover ${attentionTone(task)}`}
     >
       <div className="flex min-w-0 items-center justify-between gap-2">
         <span className="truncate text-ui-sm font-medium uppercase text-neutral-500" title={eyebrow}>{eyebrow}</span>

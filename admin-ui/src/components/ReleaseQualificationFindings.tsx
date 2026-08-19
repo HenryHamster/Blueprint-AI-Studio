@@ -157,7 +157,7 @@ export function ReleaseQualificationFindings({
                 <span
                   className={`font-semibold shrink-0 px-1.5 py-0.5 rounded border ${
                     FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ??
-                    'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'
+                    'bg-workbench-panel/50 text-neutral-400 border-neutral-700/50'
                   }`}
                 >
                   {f.severity ?? '?'}
@@ -168,7 +168,7 @@ export function ReleaseQualificationFindings({
                 <span
                   className={`shrink-0 px-1.5 py-0.5 rounded border ${
                     RESOLUTION_STATE_STYLE[f.state] ??
-                    'bg-neutral-800 text-neutral-400 border-neutral-700'
+                    'bg-workbench-panel text-neutral-400 border-neutral-700'
                   }`}
                   title={`finding key: ${f.key}`}
                 >

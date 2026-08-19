@@ -251,7 +251,7 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
           return (
             <span
               key={job.id}
-              className={`rounded border px-1.5 py-0.5 text-ui-xs font-semibold ${v?.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : v && !v.measurable ? 'border-amber-500/40 bg-amber-500/15 text-amber-300' : v ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-600/40 bg-neutral-800/60 text-neutral-400'}`}
+              className={`rounded border px-1.5 py-0.5 text-ui-xs font-semibold ${v?.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : v && !v.measurable ? 'border-amber-500/40 bg-amber-500/15 text-amber-300' : v ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-600/40 bg-workbench-panel/60 text-neutral-400'}`}
               data-testid="matrix-verdict-chip"
             >
               {(job.task_title ?? job.id).slice(0, 20)}: {v?.met ? 'met' : v && !v.measurable ? 'inconclusive' : v ? 'missed' : 'no verdict'}
@@ -314,7 +314,7 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
                         <span className={`font-semibold ${armFailed ? 'text-red-300' : 'text-neutral-400'}`}>{arm.name}:</span>
                         {armExitCode !== null && (
                           <span
-                            className={`rounded border px-1 py-0.5 text-ui-xs ${armFailed ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-700 bg-neutral-800/60 text-neutral-400'}`}
+                            className={`rounded border px-1 py-0.5 text-ui-xs ${armFailed ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-700 bg-workbench-panel/60 text-neutral-400'}`}
                             data-testid="arm-exit-code"
                           >
                             exit {armExitCode}
@@ -322,7 +322,7 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
                         )}
                         {armCostUsd !== null && (
                           <span
-                            className="rounded border border-neutral-700/50 bg-neutral-800/40 px-1 py-0.5 text-ui-xs text-neutral-300"
+                            className="rounded border border-neutral-700/50 bg-workbench-panel/40 px-1 py-0.5 text-ui-xs text-neutral-300"
                             data-testid="arm-cost-usd"
                           >
                             {fmtUsd(armCostUsd)}
@@ -761,7 +761,7 @@ function HeldExperimentsSection({
                 checked={allSelected}
                 onChange={toggleSelectAll}
                 disabled={busy}
-                className="rounded border-neutral-600 bg-neutral-800 text-sky-500 focus:ring-sky-500 disabled:opacity-40"
+                className="rounded border-neutral-600 bg-workbench-panel text-sky-500 disabled:opacity-40 workbench-focus"
                 data-testid="held-experiment-select-all"
               />
               {allSelected ? `${experiments.length} selected` : 'Select all'}
@@ -797,7 +797,7 @@ function HeldExperimentsSection({
                     checked={checked}
                     onChange={() => toggleSelect(exp.id)}
                     disabled={busy}
-                    className="rounded border-neutral-600 bg-neutral-800 text-sky-500 focus:ring-sky-500 shrink-0 disabled:opacity-40"
+                    className="rounded border-neutral-600 bg-workbench-panel text-sky-500 shrink-0 disabled:opacity-40 workbench-focus"
                     data-testid="held-experiment-checkbox"
                   />
                 )}
@@ -937,7 +937,7 @@ export function CompactJobsTable({
             const cv = job.criterion_verdict;
             const sc = job.success_criterion;
             return (
-              <tr key={job.id} className="border-t border-neutral-800/50 hover:bg-neutral-800/30 transition-colors">
+              <tr key={job.id} className="border-t border-neutral-800/50 hover:bg-workbench-hover/30 transition-colors">
                 <td className="py-1.5 pr-3 max-w-xs">
                   {job.task_id && onNavigateToTask ? (
                     <button
@@ -1413,7 +1413,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const showEmptyState = loaded && !error && jobs.length === 0;
 
   return (
-    <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4" data-viewport-allow-truncation>
+    <div className="mt-4 rounded-lg border border-neutral-800 bg-workbench-shell/60 p-4" data-viewport-allow-truncation>
       <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
         <div className="flex items-center gap-2 text-ui-md font-bold text-neutral-400 uppercase tracking-widest">
           <Cpu className="w-3.5 h-3.5 shrink-0" />
@@ -1438,7 +1438,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 key={minutes}
                 type="button"
                 onClick={() => { setAllTerminal(false); setFinishedWindowMinutes(minutes); setHasMore(false); }}
-                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${!allTerminal && finishedWindowMinutes === minutes ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${!allTerminal && finishedWindowMinutes === minutes ? 'bg-workbench-layer text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
                 data-testid={`compute-window-${label}`}
               >
                 {label}
@@ -1447,7 +1447,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
             <button
               type="button"
               onClick={() => { setAllTerminal(true); setHasMore(false); }}
-              className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${allTerminal ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+              className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${allTerminal ? 'bg-workbench-layer text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
               data-testid="compute-window-all"
             >
               All
@@ -1456,7 +1456,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           <button
             type="button"
             onClick={() => setViewMode((m) => m === 'card' ? 'table' : 'card')}
-            className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded px-1.5 py-0.5 transition-colors ${viewMode === 'table' ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+            className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded px-1.5 py-0.5 transition-colors ${viewMode === 'table' ? 'bg-workbench-layer text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
             title={viewMode === 'table' ? 'Switch to card view' : 'Switch to compact table view'}
             data-testid="compute-view-mode-toggle"
           >
@@ -1539,7 +1539,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       )}
 
       {showEmptyState && (
-        <div className="rounded-lg border border-neutral-800/80 bg-neutral-900/40 px-3 py-2">
+        <div className="rounded-lg border border-neutral-800/80 bg-workbench-base/40 px-3 py-2">
           <div className="text-xs font-semibold text-neutral-200">No compute jobs</div>
           <div className="mt-0.5 text-ui-sm text-neutral-500">
             Launch a structured experiment for this project.
@@ -1568,7 +1568,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               value={searchText}
               onChange={(e) => setSearchText(e.target.value)}
               placeholder="Search by name, experiment…"
-              className="w-full rounded border border-neutral-700 bg-neutral-900 pl-7 pr-2 py-1.5 text-ui-sm text-neutral-100 placeholder-neutral-600 focus:outline-none focus:border-sky-500/50"
+              className="w-full rounded border border-neutral-700 bg-workbench-base pl-7 pr-2 py-1.5 text-ui-sm text-neutral-100 placeholder-neutral-600 workbench-focus"
               data-testid="compute-jobs-search"
             />
           </div>
@@ -1578,7 +1578,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 key={s}
                 type="button"
                 onClick={() => setStatusFilter(s)}
-                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${statusFilter === s ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${statusFilter === s ? 'bg-workbench-layer text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
                 data-testid={`compute-status-${s}`}
               >
                 {s === 'all' ? 'All' : s === 'active' ? 'Active' : s === 'completed' ? 'Completed' : 'Failed'}
@@ -1591,7 +1591,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 key={t}
                 type="button"
                 onClick={() => setTierFilter(t)}
-                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${tierFilter === t ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${tierFilter === t ? 'bg-workbench-layer text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
                 data-testid={`compute-tier-${t}`}
                 title={
                   t === 'all'
@@ -1610,7 +1610,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
       <div className="flex flex-col gap-2" data-testid="compute-jobs-list">
         {filteredJobs.length === 0 && jobs.length > 0 && (
-          <div className="rounded-lg border border-neutral-800/80 bg-neutral-900/40 px-3 py-2">
+          <div className="rounded-lg border border-neutral-800/80 bg-workbench-base/40 px-3 py-2">
             <div className="text-ui-sm text-neutral-500">No jobs match the current filters.</div>
           </div>
         )}
@@ -1631,7 +1631,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           return (
             <div
               key={job.id}
-              className="rounded-lg border border-neutral-800/80 bg-neutral-900/50 px-3 py-2"
+              className="rounded-lg border border-neutral-800/80 bg-workbench-base/50 px-3 py-2"
             >
               <div className="flex items-start justify-between gap-2 mb-2">
                 <div className="min-w-0">
@@ -1779,7 +1779,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       {fmtUsd(spent)} / {fmtUsd(job.spend_cap_usd)}
                     </span>
                   </div>
-                  <div className="h-1.5 w-full rounded-full bg-neutral-800 overflow-hidden">
+                  <div className="h-1.5 w-full rounded-full bg-workbench-panel overflow-hidden">
                     <div
                       className={`h-full ${budgetBarClass(pct)}`}
                       style={{ width: `${Math.round(pct * 100)}%` }}
@@ -1793,7 +1793,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const hasIdentity = !!(experiment || benchmark || hypothesis);
                 if (!hasIdentity) return null;
                 return (
-                  <div className="mb-1.5 rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-0.5">
+                  <div className="mb-1.5 rounded border border-neutral-700/50 bg-workbench-panel/40 px-2 py-1.5 flex flex-col gap-0.5">
                     <div
                       className="flex flex-col gap-0.5 text-ui-sm font-mono"
                       data-testid="compute-experiment-identity"
@@ -1829,7 +1829,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 if (!hasProvenance) return null;
                 return (
                   <div
-                    className="mb-1.5 rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-0.5"
+                    className="mb-1.5 rounded border border-neutral-700/50 bg-workbench-panel/40 px-2 py-1.5 flex flex-col gap-0.5"
                     data-testid="compute-draft-provenance"
                   >
                     {prov?.drafted_from_refinement && (
@@ -1859,7 +1859,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const decoded = job.launch_params?.command_decoded;
                 return (
                   <details
-                    className="mb-1.5 rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5"
+                    className="mb-1.5 rounded border border-neutral-700/50 bg-workbench-panel/40 px-2 py-1.5"
                     data-testid="compute-command-disclosure"
                   >
                     <summary className="cursor-pointer text-ui-sm font-mono text-neutral-500 hover:text-neutral-300">
@@ -2042,7 +2042,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   )}
                   {!active && typeof job.exit_code === 'number' && (
                     <span
-                      className="shrink-0 rounded border border-neutral-700 bg-neutral-800/60 px-1 py-0.5 text-ui-xs text-neutral-400"
+                      className="shrink-0 rounded border border-neutral-700 bg-workbench-panel/60 px-1 py-0.5 text-ui-xs text-neutral-400"
                       data-testid="compute-exit-code"
                     >
                       exit {job.exit_code}
@@ -2100,7 +2100,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                               </div>
                               <button
                                 onClick={() => setRerunState(null)}
-                                className="rounded bg-neutral-700/40 text-neutral-300 hover:bg-neutral-700/60 px-3 py-1.5 text-ui-sm w-fit"
+                                className="rounded bg-workbench-layer/40 text-neutral-300 hover:bg-workbench-hover/60 px-3 py-1.5 text-ui-sm w-fit"
                                 data-testid="rerun-result-close"
                               >
                                 Close
@@ -2118,7 +2118,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                                     step="0.01"
                                     value={rerunState.spendCap}
                                     onChange={(e) => setRerunState((p) => p ? { ...p, spendCap: e.target.value } : p)}
-                                    className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                    className="w-24 rounded border border-neutral-700 bg-workbench-base px-2 py-1 text-neutral-100 text-ui-sm"
                                     data-testid="rerun-spend-cap"
                                   />
                                 </label>
@@ -2130,7 +2130,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                                     step="1"
                                     value={rerunState.deadlineSec}
                                     onChange={(e) => setRerunState((p) => p ? { ...p, deadlineSec: e.target.value } : p)}
-                                    className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                    className="w-24 rounded border border-neutral-700 bg-workbench-base px-2 py-1 text-neutral-100 text-ui-sm"
                                     data-testid="rerun-deadline-sec"
                                   />
                                 </label>
@@ -2142,7 +2142,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                                       step="any"
                                       value={rerunState.threshold}
                                       onChange={(e) => setRerunState((p) => p ? { ...p, threshold: e.target.value } : p)}
-                                      className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                      className="w-24 rounded border border-neutral-700 bg-workbench-base px-2 py-1 text-neutral-100 text-ui-sm"
                                       data-testid="rerun-threshold"
                                     />
                                   </label>
@@ -2162,7 +2162,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                                 </button>
                                 <button
                                   onClick={() => setRerunState(null)}
-                                  className="rounded bg-neutral-700/40 text-neutral-300 hover:bg-neutral-700/60 px-3 py-1.5 text-ui-sm"
+                                  className="rounded bg-workbench-layer/40 text-neutral-300 hover:bg-workbench-hover/60 px-3 py-1.5 text-ui-sm"
                                   data-testid="rerun-cancel"
                                 >
                                   Cancel
@@ -2439,13 +2439,13 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                             return (
                               <div
                                 key={arm.name}
-                                className={`rounded border px-2 py-1 ${isFailed ? 'border-red-500/30 bg-red-500/10' : 'border-neutral-700/50 bg-neutral-800/40'}`}
+                                className={`rounded border px-2 py-1 ${isFailed ? 'border-red-500/30 bg-red-500/10' : 'border-neutral-700/50 bg-workbench-panel/40'}`}
                               >
                                 <div className="flex items-center gap-1.5 flex-wrap">
                                   <div className={`text-ui-sm font-semibold font-mono ${isFailed ? 'text-red-300' : 'text-neutral-300'}`}>{arm.name}</div>
                                   {exitCodeVal !== null && (
                                     <span
-                                      className={`rounded border px-1 py-0.5 text-ui-xs ${isFailed ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-700 bg-neutral-800/60 text-neutral-400'}`}
+                                      className={`rounded border px-1 py-0.5 text-ui-xs ${isFailed ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-700 bg-workbench-panel/60 text-neutral-400'}`}
                                       data-testid="arm-exit-code"
                                     >
                                       exit {exitCodeVal}
@@ -2497,10 +2497,10 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                                   <div className="mt-0.5 text-ui-sm text-neutral-400 break-words" data-testid="arm-note">{noteVal}</div>
                                 )}
                                 {logVal && (
-                                  <pre className="mt-0.5 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-24 overflow-y-auto" data-testid="arm-log">{logVal}</pre>
+                                  <pre className="mt-0.5 rounded border border-neutral-800 bg-workbench-shell px-2 py-1 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-24 overflow-y-auto" data-testid="arm-log">{logVal}</pre>
                                 )}
                                 {stderrVal && (
-                                  <pre className="mt-0.5 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-ui-xs text-red-200 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-24 overflow-y-auto" data-testid="arm-stderr">{stderrVal}</pre>
+                                  <pre className="mt-0.5 rounded border border-neutral-800 bg-workbench-shell px-2 py-1 text-ui-xs text-red-200 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-24 overflow-y-auto" data-testid="arm-stderr">{stderrVal}</pre>
                                 )}
                               </div>
                             );
@@ -2554,7 +2554,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 let chip: React.ReactNode;
                 if (!verdict) {
                   chip = (
-                    <span className="rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-neutral-400">
+                    <span className="rounded border border-neutral-600/40 bg-workbench-panel/60 px-1 py-0.5 text-neutral-400">
                       not reported
                     </span>
                   );
@@ -2609,7 +2609,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       </div>
                     )}
                     <div
-                      className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-1 text-ui-sm font-mono"
+                      className="rounded border border-neutral-700/50 bg-workbench-panel/40 px-2 py-1.5 flex flex-col gap-1 text-ui-sm font-mono"
                       data-testid="criterion-verdict-row"
                     >
                       <div className="flex items-center gap-1.5">
@@ -2663,11 +2663,11 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   <div className="mt-1.5" data-testid="compute-live-output">
                     <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
                       <span>Live output</span>
-                      <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-500">
+                      <span className="rounded border border-neutral-700 bg-workbench-panel px-1 py-0.5 text-ui-xs text-neutral-500">
                         updating…
                       </span>
                       {(lo.truncated || (clipped && !liveExpanded)) && (
-                        <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-400">
+                        <span className="rounded border border-neutral-700 bg-workbench-panel px-1 py-0.5 text-ui-xs text-neutral-400">
                           truncated
                         </span>
                       )}
@@ -2675,14 +2675,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <button
                           type="button"
                           onClick={() => toggleDocExpanded(liveKey)}
-                          className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
+                          className="min-h-[44px] rounded border border-neutral-700 bg-workbench-panel px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
                           data-testid="compute-live-output-show-all"
                         >
                           Show all ({lines.length} lines)
                         </button>
                       )}
                     </div>
-                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+                    <pre className="rounded border border-neutral-800 bg-workbench-shell px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
                       {displayLines.join('\n')}
                     </pre>
                   </div>
@@ -2754,7 +2754,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
                       <span>{'source' in cl && cl.source ? `Terminal log (${cl.source})` : 'Command log'}</span>
                       {cl.truncated && (
-                        <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-400">
+                        <span className="rounded border border-neutral-700 bg-workbench-panel px-1 py-0.5 text-ui-xs text-neutral-400">
                           server-truncated
                         </span>
                       )}
@@ -2762,14 +2762,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <button
                           type="button"
                           onClick={() => toggleDocExpanded(logKey)}
-                          className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
+                          className="min-h-[44px] rounded border border-neutral-700 bg-workbench-panel px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
                           data-testid="compute-log-show-all"
                         >
                           Show all ({lines.length} lines)
                         </button>
                       )}
                     </div>
-                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
+                    <pre className="rounded border border-neutral-800 bg-workbench-shell px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
                       {displayLines.join('\n')}
                     </pre>
                   </div>
@@ -2835,7 +2835,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                           }))}
                           placeholder={starterQuestions.length > 0 ? starterQuestions[0] : "Ask about this run…"}
                           disabled={ask.submitting}
-                          className="flex-1 min-w-0 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-ui-sm text-neutral-100 placeholder-neutral-600"
+                          className="flex-1 min-w-0 rounded border border-neutral-700 bg-workbench-base px-2 py-1 text-ui-sm text-neutral-100 placeholder-neutral-600"
                           data-testid="compute-ask-input"
                         />
                         <button
@@ -2983,7 +2983,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           <button
             type="button"
             onClick={() => void handleLoadMore()}
-            className="min-h-[44px] rounded bg-neutral-800 px-4 text-ui-sm font-semibold text-neutral-300 hover:bg-neutral-700 transition-colors"
+            className="min-h-[44px] rounded bg-workbench-panel px-4 text-ui-sm font-semibold text-neutral-300 hover:bg-workbench-hover transition-colors"
             data-testid="compute-load-more"
           >
             Load more

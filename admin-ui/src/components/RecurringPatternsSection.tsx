@@ -33,7 +33,7 @@ export function RecurringPatternsSection({ recurringPatterns, onDirectionClick }
       </h2>
       <div className="flex flex-col gap-1">
         {recurringPatterns.slice(0, 5).map(pattern => {
-          const statusClass = STATUS_STYLES[pattern.remediation_status] ?? 'bg-neutral-700/30 text-neutral-400 border-neutral-700/30';
+          const statusClass = STATUS_STYLES[pattern.remediation_status] ?? 'bg-workbench-layer/30 text-neutral-400 border-neutral-700/30';
           const snippet = (pattern.example_message ?? '').length > 120
             ? (pattern.example_message ?? '').slice(0, 120) + '…'
             : (pattern.example_message ?? '');
@@ -41,14 +41,14 @@ export function RecurringPatternsSection({ recurringPatterns, onDirectionClick }
           return (
             <div
               key={pattern.fingerprint}
-              className="flex flex-col gap-0.5 text-xs bg-neutral-900/50 border border-neutral-800/50 px-2 py-1.5 rounded"
+              className="flex flex-col gap-0.5 text-xs bg-workbench-base/50 border border-neutral-800/50 px-2 py-1.5 rounded"
             >
               <div className="flex items-center gap-2">
                 <span className={`shrink-0 text-ui-xs font-semibold px-1.5 py-0.5 rounded border uppercase tracking-wider ${statusClass}`}>
                   {pattern.remediation_status.replace('_', ' ')}
                 </span>
                 <span className="flex-1 truncate text-neutral-400 font-mono text-ui-sm">{snippet}</span>
-                <span className="shrink-0 text-ui-xs font-semibold px-1.5 py-0.5 rounded bg-neutral-800/50 text-neutral-300 border border-neutral-700/30">
+                <span className="shrink-0 text-ui-xs font-semibold px-1.5 py-0.5 rounded bg-workbench-panel/50 text-neutral-300 border border-neutral-700/30">
                   ×{pattern.occurrence_count}
                 </span>
               </div>
@@ -60,7 +60,7 @@ export function RecurringPatternsSection({ recurringPatterns, onDirectionClick }
                       key={d.direction_id}
                       type="button"
                       onClick={() => onDirectionClick?.(d.direction_id)}
-                      className="text-ui-sm px-1 py-0.5 rounded bg-neutral-800/50 text-neutral-300 border border-neutral-700/30 hover:border-neutral-600 truncate max-w-[200px]"
+                      className="text-ui-sm px-1 py-0.5 rounded bg-workbench-panel/50 text-neutral-300 border border-neutral-700/30 hover:border-neutral-600 truncate max-w-[200px]"
                       title={d.direction_text || d.direction_id}
                     >
                       {(d.direction_text || d.direction_id).slice(0, 40)}

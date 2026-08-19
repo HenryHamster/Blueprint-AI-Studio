@@ -27,7 +27,7 @@ const TIMEOUT_SUBTYPE_LABELS: Record<string, string> = {
 export function FailureClassPill({ group, sparkData, cost }: { group: FailureGroup; sparkData?: { v: number }[]; cost?: number }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  const colorClass = FAILURE_CLASS_COLORS[group.failure_class] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+  const colorClass = FAILURE_CLASS_COLORS[group.failure_class] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
   const stroke = FAILURE_CLASS_STROKE[group.failure_class] ?? '#a3a3a3';
   const topTasks = group.tasks.slice(0, 3);
   const hasSpark = sparkData && sparkData.length >= 3;
@@ -70,12 +70,12 @@ export function FailureClassPill({ group, sparkData, cost }: { group: FailureGro
         )}
       </button>
       {open && topTasks.length > 0 && (
-        <div className="absolute z-10 top-full mt-1 left-0 w-64 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg">
+        <div className="absolute z-10 top-full mt-1 left-0 w-64 bg-workbench-base border border-neutral-700 rounded-lg p-2 shadow-lg">
           <div className="space-y-1">
             {topTasks.map(t => (
               <div key={t.task_id} className="text-ui-sm text-neutral-300 flex items-center gap-1 min-w-0">
                 {t.taxonomy && TAXONOMY_LABELS[t.taxonomy] && (
-                  <span className={`shrink-0 text-ui-xs leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[t.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`} title={TAXONOMY_LABELS[t.taxonomy]}>
+                  <span className={`shrink-0 text-ui-xs leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[t.taxonomy] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30'}`} title={TAXONOMY_LABELS[t.taxonomy]}>
                     {TAXONOMY_LABELS[t.taxonomy]}
                   </span>
                 )}

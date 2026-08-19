@@ -34,7 +34,7 @@ interface ProblemModelViewerProps {
 const capabilityBarColors: Record<string, string> = {
   working: 'bg-emerald-500',
   partial: 'bg-amber-500',
-  planned: 'bg-neutral-600',
+  planned: 'bg-workbench-card',
 };
 
 const capabilityStatusLabels: Record<string, string> = {
@@ -46,7 +46,7 @@ const capabilityStatusLabels: Record<string, string> = {
 const priorityColors: Record<string, string> = {
   high: 'bg-rose-500/15 text-rose-300 border-rose-500/30',
   medium: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-  low: 'bg-neutral-700/40 text-neutral-400 border-neutral-700',
+  low: 'bg-workbench-layer/40 text-neutral-400 border-neutral-700',
 };
 
 const sizeColors: Record<string, string> = {
@@ -91,7 +91,7 @@ function SourceBadge({ source }: { source: Source }) {
   if (source.direction_id) tail.push(`dir ${source.direction_id.slice(0, 8)}`);
   if (source.friction_id) tail.push(`friction ${source.friction_id.slice(0, 8)}`);
   return (
-    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-ui-sm font-medium rounded bg-neutral-800/70 text-neutral-400 border border-neutral-800">
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-ui-sm font-medium rounded bg-workbench-panel/70 text-neutral-400 border border-neutral-800">
       {source.type.replace(/_/g, ' ')}
       {messageRef && (
         <span
@@ -170,7 +170,7 @@ function CapabilityBar({
   const proofColor = proofStatusColors[proofStatus] || 'text-neutral-500';
 
   function proofKindColor(kind: string): string {
-    return proofKindColors[kind] || 'border-neutral-500/20 bg-neutral-500/5';
+    return proofKindColors[kind] || 'border-neutral-500/20 bg-workbench-control/5';
   }
   return (
     <div className="flex items-center gap-3 py-1.5">
@@ -247,7 +247,7 @@ function CapabilityBar({
               ? 'Revoke this proof exemption — the capability must earn a real proof again'
               : 'Grant a proof exemption — clears the enforce gate without machine proof'
           }
-          className="shrink-0 inline-flex items-center gap-1 px-1.5 py-1 min-h-[44px] md:min-h-auto text-ui-sm rounded border border-neutral-700 bg-neutral-800/50 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
+          className="shrink-0 inline-flex items-center gap-1 px-1.5 py-1 min-h-[44px] md:min-h-auto text-ui-sm rounded border border-neutral-700 bg-workbench-panel/50 text-neutral-400 hover:bg-workbench-hover hover:text-neutral-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {isExempt ? <ShieldOff size={10} /> : <ShieldCheck size={10} />}
           {busy ? '…' : isExempt ? 'Revoke exemption' : 'Grant exemption'}
@@ -278,7 +278,7 @@ function GapLinkSelect({
           setValue('');
         }
       }}
-      className="text-xs bg-neutral-900 border border-neutral-700 text-neutral-400 rounded px-2 py-1 min-w-0 max-w-full focus:outline-none focus:ring-1 focus:ring-neutral-600"
+      className="text-xs bg-workbench-base border border-neutral-700 text-neutral-400 rounded px-2 py-1 min-w-0 max-w-full workbench-focus"
     >
       <option value="">Link direction…</option>
       {directions.map(d => (
@@ -305,7 +305,7 @@ function GapCard({
   const pastMoves = gap.past_moves ?? [];
   const hasActions = onSpawnDirection || (onLinkDirection && directions && directions.length > 0);
   return (
-    <div className="border border-neutral-800 rounded-md p-3 bg-neutral-900/40">
+    <div className="border border-neutral-800 rounded-md p-3 bg-workbench-base/40">
       <div className="flex items-start justify-between gap-2 mb-1">
         <div className="flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-1.5 mb-1">
@@ -348,7 +348,7 @@ function GapCard({
             <button
               type="button"
               onClick={() => onSpawnDirection(gap.id, gap.name)}
-              className="inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-auto text-xs rounded border border-neutral-700 bg-neutral-800/50 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100 transition"
+              className="inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-auto text-xs rounded border border-neutral-700 bg-workbench-panel/50 text-neutral-300 hover:bg-workbench-hover hover:text-neutral-100 transition"
             >
               <Plus size={10} />
               Spawn direction
@@ -368,7 +368,7 @@ function ArchivedGapRow({ gap }: { gap: Gap }) {
     <div className="flex items-baseline gap-2 py-1 text-sm">
       <span className="text-neutral-600 text-xs font-mono shrink-0">{gap.id}</span>
       <span className="text-neutral-300 truncate flex-1">{gap.name}</span>
-      <span className={`text-ui-sm uppercase px-1.5 py-0.5 rounded ${gap.status === 'closed' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-neutral-700/40 text-neutral-500'}`}>
+      <span className={`text-ui-sm uppercase px-1.5 py-0.5 rounded ${gap.status === 'closed' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-workbench-layer/40 text-neutral-500'}`}>
         {gap.status}
       </span>
       {gap.closed && <span className="text-xs text-neutral-500">{timeAgo(gap.closed)}</span>}
@@ -381,7 +381,7 @@ function FrictionRow({ friction }: { friction: Friction }) {
     ? 'text-emerald-400'
     : friction.status === 'mitigated' ? 'text-amber-400' : 'text-rose-400';
   return (
-    <div className="border border-neutral-800 rounded-md p-2.5 bg-neutral-900/30">
+    <div className="border border-neutral-800 rounded-md p-2.5 bg-workbench-base/30">
       <div className="flex items-baseline gap-2 mb-0.5">
         <span className={`text-xs uppercase tracking-wide font-semibold ${statusColor}`}>
           {friction.status}
@@ -408,7 +408,7 @@ function FrictionRow({ friction }: { friction: Friction }) {
 
 function SelfReflectionCard({ entry }: { entry: SelfReflectionEntry }) {
   return (
-    <div className="border border-neutral-800 rounded-md p-3 bg-neutral-900/30 space-y-2">
+    <div className="border border-neutral-800 rounded-md p-3 bg-workbench-base/30 space-y-2">
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-ui-sm text-neutral-500">{timeAgo(entry.ts)}</span>
         {entry.cycle_task_id && (
@@ -546,7 +546,7 @@ export default function ProblemModelViewer({
         {!readOnly && <button
           type="button"
           onClick={() => setShowEditor(true)}
-          className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-neutral-700 bg-neutral-800/50 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100 transition"
+          className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-neutral-700 bg-workbench-panel/50 text-neutral-300 hover:bg-workbench-hover hover:text-neutral-100 transition"
         >
           <Pencil size={11} />
           Edit intent
@@ -682,9 +682,9 @@ export default function ProblemModelViewer({
               ) : (
                 <div className="flex items-center gap-2">
                   <span className="text-ui-md text-neutral-500 shrink-0">Proof coverage</span>
-                  <div className="flex-1 h-1.5 rounded-full bg-neutral-800 overflow-hidden min-w-[3rem] max-w-[10rem]">
+                  <div className="flex-1 h-1.5 rounded-full bg-workbench-panel overflow-hidden min-w-[3rem] max-w-[10rem]">
                     <div
-                      className={`h-full rounded-full ${proofCoveragePct >= 95 ? 'bg-emerald-500' : proofCoveragePct >= 50 ? 'bg-amber-500' : 'bg-neutral-600'}`}
+                      className={`h-full rounded-full ${proofCoveragePct >= 95 ? 'bg-emerald-500' : proofCoveragePct >= 50 ? 'bg-amber-500' : 'bg-workbench-card'}`}
                       style={{ width: `${proofCoveragePct}%` }}
                     />
                   </div>

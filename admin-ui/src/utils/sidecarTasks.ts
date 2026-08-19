@@ -133,7 +133,7 @@ export function deriveSidecarBadge(sidecar: Task, primary: Task): SidecarBadge |
 
 /** Tailwind classes per badge tone, matching the pipeline view's badge palette. */
 export const SIDECAR_TONE_CLASSES: Record<SidecarTone, string> = {
-  pending: 'text-neutral-400 bg-neutral-500/10 border-neutral-500/30',
+  pending: 'text-neutral-400 bg-workbench-control/10 border-neutral-500/30',
   positive: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30',
   negative: 'text-red-400 bg-red-500/10 border-red-500/30',
   mixed: 'text-amber-400 bg-amber-500/10 border-amber-500/30',

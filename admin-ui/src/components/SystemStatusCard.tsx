@@ -37,7 +37,7 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
   return (
     <section>
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">System Status</h2>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4">
         {loading ? (
           <Skeleton className="h-16 w-full" />
         ) : !hasContent ? (
@@ -105,7 +105,7 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
                       {recentCycleMemoStats.slice(0, 5).map((s: typeof recentCycleMemoStats[0], i: number) => (
                         <span
                           key={s.cycle_id ?? i}
-                          className="text-ui-sm text-neutral-400 px-1.5 py-0.5 rounded border border-neutral-700/50 bg-neutral-800/50"
+                          className="text-ui-sm text-neutral-400 px-1.5 py-0.5 rounded border border-neutral-700/50 bg-workbench-panel/50"
                           title={s.started_at ? `cycle ${timeAgo(s.started_at)}` : undefined}
                         >
                           {s.memos_cited}/{s.memos_available}

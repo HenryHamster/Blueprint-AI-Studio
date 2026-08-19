@@ -36,7 +36,7 @@ export function MuteWindowMenu({ muteActive, muteWindow, onSetMuteWindow }: Mute
       {open && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 top-full mt-1 z-50 w-44 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-2 space-y-0.5">
+          <div className="absolute right-0 top-full mt-1 z-50 w-44 bg-workbench-base border border-neutral-700 rounded-lg shadow-xl p-2 space-y-0.5">
             {muteActive && muteWindow ? (
               <>
                 <p className="text-ui-sm text-neutral-500 px-2 py-1">Mute active</p>
@@ -44,7 +44,7 @@ export function MuteWindowMenu({ muteActive, muteWindow, onSetMuteWindow }: Mute
                   <button key={label} onClick={() => {
                     onSetMuteWindow({ expiresAt: muteWindow.expiresAt + ms });
                     setOpen(false);
-                  }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
+                  }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-workbench-hover transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
                 ))}
                 <div className="border-t border-neutral-800 my-1" />
                 <button onClick={() => {
@@ -59,7 +59,7 @@ export function MuteWindowMenu({ muteActive, muteWindow, onSetMuteWindow }: Mute
                   <button key={label} onClick={() => {
                     onSetMuteWindow({ expiresAt: Date.now() + ms });
                     setOpen(false);
-                  }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
+                  }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-workbench-hover transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
                 ))}
               </>
             )}

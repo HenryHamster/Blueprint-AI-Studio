@@ -111,7 +111,7 @@ export function ProjectManagementModal({
         <div className="flex items-center gap-2">
           <button
             onClick={() => { onClose(); onNewProject(); }}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium bg-neutral-800 hover:bg-neutral-700 text-neutral-200 border border-neutral-700 transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium bg-workbench-panel hover:bg-workbench-hover text-neutral-200 border border-neutral-700 transition-colors"
           >
             <Plus className="w-3 h-3" />
             New Project
@@ -120,7 +120,7 @@ export function ProjectManagementModal({
           <button
             onClick={onClose}
             aria-label="Close"
-            className="p-1.5 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
+            className="p-1.5 rounded text-neutral-500 hover:text-neutral-300 hover:bg-workbench-hover transition-colors"
           >
             <X className="w-4 h-4" />
           </button>
@@ -134,7 +134,7 @@ export function ProjectManagementModal({
             onClick={() => setTab(t)}
             className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
               tab === t
-                ? 'bg-neutral-800 text-neutral-100'
+                ? 'bg-workbench-panel text-neutral-100'
                 : 'text-neutral-500 hover:text-neutral-300'
             }`}
           >
@@ -157,7 +157,7 @@ export function ProjectManagementModal({
           <div className="flex gap-2 justify-end">
             <button
               onClick={() => setConfirm(null)}
-              className="px-3 py-1.5 rounded text-xs font-medium bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 transition-colors"
+              className="px-3 py-1.5 rounded text-xs font-medium bg-workbench-panel hover:bg-workbench-hover text-neutral-300 border border-neutral-700 transition-colors"
             >
               Cancel
             </button>
@@ -195,7 +195,7 @@ export function ProjectManagementModal({
             <div
               key={project.id}
               data-testid={`project-row-${project.id}`}
-              className={`flex items-center gap-2 px-3 py-2.5 rounded-lg bg-neutral-800/50 border ${
+              className={`flex items-center gap-2 px-3 py-2.5 rounded-lg bg-workbench-panel/50 border ${
                 selectedProjectId === project.id ? 'border-neutral-600' : 'border-transparent'
               }`}
             >
@@ -229,7 +229,7 @@ export function ProjectManagementModal({
                         onClick={() => handleArchive(project.id)}
                         title="Archive project"
                         data-testid={`archive-btn-${project.id}`}
-                        className="p-1.5 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700 transition-colors"
+                        className="p-1.5 rounded text-neutral-500 hover:text-neutral-300 hover:bg-workbench-hover transition-colors"
                       >
                         <Archive className="w-3.5 h-3.5" />
                       </button>
@@ -241,7 +241,7 @@ export function ProjectManagementModal({
                       onClick={() => handleUnarchive(project.id)}
                       title="Unarchive project"
                       data-testid={`unarchive-btn-${project.id}`}
-                      className="p-1.5 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700 transition-colors"
+                      className="p-1.5 rounded text-neutral-500 hover:text-neutral-300 hover:bg-workbench-hover transition-colors"
                     >
                       <ArchiveRestore className="w-3.5 h-3.5" />
                     </button>

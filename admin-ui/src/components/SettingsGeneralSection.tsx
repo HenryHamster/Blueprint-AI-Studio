@@ -48,7 +48,7 @@ function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean
     <button
       data-viewport-allow-small-target
       onClick={() => onChange(!enabled)}
-      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-workbench-layer'}`}
     >
       <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
     </button>
@@ -131,13 +131,13 @@ export function SettingsGeneralSection({
       {/* Connection status */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Connection Status</h3>
-        <div className={`flex items-center gap-5 px-3 py-2.5 rounded-lg border ${!apiHealthy ? 'bg-red-950/20 border-red-900/40' : 'bg-neutral-900 border-neutral-800'}`}>
+        <div className={`flex items-center gap-5 px-3 py-2.5 rounded-lg border ${!apiHealthy ? 'bg-red-950/20 border-red-900/40' : 'bg-workbench-base border-neutral-800'}`}>
           <span className="flex items-center gap-2">
             <span className={`w-2 h-2 rounded-full ${apiHealthy ? 'bg-emerald-500' : 'bg-red-500 animate-pulse'}`} />
             <span className={`text-xs ${apiHealthy ? 'text-neutral-300' : 'text-red-400'}`}>{apiHealthy ? 'API Connected' : 'API Error'}</span>
           </span>
           <span className="flex items-center gap-2">
-            <span className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-blue-500' : 'bg-neutral-600'}`} />
+            <span className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-blue-500' : 'bg-workbench-card'}`} />
             <span className={`text-xs ${wsConnected ? 'text-blue-400' : 'text-neutral-500'}`}>{wsConnected ? 'WebSocket Active' : 'WebSocket Idle'}</span>
           </span>
           <span className="text-xs text-neutral-500">Fetched {timeAgo(lastFetchTime)}</span>
@@ -153,7 +153,7 @@ export function SettingsGeneralSection({
             <select
               value={defaultTaskType}
               onChange={e => onUpdateDefaultTaskType(e.target.value as UserLaunchableTaskType)}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm workbench-focus"
             >
               {userLaunchableOptions.map(option => (
                 <option key={option.value} value={option.value}>{option.label}</option>
@@ -165,7 +165,7 @@ export function SettingsGeneralSection({
             <select
               value={viewMode}
               onChange={e => onSetViewMode(e.target.value as ViewMode)}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm workbench-focus"
             >
               <option value="kanban">Kanban</option>
               <option value="pipeline">Pipeline</option>
@@ -179,7 +179,7 @@ export function SettingsGeneralSection({
                 setDefaultModel(e.target.value);
                 localStorage.setItem('blueprint-admin:defaultModel', JSON.stringify(e.target.value));
               }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm workbench-focus"
             >
               <option value="">Orchestrator default</option>
               {allModelOptions.map(model => (
@@ -195,7 +195,7 @@ export function SettingsGeneralSection({
                 setDefaultEffort(e.target.value);
                 localStorage.setItem('blueprint-admin:defaultEffort', JSON.stringify(e.target.value));
               }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm workbench-focus"
             >
               <option value="">Orchestrator default</option>
               <option value="low">low</option>
@@ -218,7 +218,7 @@ export function SettingsGeneralSection({
                 <button
                   key={p.value}
                   onClick={() => { onUpdateRefreshInterval(p.value); setRefreshInputVal(''); }}
-                  className={`flex-1 text-xs py-3.5 rounded-lg border transition-colors ${refreshInterval === p.value && !refreshInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
+                  className={`flex-1 text-xs py-3.5 rounded-lg border transition-colors ${refreshInterval === p.value && !refreshInputVal ? 'bg-workbench-card border-neutral-500 text-neutral-100' : 'bg-workbench-shell border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
                 >
                   {p.label}
                 </button>
@@ -243,7 +243,7 @@ export function SettingsGeneralSection({
                     setRefreshInputVal('');
                   }
                 }}
-                className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-1.5 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+                className="flex-1 bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-1.5 text-xs font-mono placeholder-neutral-600 workbench-focus"
               />
               <span className="text-xs text-neutral-500 shrink-0">
                 {refreshInterval === 0 ? 'off' : `${refreshInterval / 1000}s`}
@@ -257,7 +257,7 @@ export function SettingsGeneralSection({
                 <button
                   key={p}
                   onClick={() => { onUpdatePageSize(p); setPageSizeInputVal(''); }}
-                  className={`flex-1 text-xs py-3.5 rounded-lg border transition-colors ${pageSize === p && !pageSizeInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
+                  className={`flex-1 text-xs py-3.5 rounded-lg border transition-colors ${pageSize === p && !pageSizeInputVal ? 'bg-workbench-card border-neutral-500 text-neutral-100' : 'bg-workbench-shell border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
                 >
                   {p}
                 </button>
@@ -283,7 +283,7 @@ export function SettingsGeneralSection({
                     setPageSizeInputVal('');
                   }
                 }}
-                className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-1.5 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+                className="flex-1 bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-1.5 text-xs font-mono placeholder-neutral-600 workbench-focus"
               />
               <span className="text-xs text-neutral-500 shrink-0">
                 {pageSize}

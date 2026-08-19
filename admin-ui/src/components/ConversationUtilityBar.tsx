@@ -8,7 +8,7 @@ const WORKDAY_STATE_PRESENTATION: Record<
   ConversationWorkdayState,
   { dot: string; text: string }
 > = {
-  off: { dot: 'bg-neutral-600', text: 'text-neutral-500' },
+  off: { dot: 'bg-workbench-card', text: 'text-neutral-500' },
   ready: { dot: 'bg-sky-700', text: 'text-sky-400' },
   starting: { dot: 'bg-amber-400 animate-pulse', text: 'text-amber-300' },
   working: { dot: 'bg-emerald-400 animate-pulse', text: 'text-emerald-300' },
@@ -55,7 +55,7 @@ export function ConversationUtilityBar({
             value={searchQuery}
             onChange={event => onSearchChange(event.target.value)}
             placeholder="Search conversation"
-            className="min-h-[36px] min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-xs text-neutral-100 placeholder:text-neutral-500 focus:border-indigo-500 focus:outline-none"
+            className="min-h-[36px] min-w-0 flex-1 rounded-md border border-neutral-700 bg-workbench-shell px-3 py-1.5 text-xs text-neutral-100 placeholder:text-neutral-500 workbench-focus"
           />
         ) : (
           <>
@@ -64,7 +64,7 @@ export function ConversationUtilityBar({
               onClick={onExpand}
               title="Search conversation"
               aria-label="Search conversation"
-              className="inline-flex min-h-[44px] md:min-h-9 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200"
+              className="inline-flex min-h-[44px] md:min-h-9 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/70 px-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200"
             >
               <Search className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
               <span className="hidden sm:inline">Search</span>
@@ -77,7 +77,7 @@ export function ConversationUtilityBar({
             onClick={onCollapse}
             title="Hide search"
             aria-label="Hide search"
-            className="inline-flex min-h-[44px] md:min-h-9 shrink-0 items-center gap-1 rounded-md border border-neutral-800 bg-neutral-950/70 px-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200"
+            className="inline-flex min-h-[44px] md:min-h-9 shrink-0 items-center gap-1 rounded-md border border-neutral-800 bg-workbench-shell/70 px-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200"
           >
             <ChevronUp className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
             <span className="hidden sm:inline">Hide</span>
@@ -90,7 +90,7 @@ export function ConversationUtilityBar({
             data-testid="conversation-workday-status"
             data-workday-state={workdayStatus.state}
             title={workdayStatus.title}
-            className="ml-auto flex min-w-0 max-w-full flex-1 items-center justify-end gap-1.5 whitespace-nowrap rounded-md border border-neutral-800/80 bg-neutral-950/45 px-2 py-1 text-ui-md sm:flex-initial"
+            className="ml-auto flex min-w-0 max-w-full flex-1 items-center justify-end gap-1.5 whitespace-nowrap rounded-md border border-neutral-800/80 bg-workbench-shell/45 px-2 py-1 text-ui-md sm:flex-initial"
           >
             <span
               aria-hidden="true"

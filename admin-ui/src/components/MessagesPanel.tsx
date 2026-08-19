@@ -3067,7 +3067,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
                             ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
                             : isConfirmation
                             ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
-                            : 'border-neutral-800 bg-neutral-950/50 cursor-default'
+                            : 'border-neutral-800 bg-workbench-shell/50 cursor-default'
                         }`}
                       >
                         <span className="shrink-0 text-sm leading-none" aria-hidden="true">{attentionItemIcon(item.kind)}</span>
@@ -3089,7 +3089,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
                           type="button"
                           onClick={handleAck}
                           title={lifecycleAcknowledgeEffectLabel(item.lifecycle?.acknowledge_effect)}
-                          className="shrink-0 rounded border border-neutral-700/60 bg-neutral-900/40 px-1.5 py-0.5 text-ui-sm font-medium text-neutral-400 hover:bg-neutral-800/50 hover:text-neutral-200 transition-colors"
+                          className="shrink-0 rounded border border-neutral-700/60 bg-workbench-base/40 px-1.5 py-0.5 text-ui-sm font-medium text-neutral-400 hover:bg-workbench-hover/50 hover:text-neutral-200 transition-colors"
                           data-testid="attention-ack-btn"
                         >
                           Ack
@@ -3111,7 +3111,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
                         <button
                           type="button"
                           onClick={() => { void handleDismiss(); }}
-                          className="rounded border border-neutral-700/60 bg-neutral-900/40 px-2 py-0.5 text-xs font-medium text-neutral-300 hover:bg-neutral-800/50 transition-colors"
+                          className="rounded border border-neutral-700/60 bg-workbench-base/40 px-2 py-0.5 text-xs font-medium text-neutral-300 hover:bg-workbench-hover/50 transition-colors"
                           data-testid="confirmation-dismiss-btn"
                         >
                           Dismiss
@@ -3146,7 +3146,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
             data-testid="needs-action-filter-show-all"
             onClick={() => setNeedsActionOnly(false)}
             aria-pressed={!needsActionOnly}
-            className={`inline-flex items-center rounded px-2 py-0.5 text-ui-sm font-medium transition-colors ${!needsActionOnly ? 'bg-neutral-700/60 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
+            className={`inline-flex items-center rounded px-2 py-0.5 text-ui-sm font-medium transition-colors ${!needsActionOnly ? 'bg-workbench-layer/60 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
           >
             Show all
           </button>
@@ -3234,7 +3234,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       {/* Convert-to-direction modal */}
       {canOperateProject && !conversationMode && pendingConvertMsg && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" role="dialog" aria-modal="true" aria-label="Create direction from message">
-          <div className="bg-neutral-950 border border-neutral-800 rounded-lg shadow-xl w-full max-w-lg mx-4 flex flex-col max-h-[90vh]">
+          <div className="bg-workbench-shell border border-neutral-800 rounded-lg shadow-xl w-full max-w-lg mx-4 flex flex-col max-h-[90vh]">
             <div className="px-5 py-3 border-b border-neutral-800 flex items-center justify-between shrink-0">
               <span className="text-sm font-medium text-neutral-200">Create direction from message</span>
               <button
@@ -3259,7 +3259,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
               <button
                 type="button"
                 onClick={() => { setPendingConvertMsg(null); convertForm.resetAddForm(); }}
-                className="text-xs text-neutral-400 hover:text-neutral-200 px-3 py-1.5 rounded border border-neutral-700 bg-neutral-900 hover:bg-neutral-800 transition-colors"
+                className="text-xs text-neutral-400 hover:text-neutral-200 px-3 py-1.5 rounded border border-neutral-700 bg-workbench-base hover:bg-workbench-hover transition-colors"
               >
                 Cancel
               </button>
@@ -3267,7 +3267,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
                 type="button"
                 onClick={handleSubmitConvertForm}
                 disabled={convertSubmitting || !convertForm.newText.trim()}
-                className="text-xs text-neutral-200 px-3 py-1.5 rounded border border-neutral-600 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 transition-colors"
+                className="text-xs text-neutral-200 px-3 py-1.5 rounded border border-neutral-600 bg-workbench-panel hover:bg-workbench-hover disabled:opacity-40 transition-colors"
               >
                 {convertSubmitting ? 'Creating…' : 'Create direction'}
               </button>

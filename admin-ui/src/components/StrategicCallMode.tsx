@@ -61,12 +61,12 @@ function DisplayBlock({ block }: { block: CallDisplayBlock }) {
     return <div className="text-sm"><span className="sr-only">{block.content}</span><MarkdownContent content={`$$${block.content}$$`} /></div>;
   }
   if (block.type === 'code') {
-    return <pre className="overflow-x-auto rounded border border-neutral-800 bg-neutral-950 p-3 text-xs text-neutral-200"><code>{block.content}</code></pre>;
+    return <pre className="overflow-x-auto rounded border border-neutral-800 bg-workbench-shell p-3 text-xs text-neutral-200"><code>{block.content}</code></pre>;
   }
   if (block.type === 'table') {
-    return <pre className="overflow-x-auto whitespace-pre rounded border border-neutral-800 bg-neutral-950 p-3 text-xs text-neutral-200">{block.content}</pre>;
+    return <pre className="overflow-x-auto whitespace-pre rounded border border-neutral-800 bg-workbench-shell p-3 text-xs text-neutral-200">{block.content}</pre>;
   }
-  return <div className="rounded border border-neutral-800 bg-neutral-950/50 px-3 py-2 text-xs text-neutral-300">{block.content}</div>;
+  return <div className="rounded border border-neutral-800 bg-workbench-shell/50 px-3 py-2 text-xs text-neutral-300">{block.content}</div>;
 }
 
 export function StrategicCallLauncher({ onStart }: { onStart: () => void }) {
@@ -76,7 +76,7 @@ export function StrategicCallLauncher({ onStart }: { onStart: () => void }) {
       onClick={onStart}
       title="Start call. Audio is transcribed by Deepgram and replies are voiced by Cartesia; raw audio is not recorded."
       aria-describedby="strategic-call-privacy"
-      className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1.5 rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2.5 text-xs text-neutral-500 transition-colors hover:border-cyan-800 hover:bg-cyan-950/30 hover:text-cyan-200"
+      className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1.5 rounded-md border border-neutral-800/80 bg-workbench-shell/35 px-2.5 text-xs text-neutral-500 transition-colors hover:border-cyan-800 hover:bg-cyan-950/30 hover:text-cyan-200"
     >
       <Phone className="h-3.5 w-3.5" aria-hidden="true" />
       <span className="hidden sm:inline">Call</span>
@@ -108,10 +108,10 @@ export function StrategicCallMode({
   const microphoneOn = microphoneState === 'on';
   if (!enabled && connectionState === 'idle' && !error) return null;
   return (
-    <section aria-label="Live conversation" data-testid="strategic-call-mode" className="mx-auto mb-2 w-full max-w-[940px] shrink-0 rounded-lg border border-cyan-900/60 bg-neutral-950/80 px-3 py-2 shadow-sm">
+    <section aria-label="Live conversation" data-testid="strategic-call-mode" className="mx-auto mb-2 w-full max-w-[940px] shrink-0 rounded-lg border border-cyan-900/60 bg-workbench-shell/80 px-3 py-2 shadow-sm">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
         <div className="flex min-w-0 items-center gap-2 text-sm text-neutral-200">
-          <span className={`h-2 w-2 shrink-0 rounded-full ${active ? 'bg-cyan-400 animate-pulse' : 'bg-neutral-600'}`} aria-hidden="true" />
+          <span className={`h-2 w-2 shrink-0 rounded-full ${active ? 'bg-cyan-400 animate-pulse' : 'bg-workbench-card'}`} aria-hidden="true" />
           <Volume2 className="h-4 w-4 shrink-0 text-cyan-300" aria-hidden="true" />
           <span className="font-medium">Live conversation</span>
           <span data-testid="strategic-call-state" className="truncate text-xs text-neutral-400">{copy}</span>
@@ -133,7 +133,7 @@ export function StrategicCallMode({
                 className={`inline-flex min-h-[44px] items-center gap-1.5 rounded border px-2.5 text-xs disabled:cursor-wait disabled:opacity-70 ${
                   microphoneOn
                     ? 'border-cyan-700 bg-cyan-950/40 text-cyan-100 hover:bg-cyan-950/70'
-                    : 'border-neutral-700 text-neutral-200 hover:bg-neutral-800'
+                    : 'border-neutral-700 text-neutral-200 hover:bg-workbench-hover'
                 }`}
               >
                 {microphoneOn || microphoneState === 'disabling'
@@ -155,7 +155,7 @@ export function StrategicCallMode({
             </button>
           )}
           {(connectionState === 'error' || connectionState === 'reconnecting') && (
-            <button type="button" onClick={onReconnect} className="inline-flex min-h-[44px] items-center gap-1 rounded border border-neutral-700 px-2 text-xs text-neutral-200 hover:bg-neutral-800">
+            <button type="button" onClick={onReconnect} className="inline-flex min-h-[44px] items-center gap-1 rounded border border-neutral-700 px-2 text-xs text-neutral-200 hover:bg-workbench-hover">
               <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" /> Reconnect
             </button>
           )}
@@ -178,7 +178,7 @@ export function StrategicCallMode({
       {error && <p role="alert" className="mt-1.5 text-xs text-rose-300">{error}</p>}
       {enabled && (captions.length > 0 || displayBlocks.length > 0) && (
         <details className="mt-1.5 border-t border-neutral-800 pt-1.5 text-xs text-neutral-400">
-          <summary className="w-fit cursor-pointer select-none rounded px-1 py-0.5 hover:bg-neutral-800 hover:text-neutral-200">
+          <summary className="w-fit cursor-pointer select-none rounded px-1 py-0.5 hover:bg-workbench-hover hover:text-neutral-200">
             Live notes · {captions.length} caption{captions.length === 1 ? '' : 's'}
             {displayBlocks.length > 0 ? ` · ${displayBlocks.length} shared item${displayBlocks.length === 1 ? '' : 's'}` : ''}
           </summary>

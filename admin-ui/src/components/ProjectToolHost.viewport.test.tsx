@@ -59,15 +59,15 @@ const TOOLS_RESULT: FetchProjectToolsResult = {
 };
 
 function MockWidget({ tool }: ToolComponentProps) {
-  return <div className="rounded bg-neutral-800 p-2 text-xs text-neutral-300">{tool.title} content</div>;
+  return <div className="rounded bg-workbench-panel p-2 text-xs text-neutral-300">{tool.title} content</div>;
 }
 
 function MockChart({ tool }: ToolComponentProps) {
-  return <div className="rounded bg-neutral-800 p-2 text-xs text-neutral-300">{tool.title} chart</div>;
+  return <div className="rounded bg-workbench-panel p-2 text-xs text-neutral-300">{tool.title} chart</div>;
 }
 
 function MockTable({ tool }: ToolComponentProps) {
-  return <div className="rounded bg-neutral-800 p-2 text-xs text-neutral-300">{tool.title} table</div>;
+  return <div className="rounded bg-workbench-panel p-2 text-xs text-neutral-300">{tool.title} table</div>;
 }
 
 beforeAll(() => {

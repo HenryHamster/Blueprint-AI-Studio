@@ -154,7 +154,7 @@ export default function RunningUpdatePanel({
             <button
               type="button"
               onClick={startEditing}
-              className="inline-flex items-center gap-1.5 px-3 py-3 min-h-11 text-xs font-medium rounded-md border border-neutral-700 bg-neutral-800/60 text-neutral-300 hover:bg-neutral-700/60 transition"
+              className="inline-flex items-center gap-1.5 px-3 py-3 min-h-11 text-xs font-medium rounded-md border border-neutral-700 bg-workbench-panel/60 text-neutral-300 hover:bg-workbench-hover/60 transition"
             >
               <Pencil size={12} />
               Edit
@@ -180,7 +180,7 @@ export default function RunningUpdatePanel({
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               rows={16}
-              className="w-full rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 font-mono focus:outline-none focus:border-neutral-500"
+              className="w-full rounded-md border border-neutral-700 bg-workbench-base px-3 py-2 text-sm text-neutral-100 font-mono workbench-focus"
               placeholder="Edit the running update document…"
             />
             <div className="flex items-center gap-2">
@@ -197,7 +197,7 @@ export default function RunningUpdatePanel({
                 type="button"
                 onClick={cancelEditing}
                 disabled={saving}
-                className="inline-flex items-center gap-1.5 px-3 py-3 min-h-11 text-xs font-medium rounded-md border border-neutral-700 bg-neutral-800/60 text-neutral-300 hover:bg-neutral-700/60 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                className="inline-flex items-center gap-1.5 px-3 py-3 min-h-11 text-xs font-medium rounded-md border border-neutral-700 bg-workbench-panel/60 text-neutral-300 hover:bg-workbench-hover/60 disabled:opacity-40 disabled:cursor-not-allowed transition"
               >
                 <X size={12} />
                 Cancel

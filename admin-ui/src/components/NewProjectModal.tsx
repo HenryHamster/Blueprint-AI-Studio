@@ -472,7 +472,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-      <div className="bg-neutral-900 rounded-xl shadow-2xl w-full max-w-[600px] mx-3 sm:mx-auto overflow-y-auto max-h-[90vh] border border-neutral-800">
+      <div className="bg-workbench-base rounded-lg shadow-2xl w-full max-w-[600px] mx-3 sm:mx-auto overflow-y-auto max-h-[90vh] border border-neutral-800">
         <div className="flex justify-between items-center p-5 border-b border-neutral-800">
           <h2 className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
             <Plus className="w-4 h-4 text-neutral-400" />
@@ -496,7 +496,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                       ? 'bg-emerald-600 text-white'
                       : isCurrent
                       ? 'bg-white text-neutral-900'
-                      : 'bg-neutral-800 text-neutral-600'
+                      : 'bg-workbench-panel text-neutral-600'
                   }`}>
                     {isCompleted ? <CheckCircle className="w-3 h-3" /> : i + 1}
                   </div>
@@ -513,7 +513,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
           {step === 'repo' && (
             <div>
               <div className="mb-4">
-                <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950/70 p-3">
+                <div className="mb-4 rounded-lg border border-neutral-800 bg-workbench-shell/70 p-3">
                   <div className="flex items-start gap-2.5">
                     <Github className="mt-0.5 h-4 w-4 shrink-0 text-neutral-400" />
                     <div className="min-w-0 flex-1">
@@ -537,7 +537,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                           type="button"
                           onClick={handleGitHubConnect}
                           disabled={githubConnection.connecting}
-                          className="mt-2 inline-flex min-h-[44px] items-center gap-1.5 rounded border border-neutral-700 bg-neutral-800 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
+                          className="mt-2 inline-flex min-h-[44px] items-center gap-1.5 rounded border border-neutral-700 bg-workbench-panel px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-workbench-hover disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {githubConnection.connecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Github className="h-3.5 w-3.5" />}
                           Connect GitHub
@@ -556,7 +556,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                             type="button"
                             onClick={handleGitHubConnect}
                             disabled={githubConnection.connecting}
-                            className="mt-2 inline-flex min-h-[44px] items-center gap-1.5 rounded border border-neutral-700 bg-neutral-800 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
+                            className="mt-2 inline-flex min-h-[44px] items-center gap-1.5 rounded border border-neutral-700 bg-workbench-panel px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-workbench-hover disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {githubConnection.connecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Github className="h-3.5 w-3.5" />}
                             Install Blueprint App
@@ -586,10 +586,10 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                         value={repoFilter}
                         onChange={e => setRepoFilter(e.target.value)}
                         placeholder="Filter repositories…"
-                        className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg pl-8 pr-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                        className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg pl-8 pr-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                       />
                     </div>
-                    <div className="max-h-48 overflow-y-auto rounded-lg border border-neutral-800 bg-neutral-950 mb-1">
+                    <div className="max-h-48 overflow-y-auto rounded-lg border border-neutral-800 bg-workbench-shell mb-1">
                       {filteredRepos.length === 0 ? (
                         <div className="px-3 py-2 text-xs text-neutral-500">No repositories match</div>
                       ) : (
@@ -602,8 +602,8 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                               setRepoError('');
                               setPreviewDefaultBranch(r.default_branch);
                             }}
-                            className={`w-full flex items-center justify-between px-3 py-2 min-h-[44px] text-left hover:bg-neutral-800 transition-colors border-b border-neutral-800/50 last:border-b-0 ${
-                              repoInput === r.full_name ? 'bg-neutral-800' : ''
+                            className={`w-full flex items-center justify-between px-3 py-2 min-h-[44px] text-left hover:bg-workbench-hover transition-colors border-b border-neutral-800/50 last:border-b-0 ${
+                              repoInput === r.full_name ? 'bg-workbench-panel' : ''
                             }`}
                           >
                             <span className="text-xs font-mono text-neutral-200">{r.full_name}</span>
@@ -641,9 +641,9 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                       onChange={e => { setRepoInput(e.target.value); setRepoError(''); }}
                       onKeyDown={e => e.key === 'Enter' && void handleRepoNext()}
                       placeholder="owner/repo or https://github.com/owner/repo"
-                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${
-                        repoError ? 'border-red-500' : 'border-neutral-800'
-                      }`}
+                      className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 font-mono ${
+ repoError ? 'border-red-500' : 'border-neutral-800'
+ } workbench-focus`}
                     />
                     {repoOptions.length > 0 && (
                       <button
@@ -676,7 +676,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                   value={projectName}
                   onChange={e => setProjectName(e.target.value)}
                   placeholder={parsed ? `${parsed.owner}/${parsed.repo}` : 'Defaults to owner/repo'}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                 />
               </div>
 
@@ -690,7 +690,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                   onChange={e => setGoal(e.target.value)}
                   rows={2}
                   placeholder="What do you want Blueprint to achieve on this repo?"
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 resize-none"
+                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 resize-none workbench-focus"
                 />
                 <p className="text-ui-xs text-neutral-600 mt-1">
                   Seeds the project's strategic intent so the first cycle reasons from your goal. Leave blank to skip.
@@ -715,7 +715,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                       value={projectType}
                       onChange={e => setProjectType(e.target.value)}
                       placeholder="startup / research / product / personal / enterprise"
-                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                     />
                   </label>
                   <label className="block">
@@ -725,7 +725,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                       value={team}
                       onChange={e => setTeam(e.target.value)}
                       placeholder="solo / 3 engineers + 1 PM / etc."
-                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                     />
                   </label>
                   <label className="block">
@@ -735,7 +735,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                       value={users}
                       onChange={e => setUsers(e.target.value)}
                       placeholder="Who this is for, in one line"
-                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                     />
                   </label>
                   <label className="block">
@@ -745,7 +745,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                       value={deployCadence}
                       onChange={e => setDeployCadence(e.target.value)}
                       placeholder="continuous / weekly / quarterly / sporadic"
-                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                     />
                   </label>
                 </div>
@@ -756,7 +756,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                     onChange={e => setNotes(e.target.value)}
                     rows={3}
                     placeholder="Risk tolerance, compliance constraints, or other context"
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 resize-none"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 resize-none workbench-focus"
                   />
                 </label>
                 <div className="mt-4">
@@ -774,12 +774,12 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                           value={constraint}
                           onChange={e => updateConstraint(index, e.target.value)}
                           placeholder="e.g., Don't modify .github/workflows/"
-                          className="flex-1 min-w-0 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                          className="flex-1 min-w-0 bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                         />
                         <button
                           type="button"
                           onClick={() => removeConstraint(index)}
-                          className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded border border-neutral-800 text-neutral-500 hover:text-rose-400 hover:bg-neutral-800/60 transition-colors"
+                          className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded border border-neutral-800 text-neutral-500 hover:text-rose-400 hover:bg-workbench-hover/60 transition-colors"
                           aria-label="Remove constraint"
                         >
                           <X className="w-4 h-4" />
@@ -802,7 +802,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                 <button
                   type="button"
                   onClick={handleClose}
-                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors"
+                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-workbench-hover rounded transition-colors"
                 >
                   Cancel
                 </button>
@@ -810,7 +810,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                   type="button"
                   onClick={() => { void handleRepoNext(); }}
                   disabled={!repoInput.trim() || githubConnection.loading || !githubConnection.status?.identity_linked}
-                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-workbench-hover rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   Continue
                 </button>
@@ -821,7 +821,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
           {/* Step 2: Confirm */}
           {(step === 'config' || step === 'submitting') && parsed && (
             <div>
-              <div className="mb-4 p-3 bg-neutral-800/50 rounded-lg border border-neutral-700/50">
+              <div className="mb-4 p-3 bg-workbench-panel/50 rounded-lg border border-neutral-700/50">
                 <div className="flex items-center gap-2 mb-1">
                   <GitBranch className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
                   <span className="text-xs font-mono text-neutral-200">{parsed.owner}/{parsed.repo}</span>
@@ -852,7 +852,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                           value={promotionTargetInput}
                           onChange={e => setPromotionTargetInput(e.target.value)}
                           placeholder={`${effectiveDefaultBranch} (same as integration)`}
-                          className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                          className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-sm font-mono workbench-focus"
                         />
                         <p className="text-ui-xs text-neutral-600 mt-1">
                           Leave blank to use the same as integration. Set a different branch for LTS workflows (e.g. <span className="font-mono">main</span> when integration is <span className="font-mono">automain</span>).
@@ -875,7 +875,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
               ) : null}
 
               {buildConfigDraft && (
-                <div className="mb-4 p-3 bg-neutral-950 rounded-lg border border-neutral-800">
+                <div className="mb-4 p-3 bg-workbench-shell rounded-lg border border-neutral-800">
                   <div className="flex items-center justify-between gap-2 mb-3">
                     <div>
                       <div className="text-ui-md font-semibold text-neutral-300 uppercase tracking-wider">
@@ -893,7 +893,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                           ...current,
                           requires_ci_checks: e.target.checked,
                         }))}
-                        className="h-4 w-4 rounded border-neutral-700 bg-neutral-900 text-white"
+                        className="h-4 w-4 rounded border-neutral-700 bg-workbench-base text-white"
                       />
                       Require CI checks
                     </label>
@@ -907,7 +907,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                     {(buildConfigDraft.directories ?? []).length > 0 ? (
                       <div className="space-y-3">
                         {(buildConfigDraft.directories ?? []).map((directory, index) => (
-                          <div key={index} className="rounded border border-neutral-800 bg-neutral-900/70 p-3">
+                          <div key={index} className="rounded border border-neutral-800 bg-workbench-base/70 p-3">
                             <div className="mb-2 flex items-center justify-between gap-2">
                               <div className="text-ui-sm font-mono text-neutral-400">
                                 Directory {index + 1}
@@ -915,7 +915,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                               <button
                                 type="button"
                                 onClick={() => removeDraftDirectory(index)}
-                                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded border border-neutral-800 px-2 text-ui-sm text-neutral-500 hover:text-rose-400 hover:bg-neutral-800/60 transition-colors"
+                                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded border border-neutral-800 px-2 text-ui-sm text-neutral-500 hover:text-rose-400 hover:bg-workbench-hover/60 transition-colors"
                                 aria-label={`Remove directory ${index + 1}`}
                               >
                                 <X className="w-3.5 h-3.5" />
@@ -928,7 +928,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                                   type="text"
                                   value={directory.path ?? ''}
                                   onChange={e => updateDraftDirectory(index, 'path', e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono workbench-focus"
                                 />
                               </label>
                               <label className="block">
@@ -936,7 +936,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                                 <select
                                   value={directory.type ?? 'other'}
                                   onChange={e => updateDraftDirectory(index, 'type', e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md workbench-focus"
                                 >
                                   <option value="python">python</option>
                                   <option value="node">node</option>
@@ -952,7 +952,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                                   value={directory.test_cmd ?? ''}
                                   onChange={e => updateDraftDirectory(index, 'test_cmd', e.target.value)}
                                   placeholder="Leave blank to keep the merge gate unverified"
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono workbench-focus"
                                 />
                               </label>
                               <label className="block">
@@ -961,7 +961,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                                   type="text"
                                   value={directory.lint_cmd ?? ''}
                                   onChange={e => updateDraftDirectory(index, 'lint_cmd', e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono workbench-focus"
                                 />
                               </label>
                               <label className="block">
@@ -970,7 +970,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                                   type="text"
                                   value={directory.build_cmd ?? ''}
                                   onChange={e => updateDraftDirectory(index, 'build_cmd', e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono workbench-focus"
                                 />
                               </label>
                               <label className="block sm:col-span-2">
@@ -979,7 +979,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                                   type="text"
                                   value={directory.install_cmd ?? ''}
                                   onChange={e => updateDraftDirectory(index, 'install_cmd', e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono workbench-focus"
                                 />
                               </label>
                             </div>
@@ -1021,7 +1021,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                   type="button"
                   onClick={() => setStep('repo')}
                   disabled={step === 'submitting'}
-                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors disabled:opacity-40"
+                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-workbench-hover rounded transition-colors disabled:opacity-40"
                 >
                   Back
                 </button>
@@ -1030,7 +1030,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                     type="button"
                     onClick={handleClose}
                     disabled={step === 'submitting'}
-                    className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors disabled:opacity-40"
+                    className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-workbench-hover rounded transition-colors disabled:opacity-40"
                   >
                     Cancel
                   </button>
@@ -1038,7 +1038,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                     type="button"
                     onClick={handleCreate}
                     disabled={step === 'submitting' || previewLoading || !buildConfigDraft}
-                    className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
+                    className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-workbench-hover rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
                   >
                     {step === 'submitting' && (
                       <Loader2 className="animate-spin" style={{ width: 14, height: 14 }} />
@@ -1060,7 +1060,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
               </div>
 
               {/* Repository confirmed */}
-              <div className="mb-4 p-3 bg-neutral-800/50 rounded-lg border border-neutral-700/50">
+              <div className="mb-4 p-3 bg-workbench-panel/50 rounded-lg border border-neutral-700/50">
                 <div className="flex items-center gap-2">
                   <GitBranch className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
                   <span className="text-xs font-mono text-neutral-200">
@@ -1091,7 +1091,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                   {detectedConfig.directories && detectedConfig.directories.length > 0 ? (
                     <div className="space-y-1.5">
                       {detectedConfig.directories.map((dir, i) => (
-                        <div key={i} className="p-2 bg-neutral-950 rounded border border-neutral-800">
+                        <div key={i} className="p-2 bg-workbench-shell rounded border border-neutral-800">
                           <div className="text-ui-md font-mono text-neutral-300 mb-1">{dir.path}</div>
                           {(['install_cmd', 'lint_cmd', 'build_cmd', 'test_cmd'] as const).map(cmd =>
                             dir[cmd] ? (
@@ -1176,7 +1176,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                 ) : (
                   <div className="space-y-2">
                     {/* Auto-remediation toggle */}
-                    <div className="p-3 bg-neutral-800/50 rounded-lg border border-neutral-700/50">
+                    <div className="p-3 bg-workbench-panel/50 rounded-lg border border-neutral-700/50">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2 min-w-0">
                           <Zap className="w-3.5 h-3.5 text-amber-400 shrink-0" />
@@ -1192,7 +1192,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                           onClick={handleToggleAutoRemediation}
                           disabled={autoRemSaving || !autoRemediationConfig}
                           className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ml-3 disabled:opacity-50 ${
-                            autoRemediationConfig?.enabled ? 'bg-emerald-600' : 'bg-neutral-700'
+                            autoRemediationConfig?.enabled ? 'bg-emerald-600' : 'bg-workbench-layer'
                           }`}
                         >
                           <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
@@ -1203,7 +1203,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                     </div>
 
                     {/* Issue-to-implementation toggle */}
-                    <div className="p-3 bg-neutral-800/50 rounded-lg border border-neutral-700/50">
+                    <div className="p-3 bg-workbench-panel/50 rounded-lg border border-neutral-700/50">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2 min-w-0">
                           <Tag className="w-3.5 h-3.5 text-purple-400 shrink-0" />
@@ -1211,7 +1211,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                             <div className="text-xs font-medium text-neutral-200">Issue-to-Implementation</div>
                             <div className="text-ui-sm text-neutral-500 mt-0.5">
                               Label an issue{' '}
-                              <code className="font-mono text-ui-xs bg-neutral-700 px-1 py-0.5 rounded">
+                              <code className="font-mono text-ui-xs bg-workbench-layer px-1 py-0.5 rounded">
                                 {issueImplementationConfig?.trigger_label ?? 'auto:implement'}
                               </code>
                               {' '}to spawn a task
@@ -1223,7 +1223,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                           onClick={handleToggleIssueImplementation}
                           disabled={issueImplSaving || !issueImplementationConfig}
                           className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ml-3 disabled:opacity-50 ${
-                            issueImplementationConfig?.enabled ? 'bg-emerald-600' : 'bg-neutral-700'
+                            issueImplementationConfig?.enabled ? 'bg-emerald-600' : 'bg-workbench-layer'
                           }`}
                         >
                           <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
@@ -1255,7 +1255,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                   {issueImplementationConfig?.enabled && (
                     <li className="flex items-start gap-2">
                       <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
-                      <span>Label a GitHub issue <code className="font-mono text-ui-xs bg-neutral-700 px-1 py-0.5 rounded">{issueImplementationConfig.trigger_label}</code> to automatically spawn an implementation task</span>
+                      <span>Label a GitHub issue <code className="font-mono text-ui-xs bg-workbench-layer px-1 py-0.5 rounded">{issueImplementationConfig.trigger_label}</code> to automatically spawn an implementation task</span>
                     </li>
                   )}
                   <li className="flex items-start gap-2">
@@ -1269,7 +1269,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGi
                 <button
                   type="button"
                   onClick={handleClose}
-                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors"
+                  className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-workbench-hover rounded transition-colors"
                 >
                   Done
                 </button>

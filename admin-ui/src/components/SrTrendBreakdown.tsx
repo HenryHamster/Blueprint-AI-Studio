@@ -246,7 +246,7 @@ function ByScopeSection({ byScope, onScopeClick }: { byScope: Record<string, Rec
             data-testid={`sr-trend-by-scope-row-${scope}`}
             onClick={() => onScopeClick(scope)}
             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onScopeClick(scope); } }}
-            className="cursor-pointer rounded hover:bg-neutral-800/40 focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500/60"
+            className="cursor-pointer rounded hover:bg-workbench-hover/40 workbench-focus"
             aria-label={`Filter SR misses by scope ${scope}`}
           >
             <ByTaskTypeRow ttype={scope} cats={byScope[scope]} />
@@ -688,7 +688,7 @@ function CategoryRow({
           {chevron}
           {clickable ? (
             <div
-              className="flex items-center gap-2 flex-1 rounded px-0.5 cursor-pointer hover:bg-neutral-800/60 min-w-0"
+              className="flex items-center gap-2 flex-1 rounded px-0.5 cursor-pointer hover:bg-workbench-hover/60 min-w-0"
               {...interactiveProps}
             >
               {rowBody}
@@ -829,7 +829,7 @@ function CategoryRow({
         {chevron}
         {clickable ? (
           <div
-            className="flex items-center gap-1.5 flex-1 rounded px-0.5 cursor-pointer hover:bg-neutral-800/60"
+            className="flex items-center gap-1.5 flex-1 rounded px-0.5 cursor-pointer hover:bg-workbench-hover/60"
             {...interactiveProps}
           >
             {inlineBody}
@@ -873,7 +873,7 @@ export const SrTrendBreakdown = memo(function SrTrendBreakdown({ trends, variant
     return (
       <div
         data-testid="sr-trend-breakdown"
-        className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]"
+        className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]"
       >
         <div className="flex items-baseline gap-2 mb-1">
           <p className="text-ui-xs text-neutral-500 uppercase tracking-wide">

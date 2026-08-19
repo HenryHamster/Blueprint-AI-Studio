@@ -14,7 +14,7 @@ function fmtBytes(b: number): string {
 
 function DecisionCard({ label, decision }: { label: string; decision: Record<string, unknown> | null }) {
   return (
-    <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800 min-w-0">
+    <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800 min-w-0">
       <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1 truncate">{label}</p>
       {decision == null ? (
         <p className="text-xs text-neutral-600 italic">No decision yet</p>
@@ -63,7 +63,7 @@ export function StructuralHealthObservabilityPanel({
   return (
     <div className="border border-neutral-800 rounded-lg overflow-hidden" data-testid="structural-health-observability-panel">
       <button
-        className="w-full flex items-center justify-between px-4 py-3 bg-neutral-900 hover:bg-neutral-800/60 transition-colors"
+        className="w-full flex items-center justify-between px-4 py-3 bg-workbench-base hover:bg-workbench-hover/60 transition-colors"
         onClick={() => setCollapsed(v => !v)}
       >
         <div className="flex items-center gap-2">
@@ -82,14 +82,14 @@ export function StructuralHealthObservabilityPanel({
           {auditMode != null && onAuditModeChange != null && (
             <div>
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Mode</label>
-              <div className="flex gap-1 bg-neutral-950 border border-neutral-700 rounded-lg p-1 w-fit">
+              <div className="flex gap-1 bg-workbench-shell border border-neutral-700 rounded-lg p-1 w-fit">
                 {(['off', 'observe', 'enforce'] as const).map(mode => (
                   <button
                     key={mode}
                     onClick={() => void onAuditModeChange(mode)}
                     className={`px-3 py-1.5 text-xs rounded-md transition-colors capitalize ${
                       auditMode === mode
-                        ? 'bg-neutral-700 text-neutral-100'
+                        ? 'bg-workbench-layer text-neutral-100'
                         : 'text-neutral-500 hover:text-neutral-300'
                     }`}
                   >
@@ -111,15 +111,15 @@ export function StructuralHealthObservabilityPanel({
           {data != null && (
             <>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Audit Cycles</p>
                   <p className="text-lg font-mono text-neutral-100">{data.cycles}</p>
                 </div>
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Enrolled Total</p>
                   <p className="text-lg font-mono text-neutral-100">{data.enrolled_total}</p>
                 </div>
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Largest Rows</p>
                   <p className="text-lg font-mono text-neutral-100">{largestRows.length}</p>
                 </div>

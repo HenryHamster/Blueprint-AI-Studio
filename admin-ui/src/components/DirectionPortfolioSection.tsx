@@ -111,7 +111,7 @@ function priorityBadge(p: string) {
   switch (p) {
     case 'high': return 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30';
     case 'medium': return 'bg-amber-500/20 text-amber-400 border-amber-500/30';
-    default: return 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+    default: return 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
   }
 }
 
@@ -185,7 +185,7 @@ function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
       {open && hasBreakdown && (
         // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
         <div
-          className="absolute z-20 top-full mt-1 left-0 w-56 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg text-ui-sm text-neutral-300 space-y-1.5"
+          className="absolute z-20 top-full mt-1 left-0 w-56 bg-workbench-base border border-neutral-700 rounded-lg p-2 shadow-lg text-ui-sm text-neutral-300 space-y-1.5"
           onClick={e => e.stopPropagation()}
         >
           {byScope && Object.keys(byScope).length > 0 && (
@@ -313,14 +313,14 @@ function DirectionSrPill({ entry }: { entry: DirectionSrEntry }) {
 }
 
 function SectionSkeleton() {
-  return <div className="h-28 w-full animate-pulse rounded bg-neutral-900/50 border border-neutral-800/50" />;
+  return <div className="h-28 w-full animate-pulse rounded bg-workbench-base/50 border border-neutral-800/50" />;
 }
 
 function QuietDirectionCard({ direction }: { direction: DirectionPortfolioCompositionEntry }) {
   return (
-    <div className="min-w-[200px] max-w-[220px] shrink-0 rounded-lg border border-dashed border-neutral-800 bg-neutral-950/50 p-3 opacity-80">
+    <div className="min-w-[200px] max-w-[220px] shrink-0 rounded-lg border border-dashed border-neutral-800 bg-workbench-shell/50 p-3 opacity-80">
       <div className="flex items-center gap-1.5 mb-1.5">
-        <span className="text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded border bg-neutral-800/70 text-neutral-300 border-neutral-700">
+        <span className="text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded border bg-workbench-panel/70 text-neutral-300 border-neutral-700">
           Quiet
         </span>
         <span className={`text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded border ${priorityBadge(direction.priority)}`}>
@@ -539,7 +539,7 @@ export function DirectionPortfolioSection({
       {loading ? (
         <SectionSkeleton />
       ) : activeDirectionCount === 0 ? (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No active directions</div>
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No active directions</div>
       ) : (
         <>
           <div className="flex items-center gap-3 text-xs text-neutral-400 mb-2">
@@ -549,7 +549,7 @@ export function DirectionPortfolioSection({
                 <span className="text-neutral-600">&middot;</span>
                 <span className="flex items-center gap-1">
                   {productPct}% product
-                  <div className="w-16 h-1.5 rounded-full bg-neutral-800 overflow-hidden">
+                  <div className="w-16 h-1.5 rounded-full bg-workbench-panel overflow-hidden">
                     <div className="h-full rounded-full bg-emerald-500" style={{ width: `${productPct}%` }} />
                   </div>
                 </span>
@@ -639,7 +639,7 @@ export function DirectionPortfolioSection({
               return (
                 <div
                   key={d.direction_id}
-                  className="min-w-[200px] max-w-[220px] bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 shrink-0 cursor-pointer hover:border-neutral-700 transition-colors"
+                  className="min-w-[200px] max-w-[220px] bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 shrink-0 cursor-pointer hover:border-neutral-700 transition-colors"
                   onClick={() => onDirectionClick?.(d.direction_id)}
                 >
                   <div className="flex items-center gap-1.5 mb-1.5">
@@ -737,7 +737,7 @@ export function DirectionPortfolioSection({
                     tooltipLines.push(`Basis: ${basisLabel}`);
                     return (
                       <div className="mt-1.5" title={tooltipLines.join('\n')}>
-                        <div className="h-1 w-full rounded bg-neutral-800 overflow-hidden">
+                        <div className="h-1 w-full rounded bg-workbench-panel overflow-hidden">
                           <div className={`h-full ${barColor}`} style={{ width: `${clamped}%` }} />
                         </div>
                         <div className="flex justify-between text-ui-xs text-neutral-500 mt-0.5">
@@ -806,7 +806,7 @@ export function DirectionPortfolioSection({
     {evictedDrawer && (
       <div className="fixed inset-0 z-50 flex">
         <div className="flex-1 bg-black/40" onClick={closeEvictedDrawer} />
-        <div className="w-full max-w-[720px] bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl">
+        <div className="w-full max-w-[720px] bg-workbench-shell border-l border-neutral-800 flex flex-col shadow-2xl">
           <div className="flex items-start justify-between gap-3 p-4 border-b border-neutral-800 shrink-0">
             <div className="min-w-0">
               <p className="text-ui-xs uppercase tracking-widest text-neutral-500">Evicted findings</p>
@@ -844,27 +844,27 @@ export function DirectionPortfolioSection({
 
           <div className="flex-1 overflow-y-auto p-4">
             {evictedLoading ? (
-              <div className="h-28 w-full animate-pulse rounded bg-neutral-900/50 border border-neutral-800/50" />
+              <div className="h-28 w-full animate-pulse rounded bg-workbench-base/50 border border-neutral-800/50" />
             ) : evictedError ? (
-              <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2" role="status">
+              <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2" role="status">
                 <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
                 <span>Error fetching evicted findings</span>
                 <span className="text-ui-sm text-neutral-600 truncate" title={evictedError}>{evictedError}</span>
               </div>
             ) : evictedTotal === 0 ? (
-              <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2" role="status">
+              <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2" role="status">
                 <CheckCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
                 <span>No evicted findings for this direction</span>
               </div>
             ) : (
               <div className="flex flex-col gap-2">
                 {evictedItems.map((finding, index) => (
-                  <div key={`${finding.title}-${index}`} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+                  <div key={`${finding.title}-${index}`} className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
                     <div className="flex flex-wrap items-start gap-2">
                       <div className="min-w-0 flex-1">
                         <h4 className="text-sm text-neutral-100 font-medium break-words">{finding.title}</h4>
                         <div className="mt-1 flex flex-wrap items-center gap-2 text-ui-sm text-neutral-500">
-                          <span className="px-1.5 py-0.5 rounded border border-neutral-700/60 bg-neutral-900 text-neutral-300 uppercase tracking-wide">{finding.status}</span>
+                          <span className="px-1.5 py-0.5 rounded border border-neutral-700/60 bg-workbench-base text-neutral-300 uppercase tracking-wide">{finding.status}</span>
                           <span title={finding.evicted_at}>{timeAgo(finding.evicted_at)}</span>
                         </div>
                       </div>

@@ -53,12 +53,12 @@ function MergeGradeGateSettings() {
         <input
           type="number" min={0} max={1} step={0.1}
           value={input} onChange={e => setInput(e.target.value)}
-          className="w-24 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          className="w-24 bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-sm font-mono workbench-focus"
           data-testid="merge-grade-block-threshold-input"
         />
         <button
           onClick={save} disabled={saving}
-          className="inline-flex min-h-[44px] items-center justify-center rounded-md border border-neutral-700 bg-[#151c25] px-3 py-1 text-xs text-neutral-300 transition-colors hover:bg-neutral-800 disabled:opacity-50"
+          className="inline-flex min-h-[44px] items-center justify-center rounded-md border border-neutral-700 bg-workbench-hover px-3 py-1 text-xs text-neutral-300 transition-colors hover:bg-workbench-hover disabled:opacity-50"
           data-testid="merge-grade-block-threshold-save"
         >
           {saving ? 'Saving…' : saveOk ? 'Saved' : 'Save'}
@@ -135,7 +135,7 @@ export function DeploySection({
         <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-300">Deploy Health</h3>
         {deployState ? (
           <div className="space-y-3">
-            <div className="grid grid-cols-1 gap-2 rounded-md border border-neutral-800 bg-[#10151c] p-3 sm:grid-cols-3">
+            <div className="grid grid-cols-1 gap-2 rounded-md border border-neutral-800 bg-workbench-layer p-3 sm:grid-cols-3">
               <div>
                 <span className="mb-1 block text-ui-md uppercase tracking-wide text-neutral-500">Status</span>
                 <span className={`text-sm font-semibold ${
@@ -166,12 +166,12 @@ export function DeploySection({
             </div>
 
             {deployState.monitoring_window !== null && (
-              <div className="space-y-2 rounded-md border border-neutral-800 bg-[#10151c] p-3">
+              <div className="space-y-2 rounded-md border border-neutral-800 bg-workbench-layer p-3">
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-neutral-500">Monitoring Progress</span>
                   <span className="text-xs text-blue-400 font-mono">{deployState.monitoring_window.percent}%</span>
                 </div>
-                <div className="h-1.5 w-full rounded-full bg-neutral-800">
+                <div className="h-1.5 w-full rounded-full bg-workbench-panel">
                   <div
                     className="h-1.5 rounded-full bg-blue-500 transition-all duration-500"
                     style={{ width: `${deployState.monitoring_window.percent}%` }}
@@ -199,7 +199,7 @@ export function DeploySection({
             {deployState.external_health && (() => {
               const externalHealth = deployState.external_health;
               return (
-              <div className="space-y-2 rounded-md border border-neutral-800 bg-[#10151c] p-3">
+              <div className="space-y-2 rounded-md border border-neutral-800 bg-workbench-layer p-3">
                 <div className="mb-1 text-ui-md uppercase tracking-wide text-neutral-500">External Dependencies</div>
                 {EXTERNAL_DEP_ORDER.filter((dep) => {
                   if (!(dep in externalHealth)) return false;
@@ -252,12 +252,12 @@ export function DeploySection({
             })()}
 
             {deployState.status === 'PAUSED' && deployState.pre_pause_max_vms != null && (
-              <p className="rounded-md border border-neutral-800 bg-[#10151c] px-3 py-2 text-xs text-neutral-400">
+              <p className="rounded-md border border-neutral-800 bg-workbench-layer px-3 py-2 text-xs text-neutral-400">
                 Will restore to {deployState.pre_pause_max_vms} VM{deployState.pre_pause_max_vms !== 1 ? 's' : ''}
               </p>
             )}
             {deployState.status === 'PAUSED' && (deployState.health_recovery_streak ?? 0) > 0 && (
-              <div className="space-y-2 rounded-md border border-neutral-800 bg-[#10151c] p-3">
+              <div className="space-y-2 rounded-md border border-neutral-800 bg-workbench-layer p-3">
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-neutral-500">Recovery Progress</span>
                   <span className="text-xs text-emerald-400 font-mono">
@@ -274,7 +274,7 @@ export function DeploySection({
                     </span>
                   </p>
                 )}
-                <div className="h-1.5 w-full rounded-full bg-neutral-800">
+                <div className="h-1.5 w-full rounded-full bg-workbench-panel">
                   <div
                     className="h-1.5 rounded-full bg-emerald-500 transition-all duration-500"
                     style={{ width: `${Math.min(100, (deployState.health_recovery_streak / (deployState.health_recovery_streak_required ?? 3)) * 100)}%` }}
@@ -288,7 +288,7 @@ export function DeploySection({
                         const hist = deployState.health_recovery_history ?? [];
                         const probe = hist[i];
                         const isEmpty = probe === undefined;
-                        const color = isEmpty ? 'bg-neutral-700' : probe ? 'bg-emerald-500' : 'bg-red-500';
+                        const color = isEmpty ? 'bg-workbench-layer' : probe ? 'bg-emerald-500' : 'bg-red-500';
                         return <span key={i} className={`w-2.5 h-2.5 rounded-full ${color}`} title={isEmpty ? 'no probe yet' : probe ? 'healthy' : 'failed'} />;
                       })}
                     </div>
@@ -336,7 +336,7 @@ export function DeploySection({
               ) : null}
               {(deployState.status === 'MONITORING' || deployState.status === 'ROLLED_BACK' || deployState.status === 'HALTED') && (
                 <button onClick={onMarkStable}
-                  className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-700 bg-[#151c25] px-3 py-2 text-xs text-emerald-300 transition-colors hover:bg-neutral-800">
+                  className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-700 bg-workbench-hover px-3 py-2 text-xs text-emerald-300 transition-colors hover:bg-workbench-hover">
                   <CheckCircle className="w-3.5 h-3.5" /> Mark Stable
                 </button>
               )}
@@ -354,7 +354,7 @@ export function DeploySection({
                 <RotateCw className="w-3.5 h-3.5" /> Rollback
               </button>
               <button onClick={onRepairState}
-                className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-700 bg-[#151c25] px-3 py-2 text-xs text-neutral-300 transition-colors hover:bg-neutral-800">
+                className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-700 bg-workbench-hover px-3 py-2 text-xs text-neutral-300 transition-colors hover:bg-workbench-hover">
                 <Wrench className="w-3.5 h-3.5" /> Repair
               </button>
             </div>
@@ -368,7 +368,7 @@ export function DeploySection({
       <div>
         <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-300">Zone Health</h3>
         {zoneHealth ? (
-          <div className="space-y-2 rounded-md border border-neutral-800 bg-[#10151c] p-3">
+          <div className="space-y-2 rounded-md border border-neutral-800 bg-workbench-layer p-3">
             {Object.entries(zoneHealth).map(([zone, data]) => {
               const region = zone.split('-').slice(0, 2).join('-');
               const dotColor = data.status === 'healthy' ? 'bg-emerald-500'

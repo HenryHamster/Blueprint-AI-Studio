@@ -563,7 +563,7 @@ export function VersionSummaryPanel({
         placeholder="Filter by title or PR…"
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
-        className="w-full mb-2 rounded bg-slate-700/50 border border-slate-600/50 px-2 py-1 text-ui-md text-slate-300 placeholder-slate-500 outline-none focus:border-slate-500"
+        className="w-full mb-2 rounded bg-slate-700/50 border border-slate-600/50 px-2 py-1 text-ui-md text-slate-300 placeholder-slate-500 outline-none workbench-focus"
         aria-label="Filter changelog entries"
       />
       <div className="max-h-64 overflow-y-auto pr-1">

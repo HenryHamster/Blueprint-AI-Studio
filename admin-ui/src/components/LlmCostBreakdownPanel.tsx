@@ -94,7 +94,7 @@ export function LlmCostBreakdownPanel({
       <section>
         {Header}
         {StaleBanner}
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-4 text-ui-md text-neutral-500">
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-4 text-ui-md text-neutral-500">
           No priced LLM token spend in the last {data.window_days} days for this project.
         </div>
       </section>
@@ -145,7 +145,7 @@ export function LlmCostBreakdownPanel({
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
         LLM Cost Rework Attribution <span className="text-neutral-600 normal-case font-normal">· {data.window_days}d</span>
       </h2>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-3">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-3">
         <div className="flex flex-wrap gap-x-6 gap-y-1 text-ui-md mb-3">
           <span className="text-neutral-400">
             Rework share:{' '}
@@ -193,7 +193,7 @@ export function LlmCostBreakdownPanel({
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
         LLM Cost by Task Type <span className="text-neutral-600 normal-case font-normal">· {data.window_days}d</span>
       </h2>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
           {by_task_type.map((row: LlmCostTaskTypeRow, i: number) => (
@@ -266,7 +266,7 @@ export function LlmCostBreakdownPanel({
       {coverageWarning}
       {fallbackWarning}
       {approximateWarning}
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
           {by_model.map((row, i) => (

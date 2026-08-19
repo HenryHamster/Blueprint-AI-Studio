@@ -42,19 +42,19 @@ export function ColumnsPicker({ prefs, onPrefsChange, columns }: {
         className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
           open
             ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
-            : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+            : 'bg-workbench-base/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
         }`}
       >
         <LayoutGrid className="w-3.5 h-3.5" />
         Columns
       </button>
       {open && (
-        <div className="absolute top-full mt-1.5 left-0 z-50 bg-neutral-900 border border-neutral-800 rounded-xl shadow-xl p-1.5 min-w-[180px]">
+        <div className="absolute top-full mt-1.5 left-0 z-50 bg-workbench-base border border-neutral-800 rounded-lg shadow-xl p-1.5 min-w-[180px]">
           {prefs.map((pref, idx) => {
             const col = columns.find(c => c.id === pref.id);
             if (!col) return null;
             return (
-              <div key={pref.id} className="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-neutral-800/50 group">
+              <div key={pref.id} className="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-workbench-hover/50 group">
                 <input
                   type="checkbox"
                   checked={pref.visible}

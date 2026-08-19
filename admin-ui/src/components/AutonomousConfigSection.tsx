@@ -94,7 +94,7 @@ export function AutonomousConfigSection({
               max={720}
               value={configCooldownHours}
               onChange={e => setConfigCooldownHours(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('autonomous_direction_cooldown_hours', configCooldownHours)}
@@ -115,7 +115,7 @@ export function AutonomousConfigSection({
               max={525600}
               value={configProductiveCooldownMinutes}
               onChange={e => setConfigProductiveCooldownMinutes(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('productive_direction_cooldown_minutes', configProductiveCooldownMinutes)}
@@ -136,7 +136,7 @@ export function AutonomousConfigSection({
               max={1440}
               value={configIntervalMinutes}
               onChange={e => setConfigIntervalMinutes(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('autonomous_research_interval_minutes', configIntervalMinutes)}
@@ -157,7 +157,7 @@ export function AutonomousConfigSection({
               max={20}
               value={configMaxParallel}
               onChange={e => setConfigMaxParallel(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('max_parallel_research_per_project', configMaxParallel)}
@@ -178,7 +178,7 @@ export function AutonomousConfigSection({
               max={50}
               value={configMaxTotalResearch}
               onChange={e => setConfigMaxTotalResearch(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('max_total_research_per_project', configMaxTotalResearch)}
@@ -199,7 +199,7 @@ export function AutonomousConfigSection({
               max={50}
               value={configMaxTasksPerHour}
               onChange={e => setConfigMaxTasksPerHour(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('max_autonomous_tasks_per_hour', configMaxTasksPerHour)}
@@ -220,7 +220,7 @@ export function AutonomousConfigSection({
               max={20}
               value={configMaxConcurrentAutoRemediations}
               onChange={e => setConfigMaxConcurrentAutoRemediations(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('max_concurrent_auto_remediations', configMaxConcurrentAutoRemediations)}
@@ -241,7 +241,7 @@ export function AutonomousConfigSection({
               max={720}
               value={configResidualRemediationCooldownHours}
               onChange={e => setConfigResidualRemediationCooldownHours(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('residual_remediation_cooldown_hours', configResidualRemediationCooldownHours)}
@@ -262,7 +262,7 @@ export function AutonomousConfigSection({
               max={50}
               value={configResidualAuditDeferEscalationThreshold}
               onChange={e => setConfigResidualAuditDeferEscalationThreshold(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('residual_audit_defer_escalation_threshold', configResidualAuditDeferEscalationThreshold)}
@@ -283,7 +283,7 @@ export function AutonomousConfigSection({
               max={50}
               value={configMaxActiveDirections}
               onChange={e => setConfigMaxActiveDirections(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('max_active_directions', configMaxActiveDirections)}
@@ -304,7 +304,7 @@ export function AutonomousConfigSection({
               max={100}
               value={configArchitectureReviewFrequency}
               onChange={e => setConfigArchitectureReviewFrequency(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('architecture_review_frequency', configArchitectureReviewFrequency)}
@@ -325,7 +325,7 @@ export function AutonomousConfigSection({
               max={10080}
               value={configStrategicMaxIntervalMinutes}
               onChange={e => setConfigStrategicMaxIntervalMinutes(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('strategic_max_interval_minutes', configStrategicMaxIntervalMinutes)}
@@ -346,7 +346,7 @@ export function AutonomousConfigSection({
               max={10}
               value={configMaxProvisionRetries}
               onChange={e => setConfigMaxProvisionRetries(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('max_provision_retries', configMaxProvisionRetries)}
@@ -367,7 +367,7 @@ export function AutonomousConfigSection({
               max={20}
               value={configMaxRollupRetries}
               onChange={e => setConfigMaxRollupRetries(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('max_rollup_retries', configMaxRollupRetries)}
@@ -388,7 +388,7 @@ export function AutonomousConfigSection({
               max={50}
               value={configDriftOverClaimMinClaims}
               onChange={e => setConfigDriftOverClaimMinClaims(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('drift_over_claim_min_claims', configDriftOverClaimMinClaims)}
@@ -408,7 +408,7 @@ export function AutonomousConfigSection({
               step={0.05}
               value={configDriftConsistencyThreshold}
               onChange={e => setConfigDriftConsistencyThreshold(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('drift_over_claim_consistency_threshold', configDriftConsistencyThreshold)}
@@ -427,7 +427,7 @@ export function AutonomousConfigSection({
               max={50}
               value={configDriftStallMinClaims}
               onChange={e => setConfigDriftStallMinClaims(Number(e.target.value))}
-              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="flex-1 bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm workbench-focus"
             />
             <button
               onClick={() => saveConfigField('drift_stall_min_claims', configDriftStallMinClaims)}
@@ -447,7 +447,7 @@ export function AutonomousConfigSection({
                 if (!window.confirm('Wipe all residual CODE_ERROR fingerprints from memory? This only affects the in-memory store used for auto-remediation spawn decisions.')) return;
                 await clearResidualFingerprints();
               }}
-              className="flex-1 text-left bg-neutral-900 border border-neutral-700 hover:border-red-600/50 text-neutral-300 hover:text-red-400 rounded px-3 py-1.5 text-xs transition-colors"
+              className="flex-1 text-left bg-workbench-base border border-neutral-700 hover:border-red-600/50 text-neutral-300 hover:text-red-400 rounded px-3 py-1.5 text-xs transition-colors"
             >
               Clear all residual fingerprints
             </button>

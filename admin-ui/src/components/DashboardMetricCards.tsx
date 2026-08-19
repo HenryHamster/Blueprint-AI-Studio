@@ -17,7 +17,7 @@ export function MetricCard({ label, value, color, spark, dataKey, loading }: {
   if (loading) return <Skeleton className="h-20" />;
   const fill = SPARK_COLORS[color] ?? '#a3a3a3';
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
+    <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">{label}</p>
       <p className={`text-2xl font-bold font-mono text-${color}-400`}>{value}</p>
       {spark.length >= 3 && (
@@ -63,7 +63,7 @@ export function FailedCard({ value, groups, spark, loading, windowHours = 24 }: 
   const fill = SPARK_COLORS['red'];
   const topGroups = (groups ?? []).slice(0, 3);
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
+    <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Failed ({windowLabel(windowHours)})</p>
       <p className="text-2xl font-bold font-mono text-red-400">{value}</p>
       {spark.length >= 3 && (
@@ -84,7 +84,7 @@ export function FailedCard({ value, groups, spark, loading, windowHours = 24 }: 
       {value > 0 && topGroups.length > 0 && (
         <div className="flex flex-wrap gap-1 mt-1.5">
           {topGroups.map(g => {
-            const cls = FAILURE_CLASS_COLORS[g.failure_class] ?? 'bg-neutral-500/20 text-neutral-400';
+            const cls = FAILURE_CLASS_COLORS[g.failure_class] ?? 'bg-workbench-control/20 text-neutral-400';
             const short = FAILURE_CLASS_SHORT[g.failure_class] ?? g.failure_class.toLowerCase();
             return (
               <span key={g.failure_class} className={`text-ui-xs px-1.5 py-0.5 rounded font-medium ${cls}`}>
@@ -108,7 +108,7 @@ export function SuccessRateCard({ rate, trend, trendHistory, loading }: {
   const TrendIcon = trend === 'improving' ? TrendingUp : trend === 'declining' ? TrendingDown : Minus;
   const trendColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-neutral-500';
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
+    <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Success Rate</p>
       <div className="flex items-center gap-2">
         <p className="text-2xl font-bold font-mono text-neutral-100">{rate != null ? `${Math.round(rate * 100)}%` : '--'}</p>
@@ -141,7 +141,7 @@ export function ConversionRateCard({ rate, loading }: {
   const pct = rate != null ? Math.round(rate * 100) : null;
   const color = pct == null ? 'text-neutral-500' : pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
+    <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Conversion Rate</p>
       <p className={`text-2xl font-bold font-mono ${color}`}>{pct != null ? `${pct}%` : '--'}</p>
       <p className="text-ui-sm text-neutral-600 mt-1">PRs merged / PR-eligible tasks created</p>
@@ -157,7 +157,7 @@ export function AcceptanceRateCard({ rate, loading }: {
   const pct = rate != null ? Math.round(rate * 100) : null;
   const color = pct == null ? 'text-neutral-500' : pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
+    <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Acceptance Rate</p>
       <p className={`text-2xl font-bold font-mono ${color}`}>{pct != null ? `${pct}%` : '--'}</p>
       <p className="text-ui-sm text-neutral-600 mt-1">PRs merged / (merged + rejected)</p>
@@ -176,7 +176,7 @@ export function CostCard({ totalCost, trendHistory, loading, windowHours = 24 }:
   const fill = SPARK_COLORS['blue'];
   const display = totalCost == null ? '--' : totalCost < 10 ? `$${totalCost.toFixed(2)}` : `$${Math.round(totalCost)}`;
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
+    <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Cost ({windowLabel(windowHours)})</p>
       <p className="text-2xl font-bold font-mono text-blue-400">{display}</p>
       {sparkPoints.length >= 3 && (
@@ -220,7 +220,7 @@ export function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality
   const reviewerFindingCount = deriveReviewerFindingCount(trends);
   if (rate == null || reviewerFindingCount < MIN_SR_CATCH_FINDINGS) {
     return (
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
         <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
         <p className="text-2xl font-bold font-mono text-neutral-500">too small</p>
         <p className="text-ui-sm text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
@@ -245,7 +245,7 @@ export function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality
   const deltaOpacity = (verdict === 'stable' || significant === false) ? 'opacity-50' : '';
 
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
+    <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
       <div className="flex items-center justify-between mb-1">
         <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">SR Catch Rate</p>
         {trends?.is_stale && (

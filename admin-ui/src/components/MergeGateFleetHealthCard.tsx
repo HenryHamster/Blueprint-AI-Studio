@@ -12,7 +12,7 @@ import type { MergeGateFleetHealth } from '../types/digest';
 export function MergeGateFleetHealthCard({ data, stale }: { data?: MergeGateFleetHealth | null; stale?: boolean }) {
   if (!data && stale) {
     return (
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 opacity-50">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 opacity-50">
         <div className="flex items-center gap-2 mb-2">
           <ShieldCheck className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
           <h3 className="text-ui-md font-bold text-neutral-500 uppercase tracking-widest">Merge Gate Health</h3>
@@ -32,7 +32,7 @@ export function MergeGateFleetHealthCard({ data, stale }: { data?: MergeGateFlee
     ratePct == null ? 'text-neutral-400' : ratePct >= 90 ? 'text-emerald-400' : ratePct >= 70 ? 'text-amber-400' : 'text-red-400';
 
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+    <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
       <div className="flex items-center gap-2 mb-2">
         {degraded ? (
           <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />

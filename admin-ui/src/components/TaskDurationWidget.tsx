@@ -36,7 +36,7 @@ export function TaskDurationWidget({ data }: Props) {
         {hasTypes && Object.entries(data.stats).sort(([a], [b]) => a.localeCompare(b)).map(([type, s]) => (
           <span
             key={type}
-            className="inline-flex items-center gap-1 text-ui-sm font-semibold px-2 py-0.5 rounded border bg-neutral-800/60 text-neutral-300 border-neutral-600/40"
+            className="inline-flex items-center gap-1 text-ui-sm font-semibold px-2 py-0.5 rounded border bg-workbench-panel/60 text-neutral-300 border-neutral-600/40"
             title={`${type}: p50 ${fmt(s.p50_seconds)} (n=${s.sample_count})`}
           >
             {type}
@@ -76,7 +76,7 @@ export function TaskDurationWidget({ data }: Props) {
               const isWarn = ph === 'execution' && s.p50_seconds > EXEC_P50_WARN_SECONDS;
               const cls = isWarn
                 ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
-                : 'bg-neutral-800/60 text-neutral-300 border-neutral-600/40';
+                : 'bg-workbench-panel/60 text-neutral-300 border-neutral-600/40';
               return (
                 <span
                   key={ph}

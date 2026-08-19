@@ -133,7 +133,7 @@ function EfficiencySubTable({
       {caption && (
         <p className="text-ui-xs text-neutral-600 mb-1 px-1 normal-case tracking-normal">{caption}</p>
       )}
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
           {rows.map((row) => {
@@ -223,7 +223,7 @@ function ProviderRoutingVerdictCallout({ verdict }: { verdict: ProviderRoutingVe
     INSUFFICIENT_DATA: 'bg-amber-500/20 text-amber-300 border-amber-500/40',
   };
   return (
-    <div className="mb-2 rounded border border-neutral-700/50 bg-neutral-900/30 px-2.5 py-1.5 text-ui-sm">
+    <div className="mb-2 rounded border border-neutral-700/50 bg-workbench-base/30 px-2.5 py-1.5 text-ui-sm">
       <div className="flex items-center gap-2 mb-1">
         <span
           className={`inline-block px-1.5 py-px rounded text-ui-xs font-semibold border ${badgeColor[state]}`}
@@ -271,7 +271,7 @@ function ProviderRoutingShareBlock({ share }: { share: ProviderRoutingShare }) {
   if (!by_provider || by_provider.length === 0) return null;
 
   return (
-    <div className="mb-2 rounded border border-neutral-700/50 bg-neutral-900/30 px-2.5 py-1.5 text-ui-sm">
+    <div className="mb-2 rounded border border-neutral-700/50 bg-workbench-base/30 px-2.5 py-1.5 text-ui-sm">
       <h3 className="text-ui-xs font-semibold text-neutral-500 uppercase tracking-wider mb-1">
         Provider Routing Distribution
       </h3>

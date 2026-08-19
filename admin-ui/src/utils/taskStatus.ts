@@ -32,11 +32,11 @@ export function taskStatusDotColor(status: string): string {
     case 'PROVISIONING': return 'bg-sky-700/50';
     case 'EVALUATING':   return 'bg-indigo-600/50';
     case 'FAILED':       return 'bg-red-500';
-    case 'CANCELLED':    return 'bg-neutral-600';
+    case 'CANCELLED':    return 'bg-workbench-card';
     case 'BLOCKED':      return 'bg-amber-500';
     case 'PARKED':       return 'bg-purple-600/50';
     case 'QUEUED':
-    default:             return 'bg-neutral-500';
+    default:             return 'bg-workbench-control';
   }
 }
 

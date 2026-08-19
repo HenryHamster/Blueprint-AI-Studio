@@ -17,7 +17,7 @@ const SERVING_STATUS_CLASS: Record<string, string> = {
 export function servingStatusClass(status?: string | null): string {
   return (
     (status != null && SERVING_STATUS_CLASS[status]) ||
-    'bg-neutral-500/10 border-neutral-500/20 text-neutral-400'
+    'bg-workbench-control/10 border-neutral-500/20 text-neutral-400'
   );
 }
 

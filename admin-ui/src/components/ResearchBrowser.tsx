@@ -144,14 +144,14 @@ function classifySourceRef(ref: string, repoUrl: string | null): SourceLink {
 const AGREEMENT_STYLES: Record<string, { label: string; cls: string }> = {
   agrees: { label: 'Confirmed', cls: 'bg-emerald-900/40 text-emerald-400 border-emerald-700/40' },
   disagrees: { label: 'Challenged', cls: 'bg-red-900/40 text-red-400 border-red-700/40' },
-  indeterminate: { label: 'Indeterminate', cls: 'bg-neutral-800 text-neutral-400 border-neutral-700/40' },
+  indeterminate: { label: 'Indeterminate', cls: 'bg-workbench-panel text-neutral-400 border-neutral-700/40' },
 };
 
 function ChallengePanel({ challenge, onNavigateToTask }: { challenge: FindingChallenge; onNavigateToTask?: (id: string) => void }) {
   const agreement = challenge.agreement ?? 'indeterminate';
   const style = AGREEMENT_STYLES[agreement] ?? AGREEMENT_STYLES.indeterminate;
   return (
-    <div className="mt-1.5 border border-neutral-800 rounded p-2 space-y-1 bg-neutral-900/40">
+    <div className="mt-1.5 border border-neutral-800 rounded p-2 space-y-1 bg-workbench-base/40">
       <div className="flex items-center gap-1.5 flex-wrap">
         <GitBranch className="w-3 h-3 text-neutral-500 shrink-0" />
         <span className="text-ui-sm uppercase tracking-wide text-neutral-500">Second opinion</span>
@@ -261,14 +261,14 @@ function OutcomeSummaryPills({ summary }: { summary: TaskEvaluationSummary }) {
   const { label: verdictLabel, tone: verdictToneId } = formatVerdict(summary.verdict);
   return (
     <div className="flex flex-wrap gap-1.5 text-ui-sm">
-      <span className="rounded bg-neutral-800/80 px-1.5 py-0.5 text-neutral-300 uppercase tracking-wide">
+      <span className="rounded bg-workbench-panel/80 px-1.5 py-0.5 text-neutral-300 uppercase tracking-wide">
         {summary.status}
       </span>
       <span className={`rounded border px-1.5 py-0.5 uppercase tracking-wide ${verdictToneBadgeClass(verdictToneId)}`}>
         {verdictLabel}
       </span>
       {highlights.slice(0, 2).map((item, i) => (
-        <span key={i} className="rounded bg-neutral-900/70 px-1.5 py-0.5 text-neutral-400 border border-neutral-800">
+        <span key={i} className="rounded bg-workbench-base/70 px-1.5 py-0.5 text-neutral-400 border border-neutral-800">
           <span className="text-neutral-500">{item.label}</span> {item.value}
         </span>
       ))}
@@ -535,7 +535,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   return (
     <div className="fixed inset-0 z-50 flex">
       <div className="flex-1 bg-black/40" onClick={onClose} />
-      <div className="w-full max-w-[600px] bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl">
+      <div className="w-full max-w-[600px] bg-workbench-shell border-l border-neutral-800 flex flex-col shadow-2xl">
         {/* Header */}
         <div className="flex justify-between items-center p-4 border-b border-neutral-800 shrink-0">
           <div>
@@ -577,7 +577,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
               value={search}
               onChange={e => setSearch(e.target.value)}
               placeholder="Search findings..."
-              className="w-full bg-neutral-900 border border-neutral-800 rounded pl-8 pr-3 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 focus:outline-none focus:ring-1 focus:ring-neutral-700"
+              className="w-full bg-workbench-base border border-neutral-800 rounded pl-8 pr-3 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 workbench-focus"
             />
           </div>
           <div className="flex items-center gap-1 flex-wrap">
@@ -589,8 +589,8 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                 onClick={() => setOutcomeFilter(opt.value)}
                 className={`px-2 py-0.5 rounded text-ui-sm font-medium transition-colors ${
                   outcomeFilter === opt.value
-                    ? `bg-neutral-700 ${opt.color}`
-                    : 'bg-neutral-900 text-neutral-600 hover:text-neutral-400'
+                    ? `bg-workbench-layer ${opt.color}`
+                    : 'bg-workbench-base text-neutral-600 hover:text-neutral-400'
                 }`}
               >
                 {opt.label}
@@ -603,12 +603,12 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
         <div className="flex-1 overflow-y-auto p-4 space-y-3">
           {/* Research quality card */}
           {recentFindings && recentFindings.total > 0 && (
-            <div className="bg-neutral-900/50 border border-neutral-800 rounded-lg overflow-hidden">
+            <div className="bg-workbench-base/50 border border-neutral-800 rounded-lg overflow-hidden">
               {/* reason: quality card collapse toggle; py-3 matches direction group header density */}
               <button
                 data-viewport-allow-small-target
                 onClick={() => setQualityCardCollapsed(c => !c)}
-                className="w-full flex items-center gap-3 px-4 py-3 hover:bg-neutral-800/30 transition-colors text-left"
+                className="w-full flex items-center gap-3 px-4 py-3 hover:bg-workbench-hover/30 transition-colors text-left"
               >
                 <BarChart2 className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
                 <span className="flex-1 text-xs font-medium text-neutral-200">Research quality</span>
@@ -622,7 +622,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                 <div className="border-t border-neutral-800 px-4 py-3 space-y-3">
                   {/* Distribution bar */}
                   <div className="space-y-1.5">
-                    <div className="flex h-2 rounded-full overflow-hidden bg-neutral-800">
+                    <div className="flex h-2 rounded-full overflow-hidden bg-workbench-panel">
                       {recentFindings.grade_distribution_pct.HIGH > 0 && (
                         <div style={{ width: `${recentFindings.grade_distribution_pct.HIGH}%` }} className="bg-emerald-500" />
                       )}
@@ -630,7 +630,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                         <div style={{ width: `${recentFindings.grade_distribution_pct.MEDIUM}%` }} className="bg-amber-500" />
                       )}
                       {recentFindings.grade_distribution_pct.LOW > 0 && (
-                        <div style={{ width: `${recentFindings.grade_distribution_pct.LOW}%` }} className="bg-neutral-600" />
+                        <div style={{ width: `${recentFindings.grade_distribution_pct.LOW}%` }} className="bg-workbench-card" />
                       )}
                     </div>
                     <div className="flex gap-4 text-ui-sm">
@@ -682,11 +682,11 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                         <button
                           key={i}
                           onClick={handleFindingClick}
-                          className="w-full flex items-center gap-2 text-ui-md text-left hover:bg-neutral-800/30 px-1.5 py-1 rounded transition-colors min-h-[44px]"
+                          className="w-full flex items-center gap-2 text-ui-md text-left hover:bg-workbench-hover/30 px-1.5 py-1 rounded transition-colors min-h-[44px]"
                         >
                           <span className={`shrink-0 px-1.5 py-0.5 rounded text-ui-xs font-medium ${
                             f.actionability_grade === 'HIGH' ? 'bg-emerald-500/20 text-emerald-400' :
-                            f.actionability_grade === 'LOW' ? 'bg-neutral-700 text-neutral-500' :
+                            f.actionability_grade === 'LOW' ? 'bg-workbench-layer text-neutral-500' :
                             'bg-amber-500/20 text-amber-400'
                           }`}>
                             {f.actionability_grade}
@@ -717,12 +717,12 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
               groupMetrics.get(groupKey) ?? computeFindingMetrics(group.findings, isFindingRefuted);
 
             return (
-              <div key={groupKey} className="bg-neutral-900/50 border border-neutral-800 rounded-lg overflow-hidden">
+              <div key={groupKey} className="bg-workbench-base/50 border border-neutral-800 rounded-lg overflow-hidden">
                 {/* reason: finding group expand row; py-3 renders at 44px but sub-pixel margin in compact results list */}
                 <button
                   data-viewport-allow-small-target
                   onClick={() => toggleGroup(groupKey)}
-                  className="w-full flex items-center gap-3 px-4 py-3 hover:bg-neutral-800/30 transition-colors text-left"
+                  className="w-full flex items-center gap-3 px-4 py-3 hover:bg-workbench-hover/30 transition-colors text-left"
                 >
                   {isExpanded
                     ? <ChevronDown className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
@@ -738,7 +738,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                       <span className={`px-1.5 py-0.5 rounded ${
                         group.directionStatus === 'active' ? 'bg-emerald-500/15 text-emerald-400' :
                         group.directionStatus === 'paused' ? 'bg-amber-500/15 text-amber-400' :
-                        'bg-neutral-700/50 text-neutral-500'
+                        'bg-workbench-layer/50 text-neutral-500'
                       }`}>
                         {group.directionStatus}
                       </span>
@@ -786,7 +786,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                             event.preventDefault();
                             toggleFindingDetail();
                           }}
-                          className="w-full text-left px-4 py-2 hover:bg-neutral-800/20 transition-colors"
+                          className="w-full text-left px-4 py-2 hover:bg-workbench-hover/20 transition-colors"
                         >
                           <div className="flex items-center gap-2">
                             {outcomeInfo && OutcomeIcon && outcomeTaskId && onNavigateToTask
@@ -894,7 +894,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                   }`}>{ef.finding.scope}/{ef.finding.risk}</span>
                                 )}
                               {ef.finding.type && (
-                                <span className="px-1 py-0.5 rounded bg-neutral-800 text-neutral-400">{ef.finding.type}</span>
+                                <span className="px-1 py-0.5 rounded bg-workbench-panel text-neutral-400">{ef.finding.type}</span>
                               )}
                               {ef.finding.priority && ef.finding.priority !== 'medium' && (
                                 <span className={ef.finding.priority === 'high' ? 'text-amber-400' : 'text-neutral-500'}>{ef.finding.priority} priority</span>

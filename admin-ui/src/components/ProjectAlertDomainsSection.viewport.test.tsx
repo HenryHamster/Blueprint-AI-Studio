@@ -63,7 +63,7 @@ describe('ProjectAlertDomainsSection viewport regression', () => {
     root = r;
     await act(async () => {
       r.render(
-        <div className="min-h-screen bg-neutral-950 p-2 text-neutral-100">
+        <div className="min-h-screen bg-workbench-shell p-2 text-neutral-100">
           <ProjectAlertDomainsSection projectId="proj-1" canSave />
         </div>,
       );

@@ -1021,13 +1021,13 @@ export default function App() {
 
   const pipelineSurfaceActions = (
     <>
-      <span className="hidden items-center rounded-md border border-neutral-800 bg-neutral-950/80 px-2.5 py-1.5 text-xs text-neutral-500 md:inline-flex">
+      <span className="hidden items-center rounded-md border border-neutral-800 bg-workbench-shell/80 px-2.5 py-1.5 text-xs text-neutral-500 md:inline-flex">
         {filteredTasks.length}/{s.tasks.length}
       </span>
       <button
         type="button"
         onClick={() => { void s.fetchTasks(); }}
-        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9"
+        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100 sm:min-h-9"
       >
         Refresh
       </button>
@@ -1035,7 +1035,7 @@ export default function App() {
         <button
           type="button"
           onClick={s.openNewTaskModal}
-          className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9"
+          className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100 sm:min-h-9"
         >
           New task
         </button>
@@ -1089,7 +1089,7 @@ export default function App() {
             className={`inline-flex min-h-11 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
               s.compactMode
                 ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'
-                : 'border-neutral-800/50 bg-neutral-900/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+                : 'border-neutral-800/50 bg-workbench-base/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
             }`}
           >
             <LayoutList className="h-3.5 w-3.5" />
@@ -1104,7 +1104,7 @@ export default function App() {
             className={`inline-flex min-h-11 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
               s.selectionMode
                 ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'
-                : 'border-neutral-800/50 bg-neutral-900/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+                : 'border-neutral-800/50 bg-workbench-base/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
             }`}
           >
             <CheckSquare className="h-3.5 w-3.5" />
@@ -1120,7 +1120,7 @@ export default function App() {
   );
   if (s.authLoading) {
     return (
-      <div className="h-screen flex items-center justify-center bg-neutral-950 text-neutral-400">
+      <div className="h-screen flex items-center justify-center bg-workbench-shell text-neutral-400">
         <Activity className="w-5 h-5 animate-spin" />
       </div>
     );
@@ -1128,13 +1128,13 @@ export default function App() {
 
   if (!s.user) {
     return (
-      <div className="h-screen flex items-center justify-center bg-neutral-950">
-        <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-8 text-center max-w-sm">
+      <div className="h-screen flex items-center justify-center bg-workbench-shell">
+        <div className="bg-workbench-base border border-neutral-800 rounded-lg p-8 text-center max-w-sm">
           <h1 className="text-lg font-semibold text-neutral-100 mb-2">Blueprint</h1>
           <p className="text-xs text-neutral-500 mb-6">Sign in with your Google account to continue</p>
           <button
             onClick={() => signInWithGoogle().catch(e => s.setError(String(e)))}
-            className="bg-white hover:bg-neutral-200 text-neutral-950 px-6 py-2 rounded text-sm font-semibold transition-colors w-full"
+            className="bg-white hover:bg-workbench-hover text-neutral-950 px-6 py-2 rounded text-sm font-semibold transition-colors w-full"
           >
             Sign in with Google
           </button>
@@ -1146,8 +1146,8 @@ export default function App() {
 
   if (s.accessDenied) {
     return (
-      <div className="h-screen flex items-center justify-center bg-neutral-950">
-        <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-8 text-center max-w-sm">
+      <div className="h-screen flex items-center justify-center bg-workbench-shell">
+        <div className="bg-workbench-base border border-neutral-800 rounded-lg p-8 text-center max-w-sm">
           <h1 className="text-lg font-semibold text-neutral-100 mb-2">Access Denied</h1>
           <p className="text-xs text-neutral-500 mb-4">
             Your account ({s.user.email}) is not authorized to access Blueprint.
@@ -1155,7 +1155,7 @@ export default function App() {
           <p className="text-xs text-neutral-600 mb-6">Contact an administrator to request access.</p>
           <button
             onClick={() => { void signOut(); }}
-            className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 px-6 py-2 rounded text-sm font-medium transition-colors w-full"
+            className="bg-workbench-panel hover:bg-workbench-hover text-neutral-200 px-6 py-2 rounded text-sm font-medium transition-colors w-full"
           >
             Sign out
           </button>
@@ -1166,7 +1166,7 @@ export default function App() {
 
   if (s.userRole === null) {
     return (
-      <div className="h-screen flex items-center justify-center bg-neutral-950 text-neutral-400">
+      <div className="h-screen flex items-center justify-center bg-workbench-shell text-neutral-400">
         <Activity className="w-5 h-5 animate-spin" />
       </div>
     );
@@ -1179,7 +1179,7 @@ export default function App() {
     <TaskCapabilitiesProvider contract={s.taskCapabilityContract}>
     <div className="flex min-h-screen flex-col bg-[#08090b] text-neutral-200 font-sans md:h-screen md:overflow-hidden">
       {s.refreshing && (
-        <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-neutral-800 overflow-hidden">
+        <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-workbench-panel overflow-hidden">
           <div className="h-full w-2/5 bg-cyan-400" style={{ animation: 'progress-slide 1.2s ease-in-out infinite' }} />
         </div>
       )}
@@ -1303,7 +1303,7 @@ export default function App() {
               <button
                   type="button"
                   onClick={openStrategicContextWorkspace}
-                  className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 lg:hidden"
+                  className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100 sm:min-h-9 lg:hidden"
                   title="Open Strategic context"
                   aria-label="Open Strategic context"
                 >
@@ -1316,8 +1316,8 @@ export default function App() {
                 aria-pressed={!chatRailCollapsed}
                 className={`hidden min-h-11 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-xs font-semibold transition-colors sm:min-h-9 lg:inline-flex ${
                   chatRailCollapsed
-                    ? 'border-neutral-800 bg-neutral-950 text-neutral-300 hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100'
-                    : 'border-neutral-700 bg-neutral-800/90 text-neutral-100'
+                    ? 'border-neutral-800 bg-workbench-shell text-neutral-300 hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100'
+                    : 'border-neutral-700 bg-workbench-panel/90 text-neutral-100'
                 }`}
                 title={chatRailCollapsed ? 'Show context panel' : 'Hide context panel'}
                 aria-label={chatRailCollapsed ? 'Show context panel' : 'Hide context panel'}
@@ -1642,7 +1642,7 @@ export default function App() {
                 type="button"
                 data-viewport-allow-small-target
                 onClick={openTrackedTaskStreams}
-                className="rounded border border-neutral-800 bg-neutral-950/70 px-1.5 text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-100"
+                className="rounded border border-neutral-800 bg-workbench-shell/70 px-1.5 text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-100"
                 title="Open tracked task streams in Pipeline"
               >
                 tracking {s.trackedTaskIds.size}

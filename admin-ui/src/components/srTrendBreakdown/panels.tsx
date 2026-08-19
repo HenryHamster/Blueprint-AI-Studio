@@ -31,7 +31,7 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
       ? `cycle ${trend.current_cycle_id.slice(-6)} vs ${trend.previous_cycle_id ? trend.previous_cycle_id.slice(-6) : '–'}`
       : null;
   return (
-    <div data-testid="edges-trend-breakdown" className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]">
+    <div data-testid="edges-trend-breakdown" className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]">
       <div className="flex items-baseline gap-2 mb-1">
         <p className="text-ui-xs text-neutral-500 uppercase tracking-wide">Edges considered</p>
         {cycleLabel && <span className="text-ui-xs text-neutral-600 font-mono">{cycleLabel}</span>}
@@ -193,7 +193,7 @@ export function DirectionSrBreakdownPanel({
               : 'text-red-400';
         const categories = Object.entries(direction.categories).sort(([, a], [, b]) => (b.miss_rate ?? 0) - (a.miss_rate ?? 0));
         return (
-          <div key={direction.direction_id} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2">
+          <div key={direction.direction_id} className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2">
             <div className="flex items-baseline gap-2 mb-0.5">
               <span className={`font-mono font-bold tabular-nums ${rateColor}`} title="overall SR catch rate for this direction">
                 {rate != null ? `${Math.round(rate * 100)}%` : '–'}

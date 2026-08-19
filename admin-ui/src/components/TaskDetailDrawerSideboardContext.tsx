@@ -121,7 +121,7 @@ function ContextValue({ children, muted = false }: { children: ReactNode; muted?
 
 function ContextStat({ label, value }: { label: string; value: ReactNode }) {
   return (
-    <div className="min-w-0 rounded border border-neutral-800/80 bg-[#10151c] px-2 py-1.5">
+    <div className="min-w-0 rounded border border-neutral-800/80 bg-workbench-layer px-2 py-1.5">
       <ContextLabel>{label}</ContextLabel>
       <div className="mt-0.5 min-w-0 break-words text-sm font-medium text-neutral-200">{value}</div>
     </div>
@@ -406,7 +406,7 @@ export function TaskSideboardContextSection({
                   target="_blank"
                   rel="noopener noreferrer"
                   data-viewport-allow-small-target
-                  className="inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] px-2 text-xs font-semibold text-cyan-300 hover:border-cyan-500/50 hover:text-cyan-200"
+                  className="inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-layer px-2 text-xs font-semibold text-cyan-300 hover:border-cyan-500/50 hover:text-cyan-200"
                 >
                   <GitPullRequest className="h-3.5 w-3.5" aria-hidden="true" />
                   PR
@@ -428,7 +428,7 @@ export function TaskSideboardContextSection({
                 const taskId = resolveTaskTargetId(link.target);
                 const canOpenTask = Boolean(taskId && onNavigateToTask);
                 const externalUrl = externalTargetUrl(link.target);
-                const className = 'inline-flex max-w-full min-w-0 flex-col rounded border border-neutral-800 bg-[#10151c] px-2 py-1 text-left transition-colors';
+                const className = 'inline-flex max-w-full min-w-0 flex-col rounded border border-neutral-800 bg-workbench-layer px-2 py-1 text-left transition-colors';
                 const children = (
                   <>
                     <span className="break-words text-xs font-medium text-neutral-200">{link.label}</span>

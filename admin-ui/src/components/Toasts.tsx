@@ -13,7 +13,7 @@ export interface Toast {
 const styles: Record<Toast['type'], string> = {
   success: 'bg-emerald-950/90 border-emerald-800/50 text-emerald-300',
   error: 'bg-red-950/90 border-red-800/50 text-red-300',
-  info: 'bg-neutral-900/90 border-neutral-700/50 text-neutral-300',
+  info: 'bg-workbench-base/90 border-neutral-700/50 text-neutral-300',
 };
 
 const toastCounterRef = { current: 0 };

@@ -318,7 +318,7 @@ export function DirectionsPanel({
   const showStrategistChip = strategistStatus.phase !== 'idle' && (strategistActive || lastCycleCompletion);
 
   return (
-      <div className="flex-1 min-h-0 overflow-hidden flex flex-col bg-neutral-950">
+      <div className="flex-1 min-h-0 overflow-hidden flex flex-col bg-workbench-shell">
         <DirectionsPanelHeader
           selectedProjectId={selectedProjectId}
           projects={projects}

@@ -110,7 +110,7 @@ function AttemptRow({ attempt, index }: { attempt: FixLoopAttempt; index: number
         <div className={`w-5 h-5 rounded-full flex items-center justify-center text-ui-sm font-bold shrink-0 ${
           attempt.exit_reason === 'passed' ? 'bg-emerald-600/30 text-emerald-300' :
           isTerminal ? 'bg-red-600/30 text-red-300' :
-          'bg-neutral-700 text-neutral-400'
+          'bg-workbench-layer text-neutral-400'
         }`}>
           {index + 1}
         </div>
@@ -150,7 +150,7 @@ function LoopSection({ name, attempts, summary }: { name: string; attempts: FixL
   const label = LOOP_LABELS[name] ?? name;
   const { last_exit_reason } = summary;
   const converged = last_exit_reason === 'passed';
-  const dot = converged ? 'bg-emerald-500' : last_exit_reason ? 'bg-red-500' : 'bg-neutral-600';
+  const dot = converged ? 'bg-emerald-500' : last_exit_reason ? 'bg-red-500' : 'bg-workbench-card';
   const outcome = generateLoopOutcome(name, attempts, summary);
 
   return (
@@ -162,7 +162,7 @@ function LoopSection({ name, attempts, summary }: { name: string; attempts: FixL
       )}
       {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
-        className="w-full flex items-center gap-2 py-1.5 text-left hover:bg-neutral-800/30 rounded px-1 -mx-1"
+        className="w-full flex items-center gap-2 py-1.5 text-left hover:bg-workbench-hover/30 rounded px-1 -mx-1"
         onClick={() => setExpanded(e => !e)}
       >
         <div className={`w-2 h-2 rounded-full shrink-0 ${dot}`} />
@@ -172,7 +172,7 @@ function LoopSection({ name, attempts, summary }: { name: string; attempts: FixL
         <span className="ml-auto text-neutral-600 text-ui-sm">{expanded ? '▲' : '▼'}</span>
       </button>
       {expanded && attempts.length > 0 && (
-        <div className="ml-4 mt-1 bg-neutral-900/50 rounded-lg border border-neutral-800 p-2">
+        <div className="ml-4 mt-1 bg-workbench-base/50 rounded-lg border border-neutral-800 p-2">
           {attempts.map((a, i) => (
             <AttemptRow key={i} attempt={a} index={i} />
           ))}

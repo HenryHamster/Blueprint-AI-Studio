@@ -56,7 +56,7 @@ function statusToneClass(descriptor: StrategicContextRenderableDescriptor): stri
     return 'border-amber-500/25 bg-amber-500/10 text-amber-300';
   }
   if (descriptor.empty || normalized.includes('empty')) {
-    return 'border-neutral-800 bg-neutral-950/50 text-neutral-500';
+    return 'border-neutral-800 bg-workbench-shell/50 text-neutral-500';
   }
   if (normalized.includes('failed') || normalized.includes('blocked') || normalized.includes('critical')) {
     return 'border-rose-500/25 bg-rose-500/10 text-rose-300';
@@ -64,7 +64,7 @@ function statusToneClass(descriptor: StrategicContextRenderableDescriptor): stri
   if (normalized.includes('ready') || normalized.includes('complete')) {
     return 'border-emerald-500/25 bg-emerald-500/10 text-emerald-300';
   }
-  return 'border-neutral-800 bg-neutral-950/50 text-neutral-400';
+  return 'border-neutral-800 bg-workbench-shell/50 text-neutral-400';
 }
 
 function descriptorIcon(kind: string): ReactNode {
@@ -295,7 +295,7 @@ function MediaLightbox({ url, alt, onClose }: { url: string; alt: string; onClos
           href={url}
           target="_blank"
           rel="noopener noreferrer"
-          className="flex min-h-11 shrink-0 items-center gap-1.5 rounded border border-neutral-700 bg-neutral-900 px-3 text-xs font-semibold text-sky-300 transition-colors hover:border-sky-500/50 hover:text-sky-200"
+          className="flex min-h-11 shrink-0 items-center gap-1.5 rounded border border-neutral-700 bg-workbench-base px-3 text-xs font-semibold text-sky-300 transition-colors hover:border-sky-500/50 hover:text-sky-200"
           data-testid="strategic-artifact-lightbox-newtab"
         >
           <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
@@ -304,7 +304,7 @@ function MediaLightbox({ url, alt, onClose }: { url: string; alt: string; onClos
         <button
           type="button"
           onClick={onClose}
-          className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded border border-neutral-700 bg-neutral-900 text-neutral-300 transition-colors hover:border-neutral-500 hover:text-neutral-100"
+          className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded border border-neutral-700 bg-workbench-base text-neutral-300 transition-colors hover:border-neutral-500 hover:text-neutral-100"
           aria-label="Close full-size preview"
           data-testid="strategic-artifact-lightbox-close"
         >
@@ -318,7 +318,7 @@ function MediaLightbox({ url, alt, onClose }: { url: string; alt: string; onClos
 function MediaSkeleton({ className }: { className: string }) {
   return (
     <div
-      className={`${className} animate-pulse rounded bg-neutral-800/70`}
+      className={`${className} animate-pulse rounded bg-workbench-panel/70`}
       data-testid="strategic-artifact-loading"
       aria-hidden="true"
     />
@@ -535,7 +535,7 @@ export function ArtifactViewablePreviews({
 
   return (
     <div
-      className="mt-1 flex gap-1 overflow-x-auto rounded border border-neutral-800 bg-neutral-950/45 p-1 custom-scrollbar"
+      className="mt-1 flex gap-1 overflow-x-auto rounded border border-neutral-800 bg-workbench-shell/45 p-1 custom-scrollbar"
       data-testid="strategic-artifact-viewable-previews"
     >
       {items.map((preview, i) => {
@@ -564,7 +564,7 @@ export function ArtifactViewablePreviews({
               revision={preview.revision}
               bakedUrl={preview.url}
               label={alt}
-              className="flex h-20 w-32 flex-shrink-0 flex-col items-center justify-center gap-1 rounded border border-neutral-700 bg-neutral-900 p-1 text-xs text-neutral-300 hover:text-sky-300"
+              className="flex h-20 w-32 flex-shrink-0 flex-col items-center justify-center gap-1 rounded border border-neutral-700 bg-workbench-base p-1 text-xs text-neutral-300 hover:text-sky-300"
               live={preview.live}
               expiresAt={expiresAt}
             />
@@ -616,7 +616,7 @@ function ImageDescriptorBlock({
         : [];
 
   return (
-    <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45" data-testid="strategic-context-image-block">
+    <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-workbench-shell/45" data-testid="strategic-context-image-block">
       {items.length > 1 ? (
         <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
           {items.map((img, i) => (
@@ -673,7 +673,7 @@ function VideoDescriptorBlock({
         : [];
 
   return (
-    <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45" data-testid="strategic-context-video-block">
+    <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-workbench-shell/45" data-testid="strategic-context-video-block">
       {items.length > 1 ? (
         <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
           {items.map((v, i) => (
@@ -732,7 +732,7 @@ function DetailValue({
       <button
         type="button"
         onClick={() => onOpenTarget(target)}
-        className="flex min-h-11 min-w-0 items-center justify-between gap-2 rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-left text-sm text-neutral-200 transition-colors hover:border-neutral-700 hover:bg-neutral-900"
+        className="flex min-h-11 min-w-0 items-center justify-between gap-2 rounded border border-neutral-800 bg-workbench-shell/45 px-2 py-1.5 text-left text-sm text-neutral-200 transition-colors hover:border-neutral-700 hover:bg-workbench-hover"
       >
         <span className="min-w-0 break-words">{children}</span>
         <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />
@@ -740,7 +740,7 @@ function DetailValue({
     );
   }
   return (
-    <div className="min-w-0 break-words rounded border border-neutral-800 bg-neutral-950/35 px-2 py-1.5 text-sm text-neutral-200">
+    <div className="min-w-0 break-words rounded border border-neutral-800 bg-workbench-shell/35 px-2 py-1.5 text-sm text-neutral-200">
       {children}
     </div>
   );
@@ -821,7 +821,7 @@ function DescriptorCard({
           <button
             type="button"
             onClick={() => onOpenTarget?.(descriptor.target)}
-            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-100"
+            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-workbench-hover hover:text-neutral-100"
             title={`Open ${descriptor.title}`}
             aria-label={`Open ${descriptor.title}`}
           >
@@ -844,7 +844,7 @@ function DescriptorCard({
               type="button"
               disabled={!metric.target || !onOpenTarget}
               onClick={() => onOpenTarget?.(metric.target)}
-              className="min-h-11 min-w-0 rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-left disabled:cursor-default"
+              className="min-h-11 min-w-0 rounded border border-neutral-800 bg-workbench-shell/45 px-2 py-1.5 text-left disabled:cursor-default"
             >
               <span className="block break-words text-ui-sm font-semibold uppercase text-neutral-500">{metric.label}</span>
               <span className={`mt-0.5 block break-words font-mono text-sm font-semibold ${metricToneClass(metric.tone)}`}>
@@ -859,7 +859,7 @@ function DescriptorCard({
       {descriptor.kind === 'table' && columns.length > 0 && (
         <div className="mt-2 overflow-hidden rounded border border-neutral-800">
           <table className="w-full table-fixed text-left text-xs">
-            <thead className="bg-neutral-950/70 text-ui-sm uppercase text-neutral-500">
+            <thead className="bg-workbench-shell/70 text-ui-sm uppercase text-neutral-500">
               <tr>
                 {columns.slice(0, 4).map(column => (
                   <th key={column.key} className="px-2 py-1.5 font-semibold">{column.label}</th>
@@ -886,7 +886,7 @@ function DescriptorCard({
 
       {(descriptor.kind === 'markdown' || descriptor.kind === 'text') && (
         descriptor.body || descriptor.summary ? (
-          <pre className="mt-2 max-h-48 min-w-0 overflow-auto whitespace-pre-wrap break-words rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-xs leading-relaxed text-neutral-300 custom-scrollbar">
+          <pre className="mt-2 max-h-48 min-w-0 overflow-auto whitespace-pre-wrap break-words rounded border border-neutral-800 bg-workbench-shell/45 px-2 py-1.5 text-xs leading-relaxed text-neutral-300 custom-scrollbar">
             {descriptor.body || descriptor.summary}
           </pre>
         ) : (
@@ -915,7 +915,7 @@ function DescriptorCard({
               ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri, revision: fallback.revision, live: fallback.live }]
               : [];
         return (
-          <div className="mt-2 rounded border border-neutral-800 bg-neutral-950/45 p-1" data-testid="strategic-context-pdf-block">
+          <div className="mt-2 rounded border border-neutral-800 bg-workbench-shell/45 p-1" data-testid="strategic-context-pdf-block">
             {items.length > 0 ? (
               <div className="flex flex-col gap-1">
                 {items.map((doc, i) => (
@@ -926,7 +926,7 @@ function DescriptorCard({
                     revision={doc.revision}
                     bakedUrl={doc.url}
                     label={doc.alt || doc.filename || (items.length > 1 ? `${descriptor.title} ${i + 1}` : descriptor.title)}
-                    className="flex min-h-11 w-full items-center gap-2 rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-left text-sm text-neutral-200 transition-colors hover:border-sky-500/50 hover:bg-neutral-900"
+                    className="flex min-h-11 w-full items-center gap-2 rounded border border-neutral-800 bg-workbench-shell/45 px-2 py-1.5 text-left text-sm text-neutral-200 transition-colors hover:border-sky-500/50 hover:bg-workbench-hover"
                     live={doc.live}
                     expiresAt={descriptor.artifact_expires_at}
                   />
@@ -955,7 +955,7 @@ function DescriptorCard({
       )}
 
       {(descriptor.kind === 'chart' || descriptor.kind === 'plot') && (
-        <div className="mt-2 space-y-1.5 rounded border border-neutral-800 bg-neutral-950/45 p-2">
+        <div className="mt-2 space-y-1.5 rounded border border-neutral-800 bg-workbench-shell/45 p-2">
           {descriptor.chart?.kind === 'line' && chartPoints.length > 0 ? (
             <div className="space-y-1">
               {(descriptor.chart?.y_label || descriptor.chart?.x_label) && (
@@ -972,7 +972,7 @@ function DescriptorCard({
             return (
               <div key={`${descriptor.id}:${point.label}`} className="grid min-w-0 grid-cols-[5.5rem_minmax(0,1fr)_3rem] items-center gap-2 text-xs">
                 <span className="min-w-0 break-words text-neutral-500">{point.label}</span>
-                <span className="h-2 rounded bg-neutral-800">
+                <span className="h-2 rounded bg-workbench-panel">
                   <span className="block h-2 rounded bg-cyan-500/70" style={{ width: `${pct}%` }} />
                 </span>
                 <span className="text-right font-mono text-neutral-300">{formatCompactNumber(point.value)}</span>
@@ -1064,7 +1064,7 @@ export function StrategicContextArtifactSlot({
               <button
                 type="button"
                 onClick={() => onOpenTarget(mapDescriptor.target)}
-                className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-100"
+                className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-workbench-hover hover:text-neutral-100"
                 title={`Open ${mapDescriptor.title}`}
                 aria-label={`Open ${mapDescriptor.title}`}
               >

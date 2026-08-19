@@ -174,7 +174,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
             </DetailRow>
             <DetailRow label="Progress">
               <div className="flex items-center gap-2">
-                <div className="flex-1 bg-neutral-700 rounded-full h-2 max-w-xs overflow-hidden">
+                <div className="flex-1 bg-workbench-layer rounded-full h-2 max-w-xs overflow-hidden">
                   <div
                     className={`h-full transition-all ${isOver ? 'bg-amber-500' : 'bg-emerald-500'}`}
                     style={{ width: `${Math.min(progressPct, 100)}%` }}
@@ -270,7 +270,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
 
       {task.description && <>
         <SectionHeader>Description</SectionHeader>
-        <pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800">{task.description}</pre>
+        <pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-workbench-base/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800">{task.description}</pre>
       </>}
 
       {task.payloads && task.payloads.length > 0 && (() => {
@@ -325,7 +325,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
               Raw Context
             </button>
             {rawContextExpanded && (
-              <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono">
+              <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-workbench-base/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono">
                 {JSON.stringify(task.context, null, 2)}
               </pre>
             )}

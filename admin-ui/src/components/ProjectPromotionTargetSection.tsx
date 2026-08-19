@@ -66,11 +66,11 @@ export function ProjectPromotionTargetSection({ data, canSave, onSave, relatedIn
         <div className="space-y-3">
           <div className="flex items-center gap-2">
             <span className="text-xs text-neutral-400 shrink-0 w-24">Current value</span>
-            <span className="font-mono text-xs text-neutral-200 bg-neutral-900 border border-neutral-800 rounded px-2 py-1 flex-1 truncate">
+            <span className="font-mono text-xs text-neutral-200 bg-workbench-base border border-neutral-800 rounded px-2 py-1 flex-1 truncate">
               {data?.promotion_target ?? '—'}
             </span>
             {data?.is_default ? (
-              <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700 shrink-0">global default</span>
+              <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-workbench-panel text-neutral-500 border border-neutral-700 shrink-0">global default</span>
             ) : (
               <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50 shrink-0">override</span>
             )}
@@ -79,7 +79,7 @@ export function ProjectPromotionTargetSection({ data, canSave, onSave, relatedIn
           {relatedIntegrationBranch && relatedIntegrationBranch !== (data?.promotion_target ?? '') && (
             <div className="flex items-center gap-2">
               <span className="text-xs text-neutral-400 shrink-0 w-24">Integration</span>
-              <span className="font-mono text-xs text-neutral-300 bg-neutral-900 border border-neutral-800 rounded px-2 py-1 flex-1 truncate">
+              <span className="font-mono text-xs text-neutral-300 bg-workbench-base border border-neutral-800 rounded px-2 py-1 flex-1 truncate">
                 {relatedIntegrationBranch}
               </span>
               <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-400 border border-amber-900/50 shrink-0">LTS</span>
@@ -95,7 +95,7 @@ export function ProjectPromotionTargetSection({ data, canSave, onSave, relatedIn
               value={branchInput}
               onChange={e => { setBranchInput(e.target.value); setError(null); }}
               placeholder={data?.promotion_target ?? 'e.g. main/master/trunk'}
-              className={`w-full bg-neutral-950 border ${isValid ? 'border-neutral-700' : 'border-red-600'} text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600`}
+              className={`w-full bg-workbench-shell border ${isValid ? 'border-neutral-700' : 'border-red-600'} text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono workbench-focus`}
             />
             {!isValid && (
               <p className="text-ui-md text-red-400 mt-1">Branch name contains invalid characters. Use only a–z, A–Z, 0–9, ., _, /, -.</p>
@@ -113,7 +113,7 @@ export function ProjectPromotionTargetSection({ data, canSave, onSave, relatedIn
               <button
                 onClick={handleRevert}
                 disabled={saving}
-                className="inline-flex items-center justify-center min-h-[44px] bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded-lg px-4 py-2 text-xs transition-colors disabled:opacity-50"
+                className="inline-flex items-center justify-center min-h-[44px] bg-workbench-panel hover:bg-workbench-hover text-neutral-400 rounded-lg px-4 py-2 text-xs transition-colors disabled:opacity-50"
               >
                 {saving ? 'Reverting...' : 'Revert to default'}
               </button>
@@ -121,7 +121,7 @@ export function ProjectPromotionTargetSection({ data, canSave, onSave, relatedIn
             <button
               onClick={handleSave}
               disabled={saving || !hasChanges || !isValid || !branchInput.trim()}
-              className="inline-flex items-center justify-center min-h-[44px] bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50 ml-auto"
+              className="inline-flex items-center justify-center min-h-[44px] bg-workbench-layer hover:bg-workbench-hover text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50 ml-auto"
             >
               {saving ? 'Saving...' : 'Save Promotion Target'}
             </button>

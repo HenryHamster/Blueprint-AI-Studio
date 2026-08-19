@@ -116,8 +116,8 @@ function localRunnerTone(localRunner: StrategicLocalRunnerState): { dot: string;
   if (localRunner.mode === 'local') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'local' };
   if (localRunner.mode === 'local_ready') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'ready' };
   if (localRunner.mode === 'pending_local') return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'waiting' };
-  if (localRunner.mode === 'cloud') return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'cloud' };
-  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'unknown' };
+  if (localRunner.mode === 'cloud') return { dot: 'bg-workbench-card', text: 'text-neutral-400', label: 'cloud' };
+  return { dot: 'bg-workbench-card', text: 'text-neutral-400', label: 'unknown' };
 }
 
 function localRunnerDetail(localRunner: StrategicLocalRunnerState): string {
@@ -161,9 +161,9 @@ function runtimeWorkTone(work: StrategicRuntimeWorkState): { dot: string; text: 
     return { dot: 'bg-cyan-400', text: 'text-cyan-300', label: 'queued' };
   }
   if ((work.compute_jobs?.counts.terminal_recent ?? 0) > 0) {
-    return { dot: 'bg-neutral-500', text: 'text-neutral-400', label: 'recent result' };
+    return { dot: 'bg-workbench-control', text: 'text-neutral-400', label: 'recent result' };
   }
-  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'quiet' };
+  return { dot: 'bg-workbench-card', text: 'text-neutral-400', label: 'quiet' };
 }
 
 function runtimeWorkDetail(work: StrategicRuntimeWorkState): string {
@@ -197,7 +197,7 @@ function accountSpendTone(accountSpend: StrategicAccountSpendStatus): { dot: str
   const total = accountSpend.totalAccounts ?? null;
   const available = accountSpend.availableAccounts ?? null;
   const enabled = accountSpend.enabledAccounts ?? null;
-  if (total === 0) return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'not configured' };
+  if (total === 0) return { dot: 'bg-workbench-card', text: 'text-neutral-400', label: 'not configured' };
   if (available === 0 && (total == null || total > 0)) return { dot: 'bg-rose-400', text: 'text-rose-300', label: 'blocked' };
   if (
     (accountSpend.cooldownAccounts ?? 0) > 0 ||
@@ -208,7 +208,7 @@ function accountSpendTone(accountSpend: StrategicAccountSpendStatus): { dot: str
     return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'needs check' };
   }
   if ((available ?? 0) > 0 || (enabled ?? 0) > 0) return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'available' };
-  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'unknown' };
+  return { dot: 'bg-workbench-card', text: 'text-neutral-400', label: 'unknown' };
 }
 
 function accountSpendDetail(accountSpend: StrategicAccountSpendStatus): string {
@@ -256,7 +256,7 @@ function accountSpendHasProblem(
 function shaFreshnessTone(verdict?: string | null): { dot: string; text: string; label: string } {
   if (verdict === 'fresh') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'fresh' };
   if (verdict === 'stale') return { dot: 'bg-rose-400', text: 'text-rose-300', label: 'stale' };
-  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'unknown' };
+  return { dot: 'bg-workbench-card', text: 'text-neutral-400', label: 'unknown' };
 }
 
 function ShaFreshnessBlock({
@@ -339,7 +339,7 @@ function RailButton({
       onClick={onClick}
       aria-label={ariaLabel}
       title={title ?? ariaLabel}
-      className="inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
+      className="inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/70 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100"
     >
       <span>{children}</span>
       <ArrowUpRight className="h-3.5 w-3.5 text-neutral-500" aria-hidden="true" />
@@ -396,7 +396,7 @@ function SessionContextList({
         return (
           <div
             key={sessionRefKey(ref)}
-            className="flex min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/60 px-2 py-1.5"
+            className="flex min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/60 px-2 py-1.5"
           >
             <button
               type="button"
@@ -416,7 +416,7 @@ function SessionContextList({
                 type="button"
                 disabled={disabled}
                 onClick={() => onRemove(ref)}
-                className="flex min-h-11 min-w-11 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200 disabled:opacity-40"
+                className="flex min-h-11 min-w-11 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-workbench-hover hover:text-neutral-200 disabled:opacity-40"
                 title={`Stop keeping ${ref.label} in session context`}
                 aria-label={`Stop keeping ${ref.label} in session context`}
               >
@@ -563,7 +563,7 @@ const TASK_FOCUS_SECTIONS: Array<{
   { key: 'needs_judgment', label: 'Needs judgment', dot: 'bg-amber-300', text: 'text-amber-300', limit: 2 },
   { key: 'active', label: 'Pipeline', dot: 'bg-cyan-400', text: 'text-cyan-300', limit: 2 },
   { key: 'friction', label: 'Friction', dot: 'bg-rose-400', text: 'text-rose-300', limit: 2 },
-  { key: 'queued', label: 'Queued', dot: 'bg-neutral-500', text: 'text-neutral-400', limit: 1 },
+  { key: 'queued', label: 'Queued', dot: 'bg-workbench-control', text: 'text-neutral-400', limit: 1 },
   { key: 'recent_completed', label: 'Recent result', dot: 'bg-emerald-400', text: 'text-emerald-300', limit: 1 },
 ];
 
@@ -668,7 +668,7 @@ function TaskFocusRow({
 
   if (!onOpenTask) {
     return (
-      <div className="rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2">
+      <div className="rounded-md border border-neutral-800 bg-workbench-shell/60 px-2.5 py-2">
         {content}
       </div>
     );
@@ -678,7 +678,7 @@ function TaskFocusRow({
     <button
       type="button"
       onClick={() => onOpenTask(item.id)}
-      className="block min-h-11 w-full min-w-0 rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2 text-left transition-colors hover:border-neutral-700 hover:bg-neutral-900"
+      className="block min-h-11 w-full min-w-0 rounded-md border border-neutral-800 bg-workbench-shell/60 px-2.5 py-2 text-left transition-colors hover:border-neutral-700 hover:bg-workbench-hover"
     >
       {content}
     </button>
@@ -844,7 +844,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
         ? 'bg-red-400'
         : terminalDisposition === 'completed'
           ? 'bg-emerald-400'
-          : 'bg-neutral-600';
+          : 'bg-workbench-card';
   const formatTimestampAsOf = (timestamp?: string | null): string => {
     if (!timestamp) return '';
     try {

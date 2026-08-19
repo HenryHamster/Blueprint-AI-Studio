@@ -111,7 +111,7 @@ export function SystemHealthCard({
       {loading ? (
         <div className="space-y-2"><Skeleton className="h-10 w-full" /><Skeleton className="h-14 w-full" /></div>
       ) : !data ? (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-neutral-400 text-xs">
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-neutral-400 text-xs">
           <AlertTriangle className="w-4 h-4" />
           Health data unavailable
         </div>
@@ -120,14 +120,14 @@ export function SystemHealthCard({
           {data && (sr?.current != null || qd) && (
             <div className="flex flex-wrap gap-2 mb-2">
               {sr?.current != null && (
-                <div className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2.5 py-1.5 text-xs flex items-center gap-1.5">
+                <div className="bg-workbench-base/50 border border-neutral-800/50 rounded px-2.5 py-1.5 text-xs flex items-center gap-1.5">
                   <span className="text-neutral-500">Success</span>
                   <span className="font-mono font-bold text-neutral-200">{Math.round(sr.current * 100)}%</span>
                   {sr.trend && <span className={`text-ui-sm ${trendColor}`}>{trendIcon}</span>}
                 </div>
               )}
               {qd && (
-                <div className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2.5 py-1.5 text-xs flex items-center gap-2">
+                <div className="bg-workbench-base/50 border border-neutral-800/50 rounded px-2.5 py-1.5 text-xs flex items-center gap-2">
                   <span className="text-neutral-500">Queue</span>
                   <span className="font-mono text-neutral-300" title="queued">{qd.queued}q</span>
                   <span className="font-mono text-neutral-300" title="active">{qd.active}a</span>
@@ -142,26 +142,26 @@ export function SystemHealthCard({
                 type="button"
                 onClick={onOpenDirections}
                 aria-label="Open directions view"
-                className="w-full mb-2 rounded-lg border border-neutral-800/50 bg-neutral-900/40 px-2.5 py-2 text-left text-xs transition-colors hover:border-neutral-700 hover:bg-neutral-900/70 focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full mb-2 rounded-lg border border-neutral-800/50 bg-workbench-base/40 px-2.5 py-2 text-left text-xs transition-colors hover:border-neutral-700 hover:bg-workbench-hover/70 workbench-focus"
               >
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-neutral-500 uppercase tracking-wide text-ui-sm font-semibold">Directions</span>
-                  <span className={`rounded-full border px-2 py-0.5 font-mono text-ui-sm ${possiblyCompleteCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-neutral-950/40 text-neutral-500'}`}>
+                  <span className={`rounded-full border px-2 py-0.5 font-mono text-ui-sm ${possiblyCompleteCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-workbench-shell/40 text-neutral-500'}`}>
                     {possiblyCompleteCount} possibly complete
                   </span>
-                  <span className={`rounded-full border px-2 py-0.5 font-mono text-ui-sm ${missingCriteriaCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-neutral-950/40 text-neutral-500'}`}>
+                  <span className={`rounded-full border px-2 py-0.5 font-mono text-ui-sm ${missingCriteriaCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-workbench-shell/40 text-neutral-500'}`}>
                     {missingCriteriaCount} missing criteria
                   </span>
                 </div>
               </button>
             ) : (
-              <div className="mb-2 rounded-lg border border-neutral-800/50 bg-neutral-900/40 px-2.5 py-2 text-xs">
+              <div className="mb-2 rounded-lg border border-neutral-800/50 bg-workbench-base/40 px-2.5 py-2 text-xs">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-neutral-500 uppercase tracking-wide text-ui-sm font-semibold">Directions</span>
-                  <span className={`rounded-full border px-2 py-0.5 font-mono text-ui-sm ${possiblyCompleteCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-neutral-950/40 text-neutral-500'}`}>
+                  <span className={`rounded-full border px-2 py-0.5 font-mono text-ui-sm ${possiblyCompleteCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-workbench-shell/40 text-neutral-500'}`}>
                     {possiblyCompleteCount} possibly complete
                   </span>
-                  <span className={`rounded-full border px-2 py-0.5 font-mono text-ui-sm ${missingCriteriaCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-neutral-950/40 text-neutral-500'}`}>
+                  <span className={`rounded-full border px-2 py-0.5 font-mono text-ui-sm ${missingCriteriaCount > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-neutral-800/70 bg-workbench-shell/40 text-neutral-500'}`}>
                     {missingCriteriaCount} missing criteria
                   </span>
                 </div>
@@ -169,7 +169,7 @@ export function SystemHealthCard({
             )
           )}
           {issues.length === 0 ? (
-            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-emerald-400 text-xs">
+            <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-emerald-400 text-xs">
               <CheckCircle className="w-4 h-4" />
               All systems healthy
             </div>
@@ -182,7 +182,7 @@ export function SystemHealthCard({
                   .map(id => taskById.get(id))
                   .filter((t): t is Task => t != null);
                 return (
-                  <div key={i} className={`bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${borderCls} rounded-lg p-3`}>
+                  <div key={i} className={`bg-workbench-base/50 border border-neutral-800/50 border-l-2 ${borderCls} rounded-lg p-3`}>
                     <div className="flex items-start gap-2">
                       <AlertTriangle className={`w-4 h-4 mt-0.5 shrink-0 ${iconCls}`} />
                       <div className="min-w-0 flex-1">
@@ -194,7 +194,7 @@ export function SystemHealthCard({
                               <button
                                 key={t.id}
                                 onClick={() => onViewTask(t)}
-                                className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800/60 text-neutral-300 hover:text-neutral-100 hover:bg-neutral-700/60 transition-colors truncate max-w-[200px] min-h-[44px] flex items-center"
+                                className="text-ui-sm px-1.5 py-0.5 rounded bg-workbench-panel/60 text-neutral-300 hover:text-neutral-100 hover:bg-workbench-hover/60 transition-colors truncate max-w-[200px] min-h-[44px] flex items-center"
                               >
                                 {(t.title ?? t.id).slice(0, 40)}
                               </button>

@@ -87,7 +87,7 @@ export function ProblemModelEditor({
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
     >
-      <div className="bg-neutral-950 border border-neutral-800 rounded-lg w-full max-w-2xl max-h-[90vh] flex flex-col">
+      <div className="bg-workbench-shell border border-neutral-800 rounded-lg w-full max-w-2xl max-h-[90vh] flex flex-col">
         <div className="flex items-center justify-between px-5 py-3 border-b border-neutral-800">
           <h3 className="text-sm font-semibold text-neutral-100">Edit intent & constraints</h3>
           <button
@@ -112,7 +112,7 @@ export function ProblemModelEditor({
                 onChange={(e) => setPurpose(e.target.value)}
                 rows={2}
                 placeholder="Build an autonomous coding studio — agents ship merged PRs without intervention."
-                className="w-full px-3 py-2 text-sm bg-neutral-900 border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 focus:border-neutral-600 outline-none"
+                className="w-full px-3 py-2 text-sm bg-workbench-base border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 outline-none workbench-focus"
               />
             </label>
             <label className="block">
@@ -122,7 +122,7 @@ export function ProblemModelEditor({
                 onChange={(e) => setCurrentFocus(e.target.value)}
                 rows={2}
                 placeholder="Stabilize the tactical→review→merge loop at 70%+ first-attempt merge rate."
-                className="w-full px-3 py-2 text-sm bg-neutral-900 border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 focus:border-neutral-600 outline-none"
+                className="w-full px-3 py-2 text-sm bg-workbench-base border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 outline-none workbench-focus"
               />
             </label>
           </div>
@@ -141,7 +141,7 @@ export function ProblemModelEditor({
                   value={projectType}
                   onChange={(e) => setProjectType(e.target.value)}
                   placeholder="startup / research / product / personal / enterprise"
-                  className="w-full px-3 py-1.5 text-sm bg-neutral-900 border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 focus:border-neutral-600 outline-none"
+                  className="w-full px-3 py-1.5 text-sm bg-workbench-base border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 outline-none workbench-focus"
                 />
               </label>
               <label className="block">
@@ -151,7 +151,7 @@ export function ProblemModelEditor({
                   value={team}
                   onChange={(e) => setTeam(e.target.value)}
                   placeholder="solo / 3 engineers + 1 PM / etc."
-                  className="w-full px-3 py-1.5 text-sm bg-neutral-900 border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 focus:border-neutral-600 outline-none"
+                  className="w-full px-3 py-1.5 text-sm bg-workbench-base border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 outline-none workbench-focus"
                 />
               </label>
               <label className="block">
@@ -161,7 +161,7 @@ export function ProblemModelEditor({
                   value={users}
                   onChange={(e) => setUsers(e.target.value)}
                   placeholder="Who this is for, in one line"
-                  className="w-full px-3 py-1.5 text-sm bg-neutral-900 border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 focus:border-neutral-600 outline-none"
+                  className="w-full px-3 py-1.5 text-sm bg-workbench-base border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 outline-none workbench-focus"
                 />
               </label>
               <label className="block">
@@ -171,7 +171,7 @@ export function ProblemModelEditor({
                   value={deployCadence}
                   onChange={(e) => setDeployCadence(e.target.value)}
                   placeholder="continuous / weekly / quarterly / sporadic"
-                  className="w-full px-3 py-1.5 text-sm bg-neutral-900 border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 focus:border-neutral-600 outline-none"
+                  className="w-full px-3 py-1.5 text-sm bg-workbench-base border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 outline-none workbench-focus"
                 />
               </label>
             </div>
@@ -181,7 +181,7 @@ export function ProblemModelEditor({
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
                 rows={3}
-                className="w-full px-3 py-2 text-sm bg-neutral-900 border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 focus:border-neutral-600 outline-none"
+                className="w-full px-3 py-2 text-sm bg-workbench-base border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 outline-none workbench-focus"
               />
             </label>
           </div>
@@ -200,7 +200,7 @@ export function ProblemModelEditor({
                     value={c}
                     onChange={(e) => updateConstraint(i, e.target.value)}
                     placeholder="e.g., Don't modify .github/workflows/"
-                    className="flex-1 px-3 py-1.5 text-sm bg-neutral-900 border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 focus:border-neutral-600 outline-none"
+                    className="flex-1 px-3 py-1.5 text-sm bg-workbench-base border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 outline-none workbench-focus"
                   />
                   <button
                     type="button"
@@ -231,7 +231,7 @@ export function ProblemModelEditor({
             type="button"
             onClick={onClose}
             disabled={saving}
-            className="min-h-[44px] px-3 py-1.5 text-xs font-medium rounded border border-neutral-800 text-neutral-400 hover:bg-neutral-800/50 hover:text-neutral-200 transition"
+            className="min-h-[44px] px-3 py-1.5 text-xs font-medium rounded border border-neutral-800 text-neutral-400 hover:bg-workbench-hover/50 hover:text-neutral-200 transition"
           >
             Cancel
           </button>

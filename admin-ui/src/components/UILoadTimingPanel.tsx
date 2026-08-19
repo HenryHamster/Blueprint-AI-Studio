@@ -193,7 +193,7 @@ export function UILoadTimingPanel() {
           <select
             value={preset}
             onChange={e => setPreset(e.target.value)}
-            className="bg-neutral-800 text-neutral-200 border border-neutral-700 rounded px-2 py-0.5 text-xs"
+            className="bg-workbench-panel text-neutral-200 border border-neutral-700 rounded px-2 py-0.5 text-xs"
           >
             {CUTOFF_PRESETS.map(p => (
               <option key={p.value} value={p.value}>{p.label}</option>
@@ -204,7 +204,7 @@ export function UILoadTimingPanel() {
               type="datetime-local"
               value={customCutoff}
               onChange={e => setCustomCutoff(e.target.value)}
-              className="bg-neutral-800 text-neutral-200 border border-neutral-700 rounded px-2 py-0.5 text-xs"
+              className="bg-workbench-panel text-neutral-200 border border-neutral-700 rounded px-2 py-0.5 text-xs"
             />
           )}
           <span className="text-neutral-600 hidden sm:inline">|</span>
@@ -220,20 +220,20 @@ export function UILoadTimingPanel() {
             placeholder="Baseline label…"
             maxLength={128}
             aria-label="Baseline label"
-            className="bg-neutral-800 text-neutral-200 border border-neutral-700 rounded px-2 py-0.5 text-xs w-44 placeholder-neutral-600"
+            className="bg-workbench-panel text-neutral-200 border border-neutral-700 rounded px-2 py-0.5 text-xs w-44 placeholder-neutral-600"
           />
           {/* eslint-disable-next-line viewport/min-touch-target */}
           <button
             onClick={handlePin}
             disabled={pinning || pinLabel.trim() === ''}
-            className="bg-neutral-700 hover:bg-neutral-600 disabled:opacity-40 text-neutral-200 border border-neutral-600 rounded px-2 py-0.5 text-xs whitespace-nowrap"
+            className="bg-workbench-layer hover:bg-workbench-hover disabled:opacity-40 text-neutral-200 border border-neutral-600 rounded px-2 py-0.5 text-xs whitespace-nowrap"
           >
             {pinning ? 'Pinning…' : 'Pin baseline'}
           </button>
           {pinError && <span className="text-red-400 text-xs">{pinError}</span>}
         </div>
       </div>
-      <div className="overflow-hidden rounded-lg border border-neutral-800/50 bg-neutral-900/50 md:overflow-x-auto">
+      <div className="overflow-hidden rounded-lg border border-neutral-800/50 bg-workbench-base/50 md:overflow-x-auto">
         <table className="block w-full text-xs md:table">
           <thead className="hidden md:table-header-group">
             <tr className="text-ui-sm text-neutral-500 border-b border-neutral-800/50">

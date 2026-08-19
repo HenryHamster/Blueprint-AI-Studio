@@ -249,7 +249,7 @@ export function RuntimeWorkspace({
     }
   }, { intervalMs: DEFAULT_POLL_MS, enabled: !!selectedProjectId && canViewProject, deps: [selectedProjectId, canViewProject] });
   const activeRuntimeItem = resolveRuntimeItem(effectiveRuntimeSection);
-  const actionButtonClass = 'inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-0 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 sm:min-w-0 sm:px-3';
+  const actionButtonClass = 'inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/70 px-0 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100 sm:min-h-9 sm:min-w-0 sm:px-3';
   const runtimeAccounts = settingsRouterProps.maxPlanAccounts ?? [];
   const accountTotal = runtimeAccounts.length;
   const enabledAccounts = runtimeAccounts.filter(account => account.enabled).length;

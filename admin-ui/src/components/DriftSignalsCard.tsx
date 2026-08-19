@@ -129,7 +129,7 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
           {flagged_directions.map(d => (
             <div
               key={d.direction_id}
-              className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2"
+              className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2"
             >
               <p className="text-xs text-neutral-200 truncate">{d.direction_text || d.direction_id}</p>
               <div className="flex gap-1.5 mt-1 flex-wrap items-center">
@@ -161,7 +161,7 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
             </div>
           ))}
           {showSystemSummary && (
-            <div className="bg-neutral-900/40 border border-neutral-800/50 rounded-lg">
+            <div className="bg-workbench-base/40 border border-neutral-800/50 rounded-lg">
               <button
                 type="button"
                 className="w-full flex items-center gap-2 px-3 py-2 text-left"

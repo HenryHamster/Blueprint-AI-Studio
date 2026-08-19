@@ -261,7 +261,7 @@ export const MessagesComposer = memo(function MessagesComposer({
   return (
     <div className={minimal
       ? 'shrink-0 border-t border-workbench-border bg-workbench-base px-2 pb-2 pt-1.5 md:px-2.5'
-      : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
+      : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-workbench-shell/50'
     }>
       {minimal && strategicContext && (
         <StrategicContextDescriptor model={strategicContext} onOpen={onOpenStrategicContext} />
@@ -273,7 +273,7 @@ export const MessagesComposer = memo(function MessagesComposer({
       )}
       {/* Reply quote bar */}
       {replyTo && (
-        <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex items-center gap-2 rounded-r-md border-l-2 border-neutral-600 bg-neutral-900/75 px-2.5 py-1.5`}>
+        <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex items-center gap-2 rounded-r-md border-l-2 border-neutral-600 bg-workbench-base/75 px-2.5 py-1.5`}>
           <Reply className="w-3 h-3 text-neutral-400 shrink-0" />
           <span className="text-xs text-neutral-400 truncate flex-1">
             Replying to <span className="text-neutral-300">{replyTo.from}</span>: {replyTo.content.slice(0, 80)}{replyTo.content.length > 80 ? '...' : ''}
@@ -331,14 +331,14 @@ export const MessagesComposer = memo(function MessagesComposer({
               ? `(${att.size_bytes < 1024 ? '<1' : (att.size_bytes / 1024).toFixed(0)} KB)`
               : null;
             return (
-              <div key={att.id} className="group relative flex items-stretch rounded-md border border-neutral-700/60 bg-neutral-800/40 pr-7 text-xs text-neutral-300">
+              <div key={att.id} className="group relative flex items-stretch rounded-md border border-neutral-700/60 bg-workbench-panel/40 pr-7 text-xs text-neutral-300">
                 {preview ? (
                   // Image chip is clickable to open the full-size preview/editor.
                   <button
                     type="button"
                     onClick={() => setPreviewId(att.id)}
                     aria-label={`Open ${att.name} preview`}
-                    className="flex min-h-[44px] items-center gap-1.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-neutral-700/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-500"
+                    className="flex min-h-[44px] items-center gap-1.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-workbench-hover/40 workbench-focus"
                   >
                     <img src={preview} alt={att.name} className="h-8 w-8 rounded object-cover" />
                     <span className="max-w-[120px] truncate">{att.name}</span>
@@ -401,7 +401,7 @@ export const MessagesComposer = memo(function MessagesComposer({
       {hasMathInDraft && (
         <div
           aria-label="Math preview"
-          className={`${minimal ? minimalColumnClass : ''} mb-1.5 max-h-28 overflow-y-auto rounded border border-neutral-800/60 bg-neutral-900/40 px-3 py-2 text-sm`}
+          className={`${minimal ? minimalColumnClass : ''} mb-1.5 max-h-28 overflow-y-auto rounded border border-neutral-800/60 bg-workbench-base/40 px-3 py-2 text-sm`}
         >
           <MarkdownContent content={newContent} />
         </div>
@@ -428,7 +428,7 @@ export const MessagesComposer = memo(function MessagesComposer({
                 onClick={onOpenCommandPalette}
                 title="Open command palette (Ctrl+K)"
                 aria-label="Open command palette (Ctrl+K)"
-                className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-100 md:hidden"
+                className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-md border border-neutral-800/80 bg-workbench-shell/35 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-workbench-hover/80 hover:text-neutral-100 md:hidden"
               >
                 <Command className="h-3.5 w-3.5" />
                 <span className="hidden font-mono text-ui-sm text-neutral-500 sm:inline">Ctrl+K</span>
@@ -440,7 +440,7 @@ export const MessagesComposer = memo(function MessagesComposer({
               disabled={composerDisabled || editingLocked || attachmentLocked}
               title="Attach file"
               aria-label="Attach file"
-              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-300 disabled:opacity-40"
+              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-workbench-shell/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-workbench-hover/80 hover:text-neutral-300 disabled:opacity-40"
             >
               <Paperclip className="h-3.5 w-3.5" />
             </button>
@@ -450,7 +450,7 @@ export const MessagesComposer = memo(function MessagesComposer({
               disabled={composerDisabled || Boolean(editingLocked)}
               title="Insert equation"
               aria-label="Insert equation"
-              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-300 disabled:opacity-40"
+              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-workbench-shell/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-workbench-hover/80 hover:text-neutral-300 disabled:opacity-40"
             >
               <Sigma className="h-3.5 w-3.5" />
             </button>
@@ -463,7 +463,7 @@ export const MessagesComposer = memo(function MessagesComposer({
             disabled={composerDisabled || editingLocked || attachmentLocked}
             title="Attach file"
             aria-label="Attach file"
-            className="flex shrink-0 items-center justify-center rounded-xl bg-neutral-900/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
+            className="flex shrink-0 items-center justify-center rounded-lg bg-workbench-base/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-workbench-hover hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
           >
             <Paperclip className="w-4 h-4" />
           </button>
@@ -475,7 +475,7 @@ export const MessagesComposer = memo(function MessagesComposer({
             disabled={composerDisabled || Boolean(editingLocked)}
             title="Insert equation"
             aria-label="Insert equation"
-            className="flex shrink-0 items-center justify-center rounded-xl bg-neutral-900/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
+            className="flex shrink-0 items-center justify-center rounded-lg bg-workbench-base/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-workbench-hover hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
           >
             <Sigma className="w-4 h-4" />
           </button>
@@ -497,7 +497,7 @@ export const MessagesComposer = memo(function MessagesComposer({
             aria-describedby={sendState ? 'message-send-status' : undefined}
             className={minimal
               ? 'min-h-[44px] w-full resize-none rounded border-0 bg-transparent px-3 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 disabled:cursor-not-allowed disabled:text-neutral-500 md:min-h-8 md:py-1.5'
-              : 'w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600 resize-none min-h-[44px] leading-relaxed disabled:cursor-not-allowed disabled:text-neutral-500'
+              : 'w-full bg-workbench-base/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-4 py-2.5 text-sm workbench-focus placeholder-neutral-600 resize-none min-h-[44px] leading-relaxed disabled:cursor-not-allowed disabled:text-neutral-500'
             }
           />
         </div>
@@ -509,8 +509,8 @@ export const MessagesComposer = memo(function MessagesComposer({
           title={sendState === 'needs_retry' ? 'Retry message' : 'Send message'}
           data-send-state={sendState ?? undefined}
           className={minimal
-            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-500 text-neutral-950 transition-colors hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:opacity-100'
-            : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
+            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-500 text-neutral-950 transition-colors hover:bg-emerald-400 disabled:bg-workbench-panel disabled:text-neutral-500 disabled:opacity-100'
+            : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
           }
         >
           <Send className="w-4 h-4" />

@@ -586,20 +586,20 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
       {refreshError && (
         <VersionLifecycleRefreshBanner kind="stale" message={refreshError} lastSuccessfulRefreshAt={lastSuccessfulRefreshAt} refreshing={refreshing} canRetry={!!projectId} onRefresh={onRefresh} />
       )}
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-ui-sm">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-ui-sm">
         <div className="flex flex-wrap items-center gap-2">
           {data.promotion_enabled !== undefined && (
             <>
               <div className="flex flex-col gap-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${optimisticPromotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`} title="Fleet-wide setting (all projects)">
+                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${optimisticPromotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-workbench-control/10 border-neutral-500/30 text-neutral-400'}`} title="Fleet-wide setting (all projects)">
                     {optimisticPromotionEnabled ? 'LIVE' : 'DRY-RUN'}
                   </span>
                   {projectId && canManagePlatform && !readOnly && (
                     <button
                       onClick={handleTogglePromotionEnabled}
                       disabled={actionLoading !== null}
-                      className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                      className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                       title="Changes promotion mode for all projects"
                       data-viewport-allow-small-target
                     >
@@ -612,7 +612,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
               {data.promotion_enabled_effective !== undefined && (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${data.promotion_enabled_effective ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`} title="Effective promotion mode for THIS project">
+                    <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${data.promotion_enabled_effective ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-workbench-control/10 border-neutral-500/30 text-neutral-400'}`} title="Effective promotion mode for THIS project">
                       {data.promotion_enabled_effective ? 'LIVE' : 'DRY-RUN'}
                     </span>
                     {projectId && canManageProject && !readOnly && (
@@ -629,7 +629,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                         <button
                           onClick={() => handleSetProjectPromotion(false)}
                           disabled={actionLoading !== null || (data.promotion_enabled_source === 'project' && data.promotion_enabled_override === false)}
-                          className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                          className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                           title="Hold live promotion for this project only"
                           data-viewport-allow-small-target
                         >
@@ -639,7 +639,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                           <button
                             onClick={() => handleSetProjectPromotion(null)}
                             disabled={actionLoading !== null}
-                            className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                            className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                             title="Clear this project's override and follow the fleet default"
                             data-viewport-allow-small-target
                           >
@@ -730,7 +730,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                   placeholder="Enter version goal..."
                   maxLength={500}
                   disabled={actionLoading !== null}
-                  className="text-ui-md bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-1 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed resize-none"
+                  className="text-ui-md bg-workbench-panel border border-neutral-700 text-neutral-300 rounded px-2 py-1 disabled:opacity-50 disabled:cursor-not-allowed resize-none workbench-focus"
                   rows={2}
                 />
                 <div className="flex gap-1">
@@ -748,7 +748,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                       setGoalInput(cv.goal || '');
                     }}
                     disabled={actionLoading !== null}
-                    className="text-ui-sm px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="text-ui-sm px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                     data-viewport-allow-small-target
                   >
                     Cancel
@@ -793,7 +793,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                   <button
                     onClick={() => setEditingGoal(true)}
                     disabled={actionLoading !== null}
-                    className="text-ui-sm px-1.5 py-0.5 w-fit rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="text-ui-sm px-1.5 py-0.5 w-fit rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                     data-viewport-allow-small-target
                   >
                     Edit
@@ -804,7 +804,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
               <button
                 onClick={() => setEditingGoal(true)}
                 disabled={actionLoading !== null}
-                className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                 data-viewport-allow-small-target
               >
                 Set goal
@@ -819,7 +819,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
             {cv.qualification_state && (
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700'}`}>
+                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-workbench-panel text-neutral-400 border-neutral-700'}`}>
                     {cv.qualification_state.state.replace(/_/g, ' ')}
                   </span>
                   <ServingStatusBadge
@@ -1024,7 +1024,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                                       value={hotfixReason}
                                       onChange={e => setHotfixReason(e.target.value)}
                                       placeholder="Describe what this hotfix fixes and why it is safe"
-                                      className="w-full bg-neutral-800 border border-neutral-600 rounded px-2 py-1 text-ui-sm text-neutral-200 placeholder:text-neutral-600"
+                                      className="w-full bg-workbench-panel border border-neutral-600 rounded px-2 py-1 text-ui-sm text-neutral-200 placeholder:text-neutral-600"
                                       data-testid="hotfix-reason-input"
                                     />
                                   </div>
@@ -1183,7 +1183,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                         placeholder="Optional reason for cut..."
                         disabled={actionLoading !== null}
                         maxLength={200}
-                        className="text-ui-sm flex-1 bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-0.5 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="text-ui-sm flex-1 bg-workbench-panel border border-neutral-700 text-neutral-300 rounded px-2 py-0.5 disabled:opacity-50 disabled:cursor-not-allowed workbench-focus"
                       />
                       <button
                         onClick={handleCutVersion}
@@ -1199,7 +1199,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                           setCutReason('');
                         }}
                         disabled={actionLoading !== null}
-                        className="text-ui-sm px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="text-ui-sm px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                         data-viewport-allow-small-target
                       >
                         Cancel

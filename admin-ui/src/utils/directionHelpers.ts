@@ -43,9 +43,9 @@ export const priorityColors: Record<string, string> = {
 
 export const statusColors: Record<string, string> = {
   active: 'bg-emerald-950/40 text-emerald-400 border-emerald-900/50',
-  completed: 'bg-neutral-800/40 text-neutral-400 border-neutral-700/50',
+  completed: 'bg-workbench-panel/40 text-neutral-400 border-neutral-700/50',
   paused: 'bg-amber-950/40 text-amber-400 border-amber-900/50',
   proposed: 'bg-purple-950/40 text-purple-400 border-purple-900/50',
-  expired: 'bg-neutral-800/40 text-neutral-500 border-neutral-700/50',
+  expired: 'bg-workbench-panel/40 text-neutral-500 border-neutral-700/50',
   staged: 'bg-sky-950/40 text-sky-400 border-sky-900/50',
 };

@@ -102,7 +102,7 @@ describe('PipelineView composed with shell panels — viewport regression', () =
       root = r;
       await act(async () => {
         r.render(
-          <div className="flex flex-col bg-neutral-950 text-neutral-200 p-3 min-h-screen">
+          <div className="flex flex-col bg-workbench-shell text-neutral-200 p-3 min-h-screen">
             <OrchestratorHealthBar {...healthBarProps} />
             <div className="h-10 flex items-center border-b border-neutral-800 shrink-0" aria-label="navigation" />
             <PipelineView

@@ -116,7 +116,7 @@ export function PromotionPolicyBadge({
   error?: string | null;
 }) {
   if (!source) return null;
-  const style = POLICY_SOURCE_STYLE[source] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700';
+  const style = POLICY_SOURCE_STYLE[source] ?? 'bg-workbench-panel text-neutral-400 border-neutral-700';
   return (
     <div className="flex flex-wrap items-start gap-x-2 gap-y-0.5 text-ui-sm">
       <span className="text-neutral-500 uppercase tracking-wide">Policy source</span>
@@ -192,7 +192,7 @@ export function ManagedCheckWaitSnapshotDetails({
   return (
     <div
       data-testid="promotion-check-wait-snapshot"
-      className="text-ui-sm text-neutral-400 border border-neutral-800 bg-neutral-950/40 rounded px-2 py-1 space-y-1"
+      className="text-ui-sm text-neutral-400 border border-neutral-800 bg-workbench-shell/40 rounded px-2 py-1 space-y-1"
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <span className={`font-mono ${color}`}>ci:{snapshot.state}</span>
@@ -211,7 +211,7 @@ export function ManagedCheckWaitSnapshotDetails({
             return (
               <span
                 key={`${check.name}-${index}`}
-                className="font-mono text-ui-xs px-1 py-0.5 rounded border border-neutral-800 bg-neutral-900 text-neutral-300"
+                className="font-mono text-ui-xs px-1 py-0.5 rounded border border-neutral-800 bg-workbench-base text-neutral-300"
                 title={`${check.name}: ${status}`}
               >
                 {check.name}: {status}
@@ -606,7 +606,7 @@ export function AuditFindingsList({ audit }: { audit: LatestAudit }) {
       <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">Audit Findings</p>
       <AuditProvenance audit={audit} />
       {sorted.map((f, i) => (
-        <div key={i} className={`flex items-start gap-1.5 text-ui-sm px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
+        <div key={i} className={`flex items-start gap-1.5 text-ui-sm px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-workbench-panel/50 text-neutral-400 border-neutral-700/50'}`}>
           <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
           <span className="min-w-0 break-words">{f.summary}</span>
         </div>
@@ -662,17 +662,17 @@ export function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
     <div className="flex flex-wrap gap-1.5 items-center pt-0.5">
       <span className="text-ui-sm text-neutral-600 shrink-0">reconciliation:</span>
       {rec.model_reported_score != null && (
-        <span className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+        <span className="text-ui-sm px-1.5 py-0.5 rounded bg-workbench-panel text-neutral-400 border border-neutral-700 font-mono">
           model {Math.round(rec.model_reported_score * 100)}%
         </span>
       )}
       {rec.findings_derived_score != null && (
-        <span className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+        <span className="text-ui-sm px-1.5 py-0.5 rounded bg-workbench-panel text-neutral-400 border border-neutral-700 font-mono">
           findings {Math.round(rec.findings_derived_score * 100)}%
         </span>
       )}
       {rec.score_delta != null && (
-        <span className={`text-ui-sm px-1.5 py-0.5 rounded border font-mono ${hasDivergence ? 'bg-amber-950/40 text-amber-400 border-amber-900/50' : 'bg-neutral-800 text-neutral-500 border-neutral-700'}`}>
+        <span className={`text-ui-sm px-1.5 py-0.5 rounded border font-mono ${hasDivergence ? 'bg-amber-950/40 text-amber-400 border-amber-900/50' : 'bg-workbench-panel text-neutral-500 border-neutral-700'}`}>
           δ {Math.round(rec.score_delta * 100)}%
         </span>
       )}
@@ -722,7 +722,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="migration-safety"
-        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-workbench-panel text-neutral-400 border-neutral-700"
         title={q.migration_safety_detail ?? undefined}
       >
         migration {q.migration_safety ?? 'unknown'}
@@ -733,7 +733,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="migration-apply-safety"
-        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-workbench-panel text-neutral-400 border-neutral-700"
         title={q.migration_apply_safety_detail ?? undefined}
       >
         apply {q.migration_apply_safety ?? 'unknown'}
@@ -755,7 +755,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="excluded-audit-findings"
-        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-workbench-panel text-neutral-500 border-neutral-700"
         title={excludedFindings.map((f) => `${f.severity}: ${f.summary}`).join(' | ')}
       >
         {excludedFindings.length} excluded audit finding{excludedFindings.length !== 1 ? 's' : ''}
@@ -779,7 +779,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="test-erosion-detail"
-        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700 break-all"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-workbench-panel text-neutral-400 border-neutral-700 break-all"
         title={formatCompactDetail(q.test_erosion_detail)}
       >
         erosion {formatCompactDetail(q.test_erosion_detail)}
@@ -790,7 +790,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="smoketest-detail"
-        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700 break-all"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-workbench-panel text-neutral-400 border-neutral-700 break-all"
         title={formatCompactDetail(q.smoketest_detail)}
       >
         smoke {formatCompactDetail(q.smoketest_detail)}
@@ -801,7 +801,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="promotion-pr-url"
-        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-workbench-panel text-neutral-500 border-neutral-700"
         title={q.promotion_pr_url}
       >
         promotion PR
@@ -838,7 +838,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
       ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
       : isShortfall
         ? 'bg-amber-500/10 text-amber-300 border-amber-500/20'
-        : 'bg-neutral-800 text-neutral-400 border-neutral-700';
+        : 'bg-workbench-panel text-neutral-400 border-neutral-700';
     const gradeLabel =
       ga.assessed_grade != null ? ` ${Math.round(ga.assessed_grade * 100)}%` : '';
     chips.push(
@@ -895,7 +895,7 @@ export function PromotionReadinessSummary({ readiness }: { readiness: PromotionR
   if (isHistoricalCalibration) {
     return (
       <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
-        <span className="text-ui-sm font-semibold px-1.5 py-0.5 rounded border bg-neutral-500/10 border-neutral-500/30 text-neutral-400" title={reason}>
+        <span className="text-ui-sm font-semibold px-1.5 py-0.5 rounded border bg-workbench-control/10 border-neutral-500/30 text-neutral-400" title={reason}>
           pre-go-live dry-run calibration (historical)
         </span>
         <p className="text-ui-sm text-neutral-500 line-clamp-2">{reason}</p>
@@ -1183,15 +1183,15 @@ export function ChallengedVsUnchallengedSummary({ telemetry }: { telemetry: Chal
                 <span className="text-ui-sm text-neutral-600 italic"> — insufficient</span>
               ) : (
                 <div className="flex flex-wrap gap-1">
-                  <span className="text-ui-sm px-1 py-0 rounded bg-neutral-800 border border-neutral-700 text-neutral-400" title="exclusion rate — fraction of verdicts with audit findings excluded for lacking verification">excl {pct(s.exclusion_rate ?? 0)}</span>
+                  <span className="text-ui-sm px-1 py-0 rounded bg-workbench-panel border border-neutral-700 text-neutral-400" title="exclusion rate — fraction of verdicts with audit findings excluded for lacking verification">excl {pct(s.exclusion_rate ?? 0)}</span>
                   {s.disagreement_rate != null && (
-                    <span className={`text-ui-sm px-1 py-0 rounded border ${(s.disagreement_rate ?? 0) > 0.2 ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-neutral-800 border-neutral-700 text-neutral-400'}`} title="challenger disagreement rate — fraction where the challenger did not fully agree">disagree {pct(s.disagreement_rate)}</span>
+                    <span className={`text-ui-sm px-1 py-0 rounded border ${(s.disagreement_rate ?? 0) > 0.2 ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-workbench-panel border-neutral-700 text-neutral-400'}`} title="challenger disagreement rate — fraction where the challenger did not fully agree">disagree {pct(s.disagreement_rate)}</span>
                   )}
                   {s.wrong_decision_rate != null && (
                     <span className={`text-ui-sm px-1 py-0 rounded border ${s.wrong_decision_rate > 0 ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'}`} title={`post-promotion wrong decision rate over ${s.wrong_decision_resolved_sample ?? 0} resolved promotions`}>wrong {pct(s.wrong_decision_rate)}</span>
                   )}
                   {s.challenge_refuted_rate != null && (
-                    <span className={`text-ui-sm px-1 py-0 rounded border ${(s.challenge_refuted_rate ?? 0) > 0 ? 'bg-violet-500/10 border-violet-500/30 text-violet-400' : 'bg-neutral-800 border-neutral-700 text-neutral-400'}`} title={`challenger-refuted false positive rate — fraction of verdicts where the adversarial challenger explicitly refuted findings as false positives (${s.challenge_refuted_count ?? 0} total refuted findings)`}>refuted {pct(s.challenge_refuted_rate)}</span>
+                    <span className={`text-ui-sm px-1 py-0 rounded border ${(s.challenge_refuted_rate ?? 0) > 0 ? 'bg-violet-500/10 border-violet-500/30 text-violet-400' : 'bg-workbench-panel border-neutral-700 text-neutral-400'}`} title={`challenger-refuted false positive rate — fraction of verdicts where the adversarial challenger explicitly refuted findings as false positives (${s.challenge_refuted_count ?? 0} total refuted findings)`}>refuted {pct(s.challenge_refuted_rate)}</span>
                   )}
                 </div>
               )}
@@ -1343,7 +1343,7 @@ export function DimensionBreakdown({ dimensions }: { dimensions: DimensionState[
   return (
     <div data-testid="dimension-states" className="space-y-0.5 py-0.5">
       {dimensions.map(d => {
-        const dotClass = DIMENSION_STATUS_DOT[d.status] ?? 'bg-neutral-500';
+        const dotClass = DIMENSION_STATUS_DOT[d.status] ?? 'bg-workbench-control';
         const isFailed = d.status === 'failed';
         const isUnavailable = d.status === 'unavailable';
         const isPassed = d.status === 'passed';

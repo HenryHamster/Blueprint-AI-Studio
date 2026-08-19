@@ -72,9 +72,9 @@ export function AccountMenu(props: AccountMenuProps) {
           <button
             key={account.id}
             onClick={() => { onSwitchAccount(account.id); afterAction(); }}
-            className="flex min-h-[44px] w-full items-center gap-3 rounded px-3 py-2.5 text-left text-sm text-neutral-300 transition-colors hover:bg-neutral-800"
+            className="flex min-h-[44px] w-full items-center gap-3 rounded px-3 py-2.5 text-left text-sm text-neutral-300 transition-colors hover:bg-workbench-hover"
           >
-            <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-neutral-700 text-ui-sm font-semibold text-neutral-100">
+            <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-workbench-layer text-ui-sm font-semibold text-neutral-100">
               {accountInitial(accountLabel(account))}
             </span>
             <span className="min-w-0 flex-1 truncate">{accountLabel(account)}</span>
@@ -82,7 +82,7 @@ export function AccountMenu(props: AccountMenuProps) {
         ))}
         <button
           onClick={() => { onAddAccount(); afterAction(); }}
-          className="flex min-h-[44px] w-full items-center gap-3 rounded px-3 py-2.5 text-left text-sm text-neutral-300 transition-colors hover:bg-neutral-800"
+          className="flex min-h-[44px] w-full items-center gap-3 rounded px-3 py-2.5 text-left text-sm text-neutral-300 transition-colors hover:bg-workbench-hover"
         >
           <UserPlus className="h-4 w-4 shrink-0" />
           <span>Add account</span>
@@ -153,7 +153,7 @@ function DesktopAccountMenu(props: DesktopProps) {
         aria-expanded={open}
         className="flex h-7 items-center gap-1 rounded border border-workbench-border/80 bg-workbench-control px-1.5 text-neutral-400 transition-colors hover:bg-workbench-layer hover:text-neutral-100"
       >
-        <span className="grid h-4 w-4 shrink-0 place-items-center rounded-full bg-neutral-700 text-ui-sm font-semibold text-neutral-100">
+        <span className="grid h-4 w-4 shrink-0 place-items-center rounded-full bg-workbench-layer text-ui-sm font-semibold text-neutral-100">
           {accountInitial(activeEmail)}
         </span>
         <ChevronDown className="h-3 w-3 shrink-0" />
@@ -179,9 +179,9 @@ function DesktopAccountMenu(props: DesktopProps) {
                   key={account.id}
                   role="menuitem"
                   onClick={() => runAndClose(() => onSwitchAccount(account.id))}
-                  className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-neutral-300 transition-colors hover:bg-neutral-800"
+                  className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-neutral-300 transition-colors hover:bg-workbench-hover"
                 >
-                  <span className="grid h-5 w-5 shrink-0 place-items-center rounded-full bg-neutral-700 text-ui-sm font-semibold text-neutral-100">
+                  <span className="grid h-5 w-5 shrink-0 place-items-center rounded-full bg-workbench-layer text-ui-sm font-semibold text-neutral-100">
                     {accountInitial(accountLabel(account))}
                   </span>
                   <span className="min-w-0 flex-1 truncate">{accountLabel(account)}</span>
@@ -195,7 +195,7 @@ function DesktopAccountMenu(props: DesktopProps) {
             <button
               role="menuitem"
               onClick={() => runAndClose(onAddAccount)}
-              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-neutral-300 transition-colors hover:bg-neutral-800"
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-neutral-300 transition-colors hover:bg-workbench-hover"
             >
               <UserPlus className="h-4 w-4 shrink-0" />
               <span>Add account</span>

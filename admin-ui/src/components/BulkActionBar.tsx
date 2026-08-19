@@ -48,7 +48,7 @@ export function BulkActionBar({
   toggleSelectionMode,
 }: BulkActionBarProps) {
   return (
-    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex flex-wrap items-center justify-center gap-2 bg-neutral-800 border border-neutral-700 rounded-xl px-4 py-2.5 shadow-2xl max-w-[calc(100vw-1rem)]">
+    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex flex-wrap items-center justify-center gap-2 bg-workbench-panel border border-neutral-700 rounded-lg px-4 py-2.5 shadow-2xl max-w-[calc(100vw-1rem)]">
       <span className="flex items-center gap-1.5 text-xs text-neutral-300 font-medium mr-1">
         <CheckSquare className="w-3.5 h-3.5 text-amber-400" />
         {selectedCount} selected
@@ -111,7 +111,7 @@ export function BulkActionBar({
               toggleSelectionMode();
             },
           })}
-          className="px-3 py-1.5 min-h-[44px] rounded-lg text-xs font-medium bg-neutral-700 hover:bg-neutral-600 text-neutral-300 border border-neutral-600 transition-colors"
+          className="px-3 py-1.5 min-h-[44px] rounded-lg text-xs font-medium bg-workbench-layer hover:bg-workbench-hover text-neutral-300 border border-neutral-600 transition-colors"
         >
           Archive {terminalTasks.length}
         </button>
@@ -119,7 +119,7 @@ export function BulkActionBar({
       <button
         onClick={toggleSelectionMode}
         title="Exit selection mode"
-        className="ml-1 min-h-[44px] min-w-[44px] flex items-center justify-center rounded-lg text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700 transition-colors"
+        className="ml-1 min-h-[44px] min-w-[44px] flex items-center justify-center rounded-lg text-neutral-400 hover:text-neutral-200 hover:bg-workbench-hover transition-colors"
       >
         <X className="w-3.5 h-3.5" />
       </button>

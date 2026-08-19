@@ -352,7 +352,7 @@ export function NewTaskModal({
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-      <div className="bg-neutral-900 rounded-xl shadow-2xl w-full max-w-lg mx-3 sm:mx-auto overflow-y-auto max-h-[90vh] border border-neutral-800">
+      <div className="bg-workbench-base rounded-lg shadow-2xl w-full max-w-lg mx-3 sm:mx-auto overflow-y-auto max-h-[90vh] border border-neutral-800">
         <div className="flex justify-between items-center p-5 border-b border-neutral-800">
           <h2 className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
             <GitBranch className="w-4 h-4 text-neutral-400" />
@@ -378,7 +378,7 @@ export function NewTaskModal({
                 )}
               </div>
               {repoLoading ? (
-                <div className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-500 font-mono">
+                <div className="w-full bg-workbench-shell border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-500 font-mono">
                   Loading repos...
                 </div>
               ) : useManualRepo ? (
@@ -388,7 +388,7 @@ export function NewTaskModal({
                     required
                     value={newTaskRepo}
                     onChange={e => onRepoChange(e.target.value)}
-                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'}`}
+                    className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                     placeholder="owner/repo"
                   />
                   {repoError && <p className="text-ui-sm text-amber-500 mt-1">{repoError}</p>}
@@ -398,7 +398,7 @@ export function NewTaskModal({
                   required
                   value={newTaskRepo}
                   onChange={e => onRepoChange(e.target.value)}
-                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'}`}
+                  className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all font-mono appearance-none cursor-pointer ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                 >
                   <option value="" disabled>Select a repository</option>
                   {repoOptions.map(r => (
@@ -421,7 +421,7 @@ export function NewTaskModal({
                 )}
               </div>
               {branchLoading ? (
-                <div className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-500 font-mono">
+                <div className="w-full bg-workbench-shell border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-500 font-mono">
                   Loading branches...
                 </div>
               ) : useManualBranch || branchOptions.length === 0 ? (
@@ -430,7 +430,7 @@ export function NewTaskModal({
                     type="text"
                     value={newTaskBranch}
                     onChange={e => setNewTaskBranch(e.target.value)}
-                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
+                    className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                     placeholder={integrationBranch || "main"}
                   />
                   {branchError && <p className="text-ui-sm text-amber-500 mt-1">{branchError}</p>}
@@ -439,7 +439,7 @@ export function NewTaskModal({
                 <select
                   value={newTaskBranch}
                   onChange={e => setNewTaskBranch(e.target.value)}
-                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
+                  className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all font-mono appearance-none cursor-pointer ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                 >
                   {branchOptions.map(b => (
                     <option key={b} value={b}>{b}</option>
@@ -461,7 +461,7 @@ export function NewTaskModal({
                     className={`min-w-0 min-h-[44px] sm:min-h-0 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
                       newTaskType === opt.value
                         ? 'bg-white/5 border-neutral-600 text-neutral-100'
-                        : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
+                        : 'bg-workbench-shell border-neutral-800 text-neutral-500 hover:border-neutral-700'
                     }`}
                   >
                     <Icon className="w-3.5 h-3.5 shrink-0" />
@@ -485,7 +485,7 @@ export function NewTaskModal({
                   value={newTaskPrNumber}
                   onChange={e => { setNewTaskPrNumber(e.target.value); if (prNumberError) setPrNumberError(false); }}
                   onBlur={() => setPrNumberError(!isPrNumberValid(newTaskPrNumber))}
-                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${prNumberError ? 'border-red-500' : 'border-neutral-800'}`}
+                  className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 ${prNumberError ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                   placeholder="e.g., 15"
                 />
                 {prNumberError && <p className="text-ui-sm text-red-500 mt-1">PR number must be a positive integer.</p>}
@@ -496,14 +496,14 @@ export function NewTaskModal({
                   type="text"
                   value={newTaskPrBranch}
                   onChange={e => setNewTaskPrBranch(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                   placeholder="e.g., blueprint/task-abc123"
                 />
               </div>
             </div>
           </div>
           {isCodeProducing && (
-            <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
+            <div className="mb-4 rounded-lg border border-neutral-800 bg-workbench-shell/50 p-3">
               <div className="flex items-center justify-between mb-3">
                 <div className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">
                   Acceptance Evidence
@@ -515,7 +515,7 @@ export function NewTaskModal({
                 <select
                   value={evidence.kind}
                   onChange={e => updateEvidence('kind', e.target.value)}
-                  className="w-full truncate bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                  className="w-full truncate bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all appearance-none cursor-pointer workbench-focus"
                 >
                   {ACCEPTANCE_EVIDENCE_KINDS.map(option => (
                     <option key={option.value} value={option.value}>
@@ -532,7 +532,7 @@ export function NewTaskModal({
                       type="text"
                       value={evidence.testPath}
                       onChange={e => updateEvidence('testPath', e.target.value)}
-                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
+                      className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                       placeholder="e.g., tests/test_foo.py::test_bar or src/foo.test.ts"
                     />
                   </div>
@@ -542,7 +542,7 @@ export function NewTaskModal({
                       type="text"
                       value={evidence.testId}
                       onChange={e => updateEvidence('testId', e.target.value)}
-                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 workbench-focus"
                       placeholder="e.g., test_handle_create"
                     />
                   </div>
@@ -554,7 +554,7 @@ export function NewTaskModal({
                   <textarea
                     value={evidence.description}
                     onChange={e => updateEvidence('description', e.target.value)}
-                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
+                    className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                     placeholder="Describe a concrete behavior an operator or reviewer can verify…"
                   />
                 </div>
@@ -566,7 +566,7 @@ export function NewTaskModal({
                     type="text"
                     value={evidence.artifactId}
                     onChange={e => updateEvidence('artifactId', e.target.value)}
-                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
+                    className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                     placeholder="e.g., gs://bucket/path or a job id"
                   />
                 </div>
@@ -579,7 +579,7 @@ export function NewTaskModal({
                       type="text"
                       value={evidence.component}
                       onChange={e => updateEvidence('component', e.target.value)}
-                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
+                      className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                       placeholder="e.g., NewTaskModal"
                     />
                   </div>
@@ -591,7 +591,7 @@ export function NewTaskModal({
                       max="4096"
                       value={evidence.viewportWidth}
                       onChange={e => updateEvidence('viewportWidth', e.target.value)}
-                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                       placeholder="375"
                     />
                   </div>
@@ -607,7 +607,7 @@ export function NewTaskModal({
                     step="0.1"
                     value={evidence.threshold}
                     onChange={e => updateEvidence('threshold', e.target.value)}
-                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
+                    className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                     placeholder="e.g., 80"
                   />
                 </div>
@@ -618,7 +618,7 @@ export function NewTaskModal({
             </div>
           )}
           {isComputeExperiment && (
-            <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
+            <div className="mb-4 rounded-lg border border-neutral-800 bg-workbench-shell/50 p-3">
               <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-1.5 text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">
                   <Cpu className="w-3.5 h-3.5 text-neutral-500" />
@@ -640,7 +640,7 @@ export function NewTaskModal({
                   <textarea
                     value={ideaText}
                     onChange={e => setIdeaText(e.target.value)}
-                    className="flex-1 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600"
+                    className="flex-1 bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm resize-y min-h-[64px] transition-all placeholder:text-neutral-600 workbench-focus"
                     placeholder="Describe your experiment in plain English…"
                   />
                   <button
@@ -672,13 +672,13 @@ export function NewTaskModal({
                         type="text"
                         value={arm.name}
                         onChange={e => updateArm(idx, 'name', e.target.value)}
-                        className="w-24 flex-shrink-0 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                        className="w-24 flex-shrink-0 bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 workbench-focus"
                         placeholder="arm-A"
                       />
                       <textarea
                         value={arm.command}
                         onChange={e => updateArm(idx, 'command', e.target.value)}
-                        className="flex-1 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[40px] transition-all placeholder:text-neutral-600"
+                        className="flex-1 bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono resize-y min-h-[40px] transition-all placeholder:text-neutral-600 workbench-focus"
                         placeholder="python train.py --lr 0.01"
                       />
                       {computeExperiment.arms.length > 2 && (
@@ -710,7 +710,7 @@ export function NewTaskModal({
                       type="text"
                       value={computeExperiment.declaredMetric}
                       onChange={e => updateCompute('declaredMetric', e.target.value)}
-                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && computeExperiment.useArmsMode && !computeExperiment.declaredMetric.trim() ? 'border-red-500' : 'border-neutral-800'}`}
+                      className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 ${submitAttempted && computeExperiment.useArmsMode && !computeExperiment.declaredMetric.trim() ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                       placeholder="val/accuracy"
                     />
                     {submitAttempted && computeExperiment.useArmsMode && !computeExperiment.declaredMetric.trim() && (
@@ -724,7 +724,7 @@ export function NewTaskModal({
                   <textarea
                     value={computeExperiment.command}
                     onChange={e => updateCompute('command', e.target.value)}
-                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && computeCommandInvalid ? 'border-red-500' : 'border-neutral-800'}`}
+                    className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && computeCommandInvalid ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                     placeholder="python train.py --epochs 3"
                   />
                   {submitAttempted && computeCommandInvalid && <p className="text-ui-sm text-red-500 mt-1">Command is required.</p>}
@@ -740,7 +740,7 @@ export function NewTaskModal({
                     type="text"
                     value={computeExperiment.cwd}
                     onChange={e => updateCompute('cwd', e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 workbench-focus"
                     placeholder="/workspace/myproject"
                   />
                 </div>
@@ -749,7 +749,7 @@ export function NewTaskModal({
                   <textarea
                     value={computeExperiment.envVars}
                     onChange={e => updateCompute('envVars', e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[48px] transition-all placeholder:text-neutral-600"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono resize-y min-h-[48px] transition-all placeholder:text-neutral-600 workbench-focus"
                     placeholder={"BATCH_SIZE=32\nLR=0.001"}
                   />
                 </div>
@@ -760,7 +760,7 @@ export function NewTaskModal({
                   <select
                     value={computeExperiment.accelerator}
                     onChange={e => handleComputeAcceleratorChange(e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all appearance-none cursor-pointer workbench-focus"
                   >
                     <option value="">CPU (none)</option>
                     {COMPUTE_ACCELERATOR_OPTIONS.map(option => (
@@ -776,7 +776,7 @@ export function NewTaskModal({
                     <select
                       value={computeExperiment.machineType}
                       onChange={e => updateCompute('machineType', e.target.value)}
-                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                      className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all appearance-none cursor-pointer workbench-focus"
                     >
                       <option value="">Default canonical</option>
                       <option value={selectedCanonicalMachineType}>{selectedCanonicalMachineType}</option>
@@ -785,7 +785,7 @@ export function NewTaskModal({
                 ) : (
                   <div>
                     <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Machine Type <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
-                    <div className="w-full bg-neutral-950 border border-neutral-800 text-neutral-600 rounded-lg px-3 py-2 text-base md:text-sm font-mono">
+                    <div className="w-full bg-workbench-shell border border-neutral-800 text-neutral-600 rounded-lg px-3 py-2 text-base md:text-sm font-mono">
                       Default CPU
                     </div>
                   </div>
@@ -797,7 +797,7 @@ export function NewTaskModal({
                   type="text"
                   value={computeExperiment.containerImage}
                   onChange={e => updateCompute('containerImage', e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 workbench-focus"
                   placeholder="nvcr.io/nvidia/tensorflow:25.01"
                 />
                 <p className="text-ui-sm text-neutral-600 mt-1">Container image to run the experiment in (required for CUDA/NGC stacks; without it the command runs bare).</p>
@@ -810,7 +810,7 @@ export function NewTaskModal({
                   Registry credentials <span className="text-neutral-600 font-normal normal-case">(optional — private/gated registries)</span>
                 </button>
                 {registryAuthOpen && (
-                  <div className="mt-2 grid grid-cols-1 gap-2 rounded-md border border-neutral-800 bg-neutral-950/50 p-2.5">
+                  <div className="mt-2 grid grid-cols-1 gap-2 rounded-md border border-neutral-800 bg-workbench-shell/50 p-2.5">
                     <div className="grid grid-cols-2 gap-2">
                       <div>
                         <label className="block text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1">Server</label>
@@ -818,7 +818,7 @@ export function NewTaskModal({
                           type="text"
                           value={computeExperiment.containerRegistryServer}
                           onChange={e => updateCompute('containerRegistryServer', e.target.value)}
-                          className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                          className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 workbench-focus"
                           placeholder="nvcr.io"
                         />
                       </div>
@@ -828,7 +828,7 @@ export function NewTaskModal({
                           type="text"
                           value={computeExperiment.containerRegistryUsername}
                           onChange={e => updateCompute('containerRegistryUsername', e.target.value)}
-                          className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                          className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 workbench-focus"
                           placeholder="$oauthtoken"
                         />
                       </div>
@@ -840,7 +840,7 @@ export function NewTaskModal({
                         autoComplete="new-password"
                         value={computeExperiment.containerRegistryPassword}
                         onChange={e => updateCompute('containerRegistryPassword', e.target.value)}
-                        className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                        className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 workbench-focus"
                         placeholder="NGC API key (write-only — never echoed back)"
                       />
                       <p className="text-ui-sm text-neutral-600 mt-1">Set a password to enable <code className="font-mono">docker login</code>; server and username are then required.</p>
@@ -853,7 +853,7 @@ export function NewTaskModal({
                 <select
                   value={computeExperiment.provisioningModel}
                   onChange={e => updateCompute('provisioningModel', e.target.value as 'STANDARD' | 'SPOT')}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all appearance-none cursor-pointer workbench-focus"
                 >
                   <option value="STANDARD">STANDARD (on-demand)</option>
                   <option value="SPOT">SPOT (preemptible, ~60–90% cheaper)</option>
@@ -865,7 +865,7 @@ export function NewTaskModal({
                   value={computeExperiment.forcedRunnerId}
                   onChange={e => updateCompute('forcedRunnerId', e.target.value)}
                   disabled={fleetRunnersLoading}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer disabled:opacity-50"
+                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all appearance-none cursor-pointer disabled:opacity-50 workbench-focus"
                 >
                   <option value="">No preference (auto-select)</option>
                   {fleetRunners.map(runner => (
@@ -884,7 +884,7 @@ export function NewTaskModal({
                   type="text"
                   value={computeExperiment.setupStep}
                   onChange={e => updateCompute('setupStep', e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 workbench-focus"
                   placeholder="e.g., pip install -r requirements.txt"
                 />
                 <p className="text-ui-sm text-neutral-600 mt-1">Executed as <code className="font-mono">bash -lc &lt;setup_step&gt;</code> after repo clone; non-zero exit fails the job.</p>
@@ -898,7 +898,7 @@ export function NewTaskModal({
                     step="1"
                     value={computeExperiment.noProgressTimeoutSeconds}
                     onChange={e => updateCompute('noProgressTimeoutSeconds', e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                     placeholder="e.g., 1800"
                   />
                 </div>
@@ -908,7 +908,7 @@ export function NewTaskModal({
                     type="text"
                     value={computeExperiment.inputArtifactJobId}
                     onChange={e => updateCompute('inputArtifactJobId', e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 workbench-focus"
                     placeholder="prior compute job UUID"
                   />
                 </div>
@@ -922,7 +922,7 @@ export function NewTaskModal({
                     step="0.01"
                     value={computeExperiment.spendCapUsd}
                     onChange={e => updateCompute('spendCapUsd', e.target.value)}
-                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && computeSpendInvalid ? 'border-red-500' : 'border-neutral-800'}`}
+                    className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 ${submitAttempted && computeSpendInvalid ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                     placeholder="e.g., 5.00"
                   />
                   {submitAttempted && computeSpendInvalid && <p className="text-ui-sm text-red-500 mt-1">Spend cap must be positive.</p>}
@@ -935,7 +935,7 @@ export function NewTaskModal({
                     step="1"
                     value={computeExperiment.deadlineSeconds}
                     onChange={e => updateCompute('deadlineSeconds', e.target.value)}
-                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && computeDeadlineInvalid ? 'border-red-500' : 'border-neutral-800'}`}
+                    className={`w-full bg-workbench-shell border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 ${submitAttempted && computeDeadlineInvalid ? 'border-red-500' : 'border-neutral-800'} workbench-focus`}
                     placeholder="e.g., 1800"
                   />
                   {submitAttempted && computeDeadlineInvalid && <p className="text-ui-sm text-red-500 mt-1">Deadline must be a positive integer.</p>}
@@ -943,7 +943,7 @@ export function NewTaskModal({
               </div>
               {/* Preflight cost & policy panel */}
               {isComputeExperiment && (preflightLoading || preflightResult || preflightError) && (
-                <div className={`mb-3 rounded-md px-3 py-2 text-ui-sm border ${preflightError || isPreflightBlocking ? 'bg-red-950/40 border-red-800/60' : 'bg-neutral-900 border-neutral-800'}`}>
+                <div className={`mb-3 rounded-md px-3 py-2 text-ui-sm border ${preflightError || isPreflightBlocking ? 'bg-red-950/40 border-red-800/60' : 'bg-workbench-base border-neutral-800'}`}>
                   {preflightLoading && (
                     <span className="flex items-center gap-1.5 text-neutral-500">
                       <Loader2 className="animate-spin" style={{ width: 11, height: 11 }} />
@@ -1014,7 +1014,7 @@ export function NewTaskModal({
                     type="text"
                     value={computeExperiment.experiment}
                     onChange={e => updateCompute('experiment', e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                     placeholder="e.g., lora-sweep"
                   />
                 </div>
@@ -1024,7 +1024,7 @@ export function NewTaskModal({
                     type="text"
                     value={computeExperiment.benchmark}
                     onChange={e => updateCompute('benchmark', e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                     placeholder="e.g., mmlu"
                   />
                 </div>
@@ -1035,7 +1035,7 @@ export function NewTaskModal({
                   type="text"
                   value={computeExperiment.hypothesis}
                   onChange={e => updateCompute('hypothesis', e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                   placeholder="What measurable outcome do you expect?"
                 />
               </div>
@@ -1046,13 +1046,13 @@ export function NewTaskModal({
                     type="text"
                     value={computeExperiment.successMetric}
                     onChange={e => updateCompute('successMetric', e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono transition-all placeholder:text-neutral-600 workbench-focus"
                     placeholder="metric (e.g., accuracy)"
                   />
                   <select
                     value={computeExperiment.successOperator}
                     onChange={e => updateCompute('successOperator', e.target.value)}
-                    className="bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                    className="bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono transition-all appearance-none cursor-pointer workbench-focus"
                   >
                     {SUCCESS_OPERATORS.map(op => (
                       <option key={op} value={op}>{op}</option>
@@ -1063,7 +1063,7 @@ export function NewTaskModal({
                     step="any"
                     value={computeExperiment.successThreshold}
                     onChange={e => updateCompute('successThreshold', e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
                     placeholder="threshold"
                   />
                 </div>
@@ -1075,7 +1075,7 @@ export function NewTaskModal({
                     type="checkbox"
                     checked={computeExperiment.requireLiveRelease}
                     onChange={e => setComputeExperiment(f => ({ ...f, requireLiveRelease: e.target.checked }))}
-                    className="w-4 h-4 rounded border-neutral-700 bg-neutral-950 accent-neutral-400"
+                    className="w-4 h-4 rounded border-neutral-700 bg-workbench-shell accent-neutral-400"
                   />
                   <span className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">Require live release</span>
                   <span className="text-ui-md text-neutral-600 normal-case font-normal tracking-normal">(block until promoted release is serving-confirmed)</span>
@@ -1090,7 +1090,7 @@ export function NewTaskModal({
                         requireDurableArtifact: e.target.checked,
                       }))
                     }
-                    className="w-4 h-4 rounded border-neutral-700 bg-neutral-950 accent-neutral-400"
+                    className="w-4 h-4 rounded border-neutral-700 bg-workbench-shell accent-neutral-400"
                   />
                   <span className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">Require durable artifact</span>
                   <span className="text-ui-md text-neutral-600 normal-case font-normal tracking-normal">
@@ -1111,7 +1111,7 @@ export function NewTaskModal({
               autoFocus
               value={newTaskTitle}
               onChange={e => setNewTaskTitle(e.target.value)}
-              className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all placeholder:text-neutral-600 workbench-focus"
               placeholder="e.g., Add user authentication"
             />
           </div>
@@ -1124,7 +1124,7 @@ export function NewTaskModal({
                 required={!isComputeExperiment}
                 value={newTaskPrompt}
                 onChange={e => setNewTaskPrompt(e.target.value)}
-                className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[160px] max-h-[400px] transition-all placeholder:text-neutral-600"
+                className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm resize-y min-h-[160px] max-h-[400px] transition-all placeholder:text-neutral-600 workbench-focus"
                 placeholder="Describe what Claude Code should do in this repository. Be specific about files, patterns, and expected outcomes..."
               />
               <span className="text-ui-sm text-neutral-600 absolute bottom-2 right-2 pointer-events-none">{newTaskPrompt.length} chars</span>
@@ -1146,7 +1146,7 @@ export function NewTaskModal({
                   <select
                     value={newTaskModel}
                     onChange={e => setNewTaskModel(e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all appearance-none cursor-pointer workbench-focus"
                   >
                     <option value="">Default</option>
                     {/* TEMPORARY: fable-5 limited availability ~2 weeks from 2026-06-09 */}
@@ -1162,7 +1162,7 @@ export function NewTaskModal({
                   <select
                     value={newTaskEffort}
                     onChange={e => setNewTaskEffort(e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                    className="w-full bg-workbench-shell border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm transition-all appearance-none cursor-pointer workbench-focus"
                   >
                     <option value="">Default</option>
                     <option value="low">low</option>
@@ -1189,14 +1189,14 @@ export function NewTaskModal({
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors"
+              className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-workbench-hover rounded transition-colors"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={submitting || !taskBranchDefaultsReady || (isComputeExperiment && isPreflightBlocking)}
-              className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
+              className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-workbench-hover rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
             >
               {submitting && <Loader2 className="animate-spin" style={{ width: 14, height: 14 }} />}
               {isComputeExperiment && isPreflightBlocking ? 'Policy violation' : 'Launch'}

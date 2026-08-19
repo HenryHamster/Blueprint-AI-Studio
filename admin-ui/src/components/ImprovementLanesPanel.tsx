@@ -57,14 +57,14 @@ function statusClasses(status: string): string {
     case 'KILLED':
       return 'border-red-500/30 bg-red-500/15 text-red-300';
     default:
-      return 'border-neutral-700 bg-neutral-800 text-neutral-300';
+      return 'border-neutral-700 bg-workbench-panel text-neutral-300';
   }
 }
 
 function shadowClasses(shadow: boolean): string {
   return shadow
     ? 'border-orange-500/30 bg-orange-500/15 text-orange-300'
-    : 'border-neutral-700 bg-neutral-800 text-neutral-300';
+    : 'border-neutral-700 bg-workbench-panel text-neutral-300';
 }
 
 function CheckpointRow({ cp }: { cp: ImprovementLaneCheckpoint }) {
@@ -174,14 +174,14 @@ function CurrentTaskSection({ task }: { task: ImprovementLaneCurrentTask | null 
     COMPLETED: 'border-sky-500/30 bg-sky-500/15 text-sky-300',
     FAILED: 'border-red-500/30 bg-red-500/15 text-red-300',
   };
-  const statusClass = statusColors[task.status?.toUpperCase()] ?? 'border-neutral-700 bg-neutral-800 text-neutral-300';
+  const statusClass = statusColors[task.status?.toUpperCase()] ?? 'border-neutral-700 bg-workbench-panel text-neutral-300';
   return (
     <div className="flex flex-wrap items-center gap-2">
       <span className={`rounded border px-1.5 py-0.5 text-ui-sm font-bold uppercase leading-none ${statusClass}`}>
         {task.status}
       </span>
       {task.task_type && (
-        <span className="rounded border border-neutral-700 bg-neutral-800 px-1.5 py-0.5 text-ui-sm leading-none text-neutral-400">
+        <span className="rounded border border-neutral-700 bg-workbench-panel px-1.5 py-0.5 text-ui-sm leading-none text-neutral-400">
           {task.task_type}
         </span>
       )}
@@ -248,7 +248,7 @@ function LaneDetailPanel({ projectId, laneId }: LaneDetailPanelProps) {
   const checkpoints = [...(detail.checkpoints ?? [])].reverse();
 
   return (
-    <div className="border-t border-neutral-800/80 bg-neutral-950/40 px-3 py-3 space-y-4">
+    <div className="border-t border-neutral-800/80 bg-workbench-shell/40 px-3 py-3 space-y-4">
       {/* Current task */}
       <div>
         <div className="mb-1.5 text-ui-sm uppercase tracking-wide text-neutral-500 font-semibold">Current task</div>
@@ -424,7 +424,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
         <GitBranch className="h-3 w-3" />
         Improvement lanes
         {hasLanes && (
-          <span className="ml-1 rounded-full border border-neutral-700 bg-neutral-800 px-1.5 py-0.5 text-ui-sm font-bold leading-none text-neutral-300">
+          <span className="ml-1 rounded-full border border-neutral-700 bg-workbench-panel px-1.5 py-0.5 text-ui-sm font-bold leading-none text-neutral-300">
             {lanes.length} lanes
           </span>
         )}
@@ -467,7 +467,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
       )}
 
       {!collapsed && (
-        <div className="mt-1 rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-xs">
+        <div className="mt-1 rounded-lg border border-neutral-800 bg-workbench-base p-3 text-xs">
           {preflightError && (
             <div className="mb-3 flex items-start gap-2 rounded border border-amber-500/20 bg-amber-500/10 px-3 py-2">
               <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-amber-400" />
@@ -520,11 +520,11 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
           {trialMetrics && (
             <div
               data-testid="lane-pilot-trial-metrics"
-              className="mb-3 rounded border border-neutral-700 bg-neutral-950/60 p-2 text-xs"
+              className="mb-3 rounded border border-neutral-700 bg-workbench-shell/60 p-2 text-xs"
             >
               <div className="mb-1.5 flex items-center gap-1.5">
                 <span className="font-semibold text-neutral-200">Trial metrics</span>
-                <span className={`ml-auto rounded border px-1.5 py-0.5 text-ui-sm font-bold uppercase leading-none ${trialMetrics.verdict === 'KILL' ? 'border-red-500/40 bg-red-500/15 text-red-300' : trialMetrics.verdict === 'ADOPT' ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : 'border-neutral-700 bg-neutral-800 text-neutral-300'}`}>
+                <span className={`ml-auto rounded border px-1.5 py-0.5 text-ui-sm font-bold uppercase leading-none ${trialMetrics.verdict === 'KILL' ? 'border-red-500/40 bg-red-500/15 text-red-300' : trialMetrics.verdict === 'ADOPT' ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : 'border-neutral-700 bg-workbench-panel text-neutral-300'}`}>
                   {trialMetrics.verdict}
                 </span>
                 {trialMetrics.immediate_alert && (
@@ -627,7 +627,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
           {workspaceStateCounts && Object.keys(workspaceStateCounts).length > 0 && (
             <div
               data-testid="workspace-state-counts"
-              className="mb-3 rounded border border-neutral-700 bg-neutral-800/50 p-2 text-xs"
+              className="mb-3 rounded border border-neutral-700 bg-workbench-panel/50 p-2 text-xs"
             >
               <div className="mb-1 font-semibold text-neutral-300">Workspace states (fleet)</div>
               <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-neutral-400">
@@ -739,7 +739,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
           )}
 
           {!loading && !fetchError && lanes.length === 0 && (
-            <div className="rounded border border-neutral-800/80 bg-neutral-950/60 px-3 py-2 text-neutral-400">
+            <div className="rounded border border-neutral-800/80 bg-workbench-shell/60 px-3 py-2 text-neutral-400">
               No improvement lanes for this project yet.
             </div>
           )}
@@ -758,7 +758,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                   <div
                     key={lane.id}
                     data-testid="improvement-lane-row"
-                    className={`rounded-lg border bg-neutral-950/60 ${lane.shadow ? 'border-orange-500/20' : 'border-neutral-800/80'}`}
+                    className={`rounded-lg border bg-workbench-shell/60 ${lane.shadow ? 'border-orange-500/20' : 'border-neutral-800/80'}`}
                   >
                     <div className="flex min-h-[44px] flex-wrap items-center gap-1.5 px-3 py-2">
                       <button
@@ -766,7 +766,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                         data-testid="lane-expand-toggle"
                         aria-expanded={isExpanded}
                         onClick={() => setExpandedLaneId(isExpanded ? null : lane.id)}
-                        className="min-h-[44px] min-w-[44px] shrink-0 flex items-center justify-center rounded text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300"
+                        className="min-h-[44px] min-w-[44px] shrink-0 flex items-center justify-center rounded text-neutral-500 transition-colors hover:bg-workbench-hover hover:text-neutral-300"
                       >
                         {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
                       </button>

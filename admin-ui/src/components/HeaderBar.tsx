@@ -115,7 +115,7 @@ export const PrimaryTabNav = memo(function PrimaryTabNav({
               mobile ? 'px-1.5' : 'shrink-0 px-2.5 py-1 md:min-h-6 md:px-2 md:text-xs'
             } ${
               isActive
-                ? 'bg-neutral-800/90 text-neutral-100 ring-1 ring-inset ring-white/5'
+                ? 'bg-workbench-panel/90 text-neutral-100 ring-1 ring-inset ring-white/5'
                 : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-100'
             }`}
           >
@@ -197,7 +197,7 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
 
   const healthDotColor = useMemo(() => {
     if (!apiHealthy) return 'bg-red-500 animate-pulse';
-    if (!props.health) return 'bg-neutral-500';
+    if (!props.health) return 'bg-workbench-control';
     if (props.health.orchestrator_hung) return 'bg-red-500 animate-pulse';
     const cycleAge = props.health.last_cycle_seconds_ago;
     if (cycleAge !== null && cycleAge >= 120) return 'bg-red-500 animate-pulse';
@@ -229,9 +229,9 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
         <div className="flex min-w-0 shrink-0 items-center gap-1">
           <div className="hidden items-center lg:flex" aria-label="Blueprint">
             <span className="grid h-3.5 w-3.5 grid-cols-2 gap-0.5 rounded border border-workbench-border/80 bg-workbench-control p-0.5" aria-hidden="true">
-              <span className="rounded-[1px] bg-neutral-500/80" />
-              <span className="rounded-[1px] bg-neutral-700" />
-              <span className="rounded-[1px] bg-neutral-700" />
+              <span className="rounded-[1px] bg-workbench-control/80" />
+              <span className="rounded-[1px] bg-workbench-layer" />
+              <span className="rounded-[1px] bg-workbench-layer" />
               <span className="rounded-[1px] bg-emerald-400/80" />
             </span>
           </div>
@@ -252,7 +252,7 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
             /* eslint-disable-next-line viewport/min-touch-target */
             <button
               onClick={props.onManageProjects}
-              className="hidden rounded px-1.5 py-1 text-xs text-neutral-600 transition-colors hover:bg-neutral-900 hover:text-neutral-300 sm:inline-flex"
+              className="hidden rounded px-1.5 py-1 text-xs text-neutral-600 transition-colors hover:bg-workbench-hover hover:text-neutral-300 sm:inline-flex"
               title="Manage projects"
             >
               Manage
@@ -296,7 +296,7 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
             <button
               onClick={() => setHealthExpanded(prev => !prev)}
               title={healthExpanded ? 'Hide health panel' : 'Show orchestrator health'}
-              className={`flex h-7 items-center gap-1 rounded px-1.5 text-xs transition-colors ${healthExpanded ? 'bg-neutral-800/90 text-neutral-200' : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'}`}
+              className={`flex h-7 items-center gap-1 rounded px-1.5 text-xs transition-colors ${healthExpanded ? 'bg-workbench-panel/90 text-neutral-200' : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'}`}
             >
               <span className={`w-2 h-2 rounded-full shrink-0 ${healthDotColor}`} />
               <span className="hidden font-mono xl:inline">health</span>
@@ -354,16 +354,16 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
                       props.onOpenCommandPalette?.();
                       setShowMobileMenu(false);
                     }}
-                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-workbench-hover"
                   >
                     <Command className="w-4 h-4 shrink-0" />
                     <span>Command palette</span>
-                    <kbd className="ml-auto bg-neutral-800 border border-neutral-700 text-neutral-400 px-1.5 py-0.5 rounded text-ui-sm font-mono">Ctrl+K</kbd>
+                    <kbd className="ml-auto bg-workbench-panel border border-neutral-700 text-neutral-400 px-1.5 py-0.5 rounded text-ui-sm font-mono">Ctrl+K</kbd>
                   </button>
                 )}
                 <button
                   onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
-                  className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-workbench-hover'}`}
                 >
                   <Microscope className="w-4 h-4 shrink-0" />
                   <span>Findings journal</span>
@@ -375,7 +375,7 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
                 </button>
                 <button
                   onClick={() => { onToggleKnowledgeBrowser(); setShowMobileMenu(false); }}
-                  className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showKnowledgeBrowser ? 'text-violet-400 bg-violet-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showKnowledgeBrowser ? 'text-violet-400 bg-violet-500/10' : 'text-neutral-300 hover:bg-workbench-hover'}`}
                 >
                   <BookOpen className="w-4 h-4 shrink-0" />
                   <span>Knowledge library</span>
@@ -383,7 +383,7 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
                 {onOpenActivityFeed && (
                   <button
                     onClick={() => { onOpenActivityFeed(); setShowMobileMenu(false); }}
-                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-workbench-hover"
                   >
                     <Activity className="w-4 h-4 shrink-0" />
                     <span>Activity stream</span>
@@ -395,7 +395,7 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
                     setShowMobileMenu(false);
                   }}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${
-                    healthExpanded ? 'bg-neutral-800/90 text-neutral-100' : 'text-neutral-300 hover:bg-neutral-800'
+                    healthExpanded ? 'bg-workbench-panel/90 text-neutral-100' : 'text-neutral-300 hover:bg-workbench-hover'
                   }`}
                 >
                   <span className={`h-2 w-2 rounded-full shrink-0 ${healthDotColor}`} />
@@ -404,7 +404,7 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
                 {props.canManagePlatform && (
                   <button
                     onClick={() => { onOpenSettings(); setShowMobileMenu(false); }}
-                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-workbench-hover"
                   >
                     <Settings className="w-4 h-4 shrink-0" />
                     <span>Runtime settings</span>

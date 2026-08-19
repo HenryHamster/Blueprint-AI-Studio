@@ -372,7 +372,7 @@ function TriageRow({
     return (
       <div style={style} {...ariaAttributes}>
         <div className="mx-3 md:mx-4 overflow-hidden rounded-md border border-neutral-800 bg-workbench-layer">
-          <div className="flex min-h-[44px] items-center bg-workbench-layer transition-colors hover:bg-neutral-900/70">
+          <div className="flex min-h-[44px] items-center bg-workbench-layer transition-colors hover:bg-workbench-hover/70">
             <button
               onClick={() => setRoutineExpanded(e => !e)}
               className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
@@ -418,7 +418,7 @@ function TriageRow({
                                     key={shortLabel}
                                     onClick={() => addTemporaryMute(eventType, ms)}
                                     title={title}
-                                    className={`text-ui-md px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
+                                    className={`text-ui-md px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-workbench-panel text-neutral-300 hover:bg-workbench-hover'}`}
                                   >
                                     {shortLabel}
                                   </button>
@@ -457,7 +457,7 @@ function TriageRow({
     return (
       <div style={style} {...ariaAttributes}>
         <div className="mx-3 md:mx-4 pb-2 overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-layer">
-          <div className="flex items-center gap-2 bg-neutral-900/30 px-3 py-2">
+          <div className="flex items-center gap-2 bg-workbench-base/30 px-3 py-2">
             <button
               onClick={() => setExpandedGroupKeys(prev => {
                 const next = new Set(prev);
@@ -492,7 +492,7 @@ function TriageRow({
               if (next.has(digestKey)) next.delete(digestKey); else next.add(digestKey);
               return next;
             })}
-            className="w-full flex items-center gap-2 px-3 py-2 bg-neutral-900/30 text-left"
+            className="w-full flex items-center gap-2 px-3 py-2 bg-workbench-base/30 text-left"
           >
             <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
             <span className="text-xs text-neutral-500 font-medium">{row.count} stale routine{summary ? ` · ${summary}` : ''}</span>
@@ -864,7 +864,7 @@ function ConversationRowView({
               type="button"
               onClick={onLoadOlder}
               disabled={loadingOlderConversationMessages}
-              className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
+              className="min-h-11 rounded-md border border-neutral-800 bg-workbench-shell/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
             >
               {loadingOlderConversationMessages ? 'Loading older messages…' : 'Load older messages'}
             </button>
@@ -1129,7 +1129,7 @@ function ConversationVirtualList({
       {showScrollDown && (
         <button
           onClick={scrollToBottom}
-          className="absolute bottom-24 left-1/2 flex min-h-11 min-w-11 -translate-x-1/2 items-center justify-center rounded-full border border-neutral-700 bg-neutral-900 p-2 text-neutral-400 shadow-lg transition-colors hover:bg-neutral-800 hover:text-neutral-200"
+          className="absolute bottom-24 left-1/2 flex min-h-11 min-w-11 -translate-x-1/2 items-center justify-center rounded-full border border-neutral-700 bg-workbench-base p-2 text-neutral-400 shadow-lg transition-colors hover:bg-workbench-hover hover:text-neutral-200"
           aria-label="Scroll to latest message"
         >
           <ArrowDown className="h-4 w-4" />
@@ -1301,7 +1301,7 @@ function TriageVirtualList(props: TriageVirtualListProps) {
             type="button"
             onClick={() => onLoadOlderTriageMessages?.()}
             disabled={!!loadingOlderTriageMessages}
-            className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
+            className="min-h-11 rounded-md border border-neutral-800 bg-workbench-shell/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
           >
             {loadingOlderTriageMessages ? 'Loading older messages…' : 'Load older messages'}
           </button>
@@ -1321,7 +1321,7 @@ function TriageVirtualList(props: TriageVirtualListProps) {
       {showScrollDown && (
         <button
           onClick={handleTriageScrollToBottom}
-          className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
+          className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-workbench-panel border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
           aria-label="Scroll to latest message"
         >
           <ArrowDown className="w-4 h-4" />

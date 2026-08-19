@@ -55,14 +55,14 @@ export function EventVisibilityMenu({ open, onOpenChange, messages, eventPrefs, 
       <button
         onClick={() => onOpenChange(!open)}
         title="Event type visibility"
-        className={`p-2 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center ${open ? 'text-neutral-300 bg-neutral-800 border-neutral-700' : 'text-neutral-500 hover:text-neutral-300 border-transparent'}`}
+        className={`p-2 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center ${open ? 'text-neutral-300 bg-workbench-panel border-neutral-700' : 'text-neutral-500 hover:text-neutral-300 border-transparent'}`}
       >
         <Settings className="w-4 h-4" />
       </button>
       {open && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => onOpenChange(false)} />
-          <div className="absolute right-0 top-full mt-1 z-50 w-60 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-3 space-y-1.5">
+          <div className="absolute right-0 top-full mt-1 z-50 w-60 bg-workbench-base border border-neutral-700 rounded-lg shadow-xl p-3 space-y-1.5">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-neutral-300">Event visibility</span>
               {Object.keys(eventPrefs).length > 0 && (
@@ -83,7 +83,7 @@ export function EventVisibilityMenu({ open, onOpenChange, messages, eventPrefs, 
                       <span className={`text-ui-sm shrink-0 px-1.5 py-0.5 rounded-full font-medium ${
                         isHighVolume
                           ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30'
-                          : 'bg-neutral-800 text-neutral-500'
+                          : 'bg-workbench-panel text-neutral-500'
                       }`}>
                         {count}
                       </span>
@@ -92,7 +92,7 @@ export function EventVisibilityMenu({ open, onOpenChange, messages, eventPrefs, 
                   {(['surfaced', 'routine', 'mute'] as EventPref[]).map(p => (
                     <button key={p} onClick={() => onUpdatePref(et, p)}
                       title={p}
-                      className={`text-ui-sm px-1.5 py-0.5 rounded border transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-neutral-800') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
+                      className={`text-ui-sm px-1.5 py-0.5 rounded border transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-workbench-panel') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
                       {p === 'surfaced' ? '↑' : p === 'mute' ? '✕' : '·'}
                     </button>
                   ))}

@@ -661,7 +661,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
             type="text"
             value={configDraft.title}
             onChange={e => setConfigDraft(d => (d ? { ...d, title: e.target.value } : d))}
-            className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
+            className="mt-1 w-full rounded border border-neutral-700 bg-workbench-base px-2 py-1.5 text-sm text-neutral-200"
           />
         </div>
         {schemaProps.map(([key, spec]) => (
@@ -675,7 +675,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
               value={configDraft.config[key] ?? ''}
               onChange={e => setConfigDraft(d =>
                 d ? { ...d, config: { ...d.config, [key]: e.target.value } } : d)}
-              className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
+              className="mt-1 w-full rounded border border-neutral-700 bg-workbench-base px-2 py-1.5 text-sm text-neutral-200"
             />
           </div>
         ))}
@@ -722,7 +722,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
               <select
                 value={selectedKind}
                 onChange={e => setSelectedKind(e.target.value)}
-                className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
+                className="mt-1 w-full rounded border border-neutral-700 bg-workbench-base px-2 py-1.5 text-sm text-neutral-200"
               >
                 {toolKinds.map(k => (
                   <option key={k.kind} value={k.kind}>{k.label}</option>
@@ -736,7 +736,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                 value={newTitle}
                 onChange={e => setNewTitle(e.target.value)}
                 placeholder="Tool title"
-                className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
+                className="mt-1 w-full rounded border border-neutral-700 bg-workbench-base px-2 py-1.5 text-sm text-neutral-200"
               />
             </div>
             <div className="flex gap-2">

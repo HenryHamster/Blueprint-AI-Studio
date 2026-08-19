@@ -14,7 +14,7 @@ function toneClasses(phase: StrategistStatus['phase']): string {
     case 'done':
       return 'border-emerald-800/70 bg-emerald-950/30 text-emerald-200';
     default:
-      return 'border-neutral-700/50 bg-neutral-900/40 text-neutral-400';
+      return 'border-neutral-700/50 bg-workbench-base/40 text-neutral-400';
   }
 }
 

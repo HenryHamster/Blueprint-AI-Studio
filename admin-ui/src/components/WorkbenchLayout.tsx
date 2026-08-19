@@ -72,7 +72,7 @@ export function WorkbenchSurface<T extends string>({
             aria-pressed={selected}
             className={`workbench-focus inline-flex min-h-[44px] shrink-0 items-center gap-1.5 rounded border px-2.5 text-sm font-semibold transition-colors md:min-h-6 md:px-2 md:py-0.5 md:text-xs ${
               selected
-                ? 'border-workbench-border-strong bg-neutral-800/90 text-neutral-100 ring-1 ring-inset ring-white/5'
+                ? 'border-workbench-border-strong bg-workbench-panel/90 text-neutral-100 ring-1 ring-inset ring-white/5'
                 : 'border-transparent text-neutral-400 hover:bg-workbench-layer hover:text-neutral-100'
             } disabled:cursor-not-allowed disabled:opacity-40`}
           >

@@ -20,8 +20,8 @@ function toneDotClass(tone?: string | null): string {
   if (tone === 'critical') return 'bg-rose-400';
   if (tone === 'warning') return 'bg-amber-300';
   if (tone === 'active') return 'bg-cyan-400';
-  if (tone === 'watch') return 'bg-neutral-300';
-  return 'bg-neutral-600';
+  if (tone === 'watch') return 'bg-workbench-hover';
+  return 'bg-workbench-card';
 }
 
 function safeDate(value?: string | null): Date | null {
@@ -57,10 +57,10 @@ function eventMeta(event: StrategicWorkSessionEvent): string {
 
 function rowClass(density: Density, canOpen: boolean): string {
   const base = density === 'compact'
-    ? 'grid min-h-11 w-full grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-md border border-neutral-800 bg-neutral-950/50 px-2.5 py-2 text-left'
-    : 'grid min-h-12 w-full grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-md border border-neutral-800 bg-neutral-950/50 px-3 py-2.5 text-left';
+    ? 'grid min-h-11 w-full grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-md border border-neutral-800 bg-workbench-shell/50 px-2.5 py-2 text-left'
+    : 'grid min-h-12 w-full grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-md border border-neutral-800 bg-workbench-shell/50 px-3 py-2.5 text-left';
   return canOpen
-    ? `${base} transition-colors hover:border-neutral-700 hover:bg-neutral-900`
+    ? `${base} transition-colors hover:border-neutral-700 hover:bg-workbench-hover`
     : base;
 }
 

@@ -14,7 +14,7 @@ const statusColors: Record<string, string> = {
   stub: 'bg-orange-500',
   missing: 'bg-red-500',
   in_progress: 'bg-amber-500',
-  planned: 'bg-neutral-600',
+  planned: 'bg-workbench-card',
 };
 
 
@@ -55,7 +55,7 @@ function RenderValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
       return (
         <div className="space-y-2">
           {value.map((item, i) => (
-            <div key={i} className="border border-neutral-800/50 rounded p-2 bg-neutral-900/30">
+            <div key={i} className="border border-neutral-800/50 rounded p-2 bg-workbench-base/30">
               <RenderValue value={item} depth={depth + 1} />
             </div>
           ))}
@@ -63,7 +63,7 @@ function RenderValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
       );
     }
     // Fallback: JSON
-    return <pre className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 text-xs text-neutral-400 overflow-x-auto">{JSON.stringify(value, null, 2)}</pre>;
+    return <pre className="bg-workbench-base border border-neutral-800 rounded-lg p-3 text-xs text-neutral-400 overflow-x-auto">{JSON.stringify(value, null, 2)}</pre>;
   }
 
   // Objects
@@ -73,7 +73,7 @@ function RenderValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
       return <span className="text-neutral-600 italic text-sm">empty</span>;
     }
     if (depth >= 3) {
-      return <pre className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 text-xs text-neutral-400 overflow-x-auto">{JSON.stringify(value, null, 2)}</pre>;
+      return <pre className="bg-workbench-base border border-neutral-800 rounded-lg p-3 text-xs text-neutral-400 overflow-x-auto">{JSON.stringify(value, null, 2)}</pre>;
     }
     return (
       <div className="space-y-3">
@@ -82,7 +82,7 @@ function RenderValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
             <div className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-0.5 flex items-center gap-1.5">
               {key}
               {key === 'status' && typeof val === 'string' && (
-                <span className={`w-1.5 h-1.5 rounded-full ${statusColors[val] || 'bg-neutral-600'}`} />
+                <span className={`w-1.5 h-1.5 rounded-full ${statusColors[val] || 'bg-workbench-card'}`} />
               )}
             </div>
             <div className="pl-2 border-l border-neutral-800/50">
@@ -176,8 +176,8 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
             onClick={() => setSelectedPage(null)}
             className={`w-full text-left px-2 py-1.5 rounded text-xs transition-colors ${
               selectedPage === null
-                ? 'bg-neutral-800 text-neutral-100'
-                : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50'
+                ? 'bg-workbench-panel text-neutral-100'
+                : 'text-neutral-400 hover:text-neutral-200 hover:bg-workbench-hover/50'
             }`}
           >
             Overview
@@ -195,13 +195,13 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
                     onClick={() => setSelectedPage(key)}
                     className={`w-full text-left px-2 py-1 rounded text-xs flex items-center gap-1.5 transition-colors ${
                       selectedPage === key
-                        ? 'bg-neutral-800 text-neutral-100'
-                        : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50'
+                        ? 'bg-workbench-panel text-neutral-100'
+                        : 'text-neutral-400 hover:text-neutral-200 hover:bg-workbench-hover/50'
                     }`}
                   >
                     <FileText className="w-3 h-3 shrink-0 text-neutral-600" />
                     <span className="truncate flex-1">{prettifyKey(key)}</span>
-                    {status && <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusColors[status] || 'bg-neutral-600'}`} />}
+                    {status && <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusColors[status] || 'bg-workbench-card'}`} />}
                   </button>
                 );
               })}
@@ -238,12 +238,12 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
                           onClick={() => setSelectedPage(fullKey)}
                           className={`w-full text-left px-2 py-1 rounded text-xs flex items-center gap-1.5 transition-colors ${
                             selectedPage === fullKey
-                              ? 'bg-neutral-800 text-neutral-100'
-                              : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50'
+                              ? 'bg-workbench-panel text-neutral-100'
+                              : 'text-neutral-400 hover:text-neutral-200 hover:bg-workbench-hover/50'
                           }`}
                         >
                           <span className="truncate flex-1">{prettifyKey(child)}</span>
-                          {status && <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusColors[status] || 'bg-neutral-600'}`} />}
+                          {status && <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusColors[status] || 'bg-workbench-card'}`} />}
                         </button>
                       );
                     })}
@@ -263,8 +263,8 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
             <div>
               <h3 className="text-base font-bold text-neutral-100 tracking-tight mb-1">Design Document</h3>
               <div className="flex items-center gap-3 text-xs text-neutral-500">
-                <span className="bg-neutral-800 px-1.5 py-0.5 rounded text-neutral-400 font-mono">{pageCount} pages</span>
-                {typeof meta.revision === 'number' && <span className="bg-neutral-800 px-1.5 py-0.5 rounded text-neutral-400 font-mono">v{meta.revision}</span>}
+                <span className="bg-workbench-panel px-1.5 py-0.5 rounded text-neutral-400 font-mono">{pageCount} pages</span>
+                {typeof meta.revision === 'number' && <span className="bg-workbench-panel px-1.5 py-0.5 rounded text-neutral-400 font-mono">v{meta.revision}</span>}
                 {typeof meta.last_updated === 'string' && <span>updated {timeAgo(meta.last_updated as string)}</span>}
               </div>
             </div>
@@ -280,14 +280,14 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
                   <button
                     key={key}
                     onClick={() => setSelectedPage(key)}
-                    className="w-full text-left px-3 py-2 rounded-lg border border-neutral-800/50 hover:border-neutral-700 hover:bg-neutral-900/50 transition-colors group"
+                    className="w-full text-left px-3 py-2 rounded-lg border border-neutral-800/50 hover:border-neutral-700 hover:bg-workbench-hover/50 transition-colors group"
                   >
                     <div className="flex items-center gap-2">
                       <FileText className="w-3.5 h-3.5 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
                       <span className="text-sm font-medium text-neutral-300 group-hover:text-neutral-100 transition-colors">{prettifyKey(key)}</span>
                       {(() => {
                         const status = getPageStatus(designDoc[key]);
-                        return status ? <span className={`text-ui-xs px-1.5 py-0.5 rounded ${statusColors[status] ? `${statusColors[status]}/20` : 'bg-neutral-800'} text-neutral-400`}>{status}</span> : null;
+                        return status ? <span className={`text-ui-xs px-1.5 py-0.5 rounded ${statusColors[status] ? `${statusColors[status]}/20` : 'bg-workbench-panel'} text-neutral-400`}>{status}</span> : null;
                       })()}
                     </div>
                     <p className="text-xs text-neutral-500 mt-0.5 truncate pl-[22px]">{getPagePreview(designDoc[key])}</p>
@@ -304,13 +304,13 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
                         <button
                           key={fullKey}
                           onClick={() => setSelectedPage(fullKey)}
-                          className="w-full text-left px-3 py-1.5 rounded-lg hover:bg-neutral-900/50 transition-colors group"
+                          className="w-full text-left px-3 py-1.5 rounded-lg hover:bg-workbench-hover/50 transition-colors group"
                         >
                           <div className="flex items-center gap-2">
                             <span className="text-sm text-neutral-400 group-hover:text-neutral-200 transition-colors">{prettifyKey(child)}</span>
                             {(() => {
                               const status = getPageStatus(designDoc[fullKey]);
-                              return status ? <span className={`w-1.5 h-1.5 rounded-full ${statusColors[status] || 'bg-neutral-600'}`} /> : null;
+                              return status ? <span className={`w-1.5 h-1.5 rounded-full ${statusColors[status] || 'bg-workbench-card'}`} /> : null;
                             })()}
                           </div>
                           <p className="text-xs text-neutral-600 truncate">{getPagePreview(designDoc[fullKey])}</p>
@@ -336,7 +336,7 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
               <span className="text-sm font-medium text-neutral-200">{prettifyKey(selectedPage)}</span>
               {(() => {
                 const status = getPageStatus(selectedValue);
-                return status ? <span className={`w-2 h-2 rounded-full ${statusColors[status] || 'bg-neutral-600'}`} /> : null;
+                return status ? <span className={`w-2 h-2 rounded-full ${statusColors[status] || 'bg-workbench-card'}`} /> : null;
               })()}
             </div>
             <RenderValue value={selectedValue} />

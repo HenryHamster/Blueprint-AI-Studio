@@ -79,14 +79,14 @@ const DEPLOY_STATUS_BADGE: Record<string, string> = {
 
 function SkeletonRow() {
   return (
-    <div className="bg-neutral-900 border border-neutral-800 border-l-2 border-l-neutral-700 rounded-lg px-4 py-3 animate-pulse">
+    <div className="bg-workbench-base border border-neutral-800 border-l-2 border-l-neutral-700 rounded-lg px-4 py-3 animate-pulse">
       <div className="flex items-center gap-3">
-        <div className="w-4 h-4 rounded-full bg-neutral-700 shrink-0" />
+        <div className="w-4 h-4 rounded-full bg-workbench-layer shrink-0" />
         <div className="flex-1 min-w-0 space-y-1.5">
-          <div className="h-3 bg-neutral-700 rounded w-2/3" />
-          <div className="h-2.5 bg-neutral-800 rounded w-1/3" />
+          <div className="h-3 bg-workbench-layer rounded w-2/3" />
+          <div className="h-2.5 bg-workbench-panel rounded w-1/3" />
         </div>
-        <div className="h-2.5 bg-neutral-700 rounded w-14 shrink-0" />
+        <div className="h-2.5 bg-workbench-layer rounded w-14 shrink-0" />
       </div>
     </div>
   );
@@ -95,7 +95,7 @@ function SkeletonRow() {
 type FilterOption = ActivityEventType | 'ALL' | 'NEEDS_REVIEW';
 
 const FILTER_PILLS: { label: string; value: FilterOption; activeClass: string }[] = [
-  { label: 'All', value: 'ALL', activeClass: 'bg-neutral-600 text-neutral-100 border-neutral-500' },
+  { label: 'All', value: 'ALL', activeClass: 'bg-workbench-card text-neutral-100 border-neutral-500' },
   { label: 'In progress', value: 'TASK_IN_PROGRESS', activeClass: 'bg-amber-500/20 text-amber-400 border-amber-500/40' },
   { label: 'Completed', value: 'TASK_COMPLETED', activeClass: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40' },
   { label: 'Failed', value: 'TASK_FAILED', activeClass: 'bg-red-500/20 text-red-400 border-red-500/40' },
@@ -160,7 +160,7 @@ function FeedRow({
       <div className="px-6 pb-2">
         <div
           onClick={() => onRowClick(event)}
-          className={`bg-neutral-900 border border-neutral-800 border-l-2 ${EVENT_BORDER[event.type]} rounded-lg px-4 py-3 ${event.task_id ? 'hover:bg-neutral-800/50 cursor-pointer' : ''} transition-colors`}
+          className={`bg-workbench-base border border-neutral-800 border-l-2 ${EVENT_BORDER[event.type]} rounded-lg px-4 py-3 ${event.task_id ? 'hover:bg-workbench-hover/50 cursor-pointer' : ''} transition-colors`}
         >
           <div className="flex items-start gap-3">
             {EVENT_ICON[event.type]}
@@ -178,14 +178,14 @@ function FeedRow({
                 )}
 
                 {event.type === 'TASK_COMPLETED' && event.task_type && (
-                  <span className="shrink-0 bg-neutral-800 text-neutral-400 text-ui-sm px-1.5 py-0.5 rounded">
+                  <span className="shrink-0 bg-workbench-panel text-neutral-400 text-ui-sm px-1.5 py-0.5 rounded">
                     {event.task_type}
                   </span>
                 )}
 
                 {event.type === 'TASK_COMPLETED' && event.changed_files && event.changed_files.length > 0 && (
                   <span
-                    className="shrink-0 bg-neutral-800 text-neutral-400 text-ui-sm px-1.5 py-0.5 rounded"
+                    className="shrink-0 bg-workbench-panel text-neutral-400 text-ui-sm px-1.5 py-0.5 rounded"
                     title={event.changed_files.join('\n')}
                   >
                     {event.changed_files.length} file{event.changed_files.length !== 1 ? 's' : ''}
@@ -200,7 +200,7 @@ function FeedRow({
 
                 {event.type === 'TASK_COMPLETED' && event.direction_id && (
                   <span
-                    className="shrink-0 bg-neutral-800 text-neutral-500 text-ui-sm font-mono px-1.5 py-0.5 rounded"
+                    className="shrink-0 bg-workbench-panel text-neutral-500 text-ui-sm font-mono px-1.5 py-0.5 rounded"
                     title={`Direction ${event.direction_id}`}
                   >
                     dir:{event.direction_id.slice(0, 6)}
@@ -209,7 +209,7 @@ function FeedRow({
 
                 {event.type === 'TASK_COMPLETED' && event.review_iterations != null && event.review_iterations > 0 && (
                   <span
-                    className="shrink-0 bg-neutral-800 text-neutral-400 text-ui-sm px-1.5 py-0.5 rounded"
+                    className="shrink-0 bg-workbench-panel text-neutral-400 text-ui-sm px-1.5 py-0.5 rounded"
                     title="Review iterations"
                   >
                     {event.review_iterations} review{event.review_iterations !== 1 ? 's' : ''}
@@ -227,7 +227,7 @@ function FeedRow({
 
                 {event.type === 'TASK_FAILED' && event.taxonomy && TAXONOMY_LABELS[event.taxonomy] && (
                   <span
-                    className={`shrink-0 text-ui-xs leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[event.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}
+                    className={`shrink-0 text-ui-xs leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[event.taxonomy] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30'}`}
                     title={TAXONOMY_LABELS[event.taxonomy]}
                   >
                     {TAXONOMY_LABELS[event.taxonomy]}
@@ -235,7 +235,7 @@ function FeedRow({
                 )}
 
                 {event.type === 'DEPLOY_EVENT' && event.deploy_status && (
-                  <span className={`shrink-0 border text-ui-sm font-semibold px-1.5 py-0.5 rounded-full leading-none ${DEPLOY_STATUS_BADGE[event.deploy_status] ?? 'bg-neutral-700 text-neutral-300 border-neutral-600'}`}>
+                  <span className={`shrink-0 border text-ui-sm font-semibold px-1.5 py-0.5 rounded-full leading-none ${DEPLOY_STATUS_BADGE[event.deploy_status] ?? 'bg-workbench-layer text-neutral-300 border-neutral-600'}`}>
                     {event.deploy_status}
                   </span>
                 )}
@@ -249,7 +249,7 @@ function FeedRow({
 
               {event.type === 'TASK_FAILED' && event.error_summary && (
                 isExpanded ? (
-                  <pre className="whitespace-pre-wrap text-xs text-red-400/80 mt-1 max-h-32 overflow-y-auto font-mono bg-neutral-950 rounded p-2">
+                  <pre className="whitespace-pre-wrap text-xs text-red-400/80 mt-1 max-h-32 overflow-y-auto font-mono bg-workbench-shell rounded p-2">
                     {event.error_summary}
                   </pre>
                 ) : (
@@ -301,13 +301,13 @@ function FeedRow({
                     target="_blank"
                     rel="noopener noreferrer"
                     onClick={e => e.stopPropagation()}
-                    className="font-mono text-ui-sm bg-neutral-800 text-neutral-400 hover:text-neutral-200 px-1.5 py-0.5 rounded transition-colors"
+                    className="font-mono text-ui-sm bg-workbench-panel text-neutral-400 hover:text-neutral-200 px-1.5 py-0.5 rounded transition-colors"
                     title={event.commit_hash}
                   >
                     {event.commit_hash.slice(0, 7)}
                   </a>
                 ) : (
-                  <span className="font-mono text-ui-sm bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded" title={event.commit_hash}>
+                  <span className="font-mono text-ui-sm bg-workbench-panel text-neutral-400 px-1.5 py-0.5 rounded" title={event.commit_hash}>
                     {event.commit_hash.slice(0, 7)}
                   </span>
                 )
@@ -486,14 +486,14 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
   return (
     <div className="fixed inset-0 z-50 flex">
       <div className="flex-1 bg-black/40" onClick={onClose} />
-      <div className="w-full max-w-[680px] bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl overflow-hidden">
+      <div className="w-full max-w-[680px] bg-workbench-shell border-l border-neutral-800 flex flex-col shadow-2xl overflow-hidden">
       {/* Header */}
       <div className="px-6 py-4 border-b border-neutral-800 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2">
           <Clock className="w-4 h-4 text-neutral-400" />
           <h2 className="text-sm font-semibold text-neutral-100">Activity Feed</h2>
           {!loading && (
-            <span className="bg-neutral-800 text-neutral-400 border border-neutral-700 text-xs font-mono px-2 py-0.5 rounded-full">
+            <span className="bg-workbench-panel text-neutral-400 border border-neutral-700 text-xs font-mono px-2 py-0.5 rounded-full">
               {filteredEvents.length}
             </span>
           )}
@@ -509,7 +509,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
         </div>
         <button
           onClick={onClose}
-          className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] flex items-center justify-center"
+          className="bg-workbench-panel hover:bg-workbench-hover text-neutral-400 rounded transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] flex items-center justify-center"
           title="Close activity feed"
         >
           <X className="w-4 h-4" />
@@ -523,7 +523,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
           placeholder="Search events by title or error..."
           value={searchQuery}
           onChange={e => setSearchQuery(e.target.value)}
-          className="w-full bg-neutral-900 border border-neutral-700 rounded px-3 py-2 text-sm text-neutral-200 placeholder-neutral-600 focus:outline-none focus:border-neutral-500 focus:ring-1 focus:ring-neutral-500"
+          className="w-full bg-workbench-base border border-neutral-700 rounded px-3 py-2 text-sm text-neutral-200 placeholder-neutral-600 workbench-focus"
         />
         <div className="flex items-center gap-1.5 flex-wrap">
           {FILTER_PILLS.map(pill => (
@@ -559,7 +559,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
               onClick={() => { userChangedRangeRef.current = true; setTimeRange(pill.value); }}
               className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
                 timeRange === pill.value
-                  ? 'bg-neutral-700 text-neutral-200 border-neutral-500'
+                  ? 'bg-workbench-layer text-neutral-200 border-neutral-500'
                   : 'bg-transparent text-neutral-500 border-neutral-700 hover:border-neutral-600 hover:text-neutral-400'
               }`}
             >

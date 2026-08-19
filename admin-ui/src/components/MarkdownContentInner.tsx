@@ -23,15 +23,15 @@ const mdComponents: Components = {
   code: ({ children, ...props }) => {
     const isBlock = String(children).includes('\n');
     if (isBlock) return <code className="text-xs font-mono" {...props}>{children}</code>;
-    return <code className="bg-neutral-800 text-neutral-200 px-1 py-0.5 rounded text-xs font-mono break-all" {...props}>{children}</code>;
+    return <code className="bg-workbench-panel text-neutral-200 px-1 py-0.5 rounded text-xs font-mono break-all" {...props}>{children}</code>;
   },
-  pre: ({ children, ...props }) => <pre className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 overflow-x-auto text-xs mb-2" data-viewport-allow-overflow data-viewport-allow-truncation {...props}>{children}</pre>,
+  pre: ({ children, ...props }) => <pre className="bg-workbench-base border border-neutral-800 rounded-lg p-3 overflow-x-auto text-xs mb-2" data-viewport-allow-overflow data-viewport-allow-truncation {...props}>{children}</pre>,
   ul: ({ children, ...props }) => <ul className="list-disc list-inside space-y-0.5 text-sm text-neutral-300 mb-2" {...props}>{children}</ul>,
   ol: ({ children, ...props }) => <ol className="list-decimal list-inside space-y-0.5 text-sm text-neutral-300 mb-2" {...props}>{children}</ol>,
   li: ({ children, ...props }) => <li className="text-sm text-neutral-300" {...props}>{children}</li>,
   blockquote: ({ children, ...props }) => <blockquote className="border-l-2 border-neutral-700 pl-3 text-sm text-neutral-400 italic mb-2" {...props}>{children}</blockquote>,
   table: ({ children, ...props }) => <div className="overflow-x-auto mb-2"><table className="text-xs text-neutral-300 border-collapse w-full" {...props}>{children}</table></div>,
-  th: ({ children, ...props }) => <th className="border border-neutral-700 px-2 py-1 text-left text-neutral-200 bg-neutral-800/50" {...props}>{children}</th>,
+  th: ({ children, ...props }) => <th className="border border-neutral-700 px-2 py-1 text-left text-neutral-200 bg-workbench-panel/50" {...props}>{children}</th>,
   td: ({ children, ...props }) => <td className="border border-neutral-700 px-2 py-1" {...props}>{children}</td>,
   a: ({ children, href, ...props }) => <a className="text-blue-400 hover:text-blue-300 underline break-all" href={href} target="_blank" rel="noopener noreferrer" {...props}>{children}</a>,
   strong: ({ children, ...props }) => <strong className="text-neutral-100 font-semibold" {...props}>{children}</strong>,

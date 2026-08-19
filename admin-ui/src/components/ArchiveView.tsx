@@ -56,7 +56,7 @@ const STATUS_BORDER_COLORS: Record<string, string> = {
 const STATUS_DOT_COLORS: Record<string, string> = {
   COMPLETED: 'bg-emerald-500',
   FAILED: 'bg-red-500',
-  CANCELLED: 'bg-neutral-500',
+  CANCELLED: 'bg-workbench-control',
 };
 
 const DATE_RANGES: { value: string; label: string }[] = [
@@ -212,7 +212,7 @@ export default function ArchiveView({
   const hasNextPage = archivePage < totalPages;
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-neutral-800 bg-neutral-950">
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-neutral-800 bg-workbench-shell">
       <header className="flex shrink-0 flex-col gap-3 border-b border-neutral-800 px-3 py-3 md:flex-row md:items-center md:justify-between md:px-5">
         <div className="flex min-w-0 items-center gap-3">
           <Archive className="h-5 w-5 shrink-0 text-neutral-400" aria-hidden="true" />
@@ -243,7 +243,7 @@ export default function ArchiveView({
                 aria-haspopup="menu"
                 aria-expanded={purgeMenuOpen}
                 aria-controls="archive-purge-menu"
-                className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-900 px-3 text-sm font-semibold text-red-300 transition-colors hover:border-red-900 hover:bg-red-950/35 hover:text-red-200 md:min-h-9 md:text-xs"
+                className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-workbench-base px-3 text-sm font-semibold text-red-300 transition-colors hover:border-red-900 hover:bg-red-950/35 hover:text-red-200 md:min-h-9 md:text-xs"
                 title="Permanently delete archived tasks"
               >
                 <Trash2 className="h-4 w-4 shrink-0" aria-hidden="true" />
@@ -253,7 +253,7 @@ export default function ArchiveView({
                 <div
                   id="archive-purge-menu"
                   role="menu"
-                  className="absolute right-0 top-full z-20 mt-1 w-56 overflow-hidden rounded-md border border-neutral-700 bg-neutral-900 shadow-xl"
+                  className="absolute right-0 top-full z-20 mt-1 w-56 overflow-hidden rounded-md border border-neutral-700 bg-workbench-base shadow-xl"
                 >
                   {PURGE_AGE_OPTIONS.map(option => (
                     <button
@@ -261,7 +261,7 @@ export default function ArchiveView({
                       type="button"
                       role="menuitem"
                       onClick={() => handlePurgeClick(option.days)}
-                      className="flex min-h-11 w-full items-center px-3 text-left text-sm text-neutral-300 transition-colors hover:bg-neutral-800 hover:text-red-300 md:min-h-9 md:text-xs"
+                      className="flex min-h-11 w-full items-center px-3 text-left text-sm text-neutral-300 transition-colors hover:bg-workbench-hover hover:text-red-300 md:min-h-9 md:text-xs"
                     >
                       {option.label}
                     </button>
@@ -273,7 +273,7 @@ export default function ArchiveView({
           <button
             type="button"
             onClick={() => setShowArchive(false)}
-            className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-100 md:min-h-9 md:min-w-9"
+            className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-workbench-hover hover:text-neutral-100 md:min-h-9 md:min-w-9"
             title="Close archive"
             aria-label="Close archive"
           >
@@ -290,7 +290,7 @@ export default function ArchiveView({
             aria-modal="true"
             aria-labelledby="archive-purge-title"
             aria-busy={purgeLoading}
-            className="w-full max-w-sm rounded-lg border border-neutral-700 bg-neutral-900 p-5 shadow-2xl"
+            className="w-full max-w-sm rounded-lg border border-neutral-700 bg-workbench-base p-5 shadow-2xl"
           >
             <div className="flex items-center gap-3">
               <Trash2 className="h-5 w-5 shrink-0 text-red-400" aria-hidden="true" />
@@ -309,7 +309,7 @@ export default function ArchiveView({
                 type="button"
                 onClick={() => setPurgeConfirm(null)}
                 disabled={purgeLoading}
-                className="min-h-11 rounded-md border border-neutral-700 bg-neutral-800 px-4 text-sm font-semibold text-neutral-300 transition-colors hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50 md:min-h-9"
+                className="min-h-11 rounded-md border border-neutral-700 bg-workbench-panel px-4 text-sm font-semibold text-neutral-300 transition-colors hover:bg-workbench-hover disabled:cursor-not-allowed disabled:opacity-50 md:min-h-9"
               >
                 Cancel
               </button>
@@ -335,7 +335,7 @@ export default function ArchiveView({
           className="order-first min-h-0 border-b border-neutral-800 bg-[#0b1118] p-3 lg:col-start-2 lg:row-start-1 lg:border-b-0 lg:border-l"
         >
           <div className="grid gap-3">
-            <section className="rounded-md border border-neutral-800 bg-neutral-950/70 p-3">
+            <section className="rounded-md border border-neutral-800 bg-workbench-shell/70 p-3">
               <div className="flex items-center justify-between gap-3">
                 <h3 className="text-sm font-semibold text-neutral-100">Archive actions</h3>
                 <span className="font-mono text-xs text-neutral-500">{archiveTasks.length}</span>
@@ -356,7 +356,7 @@ export default function ArchiveView({
               </dl>
             </section>
 
-            <section className="rounded-md border border-neutral-800 bg-neutral-950/70 p-3">
+            <section className="rounded-md border border-neutral-800 bg-workbench-shell/70 p-3">
               <h3 className="text-sm font-semibold text-neutral-100">Filters</h3>
               <dl className="mt-3 grid gap-2 text-xs">
                 <div className="flex items-center justify-between gap-3">
@@ -375,7 +375,7 @@ export default function ArchiveView({
               <button
                 type="button"
                 onClick={clearFilters}
-                className="mt-3 inline-flex min-h-11 w-full items-center justify-center rounded-md border border-neutral-800 bg-neutral-900 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800"
+                className="mt-3 inline-flex min-h-11 w-full items-center justify-center rounded-md border border-neutral-800 bg-workbench-base px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover"
               >
                 Clear filters
               </button>
@@ -394,14 +394,14 @@ export default function ArchiveView({
                     value={archiveSearchQuery}
                     onChange={(event) => setArchiveSearchQuery(event.target.value)}
                     placeholder="Search archived tasks"
-                    className="min-h-11 w-full rounded-md border border-neutral-800 bg-neutral-950 py-2 pl-9 pr-3 text-sm text-neutral-100 outline-none transition-colors placeholder:text-neutral-600 focus:border-neutral-600 focus:ring-1 focus:ring-neutral-700"
+                    className="min-h-11 w-full rounded-md border border-neutral-800 bg-workbench-shell py-2 pl-9 pr-3 text-sm text-neutral-100 outline-none transition-colors placeholder:text-neutral-600 workbench-focus"
                     aria-label="Search archived tasks"
                   />
                 </div>
                 <select
                   value={archiveSortOrder}
                   onChange={(event) => setArchiveSortOrder(event.target.value as 'desc' | 'asc')}
-                  className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950 px-3 text-sm text-neutral-300 outline-none focus:border-neutral-600 focus:ring-1 focus:ring-neutral-700"
+                  className="min-h-11 rounded-md border border-neutral-800 bg-workbench-shell px-3 text-sm text-neutral-300 outline-none workbench-focus"
                   aria-label="Archive sort order"
                 >
                   <option value="desc">Newest first</option>
@@ -410,7 +410,7 @@ export default function ArchiveView({
                 <select
                   value={archivePageSize}
                   onChange={(event) => setArchivePageSize(Number(event.target.value))}
-                  className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950 px-3 text-sm text-neutral-300 outline-none focus:border-neutral-600 focus:ring-1 focus:ring-neutral-700"
+                  className="min-h-11 rounded-md border border-neutral-800 bg-workbench-shell px-3 text-sm text-neutral-300 outline-none workbench-focus"
                   aria-label="Archived tasks per page"
                 >
                   <option value={25}>25 per page</option>
@@ -428,8 +428,8 @@ export default function ArchiveView({
                     aria-pressed={archiveStatusFilter === filter.value}
                     className={`min-h-11 min-w-11 rounded-md border px-3 text-sm font-semibold transition-colors ${
                       archiveStatusFilter === filter.value
-                        ? `border-neutral-700 bg-neutral-800 text-neutral-100 border-l-2 ${STATUS_BORDER_COLORS[filter.value] || 'border-l-neutral-500'}`
-                        : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
+                        ? `border-neutral-700 bg-workbench-panel text-neutral-100 border-l-2 ${STATUS_BORDER_COLORS[filter.value] || 'border-l-neutral-500'}`
+                        : 'border-neutral-800 bg-workbench-shell text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
                     }`}
                   >
                     {filter.label}
@@ -446,8 +446,8 @@ export default function ArchiveView({
                     aria-pressed={archiveDateRange === range.value}
                     className={`min-h-11 min-w-11 rounded-md border px-3 text-sm font-semibold transition-colors ${
                       archiveDateRange === range.value
-                        ? 'border-neutral-700 bg-neutral-800 text-neutral-100'
-                        : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
+                        ? 'border-neutral-700 bg-workbench-panel text-neutral-100'
+                        : 'border-neutral-800 bg-workbench-shell text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
                     }`}
                   >
                     {range.label}
@@ -458,8 +458,8 @@ export default function ArchiveView({
 
             <section className="relative min-h-[18rem]">
               {archiveLoading && (
-                <div className="absolute inset-0 z-10 flex items-center justify-center rounded-md bg-neutral-950/70">
-                  <div className="flex items-center gap-2 rounded-md border border-neutral-800 bg-neutral-900 px-4 py-3 shadow-lg">
+                <div className="absolute inset-0 z-10 flex items-center justify-center rounded-md bg-workbench-shell/70">
+                  <div className="flex items-center gap-2 rounded-md border border-neutral-800 bg-workbench-base px-4 py-3 shadow-lg">
                     <Loader2 className="h-4 w-4 animate-spin text-neutral-400" aria-hidden="true" />
                     <span className="text-sm text-neutral-400">Loading</span>
                   </div>
@@ -473,7 +473,7 @@ export default function ArchiveView({
                   <button
                     type="button"
                     onClick={clearFilters}
-                    className="mt-3 min-h-11 rounded-md border border-neutral-800 bg-neutral-900 px-4 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800"
+                    className="mt-3 min-h-11 rounded-md border border-neutral-800 bg-workbench-base px-4 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover"
                   >
                     Clear filters
                   </button>
@@ -483,12 +483,12 @@ export default function ArchiveView({
                   {archiveTasks.map(task => {
                     const typeStyle = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
                     const TypeIcon = typeStyle?.icon;
-                    const dotColor = STATUS_DOT_COLORS[task.status] || 'bg-neutral-600';
+                    const dotColor = STATUS_DOT_COLORS[task.status] || 'bg-workbench-card';
 
                     return (
                       <article
                         key={task.id}
-                        className={`grid min-w-0 gap-3 rounded-md border border-l-2 border-neutral-800 ${STATUS_BORDER_COLORS[task.status] || 'border-l-neutral-600'} bg-neutral-900/70 p-3 transition-colors hover:bg-neutral-900 md:grid-cols-[minmax(0,1fr)_auto] md:items-center`}
+                        className={`grid min-w-0 gap-3 rounded-md border border-l-2 border-neutral-800 ${STATUS_BORDER_COLORS[task.status] || 'border-l-neutral-600'} bg-workbench-base/70 p-3 transition-colors hover:bg-workbench-hover md:grid-cols-[minmax(0,1fr)_auto] md:items-center`}
                       >
                         <div className="min-w-0">
                           <p className="truncate text-sm font-semibold text-neutral-100" data-viewport-allow-truncation>
@@ -506,11 +506,11 @@ export default function ArchiveView({
                                 {typeStyle.label}
                               </span>
                             )}
-                            <span className="inline-flex min-h-7 items-center gap-1.5 rounded border border-neutral-800 bg-neutral-950/60 px-2 text-xs font-semibold text-neutral-300">
+                            <span className="inline-flex min-h-7 items-center gap-1.5 rounded border border-neutral-800 bg-workbench-shell/60 px-2 text-xs font-semibold text-neutral-300">
                               <span className={`h-2 w-2 rounded-full ${dotColor}`} aria-hidden="true" />
                               {statusLabel(task.status)}
                             </span>
-                            <span className="inline-flex min-h-7 items-center rounded border border-neutral-800 bg-neutral-950/60 px-2 font-mono text-xs text-neutral-500">
+                            <span className="inline-flex min-h-7 items-center rounded border border-neutral-800 bg-workbench-shell/60 px-2 font-mono text-xs text-neutral-500">
                               {timeAgo(task.created_at)}
                             </span>
                           </div>
@@ -522,7 +522,7 @@ export default function ArchiveView({
                               href={task.pr_url}
                               target="_blank"
                               rel="noopener noreferrer"
-                              className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md border border-neutral-800 bg-neutral-950 text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-neutral-800 hover:text-neutral-100"
+                              className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md border border-neutral-800 bg-workbench-shell text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100"
                               title="View pull request"
                               aria-label={`View pull request for ${task.title}`}
                             >
@@ -532,7 +532,7 @@ export default function ArchiveView({
                           <button
                             type="button"
                             onClick={() => handleViewLogs(task)}
-                            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800"
+                            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-workbench-shell px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover"
                           >
                             <Eye className="h-4 w-4" aria-hidden="true" />
                             Details
@@ -542,7 +542,7 @@ export default function ArchiveView({
                               type="button"
                               onClick={() => { void runRowAction(`retry:${task.id}`, () => onRetryTask(task.id)); }}
                               disabled={pendingActionKey === `retry:${task.id}`}
-                              className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-3 text-sm font-semibold text-blue-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800"
+                              className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-workbench-shell px-3 text-sm font-semibold text-blue-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover"
                               title="Retry task"
                             >
                               {pendingActionKey === `retry:${task.id}`
@@ -556,7 +556,7 @@ export default function ArchiveView({
                               type="button"
                               onClick={() => { void runRowAction(`unarchive:${task.id}`, () => onUnarchiveTask(task.id)); }}
                               disabled={pendingActionKey === `unarchive:${task.id}`}
-                              className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800"
+                              className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-workbench-shell px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover"
                               title="Unarchive task"
                             >
                               {pendingActionKey === `unarchive:${task.id}`
@@ -587,7 +587,7 @@ export default function ArchiveView({
             type="button"
             onClick={() => setArchivePage(archivePage - 1)}
             disabled={archivePage <= 1}
-            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-900 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-workbench-base px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover disabled:cursor-not-allowed disabled:opacity-50"
           >
             <ChevronLeft className="h-4 w-4" aria-hidden="true" />
             Previous
@@ -599,7 +599,7 @@ export default function ArchiveView({
             type="button"
             onClick={() => setArchivePage(archivePage + 1)}
             disabled={!hasNextPage}
-            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-900 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-workbench-base px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover disabled:cursor-not-allowed disabled:opacity-50"
           >
             Next
             <ChevronRight className="h-4 w-4" aria-hidden="true" />
