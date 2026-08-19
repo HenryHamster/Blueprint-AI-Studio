@@ -84,6 +84,16 @@ def _normalize_failure_detail(detail: str, *, tree_root: Path | None) -> str:
     # noise the full-path replace targets — just past the ellipsis instead of
     # at the start of the string.
     normalized = re.sub(r"\.\.\.[^\s>]*?/backend/", ".../<repo-root>/backend/", normalized)
+    # A canonical UUID (e.g. a task id embedded in a diagnostic message by
+    # f"... for task {task_id_str}: {chain_exc}") is generated fresh on every
+    # run. It is run-unique by construction, never diff-sensitive, so an
+    # identical pre-existing failure must not be defeated by it — normalize it
+    # the same way as the other run-unique tokens above.
+    normalized = re.sub(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        "<uuid>",
+        normalized,
+    )
     if tree_root is None:
         return normalized
     normalized = normalized.replace(str(tree_root), "<tree-root>")

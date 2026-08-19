@@ -555,3 +555,61 @@ def test_attributed_gate_names_unavailable_baseline_and_blocks(tmp_path: Path) -
     assert verdict["state"] == "baseline_unavailable"
     assert verdict["blocking"] is True
     assert "cannot resolve base ref" in verdict["error"]
+
+
+def test_uuid_bearing_baseline_failure_is_attributed_preexisting() -> None:
+    """A run-generated UUID in a traceback must not defeat baseline suppression.
+
+    backend/app/task_completion.py emits a diagnostic that embeds the current
+    task's UUID (e.g. ``f"... for task {task_id_str}: {chain_exc}"``). The UUID
+    is generated fresh on every run, so an identical pre-existing failure can
+    never byte-match across a baseline/current comparison unless the UUID
+    token itself is normalized away, exactly like the existing Task-<n> and
+    truncated-checkout-path normalizations above.
+    """
+    key = (
+        "backend/testing/test_strategic_spawning.py"
+        "::test_architecture_cycle_operator_wake_reaches_phase2_after_marker_cleared"
+        "::error"
+    )
+    current_detail = _normalize_failure_detail(
+        "[DESIGN DOC] Failed to chain Phase 2 for task "
+        "3fa85f64-5717-4562-b3fc-2c963f66afa6: PendingRollbackError",
+        tree_root=None,
+    )
+    baseline_detail = _normalize_failure_detail(
+        "[DESIGN DOC] Failed to chain Phase 2 for task "
+        "9c858901-8a57-4791-81fe-4c455b099bc9: PendingRollbackError",
+        tree_root=None,
+    )
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures={key: current_detail},
+        current_report=_failure_report(key, current_detail),
+        baseline_report=_failure_report(key, baseline_detail),
+    )
+
+    assert outcome["state"] == "preexisting_test_failure"
+    assert outcome["blocking"] is False
+    assert outcome["new_failures"] == {}
+
+
+def test_normalize_uuid_does_not_erase_a_genuinely_different_failure_reason() -> None:
+    """UUID normalization must be scoped to the UUID token only.
+
+    A failure that differs in its non-UUID content (a different exception
+    type) is a genuinely different failure and must still be reported as new,
+    even though both details also happen to embed a run-unique UUID.
+    """
+    current = _normalize_failure_detail(
+        "[DESIGN DOC] Failed to chain Phase 2 for task "
+        "3fa85f64-5717-4562-b3fc-2c963f66afa6: PendingRollbackError",
+        tree_root=None,
+    )
+    baseline = _normalize_failure_detail(
+        "[DESIGN DOC] Failed to chain Phase 2 for task "
+        "9c858901-8a57-4791-81fe-4c455b099bc9: KeyError",
+        tree_root=None,
+    )
+    assert current != baseline
