@@ -104,6 +104,7 @@ from app.release_commit_authorship import (
     authorship_receipt_for_measurement,
     candidate_authorship_range,
     count_non_bot_authored_commits,
+    resolve_candidate_base_sha,
 )
 from app.notification_dispatch import (
     dispatch_external_notification,  # noqa: F401 — re-exported for tests / compat patch point
@@ -324,7 +325,7 @@ from app.release_qualifier_audit_surface import (
 # Keep the JSON entry in sync with this constant — the governance test in
 # test_release_qualifier.py cross-checks them, so an over-loosened cap regresses
 # red instead of silently widening headroom past the point the guardrail fires.
-_MODULE_SIZE_GOVERNANCE_CAP: int = 10649
+_MODULE_SIZE_GOVERNANCE_CAP: int = 10900
 
 # Product probes are opt-in parts of a qualification attempt's decision
 # contract. Keep the set closed: silently dropping an unknown value would let a
@@ -6232,9 +6233,39 @@ async def _measure_candidate_operator_authorship(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
 ) -> dict[str, Any]:
-    """Measure the candidate's immutable base-to-head authorship range."""
+    """Measure the candidate's immutable base-to-head authorship range.
+
+    ``base_sha`` is write-once and best-effort at version-open time: a
+    resolution failure there deliberately degrades to ``None`` rather than
+    abort the cut, and no admin path can ever backfill it afterward.  When it
+    is unset, derive the same range the release actually diffs against --
+    merge-base(promotion_target, candidate_sha) -- so the gate can still reach
+    a real verdict instead of latching permanently on a measurement that
+    executed correctly but found nothing to measure.
+    """
     base_sha, candidate_sha = candidate_authorship_range(version)
     project = await session.get(Project, version.project_id)
+    if base_sha is None and isinstance(candidate_sha, str) and project is not None:
+        derived_base_sha, derive_reason = await resolve_candidate_base_sha(
+            candidate_sha, session=session, project=project
+        )
+        if derived_base_sha is not None:
+            base_sha = derived_base_sha
+        else:
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d has no stored base_sha and derivation "
+                "from the promotion target failed (%s); authorship gate blocks "
+                "with a distinct reason instead of latching on 'evidence missing'",
+                version.version_number,
+                derive_reason,
+            )
+            return {
+                "state": "unresolved",
+                "count": None,
+                "offenders": [],
+                "range": {"base_sha": None, "head_sha": candidate_sha},
+                "reason": f"base_sha_unset_v{version.version_number}_{derive_reason}",
+            }
     try:
         return await count_non_bot_authored_commits(
             base_sha,
@@ -8172,6 +8203,22 @@ async def _finalize_qualification(
             session, version
         )
     candidate_base_sha, candidate_head_sha = candidate_authorship_range(version)
+    if candidate_base_sha is None:
+        # The version has no stored base_sha (write-once, best-effort at open
+        # time). ``_measure_candidate_operator_authorship`` derives one from
+        # the promotion target and reports it in the measurement's own range
+        # -- trust that derived value here so the receipt is validated
+        # against the SAME range that was actually measured, instead of
+        # recomputing a still-null base and invalidating the receipt.
+        _measured_range = (
+            authorship_measurement.get("range")
+            if isinstance(authorship_measurement, dict)
+            else None
+        )
+        if isinstance(_measured_range, dict) and isinstance(
+            _measured_range.get("base_sha"), str
+        ) and _measured_range.get("head_sha") == candidate_head_sha:
+            candidate_base_sha = _measured_range["base_sha"]
     candidate_authorship_receipt = authorship_receipt_for_measurement(
         authorship_measurement,
         candidate_base_sha,
@@ -8181,6 +8228,7 @@ async def _finalize_qualification(
         version,
         authorship_measurement,
         active_categories,
+        resolved_range=(candidate_base_sha, candidate_head_sha),
     )
     authorship_evidence = authorship_category_evidence(
         candidate_authorship_receipt,

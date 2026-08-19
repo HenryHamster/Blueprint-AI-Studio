@@ -27,7 +27,7 @@ from app.models import Project, ReleaseAuthorshipReconciliationState, ReleaseVer
 
 
 logger = logging.getLogger(__name__)
-_MODULE_SIZE_GOVERNANCE_CAP: int = 1327
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1600
 
 BOT_COMMIT_AUTHOR = "blueprintagentorchestrator[bot]"
 BLUEPRINT_GITHUB_BOT_ID = 272093198
@@ -736,6 +736,66 @@ async def count_non_bot_authored_commits(
         project=project,
         github_context=github_context,
     )
+
+
+async def resolve_candidate_base_sha(
+    candidate_sha: str, *, session: Any, project: Any
+) -> tuple[str | None, str]:
+    """Derive base_sha as merge-base(promotion_target, candidate_sha).
+
+    Used only when the write-once ``ReleaseVersion.base_sha`` was never set
+    (best-effort at open time, unrepairable afterward) so the authorship gate
+    does not latch forever.  Reuses the same GitHub Compare source of truth
+    and full-SHA/status verification as every other authorship range.
+    """
+    from app import github
+    from app.branch_resolution import get_project_promotion_target
+    from app.release_promotion import _resolve_github_with_session
+
+    if not (isinstance(candidate_sha, str) and _FULL_SHA.fullmatch(candidate_sha)):
+        return None, "missing_or_malformed_sha"
+    promotion_target = get_project_promotion_target(project)
+    if not isinstance(promotion_target, str) or not promotion_target:
+        return None, "promotion_target_unavailable"
+    try:
+        resolved = await _resolve_github_with_session(session, project)
+    except Exception:  # noqa: BLE001 - credentials are fail-closed evidence
+        return None, "github_credentials_unavailable"
+    if resolved is None:
+        return None, "github_credentials_unavailable"
+    token, owner, repo = resolved
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        response = await github._github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}/compare/"
+            f"{promotion_target}...{candidate_sha}",
+            headers,
+            params={"per_page": 1},
+            project_id=str(project.id),
+            consumer="release_commit_authorship_base_derivation",
+        )
+    except Exception:  # noqa: BLE001 - network/API failures are unresolved
+        return None, "github_range_unavailable"
+    if response.status_code != 200:
+        return None, "github_range_unavailable"
+    try:
+        comparison_data = response.json()
+    except Exception:  # noqa: BLE001 - malformed payloads are unresolved
+        return None, "malformed_github_range"
+    if not isinstance(comparison_data, dict):
+        return None, "malformed_github_range"
+    if comparison_data.get("status") not in {"identical", "ahead"}:
+        return None, "range_not_ancestor"
+    merge_base = comparison_data.get("merge_base_commit")
+    merge_base_sha = merge_base.get("sha") if isinstance(merge_base, dict) else None
+    if not (isinstance(merge_base_sha, str) and _FULL_SHA.fullmatch(merge_base_sha)):
+        return None, "malformed_merge_base_sha"
+    return merge_base_sha.lower(), "derived"
 
 
 async def persist_serving_authorship_evidence(

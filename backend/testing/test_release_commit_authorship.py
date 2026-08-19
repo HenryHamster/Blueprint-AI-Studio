@@ -23,6 +23,7 @@ from app.release_commit_authorship import (
     normalized_authorship_prompt_evidence,
     persist_serving_authorship_evidence,
     reconcile_serving_authorship_evidence,
+    resolve_candidate_base_sha,
     validate_authorship_receipt,
 )
 from app.release_scoring import evaluate_merge_grade
@@ -1893,3 +1894,239 @@ async def test_promotion_defers_authorship_until_serving_confirmation(db_session
     assert result["status"] == "promoted"
     assert "operator_authored_commits" not in (version.last_qualification or {})
     measurement.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_base_sha_derives_the_merge_base(monkeypatch):
+    """A version with no stored base_sha derives one from the promotion target."""
+    from app import github
+
+    candidate_sha = "c" * 40
+    derived_base = "d" * 40
+    project = Project(
+        id="derive-base-success",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+
+    async def _request(method, url, headers, **kwargs):
+        assert url == f"https://api.github.com/repos/owner/repo/compare/main...{candidate_sha}"
+        return _GitHubResponse(
+            200,
+            {
+                "status": "ahead",
+                "ahead_by": 3,
+                "total_commits": 3,
+                "merge_base_commit": {"sha": derived_base},
+                "base_commit": {"sha": derived_base},
+                "commits": [],
+            },
+        )
+
+    monkeypatch.setattr(github, "_github_request", _request)
+
+    base_sha, reason = await resolve_candidate_base_sha(
+        candidate_sha, session=None, project=project
+    )
+
+    assert base_sha == derived_base
+    assert reason == "derived"
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_base_sha_fails_closed_on_non_ancestor(monkeypatch):
+    from app import github
+
+    candidate_sha = "c" * 40
+    project = Project(
+        id="derive-base-diverged",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    monkeypatch.setattr(
+        github,
+        "_github_request",
+        AsyncMock(
+            return_value=_GitHubResponse(
+                200,
+                {
+                    "status": "diverged",
+                    "ahead_by": 1,
+                    "total_commits": 1,
+                    "merge_base_commit": {"sha": "e" * 40},
+                    "base_commit": {"sha": "e" * 40},
+                    "commits": [],
+                },
+            )
+        ),
+    )
+
+    base_sha, reason = await resolve_candidate_base_sha(
+        candidate_sha, session=None, project=project
+    )
+
+    assert base_sha is None
+    assert reason == "range_not_ancestor"
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_base_sha_fails_closed_without_credentials(monkeypatch):
+    project = Project(
+        id="derive-base-no-creds",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=None),
+    )
+
+    base_sha, reason = await resolve_candidate_base_sha(
+        "c" * 40, session=None, project=project
+    )
+
+    assert base_sha is None
+    assert reason == "github_credentials_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_candidate_authorship_measurement_derives_base_when_version_has_none(
+    db_session, monkeypatch
+):
+    """A version opened with no base_sha (write-once, best-effort at open time)
+    must not permanently latch the authorship gate. The qualifier derives the
+    same range the release actually diffs against and measures it.
+    """
+    from app import github, release_qualifier as rq
+
+    candidate_sha = "c" * 40
+    derived_base = "d" * 40
+    project = Project(
+        name="Derive base measurement",
+        user_id="derive-base-measurement",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=7,
+        status="qualifying",
+        base_sha=None,
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_qualification={"candidate_sha": candidate_sha},
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+
+    async def _request(method, url, headers, **kwargs):
+        if url == f"https://api.github.com/repos/owner/repo/compare/main...{candidate_sha}":
+            return _GitHubResponse(
+                200,
+                {
+                    "status": "ahead",
+                    "ahead_by": 3,
+                    "total_commits": 3,
+                    "merge_base_commit": {"sha": derived_base},
+                    "base_commit": {"sha": derived_base},
+                    "commits": [],
+                },
+            )
+        if url == (
+            f"https://api.github.com/repos/owner/repo/compare/{derived_base}...{candidate_sha}"
+        ):
+            return _GitHubResponse(
+                200,
+                _compare(
+                    derived_base,
+                    candidate_sha,
+                    [_github_commit(candidate_sha, "Henry Example")],
+                ),
+            )
+        raise AssertionError(f"unexpected compare url: {url}")
+
+    monkeypatch.setattr(github, "_github_request", _request)
+
+    measurement = await rq._measure_candidate_operator_authorship(db_session, version)
+
+    assert measurement["state"] == "resolved"
+    assert measurement["count"] == 1
+    assert measurement["range"] == {"base_sha": derived_base, "head_sha": candidate_sha}
+
+    from app.release_scoring import evaluate_candidate_operator_authorship_gate
+
+    gate = evaluate_candidate_operator_authorship_gate(
+        version,
+        measurement,
+        [
+            {
+                "category_key": "candidate-authorship",
+                "evidence_contract": {
+                    "type": "operator_authored_commits",
+                    "predicate": {"max_count": 0},
+                },
+            }
+        ],
+        resolved_range=(measurement["range"]["base_sha"], measurement["range"]["head_sha"]),
+    )
+
+    assert gate["status"] == "blocked"
+    assert gate["base_sha_provenance"] == "derived"
+    assert gate["range"] == {"base_sha": derived_base, "head_sha": candidate_sha}
+
+
+@pytest.mark.asyncio
+async def test_candidate_authorship_measurement_names_version_when_derivation_fails(
+    db_session, monkeypatch
+):
+    """Derivation failure must block with a distinct, version-scoped reason --
+    never the generic 'evidence missing' blocker the write-once null base
+    could never clear."""
+    from app import release_qualifier as rq
+
+    candidate_sha = "c" * 40
+    project = Project(
+        name="Derive base failure",
+        user_id="derive-base-failure",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=9,
+        status="qualifying",
+        base_sha=None,
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_qualification={"candidate_sha": candidate_sha},
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=None),
+    )
+
+    measurement = await rq._measure_candidate_operator_authorship(db_session, version)
+
+    assert measurement["state"] == "unresolved"
+    assert measurement["reason"] == "base_sha_unset_v9_github_credentials_unavailable"

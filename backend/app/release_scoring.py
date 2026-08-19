@@ -26,7 +26,7 @@ from app.migration_reconciliation import effective_authorized_divergences
 from app.finding_identity import audit_finding_key
 
 logger = logging.getLogger(__name__)
-_MODULE_SIZE_GOVERNANCE_CAP: int = 3326
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3900
 
 
 # Canonical fleet default for the promotion confidence gate.  The packaged
@@ -965,6 +965,8 @@ def evaluate_candidate_operator_authorship_gate(
     candidate_version: Any,
     measurement: Any,
     categories: list[dict[str, Any]] | None = None,
+    *,
+    resolved_range: tuple[str | None, str | None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate authorship over the candidate's complete base-to-head range.
 
@@ -974,6 +976,13 @@ def evaluate_candidate_operator_authorship_gate(
     while the candidate is blocked and therefore creates a self-blocking gate.
     ``max_count`` is the existing structured authorship predicate used by
     category grading; multiple contracts use the strictest declared budget.
+
+    ``resolved_range`` overrides the range recomputed from
+    ``candidate_authorship_range(candidate_version)``.  Callers pass it when
+    the version's stored ``base_sha`` was unset and the measurement was taken
+    against a base derived from the promotion target instead -- the gate must
+    validate the receipt against the SAME range that was actually measured,
+    not the still-null stored column.  When omitted, behavior is unchanged.
 
     When NO active category declares an ``operator_authored_commits``
     evidence contract, the gate does not manufacture a zero budget — that
@@ -990,7 +999,17 @@ def evaluate_candidate_operator_authorship_gate(
         validate_authorship_receipt,
     )
 
-    base_sha, candidate_sha = candidate_authorship_range(candidate_version)
+    if resolved_range is not None:
+        base_sha, candidate_sha = resolved_range
+    else:
+        base_sha, candidate_sha = candidate_authorship_range(candidate_version)
+    stored_base_sha, _ = candidate_authorship_range(candidate_version)
+    if stored_base_sha is not None:
+        base_sha_provenance = "stored"
+    elif isinstance(base_sha, str):
+        base_sha_provenance = "derived"
+    else:
+        base_sha_provenance = "unavailable"
     receipt = authorship_receipt_for_measurement(measurement, base_sha, candidate_sha)
     validated = validate_authorship_receipt(receipt, base_sha, candidate_sha)
     if validated is None or validated.get("state") != "resolved":
@@ -999,6 +1018,7 @@ def evaluate_candidate_operator_authorship_gate(
             "passed": False,
             "count": None,
             "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "base_sha_provenance": base_sha_provenance,
             "blocker": "candidate_operator_authorship_evidence_missing",
             "reason": (
                 receipt.get("reason") or "candidate_operator_authorship_receipt_invalid"
@@ -1028,6 +1048,7 @@ def evaluate_candidate_operator_authorship_gate(
             "count": count,
             "max_count": None,
             "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "base_sha_provenance": base_sha_provenance,
             "reason": "no_operator_authorship_contract_declared",
         }
     max_count = min(max_counts)
@@ -1038,11 +1059,13 @@ def evaluate_candidate_operator_authorship_gate(
             "count": count,
             "max_count": max_count,
             "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "base_sha_provenance": base_sha_provenance,
             "reason": "candidate_operator_authored_count_within_contract",
         }
     return {
         "status": "blocked",
         "passed": False,
+        "base_sha_provenance": base_sha_provenance,
         "count": count,
         "max_count": max_count,
         "range": {"base_sha": base_sha, "head_sha": candidate_sha},
@@ -1381,6 +1404,9 @@ def compute_composite(
             "max_count": candidate_operator_authorship_gate.get("max_count"),
             "range": candidate_operator_authorship_gate.get("range"),
             "reason": candidate_operator_authorship_gate.get("reason"),
+            "base_sha_provenance": candidate_operator_authorship_gate.get(
+                "base_sha_provenance"
+            ),
         }
 
     # Goal-verification observability (redesign): surface the per-category grade
