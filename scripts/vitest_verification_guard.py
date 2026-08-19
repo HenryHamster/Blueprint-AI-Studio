@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,24 +27,111 @@ from testing.fixgate_attribution import (  # noqa: E402
 class Suite:
     directory: str
     install_directory: str
-    test_file_prefixes: tuple[str, ...]
-    test_file_suffixes: tuple[str, ...]
+    config_path: str
 
 
 SUITES = {
     "agent": Suite(
         directory="agent",
         install_directory="agent",
-        test_file_prefixes=("src/",),
-        test_file_suffixes=(".test.ts",),
+        config_path="agent/vitest.config.ts",
     ),
     "admin-ui": Suite(
         directory="admin-ui",
         install_directory=".",
-        test_file_prefixes=("src/", "eslint-rules/"),
-        test_file_suffixes=(".test.ts", ".test.tsx", ".test.js"),
+        config_path="admin-ui/vitest.config.ts",
     ),
 }
+
+
+@dataclass(frozen=True)
+class _Roster:
+    """A suite's Vitest test-file roster, resolved from its own config."""
+
+    include: tuple[re.Pattern[str], ...]
+    exclude: tuple[re.Pattern[str], ...]
+
+
+_BRACE_RE = re.compile(r"\{([^{}]*)\}")
+_STRING_LITERAL_RE = re.compile(r"'([^']*)'|\"([^\"]*)\"")
+
+
+def _expand_braces(pattern: str) -> list[str]:
+    """Expand one level of `{a,b}` alternation, recursively."""
+
+    match = _BRACE_RE.search(pattern)
+    if not match:
+        return [pattern]
+    prefix, suffix = pattern[: match.start()], pattern[match.end() :]
+    expanded: list[str] = []
+    for option in match.group(1).split(","):
+        expanded.extend(_expand_braces(f"{prefix}{option}{suffix}"))
+    return expanded
+
+
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Translate a Vitest/minimatch-style glob into an anchored regex."""
+
+    parts: list[str] = []
+    i = 0
+    length = len(pattern)
+    while i < length:
+        remainder = pattern[i:]
+        if remainder.startswith("**/"):
+            parts.append("(?:.*/)?")
+            i += 3
+        elif remainder.startswith("**"):
+            parts.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            parts.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            parts.append("[^/]")
+            i += 1
+        else:
+            parts.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("^" + "".join(parts) + "$")
+
+
+def _compile_globs(patterns: list[str]) -> tuple[re.Pattern[str], ...]:
+    return tuple(
+        _glob_to_regex(expanded)
+        for pattern in patterns
+        for expanded in _expand_braces(pattern)
+    )
+
+
+def _extract_string_array(source: str, key: str) -> list[str]:
+    """Extract a flat array-of-string-literals config value by key."""
+
+    match = re.search(rf"\b{re.escape(key)}\s*:\s*\[(.*?)\]", source, re.DOTALL)
+    if not match:
+        return []
+    return [single or double for single, double in _STRING_LITERAL_RE.findall(match.group(1))]
+
+
+def _load_roster(repo: Path, suite: Suite) -> _Roster:
+    """Resolve a suite's authoritative test-file roster from its own Vitest config.
+
+    This must stay a single source of truth: the guard previously carried a
+    hand-maintained copy of these globs, which could drift from the config
+    (or omit its exclude half) and let a config-only change suppress a
+    baseline failure without the guard ever noticing.
+    """
+
+    config_file = repo / suite.config_path
+    if not config_file.is_file():
+        raise RuntimeError(f"cannot resolve Vitest roster: missing {suite.config_path}")
+    source = config_file.read_text(encoding="utf-8")
+    include = _extract_string_array(source, "include")
+    if not include:
+        raise RuntimeError(
+            f"cannot resolve Vitest roster: no include globs found in {suite.config_path}"
+        )
+    exclude = _extract_string_array(source, "exclude")
+    return _Roster(include=_compile_globs(include), exclude=_compile_globs(exclude))
 
 _EXECUTION_REPORT_ROUTE = "blueprint.vitest.execution"
 _EXECUTION_REPORT_RUNNER = f"{_EXECUTION_REPORT_ROUTE}::runner"
@@ -86,7 +174,7 @@ def _changed_files(repo: Path, base_ref: str) -> list[str]:
     return sorted(changed)
 
 
-def _is_suite_test_file(path: str, suite: Suite) -> bool:
+def _is_suite_test_file(path: str, suite: Suite, roster: _Roster) -> bool:
     """Return whether a repo-relative path belongs to this suite's Vitest roster."""
 
     normalized = path.replace("\\", "/").strip("/")
@@ -94,19 +182,21 @@ def _is_suite_test_file(path: str, suite: Suite) -> bool:
     if not normalized.startswith(prefix):
         return False
     relative = normalized[len(prefix) :]
-    return any(relative.startswith(directory) for directory in suite.test_file_prefixes) and any(
-        relative.endswith(suffix) for suffix in suite.test_file_suffixes
-    )
+    if not any(pattern.match(relative) for pattern in roster.include):
+        return False
+    return not any(pattern.match(relative) for pattern in roster.exclude)
 
 
-def _changed_test_files(repo: Path, base_ref: str, suite: Suite) -> list[str]:
-    """Return changed repo-relative test files selected by this suite's config."""
+def _changed_test_files(repo: Path, base_ref: str, suite: Suite, roster: _Roster) -> list[str]:
+    """Return changed repo-relative test files selected by this suite's roster."""
 
-    return [path for path in _changed_files(repo, base_ref) if _is_suite_test_file(path, suite)]
+    return [
+        path for path in _changed_files(repo, base_ref) if _is_suite_test_file(path, suite, roster)
+    ]
 
 
 def _base_file_selectors(
-    paths: list[str], suite: Suite, base_root: Path
+    paths: list[str], suite: Suite, roster: _Roster, base_root: Path
 ) -> list[str]:
     """Return suite-relative selectors for changed or failed files present in base."""
 
@@ -116,7 +206,7 @@ def _base_file_selectors(
         normalized = path.replace("\\", "/").strip("/")
         if not normalized.startswith(prefix):
             normalized = f"{prefix}{normalized}"
-        if not _is_suite_test_file(normalized, suite):
+        if not _is_suite_test_file(normalized, suite, roster):
             continue
         relative = normalized[len(prefix) :]
         if (base_root / normalized).is_file():
@@ -244,16 +334,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         try:
             base_ref = _base_ref(repo, args.base)
-            changed_test_files = (
-                _changed_test_files(repo, base_ref, suite) if current_is_clean else []
-            )
+            roster = _load_roster(repo, suite)
+            if current_is_clean:
+                changed_test_files = _changed_test_files(repo, base_ref, suite, roster)
+                roster_config_changed = suite.config_path in _changed_files(repo, base_ref)
+            else:
+                changed_test_files = []
+                roster_config_changed = False
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             return _blocking("baseline_unavailable", error=str(exc))
 
-        # A clean current run with no changed test file cannot have made a
-        # baseline failure disappear or become skipped. Keep this cheap path,
-        # but only after proving the suite's test-file diff is empty.
-        if current_is_clean and not changed_test_files:
+        # A clean current run with no changed test file, and no change to the
+        # config that DEFINES the roster, cannot have made a baseline failure
+        # disappear or become skipped. Keep this cheap path, but only after
+        # proving the suite's test-file diff (roster included) is empty.
+        if current_is_clean and not changed_test_files and not roster_config_changed:
             outcome = classify_verification(
                 runtime_available=True,
                 current_exit_code=current.returncode,
@@ -270,16 +365,29 @@ def main(argv: list[str] | None = None) -> int:
             base_root.mkdir()
             extract_base(repo, base_ref, base_root)
             if current_is_clean:
-                base_selectors = _base_file_selectors(
-                    changed_test_files, suite, base_root
-                )
+                if roster_config_changed:
+                    # The roster itself moved (an include/exclude glob
+                    # changed). We cannot safely narrow to individual files -
+                    # a newly excluded file wouldn't even be in this list -
+                    # so run the full suite against base under base's own
+                    # config and let route-keyed attribution catch anything
+                    # the new roster silently dropped.
+                    print(
+                        f"[vitest-verification] baseline scoped to the full suite: "
+                        f"{suite.config_path} changed"
+                    )
+                    base_selectors = None
+                else:
+                    base_selectors = _base_file_selectors(
+                        changed_test_files, suite, roster, base_root
+                    )
             else:
                 failed_file_paths = [
                     selector.split("::", 1)[0]
                     for selector in current_report.selectors.values()
                 ]
                 base_selectors = (
-                    _base_file_selectors(failed_file_paths, suite, base_root)
+                    _base_file_selectors(failed_file_paths, suite, roster, base_root)
                     if current_report.selectors
                     else None
                 )

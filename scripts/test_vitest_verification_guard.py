@@ -47,6 +47,16 @@ def _clean_execution_report() -> JUnitReport:
     return JUnitReport(test_routes={"blueprint.vitest.execution::runner"})
 
 
+def _permissive_roster() -> guard._Roster:
+    """A roster that matches any `*.test.{ts,tsx,js}` file, for tests that
+    don't care about a suite's real include/exclude globs."""
+
+    return guard._Roster(
+        include=guard._compile_globs(["**/*.test.ts", "**/*.test.tsx", "**/*.test.js"]),
+        exclude=(),
+    )
+
+
 def test_developer_gate_uses_the_shared_lane_only_in_test_mode() -> None:
     """The tracked fallback keeps unit tests opt-in while sharing attribution."""
 
@@ -89,6 +99,7 @@ def test_guard_warn_passes_only_named_identical_baseline_failure(
     monkeypatch.setattr(guard, "_run_vitest", fake_run)
     monkeypatch.setattr(guard, "_install_base", lambda *_: subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_load_roster", lambda *_: _permissive_roster())
     monkeypatch.setattr(guard, "extract_base", lambda _, __, destination: (destination / "agent").mkdir())
     monkeypatch.setattr(guard, "parse_junit_report", fake_report)
 
@@ -146,7 +157,9 @@ def test_guard_clean_current_skips_every_baseline_step(
 
     monkeypatch.setattr(guard, "_run_vitest", fake_run)
     monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_load_roster", lambda *_: _permissive_roster())
     monkeypatch.setattr(guard, "_changed_test_files", lambda *_: [])
+    monkeypatch.setattr(guard, "_changed_files", lambda *_: [])
     monkeypatch.setattr(guard, "extract_base", unexpected_baseline)
     monkeypatch.setattr(guard, "_install_base", unexpected_baseline)
     monkeypatch.setattr(
@@ -198,9 +211,15 @@ def _set_up_clean_changed_test_run(
 
     monkeypatch.setattr(guard, "_run_vitest", fake_run)
     monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_load_roster", lambda *_: _permissive_roster())
     monkeypatch.setattr(
         guard,
         "_changed_test_files",
+        lambda *_: [f"{suite.directory}/src/example.test.ts"],
+    )
+    monkeypatch.setattr(
+        guard,
+        "_changed_files",
         lambda *_: [f"{suite.directory}/src/example.test.ts"],
     )
     monkeypatch.setattr(guard, "extract_base", fake_extract)
@@ -273,6 +292,7 @@ def test_guard_clean_current_with_only_non_test_changes_skips_baseline(
 
     monkeypatch.setattr(guard, "_run_vitest", fake_run)
     monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_load_roster", lambda *_: _permissive_roster())
     monkeypatch.setattr(
         guard,
         "_changed_files",
@@ -311,9 +331,15 @@ def test_guard_clean_new_suite_test_without_base_counterpart_uses_empty_baseline
 
     monkeypatch.setattr(guard, "_run_vitest", fake_run)
     monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_load_roster", lambda *_: _permissive_roster())
     monkeypatch.setattr(
         guard,
         "_changed_test_files",
+        lambda *_: ["agent/src/new.test.ts"],
+    )
+    monkeypatch.setattr(
+        guard,
+        "_changed_files",
         lambda *_: ["agent/src/new.test.ts"],
     )
     monkeypatch.setattr(guard, "extract_base", lambda *_: None)
@@ -346,17 +372,102 @@ def test_changed_suite_test_files_union_all_diff_sources_and_filter_rosters(
         return subprocess.CompletedProcess([], 0, stdout=output, stderr="")
 
     monkeypatch.setattr(guard, "_git", fake_git)
+    agent_suite = guard.SUITES["agent"]
+    admin_ui_suite = guard.SUITES["admin-ui"]
+    agent_roster = guard._load_roster(REPO_ROOT, agent_suite)
+    admin_ui_roster = guard._load_roster(REPO_ROOT, admin_ui_suite)
 
+    # agent's real roster only includes `.test.ts`, so `.js` is filtered out -
+    # unlike a permissive stub, this pins the suite's actual exclude/include
+    # boundary, not just the diff-source union.
     assert guard._changed_test_files(
-        tmp_path, "origin/automain", guard.SUITES["agent"]
+        tmp_path, "origin/automain", agent_suite, agent_roster
     ) == [
         "agent/src/committed.test.ts",
         "agent/src/untracked.test.ts",
         "agent/src/working.test.ts",
     ]
     assert guard._changed_test_files(
-        tmp_path, "origin/automain", guard.SUITES["admin-ui"]
+        tmp_path, "origin/automain", admin_ui_suite, admin_ui_roster
     ) == ["admin-ui/src/admin.test.tsx"]
+
+
+def test_load_roster_resolves_admin_ui_config_include_and_exclude() -> None:
+    """The roster is derived from admin-ui's own config, not a hand-kept copy.
+
+    admin-ui/vitest.config.ts excludes `src/**/*.viewport.test.{ts,tsx}`; a
+    hardcoded suffix-only copy of the include half cannot know that.
+    """
+
+    suite = guard.SUITES["admin-ui"]
+    roster = guard._load_roster(REPO_ROOT, suite)
+    assert guard._is_suite_test_file("admin-ui/src/components/Example.test.tsx", suite, roster)
+    assert guard._is_suite_test_file("admin-ui/eslint-rules/example.test.js", suite, roster)
+    assert not guard._is_suite_test_file(
+        "admin-ui/src/components/Example.viewport.test.tsx", suite, roster
+    )
+
+
+def test_load_roster_resolves_agent_config_include() -> None:
+    suite = guard.SUITES["agent"]
+    roster = guard._load_roster(REPO_ROOT, suite)
+    assert guard._is_suite_test_file("agent/src/prompts/check-helper.test.ts", suite, roster)
+    assert not guard._is_suite_test_file("agent/src/prompts/check-helper.ts", suite, roster)
+
+
+def test_guard_blocks_a_baseline_failure_removed_by_a_vitest_config_exclude(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A diff that only widens vitest.config.ts's exclude glob cannot make a
+    failing baseline test vanish undetected.
+
+    This reproduces the reported hole directly: the candidate tree's config
+    now excludes `src/flaky.test.ts`, so a clean current run has zero paths
+    matching the OLD hardcoded prefix/suffix roster (the config itself has
+    neither a `src/` prefix nor a `.test.ts` suffix), and the guard used to
+    take the cheap-skip branch without ever installing or running a baseline.
+    """
+
+    suite = guard.SUITES["admin-ui"]
+    config_file = tmp_path / suite.config_path
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(
+        "export default {\n"
+        "  test: {\n"
+        "    include: ['src/**/*.test.{ts,tsx}'],\n"
+        "    exclude: ['node_modules/**', 'src/flaky.test.ts'],\n"
+        "  },\n"
+        "};\n",
+        encoding="utf-8",
+    )
+
+    def fake_run(
+        root: Path, _: guard.Suite, report: Path, __: Path, selectors: list[str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        exit_code = 0 if report.name == "current.xml" else 1
+        return subprocess.CompletedProcess([], exit_code, stdout="", stderr="")
+
+    def fake_report(path: Path, **_: object) -> JUnitReport:
+        if path.name.endswith("execution.xml"):
+            return _clean_execution_report()
+        if path.name == "current.xml":
+            return JUnitReport(test_routes={"src/other.test.ts::passes"})
+        return JUnitReport(
+            failures={"src/flaky.test.ts::breaks::failure": "inherited failure"},
+            test_routes={"src/flaky.test.ts::breaks"},
+        )
+
+    monkeypatch.setattr(guard, "_run_vitest", fake_run)
+    monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_changed_files", lambda *_: [suite.config_path])
+    monkeypatch.setattr(guard, "extract_base", lambda *_: None)
+    monkeypatch.setattr(guard, "_install_base", lambda *_: subprocess.CompletedProcess([], 0))
+    monkeypatch.setattr(guard, "parse_junit_report", fake_report)
+
+    assert guard.main(["--suite", "admin-ui", "--repo-root", str(tmp_path)]) == 1
+    output = capsys.readouterr().out
+    assert "baseline scoped to the full suite" in output
+    assert "FAILED state=baseline_failure_disappeared" in output
 
 
 def test_run_vitest_passes_base_file_selectors_to_vitest(
@@ -473,6 +584,7 @@ def test_guard_blocks_every_invalid_baseline_exit_report_pair(
     monkeypatch.setattr(guard, "_run_vitest", fake_run)
     monkeypatch.setattr(guard, "_install_base", lambda *_: subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_load_roster", lambda *_: _permissive_roster())
     monkeypatch.setattr(guard, "extract_base", lambda *_: None)
     monkeypatch.setattr(
         guard,
@@ -514,6 +626,7 @@ def test_guard_accepts_valid_failing_current_and_clean_baseline_pairs(
     monkeypatch.setattr(guard, "_run_vitest", fake_run)
     monkeypatch.setattr(guard, "_install_base", lambda *_: subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_load_roster", lambda *_: _permissive_roster())
     monkeypatch.setattr(guard, "extract_base", lambda *_: None)
     monkeypatch.setattr(
         guard,
@@ -559,6 +672,7 @@ def test_guard_blocks_mixed_inherited_failure_and_current_execution_error(
     monkeypatch.setattr(guard, "_run_vitest", fake_run)
     monkeypatch.setattr(guard, "_install_base", lambda *_: subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_load_roster", lambda *_: _permissive_roster())
     monkeypatch.setattr(guard, "extract_base", lambda _, __, destination: (destination / "agent").mkdir())
     monkeypatch.setattr(
         guard,
@@ -603,6 +717,7 @@ def test_guard_blocks_baseline_execution_report_error(
     monkeypatch.setattr(guard, "_run_vitest", fake_run)
     monkeypatch.setattr(guard, "_install_base", lambda *_: subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_load_roster", lambda *_: _permissive_roster())
     monkeypatch.setattr(guard, "extract_base", lambda _, __, destination: (destination / "agent").mkdir())
     monkeypatch.setattr(
         guard,
