@@ -892,17 +892,27 @@ async def _surface_module_finding_chain_escalation(
     try:
         from app.alert_dispatch import _maybe_create_escalation_alert
 
+        occurrence_count = int(
+            candidate.get("verified_occurrences") or candidate["occurrences"]
+        )
         await _maybe_create_escalation_alert(
             target,
             session,
             pr_number=pr_number,
             reason="module-finding-chain",
-            iteration=int(
-                candidate.get("verified_occurrences") or candidate["occurrences"]
-            ),
+            iteration=occurrence_count,
             detail=(
                 f"Recurring concern in {candidate['file_path']} across "
                 f"{candidate['occurrences']} merged PR(s); current fix continues."
+            ),
+            # Scoped by concern + occurrence count, NOT the PR number: a new
+            # PR re-raising the same concern with no new merged occurrence
+            # must stay suppressed, while a genuinely new merged occurrence
+            # (higher count) or a second distinct concern on the same PR
+            # (different file_path/finding_key) must each get their own alert.
+            dedupe_scope=(
+                f"{candidate['file_path']} "
+                f"(finding {candidate['finding_key'][:8]}, occurrence {occurrence_count})"
             ),
         )
     except Exception as exc:  # noqa: BLE001 — best-effort alert only

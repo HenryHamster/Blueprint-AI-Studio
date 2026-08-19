@@ -111,30 +111,31 @@ async def test_three_distinct_merged_prs_escalate_once():
         "description": "Session cleanup ownership leaks resources",
         "file": "backend/app/example.py",
     }
-    candidate = await find_and_mark_chain_escalation(
+    candidates = await find_and_mark_chain_escalation(
         session,
         project_id=project_id,
         issues=[issue],
         authoritative_files=[{"filename": "backend/app/example.py"}],
     )
-    assert candidate is not None
+    assert len(candidates) == 1
+    candidate = candidates[0]
     assert candidate["status"] == "chain_escalation"
     assert candidate["occurrences"] == CHAIN_ESCALATION_THRESHOLD
-    assert chain.status == "escalated"
 
     # Re-entry on the same PR without a new merged occurrence: the chain is
     # still past threshold, so the detector finds it again. It is not a
     # lifetime suppressor — dedup for repeated re-entry on one PR happens
     # downstream, in the alert layer (alert_dispatch, keyed by
-    # (task_id, title) where the title encodes the PR number).
-    same_pr_candidate = await find_and_mark_chain_escalation(
+    # (task_id, title) where the title encodes the concern and occurrence
+    # count, not the PR number).
+    same_pr_candidates = await find_and_mark_chain_escalation(
         session,
         project_id=project_id,
         issues=[issue],
         authoritative_files=[{"filename": "backend/app/example.py"}],
     )
-    assert same_pr_candidate is not None
-    assert same_pr_candidate["finding_key"] == candidate["finding_key"]
+    assert len(same_pr_candidates) == 1
+    assert same_pr_candidates[0]["finding_key"] == candidate["finding_key"]
 
     # A NEW distinct merged PR re-raising the same concern must still be
     # detectable as a fresh escalation candidate -- the chain must not go
@@ -150,16 +151,106 @@ async def test_three_distinct_merged_prs_escalate_once():
     assert chain.occurrences == 4
     assert chain.verified_occurrences == 4
 
-    next_pr_candidate = await find_and_mark_chain_escalation(
+    next_pr_candidates = await find_and_mark_chain_escalation(
         session,
         project_id=project_id,
         issues=[issue],
         authoritative_files=[{"filename": "backend/app/example.py"}],
     )
-    assert next_pr_candidate is not None
+    assert len(next_pr_candidates) == 1
+    next_pr_candidate = next_pr_candidates[0]
     assert next_pr_candidate["finding_key"] == candidate["finding_key"]
     assert next_pr_candidate["occurrences"] == 4
-    assert chain.status == "escalated"
+
+
+def _context_for_file(description: str, issue_id: str, file_path: str) -> dict:
+    issue = {
+        "issue_id": issue_id,
+        "severity": "major",
+        "description": description,
+        "file": file_path,
+    }
+    return {
+        "_pr_changed_files": [file_path],
+        "_pr_changed_files_github_verified": True,
+        "review_loop": {
+            "review_history": [
+                {"issues": [issue], "resolutions": [{"issue_id": issue_id, "disposition": "fixed"}]}
+            ],
+            "issue_ledger": {
+                "resolved": [{"issue_id": issue_id, "disposition": "fixed"}]
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_two_distinct_chains_past_threshold_on_one_pr_both_surface():
+    """A single PR can raise two unrelated concerns, each independently past
+    threshold in a different module. Both must be returned, and the result
+    must not depend on the order the issues appear in."""
+    project_id = uuid.uuid4()
+    session = _Session()
+
+    one_descriptions = [
+        "The retry loop lacks backoff and hammers the api",
+        "Retry loop lacks backoff and still hammers the api",
+        "Retry loop still lacks backoff and hammers the api",
+    ]
+    two_descriptions = [
+        "The cache key omits tenant id and leaks data",
+        "Cache key omits tenant id and still leaks data",
+        "Cache key still omits tenant id and leaks data",
+    ]
+    for pr_number, (desc_one, desc_two) in enumerate(
+        zip(one_descriptions, two_descriptions), start=401
+    ):
+        task_one = Task(
+            project_id=project_id,
+            context=_context_for_file(desc_one, f"one-{pr_number}", "backend/app/one.py"),
+        )
+        await record_merged_pr_finding_chains(task_one, session, pr_number=pr_number)
+        task_two = Task(
+            project_id=project_id,
+            context=_context_for_file(desc_two, f"two-{pr_number}", "backend/app/two.py"),
+        )
+        await record_merged_pr_finding_chains(task_two, session, pr_number=pr_number)
+
+    assert len(session.rows) == 2
+
+    issue_one = {
+        "severity": "major",
+        "description": "Retry loop lacks backoff and hammers the api",
+        "file": "backend/app/one.py",
+    }
+    issue_two = {
+        "severity": "major",
+        "description": "Cache key omits tenant id and leaks data",
+        "file": "backend/app/two.py",
+    }
+    authoritative_files = [
+        {"filename": "backend/app/one.py"},
+        {"filename": "backend/app/two.py"},
+    ]
+
+    forward = await find_and_mark_chain_escalation(
+        session,
+        project_id=project_id,
+        issues=[issue_one, issue_two],
+        authoritative_files=authoritative_files,
+    )
+    assert {c["file_path"] for c in forward} == {"backend/app/one.py", "backend/app/two.py"}
+
+    reversed_order = await find_and_mark_chain_escalation(
+        session,
+        project_id=project_id,
+        issues=[issue_two, issue_one],
+        authoritative_files=authoritative_files,
+    )
+    assert {c["file_path"] for c in reversed_order} == {
+        "backend/app/one.py",
+        "backend/app/two.py",
+    }
 
 
 @pytest.mark.asyncio
@@ -187,7 +278,7 @@ async def test_unverified_prs_do_not_cross_verified_escalation_threshold():
             ],
             authoritative_files=None,
         )
-        is None
+        == []
     )
 
 

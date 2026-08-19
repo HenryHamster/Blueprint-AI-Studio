@@ -20,6 +20,7 @@ from app.alert_dispatch import (
     _UNVERIFIED_REASON_LABELS,
     _fmt_duration_seconds,
     _maybe_create_blocked_escalation_alert,
+    _maybe_create_escalation_alert,
     _maybe_create_local_runner_hold_alert,
     _maybe_create_migration_slot_contention_alert,
     _maybe_create_pool_payoff_alert,
@@ -2469,3 +2470,154 @@ async def test_wake_delivery_stall_alert_resolves_on_recovery(db_session, mocker
     alerts = await _wake_delivery_stall_alerts(db_session, project.id)
     assert alerts[0].dismissed_at is not None, "stall alert must be dismissed on recovery"
     assert bcast.await_count == 2  # alert_created + alert_dismissed
+
+
+# ── module-finding-chain escalation alert (concern-scoped dedup) ────────────
+#
+# The module-finding-chain reason dedups on the concern's identity + occurrence
+# count (via ``dedupe_scope``), NOT the PR number embedded in the default
+# title, because its evidence is per-CONCERN: the same concern can resurface
+# across many PR numbers with no new merged occurrence, and one PR can raise
+# more than one distinct concern past threshold.
+
+
+async def _module_finding_chain_alerts(db_session, task_id):
+    stmt = sql_select(Alert).where(
+        Alert.task_id == task_id,
+        Alert.title.contains("recurring module finding"),
+        Alert.dismissed_at.is_(None),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+async def _make_module_finding_chain_task(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(project_id=project.id, title="Chain-original task")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_module_finding_chain_alert_reentry_on_same_pr_is_suppressed(
+    db_session, mocker
+):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    task = await _make_module_finding_chain_task(db_session)
+
+    for pr_number in (101, 101, 101):
+        await _maybe_create_escalation_alert(
+            task,
+            db_session,
+            pr_number=pr_number,
+            reason="module-finding-chain",
+            iteration=3,
+            detail="Recurring concern in backend/app/example.py.",
+            dedupe_scope="backend/app/example.py (finding abc12345, occurrence 3)",
+        )
+        await db_session.commit()
+
+    alerts = await _module_finding_chain_alerts(db_session, task.id)
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_module_finding_chain_alert_new_pr_same_occurrence_count_is_suppressed(
+    db_session, mocker
+):
+    """A NEW PR number re-raising the SAME concern with NO new merged
+    occurrence must not spam a second alert -- the dedup key is the concern's
+    identity + occurrence count, not the PR number."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    task = await _make_module_finding_chain_task(db_session)
+
+    for pr_number in (101, 102, 103):
+        await _maybe_create_escalation_alert(
+            task,
+            db_session,
+            pr_number=pr_number,
+            reason="module-finding-chain",
+            iteration=3,
+            detail="Recurring concern in backend/app/example.py.",
+            dedupe_scope="backend/app/example.py (finding abc12345, occurrence 3)",
+        )
+        await db_session.commit()
+
+    alerts = await _module_finding_chain_alerts(db_session, task.id)
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_module_finding_chain_alert_new_merged_occurrence_alerts_again(
+    db_session, mocker
+):
+    """A genuinely NEW merged occurrence (verified_occurrences increases) of the
+    same concern must raise a fresh alert, not be swallowed by dedup."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    task = await _make_module_finding_chain_task(db_session)
+
+    await _maybe_create_escalation_alert(
+        task,
+        db_session,
+        pr_number=101,
+        reason="module-finding-chain",
+        iteration=3,
+        detail="Recurring concern in backend/app/example.py.",
+        dedupe_scope="backend/app/example.py (finding abc12345, occurrence 3)",
+    )
+    await db_session.commit()
+
+    await _maybe_create_escalation_alert(
+        task,
+        db_session,
+        pr_number=104,
+        reason="module-finding-chain",
+        iteration=4,
+        detail="Recurring concern in backend/app/example.py.",
+        dedupe_scope="backend/app/example.py (finding abc12345, occurrence 4)",
+    )
+    await db_session.commit()
+
+    alerts = await _module_finding_chain_alerts(db_session, task.id)
+    assert len(alerts) == 2
+
+
+@pytest.mark.asyncio
+async def test_module_finding_chain_alert_two_distinct_concerns_on_same_pr_both_alert(
+    db_session, mocker
+):
+    """Two distinct chains past threshold, both raised on the same PR, must
+    both surface -- a second concern must not be swallowed by the first."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    task = await _make_module_finding_chain_task(db_session)
+
+    await _maybe_create_escalation_alert(
+        task,
+        db_session,
+        pr_number=101,
+        reason="module-finding-chain",
+        iteration=3,
+        detail="Recurring concern in backend/app/one.py.",
+        dedupe_scope="backend/app/one.py (finding aaaa1111, occurrence 3)",
+    )
+    await db_session.commit()
+
+    await _maybe_create_escalation_alert(
+        task,
+        db_session,
+        pr_number=101,
+        reason="module-finding-chain",
+        iteration=3,
+        detail="Recurring concern in backend/app/two.py.",
+        dedupe_scope="backend/app/two.py (finding bbbb2222, occurrence 3)",
+    )
+    await db_session.commit()
+
+    alerts = await _module_finding_chain_alerts(db_session, task.id)
+    assert len(alerts) == 2
+    titles = {alert.title for alert in alerts}
+    assert len(titles) == 2  # distinct titles -- not just distinct rows

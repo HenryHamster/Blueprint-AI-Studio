@@ -920,6 +920,7 @@ async def _maybe_create_escalation_alert(
     iteration: int,
     severity: AlertSeverity = AlertSeverity.WARNING,
     detail: str | None = None,
+    dedupe_scope: str | None = None,
 ) -> None:
     """Create a deduplicated operator Alert for a review-fix early escalation.
 
@@ -931,15 +932,23 @@ async def _maybe_create_escalation_alert(
     same Alerts banner as cap-exhaustion, *regardless* of whether manual approval
     gates are enabled.
 
-    Deduplicated by ``(task_id, title)``. The title encodes the PR + reason but
-    NOT the iteration, so a re-entered escalation on the same PR does not spam the
-    banner; the iteration count lives in the message. ``task`` should be the
-    chain-original task so the alert is task-linked (renders a "View task" button
-    in the banner).
+    Deduplicated by ``(task_id, title)``. By default the title encodes the PR
+    + reason but NOT the iteration, so a re-entered escalation on the same PR
+    does not spam the banner; the iteration count lives in the message.
+    ``task`` should be the chain-original task so the alert is task-linked
+    (renders a "View task" button in the banner).
+
+    ``dedupe_scope``, when given, replaces the PR-based scope in the title —
+    for reasons whose evidence is per-CONCERN rather than per-PR (e.g.
+    ``module-finding-chain``, where the same concern can resurface across many
+    PR numbers with no new merged evidence, and a single PR can raise more
+    than one distinct concern past threshold). The PR number always stays in
+    the message regardless of what scopes the title.
     """
     label = _ESCALATION_REASON_LABELS.get(reason, reason)
     pr_label = f"PR #{pr_number}" if pr_number is not None else "PR"
-    title = f"Review-fix escalation: {label} on {pr_label}"
+    scope = dedupe_scope if dedupe_scope is not None else pr_label
+    title = f"Review-fix escalation: {label} on {scope}"
     existing = await session.execute(
         select(Alert).where(
             Alert.task_id == task.id,

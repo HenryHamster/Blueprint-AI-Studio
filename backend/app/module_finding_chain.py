@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 CHAIN_ESCALATION_THRESHOLD = 3
 CHAIN_PR_NUMBERS_MAX_ENTRIES = 20
-MODULE_FINDING_CHAIN_ESCALATION_KEY = "module_finding_chain_escalation"
 
 
 def _blocking(issue: Mapping[str, Any]) -> bool:
@@ -254,15 +253,17 @@ async def find_and_mark_chain_escalation(
     project_id: Any,
     issues: Iterable[Mapping[str, Any]],
     authoritative_files: list[dict] | None,
-) -> dict[str, Any] | None:
-    """Find one recurring concern past threshold and mark it escalated.
+) -> list[dict[str, Any]]:
+    """Find every distinct recurring concern past threshold on this PR.
 
-    ``status == "escalated"`` does not gate this search: it is a durable
-    record of first escalation, not a lifetime suppressor. Noise control
-    for repeated escalation of the same concern on the same PR is the
-    downstream alert dedup (``alert_dispatch._maybe_create_escalation_alert``,
-    keyed on ``(task_id, title)`` where the title encodes the PR number) —
-    a new distinct PR re-raising the same concern must alert again.
+    A PR can legitimately raise two unrelated concerns that have each
+    independently crossed the escalation threshold in different chains; both
+    must reach the operator, so this returns one candidate per distinct
+    matched chain rather than stopping at the first blocking issue. Noise
+    control for repeated escalation of the SAME concern (re-entry on the same
+    PR, or a new PR with no new merged occurrence) is the downstream alert
+    dedup (``alert_dispatch._maybe_create_escalation_alert``), keyed on the
+    concern's identity and occurrence count rather than the PR number.
     """
     rows = list(
         (
@@ -276,34 +277,39 @@ async def find_and_mark_chain_escalation(
         .all()
     )
     if not rows:
-        return None
+        return []
     changed_paths = {
         str(item.get("filename") or "").strip()
         for item in (authoritative_files or [])
         if isinstance(item, dict) and str(item.get("filename") or "").strip()
     }
+    candidates: list[dict[str, Any]] = []
+    seen_chain_ids: set[int] = set()
     for issue in issues:
         if not _blocking(issue):
             continue
         matched = _matching_chain(rows, issue)
         if matched is None:
             continue
+        if id(matched) in seen_chain_ids:
+            continue
         if int(matched.verified_occurrences or 0) < CHAIN_ESCALATION_THRESHOLD:
             continue
-        matched.status = "escalated"
-        session.add(matched)
-        return {
-            "status": "chain_escalation",
-            "finding_key": matched.finding_key,
-            "file_path": matched.file_path,
-            "occurrences": matched.occurrences,
-            "verified_occurrences": matched.verified_occurrences,
-            "pr_numbers": list(matched.pr_numbers or []),
-            "threshold": CHAIN_ESCALATION_THRESHOLD,
-            "file_provenance": (
-                "verified"
-                if str(issue.get("file") or "").strip() in changed_paths
-                else "unverified"
-            ),
-        }
-    return None
+        seen_chain_ids.add(id(matched))
+        candidates.append(
+            {
+                "status": "chain_escalation",
+                "finding_key": matched.finding_key,
+                "file_path": matched.file_path,
+                "occurrences": matched.occurrences,
+                "verified_occurrences": matched.verified_occurrences,
+                "pr_numbers": list(matched.pr_numbers or []),
+                "threshold": CHAIN_ESCALATION_THRESHOLD,
+                "file_provenance": (
+                    "verified"
+                    if str(issue.get("file") or "").strip() in changed_paths
+                    else "unverified"
+                ),
+            }
+        )
+    return candidates
