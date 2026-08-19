@@ -10,6 +10,7 @@ import {
   buildBootstrapPrompt, buildAutonomousPrompt,
   formatCurrentEffectivePolicyJson, resolveResidentPurposeText,
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
+  consultationAbandonDeadlineMs, CONSULTATION_DEADLINE_MARGIN_MS, CONSULTATION_DEADLINE_FLOOR_MS,
   buildPriorDecisionsText,
   buildRetiredContextText,
   buildStagedDirectionsText, formatDirectionGroundingText,
@@ -455,6 +456,61 @@ describe('resolveTerminalStatus', () => {
       .toEqual({ status: 'FAILED', failureCategory: 'dead_auth' });
     expect(resolveTerminalStatus('stop_requested', 0, 'rate_limited'))
       .toEqual({ status: 'COMPLETED' });
+  });
+
+  it('FAILED (consultation_abandoned) when a consultation-abandon interrupt killed the whole process', () => {
+    // Root-cause regression for "death-as-COMPLETED": session.interrupt() on
+    // consultation abandonment kills the entire Claude Code child, not just
+    // the turn. Reporting COMPLETED here (as the generic session_process_exited
+    // path previously did whenever exitCode was 0/unknown) silently masked
+    // consultation churn from the reconciler.
+    expect(resolveTerminalStatus('consultation_abandoned_process_exit', 0))
+      .toEqual({ status: 'FAILED', failureCategory: 'consultation_abandoned' });
+    expect(resolveTerminalStatus('consultation_abandoned_process_exit', null))
+      .toEqual({ status: 'FAILED', failureCategory: 'consultation_abandoned' });
+    expect(resolveTerminalStatus('consultation_abandoned_process_exit', 1))
+      .toEqual({ status: 'FAILED', failureCategory: 'consultation_abandoned' });
+  });
+
+  it('still honors a provider failure category over a consultation-abandon exit', () => {
+    expect(resolveTerminalStatus('consultation_abandoned_process_exit', 1, 'rate_limited'))
+      .toEqual({ status: 'FAILED', failureCategory: 'rate_limited' });
+  });
+
+  it('legitimate paths are unaffected: operator stop / mode change / normal end stay clean', () => {
+    expect(resolveTerminalStatus('stop_requested', null)).toEqual({ status: 'COMPLETED' });
+    expect(resolveTerminalStatus('task_terminal', 0)).toEqual({ status: 'COMPLETED' });
+    expect(resolveTerminalStatus('session_process_exited', 0)).toEqual({ status: 'COMPLETED' });
+  });
+});
+
+describe('consultationAbandonDeadlineMs', () => {
+  it('derives from the server turn timeout plus margin when above the floor', () => {
+    // Root-cause regression for the deadline-inversion defect: the client
+    // deadline must never be shorter than the server's own configured
+    // autonomous turn timeout, or the client abandons (and SIGINTs the whole
+    // process) a turn the server still considers live.
+    expect(consultationAbandonDeadlineMs(300_000)).toBe(300_000 + CONSULTATION_DEADLINE_MARGIN_MS);
+    expect(consultationAbandonDeadlineMs(600_000)).toBe(600_000 + CONSULTATION_DEADLINE_MARGIN_MS);
+  });
+
+  it('never drops below the floor for a small/misconfigured server timeout', () => {
+    expect(consultationAbandonDeadlineMs(1_000)).toBe(CONSULTATION_DEADLINE_FLOOR_MS);
+    expect(consultationAbandonDeadlineMs(0)).toBe(CONSULTATION_DEADLINE_FLOOR_MS);
+  });
+
+  it('is monotonic in the server timeout and always exceeds it once above the floor', () => {
+    const timeoutMs = 300_000;
+    const deadlineMs = consultationAbandonDeadlineMs(timeoutMs);
+    expect(deadlineMs).toBeGreaterThan(timeoutMs);
+    expect(consultationAbandonDeadlineMs(timeoutMs + 1)).toBeGreaterThan(deadlineMs);
+  });
+
+  it('matches the previously hard-coded 240s only at the floor, not at the real 300s server default', () => {
+    // The historical bug: the client used a flat 240s regardless of the
+    // server's timeout. At the actual default (300s turn timeout) the fixed
+    // deadline must now exceed 240s, not equal it.
+    expect(consultationAbandonDeadlineMs(300_000)).toBeGreaterThan(240_000);
   });
 });
 

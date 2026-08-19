@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +20,7 @@ from app.conversation_coordinator import (
     complete_workday_consultation_continuation,
     create_or_get_workday_consultation_packet,
     native_resident_reply_may_complete_claim,
+    record_workday_consultation_gate_failure,
     renew_workday_consultation_packet,
     renew_workday_consultation_continuation,
     release_workday_consultation_continuation,
@@ -998,3 +1000,242 @@ def test_standard_fallback_is_explicit_and_only_when_fast_has_no_capacity():
         fast_capacity_available=False,
         explicitly_requested=True,
     )
+
+
+async def _expire_workday_claim_lease(db_session, packet_id: uuid.UUID) -> None:
+    """Simulate a worker that died without ever acking: force the packet's
+    already-issued claim lease into the past so the NEXT claim_next call sees
+    it as reclaimable, exactly like real lease expiry -- without sleeping."""
+    row = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.id == packet_id)
+        )
+    ).scalar_one()
+    context = dict(row.context or {})
+    context["_workday_consultation_claim_expires_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=5)
+    ).isoformat()
+    row.context = context
+    db_session.add(row)
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_workday_packet_parks_after_max_unacked_reclaims(db_session):
+    """Root-cause regression for the requeue-not-escalate churn defect: a
+    packet whose worker keeps dying before it can ack (lease simply expires,
+    exactly what happens when session.interrupt() kills the whole Claude Code
+    child) must stop being handed out indefinitely and instead park itself as
+    a terminal failure with an explanatory reason, once claimed
+    _WORKDAY_CONSULTATION_MAX_UNACKED_CLAIMS (3) times without a terminal ack.
+    """
+    project, message, task = await _project_with_input(db_session)
+    incarnation_id = uuid.uuid4()
+    claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id="session",
+        task_id=task.id,
+        worker_generation=1,
+        incarnation_id=incarnation_id,
+        message_ids=[message.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+    )
+    assert claim is not None
+    packet = await create_or_get_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        claim=claim,
+        envelope=await _envelope(db_session, project, claim),
+        delivery_key="parked-after-cap",
+        question="Investigate the recurring churn.",
+        resident_session_id="session",
+        atomic_public_reply_id=uuid.uuid4(),
+    )
+
+    first = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert first is not None and first.attempt == 1
+    await db_session.commit()
+    await _expire_workday_claim_lease(db_session, packet.message.id)
+
+    second = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert second is not None and second.attempt == 2
+    await db_session.commit()
+    await _expire_workday_claim_lease(db_session, packet.message.id)
+
+    # The 3rd reclaim attempt hits the cap: no claim is handed out, and the
+    # packet is parked instead of requeued a 4th time.
+    third = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert third is None
+    await db_session.commit()
+
+    parked = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.id == packet.message.id)
+        )
+    ).scalar_one()
+    assert parked.handling_state == MessageHandlingState.RESPONDED
+    assert parked.context.get("_workday_consultation_ack_outcome") == "failed"
+    reason = parked.context.get("_workday_consultation_result_summary") or ""
+    assert "3 claim attempts" in reason
+    assert "parked" in reason
+
+    continuation = await claim_next_workday_consultation_continuation(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert continuation is not None
+    assert continuation.message.context["result_state"] == "failed"
+    assert "parked" in continuation.message.content
+    assert "3 claim attempts" in continuation.message.content
+
+
+@pytest.mark.asyncio
+async def test_gate_failure_detail_persists_logs_and_surfaces_in_parked_reason(
+    db_session, caplog
+):
+    """Root-cause regression for the zero-observability defect: a renewal/ack
+    gate failure (409) must leave a structured server log AND a queryable
+    reason on the packet, and that reason must in turn surface inside a later
+    attempt-cap park so the incident carries its own diagnosis end to end."""
+    project, message, task = await _project_with_input(db_session)
+    incarnation_id = uuid.uuid4()
+    claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id="session",
+        task_id=task.id,
+        worker_generation=1,
+        incarnation_id=incarnation_id,
+        message_ids=[message.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+    )
+    assert claim is not None
+    packet = await create_or_get_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        claim=claim,
+        envelope=await _envelope(db_session, project, claim),
+        delivery_key="gate-failure-detail",
+        question="Investigate the stale-envelope 409.",
+        resident_session_id="session",
+        atomic_public_reply_id=uuid.uuid4(),
+    )
+
+    # Never-claimed packet: exercises the "row exists but nothing else
+    # matches" path, same shape a stale/expired-envelope 409 would hit.
+    with caplog.at_level(logging.WARNING, logger="app.conversation_coordinator"):
+        await record_workday_consultation_gate_failure(
+            db_session,
+            project_id=project.id,
+            packet_id=packet.message.id,
+            task_id=task.id,
+            resident_session_id="session",
+            gate="envelope_resolution",
+            detail="Strategic context envelope is stale, expired, or revoked",
+        )
+        await db_session.commit()
+
+    assert any(
+        "gate=envelope_resolution" in record.message
+        and "envelope is stale" in record.message
+        for record in caplog.records
+    )
+
+    refreshed = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.id == packet.message.id)
+        )
+    ).scalar_one()
+    last_failure = refreshed.context.get("_workday_consultation_last_failure")
+    assert isinstance(last_failure, dict)
+    assert last_failure["gate"] == "envelope_resolution"
+    assert "stale" in last_failure["detail"]
+    assert last_failure["task_id"] == str(task.id)
+    assert last_failure["resident_session_id"] == "session"
+    assert last_failure["recorded_at"]
+
+    # A gate failure against a nonexistent packet must not raise -- it is a
+    # best-effort diagnostic, never allowed to mask the caller's real error.
+    await record_workday_consultation_gate_failure(
+        db_session,
+        project_id=project.id,
+        packet_id=uuid.uuid4(),
+        task_id=task.id,
+        resident_session_id="session",
+        gate="acknowledge",
+        detail="does not matter",
+    )
+    await db_session.commit()
+
+    # Now drive the packet to the attempt cap and confirm the recorded detail
+    # is woven into the parked reason -- the whole point of persisting it.
+    first = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert first is not None and first.attempt == 1
+    await db_session.commit()
+    await _expire_workday_claim_lease(db_session, packet.message.id)
+    second = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert second is not None and second.attempt == 2
+    await db_session.commit()
+    await _expire_workday_claim_lease(db_session, packet.message.id)
+
+    third = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert third is None
+    await db_session.commit()
+
+    parked = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.id == packet.message.id)
+        )
+    ).scalar_one()
+    reason = parked.context.get("_workday_consultation_result_summary") or ""
+    assert "Last recorded gate failure (envelope_resolution)" in reason
+    assert "stale" in reason

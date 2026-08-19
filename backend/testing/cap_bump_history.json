@@ -3179,6 +3179,14 @@
           "new_cap": 1400
         }
       ],
+      "conversation_coordinator.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T00:00:53.323924+00:00",
+          "old_cap": 1900,
+          "new_cap": 2250
+        }
+      ],
       "recovery_evaluating_approval.py": [
         {
           "commit_sha": "unattributed",

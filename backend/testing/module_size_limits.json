@@ -163,7 +163,7 @@
     "storage.py": 1750,
     "strategic_resident_session.py": 6850,
     "release_qualifier_audit.py": 2500,
-    "conversation_coordinator.py": 1900,
+    "conversation_coordinator.py": 2250,
     "routers/agent_warm_continuity.py": 1700,
     "post_commit_errors.py": 58,
     "task_lifecycle_completion_dispatch.py": 500,
