@@ -208,6 +208,8 @@ export interface MessageBubbleProps {
   selectMode: boolean;
   selectedIds: Set<string>;
   onOpenTask?: (taskId: string) => void;
+  onOpenDirection?: (directionId: string) => void;
+  githubRepo?: string | null;
   onToggleSelect: (msgId: string) => void;
   onCreateDirection: (msg: ProjectMessage) => void;
   onCreateInvestigation: (msg: ProjectMessage) => void;
@@ -234,6 +236,8 @@ export const MessageBubble = memo(function MessageBubble({
   selectMode,
   selectedIds,
   onOpenTask,
+  onOpenDirection,
+  githubRepo,
   onToggleSelect,
   onCreateDirection,
   onCreateInvestigation,
@@ -409,11 +413,11 @@ export const MessageBubble = memo(function MessageBubble({
           {/* Content */}
           {userMsg ? (
             <div className={chatMode ? 'text-sm text-neutral-100 leading-relaxed' : 'text-sm text-neutral-200 leading-relaxed'}>
-              <MarkdownContent content={msg.content} />
+              <MarkdownContent content={msg.content} onOpenTask={onOpenTask} onOpenDirection={onOpenDirection} githubRepo={githubRepo} />
             </div>
           ) : (
             <div className={chatMode ? 'text-sm text-neutral-100 leading-relaxed' : 'text-sm text-neutral-200 leading-relaxed'}>
-              <MarkdownContent content={msg.content} />
+              <MarkdownContent content={msg.content} onOpenTask={onOpenTask} onOpenDirection={onOpenDirection} githubRepo={githubRepo} />
             </div>
           )}
           {msg.context.attachments && Array.isArray(msg.context.attachments) && msg.context.attachments.length > 0 && (

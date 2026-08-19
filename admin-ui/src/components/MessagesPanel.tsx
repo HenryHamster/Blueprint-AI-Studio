@@ -363,6 +363,7 @@ export interface MessagesPanelProps {
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onMessageCountChange?: (count: number) => void;
   onOpenTask?: (taskId: string) => void;
+  onOpenDirection?: (directionId: string) => void;
   notifyOnHighSignalMessage?: boolean;
   /**
    * `modal` preserves the legacy full header when `onClose` is supplied.
@@ -487,7 +488,7 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, onOpenDirection, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -2666,6 +2667,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     selectMode,
     selectedIds,
     onOpenTask,
+    onOpenDirection,
+    githubRepo,
     onToggleSelect: toggleSelect,
     onCreateDirection: handleOpenConvertModal,
     onCreateInvestigation,
@@ -2685,6 +2688,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     selectMode,
     selectedIds,
     onOpenTask,
+    onOpenDirection,
+    githubRepo,
     toggleSelect,
     handleOpenConvertModal,
     onCreateInvestigation,

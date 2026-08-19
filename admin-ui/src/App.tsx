@@ -1338,6 +1338,7 @@ export default function App() {
                 selectedProjectId={s.selectedProjectId}
                 canOperateProject={s.selectedProjectAccess.canOperateProject}
                 githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
+                onOpenDirection={handleBoardDirectionClick}
                 defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
                 variant="page"
                 filterChrome="minimal"
