@@ -3018,6 +3018,11 @@ def _compute_cost_telemetry_reconciliation(tasks: list[Task]) -> dict | None:
     task contributes priced LLM attempts; returns None when there are no tasks
     (the check would be vacuous) or when no tasks have a priced provider/model
     (zero-cost input with no pricing coverage is not a telemetry defect).
+
+    The returned dict omits ``per_task`` — that row-per-task detail exists for
+    the live digest recompute (admin_digest.py), not for this persisted
+    snapshot, and it dominates the persisted blob's size (1-1.3 MB/snapshot)
+    with data that has zero readers on the snapshot-history path.
     """
     if not tasks:
         return None
@@ -3043,7 +3048,9 @@ def _compute_cost_telemetry_reconciliation(tasks: list[Task]) -> dict | None:
             result.cache_hit_rate_delta,
             result.task_count,
         )
-    return result.asdict()
+    reconciliation = result.asdict()
+    reconciliation.pop("per_task", None)
+    return reconciliation
 
 
 async def _compute_prompt_static_bytes() -> int | None:

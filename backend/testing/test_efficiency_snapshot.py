@@ -12406,6 +12406,68 @@ async def test_write_snapshot_writes_to_efficiency_table(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cost_telemetry_reconciliation_omits_per_task_but_keeps_scalars(db_session):
+    """_compute_cost_telemetry_reconciliation must not persist the row-per-task
+    ``per_task`` detail into the snapshot blob — it has no readers on the
+    snapshot-history path (see admin_digest.py for the live-recompute consumer
+    that still gets per_task) and dominates the persisted blob's size. The
+    scalars the drift alert depends on (absolute_delta, tolerance, task_count,
+    within_tolerance) must still be present.
+    """
+    from app.efficiency_snapshot import _compute_cost_telemetry_reconciliation
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_merged_task(project.id)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    reconciliation = _compute_cost_telemetry_reconciliation([task])
+    assert reconciliation is not None
+    assert "per_task" not in reconciliation, (
+        "per_task must be stripped before the reconciliation enters the "
+        "persisted snapshot blob"
+    )
+    for scalar in ("absolute_delta", "tolerance", "task_count", "within_tolerance"):
+        assert scalar in reconciliation, f"drift-alert scalar {scalar!r} must survive"
+    assert reconciliation["task_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_persisted_snapshot_blob_excludes_reconciliation_per_task(db_session):
+    """The persisted project_efficiency_snapshot blob's cost_telemetry_reconciliation
+    block must not carry per_task — regression test for the 8 MB unread-field cut.
+    """
+    from app.project_telemetry import read_recent_efficiency_snapshots
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_merged_task(project.id))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    rows = await read_recent_efficiency_snapshots(db_session, project.id)
+    assert len(rows) == 1
+    reconciliation = rows[0].blob.get("cost_telemetry_reconciliation")
+    assert reconciliation is not None, "task has priced provider/model, reconciliation must run"
+    assert "per_task" not in reconciliation
+    assert "task_count" in reconciliation
+
+
+@pytest.mark.asyncio
 async def test_persisted_origination_reading_carries_cohort_provenance(db_session):
     """A written origination reading retains its evidence boundary on read."""
     project = make_project(design_doc={})
