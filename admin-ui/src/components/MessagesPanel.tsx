@@ -1,7 +1,7 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { ConversationUtilityBar } from './ConversationUtilityBar';
-import { useChatChrome } from '../hooks/useChatChrome';
+import { useChatChrome, useChatDetailRevealed } from '../hooks/useChatChrome';
 import { auth } from '../firebase';
 import { currentUiSurface, reportUiLoadTiming } from '../uiLoadTiming';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker, acceptPendingConfirmation, dismissPendingConfirmation } from '../api';
@@ -43,7 +43,7 @@ import {
 } from '../strategicStateApi';
 import { SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
 import { computeResidentActivityState } from '../utils/strategicSessionLive';
-import { buildConversationWorkdayStatus } from '../utils/conversationWorkdayStatus';
+import { buildConversationWorkdayStatus, type ConversationWorkdayStatus } from '../utils/conversationWorkdayStatus';
 import { messageHasClientIdentity, mergeCanonicalConversationMessage } from '../utils/conversationMessageIdentity';
 import { clearComposerDraftIfCurrent, loadComposerDraft, saveComposerDraft } from '../utils/conversationDraftState';
 import { finalizeLastAttachmentRemoval, type ConversationComposerIntent, updateConversationComposerIntent } from '../utils/conversationAttachmentDraftFinalization';
@@ -355,6 +355,14 @@ export interface MessagesPanelProps {
   selectedProjectId: string | null;
   /** Whether this user may perform project-scoped mutations. */
   canOperateProject: boolean;
+  /**
+   * Whether this panel is the currently visible surface. The panel now stays
+   * mounted (via a hidden wrapper) across tab switches so the transcript,
+   * loading flag, and conditional-request ETag survive; `active` lets it
+   * distinguish "navigated back to chat" from "still mounted but hidden" for
+   * timing telemetry. Defaults to true for callers that don't keep it mounted.
+   */
+  active?: boolean;
   githubRepo?: string | null;
   defaultBranch?: string;
   onClose?: () => void;
@@ -405,6 +413,12 @@ export interface MessagesPanelProps {
   onTargetMessageHandled?: () => void;
   /** Refresh the Strategic read model after a chat action changes Strategic state. */
   onStrategicStateRefresh?: () => void | Promise<void>;
+  /**
+   * Reports the single reconciled Workday status computed here so a sibling
+   * surface (e.g. the header's StrategicSessionControl) can render the same
+   * status instead of deriving a second, independently-computed readout.
+   */
+  onWorkdayStatusChange?: (status: ConversationWorkdayStatus | null) => void;
   /** Record a successful operator interaction with Strategic workbench state. */
   onStrategicInteraction?: () => void | Promise<void>;
   /** Open the Strategic context workspace from the minimal Strategic composer. */
@@ -486,7 +500,7 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, onOpenDirection, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, active = true, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, onOpenDirection, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onWorkdayStatusChange, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -556,6 +570,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     [attentionNeedsActionItems, resolvedConfirmationIds],
   );
   const [chatChromeExpanded, persistChatChrome] = useChatChrome();
+  const [chatDetailRevealed, persistChatDetailRevealed] = useChatDetailRevealed();
+  const showChatDetail = conversationMode && chatDetailRevealed;
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
   const [newType, setNewType] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.type ?? 'FEEDBACK');
   const [newContent, setNewContent] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.content ?? '');
@@ -1265,6 +1281,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       conversationMessages,
     });
   }, [conversationMessages, currentStrategicState, strategicWorkbenchState?.interaction_mode]);
+  useEffect(() => {
+    onWorkdayStatusChange?.(conversationWorkdayStatus);
+  }, [conversationWorkdayStatus, onWorkdayStatusChange]);
   // Render the operator's optimistic bubble until the durable copy lands. Client
   // identity, never message content, is the reconciliation key: identical text
   // sent intentionally must remain two distinct turns.
@@ -1739,14 +1758,38 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     lastRealtimeRefreshSignalRef.current = realtimeRefreshSignal;
     void fetchMessages();
   }, [conversationMode, fetchMessages, realtimeRefreshSignal]);
-  // Record chat data-ready timing when conversation messages first render (once per page load)
-  const initialLoadDoneRef = useRef(false);
+  // Record chat data-ready timing when conversation messages first render after
+  // navigating to chat. The panel now stays mounted across tab switches (a
+  // hidden wrapper keeps the transcript/etag alive), so "mount" no longer
+  // implies "navigation": both an inactive -> active transition and a project
+  // switch are navigations, and each restarts the clock.
+  //
+  // Clock restart and re-arm must happen together, in the SAME effect that
+  // reports, keyed on a navigation identity. Arming on the activation edge in
+  // a separate effect leaks: returning to an already-loaded chat fires no
+  // fetch (useConversation short-circuits on an unchanged scope), so no
+  // report happens then and the armed flag survives until the next `loading`
+  // toggle — a project switch minutes later — which would then report the
+  // operator's idle reading time as chat_data_ready. Here a navigation whose
+  // data is already loaded reports its (near-zero) ready time immediately,
+  // and a project switch restarts the clock before it can report.
+  const chatMountStartRef = useRef(performance.now());
+  const chatReadyReportRef = useRef<{ navigationKey: string; reported: boolean } | null>(null);
+  const chatNavigationEpochRef = useRef(0);
+  const wasActiveRef = useRef(active);
   useEffect(() => {
-    if (loading || initialLoadDoneRef.current || !conversationMode) return;
-    initialLoadDoneRef.current = true;
-    const ms = Math.round(performance.now());
+    if (active && !wasActiveRef.current) chatNavigationEpochRef.current += 1;
+    wasActiveRef.current = active;
+    const navigationKey = `${selectedProjectId ?? ''}:${chatNavigationEpochRef.current}`;
+    if (chatReadyReportRef.current?.navigationKey !== navigationKey) {
+      if (chatReadyReportRef.current !== null) chatMountStartRef.current = performance.now();
+      chatReadyReportRef.current = { navigationKey, reported: false };
+    }
+    if (!active || loading || !conversationMode || chatReadyReportRef.current.reported) return;
+    chatReadyReportRef.current.reported = true;
+    const ms = Math.round(performance.now() - chatMountStartRef.current);
     reportUiLoadTiming(currentUiSurface(), ms, 'chat_data_ready');
-  }, [loading, conversationMode]);
+  }, [active, loading, conversationMode, selectedProjectId]);
   // Auto-scroll to bottom on initial load, when the operator sends their own
   // message (optimistic send), or when a new message arrives while near bottom.
   // Uses renderedConversationMessages (includes the optimistic bubble) so the
@@ -1763,11 +1806,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     }
     const isInitialLoad = prevMessageCountRef.current === 0 && currentCount > 0;
     if (isInitialLoad) {
-      // First load — jump to bottom instantly. Use the list's API when available
-      // (react-window scrollHeight is an estimate that lands mid-history).
-      if (conversationMode && conversationListRef.current?.scrollToBottom) {
-        requestAnimationFrame(() => conversationListRef.current?.scrollToBottom());
-      } else {
+      // First load — jump to bottom instantly. In conversation mode the
+      // virtualized list's own mount-settle effect (ConversationVirtualList
+      // in MessagesListView.tsx) owns this: it hides the list and re-anchors
+      // to the last row until dynamic row-height measurements converge, then
+      // reveals it. A second, independent scrollToBottom call here would
+      // race that settle loop, so only the non-virtualized fallback scrolls.
+      if (!conversationMode) {
         requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }));
       }
     } else if (currentCount > prevMessageCountRef.current) {
@@ -2405,6 +2450,24 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     }
   }
 
+  // A dropped send (live failure or a stale in-flight send discovered on
+  // mount) parks in `needs_retry`. The identity-based retry path above is
+  // already safe to re-run unattended — it re-checks the canonical store
+  // under the same idempotency key before ever re-posting — so recover it
+  // automatically instead of waiting for the operator to press Retry. One
+  // automatic attempt per identity: if the retry itself lands back in
+  // `needs_retry`, leave it for the manual control rather than looping.
+  const autoRetryAttemptedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!canOperateProject || !conversationMode || !currentActorUserId || !selectedProjectId || !optimisticSend) return;
+    if (optimisticSend.state !== 'needs_retry') return;
+    const attempts = autoRetryAttemptedRef.current;
+    const attemptKey = `${currentActorUserId}:${selectedProjectId}:${optimisticSend.key}`;
+    if (attempts.has(attemptKey)) return;
+    attempts.add(attemptKey);
+    void handleSubmit();
+  }, [canOperateProject, conversationMode, currentActorUserId, optimisticSend, selectedProjectId]);
+
   // Retract an armed-but-not-yet-fired strategic steer. Idempotent server-side
   // (cancelling when nothing is armed is a no-op), so a late/duplicate click is
   // harmless. Clears the local pending marker immediately, then refetches to
@@ -2897,11 +2960,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
           expanded={chatChromeExpanded} onExpand={() => persistChatChrome(true)} onCollapse={() => persistChatChrome(false)}
           searchQuery={searchQuery} onSearchChange={setSearchQuery}
           workdayStatus={conversationWorkdayStatus}
+          detailRevealed={chatDetailRevealed} onToggleDetail={persistChatDetailRevealed}
         />
       )}
 
       {/* Alerts remain operational triage, not conversation transcript chrome. */}
-      {!conversationMode && alerts && alerts.length > 0 && (
+      {(!conversationMode || showChatDetail) && alerts && alerts.length > 0 && (
         <div className="shrink-0 border-b border-workbench-border px-3 py-2 md:px-4" data-testid="alerts-inline-banner">
           <AlertsBanner
             alerts={alerts}
@@ -2935,7 +2999,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       )}
 
       {/* Cycle receipts belong to operational triage. Chat contains only durable turns. */}
-      {!conversationMode && lastCycleCompletion && !strategistActive && (
+      {(!conversationMode || showChatDetail) && lastCycleCompletion && !strategistActive && (
         <div className={`px-4 md:px-6 py-2 border-b border-neutral-800 flex items-start gap-2 shrink-0 ${completionReceiptTone?.banner ?? 'bg-emerald-950/30'}`} role="status" aria-live="polite">
           <span className={`w-2 h-2 rounded-full mt-0.5 shrink-0 ${completionReceiptTone?.dot ?? 'bg-emerald-400'}`} aria-hidden="true" />
           <span className={`text-xs min-w-0 ${completionReceiptTone?.text ?? 'text-emerald-300'}`}>
@@ -2981,7 +3045,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       {/* Needs-action strip — derived from the canonical attention model when the
           strategic read model is available. Shows needs_operator items at the top
           with lifecycle.clears_when so the operator sees they will self-clear. */}
-      {!conversationMode && usesStrategicReadModel && visibleAttentionNeedsActionItems.length > 0 && (
+      {(!conversationMode || showChatDetail) && usesStrategicReadModel && visibleAttentionNeedsActionItems.length > 0 && (
         <div className="shrink-0 border-b border-workbench-border bg-amber-950/20 px-3 py-2 md:px-4" data-testid="needs-action-strip">
           <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-col gap-1.5">
             <div className="flex items-center gap-2">
@@ -3116,7 +3180,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
 
       {/* Needs-action filter toggle — visible in triage mode when the canonical
           attention read model is available so the inbox defaults to action-first. */}
-      {!conversationMode && usesStrategicReadModel && (
+      {(!conversationMode || showChatDetail) && usesStrategicReadModel && (
         <div className="shrink-0 flex items-center gap-1 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4" data-testid="needs-action-filter-bar">
           {/* eslint-disable-next-line viewport/min-touch-target */}
           <button
@@ -3211,7 +3275,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       />
 
       {/* Batch action bar */}
-      {canOperateProject && !conversationMode && selectMode && selectedIds.size > 0 && (
+      {canOperateProject && (!conversationMode || showChatDetail) && selectMode && selectedIds.size > 0 && (
         <MessagesBatchActionBar
           selectedCount={selectedIds.size}
           batchCreating={batchCreating}

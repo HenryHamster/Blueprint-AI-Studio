@@ -907,10 +907,14 @@ function ConversationVirtualList({
   conversationListRef,
 }: MessagesListViewProps) {
   const listRef = useListRef(null);
+  // Owns the visibility toggle for the settle-detection anchor loop below.
+  // A plain ref to a wrapper div (rather than the react-window-owned
+  // listRef's element) so the hook's returned value is never mutated.
+  const listWrapperRef = useRef<HTMLDivElement | null>(null);
   const rowHeight = useDynamicRowHeight({ defaultRowHeight: 96 });
   const renderedRangeRef = useRef({ startIndex: -1, stopIndex: -1 });
   const olderHistoryIntentRef = useRef(false);
-  const initialBottomAnchorRef = useRef<number | null>(null);
+  const initialBottomAnchorRef = useRef(false);
   const initialBottomAnchorFrameRef = useRef<number | null>(null);
   const initialBottomAnchoredRef = useRef(false);
   const autoLoadingOlderRef = useRef(false);
@@ -938,13 +942,27 @@ function ConversationVirtualList({
     return next;
   }, [hasOlderConversationMessages, loading, messages]);
 
+  // Always holds the latest rows so the settle loop below (whose closure is
+  // created once per anchor cycle) never scrolls to an index computed from a
+  // stale, since-shrunk row count — e.g. switching conversations mid-loop.
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+
+  // Cancels the initial settle-anchor loop (if running) and reveals the list.
+  // Shared by explicit navigation and by any operator scroll/touch/key intent.
+  const stopInitialAnchor = useCallback(() => {
+    initialBottomAnchorRef.current = false;
+    if (initialBottomAnchorFrameRef.current != null) {
+      window.cancelAnimationFrame(initialBottomAnchorFrameRef.current);
+      initialBottomAnchorFrameRef.current = null;
+    }
+    const wrapper = listWrapperRef.current;
+    if (wrapper) wrapper.style.visibility = 'visible';
+  }, []);
+
   useImperativeHandle(conversationListRef, () => ({
     scrollToMessage: (messageId: string) => {
-      initialBottomAnchorRef.current = null;
-      if (initialBottomAnchorFrameRef.current != null) {
-        window.cancelAnimationFrame(initialBottomAnchorFrameRef.current);
-        initialBottomAnchorFrameRef.current = null;
-      }
+      stopInitialAnchor();
       const index = rows.findIndex(row => row.kind === 'message' && row.message.id === messageId);
       if (index < 0 || !listRef.current) return Promise.resolve(false);
       const rendered = renderedRangeRef.current;
@@ -968,7 +986,7 @@ function ConversationVirtualList({
       if (lastIndex < 0 || !listRef.current) return;
       listRef.current?.scrollToRow({ index: lastIndex, align: 'end', behavior: 'instant' });
     },
-  }), [conversationListRef, listRef, rows]);
+  }), [conversationListRef, listRef, rows, stopInitialAnchor]);
 
   const handleLoadOlder = useCallback(() => {
     const element = listRef.current?.element;
@@ -1025,13 +1043,6 @@ function ConversationVirtualList({
     const element = listRef.current?.element;
     if (!element) return;
     let touchY: number | null = null;
-    const stopInitialAnchor = () => {
-      initialBottomAnchorRef.current = null;
-      if (initialBottomAnchorFrameRef.current != null) {
-        window.cancelAnimationFrame(initialBottomAnchorFrameRef.current);
-        initialBottomAnchorFrameRef.current = null;
-      }
-    };
     const onWheel = (event: WheelEvent) => {
       stopInitialAnchor();
       olderHistoryIntentRef.current = event.deltaY < 0;
@@ -1061,36 +1072,61 @@ function ConversationVirtualList({
       element.removeEventListener('wheel', onWheel);
       element.removeEventListener('keydown', onKeyDown);
     };
-  }, [listRef]);
+  }, [listRef, stopInitialAnchor]);
 
-  // Dynamic markdown rows are measured after their first paint. A single
-  // scroll-to-last call can therefore use stale estimates and leave a newly
-  // opened conversation in the middle. Keep the initial viewport pinned to the
-  // latest row briefly while measurements settle, stopping immediately on any
-  // operator scroll intent.
+  // Dynamic markdown rows are measured after their first paint, so a single
+  // scroll-to-last call uses stale estimates and lands mid-history. Instead of
+  // pinning visibly for a fixed wall-clock window (which produces a visible
+  // scroll correction on every open), keep the list hidden and re-issue
+  // scrollToRow each frame until two consecutive frames produce no further
+  // scrollTop change (measurements have settled), then reveal it — the
+  // correction happens off-screen. A frame cap is a safety fallback only,
+  // not the primary stop condition. Any operator scroll/touch/key intent
+  // cancels the loop and reveals immediately (see stopInitialAnchor).
   useEffect(() => {
     if (messages.length === 0) {
-      initialBottomAnchorRef.current = null;
+      initialBottomAnchorRef.current = false;
       initialBottomAnchoredRef.current = false;
       return;
     }
-    if (initialBottomAnchorRef.current != null || initialBottomAnchoredRef.current) return;
+    if (initialBottomAnchorRef.current || initialBottomAnchoredRef.current) return;
     initialBottomAnchoredRef.current = true;
-    initialBottomAnchorRef.current = performance.now() + 500;
-    const pinToLatest = () => {
-      const until = initialBottomAnchorRef.current;
-      if (until == null || performance.now() >= until) {
-        initialBottomAnchorRef.current = null;
-        initialBottomAnchorFrameRef.current = null;
-        return;
-      }
-      const lastIndex = rows.length - 1;
+    initialBottomAnchorRef.current = true;
+    const MAX_SETTLE_FRAMES = 30;
+    const STABLE_FRAMES_TARGET = 2;
+    const wrapper = listWrapperRef.current;
+    if (wrapper) wrapper.style.visibility = 'hidden';
+    let lastScrollTop: number | null = null;
+    let stableFrames = 0;
+    let frame = 0;
+    const settle = () => {
+      // The anchor can be canceled (messages cleared, an explicit
+      // navigation, or an operator scroll intent) between frames while this
+      // closure still holds a stale row count — bail before touching the
+      // list rather than scrolling to an index that may no longer exist.
+      if (!initialBottomAnchorRef.current) return;
+      const lastIndex = rowsRef.current.length - 1;
       if (lastIndex >= 0) {
         listRef.current?.scrollToRow({ index: lastIndex, align: 'end', behavior: 'instant' });
       }
-      initialBottomAnchorFrameRef.current = window.requestAnimationFrame(pinToLatest);
+      frame += 1;
+      const scrollTop = listRef.current?.element?.scrollTop ?? null;
+      if (scrollTop != null && scrollTop === lastScrollTop) {
+        stableFrames += 1;
+      } else {
+        stableFrames = 0;
+      }
+      lastScrollTop = scrollTop;
+      if (stableFrames >= STABLE_FRAMES_TARGET || frame >= MAX_SETTLE_FRAMES) {
+        initialBottomAnchorRef.current = false;
+        initialBottomAnchorFrameRef.current = null;
+        const w = listWrapperRef.current;
+        if (w) w.style.visibility = 'visible';
+        return;
+      }
+      initialBottomAnchorFrameRef.current = window.requestAnimationFrame(settle);
     };
-    initialBottomAnchorFrameRef.current = window.requestAnimationFrame(pinToLatest);
+    initialBottomAnchorFrameRef.current = window.requestAnimationFrame(settle);
   }, [listRef, messages.length, rows.length]);
 
   useEffect(() => {
@@ -1115,17 +1151,19 @@ function ConversationVirtualList({
 
   return (
     <div className="relative mx-auto w-full max-w-[940px] flex-1 overflow-hidden bg-workbench-base" data-testid="strategic-conversation-column">
-      <List
-        rowCount={rows.length}
-        rowComponent={ConversationRowView}
-        rowProps={rowProps}
-        rowHeight={rowHeight}
-        overscanCount={6}
-        listRef={listRef}
-        defaultHeight={600}
-        className="h-full custom-scrollbar overflow-y-auto"
-        onRowsRendered={handleConversationRowsRendered}
-      />
+      <div ref={listWrapperRef} className="h-full">
+        <List
+          rowCount={rows.length}
+          rowComponent={ConversationRowView}
+          rowProps={rowProps}
+          rowHeight={rowHeight}
+          overscanCount={6}
+          listRef={listRef}
+          defaultHeight={600}
+          className="h-full custom-scrollbar overflow-y-auto"
+          onRowsRendered={handleConversationRowsRendered}
+        />
+      </div>
       {showScrollDown && (
         <button
           onClick={scrollToBottom}

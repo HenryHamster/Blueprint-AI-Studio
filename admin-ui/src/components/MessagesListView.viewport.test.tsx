@@ -326,6 +326,45 @@ describe('MessagesListView — viewport regression', () => {
     });
   });
 
+  test('anchors an opened conversation at the newest message without a timed re-pin loop', async () => {
+    const messages = Array.from({ length: 50 }, (_, index) => makeMsg({
+      id: `settle-${index + 1}`,
+      sequence: index + 1,
+      from_type: index % 2 ? 'strategic' : 'user',
+      content: index === 49
+        ? 'Newest message anchor target — dynamically measured markdown row. '.repeat(15)
+        : `Conversation message ${index + 1}`,
+      surface: 'conversation',
+    }));
+
+    await renderView(baseProps({ presentation: 'conversation', messages }));
+
+    const findScrollEl = () =>
+      host?.querySelector<HTMLElement>('[data-testid="strategic-conversation-column"] .custom-scrollbar') ?? null;
+    await vi.waitFor(() => expect(findScrollEl()).toBeTruthy());
+    const el = findScrollEl()!;
+
+    // The settle loop hides the list synchronously on mount and only reveals
+    // it once row measurements have converged — it must never be visible
+    // before the very first settle frame has had a chance to run.
+    expect(getComputedStyle(el).visibility).toBe('hidden');
+
+    await vi.waitFor(() => {
+      expect(getComputedStyle(el).visibility).not.toBe('hidden');
+    }, { timeout: 2000, interval: 5 });
+
+    // Pinned to the last row once revealed — no mid-history landing.
+    expect(el.scrollTop + el.clientHeight).toBeGreaterThanOrEqual(el.scrollHeight - 4);
+
+    // A fixed 500ms re-pin window would keep re-issuing scrollToRow well
+    // after reveal even though content never changes again. The
+    // settle-detection loop stops as soon as two consecutive frames agree,
+    // so scrollTop must stay put well past that old deadline.
+    const settledScrollTop = el.scrollTop;
+    await new Promise(resolve => setTimeout(resolve, 700));
+    expect(el.scrollTop).toBe(settledScrollTop);
+  });
+
   test('scrollToBottom scrolls to the last row via list API', async () => {
     const messages = Array.from({ length: 10 }, (_, index) => makeMsg({
       id: `scroll-test-${index + 1}`,

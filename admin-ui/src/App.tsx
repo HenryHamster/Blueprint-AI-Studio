@@ -69,6 +69,7 @@ import { useStrategicContextNavigation } from './hooks/useStrategicContextNaviga
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
 import { useVersionLifecycle, hasVersionLifecycleData } from './hooks/useVersionLifecycle';
 import { type StrategicAccountSpendStatus, type StrategicStateAttentionItem, type StrategicStateResponse } from './strategicStateApi';
+import type { ConversationWorkdayStatus } from './utils/conversationWorkdayStatus';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
@@ -505,7 +506,7 @@ export default function App() {
   const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: chatPollersEnabled });
   const {
     strategicWorkbenchState, strategicInteractionMode, strategicSessionActive,
-    strategicSessionStatus, strategicSessionState, strategicSessionReason,
+    strategicSessionState,
     residentStrategicSessionRunners, strategicSessionSelectedRunnerId,
     savingStrategicWorkbench, strategicSessionBusy, persistStrategicWorkbench,
     handleSelectStrategicRunner, handleStartStrategicSession, handleStopStrategicSession,
@@ -523,6 +524,11 @@ export default function App() {
   // of running its own independent timer (eliminating the duplicate assembly).
   const strategicPollEpochRef = useRef(0);
   const [strategicPollEpoch, setStrategicPollEpoch] = useState(0);
+  // The single reconciled Workday status, reported up from MessagesPanel
+  // (which owns the conversation data it is derived from) so the header's
+  // StrategicSessionControl renders the same readout as the utility bar
+  // instead of deriving its own from raw session-lifecycle fields.
+  const [conversationWorkdayStatus, setConversationWorkdayStatus] = useState<ConversationWorkdayStatus | null>(null);
   useEffect(() => {
     if (strategicReadModel.data) {
       strategicPollEpochRef.current += 1;
@@ -1267,18 +1273,8 @@ export default function App() {
       ) : (
         <WorkbenchFrame>
       <BoardDataReadyReporter activeTab={activeTab} initialLoading={boardInitialLoading} refreshing={boardRefreshing} fetchEpoch={boardDataEpoch} />
-      {s.showUserManagement && s.userRole === 'admin' ? (
-        <Suspense fallback={null}>
-        <UserManagement
-          users={s.allowedUsers}
-          currentUserEmail={s.user?.email || ''}
-          onAdd={s.addAllowedUser}
-          onUpdateRole={s.updateAllowedUserRole}
-          onRemove={s.removeAllowedUser}
-          onClose={() => s.setShowUserManagement(false)}
-        />
-        </Suspense>
-      ) : activeTab === 'chat' ? (
+      {visitedTabs.has('chat') && (
+        <div className={messagesPanelOpen && !(s.showUserManagement && s.userRole === 'admin') ? 'contents' : 'hidden'}>
         <WorkbenchSurface
           title="Strategic"
           showTitle={false}
@@ -1288,9 +1284,8 @@ export default function App() {
                 currentMode={strategicInteractionMode === 'continuous' ? 'continuous' : 'chat'}
                 saving={savingStrategicWorkbench}
                 sessionActive={strategicSessionActive}
-                sessionStatus={strategicSessionStatus}
                 sessionState={strategicSessionState}
-                sessionReason={strategicSessionReason}
+                workdayStatus={conversationWorkdayStatus}
                 sessionBusy={strategicSessionBusy}
                 sessionRunners={residentStrategicSessionRunners}
                 sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
@@ -1335,6 +1330,7 @@ export default function App() {
             main={(
               <Suspense fallback={<WorkspaceSkeleton />}>
               <MessagesPanel
+                active={messagesPanelOpen}
                 selectedProjectId={s.selectedProjectId}
                 canOperateProject={s.selectedProjectAccess.canOperateProject}
                 githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
@@ -1347,6 +1343,7 @@ export default function App() {
                 onMessageCountChange={handleMessageCountChange}
                 onOpenTask={handleViewTask}
                 notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
+                onWorkdayStatusChange={setConversationWorkdayStatus}
                 strategistActive={s.strategistActive}
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
@@ -1410,7 +1407,20 @@ export default function App() {
             railCollapsed={chatRailCollapsed}
           />
         </WorkbenchSurface>
-      ) : activeTab === 'project' ? (
+        </div>
+      )}
+      {s.showUserManagement && s.userRole === 'admin' ? (
+        <Suspense fallback={null}>
+        <UserManagement
+          users={s.allowedUsers}
+          currentUserEmail={s.user?.email || ''}
+          onAdd={s.addAllowedUser}
+          onUpdateRole={s.updateAllowedUserRole}
+          onRemove={s.removeAllowedUser}
+          onClose={() => s.setShowUserManagement(false)}
+        />
+        </Suspense>
+      ) : activeTab === 'chat' ? null : activeTab === 'project' ? (
         <ErrorBoundary level="panel">
           <Suspense fallback={<WorkspaceSkeleton />}>
           <ProjectWorkspace

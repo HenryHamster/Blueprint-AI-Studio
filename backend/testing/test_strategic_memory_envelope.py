@@ -717,7 +717,13 @@ async def test_every_mutable_transcript_or_visibility_field_privacy_purges(db_se
     )
 
     sender_snapshot = await make_snapshot(transcript_sequence=1)
+    # "agent" sender plus a registered CONVERSATION_EVENT_TYPES event_type (not
+    # a bare from_type flip) so the row stays canonical-transcript-visible for
+    # the later transcript_sequence=1 snapshot below: strategic_conversation_predicate
+    # is fail-closed on from_type/event_type, and a non-human sender with no
+    # registered event_type would otherwise drop the row out of the conversation.
     message.from_type = "agent"
+    message.context = {**(message.context or {}), "event_type": "question_answer"}
     await db_session.flush()
     assert (
         await db_session.get(

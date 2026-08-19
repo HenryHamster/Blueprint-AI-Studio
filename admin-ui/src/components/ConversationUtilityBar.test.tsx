@@ -556,6 +556,54 @@ describe('buildConversationWorkdayStatus', () => {
   });
 });
 
+describe('ConversationUtilityBar detail toggle', () => {
+  afterEach(() => {
+    if (root) act(() => root?.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+  });
+
+  test('is absent without onToggleDetail and calls the handler with the flipped value when present', () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => {
+      root?.render(
+        <ConversationUtilityBar
+          expanded={false}
+          onExpand={() => {}}
+          onCollapse={() => {}}
+          searchQuery=""
+          onSearchChange={() => {}}
+        />,
+      );
+    });
+    expect(host.querySelector('[data-testid="conversation-detail-toggle"]')).toBeNull();
+
+    const calls: boolean[] = [];
+    const onToggleDetail = (value: boolean) => { calls.push(value); };
+    act(() => {
+      root?.render(
+        <ConversationUtilityBar
+          expanded={false}
+          onExpand={() => {}}
+          onCollapse={() => {}}
+          searchQuery=""
+          onSearchChange={() => {}}
+          detailRevealed={false}
+          onToggleDetail={onToggleDetail}
+        />,
+      );
+    });
+    const toggle = host.querySelector('[data-testid="conversation-detail-toggle"]') as HTMLButtonElement | null;
+    expect(toggle).not.toBeNull();
+    expect(toggle?.getAttribute('aria-pressed')).toBe('false');
+    act(() => { toggle?.click(); });
+    expect(calls).toEqual([true]);
+  });
+});
+
 describe('ConversationUtilityBar Workday status', () => {
   test('renders one bounded, server-derived status line with full detail in its title', () => {
     const status = buildConversationWorkdayStatus({

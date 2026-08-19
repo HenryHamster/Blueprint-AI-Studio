@@ -246,6 +246,134 @@ async def test_conversation_query_excludes_legacy_mode_knob_cut_rows(db_session)
 
 
 @pytest.mark.asyncio
+async def test_conversation_query_excludes_machine_row_by_registry_not_denylist(
+    db_session,
+):
+    """An unregistered machine event_type is excluded even with no audience stamp.
+
+    Regression coverage for the fail-open bug: the predicate used to admit any
+    row whose ``audience`` context key was simply absent. A brand-new machine
+    emitter that forgets to declare an audience — and whose event_type was
+    never added to the old hand-maintained denylist — used to leak straight
+    into the operator transcript. The fix is fail-closed on event_type
+    membership in the shared CONVERSATION_EVENT_TYPES registry, so an
+    unregistered event_type is excluded regardless of the audience stamp.
+    """
+    project = Project(
+        name="Registry-driven conversation filter",
+        user_id="conversation-query-user",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    unregistered_machine_row = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="a brand-new machine event type nobody audience-stamped",
+        context={"event_type": "totally_unregistered_future_event"},
+    )
+    registered_conversation_row = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="a registered conversation event type",
+        context={"event_type": "question_answer"},
+    )
+    operator_row = ProjectMessage(
+        project_id=project.id,
+        sequence=3,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="a plain human conversation row with no event_type at all",
+        context={},
+    )
+    db_session.add_all(
+        [unregistered_machine_row, registered_conversation_row, operator_row]
+    )
+    await db_session.commit()
+
+    page = await query_strategic_conversation(db_session, project.id, limit=20)
+
+    assert [row.id for row in page.rows] == [
+        registered_conversation_row.id,
+        operator_row.id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_conversation_query_excludes_surface_routed_pipeline_log_rows(
+    db_session,
+):
+    """Surface routing is not visibility: PIPELINE_LOG rows stay out.
+
+    ``capability_trial_stalled`` and ``capability_verdict_decided`` ARE in
+    CONVERSATION_EVENT_TYPES — that registry is what makes
+    ``build_project_message`` route them onto the conversation surface — but
+    ``message_audience`` maps both to PIPELINE_LOG precisely so they never
+    reach the operator transcript. The read predicate must therefore admit a
+    machine row only when its event type is BOTH conversation-routed and
+    operator-visible; only the ambiguous-lift escalation from that family
+    belongs in the conversation.
+    """
+    from app.message_audience import get_operator_event_types
+    from app.project_message_creation import CONVERSATION_EVENT_TYPES
+
+    # Pin the divergence mechanically: these are the surface-routed event
+    # types the audience registry keeps away from the operator.
+    assert CONVERSATION_EVENT_TYPES - get_operator_event_types() == {
+        "capability_trial_stalled",
+        "capability_verdict_decided",
+    }
+
+    project = Project(
+        name="Pipeline-log conversation filter",
+        user_id="conversation-query-user",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    stalled_row = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="capability trial stalled — platform bookkeeping",
+        context={"event_type": "capability_trial_stalled"},
+    )
+    verdict_row = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="capability verdict decided — platform bookkeeping",
+        context={"event_type": "capability_verdict_decided"},
+    )
+    escalation_row = ProjectMessage(
+        project_id=project.id,
+        sequence=3,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="ambiguous lift needs an operator call",
+        context={"event_type": "capability_trial_ambiguous_lift_escalation"},
+    )
+    db_session.add_all([stalled_row, verdict_row, escalation_row])
+    await db_session.commit()
+
+    page = await query_strategic_conversation(db_session, project.id, limit=20)
+
+    assert [row.id for row in page.rows] == [escalation_row.id]
+
+
+@pytest.mark.asyncio
 async def test_resident_conversation_query_includes_open_and_handled_history(
     client: AsyncClient,
     db_session,

@@ -883,8 +883,8 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     const send = el.querySelector<HTMLButtonElement>('button[aria-label="Send message"]')!;
     await waitFor(() => expect(send.disabled).toBe(false));
     fireEvent.click(send);
-    await waitFor(() => expect(el.querySelector('button[aria-label="Retry message"]')).toBeTruthy());
-    fireEvent.click(el.querySelector('button[aria-label="Retry message"]')!);
+    // The dropped send — and its stale-attachment-receipt recovery — both
+    // happen automatically now, without any operator click on "Retry message".
     await waitFor(() => expect(messageBodies).toHaveLength(3), { timeout: 5000 });
 
     expect(uploadReceiptCount).toBe(2);

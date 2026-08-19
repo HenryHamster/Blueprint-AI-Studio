@@ -490,6 +490,117 @@ describe('MessagesPanel chrome modes', () => {
     )).toBe(true);
   });
 
+  test('reports chat readiness relative to chat navigation rather than session uptime', async () => {
+    const { reportUiLoadTiming } = await import('../uiLoadTiming');
+    // Simulate a long-lived page session (500s of uptime) BEFORE the operator
+    // ever navigates to chat, then a fast render once chat mounts. The first
+    // performance.now() call captures the mount instant; later calls advance
+    // by small increments to model the render/effect flush.
+    let callCount = 0;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => {
+      callCount += 1;
+      return callCount === 1 ? 500_000 : 500_000 + callCount * 5;
+    });
+    try {
+      const history = Array.from({ length: 1 }, (_, index) => makeMsg({
+        id: `history-${index + 1}`,
+        sequence: index + 1,
+        content: `History message ${index + 1}`,
+        surface: 'conversation',
+      }));
+      await renderPanel({
+        filterChrome: 'minimal',
+        strategicState: makeStrategicState(),
+      }, history);
+
+      await waitFor(() => {
+        const readyCalls = vi.mocked(reportUiLoadTiming).mock.calls.filter(call => call[2] === 'chat_data_ready');
+        expect(readyCalls.length).toBeGreaterThan(0);
+      });
+
+      const [, reportedMs, sampleType] = vi.mocked(reportUiLoadTiming).mock.calls
+        .find(call => call[2] === 'chat_data_ready') as [string, number, string];
+      expect(sampleType).toBe('chat_data_ready');
+      // Reported value must be the small post-mount delta, not the raw
+      // ~500,000ms absolute performance.now() reading (session uptime).
+      expect(reportedMs).toBeLessThan(50_000);
+      expect(reportedMs).toBeGreaterThanOrEqual(0);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  test('never attributes idle reading time to chat_data_ready after a tab return and project switch', async () => {
+    const { reportUiLoadTiming } = await import('../uiLoadTiming');
+    // A single controllable clock. The operator returns to an already-loaded
+    // chat (no fetch fires — useConversation short-circuits on the unchanged
+    // scope), reads for three minutes, then switches project. Every
+    // navigation into chat must produce exactly one sample measured from THAT
+    // navigation: arming the report on the activation edge and leaving it to
+    // fire on the next `loading` toggle produced no sample on the tab return
+    // and then attributed the 180s of reading time to the project switch.
+    let nowMs = 500_000;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => nowMs);
+    try {
+      const history = [makeMsg({
+        id: 'history-1',
+        sequence: 1,
+        content: 'History message 1',
+        surface: 'conversation',
+      })];
+      _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+      _mockMessagesFetch(history);
+      const props: Partial<MessagesPanelProps> = {
+        filterChrome: 'minimal',
+        strategicState: makeStrategicState(),
+      };
+      await mountPanel({ ...props, active: true });
+      const r = root;
+      if (!r) throw new Error('root not mounted');
+
+      const rerender = async (next: Partial<MessagesPanelProps>) => {
+        await act(async () => {
+          r.render(
+            <MessagesPanel
+              selectedProjectId="proj-1"
+              addToast={() => {}}
+              onMessageCountChange={() => {}}
+              {...props}
+              {...next}
+            />,
+          );
+        });
+        await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+      };
+
+      // Operator leaves chat, comes back 100s later, reads for 180s, then
+      // switches project.
+      await rerender({ active: false });
+      nowMs = 600_000;
+      await rerender({ active: true });
+      nowMs = 780_000;
+      await rerender({
+        active: true,
+        selectedProjectId: 'proj-2',
+        strategicState: makeStrategicState({ project_id: 'proj-2' }),
+      });
+
+      const reported = vi.mocked(reportUiLoadTiming).mock.calls
+        .filter(call => call[2] === 'chat_data_ready')
+        .map(call => call[1] as number);
+      // One sample for the initial mount, one for the tab return. A report
+      // armed on the activation edge but never fired leaves only the mount
+      // sample here — and carries its stale clock into the next navigation.
+      expect(reported.length).toBeGreaterThanOrEqual(2);
+      // Every sample must be a navigation-relative delta. 100_000 (time since
+      // the tab return), 180_000 (idle reading) and 280_000 (time since the
+      // last activation) are the inflated readings this guards against.
+      for (const ms of reported) expect(ms).toBeLessThan(5_000);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   test.each([
     { accessLabel: 'false', canOperateProject: false },
     { accessLabel: 'undefined at runtime', canOperateProject: undefined as never },
@@ -567,7 +678,7 @@ describe('MessagesPanel chrome modes', () => {
     )).toEqual([]);
   });
 
-  test('sends a queued tool revision with operator intent and preserves exact identity across retry', async () => {
+  test('sends a queued tool revision with operator intent and preserves exact identity across automatic retry', async () => {
     const artifactRef = {
       id: 'tool-ref-retry',
       artifact_ref_id: 'tool-ref-retry',
@@ -613,9 +724,10 @@ describe('MessagesPanel chrome modes', () => {
     const send = el.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
     if (!send) throw new Error('Expected send button');
     await act(async () => { send.click(); });
-    await waitFor(() => expect(
-      el.querySelector<HTMLButtonElement>('button[aria-label="Retry message"]'),
-    ).not.toBeNull());
+
+    // The dropped send parks in needs_retry and recovers on its own — no
+    // operator click on "Retry message" required.
+    await waitFor(() => expect(_strategicSessionMessagePostCalls()).toHaveLength(2));
     const firstBody = JSON.parse(String(
       (_strategicSessionMessagePostCalls()[0][1] as RequestInit).body ?? '{}',
     ));
@@ -630,11 +742,6 @@ describe('MessagesPanel chrome modes', () => {
         expected_revision: 12,
       },
     });
-
-    const retry = el.querySelector<HTMLButtonElement>('button[aria-label="Retry message"]');
-    if (!retry) throw new Error('Expected retry button');
-    await act(async () => { retry.click(); });
-    await waitFor(() => expect(_strategicSessionMessagePostCalls()).toHaveLength(2));
     const secondBody = JSON.parse(String(
       (_strategicSessionMessagePostCalls()[1][1] as RequestInit).body ?? '{}',
     ));
@@ -1753,6 +1860,55 @@ describe('MessagesPanel chrome modes', () => {
   test('does not render alerts banner when alerts prop is not provided', async () => {
     const el = await renderPanel({});
     expect(el.querySelector('[data-testid="alerts-inline-banner"]')).toBeNull();
+  });
+
+  test('chat detail toggle reveals the hidden context surfaces and restores the clean transcript', async () => {
+    const alerts = [
+      {
+        id: 'alert-1',
+        project_id: 'proj-1',
+        severity: 'ERROR' as const,
+        title: 'Zone Capacity Exhausted',
+        message: 'Zone us-central1 is exhausted',
+        task_id: null,
+        created_at: new Date().toISOString(),
+        dismissed_at: null,
+        acknowledged_at: null,
+      },
+    ];
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      alerts,
+      lastCycleCompletion: {
+        status: 'completed',
+        created_count: 2,
+        tasks_spawned: 1,
+        running_update_changed: true,
+      },
+    });
+
+    // Clean by default: chat hides the operational banners.
+    expect(el.querySelector('[data-testid="alerts-inline-banner"]')).toBeNull();
+    expect(el.textContent).not.toContain('Cycle complete');
+
+    const detailToggle = el.querySelector('[data-testid="conversation-detail-toggle"]') as HTMLButtonElement | null;
+    if (!detailToggle) throw new Error('detail toggle button not found');
+    expect(detailToggle.getAttribute('aria-pressed')).toBe('false');
+
+    await act(async () => { detailToggle.click(); });
+
+    expect(detailToggle.getAttribute('aria-pressed')).toBe('true');
+    const banner = el.querySelector('[data-testid="alerts-inline-banner"]');
+    expect(banner).not.toBeNull();
+    expect(banner?.textContent).toContain('Zone Capacity Exhausted');
+    expect(el.textContent).toContain('Cycle complete');
+    expect(el.textContent).toContain('+2 directions');
+
+    await act(async () => { detailToggle.click(); });
+
+    expect(detailToggle.getAttribute('aria-pressed')).toBe('false');
+    expect(el.querySelector('[data-testid="alerts-inline-banner"]')).toBeNull();
+    expect(el.textContent).not.toContain('Cycle complete');
   });
 
   test('loads the next triage page from the reachable load-older control', async () => {

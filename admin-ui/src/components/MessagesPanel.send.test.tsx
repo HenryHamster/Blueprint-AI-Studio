@@ -1851,4 +1851,58 @@ describe('MessagesPanel attachment integration', () => {
       });
     }
   });
+
+  test('an unconfirmed send recovers automatically with the same idempotency key and never duplicates', async () => {
+    const postKeys: string[] = [];
+    let postCount = 0;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        // The canonical store never sees the first attempt land — this is what
+        // makes the automatic retry safe to re-run unattended.
+        return new Response(JSON.stringify({ conversation: { limit: 100, has_more: false, items: [] } }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') {
+        const body = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+        postKeys.push(String(body.idempotency_key));
+        postCount += 1;
+        if (postCount === 1) return new Response(JSON.stringify({ detail: 'boom' }), { status: 500 });
+        return new Response(JSON.stringify({
+          message: makeMsg({
+            id: 'recovered-send', project_id: 'proj-1', from_type: 'user',
+            content: String(body.content), surface: 'conversation', handling_state: 'pending',
+            idempotency_key: String(body.idempotency_key),
+          }),
+          wakeup_state: 'queued',
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast, { filterChrome: 'minimal', canOperateProject: true });
+
+    fireEvent.change(el.querySelector('textarea')!, { target: { value: 'please pick this up without me clicking retry' } });
+    const send = el.querySelector('button[aria-label="Send message"]') as HTMLButtonElement;
+    await act(async () => { send.click(); });
+
+    // The dropped send parks in needs_retry and — with no further clicks —
+    // the panel re-posts under the SAME idempotency key on its own.
+    await waitFor(() => expect(postCount).toBe(2));
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    expect(postKeys.length).toBe(2);
+    expect(postKeys[0]).toBeTruthy();
+    expect(postKeys[0]).toBe(postKeys[1]);
+
+    // The recovery settles the send — no lingering needs_retry / Retry affordance.
+    await waitFor(() => expect(el.querySelector('button[aria-label="Retry message"]')).toBeNull());
+
+    // Give any runaway auto-retry loop a chance to misfire, then confirm it didn't.
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 20)); });
+    expect(postCount).toBe(2);
+  });
 });

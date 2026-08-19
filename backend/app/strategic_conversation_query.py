@@ -19,11 +19,24 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.sql.functions import FunctionElement
 from sqlmodel import select
 
-from app.message_audience import PIPELINE_LOG, STRATEGIST_INTERNAL
+from app.message_audience import get_operator_event_types
 from app.models import MessageSurface, ProjectMessage
+from app.project_message_creation import CONVERSATION_EVENT_TYPES
 
-_CHECK_IN_EVENT_TYPE = "strategic_check_in"
-_MODE_KNOB_CUT_EVENT_TYPE = "mode_knob_cut_recommended"
+# The machine-row allowlist. CONVERSATION_EVENT_TYPES is a write-time SURFACE
+# routing registry: it decides which machine events land on the conversation
+# surface at all, and it deliberately includes rows that are routed there but
+# are NOT operator-visible (e.g. `capability_trial_stalled` and
+# `capability_verdict_decided`, both PIPELINE_LOG in
+# ``app.message_audience``). Visibility is owned by the audience registry, so
+# the read-side allowlist is the intersection of the two: an event type must
+# be routed to the conversation surface AND resolve to an operator-visible
+# audience. Both registries are fail-closed, so a new machine event type is
+# invisible until it is consciously registered in both.
+_OPERATOR_CONVERSATION_EVENT_TYPES = frozenset(
+    CONVERSATION_EVENT_TYPES & get_operator_event_types()
+)
+
 _EVENT_TYPE_CONTEXT_KEY = "event_type"
 _AUDIENCE_CONTEXT_KEY = "audience"
 _COVERED_MESSAGE_IDS_KEY = "_resident_reply_covered_message_ids"
@@ -117,6 +130,23 @@ def strategic_conversation_predicate() -> Any:
     evidence just as open inputs are. A Strategic sender alone is insufficient
     because internal bookkeeping is also strategist-authored; explicit reply
     provenance admits legacy replies whose audience stamp was internal.
+
+    Admission is fail-closed on ``event_type``, sourced from
+    :data:`_OPERATOR_CONVERSATION_EVENT_TYPES` — the intersection of the
+    write-time conversation-surface registry
+    (:data:`app.project_message_creation.CONVERSATION_EVENT_TYPES`) with the
+    operator-visible audience registry
+    (:func:`app.message_audience.get_operator_event_types`). Surface routing
+    alone is not visibility: PIPELINE_LOG/STRATEGIST_INTERNAL events that are
+    routed to the conversation surface stay out of the transcript. A human
+    sender (``user``/``operator``) is
+    always conversation evidence. A machine-authored row (``system``,
+    unproven ``strategic``) is admitted only when its event_type is a
+    registered conversation event; an unregistered or absent event_type on a
+    machine row is bookkeeping, not conversation, and is excluded rather than
+    passed through on an unstamped-audience default. This replaces a
+    hand-maintained event_type denylist that grew by incident with a single
+    allowlist that cannot silently miss a new machine event type.
     """
 
     reply_source = aliased(ProjectMessage)
@@ -139,22 +169,9 @@ def strategic_conversation_predicate() -> Any:
     return and_(
         ProjectMessage.surface == MessageSurface.CONVERSATION,
         or_(
-            event_type.is_(None),
-            event_type != _CHECK_IN_EVENT_TYPE,
-        ),
-        # CUT recommendations are completion-debt bookkeeping, not human
-        # conversation. Keep legacy rows out even though they were persisted on
-        # the conversation surface before that routing distinction was fixed.
-        or_(
-            event_type.is_(None),
-            event_type != _MODE_KNOB_CUT_EVENT_TYPE,
-        ),
-        or_(
+            ProjectMessage.from_type.in_(("user", "operator")),
             proven_operator_reply,
-            ProjectMessage.context[_AUDIENCE_CONTEXT_KEY].as_string().is_(None),
-            ~ProjectMessage.context[_AUDIENCE_CONTEXT_KEY]
-            .as_string()
-            .in_([STRATEGIST_INTERNAL, PIPELINE_LOG]),
+            event_type.in_(sorted(_OPERATOR_CONVERSATION_EVENT_TYPES)),
         ),
     )
 

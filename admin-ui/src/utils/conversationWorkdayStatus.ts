@@ -34,6 +34,30 @@ export interface ConversationWorkdayStatus {
   lastActivityMs?: number | null;
 }
 
+/**
+ * Single presentation source for every ConversationWorkdayState. Both the
+ * header status readout and the utility-bar status line render from this map
+ * so the two surfaces cannot disagree about what a given state looks like.
+ */
+export const WORKDAY_STATE_PRESENTATION: Record<
+  ConversationWorkdayState,
+  { dot: string; text: string; tone: string }
+> = {
+  off: { dot: 'bg-workbench-card', text: 'text-neutral-500', tone: 'text-neutral-300 border-neutral-700 bg-workbench-shell/80' },
+  ready: { dot: 'bg-sky-700', text: 'text-sky-400', tone: 'text-sky-300 border-sky-500/30 bg-sky-500/10' },
+  starting: { dot: 'bg-amber-400 animate-pulse', text: 'text-amber-300', tone: 'text-cyan-300 border-cyan-500/30 bg-cyan-500/10' },
+  working: { dot: 'bg-emerald-400 animate-pulse', text: 'text-emerald-300', tone: 'text-emerald-300 border-emerald-500/30 bg-emerald-500/10' },
+  waiting: { dot: 'bg-sky-700', text: 'text-sky-400', tone: 'text-cyan-300 border-cyan-500/30 bg-cyan-500/10' },
+  consultation_queued: { dot: 'bg-violet-400 animate-pulse', text: 'text-violet-300', tone: 'text-violet-300 border-violet-500/30 bg-violet-500/10' },
+  consultation_running: { dot: 'bg-violet-400 animate-pulse', text: 'text-violet-300', tone: 'text-violet-300 border-violet-500/30 bg-violet-500/10' },
+  consultation_delivering: { dot: 'bg-indigo-400 animate-pulse', text: 'text-indigo-300', tone: 'text-indigo-300 border-indigo-500/30 bg-indigo-500/10' },
+  paused: { dot: 'bg-amber-600', text: 'text-amber-400', tone: 'text-amber-300 border-amber-500/30 bg-amber-500/10' },
+  retrying: { dot: 'bg-amber-400 animate-pulse', text: 'text-amber-300', tone: 'text-amber-300 border-amber-500/30 bg-amber-500/10' },
+  stopping: { dot: 'bg-amber-600', text: 'text-amber-400', tone: 'text-amber-300 border-amber-500/30 bg-amber-500/10' },
+  unavailable: { dot: 'bg-red-700', text: 'text-red-400', tone: 'text-amber-300 border-amber-500/30 bg-amber-500/10' },
+  needs_restart: { dot: 'bg-red-400', text: 'text-red-300', tone: 'text-amber-300 border-amber-500/30 bg-amber-500/10' },
+};
+
 const TASK_DETAIL_MAX_CHARS = 96;
 const CONSULTATION_REASON_CODES = new Set([
   'consultation_queued',

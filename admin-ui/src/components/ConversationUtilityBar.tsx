@@ -1,28 +1,9 @@
-import { Search, ChevronUp } from 'lucide-react';
-import type {
-  ConversationWorkdayState,
-  ConversationWorkdayStatus,
+import { Search, ChevronUp, PanelRightOpen, PanelRightClose } from 'lucide-react';
+import {
+  WORKDAY_STATE_PRESENTATION,
+  type ConversationWorkdayStatus,
 } from '../utils/conversationWorkdayStatus';
 import { timeAgo } from '../utils/time';
-
-const WORKDAY_STATE_PRESENTATION: Record<
-  ConversationWorkdayState,
-  { dot: string; text: string }
-> = {
-  off: { dot: 'bg-workbench-card', text: 'text-neutral-500' },
-  ready: { dot: 'bg-sky-700', text: 'text-sky-400' },
-  starting: { dot: 'bg-amber-400 animate-pulse', text: 'text-amber-300' },
-  working: { dot: 'bg-emerald-400 animate-pulse', text: 'text-emerald-300' },
-  waiting: { dot: 'bg-sky-700', text: 'text-sky-400' },
-  consultation_queued: { dot: 'bg-violet-400 animate-pulse', text: 'text-violet-300' },
-  consultation_running: { dot: 'bg-violet-400 animate-pulse', text: 'text-violet-300' },
-  consultation_delivering: { dot: 'bg-indigo-400 animate-pulse', text: 'text-indigo-300' },
-  paused: { dot: 'bg-amber-600', text: 'text-amber-400' },
-  retrying: { dot: 'bg-amber-400 animate-pulse', text: 'text-amber-300' },
-  stopping: { dot: 'bg-amber-600', text: 'text-amber-400' },
-  unavailable: { dot: 'bg-red-700', text: 'text-red-400' },
-  needs_restart: { dot: 'bg-red-400', text: 'text-red-300' },
-};
 
 /**
  * Compact, collapsible search bar shown above the strategist conversation.
@@ -35,6 +16,8 @@ export function ConversationUtilityBar({
   searchQuery,
   onSearchChange,
   workdayStatus,
+  detailRevealed,
+  onToggleDetail,
 }: {
   expanded: boolean;
   onExpand: () => void;
@@ -42,6 +25,8 @@ export function ConversationUtilityBar({
   searchQuery: string;
   onSearchChange: (value: string) => void;
   workdayStatus?: ConversationWorkdayStatus | null;
+  detailRevealed?: boolean;
+  onToggleDetail?: (value: boolean) => void;
 }) {
   const workdayPresentation = workdayStatus
     ? WORKDAY_STATE_PRESENTATION[workdayStatus.state]
@@ -85,6 +70,28 @@ export function ConversationUtilityBar({
           >
             <ChevronUp className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
             <span className="hidden sm:inline">Hide</span>
+          </button>
+        )}
+        {onToggleDetail && (
+          <button
+            type="button"
+            onClick={() => onToggleDetail(!detailRevealed)}
+            title={detailRevealed ? 'Hide details' : 'Show details'}
+            aria-label={detailRevealed ? 'Hide details' : 'Show details'}
+            aria-pressed={Boolean(detailRevealed)}
+            data-testid="conversation-detail-toggle"
+            className={`inline-flex min-h-[44px] md:min-h-9 shrink-0 items-center gap-1.5 rounded-md border px-2 text-xs transition-colors ${
+              detailRevealed
+                ? 'border-neutral-700 bg-workbench-shell text-neutral-200'
+                : 'border-neutral-800 bg-workbench-shell/70 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
+            }`}
+          >
+            {detailRevealed ? (
+              <PanelRightClose className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            ) : (
+              <PanelRightOpen className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            )}
+            <span className="hidden sm:inline">{detailRevealed ? 'Hide details' : 'Details'}</span>
           </button>
         )}
         {workdayStatus && workdayPresentation && (

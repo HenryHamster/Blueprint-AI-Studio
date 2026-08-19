@@ -1084,8 +1084,21 @@ describe('MessagesPanel composer draft persistence', () => {
       const initObj = init as RequestInit | undefined;
       const method = initObj?.method ?? 'GET';
       if (method === 'POST' && /\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr)) {
-        postedBodies.push(JSON.parse(String(initObj?.body ?? '{}')));
-        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+        const body = JSON.parse(String(initObj?.body ?? '{}')) as Record<string, unknown>;
+        postedBodies.push(body);
+        return new Response(JSON.stringify({
+          arming: 'steering',
+          wakeup_state: 'queued',
+          message: makeMsg({
+            id: `sent-${String(body.idempotency_key ?? 'message')}`,
+            project_id: 'proj-draft',
+            from_type: 'user',
+            message_type: String(body.message_type ?? 'FEEDBACK') as _MockMsg['message_type'],
+            content: String(body.content ?? ''),
+            idempotency_key: String(body.idempotency_key ?? ''),
+            surface: 'conversation',
+          }),
+        }), { status: 200 });
       }
       if (method === 'GET' && /\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr)) {
         return new Response(JSON.stringify({
@@ -1208,8 +1221,21 @@ describe('MessagesPanel composer draft persistence', () => {
       const initObj = init as RequestInit | undefined;
       const method = initObj?.method ?? 'GET';
       if (method === 'POST' && /\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr)) {
-        postedBodies.push(JSON.parse(String(initObj?.body ?? '{}')));
-        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+        const body = JSON.parse(String(initObj?.body ?? '{}')) as Record<string, unknown>;
+        postedBodies.push(body);
+        return new Response(JSON.stringify({
+          arming: 'steering',
+          wakeup_state: 'queued',
+          message: makeMsg({
+            id: `sent-${String(body.idempotency_key ?? 'message')}`,
+            project_id: 'proj-draft',
+            from_type: 'user',
+            message_type: String(body.message_type ?? 'FEEDBACK') as _MockMsg['message_type'],
+            content: String(body.content ?? ''),
+            idempotency_key: String(body.idempotency_key ?? ''),
+            surface: 'conversation',
+          }),
+        }), { status: 200 });
       }
       if (method === 'GET' && /\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr)) {
         return new Response(JSON.stringify({
