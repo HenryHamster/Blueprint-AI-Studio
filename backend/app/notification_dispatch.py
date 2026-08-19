@@ -2909,6 +2909,9 @@ async def post_version_stabilize_stalled_message(
     version_id: str,
     age_days: int,
     tasks_merged: int,
+    blocker: str | None = None,
+    blocker_class: str | None = None,
+    remedy: str | None = None,
 ) -> ProjectMessage:
     """Post a stabilize-stall alert when a release version sits too long in stabilize.
 
@@ -2921,23 +2924,41 @@ async def post_version_stabilize_stalled_message(
 
     Does NOT commit — the caller owns the transaction.
     """
-    summary = (
-        f"v{version_number} has been in the stabilize phase for {age_days} day(s) "
-        f"with {tasks_merged} merged task(s) and has not been qualified. "
-        f"Consider requesting qualification now or addressing what is preventing "
-        f"readiness."
+    external_delivery_blocked = (
+        blocker == "promotion_disabled" and blocker_class == "external_delivery"
     )
+    if external_delivery_blocked:
+        summary = (
+            f"v{version_number} has been in the stabilize phase for {age_days} "
+            f"day(s) with {tasks_merged} merged task(s), but qualification is "
+            f"blocked because project promotion is disabled. Enable project "
+            f"promotion before requesting qualification."
+        )
+    else:
+        summary = (
+            f"v{version_number} has been in the stabilize phase for {age_days} day(s) "
+            f"with {tasks_merged} merged task(s) and has not been qualified. "
+            f"Consider requesting qualification now or addressing what is preventing "
+            f"readiness."
+        )
+    context = {
+        "version_number": version_number,
+        "version_id": version_id,
+        "age_days": age_days,
+        "tasks_merged": tasks_merged,
+    }
+    if blocker is not None:
+        context["blocker"] = blocker
+    if blocker_class is not None:
+        context["blocker_class"] = blocker_class
+    if remedy is not None:
+        context["remedy"] = remedy
     msg = await post_event_message(
         session,
         project_id,
         event_type="release_stabilize_stalled",
         summary=summary,
-        context={
-            "version_number": version_number,
-            "version_id": version_id,
-            "age_days": age_days,
-            "tasks_merged": tasks_merged,
-        },
+        context=context,
     )
     asyncio.ensure_future(
         dispatch_external_notification(
@@ -2949,6 +2970,15 @@ async def post_version_stabilize_stalled_message(
                 "age_days": age_days,
                 "tasks_merged": tasks_merged,
                 "summary": summary,
+                **(
+                    {
+                        "blocker": blocker,
+                        "blocker_class": blocker_class,
+                        "remedy": remedy,
+                    }
+                    if external_delivery_blocked
+                    else {}
+                ),
             },
         )
     )

@@ -50,6 +50,63 @@ _acceptance_window_recompute_state: dict[
 ] = {}
 
 CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
+OPERATOR_AUTHORSHIP_CRITERION_KEY = "c-operator-authorship"
+OPERATOR_AUTHORSHIP_CRITERION_TEXT = (
+    "The candidate contains no operator-authored commits across its complete release range."
+)
+
+
+async def ensure_operator_authorship_criterion(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+) -> VersionAcceptanceCriterion:
+    """Ensure every newly opened version has an explicit authorship budget.
+
+    The stable key makes retries idempotent. Existing owner-authored contracts
+    remain authoritative; this helper only supplies the product default when a
+    version has no authorship criterion yet.
+    """
+    from app.release_commit_authorship import (
+        AUTHORSHIP_EVIDENCE_CONTRACT_TYPE,
+        default_authorship_evidence_contract,
+    )
+
+    result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == OPERATOR_AUTHORSHIP_CRITERION_KEY,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    existing_result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.status == "active",
+        )
+    )
+    for criterion in existing_result.scalars().all():
+        contract = normalize_evidence_contract(criterion.evidence_contract)
+        if contract is not None and contract.get("type") == AUTHORSHIP_EVIDENCE_CONTRACT_TYPE:
+            return criterion
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project_id,
+        release_version_id=release_version_id,
+        criterion_key=OPERATOR_AUTHORSHIP_CRITERION_KEY,
+        text=OPERATOR_AUTHORSHIP_CRITERION_TEXT,
+        evidence_contract=default_authorship_evidence_contract(),
+        evidence_contract_updated_at=_utcnow(),
+        evidence_contract_updated_by="system:release_default",
+        created_by="system",
+    )
+    session.add(criterion)
+    return criterion
 
 
 def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:
@@ -62,6 +119,26 @@ def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:
     return normalize_authorship_evidence_contract(
         raw
     ) or normalize_rehearsal_evidence_contract(raw)
+
+
+def is_operator_authorship_criterion(criterion: Any) -> bool:
+    """Return whether a criterion is the deterministic authorship policy row.
+
+    Authorship contracts are release-policy gates, not user-authored product
+    criteria. They stay in rubric/detail responses so operators can inspect and
+    edit them, but must not consume the ordinary acceptance-criteria cap or make
+    the task-evidence coverage aggregate appear incomplete.
+    """
+    raw_contract = (
+        criterion.get("evidence_contract")
+        if isinstance(criterion, dict)
+        else getattr(criterion, "evidence_contract", None)
+    )
+    contract = normalize_evidence_contract(raw_contract)
+    return bool(
+        contract is not None
+        and contract.get("type") == "operator_authored_commits"
+    )
 
 
 def is_owner_controlled_machine_contract(
@@ -1063,12 +1140,16 @@ async def count_active_criteria_for_version(
     counts criteria that still participate in the qualification gate.
     """
     result = await session.execute(
-        select(func.count()).where(
+        select(VersionAcceptanceCriterion).where(
             VersionAcceptanceCriterion.release_version_id == release_version_id,
             VersionAcceptanceCriterion.status == "active",
         )
     )
-    return result.scalar_one()
+    return sum(
+        1
+        for criterion in result.scalars()
+        if not is_operator_authorship_criterion(criterion)
+    )
 
 
 async def get_criteria_for_version(
@@ -4403,7 +4484,8 @@ async def get_version_coverage_summary(
         coverage = compute_criterion_coverage(evidence)
         coverage_by_criterion[criterion.id] = coverage
         if criterion.status == "active":
-            counts[coverage] += 1
+            if not is_operator_authorship_criterion(criterion):
+                counts[coverage] += 1
         else:
             inactive_counts[criterion.status] = (
                 inactive_counts.get(criterion.status, 0) + 1
@@ -4448,7 +4530,11 @@ async def get_version_coverage_summary(
     uncovered_keys = [
         c.criterion_key
         for c in criteria_in_order
-        if c.status == "active" and coverage_by_criterion[c.id] == "uncovered"
+        if (
+            c.status == "active"
+            and not is_operator_authorship_criterion(c)
+            and coverage_by_criterion[c.id] == "uncovered"
+        )
     ]
     stuck_reasons: dict[str, str | None] = {}
     if uncovered_keys and _rv is not None:
@@ -4533,6 +4619,7 @@ async def get_version_coverage_summary(
                     c.criterion_key
                     for c in criteria_in_order
                     if c.status == "active"
+                    and not is_operator_authorship_criterion(c)
                 }
                 referenced_keys = (
                     await _gather_referenced_criterion_keys(

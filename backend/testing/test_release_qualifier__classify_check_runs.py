@@ -12,9 +12,20 @@ def _authorized_qualification_has_a_delivery_target(monkeypatch):
     monkeypatch.setattr(rq, "resolve_project_promotion_enabled", lambda _id: True)
 
 
-def _with_current_contract(project, version, record):
-    """Stamp a synthetic conclusive verdict with today's reusable contract."""
-    rubric_snapshot = record.get("rubric_snapshot") or []
+async def _with_current_contract(db_session, project, version, record):
+    """Stamp a synthetic conclusive verdict with today's reusable contract.
+
+    ``open_version`` seeds a default operator-authorship criterion, so a
+    version's live rubric is never empty.  Default the stamped snapshot to the
+    version's CURRENT active rubric — a hardcoded empty snapshot makes the
+    reuse/finalize paths correctly treat the fixture as mid-flight rubric
+    drift before the behavior under test is reached.
+    """
+    rubric_snapshot = record.get("rubric_snapshot")
+    if not rubric_snapshot:
+        rubric_snapshot, _ = await rq._snapshot_qualification_rubric(
+            db_session, version
+        )
     rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
     policy = rq._load_policy(project)
     build_setting = (project.build_config or {}).get("env_preflight_enabled")
@@ -1157,7 +1168,20 @@ async def test_run_qualification_spawns_one_holistic_audit_when_goal_set(
     )
     assert payload["candidate_sha"] == candidate
     assert payload["version_goal"] == "deliver user analytics dashboard"
+    # open_version seeds the default operator-authorship policy criterion, so
+    # every live rubric carries it alongside the product criteria.
     assert lq["rubric_snapshot"] == [
+        {
+            "criterion_key": "c-operator-authorship",
+            "text": (
+                "The candidate contains no operator-authored commits across "
+                "its complete release range."
+            ),
+            "evidence_contract": {
+                "type": "operator_authored_commits",
+                "predicate": {"max_count": 0},
+            },
+        },
         {
             "criterion_key": "c-analytics-ui",
             "text": "Render analytics for the operator",
@@ -2690,7 +2714,7 @@ async def test_run_qualification_cached_dry_run_same_sha_is_noop(db_session, moc
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     dry_run_sha = "drc0de00" * 5  # 40-char placeholder SHA
-    version.last_qualification = _with_current_contract(project, version, {
+    version.last_qualification = await _with_current_contract(db_session, project, version, {
         "status": "dry_run",
         "candidate_sha": dry_run_sha,
         "ci_green": True,
@@ -2891,6 +2915,10 @@ async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
     cannot be silently dropped from the new audit's view.
     """
     project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Audit-surface reuse is orthogonal to the acceptance rubric; retract the
+    # product-default authorship criterion so the stored audit fact stays
+    # reusable under the (empty) holistic contract this test models.
+    await _retract_default_authorship_criterion(db_session, version)
     old_sha = "0ldaudit" * 5
     same_surface_sha = "sameonly" * 5
     changed_sha = "changed1" * 5
@@ -3116,6 +3144,10 @@ async def test_delta_scoped_audit_finalize_persists_merged_ledger_facts(
     promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Audit-surface reuse is orthogonal to the acceptance rubric; retract the
+    # product-default authorship criterion so the stored audit fact stays
+    # reusable under the (empty) holistic contract this test models.
+    await _retract_default_authorship_criterion(db_session, version)
     old_sha = "0ldaudit" * 5
     new_sha = "newaudit" * 5
     origin_attempt = uuid.uuid4()
@@ -3696,7 +3728,7 @@ async def test_run_qualification_content_hash_reuse_across_sha(db_session, mocke
 
     old_sha = "oldshaaa" * 5
     new_sha = "newshaaa" * 5  # HEAD advanced to a different commit
-    version.last_qualification = _with_current_contract(project, version, {
+    version.last_qualification = await _with_current_contract(db_session, project, version, {
         "status": "dry_run",
         "candidate_sha": old_sha,
         "candidate_diff_hash": surface_hash,
@@ -4205,7 +4237,7 @@ async def test_run_qualification_cached_not_promoted_same_sha_is_noop(
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     candidate_sha = "notprom0" * 5  # 40-char placeholder SHA
-    version.last_qualification = _with_current_contract(project, version, {
+    version.last_qualification = await _with_current_contract(db_session, project, version, {
         "status": "not_promoted",
         "candidate_sha": candidate_sha,
         "ci_green": True,
@@ -4446,7 +4478,7 @@ async def test_run_qualification_cached_promoted_same_sha_is_noop(db_session, mo
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     candidate_sha = "promot00" * 5  # 40-char placeholder SHA
-    version.last_qualification = _with_current_contract(project, version, {
+    version.last_qualification = await _with_current_contract(db_session, project, version, {
         "status": "promoted",
         "candidate_sha": candidate_sha,
         "ci_green": True,
@@ -4816,6 +4848,10 @@ async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
 
     shared_state.runtime_config["promotion_enabled"] = True
     project, version = await _make_project_and_version(db_session)
+    # This test asserts behavior orthogonal to the product-default
+    # authorship policy criterion open_version seeds; retract it so the
+    # live rubric is exactly the criteria this test declares.
+    await _retract_default_authorship_criterion(db_session, version)
     prior = ReleaseVersion(
         project_id=project.id,
         version_number=0,
@@ -4962,6 +4998,10 @@ async def test_ci_build_smoke_contract_finalizes_without_grader_category(
 
     shared_state.runtime_config["promotion_enabled"] = True
     project, version = await _make_project_and_version(db_session)
+    # This test asserts behavior orthogonal to the product-default
+    # authorship policy criterion open_version seeds; retract it so the
+    # live rubric is exactly the criteria this test declares.
+    await _retract_default_authorship_criterion(db_session, version)
     criterion_key = "generated-ci-build-smoke-key"
     db_session.add(
         VersionAcceptanceCriterion(
@@ -6667,10 +6707,14 @@ async def test_reused_blocked_legacy_smoketest_fact_is_ignored(
     )
 
     project, version = await _make_project_and_version(db_session)
+    # This test asserts behavior orthogonal to the product-default
+    # authorship policy criterion open_version seeds; retract it so the
+    # live rubric is exactly the criteria this test declares.
+    await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
-        **_EMPTY_RUBRIC_PROJECTION,
+        **(await _live_rubric_projection(db_session, version)),
         "candidate_sha": sha,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -6684,8 +6728,8 @@ async def test_reused_blocked_legacy_smoketest_fact_is_ignored(
             "smoketest": {"status": "blocked", "sub_score": None},
         },
     }
-    version.last_qualification = _with_current_contract(
-        project, version, version.last_qualification
+    version.last_qualification = await _with_current_contract(
+        db_session, project, version, version.last_qualification
     )
     db_session.add(version)
     await db_session.commit()
@@ -6722,10 +6766,14 @@ async def test_reused_blocked_test_erosion_fact_stays_blocked_not_scored_1_0(
     shared_state.runtime_config["promotion_enabled"] = True
 
     _project, version = await _make_project_and_version(db_session)
+    # This test asserts behavior orthogonal to the product-default
+    # authorship policy criterion open_version seeds; retract it so the
+    # live rubric is exactly the criteria this test declares.
+    await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
-        **_EMPTY_RUBRIC_PROJECTION,
+        **(await _live_rubric_projection(db_session, version)),
         "candidate_sha": sha,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -6775,10 +6823,14 @@ async def test_archival_passed_smoketest_fact_is_ignored(
     )
 
     project, version = await _make_project_and_version(db_session)
+    # This test asserts behavior orthogonal to the product-default
+    # authorship policy criterion open_version seeds; retract it so the
+    # live rubric is exactly the criteria this test declares.
+    await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
-        **_EMPTY_RUBRIC_PROJECTION,
+        **(await _live_rubric_projection(db_session, version)),
         "candidate_sha": sha,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -6793,8 +6845,8 @@ async def test_archival_passed_smoketest_fact_is_ignored(
             "smoketest": {"status": "passed", "sub_score": None},
         },
     }
-    version.last_qualification = _with_current_contract(
-        project, version, version.last_qualification
+    version.last_qualification = await _with_current_contract(
+        db_session, project, version, version.last_qualification
     )
     db_session.add(version)
     await db_session.commit()
@@ -6876,7 +6928,8 @@ async def test_category_gate_read_back_exception_fails_closed(db_session, mocker
     # Exercise the ledger read-back path: the holistic grade is already a
     # resolved same-candidate fact, so no fresh in-memory category verdict is
     # available to bypass the canonical read.
-    version.last_qualification = _with_current_contract(
+    version.last_qualification = await _with_current_contract(
+        db_session,
         project,
         version,
         {
@@ -6932,6 +6985,10 @@ async def test_category_gate_no_verdict_for_active_criterion_fails_closed(
     shared_state.runtime_config["promotion_enabled"] = True
 
     project, version = await _make_project_and_version(db_session)
+    # This test asserts behavior orthogonal to the product-default
+    # authorship policy criterion open_version seeds; retract it so the
+    # live rubric is exactly the criteria this test declares.
+    await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     # An active criterion that was never graded into the category-verdict ledger.
     await _add_version_criterion(
@@ -6970,8 +7027,8 @@ async def test_category_gate_no_verdict_for_active_criterion_fails_closed(
             "merge_grade": {"status": "passed", "sub_score": 0.9},
         },
     }
-    version.last_qualification = _with_current_contract(
-        project, version, version.last_qualification
+    version.last_qualification = await _with_current_contract(
+        db_session, project, version, version.last_qualification
     )
     db_session.add(version)
     await db_session.commit()
@@ -7108,6 +7165,10 @@ async def test_ungraded_acceptance_contract_fails_closed(
     shared_state.runtime_config["promotion_enabled"] = False
 
     project, version = await _make_project_and_version(db_session)
+    # This test asserts behavior orthogonal to the product-default
+    # authorship policy criterion open_version seeds; retract it so the
+    # live rubric is exactly the criteria this test declares.
+    await _retract_default_authorship_criterion(db_session, version)
     await _seed_qualification_children(
         db_session,
         project,

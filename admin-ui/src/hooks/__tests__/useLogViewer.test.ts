@@ -28,6 +28,7 @@ vi.mock('../../api', () => ({
   fetchTask: vi.fn(async (id: string) => ({ id, project_id: 'projA', status: 'IN_PROGRESS', title: 'T' })),
   approveActivation: vi.fn(),
   recordFindingResolution: vi.fn(),
+  updateAcceptanceCriterionEvidenceContract: vi.fn(),
 }));
 
 class MockWebSocket {

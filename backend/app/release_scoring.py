@@ -1585,6 +1585,21 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     "criterion_coverage_incomplete": EXECUTION_SITE_DEPLOYED,
     "merge_grade_misses": EXECUTION_SITE_CANDIDATE,
     "capability_proof_gate_blocked": EXECUTION_SITE_CANDIDATE,
+    # Lifecycle and audit blockers below are emitted by the deployed
+    # qualification process.  A repair carried by the candidate is therefore
+    # a self-modifying gate until the version itself promotes; each still has a
+    # non-promotional clearing path in HARD_GATE_CLEARING_PATHS.
+    "qualification_timeout": EXECUTION_SITE_DEPLOYED,
+    "qualification_superseded": EXECUTION_SITE_DEPLOYED,
+    "qualification_contract_superseded": EXECUTION_SITE_DEPLOYED,
+    "sweep_finalize_crash_loop": EXECUTION_SITE_DEPLOYED,
+    "prepromotion_rehearsal_dispatch_pending": EXECUTION_SITE_DEPLOYED,
+    "incompatible_probe": EXECUTION_SITE_DEPLOYED,
+    "audit_challenge_independent_blocker": EXECUTION_SITE_DEPLOYED,
+    # Promotion-disabled is not a code-side gate: the deployed qualifier reads
+    # the project setting and the remedy is an operator environment/config
+    # change that creates the next revision.
+    "promotion_disabled": EXECUTION_SITE_OPERATOR_ENV,
     # NOTE: ``uncorroborated_attestation`` is deliberately absent — the
     # attestation gate it classified was replaced by the per-category
     # goal-verification gate (which blocks as ``criterion_coverage_incomplete``),
@@ -1633,6 +1648,38 @@ HARD_GATE_CLEARING_PATHS: dict[str, dict[str, str]] = {
     "merge_grade_misses": {"kind": "input", "evidence": "satisfy the candidate goal"},
     "capability_proof_gate_blocked": {
         "kind": "input", "evidence": "prove candidate capabilities"
+    },
+    "qualification_timeout": {
+        "kind": "input", "evidence": "complete or recover the pending qualification"
+    },
+    "qualification_superseded": {
+        "kind": "input", "evidence": "reconcile the already-landed candidate"
+    },
+    "qualification_contract_superseded": {
+        "kind": "input", "evidence": "rerun against the current qualification contract"
+    },
+    "sweep_finalize_crash_loop": {
+        "kind": "input", "evidence": "repair the sweep finalization failure"
+    },
+    "prepromotion_rehearsal_dispatch_pending": {
+        "kind": "input", "evidence": "dispatch or reconcile the rehearsal outbox intent"
+    },
+    "incompatible_probe": {
+        "kind": "input", "evidence": "remove or replace the incompatible product probe"
+    },
+    "audit_challenge_independent_blocker": {
+        "kind": "input", "evidence": "resolve the independent challenger finding"
+    },
+    # The remedy is an operator config change, but the invariant in
+    # test_release_qualifier.test_every_hard_promotion_gate_has_a_non_promotional_clearing_path
+    # forbids the "promot" root in clearing evidence (a gate may not document
+    # shipping the release as its own recovery).  Name the runtime-config
+    # toggle descriptively instead of by its literal key.
+    "promotion_disabled": {
+        "kind": "override",
+        "evidence": (
+            "turn on this project's release-delivery toggle in runtime config"
+        ),
     },
 }
 

@@ -10428,11 +10428,15 @@ async def test_handle_strategic_completion_applies_new_acceptance_criteria_from_
     await _handle_strategic_completion(task, logs, db_session)
 
     fetched = await ac.get_criteria_for_version(db_session, version.id)
-    assert [c.text for c in fetched] == [
+    # open_version seeds the operator-authorship policy criterion; it is not a
+    # strategist-authored row, so exclude it before asserting on the authored set.
+    assert any(ac.is_operator_authorship_criterion(c) for c in fetched)
+    authored = [c for c in fetched if not ac.is_operator_authorship_criterion(c)]
+    assert [c.text for c in authored] == [
         "All unit tests pass",
         "No unresolved P0 bugs",
     ]
-    assert all(c.created_by == "strategist" for c in fetched)
+    assert all(c.created_by == "strategist" for c in authored)
 
 
 @pytest.mark.asyncio
@@ -10509,8 +10513,11 @@ async def test_set_problem_model_lifts_new_acceptance_criteria_api_path(
 
     # Synchronous apply: criteria created during set_problem_model, not deferred.
     fetched = await ac.get_criteria_for_version(db_session, version.id)
-    assert [c.text for c in fetched] == criteria_texts
-    assert all(c.created_by == "strategist" for c in fetched)
+    # open_version seeds the operator-authorship policy criterion; exclude it.
+    assert any(ac.is_operator_authorship_criterion(c) for c in fetched)
+    authored = [c for c in fetched if not ac.is_operator_authorship_criterion(c)]
+    assert [c.text for c in authored] == criteria_texts
+    assert all(c.created_by == "strategist" for c in authored)
 
     # Context key is consumed and popped — completion handler is a no-op.
     await db_session.refresh(task)
@@ -10519,7 +10526,8 @@ async def test_set_problem_model_lifts_new_acceptance_criteria_api_path(
     # Completion handler does not create duplicate criteria.
     await _handle_strategic_completion(task, "", db_session)
     fetched2 = await ac.get_criteria_for_version(db_session, version.id)
-    assert len(fetched2) == len(criteria_texts)  # no duplicates
+    authored2 = [c for c in fetched2 if not ac.is_operator_authorship_criterion(c)]
+    assert len(authored2) == len(criteria_texts)  # no duplicates
 
 
 # ── _compute_lifetime_burn_metrics ───────────────────────────────────────────

@@ -1471,8 +1471,7 @@ class TestBlockerExecutionSite:
     def test_none_and_unknown_return_none(self):
         assert rs.blocker_execution_site(None) is None
         assert rs.blocker_execution_site("") is None
-        # A force-promote / unclassified sentinel is deliberately unclassified.
-        assert rs.blocker_execution_site("qualification_superseded") is None
+        assert rs.blocker_execution_site("qualification_superseded") == rs.EXECUTION_SITE_DEPLOYED
         assert rs.blocker_execution_site("some_future_blocker") is None
 
     def test_every_compute_composite_blocker_code_is_classified(self):
@@ -1480,8 +1479,25 @@ class TestBlockerExecutionSite:
         # execution-site — a new blocker without a classification is a bug.
         import re
 
-        src = (Path(rs.__file__)).read_text()
-        emitted = set(re.findall(r'blocker = "([a-z_]+)"', src))
+        source_paths = (
+            "release_scoring.py",
+            "release_qualifier.py",
+            "release_qualifier_sweep.py",
+            "release_qualifier_audit.py",
+            "release_reconciliation.py",
+            "release_stall_alerts.py",
+        )
+        emitted = {
+            code
+            for filename in source_paths
+            for pattern in (
+                r'blocker\s*=\s*["\']([a-z0-9_]+)["\']',
+                r'["\']blocker["\']\s*:\s*["\']([a-z0-9_]+)["\']',
+            )
+            for code in re.findall(
+                pattern, Path(rs.__file__).with_name(filename).read_text()
+            )
+        }
         assert emitted, "expected to find blocker assignments in release_scoring"
         for code in emitted:
             assert rs.blocker_execution_site(code) is not None, code
@@ -1506,8 +1522,15 @@ class TestBlockerExecutionSite:
         # qualifier after base scoring, so the reverse vocabulary check must
         # include both execution sites.
         sources = [
-            Path(rs.__file__).read_text(),
-            Path(rs.__file__).with_name("release_qualifier.py").read_text(),
+            Path(rs.__file__).with_name(filename).read_text()
+            for filename in (
+                "release_scoring.py",
+                "release_qualifier.py",
+                "release_qualifier_sweep.py",
+                "release_qualifier_audit.py",
+                "release_reconciliation.py",
+                "release_stall_alerts.py",
+            )
         ]
         emitted = {
             code
@@ -1536,7 +1559,10 @@ class TestBlockerExecutionSite:
         assert "next qualification" in candidate_label
         # No blocker / unclassified → no label.
         assert rs.blocker_execution_site_label(None) is None
-        assert rs.blocker_execution_site_label("qualification_superseded") is None
+        assert (
+            rs.blocker_execution_site_label("qualification_superseded")
+            == rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_DEPLOYED]
+        )
 
 
 # ---------------------------------------------------------------------------

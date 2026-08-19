@@ -45,6 +45,15 @@ _BUILD_STALL_MERGED_TASKS = 40
 _STABILIZE_STALL_AGE_DAYS = 14
 _STABILIZE_STALL_MERGED_TASKS = 40
 
+# Qualification can stop before it creates a candidate when project promotion
+# is disabled. This is an external-delivery boundary, so the stabilize stall
+# backstop must name the project setting that can actually clear it.
+_EXTERNAL_DELIVERY_BLOCKER = {
+    "status": "external_blocker",
+    "blocker": "promotion_disabled",
+    "blocker_class": "external_delivery",
+}
+
 # A managed promotion PR includes ordinary CI, whose supported full gate can
 # legitimately take 45-60+ minutes. Alert only after four hours, re-alert on the
 # same cadence, and escalate at the promotion_pending 24-hour backstop.
@@ -56,8 +65,25 @@ _BLOCKER_LITERAL = re.compile(
     r"(?:\bblocker\s*=\s*|['\"]blocker['\"]\s*:\s*)['\"]([a-z0-9_]+)['\"]"
 )
 _GATE_SOURCES = (
+    # Keep this inventory aligned with every module that can persist a release
+    # qualification blocker.  The qualifier was split into lifecycle, audit,
+    # and reconciliation modules; scanning only the original two modules makes
+    # a self-repair in an extracted gate indistinguishable from no repair.
     ("backend/app/release_scoring.py", Path(__file__).with_name("release_scoring.py")),
     ("backend/app/release_qualifier.py", Path(__file__).with_name("release_qualifier.py")),
+    (
+        "backend/app/release_qualifier_sweep.py",
+        Path(__file__).with_name("release_qualifier_sweep.py"),
+    ),
+    (
+        "backend/app/release_qualifier_audit.py",
+        Path(__file__).with_name("release_qualifier_audit.py"),
+    ),
+    (
+        "backend/app/release_reconciliation.py",
+        Path(__file__).with_name("release_reconciliation.py"),
+    ),
+    ("backend/app/release_stall_alerts.py", Path(__file__)),
 )
 
 
@@ -526,6 +552,9 @@ async def _check_version_stabilize_stall(
     qual_status = qual.get("status")
     if qual_status == "dry_run":
         return False
+    external_delivery_blocked = all(
+        qual.get(key) == value for key, value in _EXTERNAL_DELIVERY_BLOCKER.items()
+    )
     if (
         qual_status == "not_promoted"
         and qual.get("blocker")
@@ -564,19 +593,29 @@ async def _check_version_stabilize_stall(
     if version.stabilize_stall_alerted_at == ref_time:
         return False
 
+    if external_delivery_blocked:
+        alert_message = (
+            f"Release v{version.version_number} has been in the stabilize phase "
+            f"for {age_days} day(s) with {merged_count} merged task(s), but "
+            f"qualification is blocked because project promotion is disabled. "
+            f"Enable project promotion before requesting qualification."
+        )
+    else:
+        alert_message = (
+            f"Release v{version.version_number} has been in the stabilize "
+            f"phase for {age_days} day(s) with {merged_count} merged task(s) "
+            f"but has not been qualified. stabilize→qualify requires a "
+            f"qualify_request from the strategic agent — consider requesting "
+            f"qualification now or addressing what is preventing readiness."
+        )
+
     session.add(
         Alert(
             project_id=version.project_id,
             event_type="release.stabilize_stalled",
             severity=AlertSeverity.WARNING,
             title=f"Release v{version.version_number} stalled in stabilize phase",
-            message=(
-                f"Release v{version.version_number} has been in the stabilize "
-                f"phase for {age_days} day(s) with {merged_count} merged task(s) "
-                f"but has not been qualified. stabilize→qualify requires a "
-                f"qualify_request from the strategic agent — consider requesting "
-                f"qualification now or addressing what is preventing readiness."
-            ),
+            message=alert_message,
         )
     )
     try:
@@ -587,6 +626,9 @@ async def _check_version_stabilize_stall(
             version_id=str(version.id),
             age_days=age_days,
             tasks_merged=merged_count,
+            blocker=("promotion_disabled" if external_delivery_blocked else None),
+            blocker_class=("external_delivery" if external_delivery_blocked else None),
+            remedy=("enable_project_promotion" if external_delivery_blocked else None),
         )
     except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
         logger.warning(

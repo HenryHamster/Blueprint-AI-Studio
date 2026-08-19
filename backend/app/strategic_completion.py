@@ -1291,7 +1291,11 @@ async def _apply_new_acceptance_criteria(
             return
         existing = await _ac.get_criteria_for_version(session, _open_ver.id)
         existing_texts = {c.text for c in existing}
-        active_count = sum(1 for c in existing if c.status == "active")
+        active_count = sum(
+            1
+            for c in existing
+            if c.status == "active" and not _ac.is_operator_authorship_criterion(c)
+        )
         headroom = _ac.MAX_CRITERIA_PER_VERSION - active_count
         created_count = 0
         skipped_over_cap = 0
@@ -1324,6 +1328,12 @@ async def _apply_new_acceptance_criteria(
             )
             existing_texts.add(cleaned)
             created_count += 1
+        if created_count > 0:
+            # The test harness and several callers intentionally keep
+            # ``autoflush`` disabled while this helper stages work. Flush so
+            # same-transaction readers (including the lifecycle UI refresh)
+            # can observe the newly authored criteria without committing here.
+            await session.flush()
         if created_count > 0:
             logger.info(
                 "[STRATEGIC] Task %s (%s path): authored %d acceptance criterion(a) "

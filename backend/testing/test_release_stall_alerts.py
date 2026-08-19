@@ -30,6 +30,8 @@ from app.release_stall_alerts import (
     _alert_promotion_deploy_failed,
     _check_deployed_gate_latch,
     _check_version_managed_check_wait_stall,
+    _check_version_stabilize_stall,
+    gate_implementing_paths,
     _deploy_failed_alert_title,
     _resolve_promotion_deploy_failed_alert,
 )
@@ -45,6 +47,21 @@ def test_retired_pending_activation_reason_is_absent_from_alert_module():
 
     assert "PENDING_OPERATOR_ACTIVATION_REASON" not in source
     assert "Approve activation" not in source
+
+
+def test_gate_implementing_paths_scans_extracted_release_blocker_modules():
+    """A blocker emitted by an extracted lifecycle module remains discoverable."""
+    assert gate_implementing_paths("sweep_finalize_crash_loop") == [
+        "backend/app/release_qualifier_sweep.py"
+    ]
+    assert gate_implementing_paths("audit_challenge_independent_blocker") == [
+        "backend/app/release_qualifier_audit.py"
+    ]
+    assert gate_implementing_paths("qualification_superseded") == [
+        "backend/app/release_qualifier.py",
+        "backend/app/release_qualifier_sweep.py",
+        "backend/app/release_reconciliation.py",
+    ]
 
 
 async def _make_project_and_version(db_session):
@@ -168,6 +185,65 @@ async def test_deployed_gate_latch_ignores_ordinary_blocked_candidate(db_session
 def test_release_blocked_is_operator_reachable():
     assert route_event("release_blocked") == OPERATOR_ACTION_NEEDED
     assert route_event("release_blocked") != STRATEGIST_INTERNAL
+
+
+@pytest.mark.asyncio
+async def test_external_delivery_blocker_alert_names_promotion_switch(db_session):
+    """An external qualification blocker names the setting that clears it."""
+    _project, version = await _make_project_and_version(db_session)
+    version.phase_changed_at = _utcnow() - timedelta(days=15)
+    version.last_qualification = {
+        "status": "external_blocker",
+        "blocker": "promotion_disabled",
+        "blocker_class": "external_delivery",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert await _check_version_stabilize_stall(db_session, version) is True
+    await db_session.commit()
+
+    alert = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert "project promotion is disabled" in alert.message
+    assert "Enable project promotion before requesting qualification" in alert.message
+
+    message = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == version.project_id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert message.context["blocker"] == "promotion_disabled"
+    assert message.context["blocker_class"] == "external_delivery"
+    assert message.context["remedy"] == "enable_project_promotion"
+    assert "Enable project promotion before requesting qualification" in message.content
+
+    # The existing phase-change anchor deduplicates repeated sweep passes.
+    assert await _check_version_stabilize_stall(db_session, version) is False
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
 
 
 @pytest.mark.asyncio

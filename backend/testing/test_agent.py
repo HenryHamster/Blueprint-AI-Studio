@@ -21828,6 +21828,7 @@ async def _seed_qualifier_children(
     from app.release_qualifier import (
         _qualification_contract_fingerprint,
         _rubric_fingerprint,
+        _snapshot_qualification_rubric,
     )
     audit_task = Task(
         project_id=project.id,
@@ -21854,20 +21855,23 @@ async def _seed_qualifier_children(
     await db_session.refresh(audit_task)
     await db_session.refresh(smoke_task)
 
-    rubric_fingerprint = _rubric_fingerprint([])
+    rubric_snapshot, rubric_lifecycle_snapshot = await _snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = _rubric_fingerprint(rubric_snapshot)
     version.last_qualification = {
         "status": "pending",
         # Real run_qualification always stamps the launched rubric projection;
         # #15102 made _finalize_qualification resolve it first and short-circuit
-        # to rubric_provenance_unknown when it is absent. Seed the empty
-        # projection so the infra-failure child path is reached as in prod.
-        "rubric_snapshot": [],
+        # to rubric_provenance_unknown when it is absent. Mirror the active
+        # release rubric so the infra-failure child path is reached as in prod.
+        "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
         "contract_fingerprint": _qualification_contract_fingerprint(
             version.goal or "", rubric_fingerprint
         ),
         "version_goal": version.goal or "",
-        "rubric_lifecycle_snapshot": [],
+        "rubric_lifecycle_snapshot": rubric_lifecycle_snapshot,
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "started_at": "2026-05-20T00:00:00",
@@ -22161,6 +22165,7 @@ async def test_legacy_qualifier_smoketest_artifact_is_stored_but_inert(
     from app.release_qualifier import (
         _qualification_contract_fingerprint,
         _rubric_fingerprint,
+        _snapshot_qualification_rubric,
     )
     from app.models import ReleaseVersion, Artifact, ArtifactType
 
@@ -22282,20 +22287,23 @@ async def test_legacy_qualifier_smoketest_artifact_is_stored_but_inert(
     await db_session.commit()
     await db_session.refresh(smoke_task)
 
-    rubric_fingerprint = _rubric_fingerprint([])
+    rubric_snapshot, rubric_lifecycle_snapshot = await _snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = _rubric_fingerprint(rubric_snapshot)
     version.last_qualification = {
         "status": "pending",
         # Real run_qualification always stamps the launched rubric projection;
         # #15102 made _finalize_qualification resolve it first and short-circuit
-        # to rubric_provenance_unknown when it is absent. Seed the empty
-        # projection so the infra-failure child path is reached as in prod.
-        "rubric_snapshot": [],
+        # to rubric_provenance_unknown when it is absent. Mirror the active
+        # release rubric so the archival-artifact path is reached as in prod.
+        "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
         "contract_fingerprint": _qualification_contract_fingerprint(
             version.goal or "", rubric_fingerprint
         ),
         "version_goal": version.goal or "",
-        "rubric_lifecycle_snapshot": [],
+        "rubric_lifecycle_snapshot": rubric_lifecycle_snapshot,
         "candidate_sha": candidate_sha,
         "ci_green": True,
         "started_at": "2026-05-20T00:00:00",

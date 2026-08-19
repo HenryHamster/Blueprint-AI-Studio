@@ -16,6 +16,7 @@ import {
   setProjectPromotionEnabled,
   setVersionPhase,
   setVersionGoal,
+  updateAcceptanceCriterionEvidenceContract,
   triggerHotfixPromote,
   triggerQualify,
   type AgentServingShasResponse,
@@ -26,6 +27,7 @@ import {
   type RecentVersion,
   type QualificationState,
   type QualificationTriggerState,
+  type OperatorAuthorshipEvidenceContract,
 } from '../api';
 import { timeAgo } from '../utils/time';
 import {
@@ -580,6 +582,22 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
       }
     : undefined;
 
+  const handleUpdateEvidenceContract = projectId && canManageProject && !readOnly
+    ? async (criterionKey: string, maxCount: number) => {
+        try {
+          const evidenceContract: OperatorAuthorshipEvidenceContract = {
+            type: 'operator_authored_commits',
+            predicate: { max_count: maxCount },
+          };
+          await updateAcceptanceCriterionEvidenceContract(projectId, criterionKey, evidenceContract);
+          setActionMsg('Candidate authorship budget updated');
+          onRefresh();
+        } catch (err) {
+          setActionMsg(err instanceof Error ? err.message : 'Failed to update authorship budget');
+        }
+      }
+    : undefined;
+
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
@@ -936,6 +954,26 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                 {cv.dimension_states && cv.dimension_states.length > 0 && (
                   <DimensionBreakdown dimensions={cv.dimension_states} />
                 )}
+                {cv.last_qualification.sub_scores?.candidate_operator_authorship && (
+                  <div
+                    className="flex flex-wrap items-baseline gap-x-2 text-ui-sm text-violet-300"
+                    data-testid="candidate-operator-authorship-gate"
+                  >
+                    <span className="font-medium">Candidate authorship</span>
+                    <span>{cv.last_qualification.sub_scores.candidate_operator_authorship.status}</span>
+                    <span className="font-mono">
+                      {cv.last_qualification.sub_scores.candidate_operator_authorship.count ?? '—'}
+                      {cv.last_qualification.sub_scores.candidate_operator_authorship.max_count != null
+                        ? ` / ${cv.last_qualification.sub_scores.candidate_operator_authorship.max_count}`
+                        : ' commits'}
+                    </span>
+                    {cv.last_qualification.sub_scores.candidate_operator_authorship.reason && (
+                      <span className="text-neutral-500">
+                        {cv.last_qualification.sub_scores.candidate_operator_authorship.reason}
+                      </span>
+                    )}
+                  </div>
+                )}
                 {cv.last_qualification.blocker && (
                   <p className="text-ui-sm text-red-400 truncate">{cv.last_qualification.blocker}</p>
                 )}
@@ -1126,7 +1164,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                   </span>
                 </button>
                 {changelogExpanded && (
-                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} categoryVerdicts={cv.last_qualification?.category_verdicts} residualUncapturedGap={cv.last_qualification?.residual_uncaptured_gap} onReinstate={handleReinstate} onAttest={handleAttest} onLinkDirection={handleLinkDirection} />
+                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} categoryVerdicts={cv.last_qualification?.category_verdicts} residualUncapturedGap={cv.last_qualification?.residual_uncaptured_gap} onReinstate={handleReinstate} onAttest={handleAttest} onLinkDirection={handleLinkDirection} onUpdateEvidenceContract={handleUpdateEvidenceContract} />
                 )}
               </div>
             )}

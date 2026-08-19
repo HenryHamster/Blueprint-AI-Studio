@@ -202,6 +202,7 @@ export interface VersionQualificationSubScores {
   smoketest?: number | null;
   ci_resolution?: CiResolution | null;
   debt_pressure?: number | null;
+  candidate_operator_authorship?: CandidateOperatorAuthorshipGate | null;
 }
 
 export interface CompletionDebtQualItem {
@@ -259,6 +260,19 @@ export interface QualificationCategoryVerdict {
   tier: string | null;       // 'judged' | 'machine' | 'unverified'
   gap?: string | null;
   citations?: unknown[] | null;
+}
+
+export interface OperatorAuthorshipEvidenceContract {
+  type: 'operator_authored_commits';
+  predicate: { max_count: number };
+}
+
+export interface CandidateOperatorAuthorshipGate {
+  status: 'passed' | 'blocked' | 'unresolved' | 'not_applicable' | string;
+  count: number | null;
+  max_count: number | null;
+  range?: { base_sha: string | null; head_sha: string | null } | null;
+  reason?: string | null;
 }
 
 export interface AuditFinding {
@@ -487,6 +501,9 @@ export interface CriterionCoverageEntry {
   coverage: 'covered' | 'attested' | 'backfilled' | 'probed' | 'partial' | 'uncovered';
   status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
+  evidence_contract?: OperatorAuthorshipEvidenceContract | null;
+  evidence_contract_updated_at?: string | null;
+  evidence_contract_updated_by?: string | null;
   stuck_reason?: 'no_mapping' | 'direction_retired' | 'direction_inactive' | null;
   /** ISO-8601 UTC timestamp when the operator attestation expires.
    *  Present only when coverage='attested' and the attestation carries a
@@ -1133,6 +1150,23 @@ export async function createAcceptanceCriterion(
   if (!res.ok) {
     const detail = data?.detail || `Failed to create criterion: ${res.status}`;
     throw new Error(detail);
+  }
+  return data;
+}
+
+export async function updateAcceptanceCriterionEvidenceContract(
+  projectId: string,
+  criterionKey: string,
+  evidenceContract: OperatorAuthorshipEvidenceContract | null,
+): Promise<{ criterion_key: string; evidence_contract: OperatorAuthorshipEvidenceContract | null }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria/${encodeURIComponent(criterionKey)}/evidence-contract`,
+    { method: 'PATCH', body: JSON.stringify({ evidence_contract: evidenceContract }) },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to update criterion contract: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : `Failed to update criterion contract: ${res.status}`);
   }
   return data;
 }

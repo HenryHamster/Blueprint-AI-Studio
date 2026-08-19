@@ -83,6 +83,9 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
     shared_state.runtime_config["promotion_enabled"] = False
 
     project, version = await _make_project_and_version(db_session)
+    # open_version seeds a default operator-authorship criterion; this test is
+    # specifically about the no-criteria shape, so drop it.
+    await _delete_default_authorship_criterion(db_session, version)
     await _seed_qualification_children(
         db_session,
         project,
@@ -4427,6 +4430,25 @@ def test_evaluate_hotfix_scope_pure_predicate():
         "backend/testing/test_release_scoring.py",
     ]
     assert hotfix_policy.evaluate_hotfix_scope(authorship_gate_repair_files).eligible
+
+    # Literal file set from 3029329ff: the latch alert and its operator-facing
+    # delivery path must be eligible as one repair.
+    latch_announcement_repair_files = [
+        "backend/app/message_audience.py",
+        "backend/app/project_message_creation.py",
+        "backend/app/release_stall_alerts.py",
+        "backend/testing/test_release_stall_alerts.py",
+    ]
+    assert hotfix_policy.evaluate_hotfix_scope(latch_announcement_repair_files).eligible
+
+    # Literal file set from 8731cfa17: a release-gate invariant may travel with
+    # the production repair even though the general test tree remains blocked.
+    authorship_budget_repair_files = [
+        "backend/app/release_scoring.py",
+        "backend/testing/test_invariants.py",
+        "backend/testing/test_release_operator_commit_gate.py",
+    ]
+    assert hotfix_policy.evaluate_hotfix_scope(authorship_budget_repair_files).eligible
 
     # A product-code path remains outside the authorization surface.
     product_file = hotfix_policy.evaluate_hotfix_scope(["backend/app/reaper.py"])

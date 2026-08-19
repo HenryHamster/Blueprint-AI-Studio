@@ -4208,6 +4208,60 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByTestId('criterion-row-k3')).toBeInTheDocument();
     });
 
+    it('surfaces and lets the project owner edit the candidate authorship budget', async () => {
+      const coverage: api.VersionCriterionCoverage = {
+        total: 1,
+        covered: 0,
+        partial: 0,
+        uncovered: 1,
+        criteria: [{
+          criterion_key: 'c-operator-authorship',
+          text: 'The candidate contains no operator-authored commits across its complete release range.',
+          coverage: 'uncovered',
+          evidence_count: 0,
+          evidence_contract: {
+            type: 'operator_authored_commits',
+            predicate: { max_count: 0 },
+          },
+        }],
+      };
+      vi.mocked(api.updateAcceptanceCriterionEvidenceContract).mockResolvedValue({
+        criterion_key: 'c-operator-authorship',
+        evidence_contract: { type: 'operator_authored_commits', predicate: { max_count: 2 } },
+      });
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: [{ task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null }],
+          criterion_coverage: coverage,
+          last_qualification: makeQualification({
+            sub_scores: {
+              audit: 0.9,
+              test_erosion: 0.9,
+              candidate_operator_authorship: {
+                status: 'blocked',
+                count: 1,
+                max_count: 0,
+                reason: 'candidate_operator_authored_count_exceeds_contract',
+              },
+            },
+          }),
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      expect(screen.getByTestId('candidate-operator-authorship-gate')).toHaveTextContent('blocked');
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      fireEvent.click(await screen.findByTestId('edit-authorship-budget-c-operator-authorship'));
+      fireEvent.change(screen.getByLabelText('Maximum operator-authored commits'), { target: { value: '2' } });
+      fireEvent.click(screen.getByText('save'));
+
+      await waitFor(() => expect(api.updateAcceptanceCriterionEvidenceContract).toHaveBeenCalledWith(
+        'proj-1',
+        'c-operator-authorship',
+        { type: 'operator_authored_commits', predicate: { max_count: 2 } },
+      ));
+    });
+
     it('renders inactive criterion audit rows from current_version criterion_coverage when active total is zero', async () => {
       const coverage: api.VersionCriterionCoverage = {
         total: 0,

@@ -952,11 +952,80 @@ _REUSE_PATH_PRE_GATES = {
     "apply_detail": {},
 }
 
-_EMPTY_RUBRIC_PROJECTION = {
-    "rubric_snapshot": [],
-    "rubric_fingerprint": rq._rubric_fingerprint([]),
-    "rubric_lifecycle_snapshot": [],
-}
+
+async def _retract_default_authorship_criterion(db_session, version) -> None:
+    """Retract the product-default authorship criterion ``open_version`` seeds.
+
+    Many qualifier tests exercise behavior that is orthogonal to the acceptance
+    rubric and were written against a version with an EMPTY live rubric.  The
+    default ``c-operator-authorship`` policy row is real product behavior, so it
+    is retracted explicitly (the same terminal status the criteria API uses)
+    rather than skipped — the version keeps a consistent live rubric and the
+    test keeps asserting only what it is about.
+    """
+    rows = (
+        (
+            await db_session.execute(
+                select(VersionAcceptanceCriterion).where(
+                    VersionAcceptanceCriterion.release_version_id == version.id,
+                    VersionAcceptanceCriterion.criterion_key
+                    == "c-operator-authorship",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        row.status = "retracted"
+        db_session.add(row)
+    await db_session.flush()
+
+
+async def _delete_default_authorship_criterion(db_session, version) -> None:
+    """Remove the seeded authorship criterion so the version has NO criteria.
+
+    ``_retract_default_authorship_criterion`` keeps a terminal row, which still
+    appears in the coverage projection.  A handful of tests assert the
+    genuinely-empty-rubric shape (``total`` 0, ``criteria`` []); for those the
+    row must not exist at all, which is the state a version had before the
+    product started seeding a default criterion at open time.
+    """
+    rows = (
+        (
+            await db_session.execute(
+                select(VersionAcceptanceCriterion).where(
+                    VersionAcceptanceCriterion.release_version_id == version.id,
+                    VersionAcceptanceCriterion.criterion_key
+                    == "c-operator-authorship",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        await db_session.delete(row)
+    await db_session.flush()
+
+
+async def _live_rubric_projection(db_session, version) -> dict:
+    """Launched-rubric projection matching the version's CURRENT active rubric.
+
+    ``open_version`` seeds a default operator-authorship criterion, so a
+    version's live rubric is never empty.  Stamping a hardcoded empty
+    projection makes ``_finalize_qualification`` short-circuit at the
+    bounded rubric-drift guard (status ``rubric_changed``) — and, once a
+    contract fingerprint is present, at ``qualification_contract_superseded``
+    — before the behavior under test is ever reached.  Mirror what
+    ``run_qualification`` actually stamps instead.
+    """
+    snapshot, lifecycle = await rq._snapshot_qualification_rubric(db_session, version)
+    return {
+        "rubric_snapshot": snapshot,
+        "rubric_fingerprint": rq._rubric_fingerprint(snapshot),
+        "rubric_lifecycle_snapshot": lifecycle,
+    }
 
 
 def _clean_finalize_pre_gates(
@@ -1315,7 +1384,7 @@ async def _seed_infra_failure_children(
 
     version.last_qualification = {
         "status": "pending",
-        **_EMPTY_RUBRIC_PROJECTION,
+        **(await _live_rubric_projection(db_session, version)),
         "candidate_sha": "dead" * 10,
         "ci_green": True,
         "smoketest_enabled": smoketest_enabled,
@@ -1440,7 +1509,7 @@ async def _seed_pending_qualification(
 
     version.last_qualification = {
         "status": "pending",
-        **_EMPTY_RUBRIC_PROJECTION,
+        **(await _live_rubric_projection(db_session, version)),
         "qualification_attempt_id": attempt_text,
         "candidate_sha": candidate_sha or "abcd" * 10,
         "ci_green": True,
@@ -1622,7 +1691,7 @@ async def _seed_pending_qualification_with_challenge(
 
     version.last_qualification = {
         "status": "pending",
-        **_EMPTY_RUBRIC_PROJECTION,
+        **(await _live_rubric_projection(db_session, version)),
         "qualification_attempt_id": attempt_text,
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
@@ -1695,7 +1764,7 @@ async def _seed_audit_only_pending_qualification(
 
     version.last_qualification = {
         "status": "pending",
-        **_EMPTY_RUBRIC_PROJECTION,
+        **(await _live_rubric_projection(db_session, version)),
         "qualification_attempt_id": attempt_text,
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
@@ -2158,7 +2227,9 @@ __all__ = [
     '_seed_dimension_row',
     '_dimension_rows_by_dim',
     '_REUSE_PATH_PRE_GATES',
-    '_EMPTY_RUBRIC_PROJECTION',
+    '_live_rubric_projection',
+    '_retract_default_authorship_criterion',
+    '_delete_default_authorship_criterion',
     '_clean_finalize_pre_gates',
     '_seed_relaxed_ci_clean_qualification',
     '_seed_green_finalize_candidate',

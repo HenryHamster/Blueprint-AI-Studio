@@ -190,6 +190,9 @@ async def open_version(
         goal=goal[:_GOAL_MAX] if goal else None,
     )
     session.add(version)
+    from app.acceptance_criteria import ensure_operator_authorship_criterion
+
+    await ensure_operator_authorship_criterion(session, project_id, version.id)
     logger.info(
         "[RELEASE_VERSION] opened version=%d project=%s sha=%s phase=%s",
         version_number,

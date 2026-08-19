@@ -10333,6 +10333,85 @@ def test_stall_alert_functions_reachable_from_canonical_import_path():
         "Unreachable functions:\n" + "\n".join(f"  {f}" for f in unreachable)
     )
 
+
+def test_release_blocker_codes_are_classified_and_scannable():
+    """Every persisted release blocker is in the latch inventory and map."""
+    app_dir = BACKEND_ROOT / "app"
+    source_names = {
+        "release_scoring.py",
+        "release_qualifier.py",
+        "release_qualifier_sweep.py",
+        "release_qualifier_audit.py",
+        "release_reconciliation.py",
+        "release_stall_alerts.py",
+    }
+    stall_source = (app_dir / "release_stall_alerts.py").read_text(encoding="utf-8")
+    registry_names = set(
+        re.findall(r'backend/app/(release_[a-z_]+\.py)', stall_source)
+    )
+    assert registry_names == source_names, (
+        "release latch source inventory drifted: "
+        f"expected {sorted(source_names)}, found {sorted(registry_names)}"
+    )
+
+    blocker_pattern = re.compile(
+        r'(?:\bblocker\s*=\s*|["\']blocker["\']\s*:\s*)'
+        r'["\']([a-z0-9_]+)["\']'
+    )
+    emitted = {
+        code
+        for name in source_names
+        for code in blocker_pattern.findall(
+            (app_dir / name).read_text(encoding="utf-8")
+        )
+    }
+    scoring_source = (app_dir / "release_scoring.py").read_text(encoding="utf-8")
+    classified = set(
+        re.findall(
+            r'^[ \t]*["\']([a-z0-9_]+)["\']:[ \t]*EXECUTION_SITE_',
+            scoring_source,
+            re.MULTILINE,
+        )
+    )
+    missing = sorted(emitted - classified)
+    assert not missing, (
+        "release blocker codes are emitted outside the scoring module but lack "
+        f"execution-site classification: {missing}"
+    )
+
+
+def test_latch_implicated_paths_are_hotfix_eligible():
+    """The latch detector's repair surface must fit its approved hotfix lane."""
+    from app import hotfix_policy
+
+    # These are the production paths changed by the shipped latch-announcement
+    # repair.  Keep this explicit: widening the hotfix lane is an authorization
+    # change and must be visible in this invariant's reviewable inventory.
+    latch_support_paths = {
+        "backend/app/message_audience.py",
+        "backend/app/project_message_creation.py",
+        "backend/app/release_stall_alerts.py",
+    }
+    assert latch_support_paths <= hotfix_policy.HOTFIX_ELIGIBLE_MODULES, (
+        "latch repair paths missing from HOTFIX_ELIGIBLE_MODULES: "
+        f"{sorted(latch_support_paths - hotfix_policy.HOTFIX_ELIGIBLE_MODULES)}"
+    )
+
+    # The standalone invariant is the one non-release test that the gate fix
+    # itself may need to change; verify the bounded companion exception covers
+    # it without making the general test tree eligible.
+    verdict = hotfix_policy.evaluate_hotfix_scope(
+        sorted(latch_support_paths | {"backend/testing/test_invariants.py"})
+    )
+    assert verdict.eligible, (
+        "latch repair plus its invariant must be hotfix-eligible: "
+        f"{verdict.offending_files} ({verdict.reason})"
+    )
+    assert not hotfix_policy.evaluate_hotfix_scope(
+        ["backend/testing/test_message_audience.py"]
+    ).eligible, "unbounded backend tests must remain outside the hotfix lane"
+
+
 def test_summarize_release_artifacts_callers_always_pass_project():
     """Every call to summarize_release_artifacts in backend/app/ passes project=.
 
@@ -13126,11 +13205,11 @@ class TestProblemModelWritePathInvariants:
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
         ("direction_lifecycle.py", 874): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5426): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 5436): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5463): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 5473): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 7146): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 7156): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
         ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)

@@ -575,12 +575,13 @@ Skip entirely if criteria already exist and are reasonably mapped. Do NOT fabric
 When criteria are warranted, write \`${PROPOSED_CRITERIA_PATH_TOKEN}\` ${READ_ONLY_BASH_WRITE_NOTE} as the backend payload shape:
 
 \`\`\`json
-{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}],"retract":[{"criterion_key":"c-old-key","reason":"All directions that could produce covering evidence have been retired; this criterion is permanently uncoverable.","superseded_by_key":"c-new-key"}]}
+{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]},{"text":"The candidate contains no operator-authored commits across its complete release range.","evidence_contract":{"type":"operator_authored_commits","predicate":{"max_count":0}}}],"retract":[{"criterion_key":"c-old-key","reason":"All directions that could produce covering evidence have been retired; this criterion is permanently uncoverable.","superseded_by_key":"c-new-key"}]}
 \`\`\`
 
 Each \`criteria\` item has:
 - \`text\`: a short, concrete, independently verifiable criterion statement for the VERSION, not a direction description.
 - \`direction_keys\`: the \`d-xxx\` identifiers of directions that contribute to that criterion; use an empty array only when no active direction maps cleanly yet.
+- \`evidence_contract\` is optional structured machine policy. The release system seeds the candidate-authorship contract with a zero-commit default for every new version; preserve that contract unless the operator has explicitly changed the budget. Never use free-form prose to imply a machine gate.
 
 The optional top-level \`retract\` array lets you retract or supersede an existing **active** criterion that has become permanently uncoverable — for example, when every direction that could produce covering evidence has been retired and no realistic path to covering the criterion remains. Each retraction item has:
 - \`criterion_key\` (required): the \`c-xxx\` key of the active criterion to retract.

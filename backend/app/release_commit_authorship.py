@@ -136,6 +136,15 @@ def authorship_receipt_for_measurement(
 
 
 AUTHORSHIP_EVIDENCE_CONTRACT_TYPE = "operator_authored_commits"
+DEFAULT_OPERATOR_AUTHORSHIP_MAX_COUNT = 0
+
+
+def default_authorship_evidence_contract() -> dict[str, Any]:
+    """Return the explicit default budget for a newly opened release."""
+    return {
+        "type": AUTHORSHIP_EVIDENCE_CONTRACT_TYPE,
+        "predicate": {"max_count": DEFAULT_OPERATOR_AUTHORSHIP_MAX_COUNT},
+    }
 
 
 def normalize_authorship_evidence_contract(raw: Any) -> dict[str, Any] | None:
