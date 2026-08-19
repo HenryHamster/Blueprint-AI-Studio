@@ -34,4 +34,20 @@ echo ""
 # pytest against the full testing/ directory with duration recording enabled.
 # pytest-split writes .test_durations to the rootdir (/app inside Docker),
 # which is bind-mounted from backend/, so the file lands at backend/.test_durations.
-exec "$SCRIPT_DIR/test-backend.sh" testing/ --store-durations "$@"
+"$SCRIPT_DIR/test-backend.sh" testing/ --store-durations "$@"
+
+# pytest-split's raw --store-durations output charges fixture/setup cost
+# (e.g. a Postgres cold-start billed to the first test of a batch) directly
+# onto individual test entries. Route the freshly written file through
+# merge_durations.py so it gets the same canonical duration policy the
+# partial-recording path already applies -- OUTLIER_CAP plus the in-band
+# setup-artifact strip from scripts/durations_quality.py -- and a full-suite
+# regeneration cannot reintroduce the fixture-plateau pollution that
+# backend/testing/test_test_durations_freshness.py rejects. A full-suite run
+# produces no partial-recording files, so pass an empty source directory:
+# merge() then reads backend/.test_durations as its baseline, sanitizes it,
+# and rewrites it in place.
+BACKEND_DIR="$SCRIPT_DIR/../backend"
+EMPTY_SRC_DIR="$(mktemp -d)"
+trap 'rm -rf "$EMPTY_SRC_DIR"' EXIT
+python3 "$SCRIPT_DIR/merge_durations.py" "$EMPTY_SRC_DIR" "$BACKEND_DIR/.test_durations"
