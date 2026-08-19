@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
-from typing import TypedDict
+from typing import Callable, TypedDict
 
 
 class GovernanceCapExceededError(ValueError):
@@ -37,6 +37,82 @@ _SECTION_SOURCE_DIRS = {
     "frontend": ("admin-ui", "src"),
     "testing": ("backend", "testing"),
     "scripts": ("scripts",),
+}
+
+# The authoritative section-key set: the top-level keys of
+# ``module_size_limits.json``. Every consumer that scans, maps, or gates on a
+# section (``ci_compliance``, ``rollup_size_preflight``, ``hotfix_backmerge``,
+# ``check_size_limits``) must cover exactly this set — a consumer with a
+# hand-copied subset silently under-reports the missing sections. Kept as a
+# literal (not merely ``frozenset(_SECTION_SOURCE_DIRS)``) so a future 6th
+# section added to one but not the other fails a parity assertion loudly
+# instead of both sides silently agreeing on the smaller set.
+SECTION_KEYS: frozenset[str] = frozenset(
+    {"backend", "agent", "frontend", "testing", "scripts"}
+)
+assert frozenset(_SECTION_SOURCE_DIRS) == SECTION_KEYS, (
+    "_SECTION_SOURCE_DIRS must declare exactly SECTION_KEYS"
+)
+
+
+def _no_section_exclusion(_rel_path: str) -> bool:
+    return False
+
+
+def _is_frontend_section_excluded(rel_path: str) -> bool:
+    """Mirror check_size_limits._is_frontend_excluded: skip test/type files."""
+    return rel_path.endswith((".test.ts", ".test.tsx", ".d.ts")) or rel_path.startswith(
+        "test/"
+    )
+
+
+def _is_agent_section_excluded(rel_path: str) -> bool:
+    """Mirror check_size_limits._is_agent_excluded: skip test/type files."""
+    return rel_path.endswith((".test.ts", ".d.ts"))
+
+
+# Repo-relative path prefix each section's ``rel`` keys are rooted at, derived
+# from ``_SECTION_SOURCE_DIRS`` so the two can never drift apart. Consumers
+# that need a trailing-slash string prefix (``ci_compliance``,
+# ``rollup_size_preflight``) use this directly instead of hand-copying a
+# second literal table.
+SECTION_PATH_PREFIXES: dict[str, str] = {
+    section: "/".join(parts) + "/" for section, parts in _SECTION_SOURCE_DIRS.items()
+}
+
+# Ordered longest-prefix-first for consumers (``hotfix_backmerge``) that match
+# a changed file's path against each section prefix with ``startswith`` — a
+# more-specific prefix must always be tried before a shorter one that could
+# otherwise shadow it. No two section prefixes here are actually in a
+# prefix relationship (verified by a guard test), but the ordering keeps that
+# true by construction rather than by accident of dict insertion order.
+SECTION_PREFIX_ORDER: tuple[tuple[str, str], ...] = tuple(
+    sorted(
+        ((prefix, section) for section, prefix in SECTION_PATH_PREFIXES.items()),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+
+# Per-section source file extensions scanned for the uncapped-coverage
+# guardrail. Mirrors check_size_limits._SECTION_SCAN.
+SECTION_EXTENSIONS: dict[str, tuple[str, ...]] = {
+    "backend": (".py",),
+    "agent": (".ts",),
+    "frontend": (".ts", ".tsx"),
+    "testing": (".py",),
+    "scripts": (".py",),
+}
+
+# Per-section exclusion predicate for the uncapped-coverage guardrail. Mirrors
+# check_size_limits._SECTION_SCAN (backend/testing/scripts scan every file of
+# their extension; agent/frontend skip their own test/type files).
+SECTION_EXCLUDED: dict[str, Callable[[str], bool]] = {
+    "backend": _no_section_exclusion,
+    "agent": _is_agent_section_excluded,
+    "frontend": _is_frontend_section_excluded,
+    "testing": _no_section_exclusion,
+    "scripts": _no_section_exclusion,
 }
 
 

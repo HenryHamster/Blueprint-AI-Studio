@@ -73,7 +73,11 @@ from app.broadcast import broadcast_to_project
 # safe — no circular import.  _resolve_github_with_session is the shared
 # credential resolver used by the whole LTS machinery.
 from app.release_qualifier import _lts_branch_names, _resolve_github_with_session
-from app.size_limit_policy import _is_chronic_offender, parse_bump_history
+from app.size_limit_policy import (
+    SECTION_PREFIX_ORDER,
+    _is_chronic_offender,
+    parse_bump_history,
+)
 from testing.check_size_limits import (
     _COVERAGE_THRESHOLD as _UNCAPPED_SIZE_THRESHOLD,
     _is_agent_excluded,
@@ -113,12 +117,12 @@ _MODULE_SIZE_LIMITS_PATH = os.path.normpath(
 )
 
 # Maps a file-path prefix to its section name in module_size_limits.json.
-# Listed longest-first so a more-specific prefix always wins on a match.
-_FILE_PREFIX_MAP: list[tuple[str, str]] = [
-    ("backend/app/", "backend"),
-    ("agent/src/", "agent"),
-    ("admin-ui/src/", "frontend"),
-]
+# Single-sourced from ``size_limit_policy`` (longest-prefix-first, derived from
+# the same table ``ci_compliance``/``rollup_size_preflight`` use) so a
+# back-merge PR touching ``backend/testing/*.py`` or ``scripts/*.py`` is
+# checked against its cap instead of silently falling through
+# ``_map_pr_file_to_section`` as an untracked file.
+_FILE_PREFIX_MAP: list[tuple[str, str]] = list(SECTION_PREFIX_ORDER)
 
 # Maps section names to their uncapped-file exclusion predicate.  Mirrors the
 # per-section exclusion rules in check_size_limits._SECTION_SCAN so that the
