@@ -369,7 +369,8 @@
     },
     {
       "path": "backend/testing/test_workday_resident_invariants.py",
-      "reason": "Primary protection for conversational Workday seams \u2014 invariant tests covering session availability, arming suppression, retry/refresh binding, operator-send serialization, mutation fencing, terminal reconciliation, and work-session arming. Exact test list is machine-enforced by test_workday_invariant_suite_is_protected_with_all_tests; silently deleting or emptying this file would remove all invariant coverage without tripping any existing guard.",
+      "completeness": "all",
+      "reason": "Primary protection for conversational Workday seams — invariant tests covering session availability, arming suppression, retry/refresh binding, operator-send serialization, mutation fencing, terminal reconciliation, and work-session arming. Its complete test list is machine-enforced by the manifest-driven completeness guard; silently deleting or emptying this file would remove all invariant coverage without tripping any existing guard.",
       "test_ids": [
         "test_workday_availability_does_not_consult_removed_global_gate",
         "test_workday_activation_enqueues_one_canonical_fast_turn_per_session",
@@ -399,7 +400,8 @@
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
-      "reason": "Covers the core conversational Workday session lifecycle \u2014 start/adopt, liveness heartbeat/lease, runner-pin preservation across the spawn/finalize race, stop/handoff, and message handoff. These are the primary backend seams for the operator-driven Workday session; deleting this file would leave the session start/stop/handoff contract completely untested.",
+      "completeness": "all",
+      "reason": "Covers the core conversational Workday session lifecycle — start/adopt, liveness heartbeat/lease, runner-pin preservation across the spawn/finalize race, stop/handoff, and message handoff. These are the primary backend seams for the operator-driven Workday session; deleting this file would leave the session start/stop/handoff contract completely untested.",
       "test_ids": [
         "test_session_state_helpers_remain_table_free",
         "test_session_snapshot_exposes_bounded_activity_without_silence_deadline",
@@ -500,6 +502,7 @@
     },
     {
       "path": "agent/src/handlers/typed-fast-resident.test.ts",
+      "completeness": "all",
       "reason": "Covers the structurally fenced Typed Fast child used by conversational Workday: exact claim binding, at most one public completion and one bounded private request, request/completion coupling, unique idempotency, readiness timeout, circuit fallback, malformed staging rejection, and the narrow direct managed-execution role fence.",
       "test_ids": [
         "poisons the child when direct managed-execution staging violates its role",
@@ -536,7 +539,8 @@
     },
     {
       "path": "agent/src/handlers/strategic-resident.test.ts",
-      "reason": "Covers handleStrategicResident \u2014 the agent-side handler that drives the conversational Workday session loop (operator reply, compaction restart, workspace recovery, corrective tick, provider-error guard). This is the deepest coverage of the resident session path on the agent side; deleting it leaves the handler entirely untested.",
+      "completeness": "all",
+      "reason": "Covers handleStrategicResident — the agent-side handler that drives the conversational Workday session loop (operator reply, compaction restart, workspace recovery, corrective tick, provider-error guard). This is the deepest coverage of the resident session path on the agent side; deleting it leaves the handler entirely untested.",
       "test_ids": [
         "hands a large residual to the rate-limited drain instead of bursting it synchronously",
         "spaces the flushed frames across rate windows instead of bursting them",
@@ -737,7 +741,8 @@
     },
     {
       "path": "agent/src/handlers/strategic-resident-lib.test.ts",
-      "reason": "Covers strategic-resident-lib.ts \u2014 the core utility library for the conversational Workday resident session (config knobs, message cursor, dedup, content blocks, bootstrap/autonomous prompts, compaction checkpoint, exam ledger, operator-decision review, decisions register, surface catalog, tick-verdict parsing, and frame coalescer). These 242 it() cases and one it.each block are the deepest unit-level coverage of the resident session logic; deleting or emptying this file would leave all resident-lib primitives entirely untested.",
+      "completeness": "all",
+      "reason": "Covers strategic-resident-lib.ts — the core utility library for the conversational Workday resident session (config knobs, message cursor, dedup, content blocks, bootstrap/autonomous prompts, compaction checkpoint, exam ledger, operator-decision review, decisions register, surface catalog, tick-verdict parsing, and frame coalescer). These 242 it() cases and one it.each block are the deepest unit-level coverage of the resident session logic; deleting or emptying this file would leave all resident-lib primitives entirely untested.",
       "test_ids": [
         "does not fire unchanged-state exploration when the interval is disabled",
         "has no scheduled review when unchanged-state exploration is disabled",
@@ -1034,7 +1039,8 @@
     },
     {
       "path": "admin-ui/src/hooks/useStrategicLiveness.test.tsx",
-      "reason": "Covers useStrategicLiveness \u2014 the React hook that probes the backend liveness endpoint for the conversational Workday resident session. Guards: null/disabled short-circuit, mount fetch, stale-response generation guard (project switch while probe in flight), and error-swallowing so a failed probe never crashes the UI.",
+      "completeness": "all",
+      "reason": "Covers useStrategicLiveness — the React hook that probes the backend liveness endpoint for the conversational Workday resident session. Guards: null/disabled short-circuit, mount fetch, stale-response generation guard (project switch while probe in flight), and error-swallowing so a failed probe never crashes the UI.",
       "test_ids": [
         "returns null data and does not fetch when projectId is null",
         "does not fetch when disabled",
@@ -1068,6 +1074,7 @@
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",
+      "completeness": "all",
       "reason": "Protects the supported Notes/Whiteboard-to-conversation controls. These queue immutable revisions for the current Workday conversation and are not autonomous shadow-Resident controls.",
       "test_ids": [
         "associates the disabled explanation with both handoff actions",
@@ -1078,6 +1085,7 @@
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.viewport.test.tsx",
+      "completeness": "all",
       "reason": "Protects the supported conversation-handoff controls at narrow operator viewports.",
       "test_ids": [
         "renders handoff controls without overflow, clipped text, or small targets at 375px",
@@ -1087,6 +1095,7 @@
     },
     {
       "path": "admin-ui/src/utils/residentToolHandoff.test.ts",
+      "completeness": "all",
       "reason": "Protects durable actor/project-scoped handoff queue persistence, truthful failure, cross-tab wakeup, snapshot-safe acknowledgement, and expiry cleanup.",
       "test_ids": [
         "persists the canonical actor/project handoff without a mounted listener",
@@ -1101,6 +1110,7 @@
     },
     {
       "path": "admin-ui/src/utils/pendingWhiteboardArtifactRef.test.ts",
+      "completeness": "all",
       "reason": "Protects crash/reload-safe Whiteboard promotion with exact receipt replay, coalescing, bounded retry pacing, and terminal intent preservation.",
       "test_ids": [
         "polls 202 to ready with the exact same receipt and rendered payload",
@@ -1137,6 +1147,7 @@
     },
     {
       "path": "backend/testing/test_workday_artifact_materialization.py",
+      "completeness": "all",
       "reason": "Protects exact Notes/Whiteboard materialization, immutable receipt validation, transient retry without cursor loss, permanent poison-message quarantine, authority/page final fences, and bounded image delivery.",
       "test_ids": [
         "test_materializes_exact_notes_snapshot",

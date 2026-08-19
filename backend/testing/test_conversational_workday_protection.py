@@ -13,6 +13,7 @@ no conftest imports. Added to the standalone smoke set via the normal
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -121,6 +122,58 @@ def _extract_ts_test_labels(source: str) -> set[str]:
     return labels
 
 
+def _extract_python_test_labels(source: str) -> set[str]:
+    """Extract test function names from a Python test module."""
+    return set(re.findall(
+        r"^\s*(?:async\s+)?def\s+(test_\w+)\s*\(",
+        source,
+        re.MULTILINE,
+    ))
+
+
+def _extract_test_labels(path: str, source: str) -> set[str]:
+    """Extract all test identities supported by a protected test file."""
+    if path.endswith(".py"):
+        return _extract_python_test_labels(source)
+    if path.endswith((".ts", ".tsx")):
+        return (
+            _extract_ts_it_labels(source)
+            | _extract_ts_it_each_labels(source)
+            | _extract_ts_test_labels(source)
+        )
+    return set()
+
+
+def _find_completeness_violations(manifest: dict, repo_root: Path) -> list[dict]:
+    """Return missing/extra IDs for entries explicitly marked complete."""
+    violations = []
+    for entry in manifest["protect"]:
+        if entry.get("completeness") != "all":
+            continue
+
+        target_path = entry["path"]
+        full_path = repo_root / target_path
+        if not full_path.exists():
+            continue
+
+        actual_labels = _extract_test_labels(
+            target_path,
+            full_path.read_text(encoding="utf-8"),
+        )
+        listed_labels = set(entry["test_ids"])
+        missing_from_manifest = sorted(actual_labels - listed_labels)
+        extra_in_manifest = sorted(listed_labels - actual_labels)
+        if missing_from_manifest or extra_in_manifest:
+            violations.append(
+                {
+                    "path": target_path,
+                    "missing": missing_from_manifest,
+                    "extra": extra_in_manifest,
+                }
+            )
+    return violations
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -157,6 +210,11 @@ def test_manifest_is_valid_json_with_required_keys():
         assert "test_count" in entry, f"protect entry missing 'test_count': {entry!r}"
         assert isinstance(entry["test_ids"], list), f"'test_ids' must be a list in {entry['path']}"
         assert len(entry["test_ids"]) > 0, f"'test_ids' must not be empty in {entry['path']}"
+        if "completeness" in entry:
+            assert entry["completeness"] == "all", (
+                f"Unknown completeness marker in {entry['path']}: "
+                f"{entry['completeness']!r}; expected 'all'"
+            )
         assert isinstance(entry["test_count"], int) and not isinstance(entry["test_count"], bool), (
             f"'test_count' must be an integer in {entry['path']}"
         )
@@ -248,8 +306,6 @@ def test_all_protect_test_ids_exist_in_their_files():
     (the it()/test()/describe() label string). A test can be deleted or renamed
     with the path guard still green — this check closes that gap.
     """
-    import re
-
     manifest = _load_manifest()
     missing = []
     for entry in manifest["protect"]:
@@ -258,36 +314,10 @@ def test_all_protect_test_ids_exist_in_their_files():
             # test_all_protect_paths_exist already covers this; skip here
             continue
         source = full_path.read_text(encoding="utf-8")
-        if entry["path"].endswith(".py"):
-            actual_test_ids = _extract_python_test_ids(source)
-            missing.extend(
-                f"{entry['path']}::{test_id}"
-                for test_id in entry["test_ids"]
-                if test_id not in actual_test_ids
-                and not any(test_id == node_id.rsplit("::", 1)[-1] for node_id in actual_test_ids)
-            )
-        elif entry["path"].endswith((".ts", ".tsx")):
-            # TypeScript test suites use describe()/it()/test() with string labels.
-            # Collect actual labels via the quote-aware helpers (all three JS/TS
-            # quote styles) rather than a plain substring search — a substring match
-            # would allow test_id "foo" to pass even if only "foobar" exists in
-            # the file, silently weakening the anti-deletion guarantee.
-            actual_labels = _extract_ts_it_labels(source)
-            actual_labels |= _extract_ts_it_each_labels(source)
-            # Also collect test('...') labels; some files use test() not it().
-            for m in re.finditer(
-                r"""^\s*test\s*\(\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)""",
-                source,
-                re.MULTILINE,
-            ):
-                label = m.group(1) or m.group(2) or m.group(3)
-                if label:
-                    actual_labels.add(label)
-            missing.extend(
-                f"{entry['path']}::{test_id}"
-                for test_id in entry["test_ids"]
-                if test_id not in actual_labels
-            )
+        actual_labels = _extract_test_labels(entry["path"], source)
+        for test_id in entry["test_ids"]:
+            if test_id not in actual_labels:
+                missing.append(f"{entry['path']}::{test_id}")
 
     assert not missing, (
         "The following PROTECT-listed test_ids no longer exist in their files. "
@@ -692,318 +722,86 @@ def test_no_removed_resident_strategic_backend_modules():
     )
 
 
-def test_workday_invariant_suite_is_protected_with_all_tests():
-    """The Workday invariant suite must appear in the protect manifest with all tests.
+def test_protect_entries_marked_complete_have_all_tests():
+    """Every manifest entry marked completeness=all covers its whole file.
 
-    test_workday_resident_invariants.py is the primary guard for conversational
-    Workday seams. Deleting or emptying it without operator sign-off must trip a
-    manifest guard. This test verifies: (a) the file is in the protect section,
-    (b) every def/async-def test function in the actual file is listed, and
-    (c) the count matches, so a silently-added test doesn't escape the manifest.
-    """
-    import re
-
-    manifest = _load_manifest()
-    invariant_path = "backend/testing/test_workday_resident_invariants.py"
-
-    # (a) The file must appear in the protect section.
-    entries = [e for e in manifest["protect"] if e["path"] == invariant_path]
-    assert entries, (
-        f"{invariant_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so silent deletion of the invariant suite "
-        "is caught at every CI run."
-    )
-    entry = entries[0]
-
-    # (b/c) Every test function in the file must be listed and counts must match.
-    full_path = REPO_ROOT / invariant_path
-    if not full_path.exists():
-        pytest.skip(f"{invariant_path} not found — test_all_protect_paths_exist covers the missing-file case")
-
-    source = full_path.read_text(encoding="utf-8")
-    actual_tests = re.findall(
-        r"^\s*(?:async\s+)?def\s+(test_\w+)\s*\(",
-        source,
-        re.MULTILINE,
-    )
-    listed_tests = entry["test_ids"]
-
-    missing_from_manifest = sorted(set(actual_tests) - set(listed_tests))
-    extra_in_manifest = sorted(set(listed_tests) - set(actual_tests))
-
-    assert not missing_from_manifest, (
-        "These test functions exist in test_workday_resident_invariants.py but "
-        "are NOT listed in the protect manifest. Add them so deletion of any "
-        "invariant test is caught:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
-    )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "test_workday_resident_invariants.py. Update the manifest:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
-    )
-
-
-def test_strategic_resident_session_is_protected_with_all_tests():
-    """The strategic resident session suite must appear in the manifest with all tests.
-
-    backend/testing/test_strategic_resident_session.py is the primary backend
-    seam for the operator-driven Workday session lifecycle (start, stop, lease,
-    handoff). Deleting or emptying it without operator sign-off must trip this
-    guard. Verifies: (a) the file is in the protect section, (b) every
-    def/async-def test function in the file is listed, and (c) counts match so
-    a silently-added test doesn't escape the manifest.
-    """
-    import re
-
-    manifest = _load_manifest()
-    target_path = "backend/testing/test_strategic_resident_session.py"
-
-    entries = [e for e in manifest["protect"] if e["path"] == target_path]
-    assert entries, (
-        f"{target_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so silent deletion of the resident session "
-        "suite is caught at every CI run."
-    )
-    entry = entries[0]
-
-    full_path = REPO_ROOT / target_path
-    if not full_path.exists():
-        pytest.skip(
-            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
-        )
-
-    source = full_path.read_text(encoding="utf-8")
-    actual_tests = re.findall(
-        r"^\s*(?:async\s+)?def\s+(test_\w+)\s*\(",
-        source,
-        re.MULTILINE,
-    )
-    listed_tests = entry["test_ids"]
-
-    missing_from_manifest = sorted(set(actual_tests) - set(listed_tests))
-    extra_in_manifest = sorted(set(listed_tests) - set(actual_tests))
-
-    assert not missing_from_manifest, (
-        "These test functions exist in test_strategic_resident_session.py but "
-        "are NOT listed in the protect manifest. Add them so deletion of any "
-        "resident session test is caught:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
-    )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "test_strategic_resident_session.py. Update the manifest:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
-    )
-
-
-def test_strategic_resident_agent_handler_is_protected_with_all_tests():
-    """The strategic resident agent handler test suite must appear in the manifest with all tests.
-
-    agent/src/handlers/strategic-resident.test.ts is the deepest coverage of
-    the resident session path on the agent side — it covers operator reply,
-    compaction restart, workspace recovery, corrective tick, and provider-error
-    guard. Deleting or emptying it without operator sign-off must trip this
-    guard. Verifies: (a) the file is in the protect section, (b) every it()/
-    it.each() test label in the file is listed, and (c) counts match.
+    Entries without the marker intentionally retain partial protection semantics.
+    The marker is explicit so adding a new test to a complete suite cannot make
+    the manifest silently stale.
     """
     manifest = _load_manifest()
-    target_path = "agent/src/handlers/strategic-resident.test.ts"
+    violations = _find_completeness_violations(manifest, REPO_ROOT)
 
-    entries = [e for e in manifest["protect"] if e["path"] == target_path]
-    assert entries, (
-        f"{target_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so silent deletion of the resident handler "
-        "test suite is caught at every CI run."
-    )
-    entry = entries[0]
-
-    full_path = REPO_ROOT / target_path
-    if not full_path.exists():
-        pytest.skip(
-            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
+    assert not violations, (
+        "The following complete protect entries do not exactly match their "
+        "test files. Add newly-created tests, remove stale IDs, or remove the "
+        "completeness marker only when partial protection is intentional:\n"
+        + "\n".join(
+            f"  - {violation['path']}: "
+            f"missing={violation['missing']!r}, extra={violation['extra']!r}"
+            for violation in violations
         )
-
-    source = full_path.read_text(encoding="utf-8")
-
-    # Collect all it('label') / it("label") / it(`label`) test labels.
-    # _extract_ts_it_labels handles all three JS/TS quote styles so that a
-    # test written with double or backtick quotes is not silently missed.
-    actual_labels: set[str] = _extract_ts_it_labels(source)
-    # Collect it.each(...)('template') / it.each(...)("template") labels.
-    actual_labels |= _extract_ts_it_each_labels(source)
-    # Also collect test('...') / test("...") / test(`...`) labels — some suites
-    # use test() instead of it(); missing this form lets a test() case escape
-    # the manifest-completeness check entirely.
-    actual_labels |= _extract_ts_test_labels(source)
-
-    listed_labels = set(entry["test_ids"])
-
-    missing_from_manifest = sorted(actual_labels - listed_labels)
-    extra_in_manifest = sorted(listed_labels - actual_labels)
-
-    assert not missing_from_manifest, (
-        "These test labels exist in strategic-resident.test.ts but are NOT "
-        "listed in the protect manifest. Add them so deletion of any resident "
-        "handler test is caught:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
-    )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "strategic-resident.test.ts. Update the manifest:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
     )
 
 
-def test_typed_fast_resident_handler_is_protected_with_all_tests():
-    """The Typed Fast Resident suite must be protected in both directions."""
+def test_completeness_markers_identify_the_existing_full_suites():
+    """Only suites with former reverse guards opt into full completeness."""
     manifest = _load_manifest()
-    target_path = "agent/src/handlers/typed-fast-resident.test.ts"
-
-    entries = [e for e in manifest["protect"] if e["path"] == target_path]
-    assert entries, (
-        f"{target_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so deletion of the fenced Fast child suite "
-        "cannot silently weaken conversational Workday."
+    marked = {
+        entry["path"]
+        for entry in manifest["protect"]
+        if entry.get("completeness") == "all"
+    }
+    assert len(marked) == 11
+    assert all(
+        entry.get("completeness") in {None, "all"}
+        for entry in manifest["protect"]
     )
-    entry = entries[0]
+    assert "backend/testing/test_reaper.py" not in marked
 
-    full_path = REPO_ROOT / target_path
-    if not full_path.exists():
-        pytest.skip(
-            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
-        )
 
-    source = full_path.read_text(encoding="utf-8")
-    actual_labels: set[str] = _extract_ts_it_labels(source)
-    actual_labels |= _extract_ts_it_each_labels(source)
-    actual_labels |= _extract_ts_test_labels(source)
-    listed_labels = set(entry["test_ids"])
+def test_extract_test_labels_dispatches_python_and_typescript():
+    """The generic extractor covers Python, it.each, and test labels."""
+    assert _extract_test_labels(
+        "example.py",
+        "def test_python_case():\n    pass\n",
+    ) == {"test_python_case"}
+    assert _extract_test_labels(
+        "example.test.tsx",
+        "it('it case', () => {})\n"
+        "it.each([['x']])('each %s', () => {})\n"
+        'test("test case", () => {})\n',
+    ) == {"it case", "each %s", "test case"}
 
-    missing_from_manifest = sorted(actual_labels - listed_labels)
-    extra_in_manifest = sorted(listed_labels - actual_labels)
-    assert not missing_from_manifest, (
-        "These test labels exist in typed-fast-resident.test.ts but are NOT "
-        "listed in the protect manifest:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
+
+def test_completeness_checker_ignores_partial_and_reports_missing_and_extra(tmp_path):
+    """Partial entries stay partial while complete entries fail both directions."""
+    complete = tmp_path / "complete.py"
+    complete.write_text(
+        "def test_present():\n    pass\n\n"
+        "def test_new():\n    pass\n",
+        encoding="utf-8",
     )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "typed-fast-resident.test.ts:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
-    )
+    partial = tmp_path / "partial.py"
+    partial.write_text("def test_unlisted():\n    pass\n", encoding="utf-8")
+    manifest = {
+        "protect": [
+            {
+                "path": "complete.py",
+                "completeness": "all",
+                "test_ids": ["test_present", "test_stale"],
+            },
+            {"path": "partial.py", "test_ids": ["test_other"]},
+        ]
+    }
 
-
-def test_strategic_resident_lib_is_protected_with_all_tests():
-    """The strategic-resident-lib agent test suite must appear in the manifest with all tests.
-
-    agent/src/handlers/strategic-resident-lib.test.ts covers the core utility
-    library for the conversational Workday resident session (config knobs, message
-    cursor, dedup, content blocks, bootstrap/autonomous prompts, compaction
-    checkpoint, exam ledger, operator-decision review, decisions register, surface
-    catalog, tick-verdict parsing, and frame coalescer). Deleting or emptying it
-    without operator sign-off must trip this guard. Verifies: (a) the file is in
-    the protect section, (b) every it()/it.each() label in the file is listed, and
-    (c) counts match so a silently-added test doesn't escape the manifest.
-    """
-    manifest = _load_manifest()
-    target_path = "agent/src/handlers/strategic-resident-lib.test.ts"
-
-    entries = [e for e in manifest["protect"] if e["path"] == target_path]
-    assert entries, (
-        f"{target_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so silent deletion of the resident-lib "
-        "test suite is caught at every CI run."
-    )
-    entry = entries[0]
-
-    full_path = REPO_ROOT / target_path
-    if not full_path.exists():
-        pytest.skip(
-            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
-        )
-
-    source = full_path.read_text(encoding="utf-8")
-
-    # Collect all it('label') / it("label") / it(`label`) test labels.
-    # _extract_ts_it_labels handles all three JS/TS quote styles so that a
-    # test written with double or backtick quotes is not silently missed.
-    actual_labels: set[str] = _extract_ts_it_labels(source)
-    # Collect it.each(...)('template') / it.each(...)("template") labels.
-    actual_labels |= _extract_ts_it_each_labels(source)
-    # Also collect test('...') / test("...") / test(`...`) labels — some suites
-    # use test() instead of it(); missing this form lets a test() case escape
-    # the manifest-completeness check entirely.
-    actual_labels |= _extract_ts_test_labels(source)
-
-    listed_labels = set(entry["test_ids"])
-
-    missing_from_manifest = sorted(actual_labels - listed_labels)
-    extra_in_manifest = sorted(listed_labels - actual_labels)
-
-    assert not missing_from_manifest, (
-        "These test labels exist in strategic-resident-lib.test.ts but are NOT "
-        "listed in the protect manifest. Add them so deletion of any resident-lib "
-        "test is caught:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
-    )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "strategic-resident-lib.test.ts. Update the manifest:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
-    )
-
-
-def test_use_strategic_liveness_is_protected_with_all_tests():
-    """The useStrategicLiveness hook test suite must appear in the manifest with all tests.
-
-    admin-ui/src/hooks/useStrategicLiveness.test.tsx covers the React hook that
-    probes the backend liveness endpoint for the conversational Workday resident
-    session (null/disabled short-circuit, mount fetch, stale-response generation
-    guard, error-swallowing). Deleting or emptying it without operator sign-off
-    must trip this guard. Verifies: (a) the file is in the protect section, (b)
-    every it() label in the file is listed, and (c) counts match.
-    """
-    manifest = _load_manifest()
-    target_path = "admin-ui/src/hooks/useStrategicLiveness.test.tsx"
-
-    entries = [e for e in manifest["protect"] if e["path"] == target_path]
-    assert entries, (
-        f"{target_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so silent deletion of the useStrategicLiveness "
-        "test suite is caught at every CI run."
-    )
-    entry = entries[0]
-
-    full_path = REPO_ROOT / target_path
-    if not full_path.exists():
-        pytest.skip(
-            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
-        )
-
-    source = full_path.read_text(encoding="utf-8")
-
-    # useStrategicLiveness.test.tsx uses it('...'). Use the all-quote helper so
-    # double-quoted or backtick-quoted tests are not silently missed.
-    actual_labels: set[str] = _extract_ts_it_labels(source)
-    actual_labels |= _extract_ts_test_labels(source)
-
-    listed_labels = set(entry["test_ids"])
-
-    missing_from_manifest = sorted(actual_labels - listed_labels)
-    extra_in_manifest = sorted(listed_labels - actual_labels)
-
-    assert not missing_from_manifest, (
-        "These test labels exist in useStrategicLiveness.test.tsx but are NOT "
-        "listed in the protect manifest. Add them so deletion of any liveness "
-        "hook test is caught:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
-    )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "useStrategicLiveness.test.tsx. Update the manifest:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
-    )
+    assert _find_completeness_violations(manifest, tmp_path) == [
+        {
+            "path": "complete.py",
+            "missing": ["test_new"],
+            "extra": ["test_stale"],
+        }
+    ]
 
 
 def test_no_removed_resident_task_type_in_task_capabilities():
@@ -1269,260 +1067,3 @@ def test_ts_label_extraction_empty_source():
     """_extract_ts_it_labels returns an empty set for an empty source string."""
     assert _extract_ts_it_labels("") == set()
     assert _extract_ts_it_each_labels("") == set()
-
-
-# ---------------------------------------------------------------------------
-# Reverse completeness guards — artifact-materialization and tool-handoff suites
-#
-# These are TWO-WAY guards: (a) the file appears in the protect manifest with
-# all its test_ids listed, AND (b) every actual test in the file is also in the
-# manifest, so a silently-added-then-deleted test cannot escape detection.
-# ---------------------------------------------------------------------------
-
-
-def test_workday_artifact_materialization_is_protected_with_all_tests():
-    """The artifact-materialization suite must appear in the manifest with all tests.
-
-    backend/testing/test_workday_artifact_materialization.py covers exact
-    Notes/Whiteboard materialization, immutable receipt validation, transient
-    retry, permanent quarantine, authority/page fences, and bounded image
-    delivery. Deleting or emptying it without operator sign-off must trip this
-    guard. Verifies: (a) the file is in the protect section, (b) every
-    def/async-def test function in the file is listed, and (c) counts match.
-    """
-    import re
-
-    manifest = _load_manifest()
-    target_path = "backend/testing/test_workday_artifact_materialization.py"
-
-    entries = [e for e in manifest["protect"] if e["path"] == target_path]
-    assert entries, (
-        f"{target_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so silent deletion of the artifact-materialization "
-        "suite is caught at every CI run."
-    )
-    entry = entries[0]
-
-    full_path = REPO_ROOT / target_path
-    if not full_path.exists():
-        pytest.skip(
-            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
-        )
-
-    source = full_path.read_text(encoding="utf-8")
-    actual_tests = re.findall(
-        r"^\s*(?:async\s+)?def\s+(test_\w+)\s*\(",
-        source,
-        re.MULTILINE,
-    )
-    listed_tests = entry["test_ids"]
-
-    missing_from_manifest = sorted(set(actual_tests) - set(listed_tests))
-    extra_in_manifest = sorted(set(listed_tests) - set(actual_tests))
-
-    assert not missing_from_manifest, (
-        "These test functions exist in test_workday_artifact_materialization.py but "
-        "are NOT listed in the protect manifest. Add them so deletion of any "
-        "artifact-materialization test is caught:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
-    )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "test_workday_artifact_materialization.py. Update the manifest:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
-    )
-
-
-def test_tool_resident_handoff_controls_is_protected_with_all_tests():
-    """The ToolResidentHandoffControls test suite must appear in the manifest with all tests.
-
-    admin-ui/src/components/ToolResidentHandoffControls.test.tsx covers the
-    Notes/Whiteboard-to-conversation handoff controls that queue immutable
-    revisions for the current Workday conversation. Deleting or emptying it
-    without operator sign-off must trip this guard. Verifies: (a) the file is
-    in the protect section, (b) every test() label in the file is listed, and
-    (c) counts match.
-    """
-    manifest = _load_manifest()
-    target_path = "admin-ui/src/components/ToolResidentHandoffControls.test.tsx"
-
-    entries = [e for e in manifest["protect"] if e["path"] == target_path]
-    assert entries, (
-        f"{target_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so silent deletion of the handoff controls "
-        "test suite is caught at every CI run."
-    )
-    entry = entries[0]
-
-    full_path = REPO_ROOT / target_path
-    if not full_path.exists():
-        pytest.skip(
-            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
-        )
-
-    source = full_path.read_text(encoding="utf-8")
-    actual_labels: set[str] = _extract_ts_it_labels(source)
-    actual_labels |= _extract_ts_test_labels(source)
-
-    listed_labels = set(entry["test_ids"])
-
-    missing_from_manifest = sorted(actual_labels - listed_labels)
-    extra_in_manifest = sorted(listed_labels - actual_labels)
-
-    assert not missing_from_manifest, (
-        "These test labels exist in ToolResidentHandoffControls.test.tsx but are NOT "
-        "listed in the protect manifest. Add them so deletion of any handoff controls "
-        "test is caught:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
-    )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "ToolResidentHandoffControls.test.tsx. Update the manifest:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
-    )
-
-
-def test_tool_resident_handoff_controls_viewport_is_protected_with_all_tests():
-    """The ToolResidentHandoffControls viewport test suite must appear in the manifest.
-
-    admin-ui/src/components/ToolResidentHandoffControls.viewport.test.tsx covers
-    handoff controls at narrow operator viewports. Deleting or emptying it without
-    operator sign-off must trip this guard. Verifies: (a) the file is in the
-    protect section, (b) every test() label in the file is listed, and
-    (c) counts match.
-    """
-    manifest = _load_manifest()
-    target_path = "admin-ui/src/components/ToolResidentHandoffControls.viewport.test.tsx"
-
-    entries = [e for e in manifest["protect"] if e["path"] == target_path]
-    assert entries, (
-        f"{target_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so silent deletion of the handoff controls "
-        "viewport test suite is caught at every CI run."
-    )
-    entry = entries[0]
-
-    full_path = REPO_ROOT / target_path
-    if not full_path.exists():
-        pytest.skip(
-            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
-        )
-
-    source = full_path.read_text(encoding="utf-8")
-    actual_labels: set[str] = _extract_ts_it_labels(source)
-    actual_labels |= _extract_ts_test_labels(source)
-
-    listed_labels = set(entry["test_ids"])
-
-    missing_from_manifest = sorted(actual_labels - listed_labels)
-    extra_in_manifest = sorted(listed_labels - actual_labels)
-
-    assert not missing_from_manifest, (
-        "These test labels exist in ToolResidentHandoffControls.viewport.test.tsx but "
-        "are NOT listed in the protect manifest. Add them so deletion of any "
-        "handoff controls viewport test is caught:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
-    )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "ToolResidentHandoffControls.viewport.test.tsx. Update the manifest:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
-    )
-
-
-def test_resident_tool_handoff_util_is_protected_with_all_tests():
-    """The residentToolHandoff utility test suite must appear in the manifest with all tests.
-
-    admin-ui/src/utils/residentToolHandoff.test.ts covers durable actor/project-
-    scoped handoff queue persistence, truthful failure, cross-tab wakeup,
-    snapshot-safe acknowledgement, and expiry cleanup. Deleting or emptying it
-    without operator sign-off must trip this guard. Verifies: (a) the file is in
-    the protect section, (b) every it() label in the file is listed, and
-    (c) counts match.
-    """
-    manifest = _load_manifest()
-    target_path = "admin-ui/src/utils/residentToolHandoff.test.ts"
-
-    entries = [e for e in manifest["protect"] if e["path"] == target_path]
-    assert entries, (
-        f"{target_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so silent deletion of the resident tool handoff "
-        "utility test suite is caught at every CI run."
-    )
-    entry = entries[0]
-
-    full_path = REPO_ROOT / target_path
-    if not full_path.exists():
-        pytest.skip(
-            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
-        )
-
-    source = full_path.read_text(encoding="utf-8")
-    actual_labels: set[str] = _extract_ts_it_labels(source)
-    actual_labels |= _extract_ts_test_labels(source)
-
-    listed_labels = set(entry["test_ids"])
-
-    missing_from_manifest = sorted(actual_labels - listed_labels)
-    extra_in_manifest = sorted(listed_labels - actual_labels)
-
-    assert not missing_from_manifest, (
-        "These test labels exist in residentToolHandoff.test.ts but are NOT "
-        "listed in the protect manifest. Add them so deletion of any resident "
-        "tool handoff utility test is caught:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
-    )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "residentToolHandoff.test.ts. Update the manifest:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
-    )
-
-
-def test_pending_whiteboard_artifact_ref_is_protected_with_all_tests():
-    """The pendingWhiteboardArtifactRef test suite must appear in the manifest with all tests.
-
-    admin-ui/src/utils/pendingWhiteboardArtifactRef.test.ts covers crash/reload-
-    safe Whiteboard promotion with exact receipt replay, coalescing, bounded retry
-    pacing, and terminal intent preservation. Deleting or emptying it without
-    operator sign-off must trip this guard. Verifies: (a) the file is in the
-    protect section, (b) every test() label in the file is listed, and
-    (c) counts match.
-    """
-    manifest = _load_manifest()
-    target_path = "admin-ui/src/utils/pendingWhiteboardArtifactRef.test.ts"
-
-    entries = [e for e in manifest["protect"] if e["path"] == target_path]
-    assert entries, (
-        f"{target_path} is not in the protect section of the manifest. "
-        "Add it with all test_ids so silent deletion of the pending Whiteboard "
-        "artifact ref test suite is caught at every CI run."
-    )
-    entry = entries[0]
-
-    full_path = REPO_ROOT / target_path
-    if not full_path.exists():
-        pytest.skip(
-            f"{target_path} not found — test_all_protect_paths_exist covers the missing-file case"
-        )
-
-    source = full_path.read_text(encoding="utf-8")
-    actual_labels: set[str] = _extract_ts_it_labels(source)
-    actual_labels |= _extract_ts_test_labels(source)
-
-    listed_labels = set(entry["test_ids"])
-
-    missing_from_manifest = sorted(actual_labels - listed_labels)
-    extra_in_manifest = sorted(listed_labels - actual_labels)
-
-    assert not missing_from_manifest, (
-        "These test labels exist in pendingWhiteboardArtifactRef.test.ts but are NOT "
-        "listed in the protect manifest. Add them so deletion of any pending "
-        "Whiteboard artifact ref test is caught:\n"
-        + "\n".join(f"  - {t}" for t in missing_from_manifest)
-    )
-    assert not extra_in_manifest, (
-        "These test_ids are in the protect manifest but no longer exist in "
-        "pendingWhiteboardArtifactRef.test.ts. Update the manifest:\n"
-        + "\n".join(f"  - {t}" for t in extra_in_manifest)
-    )
