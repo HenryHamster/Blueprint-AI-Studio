@@ -67,9 +67,26 @@ def _relative_source(source: Path, tree_root: Path) -> str:
 def _normalize_failure_detail(detail: str, *, tree_root: Path | None) -> str:
     """Remove checkout- and runtime-specific noise from failure diagnostics."""
 
+    # pytest-asyncio names its internal Tasks 'Task-<n>' with a process-wide,
+    # monotonically increasing counter. The same test can surface a different
+    # counter value on every run (baseline vs current, or even rerun vs rerun)
+    # purely because of how many async Tasks happened to be created earlier in
+    # the session — never because the test's own behavior changed. Left
+    # unnormalized, this alone makes an identical pre-existing failure
+    # unmatchable across a baseline/current comparison.
+    normalized = re.sub(r"Task-\d+", "Task-<n>", detail)
+    # A coroutine/Task repr truncates its embedded source path with a leading
+    # '...' once the qualname exceeds Python's internal repr budget, so the
+    # checkout-root replace below (which only matches the FULL, untruncated
+    # path) never fires on it. The checkout directory name differs between
+    # the current tree and a freshly `git archive`-extracted baseline temp
+    # dir, so this truncated prefix is exactly the same kind of checkout
+    # noise the full-path replace targets — just past the ellipsis instead of
+    # at the start of the string.
+    normalized = re.sub(r"\.\.\.[^\s>]*?/backend/", ".../<repo-root>/backend/", normalized)
     if tree_root is None:
-        return detail
-    normalized = detail.replace(str(tree_root), "<tree-root>")
+        return normalized
+    normalized = normalized.replace(str(tree_root), "<tree-root>")
     normalized = re.sub(
         r"/tmp/pytest-of-[^/]+/pytest-\d+",
         "<pytest-temp>",

@@ -14207,12 +14207,13 @@ async def _make_bug_message(
     msg_type=MessageType.BUG_REPORT,
     status="open",
     context=None,
+    from_type="system",
 ):
     """Create a ProjectMessage of bug-class type and flush it."""
     msg = ProjectMessage(
         project_id=project.id,
         message_type=msg_type,
-        from_type="system",
+        from_type=from_type,
         content="Test bug report",
         status=status,
         context=context or {},
@@ -15019,6 +15020,38 @@ async def test_sweep_decay_stale_open_bug_messages_decays_unowned_blocker(reaper
 
 
 @pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_decays_unowned_strategic_bug_report(
+    reaper_db,
+):
+    """An OPEN unowned strategist-filed (from_type='strategic') BUG_REPORT older
+    than the threshold is auto-decayed like a 'system'/'agent' one — agent-filed
+    bug reports authored via strategic_completion.py must not be permanently
+    invisible to this sweep."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 1)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="strategic",
+        content="old unowned strategist-filed bug report",
+        status="open",
+        context={},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
 async def test_sweep_decay_stale_open_bug_messages_skips_recent(reaper_db):
     """A BUG_REPORT younger than the threshold is left open."""
     project = await _make_project(reaper_db)
@@ -15643,6 +15676,32 @@ async def test_open_owned_resolves_when_direction_completed(reaper_db):
 
 
 @pytest.mark.asyncio
+async def test_open_owned_resolves_strategic_authored_bug_report(reaper_db):
+    """A strategist-filed (from_type='strategic') BUG_REPORT — the shape produced
+    by strategic_completion.py for agent-filed bug reports — resolves on owner
+    success the same as a 'system'/'agent'-authored one. Without 'strategic' in
+    SYSTEM_AUTHORED_FROM_TYPES this row would never be selected by any sweep."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key="d-done-strategic", status="completed"
+    )
+    msg = await _make_bug_message(
+        reaper_db,
+        project,
+        context={"direction_id": "d-done-strategic"},
+        from_type="strategic",
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert "d-done-strategic" in (msg.resolution or "")
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
 async def test_open_owned_resolution_broadcasts_workbench_envelope(reaper_db, mocker):
     """Owner-success auto-resolution publishes a resolved message envelope."""
     project = await _make_project(reaper_db)
@@ -15963,6 +16022,41 @@ async def test_stale_open_bug_resolves_when_citations_absent(reaper_db, monkeypa
     assert msg.context.get("_stale_auto_resolution") == msg.resolution
     assert msg.context.get("_stale_auto_citation_signal") == absent_signal
     assert "_owned_auto_resolution" not in msg.context
+
+
+@pytest.mark.asyncio
+async def test_stale_open_bug_resolves_strategic_authored_when_citations_absent(
+    reaper_db, monkeypatch
+):
+    """A strategist-filed (from_type='strategic') bug message whose citations
+    re-validate as ABSENT on HEAD is resolved the same as a 'system'/'agent'
+    one — strategic-authored rows must be selected by this sweep too."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(
+        reaper_db, project, context={"source": "x"}, from_type="strategic"
+    )
+
+    async def _absent(_session, _project, _content, *, structured_context=None):
+        return {
+            "citation_state": "absent",
+            "broken_refs": ["app/gone.py"],
+            "ungrounded_refs": ["app/gone.py:vanished"],
+        }
+
+    monkeypatch.setattr(_rs, "compute_message_citation_warning", _absent, raising=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation.compute_message_citation_warning",
+        _absent,
+        raising=False,
+    )
+
+    resolved = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert "stale" in (msg.resolution or "").lower()
+    assert msg.resolved_at is not None
 
 
 @pytest.mark.asyncio

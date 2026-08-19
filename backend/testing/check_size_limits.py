@@ -48,11 +48,12 @@ Usage (from the repo root, no install step)::
     python3 backend/testing/check_size_limits.py --base-root /tmp/base_wt
                                   # baseline-aware: block only NEW/GROWN offenders
 
-Stdlib only. The three sections resolve their source roots exactly the way
+Stdlib only. The five sections resolve their source roots exactly the way
 ``test_invariants.py`` does: backend -> ``backend/app``, agent -> ``agent/src``,
 frontend -> ``admin-ui/src`` (honoring the ``ADMIN_UI_SRC`` override and the
-Docker ``/admin-ui/src`` mount). A section whose source tree is absent in the
-current environment is reported as skipped rather than treated as an error.
+Docker ``/admin-ui/src`` mount), testing -> ``backend/testing``, and
+scripts -> ``scripts``. A section whose source tree is absent in the current
+environment is reported as skipped rather than treated as an error.
 """
 
 import argparse
@@ -193,7 +194,7 @@ def _is_git_checkout(repo_root: str) -> bool:
 
 # Section order is significant: matches the JSON's section order so output and
 # --sections=all iteration are deterministic.
-SECTIONS = ("backend", "agent", "frontend", "testing")
+SECTIONS = ("backend", "agent", "frontend", "testing", "scripts")
 
 # The release/verification surface this guardrail was built to bound: every
 # backend/app/release_*.py and acceptance_*.py module, plus
@@ -265,6 +266,7 @@ _SECTION_SCAN = {
     "agent": ((".ts",), _is_agent_excluded),
     "frontend": ((".ts", ".tsx"), _is_frontend_excluded),
     "testing": ((".py",), _no_exclusion),
+    "scripts": ((".py",), _no_exclusion),
 }
 
 
@@ -304,6 +306,9 @@ def resolve_section_root(
         return None
     if section == "testing":
         root = os.path.join(repo_root, "backend", "testing")
+        return root if os.path.isdir(root) else None
+    if section == "scripts":
+        root = os.path.join(repo_root, "scripts")
         return root if os.path.isdir(root) else None
     raise ValueError(f"Unknown section: {section}")
 

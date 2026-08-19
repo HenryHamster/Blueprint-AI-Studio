@@ -20,7 +20,6 @@ from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 from app.blocked_task_unblock_sweeps import (
     _BLOCKED_ESCALATE_AFTER,
     _BLOCKED_ESCALATED_PARK,
-    _BLOCKED_ESCALATED_RECHECK_MAX,
     _BLOCKED_OPTIMISTIC_RETRY_CAP,
     _BLOCKED_PARKED_REEVAL_CAP,
     _BLOCKED_PARKED_REEVAL_INTERVAL,
@@ -2927,6 +2926,7 @@ from app.reaper_bug_message_sweeps import (  # noqa: E402
     sweep_decay_stale_open_bug_messages,
     sweep_decay_stale_unlinked_blocker_messages,
     sweep_deliver_task_wakes,
+    sweep_fail_stranded_pending_conversation_messages,
     sweep_resolve_open_owned_bug_messages,
     sweep_resolve_stale_open_bug_messages,
     sweep_wake_delivery_stall_alerts,
@@ -4584,6 +4584,7 @@ __all__ = [
     "sweep_decay_stale_open_bug_messages",
     "sweep_decay_stale_unlinked_blocker_messages",
     "STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS",
+    "sweep_fail_stranded_pending_conversation_messages",
     "sweep_deliver_task_wakes",
     "sweep_resolve_open_owned_bug_messages",
     "sweep_resolve_stale_open_bug_messages",

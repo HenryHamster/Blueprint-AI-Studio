@@ -4082,6 +4082,7 @@ class MessageHandlingState(str, Enum):
     CLAIMED = "claimed"
     RESPONDED = "responded"
     SUPERSEDED = "superseded"
+    FAILED = "failed"
 
 
 class ProjectMessage(SQLModel, table=True):
@@ -4232,7 +4233,7 @@ class ProjectMessage(SQLModel, table=True):
             name="chk_projectmessage_surface",
         ),
         CheckConstraint(
-            "handling_state IN ('pending','claimed','responded','superseded')",
+            "handling_state IN ('pending','claimed','responded','superseded','failed')",
             name="chk_projectmessage_handling_state",
         ),
         CheckConstraint(

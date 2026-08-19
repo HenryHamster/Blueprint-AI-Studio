@@ -36,6 +36,7 @@ _SECTION_SOURCE_DIRS = {
     "agent": ("agent", "src"),
     "frontend": ("admin-ui", "src"),
     "testing": ("backend", "testing"),
+    "scripts": ("scripts",),
 }
 
 

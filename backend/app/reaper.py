@@ -336,6 +336,7 @@ from app.reaper_sweeps import (
     sweep_auto_resolve_answered_messages,
     sweep_decay_stale_open_bug_messages,
     sweep_decay_stale_unlinked_blocker_messages,
+    sweep_fail_stranded_pending_conversation_messages,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
@@ -3607,6 +3608,32 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         "[REAPER] Consumed message attachment retirement sweep error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 25: Stranded conversation message failure sweep — age out
+                # unclaimed PENDING conversation-surface messages (no runner ever
+                # claimed them, e.g. the selected runner is dead) after a bounded
+                # window so the operator gets a terminal, visible 'failed' state
+                # instead of silent, permanent PENDING. Claimed messages are left
+                # to conversation_coordinator's lease-expiry/reclaim path.
+                _mark_reaper_progress()
+                try:
+                    _stranded_failed = await sweep_fail_stranded_pending_conversation_messages(
+                        session, now
+                    )
+                    if _stranded_failed:
+                        logger.info(
+                            "[REAPER] Step 25: failed %d stranded pending "
+                            "conversation message(s)",
+                            _stranded_failed,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "[REAPER] Stranded-conversation-message fail sweep error: %s",
                         e,
                         exc_info=True,
                     )

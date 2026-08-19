@@ -28,10 +28,10 @@ def _write_lines(path: str, n: int) -> None:
         f.write("\n")
 
 
-def _build_repo(tmp_path, *, backend=None, agent=None, frontend=None):
+def _build_repo(tmp_path, *, backend=None, agent=None, frontend=None, scripts=None):
     """Create a fake repo tree + a module_size_limits.json.
 
-    Each of backend/agent/frontend is a dict ``{rel_path: (line_count, cap)}``.
+    Each of backend/agent/frontend/scripts is a dict ``{rel_path: (line_count, cap)}``.
     If a section is None its source tree is NOT created (to exercise skips), but
     the JSON still lists it. Returns (repo_root, json_path).
     """
@@ -42,11 +42,13 @@ def _build_repo(tmp_path, *, backend=None, agent=None, frontend=None):
         "backend": repo / "backend" / "app",
         "agent": repo / "agent" / "src",
         "frontend": repo / "admin-ui" / "src",
+        "scripts": repo / "scripts",
     }
     for section, spec in (
         ("backend", backend),
         ("agent", agent),
         ("frontend", frontend),
+        ("scripts", scripts),
     ):
         limits[section] = {}
         if spec is None:
@@ -152,6 +154,47 @@ def test_absent_tree_section_skipped_not_errored(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "[skip] agent" in out
     assert "[skip] frontend" in out
+
+
+def test_scripts_section_resolves_root_and_scans_py_files(tmp_path):
+    # scripts/ mirrors backend/agent/frontend/testing: resolve_section_root
+    # resolves it to <repo>/scripts, and a breach in a .py file under it is
+    # detected exactly like any other governed section.
+    repo, jp = _build_repo(
+        tmp_path,
+        backend={"ok.py": (50, 100)},
+        scripts={"big.py": (120, 100), "ok.py": (50, 100)},
+    )
+    assert csl.resolve_section_root("scripts", repo) == os.path.join(repo, "scripts")
+    assert csl._SECTION_SCAN["scripts"] == ((".py",), csl._no_exclusion)
+    assert _run(jp, repo, "--sections", "scripts") == 1
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_scripts_section_scoping_isolated_from_other_sections(tmp_path):
+    # A breach confined to scripts/ must not leak into backend's result, and
+    # scoping to backend must not hide the scripts breach.
+    repo, jp = _build_repo(
+        tmp_path,
+        backend={"ok.py": (50, 100)},
+        scripts={"big.py": (200, 100)},
+    )
+    assert _run(jp, repo, "--sections", "backend") == 0
+    assert _run(jp, repo, "--sections", "scripts") == 1
+
+
+def test_scripts_fix_adds_cap_for_uncapped_file_at_policy_value(tmp_path):
+    # --fix on scripts/ adds a new cap for an oversized, uncapped .py file at
+    # the same canonical policy headroom used for backend/agent/frontend.
+    repo, jp = _build_repo(tmp_path, scripts={"ok.py": (50, 100)})
+    _write_lines(str(tmp_path / "repo" / "scripts" / "huge.py"), 1600)
+
+    assert _run(jp, repo, "--fix", "--sections", "scripts") == 0
+
+    data = json.loads(_read(jp))
+    assert data["scripts"]["huge.py"] == csl.recommended_cap_for_line_count(1600)
+    assert data["scripts"]["ok.py"] == 100
+    assert _run(jp, repo, "--sections", "scripts") == 0
 
 
 def test_default_sections_check_all(tmp_path):

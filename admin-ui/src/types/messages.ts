@@ -139,7 +139,7 @@ export interface ProjectMessage {
   actor_user_id?: string | null;
   sequence?: number | null;
   surface?: 'conversation' | 'activity' | string;
-  handling_state?: 'pending' | 'claimed' | 'responded' | 'superseded' | string;
+  handling_state?: 'pending' | 'claimed' | 'responded' | 'superseded' | 'failed' | string;
   handled_by_task_id?: string | null;
   reply_to_message_id?: string | null;
   updated_at?: string | null;

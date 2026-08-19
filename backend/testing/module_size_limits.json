@@ -58,7 +58,7 @@
     "reaper.py": 4250,
     "reaper_sweeps.py": 4750,
     "reaper_fleet_health_sweeps.py": 500,
-    "reaper_bug_message_sweeps.py": 1700,
+    "reaper_bug_message_sweeps.py": 2050,
     "reaper_evaluating_sweeps.py": 600,
     "blocked_task_unblock_sweeps.py": 2500,
     "reaper_orphan_io.py": 600,
@@ -296,7 +296,7 @@
     "test_acceptance_criteria__walkthrough.py": 903,
     "test_playbook_sr_metrics.py": 11650,
     "test_direction_outcomes.py": 11600,
-    "test_strategic_state.py": 10600,
+    "test_strategic_state.py": 12250,
     "test_metrics_integrity_sweep.py": 9200,
     "test_digest_metrics.py": 9050,
     "test_release_reconciliation.py": 8950,
@@ -417,5 +417,22 @@
     "test_release_commit_authorship.py": 2650,
     "test_approved_pr_stranding.py": 1800,
     "test_admin_approval_authority.py": 1750
+  },
+  "scripts": {
+    "test_local_runner.py": 14250,
+    "local_runner.py": 11450,
+    "blueprint.py": 9900,
+    "test_blueprint_cli.py": 8800,
+    "test_runner_isolation.py": 3400,
+    "runner_isolation.py": 3400,
+    "blueprint_runner.py": 2700,
+    "test_blueprint_runner.py": 2450,
+    "local_postgres_cutover.py": 2200,
+    "local_app_release.py": 2100,
+    "blueprint_node.py": 2100,
+    "local_postgres_rehearsal.py": 1850,
+    "test_guard_gate_left_shift.py": 1750,
+    "test-backend.sh": 1050,
+    "static_release_guard.py": 750
   }
 }

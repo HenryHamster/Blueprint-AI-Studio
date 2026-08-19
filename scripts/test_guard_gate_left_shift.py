@@ -31,7 +31,45 @@ def test_static_scope_matches_path_boundaries() -> None:
     assert static_release_guard._is_static_scope("backend/testing/test_guard.py")
     assert static_release_guard._is_static_scope("check")
     assert not static_release_guard._is_static_scope("checklist/results.txt")
-    assert not static_release_guard._is_static_scope("scripts/test-backend.sh.bak")
+    assert not static_release_guard._is_static_scope("backend-other/foo.py")
+    # scripts/ is a directory prefix (manifest-derived) as of this guard, so a
+    # sibling file under scripts/ is legitimately in scope, not a boundary leak.
+    assert static_release_guard._is_static_scope("scripts/test-backend.sh.bak")
+    assert not static_release_guard._is_static_scope("scripts-other/foo.py")
+
+
+def test_static_scope_covers_manifest_protected_directories() -> None:
+    """Guard selection follows what the Workday manifest reads, not only where
+    the guard itself historically lived — most manifest-protected paths are
+    outside backend/ (admin-ui/, agent/, scripts/)."""
+    manifest = json.loads(
+        (REPO_ROOT / "backend" / "testing" / "conversational_workday_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    top_level_dirs = {
+        entry["path"].split("/", 1)[0]
+        for entry in manifest["protect"]
+        if "/" in entry["path"]
+    }
+    assert {"admin-ui", "agent", "scripts"} <= top_level_dirs
+    assert static_release_guard._is_static_scope(
+        "admin-ui/src/components/StrategicSessionControl.tsx"
+    )
+    assert static_release_guard._is_static_scope("agent/src/handlers/strategic.ts")
+    assert not static_release_guard._is_static_scope("docs/some_unrelated_doc.md")
+
+
+def test_manifest_protected_prefixes_falls_back_when_manifest_unusable(
+    tmp_path: Path,
+) -> None:
+    """A missing or malformed manifest yields no extra prefixes, not a crash."""
+    missing = tmp_path / "does-not-exist.json"
+    assert static_release_guard._manifest_protected_prefixes(missing) == ()
+
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{not valid json", encoding="utf-8")
+    assert static_release_guard._manifest_protected_prefixes(malformed) == ()
 
 
 class _OrderedStderr:

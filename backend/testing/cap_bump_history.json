@@ -1643,6 +1643,12 @@
           "commit_date": "2026-07-17T04:13:17Z",
           "old_cap": 1400,
           "new_cap": 1700
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T12:21:31.979838+00:00",
+          "old_cap": 1700,
+          "new_cap": 2050
         }
       ],
       "blocked_task_unblock_sweeps.py": [
@@ -4565,10 +4571,18 @@
       ],
       "test_release_qualifier__finalize_qualification.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-19T10:09:45.833309+00:00",
+          "commit_sha": "009f1da2250809d07d245825d7d6880b4932c2b2",
+          "commit_date": "2026-08-19T10:24:13+00:00",
           "old_cap": 7050,
           "new_cap": 8150
+        }
+      ],
+      "test_strategic_state.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T12:21:31.979838+00:00",
+          "old_cap": 10600,
+          "new_cap": 12250
         }
       ]
     }

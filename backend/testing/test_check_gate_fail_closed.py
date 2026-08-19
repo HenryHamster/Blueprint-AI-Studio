@@ -24,7 +24,12 @@ from pathlib import Path
 
 import pytest
 
-from testing.fixgate_attribution import JUnitReport, classify_verification
+from testing.fixgate_attribution import (
+    JUnitReport,
+    _normalize_failure_detail,
+    attribute_failure_maps,
+    classify_verification,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if not (_REPO_ROOT / "check").exists() and Path("/repo/check").exists():
@@ -300,6 +305,62 @@ def _failure_report(key: str, detail: str = "boom", *, skipped: bool = False) ->
         test_routes={test_key},
         skipped_routes={test_key} if skipped else set(),
     )
+
+
+def test_normalize_strips_pytest_asyncio_task_counter() -> None:
+    """A pytest-asyncio internal Task-<n> counter is process-wide and
+    monotonically increasing, so the identical failure names a different
+    counter value on every run (baseline vs current or rerun vs rerun) even
+    though the test's own behavior never changed. It must not defeat
+    attribution."""
+    detail = "future = <Task finished name='Task-4898' coro=<foo() done>>"
+    other = "future = <Task finished name='Task-7290' coro=<foo() done>>"
+    assert _normalize_failure_detail(detail, tree_root=None) == _normalize_failure_detail(
+        other, tree_root=None
+    )
+
+
+def test_normalize_strips_truncated_coroutine_repr_checkout_path() -> None:
+    """A coroutine/Task repr truncates its embedded source path with a
+    leading '...' once the qualname exceeds Python's repr budget, so the
+    full-path checkout-root replace never matches it. The truncated prefix
+    still differs between the current checkout and a freshly extracted
+    baseline temp dir purely by directory name, not by test behavior."""
+    current = "coro=<f() done...space/agent/backend/testing/test_x.py:16451>"
+    baseline = "coro=<f() done...main-check2/backend/testing/test_x.py:16451>"
+    assert _normalize_failure_detail(current, tree_root=None) == _normalize_failure_detail(
+        baseline, tree_root=None
+    )
+
+
+def test_normalize_preserves_a_genuinely_different_line_number() -> None:
+    """The truncated-path normalization must only erase the checkout-name
+    noise before '/backend/', not the file:line suffix that would signal a
+    real code change."""
+    current = "coro=<f() done...space/agent/backend/testing/test_x.py:100>"
+    baseline = "coro=<f() done...main-check2/backend/testing/test_x.py:200>"
+    assert _normalize_failure_detail(current, tree_root=None) != _normalize_failure_detail(
+        baseline, tree_root=None
+    )
+
+
+def test_attribute_failure_maps_suppresses_task_counter_only_difference() -> None:
+    """End-to-end: a failure identical except for the pytest-asyncio Task
+    counter and the truncated checkout path must be classified as
+    pre-existing (suppressed), not a new failure introduced by this diff."""
+    key = "backend/testing/test_strategic_spawning.py::test_x::failure"
+    current = {
+        key: "future = <Task finished name='Task-4898' "
+        "coro=<x() done...space/agent/backend/testing/test_x.py:16451>>"
+    }
+    baseline = {
+        key: "future = <Task finished name='Task-7290' "
+        "coro=<x() done...main-check2/backend/testing/test_x.py:16451>>"
+    }
+    attribution = attribute_failure_maps(current, baseline)
+
+    assert attribution.new_failures == {}
+    assert key in attribution.suppressed_failures
 
 
 def test_attributed_gate_blocks_a_failure_introduced_by_the_diff() -> None:

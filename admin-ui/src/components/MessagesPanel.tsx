@@ -1435,7 +1435,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     if (!canOperateProject || !optimisticSend) return;
     const landed = conversationMessages.find(m => messageHasClientIdentity(m, optimisticSend.key));
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (landed && ['claimed', 'responded', 'superseded'].includes(landed.handling_state ?? '')) {
+    if (landed && ['claimed', 'responded', 'superseded', 'failed'].includes(landed.handling_state ?? '')) {
       conversationSend.clearPending();
       if (currentActorUserId && selectedProjectId) {
         void clearStoredPendingAttachments(currentActorUserId, selectedProjectId, optimisticSend.key);
@@ -2165,7 +2165,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
             || receipt.wakeup_state === 'queued'
             || receipt.wakeup_state === 'coalesced';
           setWorkingSince(adoptedWorking ? Date.now() : null);
-          if (['claimed', 'responded', 'superseded'].includes(adopted.handling_state ?? '')) {
+          if (['claimed', 'responded', 'superseded', 'failed'].includes(adopted.handling_state ?? '')) {
             conversationSend.clear();
           } else {
             conversationSend.transition(
@@ -2862,7 +2862,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       if (selectedProjectIdRef.current !== projectId || currentActorUserIdRef.current !== actorUserId) return;
       if (receipt) {
         setMessages(previous => mergeCanonicalConversationMessage(previous, receipt.message));
-        if (['claimed', 'responded', 'superseded'].includes(receipt.message.handling_state ?? '')) {
+        if (['claimed', 'responded', 'superseded', 'failed'].includes(receipt.message.handling_state ?? '')) {
           conversationSend.clear();
         } else {
           conversationSend.transition(

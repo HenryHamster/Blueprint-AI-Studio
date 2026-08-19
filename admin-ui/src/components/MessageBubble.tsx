@@ -468,8 +468,18 @@ export const MessageBubble = memo(function MessageBubble({
           </div>
         )}
 
+        {/* Stranded-send failure (distinct from a genuine resolution — the
+            operator's message never reached a runner) */}
+        {msg.status === 'resolved' && msg.handling_state === 'failed' && (
+          <div className={`mt-1 ${userMsg ? 'mr-2' : 'ml-2'} px-2.5 py-1 rounded border border-red-800/50 bg-red-950/30`}>
+            <p className="text-ui-md text-red-300/90">
+              <span className="font-medium">Delivery failed:</span> {msg.resolution || 'no runner claimed this message'}
+            </p>
+          </div>
+        )}
+
         {/* Resolution (for resolved messages) */}
-        {msg.status === 'resolved' && msg.resolution && (
+        {msg.status === 'resolved' && msg.handling_state !== 'failed' && msg.resolution && (
           <div className={`mt-1 ${userMsg ? 'mr-2' : 'ml-2'} px-2.5 py-1 ${chatMode ? 'rounded border border-neutral-800/70 bg-workbench-base/40' : 'rounded-lg bg-workbench-panel/50 border border-neutral-700/30'}`}>
             <p className="text-ui-md text-neutral-500">
               <span className="text-emerald-500/70 font-medium">Resolved:</span> {msg.resolution}

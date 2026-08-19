@@ -50,13 +50,17 @@ BUG_CLASS_TYPES: frozenset[str] = frozenset(
 # Status string for an unowned, action-needed message.
 OPEN_STATUS = "open"
 
-# Author types whose bug-class messages are pipeline-generated (system events or
-# agent-surfaced findings) and therefore carry machine-readable ownership context
-# (a direction id, or a pr_number + source_task_id). Operator-authored ("user")
-# bug reports are excluded — they are never auto-resolved by ownership signals.
-# Single source of truth for "system/agent-authored bug/blocker", shared by the
-# open-owned auto-resolve sweep so the eligibility set is defined exactly once.
-SYSTEM_AUTHORED_FROM_TYPES: frozenset[str] = frozenset({"system", "agent"})
+# Author types whose bug-class messages are pipeline-generated (system events,
+# agent-surfaced findings, or strategist-filed reports) and therefore carry
+# machine-readable ownership context (a direction id, or a pr_number +
+# source_task_id). Operator-authored ("user") bug reports are excluded — they
+# are never auto-resolved by ownership signals. Single source of truth for
+# "system/agent/strategic-authored bug/blocker", shared by the open-owned
+# auto-resolve sweep so the eligibility set is defined exactly once. Includes
+# "strategic" so agent-filed BUG_REPORT/BLOCKER rows (authored via
+# strategic_completion.py with from_type="strategic") are reachable by the
+# same closing sweeps as "system"/"agent" rows instead of staying open forever.
+SYSTEM_AUTHORED_FROM_TYPES: frozenset[str] = frozenset({"system", "agent", "strategic"})
 
 # JSONB context key under which the convergence link is stored.
 _CONVERGENCE_LINK_KEY = "_convergence_link"

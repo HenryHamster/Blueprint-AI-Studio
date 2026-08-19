@@ -27,12 +27,41 @@ from testing.fixgate_attribution import (  # noqa: E402
     parse_junit_report,
 )
 
+MANIFEST_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "backend"
+    / "testing"
+    / "conversational_workday_manifest.json"
+)
+
+
+def _manifest_protected_prefixes(manifest_path: Path = MANIFEST_PATH) -> tuple[str, ...]:
+    """Derive extra static-guard prefixes from the Workday protection manifest.
+
+    36 of the manifest's 55 protected paths live outside backend/ (admin-ui/,
+    agent/, scripts/) -- keying guard scope only on the guard's own historical
+    footprint leaves those changes unscoped. Falls back to no extra prefixes
+    (the static floor below still applies) if the manifest is missing or
+    malformed, so a broken manifest cannot crash guard selection.
+    """
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ()
+    prefixes = set()
+    for entry in manifest.get("protect", []):
+        path = entry.get("path", "")
+        if "/" in path:
+            prefixes.add(f"{path.split('/', 1)[0]}/")
+    return tuple(sorted(prefixes))
+
+
 STATIC_PATH_PREFIXES = (
     "backend/",
     "check",
     "scripts/test-backend.sh",
     "scripts/static_release_guard.py",
-)
+) + _manifest_protected_prefixes()
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

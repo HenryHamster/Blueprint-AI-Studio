@@ -238,7 +238,7 @@
       "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
       "reason": "Covers the StrategicSessionControl component \u2014 the operator UI for the conversational Workday session lifecycle. Restored in #16075; guard ensures this test file is not silently deleted again.",
       "test_ids": [
-        "keeps the legacy active fallback when lifecycle state is absent"
+        "root element carries data-testid=\"strategic-session-control\""
       ],
       "test_count": 17
     },
@@ -715,7 +715,7 @@
         "keeps a terminal expanded window terminal when the capped newest-window poll runs",
         "opens a durable tool handoff as an exact conversation draft",
         "hides the Workday activation trigger but shows its model-generated reply",
-        "sends a queued tool revision with operator intent and preserves exact identity across retry",
+        "sends a queued tool revision with operator intent and preserves exact identity across automatic retry",
         "removing an unrelated artifact preserves the queued handoff operator intent",
         "drains only one queued handoff and immediately shows the next after chip removal"
       ],

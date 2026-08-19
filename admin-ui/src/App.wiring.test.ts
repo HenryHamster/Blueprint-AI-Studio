@@ -95,4 +95,16 @@ describe('App workbench wiring', () => {
     expect(appSource).toMatch(/if \(targetEpochRef\.current !== null && fetchEpoch >= targetEpochRef\.current\) \{[\s\S]*reportUiLoadTiming\(activeTab, Math\.round\(performance\.now\(\) - navigationStartRef\.current\), 'board_data_ready'\)/);
     expect(appSource).toMatch(/navigationStartRef\.current = performance\.now\(\);[\s\S]*reportedRef\.current = false;[\s\S]*targetEpochRef\.current = fetchEpoch \+ 1;/);
   });
+
+  test('normalizes direction citation ids to the d- prefixed form the research journal scopes on', () => {
+    const handler = appSource.match(/const handleBoardDirectionClick = useCallback\([\s\S]*?\}, \[setResearchBrowserDirectionId, s\.setShowResearchBrowser\]\);/)?.[0] ?? '';
+
+    expect(handler).toContain("const normalized = dirId.startsWith('d-') ? dirId : `d-${dirId}`;");
+    expect(handler).toContain('setResearchBrowserDirectionId(normalized);');
+    expect(handler).toContain('s.setShowResearchBrowser(true);');
+    // Board clicks (TaskCard) and citation clicks (MarkdownContentInner) both route
+    // through this single handler, so both converge on the same normalized id.
+    expect(appSource).toContain('onOpenDirection={handleBoardDirectionClick}');
+    expect(appSource).toContain('onDirectionClick: handleBoardDirectionClick,');
+  });
 });

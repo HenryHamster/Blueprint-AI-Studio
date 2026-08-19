@@ -5753,6 +5753,7 @@ _SIZE_LIMITS = _load_size_limits()
 MODULE_SIZE_LIMITS = _SIZE_LIMITS["backend"]
 AGENT_SIZE_LIMITS = _SIZE_LIMITS["agent"]
 TESTING_SIZE_LIMITS = _SIZE_LIMITS.get("testing", {})
+SCRIPTS_SIZE_LIMITS = _SIZE_LIMITS.get("scripts", {})
 
 def _size_breach_message(
     rel_path: str, count: int, limit: int, module_kind: str
@@ -6070,6 +6071,73 @@ class TestTestFileSizeGuardrails:
             "and commit the updated module_size_limits.json."
         )
 
+_SCRIPTS_ROOT = (
+    os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
+    if os.path.isdir(
+        os.path.join(os.path.dirname(__file__), "..", "..", "scripts")
+    )
+    else None
+)
+
+class TestScriptsModuleSizeGuardrails:
+    """Loose upper bounds for scripts/ files to catch runaway growth.
+
+    scripts/ holds release-critical logic (static_release_guard.py,
+    test-backend.sh's Python helpers) but sat outside size-limit governance
+    entirely. Every key in the ``scripts`` section of module_size_limits.json
+    is enforced automatically — adding a key to the JSON is sufficient.
+    """
+
+    def _check_scripts_file(self, relative_path: str) -> None:
+        max_lines = SCRIPTS_SIZE_LIMITS[relative_path]
+        path = os.path.join(_SCRIPTS_ROOT, relative_path)
+        assert os.path.isfile(path), _stale_size_cap_message(relative_path, "scripts")
+        with open(path, encoding="utf-8") as f:
+            count = len(f.readlines())
+        assert count <= max_lines, _size_breach_message(
+            relative_path, count, max_lines, "scripts"
+        )
+
+    @pytest.mark.parametrize("relative_path", sorted(SCRIPTS_SIZE_LIMITS))
+    def test_scripts_file_within_limit(self, relative_path):
+        """Every key in the ``scripts`` section of module_size_limits.json is
+        enforced automatically — adding a key to the JSON is sufficient to
+        enforce its cap, with no per-file test method to maintain."""
+        self._check_scripts_file(relative_path)
+
+    def test_no_stale_scripts_caps(self):
+        """Caps must remain close enough to actual file sizes to catch real growth.
+
+        A cap that has drifted to 3x+ the actual file size (typical after a
+        monolith is split) is no longer a meaningful guardrail. This test
+        enforces that every scripts cap stays within max(actual + 500, actual * 2).
+
+        Remedy: tighten the cap in module_size_limits.json under 'scripts' to
+        match the policy value returned by ``check_size_limits.py --fix`` for
+        the breaching entry. Do NOT modify this test to raise the threshold.
+        """
+        stale = []
+        for rel_path, cap in SCRIPTS_SIZE_LIMITS.items():
+            abs_path = os.path.join(_SCRIPTS_ROOT, rel_path)
+            if not os.path.exists(abs_path):
+                continue
+            with open(abs_path, encoding="utf-8") as fh:
+                actual = len(fh.readlines())
+            allowed_cap = max(actual + 500, actual * 2)
+            if cap > allowed_cap:
+                stale.append((rel_path, actual, cap, allowed_cap))
+        assert not stale, (
+            f"{len(stale)} scripts cap(s) have drifted far above actual file size "
+            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
+            "the file grows to an unreasonable size:\n\n"
+            + "\n".join(
+                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
+                for r, actual, cap, allowed in stale
+            )
+            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
+            "and commit the updated module_size_limits.json."
+        )
+
 
 # ── Size-Guardrail Coverage (no large file may escape having a cap) ──────────
 #
@@ -6205,6 +6273,16 @@ class TestSizeGuardrailCoverage:
             testing_root, TESTING_SIZE_LIMITS, (".py",), lambda _rel: False
         )
         assert not offenders, _missing_cap_message(offenders, "testing")
+
+    def test_scripts_no_uncapped_large_file(self):
+        import pytest
+
+        if _SCRIPTS_ROOT is None:
+            pytest.skip("scripts/ not available in this test environment")
+        offenders = _scan_uncapped(
+            _SCRIPTS_ROOT, SCRIPTS_SIZE_LIMITS, (".py",), lambda _rel: False
+        )
+        assert not offenders, _missing_cap_message(offenders, "scripts")
 
 # ── LLM Token Pricing Coverage ──────────────────────────────────────────────
 
@@ -13211,9 +13289,9 @@ class TestProblemModelWritePathInvariants:
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
         ("strategic_completion.py", 7156): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
-        ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1255): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
-        ("reaper_sweeps.py", 1381): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1383): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
         (
             "routers/admin_projects.py",

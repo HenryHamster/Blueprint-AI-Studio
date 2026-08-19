@@ -817,7 +817,13 @@ export default function App() {
     });
   }, [s.selectedProjectAccess.canOperateProject, s.setConfirmDialog, s.handleBulkArchiveColumn]);
   const handleBoardDirectionClick = useCallback((dirId: string) => {
-    setResearchBrowserDirectionId(dirId);
+    // Citation links (MarkdownContentInner -> onOpenDirection) pass the bare 8-hex
+    // id that citationLinks.ts deliberately strips of its `d-` prefix, while board
+    // clicks (TaskCard -> onDirectionClick) already pass the full `d-xxxxxxxx` id
+    // that ResearchBrowser's directionFilter compares against finding.direction_id.
+    // Normalize here so both callers land on the canonical scoped id.
+    const normalized = dirId.startsWith('d-') ? dirId : `d-${dirId}`;
+    setResearchBrowserDirectionId(normalized);
     s.setShowResearchBrowser(true);
   }, [setResearchBrowserDirectionId, s.setShowResearchBrowser]);
   const handleClearWaveDeps = useMemo(() => {
