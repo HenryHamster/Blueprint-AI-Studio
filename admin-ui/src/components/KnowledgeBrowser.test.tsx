@@ -1,9 +1,22 @@
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { KnowledgeBrowser } from './KnowledgeBrowser';
 import type { KnowledgeDocument } from '../api';
-import { waitFor } from '@testing-library/react';
+
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+async function settleKnowledgeBrowser(ms = 350) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+}
 
 // A compute_experiment document — proves compute knowledge is recognized as a
 // first-class source kind with 'Compute' badge and filter option.
@@ -194,14 +207,14 @@ describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
     const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('Survey of reachable web sources'),
     );
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected knowledge document button');
     await act(async () => { (docButton as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
   }
 
   test('renders web_research grounding with modality-neutral citation wording', async () => {
@@ -312,7 +325,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
 
     const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('GPU benchmark'),
@@ -320,7 +333,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected document button');
     await act(async () => { (docButton as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Criterion MET');
   });
@@ -353,7 +366,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
 
     const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('deterministic'),
@@ -361,7 +374,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected document button');
     await act(async () => { (docButton as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Criterion NOT MET');
   });
@@ -394,7 +407,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
 
     const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('GPU benchmark'),
@@ -402,7 +415,7 @@ describe('KnowledgeBrowser — criterion verdict badge', () => {
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected document button');
     await act(async () => { (docButton as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Criterion UNMEASURED');
   });
@@ -469,7 +482,7 @@ describe('KnowledgeBrowser — pagination', () => {
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
     return host as HTMLDivElement;
   }
 
@@ -495,7 +508,7 @@ describe('KnowledgeBrowser — pagination', () => {
     if (!loadMore) throw new Error('expected load more button');
 
     await act(async () => { loadMore.click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
 
     const text = container.textContent ?? '';
     expect(text).toContain('First page document');
@@ -527,7 +540,7 @@ describe('KnowledgeBrowser — pagination', () => {
     const loadMore = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('Load more'));
     if (!loadMore) throw new Error('expected load more button');
     await act(async () => { loadMore.click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
 
     // Change the search input — should reset to offset 0
     const searchInput = container.querySelector('input[type="text"]') as HTMLInputElement;
@@ -538,7 +551,7 @@ describe('KnowledgeBrowser — pagination', () => {
       nativeInputValueSetter?.call(searchInput, 'new query');
       searchInput.dispatchEvent(new Event('input', { bubbles: true }));
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
 
     // The last call to fetchKnowledgeDocuments should have offset=0
     const calls = vi.mocked(fetchKnowledgeDocuments).mock.calls;
@@ -559,7 +572,7 @@ describe('KnowledgeBrowser — pagination', () => {
     const loadMore = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('Load more'));
     if (!loadMore) throw new Error('expected load more button');
     await act(async () => { loadMore.click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
 
     // Click the 'Design' origin filter button — changes sourceKindFilter, should reset offset
     const designButton = Array.from(container.querySelectorAll('button')).find(
@@ -568,7 +581,7 @@ describe('KnowledgeBrowser — pagination', () => {
     expect(designButton).toBeTruthy();
     if (!designButton) throw new Error('expected Design filter button');
     await act(async () => { designButton.click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
 
     const calls = vi.mocked(fetchKnowledgeDocuments).mock.calls;
     const lastCall = calls[calls.length - 1];
@@ -617,7 +630,7 @@ describe('KnowledgeBrowser — compute_experiment source kind', () => {
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
   }
 
   test('renders compute_experiment as a first-class source kind and filter option', async () => {
@@ -647,7 +660,7 @@ describe('KnowledgeBrowser — compute_experiment source kind', () => {
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected compute document button');
     await act(async () => { (docButton as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Grounded 1 of 1 citation');
     expect(text).toContain('Acceptance probes');
@@ -704,7 +717,7 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
   }
 
   test('renders_compute_acceptance_grade_and_measured_only_badges', async () => {
@@ -731,7 +744,7 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
     // Open the acceptance-grade document — its badge also renders in the detail meta row.
     if (!acceptanceCard) throw new Error('expected acceptance compute card');
     await act(async () => { (acceptanceCard as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
     expect(findBadge(host as HTMLDivElement, 'Acceptance')).toBeTruthy();
 
     // Return to the list so the measured-only row can be clicked from a live DOM node.
@@ -743,7 +756,7 @@ describe('KnowledgeBrowser — compute acceptance grade', () => {
     );
     if (!measuredCardAgain) throw new Error('expected measured compute card');
     await act(async () => { (measuredCardAgain as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
     const detailText = (host as HTMLDivElement).textContent ?? '';
     expect(detailText).toContain('Measured only');
     expect(detailText).toContain('Analysis disabled');
@@ -900,7 +913,7 @@ describe('KnowledgeBrowser — finding-challenge origin provenance', () => {
         <KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} onNavigateToTask={() => {}} />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
   }
 
   function cardFor(title: string): Element | undefined {
@@ -936,7 +949,7 @@ describe('KnowledgeBrowser — finding-challenge origin provenance', () => {
     // task / finding identity and the second-opinion decision record.
     if (!confirmedCard) throw new Error('expected confirmed finding card');
     await act(async () => { (confirmedCard as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
     const detailText = (host as HTMLDivElement).textContent ?? '';
     expect(detailText).toContain('Finding origin');
     expect(detailText).toContain('Research finding');
@@ -952,7 +965,7 @@ describe('KnowledgeBrowser — finding-challenge origin provenance', () => {
     const card = cardFor('Legacy design without provenance');
     if (!card) throw new Error('expected legacy card');
     await act(async () => { (card as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
     // No origin_provenance → no finding-origin block, but the document still renders.
     expect((host as HTMLDivElement).textContent).not.toContain('Finding origin');
     expect((host as HTMLDivElement).textContent).toContain('Legacy design without provenance');
@@ -968,7 +981,7 @@ describe('KnowledgeBrowser — finding-challenge origin provenance', () => {
     expect(overturnedFilter).toBeTruthy();
     if (!overturnedFilter) throw new Error('expected Overturned filter button');
     await act(async () => { overturnedFilter.click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
     const calls = vi.mocked(fetchKnowledgeDocuments).mock.calls;
     const lastCall = calls[calls.length - 1];
     expect(lastCall[1]?.offset).toBe(0);
@@ -1024,7 +1037,7 @@ describe('KnowledgeBrowser — lifecycle status badge', () => {
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
   }
 
   function cardFor(title: string): Element | undefined {
@@ -1079,7 +1092,7 @@ describe('KnowledgeBrowser — lifecycle status badge', () => {
     expect(card).toBeTruthy();
     if (!card) throw new Error('expected document card');
     await act(async () => { (card as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
     expect((host as HTMLDivElement).textContent).toContain('Consumed');
   });
 
@@ -1090,7 +1103,7 @@ describe('KnowledgeBrowser — lifecycle status badge', () => {
     expect(card).toBeTruthy();
     if (!card) throw new Error('expected document card');
     await act(async () => { (card as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
     expect((host as HTMLDivElement).textContent).toContain('Dismissed');
   });
 
@@ -1104,7 +1117,7 @@ describe('KnowledgeBrowser — lifecycle status badge', () => {
     expect(pendingFilter).toBeTruthy();
     if (!pendingFilter) throw new Error('expected Pending filter button');
     await act(async () => { pendingFilter.click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
     const calls = vi.mocked(fetchKnowledgeDocuments).mock.calls;
     const lastCall = calls[calls.length - 1];
     expect(lastCall[1]?.offset).toBe(0);
@@ -1141,7 +1154,7 @@ describe('KnowledgeBrowser — document body load failure', () => {
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
     return host as HTMLDivElement;
   }
 
@@ -1159,7 +1172,7 @@ describe('KnowledgeBrowser — document body load failure', () => {
     expect(docButton).toBeTruthy();
     if (!docButton) throw new Error('expected knowledge document button');
     await act(async () => { (docButton as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
 
     const errorEl = container.querySelector('[data-testid="doc-error"]');
     expect(errorEl).toBeTruthy();
@@ -1250,13 +1263,13 @@ describe('KnowledgeBrowser — live proof release evidence', () => {
         <KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} onNavigateToTask={() => {}} />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
     const card = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes((doc as { title: string }).title),
     );
     if (!card) throw new Error('expected document card');
     await act(async () => { (card as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
   }
 
   test('live-proof compute doc shows the Live Proof Context block with version, short SHA, and serving status', async () => {
@@ -1312,13 +1325,13 @@ describe('KnowledgeBrowser — compute run provenance detail', () => {
     await act(async () => {
       r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} />);
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
     const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes(doc.title),
     );
     if (!docButton) throw new Error('expected document button');
     await act(async () => { (docButton as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
   }
 
   test('renders run provenance with operator-hardware label and truncated runner id for local-subprocess', async () => {
@@ -1465,7 +1478,7 @@ describe('KnowledgeBrowser — renders execution-location badge on compute_exper
     await act(async () => {
       r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} />);
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
 
     return Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes(doc.title),
@@ -1539,7 +1552,7 @@ describe('KnowledgeBrowser — renders execution-location badge on compute_exper
     await act(async () => {
       r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} />);
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
 
     const card = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes(nonComputeDoc.title),
@@ -1598,16 +1611,15 @@ describe('KnowledgeBrowser — viewable-media error fallback sanitizes citation 
         />,
       );
     });
-    const docButton = await waitFor(() => {
-      const button = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
-        b => b.textContent?.includes('Survey of reachable web sources'),
-      );
-      if (!button) throw new Error('expected knowledge document button');
-      return button;
-    });
+    await settleKnowledgeBrowser();
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
+      b => b.textContent?.includes('Survey of reachable web sources'),
+    );
+    expect(docButton).toBeTruthy();
+    if (!docButton) throw new Error('expected knowledge document button');
     await act(async () => { (docButton as HTMLElement).click(); });
     // Allow the rejected resolveArtifactDownloadUrl promise to settle into the error state.
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
 
     const anchors = Array.from((host as HTMLDivElement).querySelectorAll('a'));
     // No anchor may carry a javascript: scheme href sourced from the citation ref.
@@ -1652,13 +1664,13 @@ describe('KnowledgeBrowser — viewable-media error fallback sanitizes citation 
         />,
       );
     });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await settleKnowledgeBrowser();
     const docButton = Array.from((host as HTMLDivElement).querySelectorAll<HTMLElement>('[role="button"]')).find(
       b => b.textContent?.includes('Survey of reachable web sources'),
     );
     if (!docButton) throw new Error('expected knowledge document button');
     await act(async () => { (docButton as HTMLElement).click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
 
     // The img renders with the first (expired) URL.
     const img = (host as HTMLDivElement).querySelector('img[src*="signed.example.com"]');
@@ -1666,7 +1678,7 @@ describe('KnowledgeBrowser — viewable-media error fallback sanitizes citation 
 
     // Simulate the browser firing onError on the expired URL.
     await act(async () => { img.dispatchEvent(new Event('error')); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    await settleKnowledgeBrowser(50);
 
     // resolveArtifactDownloadUrl must have been called a second time for the retry.
     expect(vi.mocked(resolveArtifactDownloadUrl).mock.calls.length).toBeGreaterThanOrEqual(2);

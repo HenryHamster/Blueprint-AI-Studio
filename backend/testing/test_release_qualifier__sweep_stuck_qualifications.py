@@ -5100,6 +5100,91 @@ async def test_walkthrough_spawn_failed_cap_holds_without_site_change(db_session
 
 
 @pytest.mark.asyncio
+async def test_transient_error_redrive_cap_escalates_once(db_session, mocker):
+    """A capped non-walkthrough transient error is visible, not silently parked."""
+    from app.release_qualifier_redrive import (
+        _MAX_ERROR_REDRIVE_ATTEMPTS,
+        _redrive_error_qualification,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "error_redrive_count": _MAX_ERROR_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    mock_run_qual = mocker.patch("app.release_qualifier.run_qualification")
+
+    result = await _redrive_error_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False
+    mock_run_qual.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["error_redrive_loop_escalated"] is True
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "transient" in alerts[0].title.lower()
+
+    result_again = await _redrive_error_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result_again is False
+    alerts_again = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts_again) == 1
+
+
+@pytest.mark.asyncio
+async def test_promotion_failure_redrive_cap_escalates_once(db_session):
+    """The promotion-failure cap persists an operator Alert and dedupe marker."""
+    from app.release_qualifier_redrive import (
+        _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+        _escalate_promotion_failure_loop_in_dedicated_session,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "promotion_failure_count": _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    assert await _escalate_promotion_failure_loop_in_dedicated_session(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is True
+    await db_session.refresh(version)
+    assert version.last_qualification["promotion_loop_escalated"] is True
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "promotion" in alerts[0].title.lower()
+
+    assert await _escalate_promotion_failure_loop_in_dedicated_session(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is False
+    alerts_again = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts_again) == 1
+
+
+@pytest.mark.asyncio
 async def test_calcification_not_fired_below_attempt_threshold(db_session):
     """Fewer than _MIN_CALCIFICATION_ATTEMPTS hard-blocker failures do not
     trigger an alert — the stall may still be transient."""

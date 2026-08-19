@@ -11,7 +11,14 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from durations_quality import MIN_ENTRIES, MIN_UNIQUE, MIN_CV, OUTLIER_CAP, quality_ok
+from durations_quality import (
+    MIN_CV,
+    MIN_ENTRIES,
+    MIN_UNIQUE,
+    OUTLIER_CAP,
+    in_band_setup_artifacts,
+    quality_ok,
+)
 from merge_durations import filter_current_entries, load_duration_baseline
 
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
@@ -110,6 +117,11 @@ def write_merged():
     if outlier_count:
         print(f"  Dropped {outlier_count} outlier(s) > {OUTLIER_CAP}s (fixture-setup misattribution)")
 
+    band_artifacts = in_band_setup_artifacts(merged)
+    for key in band_artifacts:
+        del merged[key]
+    if band_artifacts:
+        print(f"  Dropped {len(band_artifacts)} in-band setup artifacts (fixture-setup misattribution)")
     with open(td, "w") as f:
         json.dump(merged, f, indent=2, sort_keys=True)
         f.write("\n")

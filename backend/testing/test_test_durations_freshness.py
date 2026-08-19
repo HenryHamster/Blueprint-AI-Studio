@@ -160,6 +160,10 @@ _DEGENERATE_WARN_THRESHOLD = 5
 # can produce 400-600s entries. 60s is well above any legitimate single-test cost in
 # this suite (next-longest real test is ~27s) and well below the fixture-attribution range.
 _IMPLAUSIBLE_OUTLIER_CAP = 60.0
+_IN_BAND_SETUP_MIN = 15.0
+_IN_BAND_SETUP_MAX = 21.1
+_IN_BAND_SETUP_MIN_COUNT = 100
+_IN_BAND_SETUP_GAP_MAX = 27.4
 
 
 def test_durations_are_not_degenerate_synthetic_placeholders() -> None:
@@ -268,7 +272,7 @@ def test_durations_no_implausible_outliers() -> None:
 
     When pytest-split runs tests in batches with Docker+Postgres, Postgres cold-start
     time (~400-600s) is charged to the first test in the batch.  These outlier values
-    corrupt shard balancing: the affected test looks 30-100× more expensive than it is,
+    corrupt shard balancing: the affected test looks 30-100x more expensive than it is,
     causing CI to under-fill the shard that contains it.
 
     Any duration above _IMPLAUSIBLE_OUTLIER_CAP (60s) is a misattribution artifact.
@@ -287,6 +291,33 @@ def test_durations_no_implausible_outliers() -> None:
         f"Offending entries: {dict(list(outliers.items())[:5])}\n"
         f"Fix: strip entries > {_IMPLAUSIBLE_OUTLIER_CAP}s then recommit, or regenerate "
         f"via scripts/batch-store-durations.sh (which caps automatically)."
+    )
+
+
+def test_durations_no_in_band_setup_attribution() -> None:
+    """Reject the measured 15-21s setup-cost plateau before it skews shards.
+
+    The plateau is distinct from a single extreme outlier: it is a dense band
+    followed by a diagnostic gap, so every affected test can look plausible in
+    isolation while collectively taking most of the shard weight.
+    """
+    data = _load_durations()
+    band = {
+        key
+        for key, value in data.items()
+        if _IN_BAND_SETUP_MIN <= value < _IN_BAND_SETUP_MAX
+    }
+    if len(band) < _IN_BAND_SETUP_MIN_COUNT:
+        return
+    has_following_observation = any(
+        _IN_BAND_SETUP_MAX <= value <= _IN_BAND_SETUP_GAP_MAX
+        for value in data.values()
+    )
+    assert has_following_observation, (
+        f"backend/.test_durations contains {len(band)} entries in the "
+        f"{_IN_BAND_SETUP_MIN:g}-{_IN_BAND_SETUP_MAX:g}s setup-attribution band "
+        f"with no observations through {_IN_BAND_SETUP_GAP_MAX:g}s. "
+        "Strip these entries and regenerate via scripts/batch-store-durations.sh."
     )
 
 
@@ -386,11 +417,9 @@ def test_durations_no_stale_entries() -> None:
 
 def _write_tmp_py(content: str) -> Path:
     """Write Python source to a temporary file and return its Path."""
-    tf = tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False)
-    tf.write(content)
-    tf.flush()
-    tf.close()
-    return Path(tf.name)
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tf:
+        tf.write(content)
+        return Path(tf.name)
 
 
 def test_extract_valid_test_ids_top_level_sync_functions() -> None:

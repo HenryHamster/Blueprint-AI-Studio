@@ -41,6 +41,25 @@ def _load_manifest() -> dict:
         return json.load(fh)
 
 
+def _extract_python_test_ids(source: str) -> set[str]:
+    """Collect pytest node IDs from top-level functions and ``Test*`` classes."""
+    import ast
+
+    tree = ast.parse(source)
+    test_ids: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            test_ids.add(node.name)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            test_ids.update(
+                f"{node.name}::{item.name}"
+                for item in node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name.startswith("test_")
+            )
+    return test_ids
+
+
 def _extract_ts_it_labels(source: str) -> set[str]:
     """Extract all it('...') / it("...") / it(`...`) labels from TS source.
 
@@ -135,8 +154,13 @@ def test_manifest_is_valid_json_with_required_keys():
         assert "path" in entry, f"protect entry missing 'path': {entry}"
         assert "reason" in entry, f"protect entry missing 'reason': {entry!r}"
         assert "test_ids" in entry, f"protect entry missing 'test_ids': {entry!r}"
+        assert "test_count" in entry, f"protect entry missing 'test_count': {entry!r}"
         assert isinstance(entry["test_ids"], list), f"'test_ids' must be a list in {entry['path']}"
         assert len(entry["test_ids"]) > 0, f"'test_ids' must not be empty in {entry['path']}"
+        assert isinstance(entry["test_count"], int) and not isinstance(entry["test_count"], bool), (
+            f"'test_count' must be an integer in {entry['path']}"
+        )
+        assert entry["test_count"] > 0, f"'test_count' must be positive in {entry['path']}"
 
     for entry in manifest["deleted_frontend"]:
         assert "path" in entry, f"deleted_frontend entry missing 'path': {entry}"
@@ -235,13 +259,13 @@ def test_all_protect_test_ids_exist_in_their_files():
             continue
         source = full_path.read_text(encoding="utf-8")
         if entry["path"].endswith(".py"):
-            for test_id in entry["test_ids"]:
-                pattern = re.compile(
-                    r"^\s*(?:async\s+)?def\s+" + re.escape(test_id) + r"\s*\(",
-                    re.MULTILINE,
-                )
-                if not pattern.search(source):
-                    missing.append(f"{entry['path']}::{test_id}")
+            actual_test_ids = _extract_python_test_ids(source)
+            missing.extend(
+                f"{entry['path']}::{test_id}"
+                for test_id in entry["test_ids"]
+                if test_id not in actual_test_ids
+                and not any(test_id == node_id.rsplit("::", 1)[-1] for node_id in actual_test_ids)
+            )
         elif entry["path"].endswith((".ts", ".tsx")):
             # TypeScript test suites use describe()/it()/test() with string labels.
             # Collect actual labels via the quote-aware helpers (all three JS/TS
@@ -259,14 +283,53 @@ def test_all_protect_test_ids_exist_in_their_files():
                 label = m.group(1) or m.group(2) or m.group(3)
                 if label:
                     actual_labels.add(label)
-            for test_id in entry["test_ids"]:
-                if test_id not in actual_labels:
-                    missing.append(f"{entry['path']}::{test_id}")
+            missing.extend(
+                f"{entry['path']}::{test_id}"
+                for test_id in entry["test_ids"]
+                if test_id not in actual_labels
+            )
 
     assert not missing, (
         "The following PROTECT-listed test_ids no longer exist in their files. "
         "Either restore the test or update the manifest (with operator sign-off):\n"
         + "\n".join(f"  - {m}" for m in missing)
+    )
+
+
+def test_every_protected_file_meets_declared_test_count():
+    """Every protected file must retain at least its manifest test count.
+
+    The manifest's hand-picked ``test_ids`` remain a forward existence contract;
+    this data-driven count floor closes the reverse gap, so deleting an
+    undeclared test from any protected file fails without hardcoding file paths.
+    """
+    manifest = _load_manifest()
+    mismatches: list[str] = []
+    for entry in manifest["protect"]:
+        path = entry["path"]
+        full_path = REPO_ROOT / path
+        if not full_path.exists():
+            continue
+        source = full_path.read_text(encoding="utf-8")
+        if path.endswith(".py"):
+            actual = _extract_python_test_ids(source)
+        elif path.endswith((".ts", ".tsx")):
+            actual = _extract_ts_it_labels(source)
+            actual |= _extract_ts_it_each_labels(source)
+            actual |= _extract_ts_test_labels(source)
+        else:
+            mismatches.append(f"{path}: unsupported test file type")
+            continue
+        declared_count = entry["test_count"]
+        if len(actual) < declared_count:
+            mismatches.append(
+                f"{path}: actual={len(actual)}, declared_floor={declared_count}"
+            )
+
+    assert not mismatches, (
+        "Protected test files must retain their declared test-count floor; "
+        "update conversational_workday_manifest.json after an intentional test removal:\n"
+        + "\n".join(f"  - {item}" for item in mismatches)
     )
 
 

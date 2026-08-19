@@ -1,18 +1,18 @@
 {
   "_schema": "conversational-workday-protection-manifest-v1",
   "_purpose": "Machine-checkable boundary between LIVE conversational Workday path tests (protect) and DELETED autonomous-resident tests (safe-to-cut / restore-on-restore). Future test-estate cut subtasks must not touch PROTECT entries without operator sign-off.",
-
   "protect": [
     {
       "path": "backend/testing/test_project_message_projection.py",
       "reason": "Protects the bounded realtime/canonical preview fields that power the truthful non-interruptive Workday-consulted cue in Chat.",
       "test_ids": [
         "test_message_preview_preserves_bounded_workday_chat_provenance"
-      ]
+      ],
+      "test_count": 24
     },
     {
       "path": "backend/testing/test_strategic_session_messages.py",
-      "reason": "Covers the agent-side message-poll endpoint (GET /api/agent/projects/{id}/messages) — the inbound operator-to-agent channel for the conversational Workday session. Removing this leaves zero test coverage on the agent message delivery contract.",
+      "reason": "Covers the agent-side message-poll endpoint (GET /api/agent/projects/{id}/messages) \u2014 the inbound operator-to-agent channel for the conversational Workday session. Removing this leaves zero test coverage on the agent message delivery contract.",
       "test_ids": [
         "test_poll_returns_open_user_messages_ascending_with_exact_shape",
         "test_poll_since_cursor_returns_only_newer",
@@ -41,7 +41,8 @@
         "test_resident_final_fence_orders_equal_timestamps_deterministically",
         "test_resident_poll_rejects_query_identity_spoof",
         "test_stale_resident_poll_is_rejected_without_generation_query"
-      ]
+      ],
+      "test_count": 42
     },
     {
       "path": "backend/testing/test_strategic_fast_live_work.py",
@@ -52,14 +53,16 @@
         "test_fast_live_role_contract_disables_private_autonomy_in_chat",
         "test_fast_live_work_marks_bounded_collections_as_truncated",
         "test_receipts_resolve_exact_project_entities_outside_global_windows"
-      ]
+      ],
+      "test_count": 5
     },
     {
       "path": "backend/testing/test_strategic_workday_mutation_rebind.py",
       "reason": "Protects full per-packet Workday operation idempotency beyond the bounded Fast receipt projection, including old replay, fingerprint conflict, capacity rejection, and a fresh next-consultation ledger.",
       "test_ids": [
         "test_workday_operation_replay_survives_projection_window_and_is_packet_scoped"
-      ]
+      ],
+      "test_count": 2
     },
     {
       "path": "backend/testing/test_strategic_workday_handoff_recovery.py",
@@ -68,14 +71,16 @@
         "test_stale_workday_packet_settles_source_once_without_private_leak",
         "test_stale_workday_result_is_replaced_by_neutral_terminal_result",
         "test_missing_handoff_recovers_but_deleted_source_publishes_nothing"
-      ]
+      ],
+      "test_count": 3
     },
     {
       "path": "backend/testing/test_conversation_coordinator_two_speed.py",
       "reason": "Protects the bounded two-attempt initial Workday failure protocol and its single server-owned neutral terminal result.",
       "test_ids": [
         "test_workday_empty_result_retries_once_then_creates_terminal_failure"
-      ]
+      ],
+      "test_count": 12
     },
     {
       "path": "backend/testing/test_strategic_resident_continuous_liveness.py",
@@ -89,7 +94,8 @@
         "test_explicit_stop_before_heartbeat_cannot_be_rearmed",
         "test_competing_incarnation_cannot_renew_continuous_liveness",
         "test_dead_resident_process_remains_reapable_without_heartbeat"
-      ]
+      ],
+      "test_count": 8
     },
     {
       "path": "backend/testing/test_strategic_resident_pipeline_projection.py",
@@ -97,7 +103,8 @@
       "test_ids": [
         "test_four_resident_generations_project_as_one_real_pipeline_work_item",
         "test_resident_terminal_without_result_skips_generic_strategic_failure_path"
-      ]
+      ],
+      "test_count": 3
     },
     {
       "path": "backend/testing/test_strategic_state.py",
@@ -124,17 +131,19 @@
         "test_operator_send_racing_mode_leave_commits_unbound_chat_message",
         "test_post_lapse_exact_message_replay_never_restarts_workday",
         "test_post_lapse_rearm_does_not_migrate_from_offline_preferred_runner"
-      ]
+      ],
+      "test_count": 174
     },
     {
       "path": "backend/testing/test_admin_routers__messages.py",
-      "reason": "Covers the operator message-create endpoint (POST /api/admin/projects/{id}/strategic-session/messages) and workbench-state session_started_at decay — all live conversational-Workday contracts. Split from test_admin_routers.py.",
+      "reason": "Covers the operator message-create endpoint (POST /api/admin/projects/{id}/strategic-session/messages) and workbench-state session_started_at decay \u2014 all live conversational-Workday contracts. Split from test_admin_routers.py.",
       "test_ids": [
         "test_strategic_session_message_idempotency_preserves_response_shape_and_broadcast",
         "test_strategic_session_message_persists_workbench_snapshot_and_arms",
         "test_strategic_session_message_allows_attachment_only_content",
         "test_workbench_state_from_prefs_legacy_fallback_decays_stale_session_started_at"
-      ]
+      ],
+      "test_count": 140
     },
     {
       "path": "backend/testing/test_admin_routers__strategic_directions.py",
@@ -142,15 +151,17 @@
       "test_ids": [
         "test_strategic_create_message_strips_server_owned_chat_provenance",
         "test_typed_fast_autonomy_cannot_emit_unclaimed_public_messages"
-      ]
+      ],
+      "test_count": 29
     },
     {
       "path": "backend/testing/test_admin_routers.py",
-      "reason": "Covers strategic session settings persistence — live conversational-Workday contracts remaining in the main admin_routers test file.",
+      "reason": "Covers strategic session settings persistence \u2014 live conversational-Workday contracts remaining in the main admin_routers test file.",
       "test_ids": [
         "test_strategic_session_settings",
         "test_strategic_session_settings_persist_across_sync"
-      ]
+      ],
+      "test_count": 441
     },
     {
       "path": "backend/testing/test_agent_strategic_fetch.py",
@@ -161,21 +172,24 @@
         "test_strategic_create_message_mixed_present_citation_is_flagged",
         "test_strategic_create_message_note_type_not_grounded",
         "test_strategic_create_message_broadcasts_workbench_envelope"
-      ]
+      ],
+      "test_count": 138
     },
     {
       "path": "backend/testing/test_operator_workbench_contracts.py",
       "reason": "test_operator_workbench_current_state_contract_surfaces validates the strategic_session surface on the workbench event contract; losing it would allow silent drift in the admin-UI data contract for conversational state.",
       "test_ids": [
         "test_operator_workbench_current_state_contract_surfaces"
-      ]
+      ],
+      "test_count": 8
     },
     {
       "path": "admin-ui/src/components/MessageBubble.test.tsx",
       "reason": "Protects strict server-owned Fast only and Workday requested receipts from caller-spoofed booleans, wrong message roles, or missing provenance.",
       "test_ids": [
         "renders only strict server-owned Workday consultation receipts"
-      ]
+      ],
+      "test_count": 40
     },
     {
       "path": "admin-ui/src/components/ConversationUtilityBar.test.tsx",
@@ -195,7 +209,8 @@
         "maps durable retry and dead states without inventing activity",
         "uses server availability when a Continuous session has no activity snapshot yet",
         "renders one bounded, server-derived status line with full detail in its title"
-      ]
+      ],
+      "test_count": 15
     },
     {
       "path": "admin-ui/src/components/ConversationUtilityBar.viewport.test.tsx",
@@ -206,7 +221,8 @@
         "Workday status and bounded task detail do not overflow at 375px",
         "expanded search plus Workday status does not overflow at 375px",
         "requested and paused Workday remains truthful without hover at 375px"
-      ]
+      ],
+      "test_count": 6
     },
     {
       "path": "admin-ui/src/components/MessagesListView.viewport.test.tsx",
@@ -215,14 +231,16 @@
         "renders a resolved Fast reply at normal emphasis with proven Workday provenance",
         "renders the server-owned Workday request receipt on the Fast acknowledgement",
         "renders the server-owned Fast-only receipt on a reply without a Workday request"
-      ]
+      ],
+      "test_count": 28
     },
     {
       "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
-      "reason": "Covers the StrategicSessionControl component — the operator UI for the conversational Workday session lifecycle. Restored in #16075; guard ensures this test file is not silently deleted again.",
+      "reason": "Covers the StrategicSessionControl component \u2014 the operator UI for the conversational Workday session lifecycle. Restored in #16075; guard ensures this test file is not silently deleted again.",
       "test_ids": [
         "keeps the legacy active fallback when lifecycle state is absent"
-      ]
+      ],
+      "test_count": 17
     },
     {
       "path": "admin-ui/src/components/StrategicSessionControl.viewport.test.tsx",
@@ -230,11 +248,12 @@
       "test_ids": [
         "Workday controls remain contained at 375px",
         "active Workday controls remain contained at 768px"
-      ]
+      ],
+      "test_count": 2
     },
     {
       "path": "admin-ui/src/hooks/useStrategicSession.test.tsx",
-      "reason": "Covers the useStrategicSession hook — primary React hook for conversational Workday session state. Restored in #16075; guard ensures this test file is not silently deleted again.",
+      "reason": "Covers the useStrategicSession hook \u2014 primary React hook for conversational Workday session state. Restored in #16075; guard ensures this test file is not silently deleted again.",
       "test_ids": [
         "resolves mode + session fields from the liveness probe before the read model lands",
         "lets the heavy read model take precedence once it hydrates",
@@ -251,15 +270,17 @@
         "wakes itself when an unchanged starting snapshot crosses the stale deadline",
         "keeps an explicitly stopped Workday stopped until the operator explicitly starts it",
         "allows Workday auto-ensure again after leaving and explicitly re-entering continuous mode"
-      ]
+      ],
+      "test_count": 25
     },
     {
       "path": "admin-ui/src/utils/strategicSessionLive.test.ts",
-      "reason": "Covers strategicSessionLive streaming utility — live-streaming helpers for the conversational Workday session. Restored in #16075; guard ensures this test file is not silently deleted again.",
+      "reason": "Covers strategicSessionLive streaming utility \u2014 live-streaming helpers for the conversational Workday session. Restored in #16075; guard ensures this test file is not silently deleted again.",
       "test_ids": [
         "treats message / reasoning / kind-less as reply, activity kinds as not",
         "builds the bubble from reply-kind deltas only (activity noise excluded)"
-      ]
+      ],
+      "test_count": 29
     },
     {
       "path": "admin-ui/src/utils/pendingAttachmentStore.test.ts",
@@ -268,11 +289,12 @@
         "restores exact bytes only for the actor, project, and send key",
         "cleans every blob in a completed send without touching another send",
         "persists attachment bytes through IndexedDB across a module reload"
-      ]
+      ],
+      "test_count": 3
     },
     {
       "path": "agent/src/handlers/index.test.ts",
-      "reason": "Covers the strategic dispatch gate (isResidentSessionTask / dispatchStrategic) — the agent-side entry seam that routes marked strategic_review tasks to the conversational Workday session handler vs. one-shot strategic. Removing or neutering these tests leaves the dispatch gate unguarded.",
+      "reason": "Covers the strategic dispatch gate (isResidentSessionTask / dispatchStrategic) \u2014 the agent-side entry seam that routes marked strategic_review tasks to the conversational Workday session handler vs. one-shot strategic. Removing or neutering these tests leaves the dispatch gate unguarded.",
       "test_ids": [
         "handlers.strategic_review writes the strategic helper to the workspace",
         "handlers.research with research_mode=\"strategic\" routes to handleStrategic (writes strategic helper)",
@@ -284,17 +306,19 @@
         "routes resident_session=true to handleStrategicResident, not handleStrategic",
         "routes context._resident_session=true to handleStrategicResident",
         "routes plain strategic_review (no flags) to handleStrategic, not handleStrategicResident"
-      ]
+      ],
+      "test_count": 37
     },
     {
       "path": "agent/src/providers/resident-session.test.ts",
-      "reason": "Covers startResidentClaudeSession — the long-running process that drives the conversational Workday session loop (stdin/stdout NDJSON protocol, turn lifecycle, rate-limit classification). Removing these tests leaves the session provider contract unguarded.",
+      "reason": "Covers startResidentClaudeSession \u2014 the long-running process that drives the conversational Workday session loop (stdin/stdout NDJSON protocol, turn lifecycle, rate-limit classification). Removing these tests leaves the session provider contract unguarded.",
       "test_ids": [
         "appends --input-format stream-json and keeps stdin piped",
         "sendTurn writes a user NDJSON line and resolves on the top-level result",
         "classifies provider rate limits from bounded stderr evidence",
         "allows foreground Fast without append support while identity-bound Workday stays fail-closed"
-      ]
+      ],
+      "test_count": 48
     },
     {
       "path": "scripts/test_runner_isolation.py",
@@ -303,14 +327,16 @@
         "test_host_selected_provider_cli_precedes_legacy_node_directory",
         "test_agent_plan_probe_uses_exact_bwrap_boundary",
         "test_agent_plan_probe_reports_sandbox_missing_resident_flag"
-      ]
+      ],
+      "test_count": 177
     },
     {
       "path": "scripts/test_local_runner.py",
       "reason": "Protects heartbeat admission proof through the exact bwrap Agent plan before a conversational Workday session is assigned to a runner.",
       "test_ids": [
         "test_bwrap_backend_probes_the_exact_agent_plan_when_available"
-      ]
+      ],
+      "test_count": 611
     },
     {
       "path": "agent/src/index.provider-runner.test.ts",
@@ -319,7 +345,8 @@
         "retries a truncated Claude help surface before caching Resident capabilities",
         "recognizes Resident flags emitted on Claude help stderr",
         "does not reuse Claude capabilities across distinct executable environments"
-      ]
+      ],
+      "test_count": 125
     },
     {
       "path": "agent/src/handlers/strategic-resident-prompt.test.ts",
@@ -328,7 +355,8 @@
         "defines the Resident identity and strategic object model compactly",
         "commissions implementation and forbids direction sharding",
         "preserves the native reply protocol"
-      ]
+      ],
+      "test_count": 3
     },
     {
       "path": "agent/src/providers/resident-stream.test.ts",
@@ -336,11 +364,12 @@
       "test_ids": [
         "detects mutating ./strategic verbs",
         "detects ./messages send in various shells"
-      ]
+      ],
+      "test_count": 45
     },
     {
       "path": "backend/testing/test_workday_resident_invariants.py",
-      "reason": "Primary protection for conversational Workday seams — invariant tests covering session availability, arming suppression, retry/refresh binding, operator-send serialization, mutation fencing, terminal reconciliation, and work-session arming. Exact test list is machine-enforced by test_workday_invariant_suite_is_protected_with_all_tests; silently deleting or emptying this file would remove all invariant coverage without tripping any existing guard.",
+      "reason": "Primary protection for conversational Workday seams \u2014 invariant tests covering session availability, arming suppression, retry/refresh binding, operator-send serialization, mutation fencing, terminal reconciliation, and work-session arming. Exact test list is machine-enforced by test_workday_invariant_suite_is_protected_with_all_tests; silently deleting or emptying this file would remove all invariant coverage without tripping any existing guard.",
       "test_ids": [
         "test_workday_availability_does_not_consult_removed_global_gate",
         "test_workday_activation_enqueues_one_canonical_fast_turn_per_session",
@@ -365,11 +394,12 @@
         "test_active_one_shot_records_cycle_reason_then_completion_retries",
         "test_resident_retry_does_not_restore_task_declined_runner",
         "test_workbench_and_work_session_arming_suppressed_during_resident_session"
-      ]
+      ],
+      "test_count": 23
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
-      "reason": "Covers the core conversational Workday session lifecycle — start/adopt, liveness heartbeat/lease, runner-pin preservation across the spawn/finalize race, stop/handoff, and message handoff. These are the primary backend seams for the operator-driven Workday session; deleting this file would leave the session start/stop/handoff contract completely untested.",
+      "reason": "Covers the core conversational Workday session lifecycle \u2014 start/adopt, liveness heartbeat/lease, runner-pin preservation across the spawn/finalize race, stop/handoff, and message handoff. These are the primary backend seams for the operator-driven Workday session; deleting this file would leave the session start/stop/handoff contract completely untested.",
       "test_ids": [
         "test_session_state_helpers_remain_table_free",
         "test_session_snapshot_exposes_bounded_activity_without_silence_deadline",
@@ -420,15 +450,15 @@
         "test_heartbeat_handled_ids_only_affect_own_session",
         "test_new_resident_start_repairs_stale_message_ownership_without_cadence",
         "test_poisoned_blocked_reason_write_recovers_before_activation",
-          "test_fresh_session_rebinds_only_immediate_predecessor_turn_without_activation_cobatch",
-          "test_restart_retires_predecessor_activation_before_enqueuing_new_one",
-          "test_restart_rebinds_pending_workday_packet_with_fresh_lease",
-          "test_restart_rebinds_awaiting_workday_continuation_with_fresh_lease",
-          "test_restart_cursor_floor_survives_packed_open_message_eviction",
-          "test_fresh_session_does_not_rebind_marked_rows_from_older_sessions",
-          "test_fresh_session_severs_shared_predecessor_claim_before_narrow_rebind",
-          "test_failed_provisional_start_handoff_is_recovered_by_next_start",
-          "test_healthy_existing_resident_ensure_repairs_stale_message_ownership",
+        "test_fresh_session_rebinds_only_immediate_predecessor_turn_without_activation_cobatch",
+        "test_restart_retires_predecessor_activation_before_enqueuing_new_one",
+        "test_restart_rebinds_pending_workday_packet_with_fresh_lease",
+        "test_restart_rebinds_awaiting_workday_continuation_with_fresh_lease",
+        "test_restart_cursor_floor_survives_packed_open_message_eviction",
+        "test_fresh_session_does_not_rebind_marked_rows_from_older_sessions",
+        "test_fresh_session_severs_shared_predecessor_claim_before_narrow_rebind",
+        "test_failed_provisional_start_handoff_is_recovered_by_next_start",
+        "test_healthy_existing_resident_ensure_repairs_stale_message_ownership",
         "test_repair_excludes_db_authoritative_active_session",
         "test_repair_noop_candidate_releases_per_id_project_transaction",
         "test_repair_rechecks_active_session_between_stale_ids",
@@ -456,15 +486,17 @@
         "test_autonomous_turn_survives_operator_silence_with_exact_heartbeat",
         "test_autonomous_turn_flag_cannot_rescue_committed_chat_mode",
         "test_autonomous_working_turn_renews_freshness_without_mutation"
-      ]
+      ],
+      "test_count": 85
     },
     {
       "path": "agent/src/workspacePrep.test.ts",
       "reason": "Protects the Resident cold-clone optimization: selected-branch full history with blobless transfer, including the warm-failure recovery path, without changing other workspace callers.",
       "test_ids": [
         "cold path: opt-in full-history single-branch blobless clone passes exact args to retry wrapper",
-        "optimized full-history warm failure → cold recovery preserves single-branch blobless args"
-      ]
+        "optimized full-history warm failure \u2192 cold recovery preserves single-branch blobless args"
+      ],
+      "test_count": 74
     },
     {
       "path": "agent/src/handlers/typed-fast-resident.test.ts",
@@ -481,7 +513,8 @@
         "rejects direct managed execution",
         "accepts neutral strategist prose without body-status classification",
         "keeps the managed-execution fence bounded on 20k prose"
-      ]
+      ],
+      "test_count": 11
     },
     {
       "path": "backend/testing/test_strategic_consultation_status.py",
@@ -490,22 +523,24 @@
         "test_consultation_activity_verification_requires_live_canonical_packet",
         "test_heartbeat_emits_only_ordered_semantic_activity_transitions",
         "test_short_consultation_projects_delivering_then_settles_before_message"
-      ]
+      ],
+      "test_count": 3
     },
     {
       "path": "agent/src/handlers/strategic-helpers.test.ts",
       "reason": "Protects generated Strategic helper provenance, stable mutation identity across retries, and the deliberate private-consultation qualification boundary.",
       "test_ids": [
         "injects stable typed-consultation provenance across transport retries"
-      ]
+      ],
+      "test_count": 115
     },
     {
       "path": "agent/src/handlers/strategic-resident.test.ts",
-      "reason": "Covers handleStrategicResident — the agent-side handler that drives the conversational Workday session loop (operator reply, compaction restart, workspace recovery, corrective tick, provider-error guard). This is the deepest coverage of the resident session path on the agent side; deleting it leaves the handler entirely untested.",
+      "reason": "Covers handleStrategicResident \u2014 the agent-side handler that drives the conversational Workday session loop (operator reply, compaction restart, workspace recovery, corrective tick, provider-error guard). This is the deepest coverage of the resident session path on the agent side; deleting it leaves the handler entirely untested.",
       "test_ids": [
         "hands a large residual to the rate-limited drain instead of bursting it synchronously",
         "spaces the flushed frames across rate windows instead of bursting them",
-        "seals the ending turn’s open text so the next turn’s delta starts a fresh frame",
+        "seals the ending turn\u2019s open text so the next turn\u2019s delta starts a fresh frame",
         "interleaves tool frames between adjacent text deltas in order",
         "places reply authority outside the mutable Git workspace",
         "removes stale reply artifacts before the session starts or autonomous work runs",
@@ -526,12 +561,12 @@
         "refreshes from the READ-SCOPED endpoint and never from the push-capable one",
         "keeps the existing token when the refresh returns nothing",
         "never throws when the refresh fails, so the resident loop survives",
-        "mints a FRESH read-scoped token and clones with it — never the stale push token",
+        "mints a FRESH read-scoped token and clones with it \u2014 never the stale push token",
         "restores the refreshable credential helper so fetch survives the next TTL",
         "calls recordOperatorDecisionCapture(true) when operator turn has OPERATOR-DECISION marker",
         "keeps an earlier markerless exchange pending when a later marked turn arrives before the corrective tick",
         "recovers a missed OPERATOR-DECISION from the corrective tick, admits it to the durable register, and the heartbeat carries it (classification+admission run BEFORE the heartbeat)",
-        "records a capture (true) — NOT a miss — when the corrective tick completes cleanly with no recovered decision",
+        "records a capture (true) \u2014 NOT a miss \u2014 when the corrective tick completes cleanly with no recovered decision",
         "keeps operatorDecisionCorrectiveNext armed across an INTERRUPTED corrective tick and fires it again on the next autonomous tick",
         "exhausts review attempts and force-admits exchange text to the durable decisions register, clearing the review and emitting a status",
         "exhausted-attempts fallback with no exchange text produces [exchange text unavailable] in the note",
@@ -629,38 +664,43 @@
         "keeps the shared private Workday boundary replyless, silent, and serialized",
         "answers server fast-marked rows through the legacy Workday path when typed Fast is not activated",
         "rewinds and immediately repolls when the server advertises an older open-message floor"
-      ]
+      ],
+      "test_count": 126
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
-      "reason": "Covers the StrategicSessionEvents component — the live event feed and target drilldowns for a conversational Workday session. Restored with the persistent Workday UI; guard ensures the event feed is not silently deleted again.",
+      "reason": "Covers the StrategicSessionEvents component \u2014 the live event feed and target drilldowns for a conversational Workday session. Restored with the persistent Workday UI; guard ensures the event feed is not silently deleted again.",
       "test_ids": [
         "renders bounded event rows with compact metadata",
         "opens event targets through the provided handler",
         "renders an empty label when requested",
         "treats backend naive timestamps as UTC"
-      ]
+      ],
+      "test_count": 4
     },
     {
       "path": "admin-ui/src/App.wiring.test.ts",
       "reason": "Protects the App-level chat Workday seam so the lifecycle control remains connected to the live session state, pinned runner selection, and start/stop handlers.",
       "test_ids": [
         "keeps chat Workday lifecycle wired to live session state and runner controls"
-      ]
+      ],
+      "test_count": 10
     },
     {
       "path": "admin-ui/src/components/StrategicContextRail.test.tsx",
       "reason": "Protects the compact Strategic rail's recent Workday signal rendering and event-target navigation.",
       "test_ids": [
         "renders warning work session signals and routes event targets"
-      ]
+      ],
+      "test_count": 55
     },
     {
       "path": "admin-ui/src/components/StrategicContextWorkspace.test.tsx",
       "reason": "Protects the full Strategic context workspace's recent Workday flow and event-target navigation.",
       "test_ids": [
         "renders recent session flow and opens existing targets"
-      ]
+      ],
+      "test_count": 20
     },
     {
       "path": "admin-ui/src/components/MessagesPanel.test.tsx",
@@ -674,7 +714,8 @@
         "sends a queued tool revision with operator intent and preserves exact identity across retry",
         "removing an unrelated artifact preserves the queued handoff operator intent",
         "drains only one queued handoff and immediately shows the next after chip removal"
-      ]
+      ],
+      "test_count": 64
     },
     {
       "path": "admin-ui/src/hooks/useConversation.test.tsx",
@@ -683,24 +724,26 @@
         "calls sendAck with the realtime message id when a conversation message is merged",
         "can acknowledge the same canonical message again on a recovery frame",
         "re-acknowledges an admitted replay after conversation navigation"
-      ]
+      ],
+      "test_count": 28
     },
     {
       "path": "admin-ui/src/components/MessagesPanel.advanced.test.tsx",
       "reason": "Protects end-to-end attachment recovery when an upload receipt expires, including byte re-upload and stable message identity.",
       "test_ids": [
         "expired attachment receipt re-uploads durable bytes under the same message identity"
-      ]
+      ],
+      "test_count": 32
     },
     {
       "path": "agent/src/handlers/strategic-resident-lib.test.ts",
-      "reason": "Covers strategic-resident-lib.ts — the core utility library for the conversational Workday resident session (config knobs, message cursor, dedup, content blocks, bootstrap/autonomous prompts, compaction checkpoint, exam ledger, operator-decision review, decisions register, surface catalog, tick-verdict parsing, and frame coalescer). These 242 it() cases and one it.each block are the deepest unit-level coverage of the resident session logic; deleting or emptying this file would leave all resident-lib primitives entirely untested.",
+      "reason": "Covers strategic-resident-lib.ts \u2014 the core utility library for the conversational Workday resident session (config knobs, message cursor, dedup, content blocks, bootstrap/autonomous prompts, compaction checkpoint, exam ledger, operator-decision review, decisions register, surface catalog, tick-verdict parsing, and frame coalescer). These 242 it() cases and one it.each block are the deepest unit-level coverage of the resident session logic; deleting or emptying this file would leave all resident-lib primitives entirely untested.",
       "test_ids": [
         "does not fire unchanged-state exploration when the interval is disabled",
         "has no scheduled review when unchanged-state exploration is disabled",
         "retains the scheduled projection for enabled exploration",
         "uses contract defaults when the payload omits the knobs",
-        "reads the payload knobs (seconds → ms)",
+        "reads the payload knobs (seconds \u2192 ms)",
         "preserves zero as the disabled unchanged-state exploration sentinel",
         "keeps canned acknowledgements disabled regardless of stale payload settings",
         "clamps to safe minimums",
@@ -826,8 +869,8 @@
         "uses the MAX atTick per surface and honors n",
         "ignores records for surfaces no longer in the catalog",
         "parses ADVANCED (no surface key)",
-        "parses FOUND <surface> — note without splitting a hyphenated key",
-        "parses CLEAR <surface> — note",
+        "parses FOUND <surface> \u2014 note without splitting a hyphenated key",
+        "parses CLEAR <surface> \u2014 note",
         "uses the LAST marker and is case-insensitive",
         "handles a FOUND/CLEAR with a space separator (no dash)",
         "returns null for a missing or garbled marker",
@@ -866,7 +909,7 @@
         "seal() closes the trailing open text so a later delta starts a fresh frame",
         "seal() is a no-op on an empty or already-sealed queue",
         "ignores empty text and drain() empties the queue in order",
-        "round-trips a ledger through serialize → restore",
+        "round-trips a ledger through serialize \u2192 restore",
         "restoreLedger returns null for undefined / empty / malformed input",
         "caps records at EXAM_RECORDS_CAP on serialize",
         "drops oldest records to stay within EXAM_LEDGER_MAX_BYTES",
@@ -911,7 +954,7 @@
         "omits the timestamp when set_at is absent",
         "skips entries with a missing/blank note and drops non-object entries",
         "degrades to empty string for empty / non-array input",
-        "renders KnowledgeDocument index entries as \"- [created_at] title — summary\"",
+        "renders KnowledgeDocument index entries as \"- [created_at] title \u2014 summary\"",
         "renders index entry with title only when summary is absent",
         "renders index entry with summary only when title is absent",
         "renders index entry without timestamp when created_at is absent",
@@ -940,7 +983,7 @@
         "leaves threshold undefined when payload omits it",
         "reads compaction cooldown from payload",
         "clamps compaction cooldown to minimum 60s",
-        "round-trips a register through serialize → restore",
+        "round-trips a register through serialize \u2192 restore",
         "restoreDecisionsReg returns null for undefined / empty / malformed input",
         "empty register returns a valid empty entries array from serializeDecisionsReg",
         "caps at DECISIONS_REGISTER_CAP entries on restore",
@@ -981,16 +1024,17 @@
         "treats an unsettled last verdict (found/unevidenced) as due regardless of change signal",
         "exploration turn is suppressed when nothing is due, runs when a surface is due, and never overrides a real wake",
         "never suppresses the FIRST autonomous turn of a session (empty-session guard)",
-        "persists the change-gate signal across serialize → restore (baseline survives restart)",
+        "persists the change-gate signal across serialize \u2192 restore (baseline survives restart)",
         "re-examines a legacy clear record with no stored signal (seeds a baseline once)",
         "renders the backend-resolved effective policy with explicit source precedence",
         "ignores absent or non-record effective policy payloads",
         "buildCompactionCheckpoint preserves effective policy authority and freshness rules"
-      ]
+      ],
+      "test_count": 290
     },
     {
       "path": "admin-ui/src/hooks/useStrategicLiveness.test.tsx",
-      "reason": "Covers useStrategicLiveness — the React hook that probes the backend liveness endpoint for the conversational Workday resident session. Guards: null/disabled short-circuit, mount fetch, stale-response generation guard (project switch while probe in flight), and error-swallowing so a failed probe never crashes the UI.",
+      "reason": "Covers useStrategicLiveness \u2014 the React hook that probes the backend liveness endpoint for the conversational Workday resident session. Guards: null/disabled short-circuit, mount fetch, stale-response generation guard (project switch while probe in flight), and error-swallowing so a failed probe never crashes the UI.",
       "test_ids": [
         "returns null data and does not fetch when projectId is null",
         "does not fetch when disabled",
@@ -998,7 +1042,8 @@
         "clears data immediately on project change and refetches for the new project",
         "drops a stale response whose project no longer matches (generation guard)",
         "swallows a failed probe and leaves data null"
-      ]
+      ],
+      "test_count": 6
     },
     {
       "path": "admin-ui/src/api/projectTools.residentArtifact.test.ts",
@@ -1009,7 +1054,8 @@
         "returns a typed pending response for 202",
         "surfaces a 409 as a revision-aware conflict",
         "treats 401 as retryable so replay reuses the same receipt"
-      ]
+      ],
+      "test_count": 5
     },
     {
       "path": "backend/testing/test_reaper.py",
@@ -1017,7 +1063,8 @@
       "test_ids": [
         "test_classify_orphan_resident_session_exempt_from_progress_staleness",
         "test_classify_resident_session_warm_idle_not_reaped"
-      ]
+      ],
+      "test_count": 472
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",
@@ -1026,7 +1073,8 @@
         "associates the disabled explanation with both handoff actions",
         "announces busy and draft-queue completion",
         "coalesces a double click into one handoff operation"
-      ]
+      ],
+      "test_count": 3
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.viewport.test.tsx",
@@ -1034,7 +1082,8 @@
       "test_ids": [
         "renders handoff controls without overflow, clipped text, or small targets at 375px",
         "renders disabled-reason and preparing states without overflow at 375px"
-      ]
+      ],
+      "test_count": 2
     },
     {
       "path": "admin-ui/src/utils/residentToolHandoff.test.ts",
@@ -1047,7 +1096,8 @@
         "rejects a mismatched project or missing author before persistence",
         "acknowledges only the snapshot and preserves an interleaved later event",
         "removes malformed and expired scoped entries during maintenance"
-      ]
+      ],
+      "test_count": 7
     },
     {
       "path": "admin-ui/src/utils/pendingWhiteboardArtifactRef.test.ts",
@@ -1059,7 +1109,8 @@
         "coalesces duplicate settlement attempts for one operation identity",
         "persists an exponential next retry so repeated Resume clicks stay below 30/minute",
         "terminal rejection preserves user intent and receipt for a fresh render"
-      ]
+      ],
+      "test_count": 6
     },
     {
       "path": "admin-ui/src/components/NotesTool.test.tsx",
@@ -1068,7 +1119,8 @@
         "Share in conversation flushes the exact dirty revision before creating its reference",
         "an unresolved conflict refuses conversation handoff",
         "a failed flush never creates a conversation reference"
-      ]
+      ],
+      "test_count": 13
     },
     {
       "path": "admin-ui/src/components/WhiteboardTool.test.tsx",
@@ -1080,7 +1132,8 @@
         "pending preparation becomes waiting and Resume reaches ready with the same receipt",
         "terminal preparation retries with a fresh render while preserving Share/Ask intent",
         "cross-tab removal clears stale Resume only when the exact durable operation disappeared"
-      ]
+      ],
+      "test_count": 14
     },
     {
       "path": "backend/testing/test_workday_artifact_materialization.py",
@@ -1103,9 +1156,9 @@
         "test_whiteboard_receipt_mismatch_is_permanently_quarantined",
         "test_required_images_progress_oldest_first_across_poll_batches",
         "test_single_message_exceeding_image_budget_is_quarantined_not_starved"
-      ]
+      ],
+      "test_count": 17
     }
   ],
-
   "deleted_frontend": []
 }

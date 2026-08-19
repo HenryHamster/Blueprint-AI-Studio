@@ -2659,23 +2659,22 @@ async def run_qualification(
     #     the fix; its surface == the passed one by hypothesis) WITHOUT re-running
     #     the ~15min audit or re-rolling the non-deterministic score (the v21
     #     treadmill).  Strictly gated: prior status promotion_failed AND the live
-    #     candidate_diff_hash is truthy AND == the prior verdict's hash AND the
-    #     promotion-failure re-qualify cap is NOT exhausted.  ANY miss (a CHANGED
-    #     surface = an app-code fix, or the cap reached) FALLS THROUGH to the
-    #     normal re-audit below — fail-safe.
-    #
+    #     candidate_diff_hash is truthy AND == the prior verdict's hash.
     #     Lock/session discipline (critical): the promote runs in a DEDICATED
     #     AsyncSessionLocal session, NEVER this caller's — otherwise promote()'s
     #     intermediate commit (which it issues to free the row lock before its
     #     30-120s of GitHub I/O) would prematurely commit the caller's unrelated
     #     dirty work.  This runs BEFORE this function's own FOR UPDATE lock (step
     #     4 below): the dedicated session must be free to SELECT..FOR UPDATE the
-    #     version row, which this caller has NOT yet locked, so there is no
-    #     self-deadlock.  The dedicated helper re-verifies the gate + cap under
-    #     its OWN row lock (authoritative — the pre-lock read may be stale) and
-    #     reconstructs composite/base_record from the passing fields the
-    #     promotion_failed record carries; a None return (state changed, cap hit,
-    #     candidate already on main, lock contended) falls through to re-audit.
+    #     version row, which this caller has NOT yet locked. A capped record is
+    #     escalated below; otherwise the dedicated retry is used.
+    if (_pre_lock_qual.get("status") == "promotion_failed" and
+            int(_pre_lock_qual.get("promotion_failure_count") or 0) >=
+            _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS):
+        from app.release_qualifier_redrive import _escalate_promotion_failure_loop_in_dedicated_session
+        await _escalate_promotion_failure_loop_in_dedicated_session(version.id, session_factory=session_factory)
+        return {"status": "promotion_failed_requalify_cap", "candidate_sha": candidate_sha}
+
     if (
         not effective_requested_probes
         and _qualification_probe_contract_is_reusable(
@@ -9904,7 +9903,9 @@ async def _reattempt_promotion_failed_locked(
         int(qual.get("promotion_failure_count") or 0)
         >= _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
     ):
-        return None
+        from app.release_qualifier_redrive import _escalate_promotion_failure_loop
+        await _escalate_promotion_failure_loop(session, version)
+        return {"status": "promotion_failed_requalify_cap", "candidate_sha": candidate_sha}
 
     # Reconstruct the composite promote() needs (it only reads confidence, for
     # the PR body) from the passing verdict — do NOT re-score.

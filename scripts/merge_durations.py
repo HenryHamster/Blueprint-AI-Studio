@@ -16,7 +16,15 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from durations_quality import MIN_ENTRIES, MIN_UNIQUE, MIN_CV, OUTLIER_CAP, quality_ok
+from durations_quality import (
+    IN_BAND_SETUP_MAX,
+    MIN_CV,
+    MIN_ENTRIES,
+    MIN_UNIQUE,
+    OUTLIER_CAP,
+    in_band_setup_artifacts,
+    quality_ok,
+)
 
 
 def _valid_test_ids(path: Path) -> set[str] | None:
@@ -101,6 +109,15 @@ def merge(src_dir: str, output_path: str) -> int:
                 merged[k] = v
         added = len(merged) - pre
         print(f"  {os.path.relpath(path, src_dir)}: {len(data)} entries ({added} new)")
+
+    band_artifacts = in_band_setup_artifacts(merged)
+    for key in band_artifacts:
+        del merged[key]
+    if band_artifacts:
+        print(
+            f"  Dropped {len(band_artifacts)} in-band setup artifacts "
+            f"({IN_BAND_SETUP_MAX:g}s plateau with no following observations)"
+        )
 
     if outlier_count:
         print(f"  Dropped {outlier_count} outlier(s) > {OUTLIER_CAP}s (fixture-setup misattribution)")
