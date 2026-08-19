@@ -34,7 +34,14 @@ from app.models import CompletionDebtEntry, Project, VersionAcceptanceCriterion
 
 
 async def _setup(db_session):
-    """Create a project + one open release version."""
+    """Create a project + one open release version with an empty rubric.
+
+    ``open_version`` seeds the default operator-authorship criterion on every
+    new version. These tests exercise the ledger's pure met/residual logic
+    against rubrics they author themselves, so retract the seeded criterion
+    (retracted criteria are excluded from the active set — proven separately
+    by test_retracted_criterion_not_required) to start from a clean slate.
+    """
     project = Project(name="cvl-test", user_id="cvl-user")
     db_session.add(project)
     await db_session.commit()
@@ -43,6 +50,18 @@ async def _setup(db_session):
     version = await rv.open_version(db_session, project.id, version_number=1)
     await db_session.commit()
     await db_session.refresh(version)
+
+    seeded = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.release_version_id == version.id
+            )
+        )
+    ).scalars().all()
+    for criterion in seeded:
+        criterion.status = "retracted"
+        db_session.add(criterion)
+    await db_session.commit()
     return project, version
 
 

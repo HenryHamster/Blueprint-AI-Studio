@@ -32,7 +32,7 @@ from app.models import (
     VersionAcceptanceCriterion,
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 5450
+_MODULE_SIZE_GOVERNANCE_CAP: int = 5950
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession

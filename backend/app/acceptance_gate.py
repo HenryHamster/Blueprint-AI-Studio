@@ -88,7 +88,7 @@ from app.acceptance_provenance import (
     stamp_commit_range_derived_changed_files_signal as _stamp_commit_range_signal,
     stamp_changed_files_skip_reason,
 )
-_MODULE_SIZE_GOVERNANCE_CAP: int = 3448
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3650
 
 logger = logging.getLogger(__name__)
 

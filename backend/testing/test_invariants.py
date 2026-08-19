@@ -6071,13 +6071,42 @@ class TestTestFileSizeGuardrails:
             "and commit the updated module_size_limits.json."
         )
 
-_SCRIPTS_ROOT = (
-    os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
-    if os.path.isdir(
-        os.path.join(os.path.dirname(__file__), "..", "..", "scripts")
+def _resolve_scripts_root() -> str | None:
+    """Resolve the repo's scripts/ directory across both test layouts.
+
+    The CI shard containers mount the backend at /app and the full repo at
+    /repo, so ``../../scripts`` relative to testing/ does not exist there —
+    /repo/scripts is the canonical location (same convention as
+    ``_script_test_harness``). Local checkouts resolve the sibling path.
+    When CI is set and neither candidate exists the guardrail must HARD-FAIL,
+    not skip: a silently unresolvable scripts/ tree would blind every scripts
+    cap in module_size_limits.json.
+    """
+    candidates = (
+        os.path.join("/repo", "scripts"),
+        os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "scripts")
+        ),
     )
-    else None
-)
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+_SCRIPTS_ROOT = _resolve_scripts_root()
+
+
+def _require_scripts_root() -> str:
+    if _SCRIPTS_ROOT is None:
+        if os.environ.get("CI"):
+            pytest.fail(
+                "scripts/ directory is unavailable (checked /repo/scripts and "
+                "the repo-relative sibling); the CI harness must mount the "
+                "repo at /repo so scripts size caps stay enforced"
+            )
+        pytest.skip("scripts/ directory not available in this environment")
+    return _SCRIPTS_ROOT
 
 class TestScriptsModuleSizeGuardrails:
     """Loose upper bounds for scripts/ files to catch runaway growth.
@@ -6090,7 +6119,7 @@ class TestScriptsModuleSizeGuardrails:
 
     def _check_scripts_file(self, relative_path: str) -> None:
         max_lines = SCRIPTS_SIZE_LIMITS[relative_path]
-        path = os.path.join(_SCRIPTS_ROOT, relative_path)
+        path = os.path.join(_require_scripts_root(), relative_path)
         assert os.path.isfile(path), _stale_size_cap_message(relative_path, "scripts")
         with open(path, encoding="utf-8") as f:
             count = len(f.readlines())
@@ -6117,8 +6146,9 @@ class TestScriptsModuleSizeGuardrails:
         the breaching entry. Do NOT modify this test to raise the threshold.
         """
         stale = []
+        scripts_root = _require_scripts_root()
         for rel_path, cap in SCRIPTS_SIZE_LIMITS.items():
-            abs_path = os.path.join(_SCRIPTS_ROOT, rel_path)
+            abs_path = os.path.join(scripts_root, rel_path)
             if not os.path.exists(abs_path):
                 continue
             with open(abs_path, encoding="utf-8") as fh:
@@ -6275,12 +6305,8 @@ class TestSizeGuardrailCoverage:
         assert not offenders, _missing_cap_message(offenders, "testing")
 
     def test_scripts_no_uncapped_large_file(self):
-        import pytest
-
-        if _SCRIPTS_ROOT is None:
-            pytest.skip("scripts/ not available in this test environment")
         offenders = _scan_uncapped(
-            _SCRIPTS_ROOT, SCRIPTS_SIZE_LIMITS, (".py",), lambda _rel: False
+            _require_scripts_root(), SCRIPTS_SIZE_LIMITS, (".py",), lambda _rel: False
         )
         assert not offenders, _missing_cap_message(offenders, "scripts")
 

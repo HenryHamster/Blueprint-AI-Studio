@@ -347,6 +347,16 @@ async def _add_conversation_message(
     sequence: int,
     delivered_at=None,
 ) -> ProjectMessage:
+    # The conversation visibility predicate is fail-closed for machine-authored
+    # rows (strategic/system): they are only transcript-visible with a
+    # registered operator-conversation event_type (or reply provenance). Stamp
+    # a registered type so these rows model real strategist/system replies;
+    # human rows (user/operator) are visible unconditionally.
+    context = None
+    if from_type == "strategic":
+        context = {"event_type": "question_answer"}
+    elif from_type == "system":
+        context = {"event_type": "failure_alert"}
     msg = ProjectMessage(
         project_id=project_id,
         sequence=sequence,
@@ -356,6 +366,7 @@ async def _add_conversation_message(
         content=f"{from_type} message {sequence}",
         created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
         delivered_at=delivered_at,
+        context=context,
     )
     db_session.add(msg)
     await db_session.commit()

@@ -9892,7 +9892,6 @@
   "testing/test_max_plan_pool.py::TestQuarantineTrigger::test_no_trigger_when_earlier_records_disqualify_last_n": 0.0017002479999064235,
   "testing/test_max_plan_pool.py::TestQuarantineTrigger::test_no_trigger_when_fewer_than_n_records": 0.0016972399998849141,
   "testing/test_max_plan_pool.py::TestQuarantineTrigger::test_no_trigger_when_mixed_classes_break_streak": 0.0017402030007360736,
-  "testing/test_max_plan_pool.py::TestQuarantineTrigger::test_quarantine_cooldown_is_short_flat": 0.0037661389987988514,
   "testing/test_max_plan_pool.py::TestQuarantineTrigger::test_quota_exhausted_not_overridden_by_quarantine": 0.00323323500015249,
   "testing/test_max_plan_pool.py::TestQuarantineTrigger::test_triggers_when_last_n_are_provision_failure_high_confidence": 0.0017212869997820235,
   "testing/test_max_plan_pool.py::TestQuarantineTrigger::test_triggers_when_last_n_are_rate_limit_high_confidence": 0.0020089009985895245,
