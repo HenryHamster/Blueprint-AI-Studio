@@ -1010,7 +1010,7 @@ describe('MessagesPanel chrome modes', () => {
     expect(el.textContent).not.toContain('Question waiting');
   });
 
-  test('minimal chat composer shows live Strategic context and opens the sideboard', async () => {
+  test('minimal chat composer no longer renders the composer-adjacent context bar', async () => {
     const sessionStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
     const lastInteractionAt = new Date(Date.now() - 5 * 60_000).toISOString();
     const onOpenStrategicContextWorkspace = vi.fn();
@@ -1070,20 +1070,10 @@ describe('MessagesPanel chrome modes', () => {
       },
     });
 
-    const descriptor = el.querySelector('[data-testid="strategic-context-descriptor"]') as HTMLButtonElement | null;
-    expect(descriptor).not.toBeNull();
-    expect(descriptor?.textContent).toContain('Workbench context');
-    expect(descriptor?.textContent).toContain('Workday');
-    expect(descriptor?.textContent).toContain('Context ready');
-    expect(descriptor?.textContent).toContain('Latest context report');
-    expect(descriptor?.textContent).not.toContain('1 ref');
-    expect(descriptor?.textContent).not.toContain('8 nodes / 7 links');
-    expect(descriptor?.textContent).not.toContain('18 items');
-
-    await act(async () => {
-      descriptor?.click();
-    });
-    expect(onOpenStrategicContextWorkspace).toHaveBeenCalledTimes(1);
+    // The composer-adjacent bar (StrategicContextDescriptor variant="composer")
+    // is removed; only an in-message receipt (variant="receipt") may render.
+    expect(el.querySelector('[data-testid="strategic-context-descriptor"]')).toBeNull();
+    expect(onOpenStrategicContextWorkspace).not.toHaveBeenCalled();
   });
 
   test('minimal chat composer hides stale Strategic workbench context', async () => {

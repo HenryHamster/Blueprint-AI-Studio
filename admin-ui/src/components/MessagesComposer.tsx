@@ -1,9 +1,7 @@
-import { memo, useRef, useState, type ReactNode, type RefObject } from 'react';
-import { Command, X, Send, Reply, Paperclip, FileText, Image, Sigma } from 'lucide-react';
+import { memo, useRef, useState, type RefObject } from 'react';
+import { Command, X, Send, Reply, Paperclip, FileText, Image } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
-import { type ArmingOutcome, composerHintCopy } from './messageArming';
-import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
-import { StrategicContextDescriptor } from './StrategicContextDescriptor';
+import { type ArmingOutcome, armingHintCopy } from './messageArming';
 import { AttachmentPreviewModal } from './AttachmentPreviewModal';
 import { MarkdownContent } from './MarkdownContent';
 import { hasMathDelimiters } from '../utils/mathContent';
@@ -44,9 +42,6 @@ export interface MessagesComposerProps {
   replyTo: { id: string; content: string; from: string; message_type: string; status: string } | null;
   /** Outcome the server reported for the last send, or null before any send. */
   lastArming?: ArmingOutcome | null;
-  /** Whether a strategic cycle is currently running (live WS-driven signal). */
-  strategistBusy?: boolean;
-  strategicContext?: StrategicContextDescriptorModel | null;
   capabilityHint?: string | null;
   disabledReason?: string | null;
   pendingAttachments?: PendingAttachment[];
@@ -54,9 +49,7 @@ export interface MessagesComposerProps {
   sourceRefs?: ComposerSourceRef[];
   artifactRefs?: ComposerArtifactRef[];
   uploading?: boolean;
-  onOpenStrategicContext?: () => void;
   onOpenCommandPalette?: () => void;
-  leadingControl?: ReactNode;
   onChangeType: (value: string) => void;
   onChangeContent: (value: string) => void;
   onCancelReply: () => void;
@@ -94,8 +87,6 @@ export const MessagesComposer = memo(function MessagesComposer({
   editingLocked,
   replyTo,
   lastArming,
-  strategistBusy,
-  strategicContext,
   capabilityHint,
   disabledReason,
   pendingAttachments,
@@ -103,9 +94,7 @@ export const MessagesComposer = memo(function MessagesComposer({
   sourceRefs = [],
   artifactRefs = [],
   uploading,
-  onOpenStrategicContext,
   onOpenCommandPalette,
-  leadingControl,
   onChangeType,
   onChangeContent,
   onCancelReply,
@@ -133,17 +122,15 @@ export const MessagesComposer = memo(function MessagesComposer({
   const overLimit = newContent.length > MESSAGE_CONTENT_MAX;
   const nearLimit = newContent.length > MESSAGE_CONTENT_MAX * 0.8;
 
-  // Hint reflects the server's real decision for the last send when available
-  // (the only source that accounts for routine/system event exclusions),
-  // falling back to the type-based prediction before any message has been sent —
-  // and, when the strategist is mid-cycle, flagging that a steer is queued rather
-  // than acting immediately.
   const minimal = chrome === 'minimal';
   const minimalColumnClass = 'mx-auto w-full max-w-[940px]';
   const composerDisabled = Boolean(disabledReason);
-  const hintArming = minimal && strategistBusy && lastArming !== 'not_armed' ? null : lastArming;
-  const hintText = composerHintCopy(newType, hintArming, strategistBusy);
-  const showHint = Boolean(disabledReason) || !minimal || Boolean(strategistBusy) || lastArming === 'not_armed' || sendState != null;
+  // `not_armed` means the server tried to arm a steer and could NOT persist it —
+  // the strategist was genuinely not woken. Every other outcome is steady-state
+  // narration the operator doesn't need repeated on every message, so this is
+  // the only outcome with an inline hint, surfaced distinctly as a warning.
+  const notArmedHint = lastArming === 'not_armed' ? armingHintCopy('not_armed') : null;
+  const showHint = Boolean(disabledReason) || Boolean(notArmedHint) || sendState != null;
   const sendStateHint = sendState === 'sending'
     ? 'Sending…'
     : sendState === 'needs_retry'
@@ -243,29 +230,11 @@ export const MessagesComposer = memo(function MessagesComposer({
   const attHasPreview = (att: PendingAttachment): string | null =>
     att.previewUrl;
 
-  function insertEquation() {
-    const el = textareaRef.current;
-    if (!el || composerDisabled || editingLocked) return;
-    const start = el.selectionStart ?? 0;
-    const end = el.selectionEnd ?? 0;
-    const placeholder = 'equation';
-    const newText = `${newContent.slice(0, start)}$${placeholder}$${newContent.slice(end)}`;
-    onChangeContent(newText);
-    requestAnimationFrame(() => {
-      if (!textareaRef.current) return;
-      textareaRef.current.focus();
-      textareaRef.current.setSelectionRange(start + 1, start + 1 + placeholder.length);
-    });
-  }
-
   return (
     <div className={minimal
       ? 'shrink-0 border-t border-workbench-border bg-workbench-base px-2 pb-2 pt-1.5 md:px-2.5'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-workbench-shell/50'
     }>
-      {minimal && strategicContext && (
-        <StrategicContextDescriptor model={strategicContext} onOpen={onOpenStrategicContext} />
-      )}
       {minimal && !newContent && capabilityHint && (
         <p className={`${minimalColumnClass} mb-1 px-1 text-ui-md text-neutral-600 leading-snug`}>
           {capabilityHint}
@@ -421,7 +390,6 @@ export const MessagesComposer = memo(function MessagesComposer({
         )}
         {minimal && (
           <>
-            {leadingControl}
             {onOpenCommandPalette && (
               <button
                 type="button"
@@ -444,16 +412,6 @@ export const MessagesComposer = memo(function MessagesComposer({
             >
               <Paperclip className="h-3.5 w-3.5" />
             </button>
-            <button
-              type="button"
-              onClick={insertEquation}
-              disabled={composerDisabled || Boolean(editingLocked)}
-              title="Insert equation"
-              aria-label="Insert equation"
-              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-workbench-shell/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-workbench-hover/80 hover:text-neutral-300 disabled:opacity-40"
-            >
-              <Sigma className="h-3.5 w-3.5" />
-            </button>
           </>
         )}
         {!minimal && (
@@ -466,18 +424,6 @@ export const MessagesComposer = memo(function MessagesComposer({
             className="flex shrink-0 items-center justify-center rounded-lg bg-workbench-base/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-workbench-hover hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
           >
             <Paperclip className="w-4 h-4" />
-          </button>
-        )}
-        {!minimal && (
-          <button
-            type="button"
-            onClick={insertEquation}
-            disabled={composerDisabled || Boolean(editingLocked)}
-            title="Insert equation"
-            aria-label="Insert equation"
-            className="flex shrink-0 items-center justify-center rounded-lg bg-workbench-base/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-workbench-hover hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
-          >
-            <Sigma className="w-4 h-4" />
           </button>
         )}
         <div className="relative flex-1">
@@ -516,18 +462,22 @@ export const MessagesComposer = memo(function MessagesComposer({
           <Send className="w-4 h-4" />
         </button>
       </div>
-      {/* Steering hint: grounded in the last send's real outcome when available,
-          otherwise predicted from the selected type. */}
+      {/* not_armed is the only steady hint left: a genuine delivery failure
+          (the server tried to arm the steer and could not), surfaced only
+          when it happens rather than blended into always-on narration. */}
       {(showHint || nearLimit) && (
         <div className={minimal ? `${minimalColumnClass} mt-1.5 px-1` : ''}>
           {showHint && (
             <p
               id={sendState ? 'message-send-status' : undefined}
-              role={sendState ? 'status' : undefined}
-              aria-live={sendState ? 'polite' : undefined}
-              className={`${minimal ? 'text-ui-md text-neutral-600' : 'text-ui-md text-neutral-500'} leading-snug ${minimal ? '' : 'mt-1.5 px-0.5'}`}
+              role={sendState ? 'status' : notArmedHint ? 'alert' : undefined}
+              aria-live={sendState || notArmedHint ? 'polite' : undefined}
+              className={`${!disabledReason && !sendStateHint && notArmedHint
+                ? 'text-ui-md font-medium text-amber-400'
+                : (minimal ? 'text-ui-md text-neutral-600' : 'text-ui-md text-neutral-500')
+              } leading-snug ${minimal ? '' : 'mt-1.5 px-0.5'}`}
             >
-              {disabledReason ?? sendStateHint ?? hintText}
+              {disabledReason ?? sendStateHint ?? notArmedHint}
             </p>
           )}
           {sendState === 'needs_retry' && onAbandonPending && (

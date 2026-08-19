@@ -28,8 +28,6 @@ import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useConversationSend } from '../hooks/useConversationSend';
 import { compareConversationMessages, isCanonicalConversationEnvelope, useConversation } from '../hooks/useConversation';
-import { useStrategicCall } from '../hooks/useStrategicCall';
-import { StrategicCallLauncher, StrategicCallMode } from './StrategicCallMode';
 import { useStrategistStatus } from '../hooks/useStrategistStatus';
 import { StrategistStatusChip } from './StrategistStatusChip';
 import { DirectionsAddForm } from './DirectionsAddForm';
@@ -43,7 +41,7 @@ import {
   type StrategicStateResponse,
   type StrategicWorkbenchState,
 } from '../strategicStateApi';
-import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
+import { SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
 import { computeResidentActivityState } from '../utils/strategicSessionLive';
 import { buildConversationWorkdayStatus } from '../utils/conversationWorkdayStatus';
 import { messageHasClientIdentity, mergeCanonicalConversationMessage } from '../utils/conversationMessageIdentity';
@@ -493,11 +491,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
   const conversationMode = resolvedFilterChrome === 'minimal';
-  const strategicCall = useStrategicCall(conversationMode && canOperateProject ? selectedProjectId : null);
-  const strategicCallEnabled = Boolean(
-    strategicCall.call
-    && !['ended', 'failed', 'expired'].includes(strategicCall.call.status),
-  );
   const currentActorUserId = auth.currentUser?.uid ?? auth.currentUser?.email ?? null;
   const currentStrategicState = strategicState?.project_id === selectedProjectId ? strategicState : null;
   const usesStrategicReadModel = currentStrategicState != null;
@@ -1468,12 +1461,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       });
     return () => { cancelled = true; if (!settled) recoveryKeys.delete(recoveryKey); };
   }, [canOperateProject, clearSubmittedComposerDraft, conversationMode, currentActorUserId, optimisticSend, resetComposerIntent, selectedProjectId]);
-  const strategicComposerContext = useMemo(
-    () => conversationMode
-      ? buildStrategicContextDescriptor(currentStrategicState, strategicWorkbenchState)
-      : null,
-    [conversationMode, currentStrategicState, strategicWorkbenchState],
-  );
   const mutedCount = useMemo(
     () => Object.values(eventPrefs).filter(v => v === 'mute').length,
     [eventPrefs],
@@ -2294,10 +2281,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
           return;
         }
         setMessages(previous => mergeCanonicalConversationMessage(previous, canonicalMessage));
-        // The ordinary message endpoint is the durable commit boundary. Only
-        // after it returns a canonical row may the call transport receive its
-        // deliberately content-free wake hint.
-        void strategicCall.publishCommittedMessage(canonicalMessage).catch(() => undefined);
         const wakeupState = data.wakeup_state ?? recoveredReceipt?.wakeup_state ?? null;
         const acceptedState = wakeupState === 'paused' || wakeupState === 'waiting_for_capacity'
           ? 'waiting'
@@ -3282,22 +3265,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       )}
 
       {/* Compose area — bottom, chat-style */}
-      {canOperateProject && conversationMode && (
-        <StrategicCallMode
-          enabled={strategicCallEnabled}
-          connectionState={strategicCall.connectionState}
-          microphoneState={strategicCall.microphoneState}
-          audioPlaybackState={strategicCall.audioPlaybackState}
-          captions={strategicCall.captions}
-          displayBlocks={strategicCall.displayBlocks}
-          error={strategicCall.error}
-          onStart={() => { void strategicCall.start(); }}
-          onEnd={() => { void strategicCall.end(); }}
-          onReconnect={() => { void strategicCall.reconnect(); }}
-          onToggleMicrophone={() => { void strategicCall.toggleMicrophone(); }}
-          onEnableAudio={() => { void strategicCall.enableAudio(); }}
-        />
-      )}
       {canOperateProject && <MessagesComposer
         textareaRef={textareaRef}
         newType={effectiveNewType}
@@ -3310,7 +3277,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         editingLocked={sendState === 'sending' || sendState === 'needs_retry'}
         replyTo={replyTo}
         lastArming={lastArming}
-        strategistBusy={conversationMode ? false : strategistActive}
         disabledReason={selectedProjectId ? null : 'Select a project to message Strategic'}
         pendingAttachments={pendingAttachments}
         retainedAttachmentCount={sendState === 'needs_retry'
@@ -3333,11 +3299,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         onSubmit={handleSubmit}
         capabilityHint={showEmptyConversationHint ? WORKDAY_CAPABILITY_HINT : undefined}
         chrome={conversationMode ? 'minimal' : 'full'}
-        strategicContext={strategicComposerContext}
-        leadingControl={conversationMode && !strategicCallEnabled && strategicCall.connectionState === 'idle'
-          ? <StrategicCallLauncher onStart={() => { void strategicCall.start(); }} />
-          : undefined}
-        onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}
         onOpenCommandPalette={conversationMode ? openMessageCommandSurface : undefined}
       />}
     </div>

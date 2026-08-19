@@ -468,15 +468,6 @@ describe('StrategicContextRail — viewport regression', () => {
                   newContent=""
                   submitting={false}
                   replyTo={null}
-                  strategistBusy={false}
-                  strategicContext={{
-                    modeLabel: 'Chat',
-                    surfaceLabel: 'Strategic',
-                    contextLabel: 'Context ready',
-                    contextTone: 'ready',
-                    refCount: 1,
-                    refs: [{ kind: 'canvas', id: 'canvas:proj-1', label: 'Strategic map' }],
-                  }}
                   onChangeType={() => {}}
                   onChangeContent={() => {}}
                   onCancelReply={() => {}}

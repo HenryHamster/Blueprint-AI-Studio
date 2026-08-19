@@ -66,35 +66,13 @@ describe('MessagesComposer — live math preview', () => {
   });
 });
 
-describe('MessagesComposer — insert equation', () => {
-  test('renders an Insert equation button in minimal chrome', () => {
-    renderComposer({ chrome: 'minimal' });
-    expect(screen.getByLabelText('Insert equation')).toBeTruthy();
-  });
-
-  test('renders an Insert equation button in full chrome', () => {
+describe('MessagesComposer — no manual equation affordance', () => {
+  test('does not render an Insert equation button in minimal or full chrome', () => {
+    const { unmount } = renderComposer({ chrome: 'minimal' });
+    expect(screen.queryByLabelText('Insert equation')).toBeNull();
+    unmount();
     renderComposer({ chrome: 'full' });
-    expect(screen.getByLabelText('Insert equation')).toBeTruthy();
-  });
-
-  test('clicking insert equation calls onChangeContent with $equation$ appended', () => {
-    const onChangeContent = vi.fn();
-    renderComposer({ newContent: 'Energy: ', onChangeContent });
-    fireEvent.click(screen.getByLabelText('Insert equation'));
-    expect(onChangeContent).toHaveBeenCalledWith('Energy: $equation$');
-  });
-
-  test('inserts $equation$ at cursor position when content is empty', () => {
-    const onChangeContent = vi.fn();
-    renderComposer({ newContent: '', onChangeContent });
-    fireEvent.click(screen.getByLabelText('Insert equation'));
-    expect(onChangeContent).toHaveBeenCalledWith('$equation$');
-  });
-
-  test('insert equation button is disabled when composerDisabled', () => {
-    renderComposer({ disabledReason: 'Composer disabled', chrome: 'minimal' });
-    const btn = screen.getByLabelText('Insert equation');
-    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByLabelText('Insert equation')).toBeNull();
   });
 });
 
