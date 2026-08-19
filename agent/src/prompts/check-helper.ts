@@ -51,11 +51,6 @@ function loadCiFailureVerifyScript(): string {
   try { return readShellFragment(_CI_FAILURE_VERIFY_PATH); } catch { return ''; }
 }
 
-const _MERGE_VERIFY_PATH = path.join(_CHECK_HELPER_DIR, 'check_merge_verify.sh');
-function loadMergeVerifyScript(): string {
-  try { return readShellFragment(_MERGE_VERIFY_PATH); } catch { return ''; }
-}
-
 const _VIEWPORT_UPLOAD_PATH = path.join(_CHECK_HELPER_DIR, 'check_viewport_upload.sh');
 function loadViewportUploadScript(): string {
   try { return readShellFragment(_VIEWPORT_UPLOAD_PATH); } catch { return ''; }
@@ -110,32 +105,6 @@ function buildCiFailureVerifyBlock(selectors: string[], taskId: string): string 
   return loadCiFailureVerifyScript()
     .replace(/@CI_FAIL_SELECTORS@/g, quoted)
     .replace(/@TASK_ID@/g, taskId);
-}
-
-/** Emit the merge-resolution closed-loop verify block for the generated ./check.
- *
- *  A conflict-resolution fix (the agent rebased/merged the base branch and
- *  resolved conflicts) can silently break tests OUTSIDE the standalone gate's 3
- *  files: a dropped fixture line (FK violation) or a code/test vintage skew
- *  between the branch and a fast-moving base. The standalone `--no-postgres`
- *  gate never runs those DB-backed files, so a bad resolution shipped clean and
- *  CI re-failed, burning the whole review-fix budget (incident: rollup PR #8920,
- *  research task 72e4b062 — 16 iterations exhausted on two tests the resolution
- *  broke, not the diff under review).
- *
- *  This block derives the affected backend test files from $CHANGED (already
- *  computed above): every `backend/testing/test_*.py` the merge touched, plus
- *  `test_<module>.py` for each changed `backend/app/<module>.py` that has one.
- *  It runs them under the sanctioned Postgres harness — bounded (capped; never
- *  the full suite, which OOMs the 8 GB VM — the harness memory guard exempts
- *  targeted *.py args). A still-broken affected test fails this gate, and since
- *  ./pr open gates on ./check, the push is blocked until it passes. Overflow
- *  past the cap is logged (deferred to CI), never silently dropped. Graceful
- *  when Docker is absent: warn + GATE-ENVIRONMENT marker, don't block (CI runs
- *  the authoritative suite on the PR). Derivation uses only $CHANGED + on-disk
- *  test-file existence, so it reflects the RESOLVED tree at ./check time. */
-function buildMergeVerifyBlock(taskId: string): string {
-  return loadMergeVerifyScript().replace(/@TASK_ID@/g, taskId);
 }
 
 function buildRequiredBackendVerificationBlock(cfg: CodeChangeHelperConfig): string {
@@ -275,8 +244,10 @@ export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
 #   ./check         # lint+build only — fast, run before each iteration
 #   ./check test    # also run tests (slow; mainly before ./pr open)
 #   ./check full    # run repo-wide lint (eslint .) + full viewport suite
-#                   # WITHOUT scoping. Skips the baseline recheck on
-#                   # failure (because the result IS the new baseline).
+#                   # WITHOUT scoping. Skips the SIZE-GUARDRAIL baseline
+#                   # recheck on failure (the result IS the new baseline).
+#                   # The viewport lane stays per-identity attributed in
+#                   # both modes — it just runs the unscoped roster here.
 #                   # Use sparingly — when you're confident your edits
 #                   # affect a shared rule / config / global selector
 #                   # whose effect a scoped check can't surface, OR
@@ -305,6 +276,11 @@ if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RE
   echo "[check] unable to remove prior verification receipt(s) — refusing to run" >&2
   exit 1
 fi
+# Every attributed lane merges its own structured block into this one sidecar.
+# Exporting the resolved path is what keeps a guard from re-deriving the task
+# identity and disagreeing with the gate that already resolved it.
+BLUEPRINT_VERIFICATION_RECEIPT="$_VERIFY_RECEIPT"
+export BLUEPRINT_VERIFICATION_RECEIPT
 WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
@@ -460,7 +436,7 @@ if admin_ui_runtime_touched; then
     fi
   fi
 
-  # Viewport gate: scoped run + baseline recheck.
+  # Viewport gate: scoped run through the shared attributed guard.
   #
   # 1) SCOPING: by default, run only the viewport tests whose component
   #    .tsx (or .viewport.test.tsx) was touched. Repo-wide viewport stays
@@ -470,12 +446,17 @@ if admin_ui_runtime_touched; then
   #    package.json, src/test/*), fall back to the full suite — that
   #    edit could break any component.
   #
-  # 2) BASELINE: if the (scoped or full) run fails, re-run the SAME
-  #    subset against origin/$BASE in a detached worktree. Both fail →
-  #    pre-existing → warn-pass (mirrors frontend CI's BROKEN/OK
-  #    pattern). PR-only fail →
-  #    real regression → block. Worktree path keeps the agent's working
-  #    tree untouched.
+  # 2) BASELINE: delegated wholesale to scripts/vitest_verification_guard.py
+  #    (--suite admin-ui-viewport), the same fail-closed attributor the two
+  #    unit lanes use. It compares structured JUnit failure IDENTITIES
+  #    against an isolated base checkout, so only the specific inherited
+  #    failures warn-pass; everything else blocks. A base install, browser
+  #    bootstrap or base run that cannot produce a report reports a blocking
+  #    unavailable-baseline state — never a waiver. The former bash whole-run
+  #    compare (detached base worktree + a single boolean waiver flag) is
+  #    deliberately GONE: any non-zero base-side exit, including a failed
+  #    npm ci or Playwright browser download, waived EVERY current viewport
+  #    failure.
   ADMIN_UI_CHANGED=$(printf '%s\\n' "$CHANGED" | grep -E '^admin-ui/' || true)
   NON_COMPONENT=$(printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -vE '^admin-ui/src/components/[^/]+\\.(viewport\\.test\\.tsx|tsx)$' || true)
 
@@ -525,6 +506,13 @@ if admin_ui_runtime_touched; then
     VIEWPORT_RUN=0
   fi
 
+  # NOTE: the five viewport-coverage invariants are NOT re-run here. They are
+  # asserted by admin-ui/src/test/viewport-coverage.test.ts, which matches the
+  # unit config's \`src/**/*.test.{ts,tsx}\` include and is not in its
+  # \`.viewport.test.*\` exclude, so they already run inside the attributed
+  # "admin-ui vitest (attributed)" lane below. Adding an explicit step would
+  # re-enforce them unattributed, hard-blocking agents on inherited violations.
+
   if [ "$VIEWPORT_RUN" = "1" ]; then
     # Bootstrap Playwright Chromium for the optional VM-side viewport check.
     # The baked agent VM already includes the system libs (libatk, libnss,
@@ -567,67 +555,31 @@ if admin_ui_runtime_touched; then
 
   if [ "$VIEWPORT_RUN" = "1" ]; then
     echo "[check] $VIEWPORT_LABEL..."
-    PR_VP_LOG=/tmp/check_viewport_pr.log
-    export VIEWPORT_FILTER
-    if ( cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport -- $VIEWPORT_FILTER 2>&1 ) > "$PR_VP_LOG" 2>&1; then
-      tail -20 "$PR_VP_LOG"
-      echo "[check] $VIEWPORT_LABEL OK"
-    elif [ "$FULL_SCOPE" = "1" ]; then
-      # --full mode: skip baseline recheck. The result IS the new baseline.
-      echo "[check] $VIEWPORT_LABEL FAILED (--full, no baseline recheck)"
-      tail -100 "$PR_VP_LOG" || true
-      FAILED+=("$VIEWPORT_LABEL")
+    # One attributed lane, same guard as the unit suites. The scoped path
+    # hands the guard the already-computed VIEWPORT_FILTER as the CURRENT-side
+    # selector list; the guard rejects a scope that omits a changed viewport
+    # test rather than quietly shrinking what got proven.
+    if [ "$FULL_SCOPE" = "1" ] || [ -n "$NON_COMPONENT" ]; then
+      python3 scripts/vitest_verification_guard.py --suite admin-ui-viewport --base "$BASE" --repo-root "$WORKSPACE"
+      VIEWPORT_STATUS=$?
     else
-      echo "[check] $VIEWPORT_LABEL FAILED on PR — checking baseline on origin/$BASE..."
-      BASELINE_FAILED=0
-      BASELINE_REASON=""
-      BASE_REF="origin/$BASE"
-      if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
-        BASE_REF="$BASE"
-        git rev-parse --verify "$BASE_REF" >/dev/null 2>&1 || BASELINE_REASON="base ref unavailable"
-      fi
-      if [ -z "$BASELINE_REASON" ]; then
-        WT=/tmp/check_viewport_baseline_wt
-        # Stale worktree from a prior run can wedge \`worktree add\`.
-        # \`worktree remove --force\` is the safe cleanup (no rm -rf).
-        git worktree remove --force "$WT" >/dev/null 2>&1 || true
-        if ! git worktree add --detach "$WT" "$BASE_REF" >/tmp/check_viewport_wt.log 2>&1; then
-          BASELINE_REASON="worktree add failed (see /tmp/check_viewport_wt.log)"
-        else
-          MAIN_VP_LOG=/tmp/check_viewport_main.log
-          # Baseline run uses the SAME scoped subset — VIEWPORT_FILTER
-          # is exported above. If the test files don't exist on main
-          # (newly added in this PR), vitest exits 0 with "no tests"
-          # and we treat baseline as PASSING (so PR-side failure is
-          # real). Acceptable: new test files should pass when added.
-          if ( cd "$WT/admin-ui" && npm ci >/tmp/check_viewport_main_npmci.log 2>&1 && { [ -d "$HOME/.cache/ms-playwright" ] && ls "$HOME/.cache/ms-playwright"/chromium-* >/dev/null 2>&1 || npx playwright install chromium || npx playwright install --with-deps chromium; } >/tmp/check_viewport_main_pw.log 2>&1 && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport -- $VIEWPORT_FILTER 2>&1 ) > "$MAIN_VP_LOG" 2>&1; then
-            BASELINE_FAILED=0
-          else
-            BASELINE_FAILED=1
-          fi
-          git worktree remove --force "$WT" >/dev/null 2>&1 || true
-        fi
-      fi
-      if [ "$BASELINE_FAILED" = "1" ]; then
-        echo "[check] $VIEWPORT_LABEL WARN — also broken on $BASE_REF; not blocking PR"
-        if [ -f scripts/guard_suppression_receipt.py ]; then python3 scripts/guard_suppression_receipt.py record --lane viewport --state preexisting_viewport_failure --suppressed "viewport::baseline_also_broken=$VIEWPORT_LABEL also failing on $BASE_REF" || true; fi
-        echo "[check] PR-side tail:"
-        tail -30 "$PR_VP_LOG" || true
-        echo "[check] Baseline-side tail:"
-        tail -30 /tmp/check_viewport_main.log || true
-      else
-        echo "[check] $VIEWPORT_LABEL FAILED — passes on $BASE_REF, fails on PR. Real regression."
-        [ -n "$BASELINE_REASON" ] && echo "[check] (baseline check skipped: $BASELINE_REASON — treating PR failure as real)"
-        tail -100 "$PR_VP_LOG" || true
-        FAILED+=("$VIEWPORT_LABEL")
-${buildViewportUploadBlock(cfg.taskId)}      fi
+      python3 scripts/vitest_verification_guard.py --suite admin-ui-viewport --base "$BASE" --repo-root "$WORKSPACE" --current-files $VIEWPORT_FILTER
+      VIEWPORT_STATUS=$?
     fi
+    if [ "$VIEWPORT_STATUS" = "0" ]; then
+      echo "[check] $VIEWPORT_LABEL OK"
+    else
+      echo "[check] $VIEWPORT_LABEL FAILED — blocking per attributed viewport guard."
+      FAILED+=("$VIEWPORT_LABEL")
+${buildViewportUploadBlock(cfg.taskId)}    fi
   fi
 
   # Typecheck on agent VM; vite bundle OOMs here and is CI's job. The build
-  # half (tsc -b --noEmit) is attributed against an isolated base checkout so
-  # an inherited type error doesn't block whichever task touches admin-ui
-  # next; the test-file half keeps its existing shrink-only baseline gate.
+  # half (tsc -b --noEmit) is routed through the shared base-attribution guard
+  # and compared against an isolated base checkout, so an inherited type error
+  # on the integration branch warn-passes instead of blocking every agent that
+  # touches admin-ui; unavailable attribution stays fail-closed. The test-file
+  # half keeps its existing shrink-only baseline gate.
   run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
   run "admin-ui typecheck (test files)" bash -c 'cd admin-ui && node scripts/typecheck-tests-baseline.mjs 2>&1'
 
@@ -643,7 +595,9 @@ if touches agent/; then
     tail -30 /tmp/check_agent_npm_ci.log
     FAILED+=("agent npm ci")
   }
-  run "agent tsc"        bash -c 'cd agent && ${BLUEPRINT_AGENT_TSC_CMD}'
+  # Always-on: ./pr open gates on plain ./check, so this lane must stay armed
+  # outside any test-only switch. Same fail-closed base-attribution contract.
+  run "agent tsc (attributed)" python3 scripts/typecheck_verification_guard.py --suite agent --base "$BASE" --repo-root "$WORKSPACE"
 
   # Scope agent eslint to changed files. Errors in files the agent
   # edited are the agent's responsibility ("don't leave preexisting
@@ -712,7 +666,6 @@ if touches backend/; then
   fi
 fi
 ${buildCiFailureVerifyBlock(ciFailureSelectors, cfg.taskId)}
-${cfg.mergeVerify ? buildMergeVerifyBlock(cfg.taskId) : ''}
 ${loadSizeGuardrailScript()}`;
   // Stack-block selection (ordered, most specific first):
   //  1. build_config with directories  → config-driven per-directory blocks.

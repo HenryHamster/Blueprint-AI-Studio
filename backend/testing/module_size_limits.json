@@ -215,7 +215,8 @@
     "providers/runners.ts": 2700,
     "prompts/context-prefix.ts": 1350,
     "handlers/research-plan-sections.ts": 1800,
-    "providers/resident-session.ts": 1050
+    "providers/resident-session.ts": 1050,
+    "handlers/verify-tests.ts": 1750
   },
   "frontend": {
     "useAppState.ts": 3000,
@@ -441,6 +442,7 @@
     "local_postgres_rehearsal.py": 1850,
     "test_guard_gate_left_shift.py": 2400,
     "test-backend.sh": 1050,
-    "static_release_guard.py": 750
+    "static_release_guard.py": 750,
+    "test_vitest_verification_guard.py": 1900
   }
 }

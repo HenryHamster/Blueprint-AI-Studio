@@ -20,6 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
 try:
     from guard_suppression_receipt import record_classification  # noqa: E402
 except ImportError:  # pragma: no cover - emitting is fail-open by contract
@@ -34,6 +36,10 @@ from testing.fixgate_attribution import (  # noqa: E402
     extract_base,
     is_attributable_pytest_result,
     parse_junit_report,
+)
+from verification_receipt import (  # noqa: E402
+    LANE_STATIC_CORPUS,
+    record_lane as record_verification_lane,
 )
 from testing.impacted_tests import load_surface_manifest
 
@@ -545,6 +551,26 @@ def main(argv: list[str] | None = None) -> int:
                                     f"failure(s) {' or '.join(hidden_by_harness)}"
                                 )
                             suppressed_failures = outcome.get("suppressed_failures") or {}
+                            if new_failures:
+                                corpus_state = "test_failure"
+                            elif suppressed_failures:
+                                corpus_state = "preexisting_test_failure"
+                            else:
+                                corpus_state = "passed"
+                            # Advisory: the receipt records what this lane
+                            # relied on; it never decides the lane's verdict.
+                            # `new_failures` is used rather than the raw
+                            # outcome bucket because the synthetic "<harness>"
+                            # finding above is what actually blocks here.
+                            record_verification_lane(
+                                LANE_STATIC_CORPUS,
+                                state=corpus_state,
+                                blocking=bool(new_failures),
+                                new_failures=new_failures,
+                                suppressed_failures=suppressed_failures,
+                                disappeared_failures=disappeared,
+                                skipped_failures=skipped,
+                            )
                             if suppressed_failures:
                                 print(
                                     "[static guard] suppressed baseline failures: "

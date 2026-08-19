@@ -31,7 +31,7 @@ import {
   type BuildConfig, type TestRunner, type AcceptanceProbe, type DocumentedCommand,
   type DeclaredAcceptanceTest,
 } from '../utils/test-runners.js';
-import { testFixLoop } from '../utils/test-fix-loop.js';
+import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 
 // Cap the failing-test output we ship in the verdict. Mirrors the smoketest
 // error-log tail size — enough to diagnose a failure without bloating the
@@ -241,19 +241,76 @@ type StaleCommandRecovery =
   | { kind: 'setupFailed'; loop: TestFixLoopResult }
   | null;
 
+interface BaseTestCaptureResult {
+  baselineFailures?: Set<string>;
+  restoreError?: string;
+}
+
+// The verify gate runs on the PR head, but the existing baseline helper assumes
+// its current checkout is the code being measured. Temporarily move this clone
+// to the authoritative base ref, capture structured failures, and always return
+// to the exact head SHA before the caller runs the real verdict. A missing base
+// or an unparseable baseline is deliberately represented as undefined so the
+// existing raw-failure path remains fail-closed.
+async function captureBaseTestFailures(
+  ws: WebSocket | null,
+  statusRef: { value: string },
+  buildConfig: BuildConfig | undefined,
+  baseBranch: string,
+  relatedFiles: string[],
+): Promise<BaseTestCaptureResult> {
+  let headSha = '';
+  try {
+    headSha = (await execFileAsync(
+      'git', ['rev-parse', '--verify', 'HEAD'],
+      { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT },
+    )).trim();
+    if (!headSha) throw new Error('HEAD resolved to an empty SHA');
+    await execFileAsync(
+      'git', ['checkout', '--force', '--detach', `origin/${baseBranch}`],
+      { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT },
+    );
+  } catch (error) {
+    sendLog(ws, `Could not check out origin/${baseBranch} for test baseline — proceeding without baseline: ${error instanceof Error ? error.message : String(error)}\n`);
+    return {};
+  }
+
+  let baselineFailures: Set<string> | null = null;
+  let restoreError: string | undefined;
+  try {
+    baselineFailures = await captureTestBaseline(ws, statusRef, buildConfig, relatedFiles);
+  } catch (error) {
+    sendLog(ws, `Test baseline capture failed — proceeding without baseline: ${error instanceof Error ? error.message : String(error)}\n`);
+  } finally {
+    try {
+      await execFileAsync(
+        'git', ['checkout', '--force', '--detach', headSha],
+        { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT },
+      );
+    } catch (error) {
+      restoreError = `Could not restore PR head ${headSha} after base test baseline: ${error instanceof Error ? error.message : String(error)}`;
+      sendLog(ws, `${restoreError}\n`);
+    }
+  }
+
+  if (restoreError) return { restoreError };
+  return { baselineFailures: baselineFailures ?? undefined };
+}
+
 async function runVerifyLoop(
   ws: WebSocket | null,
   statusRef: { value: string },
   model: string | undefined,
   effort: string | undefined,
   buildConfig: BuildConfig | undefined,
+  baselineFailures: Set<string> | undefined,
   runnersOverride?: TestRunner[],
   retryStatusLabel = 'detected suite',
   changedLineCounts?: Record<string, number>,
 ): Promise<TestFixLoopResult> {
   let loop = await testFixLoop(
     ws, statusRef, model, effort, buildConfig,
-    undefined, undefined, undefined,
+    baselineFailures, undefined, undefined,
     { maxFixAttempts: 0, runnersOverride, changedLineCounts },
   );
 
@@ -268,7 +325,7 @@ async function runVerifyLoop(
     statusRef.value = `Retrying ${retryStatusLabel} after setup failure (${setupRetries}/${MAX_VERIFY_SETUP_RETRIES})...`;
     loop = await testFixLoop(
       ws, statusRef, model, effort, buildConfig,
-      undefined, undefined, undefined,
+      baselineFailures, undefined, undefined,
       { maxFixAttempts: 0, runnersOverride, changedLineCounts },
     );
   }
@@ -1001,6 +1058,7 @@ async function recoverFromStaleCommand(
   ws: WebSocket | null, statusRef: { value: string },
   model: string | undefined, effort: string | undefined,
   buildConfig: BuildConfig | undefined, storedRunners: TestRunner[],
+  baselineFailures: Set<string> | undefined,
 ): Promise<StaleCommandRecovery> {
   const autoRunners = detectAutoTestRunners();
   // Never re-invoke a stored runner we already know is dead: drop any
@@ -1020,6 +1078,7 @@ async function recoverFromStaleCommand(
   statusRef.value = 'Running auto-detected replacement suite (stale-command recovery)...';
   const loop = await runVerifyLoop(
     ws, statusRef, model, effort, buildConfig,
+    baselineFailures,
     replacement,
     'replacement suite',
   );
@@ -1265,8 +1324,20 @@ export async function handleVerifyTests(
     );
     // Single no-fix run: maxFixAttempts 0 means testFixLoop runs each runner
     // once and returns a verdict without ever invoking Claude to repair code.
+    const baselineCapture = await captureBaseTestFailures(
+      ws, statusRef, buildConfig, baseBranch, earlyPrDiff.changedFiles,
+    );
+    if (baselineCapture.restoreError) {
+      statusRef.value = 'Reporting test baseline checkout failure...';
+      await postVerifySetupFailure(
+        taskId, owner, repo, ws, baselineCapture.restoreError, buildConfig,
+      );
+      return;
+    }
+
     const loop = await runVerifyLoop(
       ws, statusRef, model, effort, buildConfig,
+      baselineCapture.baselineFailures,
       runnersToRun,
       'detected suite',
       changedLineCounts,
@@ -1325,7 +1396,10 @@ export async function handleVerifyTests(
       // stored command may simply be STALE while the cloned repo still carries
       // a real, runnable suite at a different path/command. Re-detect ignoring
       // the stored config and run that replacement if found.
-      const recovered = await recoverFromStaleCommand(ws, statusRef, model, effort, buildConfig, runners);
+      const recovered = await recoverFromStaleCommand(
+        ws, statusRef, model, effort, buildConfig, runners,
+        baselineCapture.baselineFailures,
+      );
       if (recovered?.kind === 'recovered') {
         result = recovered.result;
       } else if (recovered?.kind === 'setupFailed') {

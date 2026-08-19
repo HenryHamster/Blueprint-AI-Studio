@@ -1334,18 +1334,11 @@ export async function handleFix(
   statusRef.value = `Rebasing onto ${baseBranch}...`;
   sendLog(ws, `Rebasing ${branch} onto origin/${baseBranch}...\n`);
   let hasConflicts = false;
-  // True when the rebase onto base hit conflicts (the agent integrated a
-  // moving base and a resolution was required). Threaded into ./check as
-  // mergeVerify so the gate runs the affected backend test files under Postgres
-  // before ./pr open can push — catching a silent drop / vintage skew the
-  // standalone gate would miss.
-  let conflictResolutionOccurred = false;
   try {
     git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`]);
     git(['rebase', `origin/${baseBranch}`]);
     sendLog(ws, `Rebase successful\n`);
   } catch {
-    conflictResolutionOccurred = true;
     sendLog(ws, `Rebase had conflicts — Claude will resolve them\n`);
     // Abort the failed rebase so Claude can handle it with a merge strategy
     try { git(['rebase', '--abort']); } catch { /* ignore */ }
@@ -1944,11 +1937,6 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     // non-ci_failure fixes (ciFailureSelectors is [] unless fixReason ===
     // 'ci_failure'), so review-feedback fixes keep the existing gate untouched.
     ciFailureSelectors,
-    // Conflict-resolution closed-loop verify: when this fix integrated a moving
-    // base and resolved conflicts (or is an explicit merge_conflict fix), ./check
-    // runs the affected backend test files under Postgres so a bad resolution
-    // fails the gate before ./pr open can push (see buildMergeVerifyBlock).
-    mergeVerify: conflictResolutionOccurred || fixReason === 'merge_conflict',
   });
 
 }

@@ -180,7 +180,31 @@ describe('handleVerifyTests — bounded/fall-open safety net', () => {
     // through the shared route-aware guard; a rendered traceback comparison is
     // not an acceptable substitute for these structured fields.
     expect(verifier).toContain('--current-exit-code "$_verification_exit"');
-    expect(verifier).toContain('"suppressed_failures":d.get("suppressed_failures",{})');
-    expect(verifier).toContain('"disappeared_failures":d.get("disappeared_failures",{})');
+    // The structured attribution reaches the durable sidecar through the real
+    // scripts/verification_receipt.py writer, which MERGES this lane's block
+    // beside the other attributed lanes instead of overwriting the file.
+    expect(verifier).toContain(
+      'python3 scripts/verification_receipt.py backend-pytest --receipt "$_VERIFY_RECEIPT"',
+    );
+    // Passed as a FILE, not argv: one traceback per suppressed baseline failure
+    // would otherwise blow the OS argv-size limit (E2BIG) on a busy run.
+    expect(verifier).toContain('--attribution-file "$_verification_attribution_file"');
+    // The fragment is emitted for any blueprint-v1 project, so the writer is
+    // reached behind a readability guard with a self-contained fallback -- a
+    // foreign workspace without it must not be blocked on a green lane.
+    expect(verifier).toContain('if [ -r scripts/verification_receipt.py ]; then');
+    expect(verifier).toContain('elif python3 -c ');
+    const writer = readFileSync(
+      fileURLToPath(new URL('../../../scripts/verification_receipt.py', import.meta.url)),
+      'utf8',
+    );
+    for (const field of [
+      'new_failures',
+      'suppressed_failures',
+      'disappeared_failures',
+      'skipped_failures',
+    ]) {
+      expect(writer).toContain(`attribution.get("${field}")`);
+    }
   });
 });

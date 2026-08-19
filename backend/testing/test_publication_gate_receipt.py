@@ -1,7 +1,12 @@
 """Tests for the bounded, durable local publication-gate receipt."""
 
 import json
+import os
+import sys
 import uuid
+from pathlib import Path
+
+import pytest
 
 from app.models import Task, TaskStatus
 from app.schemas import PublicationGateReceipt
@@ -12,10 +17,72 @@ from app.task_blocked import (
     PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH,
     PUBLICATION_GATE_ATTRIBUTION_MAX_BYTES,
     PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES,
+    PUBLICATION_GATE_ATTRIBUTION_MAX_LANE_ROWS,
     PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH,
     record_publication_gate_receipt,
     sanitize_publication_gate_receipt,
 )
+
+
+def _resolve_scripts_dir() -> "Path | None":
+    """Locate the repo's ``scripts/`` dir across local + Docker test environments.
+
+    Candidates, in order: an explicit env override, the ``/repo`` bind-mount
+    (both ``scripts/test-backend.sh`` and the CI shard matrix mount the repo
+    root read-only at ``/repo`` while the *backend* dir is ``/app``), then the
+    repo root two levels above this file (plain checkouts / non-Docker runs).
+    Inside those containers ``parents[2]`` is the filesystem root, so the
+    relative candidate alone resolves to a nonexistent ``/scripts``.
+    """
+    candidates = []
+    env_override = os.getenv("BLUEPRINT_SCRIPTS_DIR")
+    if env_override:
+        candidates.append(Path(env_override))
+    candidates.append(Path("/repo/scripts"))
+    candidates.append(Path(__file__).resolve().parents[2] / "scripts")
+    for path in candidates:
+        if (path / "verification_receipt.py").is_file():
+            return path
+    return None
+
+
+# The publication receipt's multi-lane projection is produced by the shared
+# receipt writer the local gate invokes (scripts/verification_receipt.py).
+# Import the real one so this suite exercises the projection that actually runs
+# on the VM rather than a hand-rolled restatement of its shape. The import is
+# tolerant: a missing scripts/ tree must not error the whole module and take
+# the DB-backed receipt tests down with it.
+_SCRIPTS_DIR = _resolve_scripts_dir()
+if _SCRIPTS_DIR is not None and str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+try:
+    import verification_receipt
+except ImportError:  # pragma: no cover - only when scripts/ is absent
+    verification_receipt = None
+
+
+def _require_verification_receipt():
+    """Return the writer module, or skip — except in CI, where a miss FAILS.
+
+    A silent skip in the promotion CI would mean the multi-lane projection
+    invariants never enforce; only ad-hoc environments without the repo
+    checkout may skip.
+    """
+    if verification_receipt is not None:
+        return verification_receipt
+    msg = (
+        "scripts/verification_receipt.py not available in this test "
+        "environment (checked BLUEPRINT_SCRIPTS_DIR, the /repo bind-mount "
+        "that scripts/test-backend.sh and the CI shards provide, and "
+        "../../scripts relative to this file)"
+    )
+    if os.getenv("CI"):
+        pytest.fail(
+            msg + " — refusing to skip in CI: mount the repo root at /repo "
+            "or set BLUEPRINT_SCRIPTS_DIR so these invariants enforce"
+        )
+    pytest.skip(msg)
 
 
 def _legacy_receipt() -> dict:
@@ -361,3 +428,182 @@ def test_attribution_only_change_archives_prior_receipt():
     assert record_publication_gate_receipt(task, second) is True
     assert task.context["publication_gate_receipt"] == sanitize_publication_gate_receipt(second)
     assert task.context["publication_gate_receipt_history"] == [sanitize_publication_gate_receipt(first)]
+
+
+def _lane_block(lane: str, state: str, suppressed: dict) -> dict:
+    return {
+        "lane": lane,
+        "state": state,
+        "blocking": False,
+        "new_failures": {},
+        "suppressed_failures": suppressed,
+        "disappeared_failures": {},
+        "skipped_failures": {},
+    }
+
+
+def test_receipt_names_suppressed_failures_from_every_attributed_lane():
+    """A publication that leaned on several lanes must name all of them.
+
+    Before this projection only the targeted backend lane reached the durable
+    receipt: a publication forgiven by the static-corpus, Vitest or typecheck
+    lanes presented as fully clean to every reviewer.
+    """
+    vr = _require_verification_receipt()
+    sidecar = {
+        "version": 1,
+        "pytest": {
+            "state": "preexisting_test_failure",
+            "new_failures": {},
+            "suppressed_failures": {"backend/testing/test_a.py::test_a::failure": {"detail": "backend inherited"}},
+            "disappeared_failures": {},
+            "skipped_failures": {},
+        },
+        "lanes": {
+            "backend-pytest": _lane_block(
+                "backend-pytest",
+                "preexisting_test_failure",
+                {"backend/testing/test_a.py::test_a::failure": {
+                    "detail": "backend inherited",
+                    "reason": "same route/test/failure kind failed on baseline"}},
+            ),
+            "static-corpus": _lane_block(
+                "static-corpus",
+                "preexisting_test_failure",
+                {"backend/testing/test_b.py::test_b::error": {"detail": "corpus inherited"}},
+            ),
+            "vitest:admin-ui": _lane_block(
+                "vitest:admin-ui",
+                "preexisting_test_failure",
+                {"src/components/Foo.test.tsx::renders::failure": {"detail": "vitest inherited"}},
+            ),
+            "typecheck:agent": _lane_block("typecheck:agent", "clean", {}),
+        },
+    }
+
+    task = _task()
+    raw = {**_legacy_receipt(), **vr.project_attribution(sidecar)}
+    assert record_publication_gate_receipt(task, raw) is True
+    persisted = task.context["publication_gate_receipt"]
+
+    # Every lane's own state is named; no single lane's verdict stands in for
+    # the whole gate's.
+    assert persisted["attribution_state"] == (
+        "backend-pytest=preexisting_test_failure; "
+        "static-corpus=preexisting_test_failure; "
+        "typecheck:agent=clean; "
+        "vitest:admin-ui=preexisting_test_failure"
+    )
+    # Every lane's suppressed identity survives, attributed to its own lane.
+    assert persisted["suppressed_failures"] == {
+        "[backend-pytest] backend/testing/test_a.py::test_a::failure": {
+            "detail": "backend inherited",
+            "reason": "same route/test/failure kind failed on baseline"},
+        "[static-corpus] backend/testing/test_b.py::test_b::error": {"detail": "corpus inherited"},
+        "[vitest:admin-ui] src/components/Foo.test.tsx::renders::failure": {"detail": "vitest inherited"},
+    }
+    counts = persisted["attribution_counts"]
+    for lane in ("backend-pytest", "static-corpus", "vitest:admin-ui"):
+        assert counts[f"suppressed_failures[{lane}]"] == {"observed": 1, "kept": 1}
+    assert counts["suppressed_failures"] == {"observed": 3, "kept": 3}
+    # Identical identities in two lanes cannot overwrite each other, and the
+    # sanitized receipt is still a fixed point of the sanitizer.
+    assert sanitize_publication_gate_receipt(persisted) == persisted
+    assert PublicationGateReceipt.model_validate(persisted).attribution_counts == counts
+
+
+def test_aggregate_eviction_cannot_silently_delete_one_whole_lane():
+    """Over-budget eviction must thin every lane, not erase the last one.
+
+    Identities sort lane-first, so evicting the greatest identity would consume
+    one lane entirely while the receipt still named the others as complete.
+    """
+    vr = _require_verification_receipt()
+    lanes = ("backend-pytest", "static-corpus", "vitest:admin-ui")
+    raw = {**_legacy_receipt(), "attribution_state": "; ".join(f"{lane}=preexisting_test_failure" for lane in lanes)}
+    raw["suppressed_failures"] = {
+        vr.namespace_identity(lane, f"test_{index:03d}.py::test::failure"): {
+            "detail": "d" * 500,
+            "reason": "same route/test/failure kind failed on baseline",
+        }
+        for lane in lanes
+        for index in range(30)
+    }
+
+    sanitized = sanitize_publication_gate_receipt(raw)
+
+    assert sanitized is not None
+    counts = sanitized["attribution_counts"]
+    assert counts["suppressed_failures"]["kept"] < counts["suppressed_failures"]["observed"]
+    surviving = {
+        vr.split_namespaced_identity(identity)[0]
+        for identity in sanitized["suppressed_failures"]
+    }
+    assert surviving == set(lanes), "eviction erased a whole lane's suppressions"
+    kept = [counts[f"suppressed_failures[{lane}]"]["kept"] for lane in lanes]
+    assert all(count > 0 for count in kept)
+    assert max(kept) - min(kept) <= 1, "eviction was not spread evenly across lanes"
+    assert all(counts[f"suppressed_failures[{lane}]"]["observed"] == 30 for lane in lanes)
+    assert sum(kept) == counts["suppressed_failures"]["kept"]
+
+
+def test_attribution_block_is_bounded_with_thousands_of_lanes():
+    """Per-lane counts rows must not outgrow the aggregate byte budget.
+
+    Identity eviction can empty every failure bucket; if the per-lane truncation
+    rows were still derived one-per-observed-lane from the raw map, the block
+    would exceed its budget with nothing left to evict.  Rows past the cap fold
+    into one remainder row that still totals every dropped lane.
+    """
+    lanes = 1200
+    raw = {
+        **_legacy_receipt(),
+        "attribution_state": "s" * (PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH + 500),
+        "new_failures": {
+            f"[lane{index:04d}] test_{index:04d}.py::test::failure": {
+                "detail": "d" * PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH,
+                "reason": "r" * PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH,
+            }
+            for index in range(lanes)
+        },
+    }
+
+    sanitized = sanitize_publication_gate_receipt(raw)
+
+    assert sanitized is not None
+    attribution = {
+        key: sanitized[key]
+        for key in (
+            "attribution_state",
+            "new_failures",
+            "suppressed_failures",
+            "disappeared_failures",
+            "skipped_failures",
+            "attribution_counts",
+        )
+        if key in sanitized
+    }
+    assert len(
+        json.dumps(attribution, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ) <= PUBLICATION_GATE_ATTRIBUTION_MAX_BYTES
+    counts = sanitized["attribution_counts"]
+    lane_rows = [key for key in counts if key.startswith("new_failures[")]
+    assert lane_rows, "lane attribution must still be reported"
+    assert len(lane_rows) <= PUBLICATION_GATE_ATTRIBUTION_MAX_LANE_ROWS + 1
+    # No lane's observations are silently dropped: rows (including the folded
+    # remainder) still account for every observed identity.
+    assert counts["new_failures"]["observed"] == lanes
+    assert sum(counts[key]["observed"] for key in lane_rows) == lanes
+    assert sum(counts[key]["kept"] for key in lane_rows) == counts["new_failures"]["kept"]
+    remainder = counts.get("new_failures[+remainder]")
+    assert remainder is not None and remainder["lanes"] > 0
+    # The projection is durable: it round-trips through the persisted schema.
+    assert PublicationGateReceipt.model_validate(sanitized).attribution_counts == counts
+
+
+def test_legacy_single_lane_receipt_keeps_its_exact_counts_shape():
+    """Un-namespaced identities must not grow per-lane count rows."""
+    sanitized = sanitize_publication_gate_receipt(_attributed_receipt())
+    assert sanitized is not None
+    assert set(sanitized["attribution_counts"]) == {
+        "new_failures", "suppressed_failures", "disappeared_failures", "skipped_failures"}

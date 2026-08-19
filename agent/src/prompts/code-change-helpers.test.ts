@@ -99,7 +99,8 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(checkScript).toBeDefined();
     expect(checkScript).toContain('VIEWPORT_CAPTURE_SKIPPED');
     expect(checkScript).not.toContain('run "admin-ui playwright chromium"');
-    expect(checkScript).toContain('npm run test:viewport');
+    expect(checkScript).toContain('--suite admin-ui-viewport --base "$BASE" --repo-root "$WORKSPACE"');
+    expect(checkScript).not.toContain('npm run test:viewport -- $VIEWPORT_FILTER');
     expect(checkScript).toContain('Playwright Chromium');
     // Bootstrap step uses the smart install logic (cache check + fallback chain).
     expect(checkScript).toContain('$HOME/.cache/ms-playwright');
@@ -108,8 +109,16 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(checkScript).toContain('Retrying inside');
     expect(checkScript).toContain('mcr.microsoft.com/playwright:v1.59.1-jammy');
     expect(checkScript).not.toContain('npm run test:run');
-    expect(checkScript.indexOf('admin-ui playwright chromium')).toBeLessThan(checkScript.indexOf('admin-ui viewport'));
-    expect(checkScript.indexOf('admin-ui viewport')).toBeLessThan(checkScript.indexOf('admin-ui typecheck'));
+    // The attributed browser lane runs after the Chromium bootstrap and before
+    // the attributed typecheck. The viewport-coverage invariants are not a
+    // separate step: the attributed unit lane already asserts them.
+    expect(checkScript).not.toContain('check-viewport-coverage.js');
+    expect(checkScript.indexOf('admin-ui playwright chromium')).toBeLessThan(
+      checkScript.indexOf('python3 scripts/vitest_verification_guard.py --suite admin-ui-viewport')
+    );
+    expect(
+      checkScript.indexOf('python3 scripts/vitest_verification_guard.py --suite admin-ui-viewport')
+    ).toBeLessThan(checkScript.indexOf('admin-ui typecheck (attributed)'));
   });
 
   it('generated ./check script passes `bash -n` syntax check', async () => {
@@ -593,9 +602,9 @@ describe('writeCheckHelper — config-driven build_config path', () => {
     // shared header, but it must not be invoked, and no hardcoded stack
     // commands should appear).
     expect(checkScript).not.toContain('if admin_ui_runtime_touched; then');
-    expect(checkScript).not.toContain('run "agent tsc"');
+    expect(checkScript).not.toContain('run "agent tsc');
     expect(checkScript).not.toContain('backend ruff (changed)');
-    expect(checkScript).not.toContain('npm run test:viewport');
+    expect(checkScript).not.toContain('--suite admin-ui-viewport');
   });
 
   it('emits the generic no-op fallback (no Blueprint blocks) for a foreign repo with no buildConfig', async () => {
@@ -609,9 +618,9 @@ describe('writeCheckHelper — config-driven build_config path', () => {
     expect(checkScript).toBeDefined();
     expect(checkScript).toContain('no build_config configured for acme/other-repo');
     expect(checkScript).not.toContain('if admin_ui_runtime_touched; then');
-    expect(checkScript).not.toContain('run "agent tsc"');
+    expect(checkScript).not.toContain('run "agent tsc');
     expect(checkScript).not.toContain('backend ruff (changed)');
-    expect(checkScript).not.toContain('npm run test:viewport');
+    expect(checkScript).not.toContain('--suite admin-ui-viewport');
     // And the config-driven marker is absent.
     expect(checkScript).not.toContain('Config-driven checks');
   });
@@ -623,9 +632,9 @@ describe('writeCheckHelper — config-driven build_config path', () => {
     const checkScript = capturedScripts['/tmp/workspace/check'];
     expect(checkScript).toBeDefined();
     expect(checkScript).toContain('admin_ui_runtime_touched');
-    expect(checkScript).toContain('run "agent tsc"');
+    expect(checkScript).toContain('run "agent tsc (attributed)"');
     expect(checkScript).toContain('backend ruff (changed)');
-    expect(checkScript).toContain('npm run test:viewport');
+    expect(checkScript).toContain('--suite admin-ui-viewport');
     // And the config-driven marker is absent.
     expect(checkScript).not.toContain('Config-driven checks');
   });
@@ -1171,47 +1180,33 @@ describe('writeCodeChangeHelpers — viewport upload block', () => {
     expect(checkScript).toContain('/api/agent/viewport/failure-screenshot-upload-url');
   });
 
-  it('viewport upload block: upload endpoint absent from --full failure path', async () => {
+  it('viewport upload block: emitted once inside the guard failure branch, waiver deleted', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers(selfRepoCfg);
     const checkScript = capturedScripts['/tmp/workspace/check'];
     expect(checkScript).toBeDefined();
-    // The --full branch outputs "FAILED (--full, no baseline recheck)" and adds to FAILED.
-    // The upload endpoint must NOT appear in that branch.
-    const fullFailIdx = checkScript.indexOf('FAILED (--full, no baseline recheck)');
-    const prOnlyIdx = checkScript.indexOf('passes on $BASE_REF, fails on PR. Real regression.');
-    expect(fullFailIdx).toBeGreaterThan(-1);
-    expect(prOnlyIdx).toBeGreaterThan(-1);
-    // Upload endpoint appears only AFTER the PR-only regression marker, never before it
-    // (which would mean it's reachable from the --full path).
-    const uploadIdx = checkScript.indexOf('/api/agent/viewport/failure-screenshot-upload-url');
-    expect(uploadIdx).toBeGreaterThan(prOnlyIdx);
-    expect(uploadIdx).toBeGreaterThan(fullFailIdx);
-    // The --full branch uses FULL_SCOPE=1 guard: ensure the upload block is inside
-    // the else (non-full) branch by checking it does not appear between the --full
-    // marker and the PR-only marker.
-    const blockBetweenFullAndPrOnly = checkScript.slice(fullFailIdx, prOnlyIdx);
-    expect(blockBetweenFullAndPrOnly).not.toContain('/api/agent/viewport/failure-screenshot-upload-url');
-  });
-
-  it('viewport upload block: inside PR-only else, not in baseline-also-broken WARN path', async () => {
-    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
-    writeCodeChangeHelpers(selfRepoCfg);
-    const checkScript = capturedScripts['/tmp/workspace/check'];
-    expect(checkScript).toBeDefined();
-    // WARN path marker
-    const warnIdx = checkScript.indexOf('WARN — also broken on $BASE_REF; not blocking PR');
-    const prOnlyIdx = checkScript.indexOf('passes on $BASE_REF, fails on PR. Real regression.');
-    const uploadIdx = checkScript.indexOf('/api/agent/viewport/failure-screenshot-upload-url');
-    expect(warnIdx).toBeGreaterThan(-1);
-    expect(prOnlyIdx).toBeGreaterThan(-1);
-    expect(uploadIdx).toBeGreaterThan(-1);
-    // Upload block appears after the PR-only marker, not inside the WARN block.
-    // The WARN and PR-only markers are siblings in an if/else; upload is in else (after PR-only).
-    expect(uploadIdx).toBeGreaterThan(prOnlyIdx);
-    // Slice from WARN marker to PR-only marker — upload must NOT appear in that region.
-    const warnRegion = checkScript.slice(warnIdx, prOnlyIdx);
-    expect(warnRegion).not.toContain('/api/agent/viewport/failure-screenshot-upload-url');
+    // The old two-branch shape (--full "no baseline recheck" vs PR-only "Real
+    // regression") is gone: the guard attributes per failure identity in both
+    // scoping modes, so there is exactly ONE blocking branch. And the whole-run
+    // waiver — any non-zero exit of the base-side `npm ci && playwright install
+    // && npm run test:viewport` chain excused EVERY current failure — is
+    // deleted, not kept alongside the guard.
+    expect(checkScript).not.toContain('$VIEWPORT_LABEL FAILED (--full, no baseline recheck)');
+    expect(checkScript).not.toContain('passes on $BASE_REF, fails on PR. Real regression.');
+    expect(checkScript).not.toContain('WARN — also broken on $BASE_REF; not blocking PR');
+    expect(checkScript).not.toContain('BASELINE_FAILED');
+    expect(checkScript).not.toContain('/tmp/check_viewport_baseline_wt');
+    expect(checkScript).not.toContain('git worktree add --detach "$WT"');
+    expect(checkScript).toContain(
+      'python3 scripts/vitest_verification_guard.py --suite admin-ui-viewport --base "$BASE" --repo-root "$WORKSPACE" --current-files $VIEWPORT_FILTER'
+    );
+    const blockingIdx = checkScript.indexOf(
+      '[check] $VIEWPORT_LABEL FAILED — blocking per attributed viewport guard.'
+    );
+    expect(blockingIdx).toBeGreaterThan(-1);
+    expect(checkScript.indexOf('/api/agent/viewport/failure-screenshot-upload-url')).toBeGreaterThan(blockingIdx);
+    // Exactly one emission — no second copy left behind on a waiver path.
+    expect(checkScript.split('/api/agent/viewport/failure-screenshot-upload-url').length - 1).toBe(1);
   });
 
   it('generated ./check with upload block passes bash -n syntax check', async () => {

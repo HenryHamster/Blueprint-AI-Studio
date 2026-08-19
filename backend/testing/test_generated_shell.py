@@ -2145,7 +2145,10 @@ class TestProjectVerificationRuntimeContract:
                 "PostgreSQL runtime unavailable",
                 "no impacted pytest file/node",
                 "_VERIFY_RECEIPT",
-                "postgres_sidecar",
+                # The postgres-sidecar receipt itself: both scripts must merge
+                # it through the shared writer (whose own source carries the
+                # "postgres_sidecar" key, asserted in contract_sources below).
+                "python3 scripts/verification_receipt.py backend-pytest",
             ):
                 assert required in script, f"{label} missing fail-closed token {required}"
             for forbidden in ("--standalone --no-postgres", "GATE-ENVIRONMENT"):
@@ -2157,7 +2160,17 @@ class TestProjectVerificationRuntimeContract:
         helper = (_BLUEPRINT_ROOT / "scripts" / "backend-test-route.sh").read_text(
             encoding="utf-8"
         )
-        contract_sources = (rendered_fragment, tracked, helper)
+        # The receipt writer is a real, lintable, directly tested helper the
+        # fragment invokes -- not another multi-line heredoc inside generated
+        # shell -- so the receipt half of the contract lives in its source.
+        receipt_writer = (_BLUEPRINT_ROOT / "scripts" / "verification_receipt.py").read_text(
+            encoding="utf-8"
+        )
+        contract_sources = (rendered_fragment, tracked, helper, receipt_writer)
+        for source in (rendered_fragment, tracked):
+            assert (
+                "python3 scripts/verification_receipt.py backend-pytest" in source
+            ), "backend lane must merge its receipt through the shared writer"
         for required in (
             "python3 -m ruff check --select E,F,W --ignore E501",
             "USE_TEST_POSTGRES=true bash",

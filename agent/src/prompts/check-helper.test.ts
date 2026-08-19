@@ -149,25 +149,33 @@ describe('writeCheckHelper — direct invocation', () => {
     // cleared at startup, exactly as the verification receipts above are.
     expect(script).toContain('BLUEPRINT_GUARD_SUPPRESSION_DIR="/tmp/guard_suppression_receipts_${_VERIFY_TASK_ID}"');
     expect(script).toContain('export BLUEPRINT_GUARD_SUPPRESSION_DIR');
-    // Every lane's suppressions are merged into one cross-lane aggregate, and
-    // the viewport lane's two suppressing branches record through the CLI.
+    // Every lane's suppressions are merged into one cross-lane aggregate. The
+    // capture-skipped branch is the only viewport suppression still emitted from
+    // bash: the suite itself runs through the attributed Vitest guard, which
+    // records a warn-passed inherited viewport failure under its own
+    // `vitest:admin-ui-viewport` lane instead of a second baseline compare here.
     expect(script).toContain('guard_suppression_receipt.py aggregate --out "$BLUEPRINT_GUARD_SUPPRESSION_DIR/aggregate.json"');
     expect(script).toContain('guard_suppression_receipt.py record --lane viewport --state capture_skipped');
-    expect(script).toContain('guard_suppression_receipt.py record --lane viewport --state preexisting_viewport_failure');
+    expect(script).toContain(
+      'python3 scripts/vitest_verification_guard.py --suite admin-ui-viewport --base "$BASE" --repo-root "$WORKSPACE"',
+    );
     // Blueprint blocks are the default on the self-repo when no buildConfig is supplied.
     expect(script).toContain('if admin_ui_runtime_touched; then');
     expect(script).toContain('touches agent/');
     expect(script).toContain('touches backend/');
     expect(script).toContain('admin-ui playwright chromium');
     // The admin-ui typecheck runs on the agent VM (safe, no OOM); vite bundle
-    // is deferred to CI where it has room to breathe. The build half is
-    // base-attributed so an inherited type error isn't blamed on this task.
+    // is deferred to CI where it has room to breathe. The build half goes
+    // through the shared base-attribution guard rather than a raw whole-project
+    // compile, so an inherited type error isn't blamed on this task; the
+    // test-file half keeps its shrink-only baseline gate.
     expect(script).toContain(
       'run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"',
     );
     expect(script).toContain(
       'run "admin-ui typecheck (test files)" bash -c \'cd admin-ui && node scripts/typecheck-tests-baseline.mjs 2>&1\'',
     );
+    expect(script).not.toContain('npm run typecheck 2>&1'); // no unattributed compile
     expect(script).not.toContain('npm run build 2>&1'); // no vite build on agent VM
     // The agent suite remains always-on, but its result now comes from the
     // shared fail-closed base-attribution guard rather than console output.
@@ -185,6 +193,10 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).toContain('--corpus-only --base "$BASE" --repo-root "$WORKSPACE"');
     expect(script).not.toContain('BPYTEST_BASELINE_FAILED');
     expect(script).not.toContain('backend pytest WARN — also broken on $BPYTEST_BASE_REF; not blocking PR');
+    // Conflict-resolution verification shares this one attributed backend lane;
+    // a second raw Postgres invocation would charge inherited failures twice.
+    expect(script).not.toContain('merge-resolution closed-loop verify');
+    expect(script).not.toContain('merge-resolution verify');
     expect(script).toContain('PASS — all checks green');
     // Size guardrail is wired into the self-repo gate: invoked by reference as
     // the committed checker script, run UNCONDITIONALLY across all sections
@@ -221,6 +233,73 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).not.toContain('( cd agent && [ -d node_modules ] || npm ci )');
   }, 15_000);
 
+  it('routes the admin-ui viewport lane through the attributed verification guard', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'check-viewport-attributed',
+      workBranch: 'blueprint/check-viewport-attributed',
+      baseBranch: 'main',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+
+    const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toBeDefined();
+
+    // Literal pins on the guard invocation — both scoping modes. The scoped
+    // path forwards the already-computed VIEWPORT_FILTER as the CURRENT-side
+    // selector list so the guard can reject an incomplete scope itself.
+    expect(script).toContain(
+      'python3 scripts/vitest_verification_guard.py --suite admin-ui-viewport --base "$BASE" --repo-root "$WORKSPACE"'
+    );
+    expect(script).toContain(
+      'python3 scripts/vitest_verification_guard.py --suite admin-ui-viewport --base "$BASE" --repo-root "$WORKSPACE" --current-files $VIEWPORT_FILTER'
+    );
+    // Unscoped guard call is reachable only from --full / non-component changes.
+    expect(script).toContain('if [ "$FULL_SCOPE" = "1" ] || [ -n "$NON_COMPONENT" ]; then');
+    // A non-zero guard exit blocks; there is no waiver branch left.
+    expect(script).toContain('FAILED+=("$VIEWPORT_LABEL")');
+    expect(script).toContain('[check] $VIEWPORT_LABEL FAILED — blocking per attributed viewport guard.');
+
+    // The whole-run bash compare is DELETED, not left armed alongside the guard.
+    expect(script).not.toContain('BASELINE_FAILED');
+    expect(script).not.toContain('WARN — also broken on $BASE_REF; not blocking PR');
+    expect(script).not.toContain('git worktree add --detach "$WT"');
+    expect(script).not.toContain('/tmp/check_viewport_baseline_wt');
+    expect(script).not.toContain('passes on $BASE_REF, fails on PR. Real regression.');
+    expect(script).not.toContain('$VIEWPORT_LABEL FAILED (--full, no baseline recheck)');
+
+    // The lane no longer shells out to `npm run test:viewport`, whose npm
+    // script chained the entire unfiltered happy-dom unit suite ahead of the
+    // browser run — on BOTH sides of the old compare. The capture-mode script
+    // (a different npm script) is untouched.
+    expect(script).not.toContain('npm run test:viewport -- $VIEWPORT_FILTER');
+    expect(script).not.toContain('npm run test:viewport 2>&1');
+    // The coverage invariants that npm script used to chain in are NOT
+    // re-added as a standalone unattributed lane: they are asserted by
+    // admin-ui/src/test/viewport-coverage.test.ts, which the unit config
+    // includes, so the attributed `--suite admin-ui` lane already enforces
+    // them with base attribution. An explicit step here would hard-block on
+    // inherited violations the attributed lane correctly warn-passes.
+    expect(script).not.toContain('check-viewport-coverage.js');
+    expect(script).toContain(
+      'run "admin-ui vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite admin-ui'
+    );
+
+    // Preserved surrounding behavior that is NOT the defect.
+    expect(script).toContain('no viewport test matches changed components, skipping viewport suite');
+    expect(script).toContain('VIEWPORT_CAPTURE_SKIPPED: Chromium substrate unavailable on this VM');
+    expect(script).toContain('admin-ui new component viewport test');
+    expect(script).toContain('VIEWPORT_LABEL="admin-ui viewport (full, --full)"');
+    // The screenshot-upload evidence block still fires on a blocking failure
+    // and still reads the JSON manifest the guard keeps emitting.
+    expect(script).toContain('admin-ui/test-results/viewport-failures.json');
+    expect(script.indexOf('/api/agent/viewport/failure-screenshot-upload-url')).toBeGreaterThan(
+      script.indexOf('[check] $VIEWPORT_LABEL FAILED — blocking per attributed viewport guard.')
+    );
+  }, 15_000);
+
   it('emits a generic no-op fallback (no Blueprint blocks) for a foreign repo with no buildConfig', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
@@ -238,7 +317,7 @@ describe('writeCheckHelper — direct invocation', () => {
     // Generic fallback: no Blueprint-stack commands run against an unknown repo.
     expect(script).toContain('no build_config configured for some-org/some-other-repo');
     expect(script).not.toContain('if admin_ui_runtime_touched; then');
-    expect(script).not.toContain('run "agent tsc"');
+    expect(script).not.toContain('run "agent tsc');
     expect(script).not.toContain('admin-ui playwright chromium');
     // The Blueprint-specific size guardrail does not run against a foreign repo.
     expect(script).not.toContain('check_size_limits.py');
@@ -255,71 +334,6 @@ describe('writeCheckHelper — direct invocation', () => {
       owner: 'HenryHamster',
       repo: 'BlueprintAIStudio',
       testsOnMainBranch: true,
-    });
-    const script = capturedScripts['/tmp/workspace/.check-task'];
-    expect(script).toBeDefined();
-    const { execSync } = await import('child_process');
-    // Pipe through stdin so we don't need a writable fs (vi.mock('fs') is in effect).
-    execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
-  });
-
-  it('emits the merge-resolution verify block when mergeVerify is set (self-repo)', async () => {
-    const { writeCheckHelper } = await import('./check-helper.js');
-    writeCheckHelper({
-      taskId: 'check-merge-verify-1',
-      workBranch: 'blueprint/check-merge-verify-1',
-      baseBranch: 'automain',
-      owner: 'HenryHamster',
-      repo: 'BlueprintAIStudio',
-      testsOnMainBranch: true,
-      mergeVerify: true,
-    });
-    const script = capturedScripts['/tmp/workspace/.check-task'];
-    expect(script).toBeDefined();
-    // Derives affected backend test files from $CHANGED and runs them under the
-    // sanctioned Postgres harness, routed through `run` so a failure lands in
-    // FAILED and ./pr open (which gates on ./check) cannot push.
-    expect(script).toContain('merge-resolution closed-loop verify');
-    expect(script).toContain('MERGE_VERIFY_CAP=8');
-    expect(script).toContain('run "merge-resolution verify" bash -c ');
-    expect(script).toContain('scripts/test-backend.sh --postgres');
-    // Maps changed backend/app/*.py to its test file, and picks up directly
-    // changed test files.
-    expect(script).toContain('backend/app/');
-    expect(script).toContain('backend/testing/test_');
-    // Overflow past the cap is logged (deferred to CI), never silently dropped.
-    expect(script).toContain('deferred-to-CI:');
-    // Graceful no-Docker skip writes the GATE-ENVIRONMENT marker (taskId-scoped).
-    expect(script).toContain('/tmp/check_gate_env_check-merge-verify-1.txt');
-  });
-
-  it('omits the merge-resolution verify block when mergeVerify is not set', async () => {
-    const { writeCheckHelper } = await import('./check-helper.js');
-    writeCheckHelper({
-      taskId: 'check-merge-verify-off',
-      workBranch: 'blueprint/check-merge-verify-off',
-      baseBranch: 'automain',
-      owner: 'HenryHamster',
-      repo: 'BlueprintAIStudio',
-      testsOnMainBranch: true,
-      // mergeVerify omitted — review-feedback / non-conflict fixes are unchanged.
-    });
-    const script = capturedScripts['/tmp/workspace/.check-task'];
-    expect(script).toBeDefined();
-    expect(script).not.toContain('merge-resolution closed-loop verify');
-    expect(script).not.toContain('merge-resolution verify');
-  });
-
-  it('generated ./check script with mergeVerify passes `bash -n` syntax check', async () => {
-    const { writeCheckHelper } = await import('./check-helper.js');
-    writeCheckHelper({
-      taskId: 'check-merge-verify-2',
-      workBranch: 'blueprint/check-merge-verify-2',
-      baseBranch: 'automain',
-      owner: 'HenryHamster',
-      repo: 'BlueprintAIStudio',
-      testsOnMainBranch: true,
-      mergeVerify: true,
     });
     const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
@@ -372,7 +386,7 @@ describe('writeCheckHelper — direct invocation', () => {
     // (The admin_ui_runtime_touched helper function definition is in the
     // shared header — what we check for is that it's not invoked here.)
     expect(script).not.toContain('if admin_ui_runtime_touched; then');
-    expect(script).not.toContain('run "agent tsc"');
+    expect(script).not.toContain('run "agent tsc');
     // Size guardrail is a Blueprint self-repo concern, not config-driven.
     expect(script).not.toContain('check_size_limits.py');
   });
@@ -806,13 +820,85 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       '_VERIFY_RECEIPT="/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"',
     );
     expect(script).toContain('--current-exit-code "$_verification_exit"');
+    // The four structured attribution maps reach the sidecar through the real,
+    // directly tested writer when the workspace ships it. The inline python3 -c
+    // heredoc survives only as the guarded fallback for a foreign workspace
+    // that has no scripts/verification_receipt.py (see the foreign-repo test
+    // below) — it must never be reached when the writer IS present.
+    expect(script).toContain('if [ -r scripts/verification_receipt.py ]; then');
+    expect(script).toContain(
+      'python3 scripts/verification_receipt.py backend-pytest --receipt "$_VERIFY_RECEIPT"',
+    );
+    // Read from a FILE, never argv: one traceback per suppressed baseline
+    // failure would otherwise blow the OS argv-size limit (E2BIG).
+    expect(script).toContain('--attribution-file "$_verification_attribution_file"');
+    expect(script).toContain('elif python3 -c ');
     expect(script).toContain('"suppressed_failures":d.get("suppressed_failures",{})');
-    expect(script).toContain('"disappeared_failures":d.get("disappeared_failures",{})');
+    expect(script).toContain('BLUEPRINT_VERIFICATION_RECEIPT="$_VERIFY_RECEIPT"');
+    expect(script).toContain('export BLUEPRINT_VERIFICATION_RECEIPT');
     expect(script).toContain('no impacted pytest file/node was resolved');
     expect(script).toContain("grep -E '^backend/(testing|tests)/test_.*\\.py$'");
     expect(script).toContain('PostgreSQL runtime unavailable');
     expect(script).toContain('sanctioned harness missing');
     expect(script).not.toContain('touches "backend/" && [ "$WITH_TESTS" = "1" ]');
+  });
+  // The fragment is emitted for ANY project whose build_config declares the
+  // blueprint-v1 verification protocol -- not only the Blueprint self-repo. A
+  // foreign workspace has no scripts/verification_receipt.py, so an unguarded
+  // dependency on it would make python3 exit non-zero, push
+  // `FAILED+=("... verification receipt")`, and block every ./check (and
+  // therefore every ./pr open) in that project even when the targeted Postgres
+  // pytest lane passed.
+  it('keeps a self-contained receipt writer for a foreign repo that lacks the Blueprint helper', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'verify-foreign-1',
+      workBranch: 'blueprint/verify-foreign-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'not-blueprint',
+      testsOnMainBranch: false,
+      taskCapability: authoringCapability,
+      buildConfig: {
+        directories: [{
+          path: 'service',
+          type: 'python',
+          lint_cmd: 'ruff check .',
+          test_cmd: 'python3 -m pytest',
+          project_verification: {
+            protocol: 'blueprint-v1',
+            harness: 'tools/verified-postgres-tests.sh',
+          },
+        }],
+      },
+    });
+    // A foreign repo gets the gate written straight to `check`; the
+    // `.check-task` delegation wrapper is a self-repo-only arrangement, which
+    // is itself part of why this path had no coverage.
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toContain('required backend-authoring verification');
+    // Every reference to the Blueprint-local writer is behind the readability
+    // guard, and the fallback that runs without it writes the same receipt.
+    const guardAt = script.indexOf('if [ -r scripts/verification_receipt.py ]; then');
+    const fallbackAt = script.indexOf('elif python3 -c ');
+    const verdictAt = script.indexOf('if [ "$_verification_receipt_written" = "1" ]; then');
+    expect(guardAt).toBeGreaterThan(-1);
+    expect(fallbackAt).toBeGreaterThan(guardAt);
+    expect(verdictAt).toBeGreaterThan(fallbackAt);
+    // Structural: every invocation of the Blueprint-local helper sits INSIDE
+    // the readability guard, so its absence takes the `elif` fallback rather
+    // than exiting non-zero.
+    for (
+      let at = script.indexOf('python3 scripts/verification_receipt.py backend-pytest');
+      at !== -1;
+      at = script.indexOf('python3 scripts/verification_receipt.py backend-pytest', at + 1)
+    ) {
+      expect(at).toBeGreaterThan(guardAt);
+      expect(at).toBeLessThan(fallbackAt);
+    }
+    // The self-contained fallback writes the same four attribution maps.
+    expect(script).toContain('"suppressed_failures":d.get("suppressed_failures",{})');
+    expect(script).toContain('FAILED+=("$_VERIFICATION_DIR verification receipt")');
   });
   it('does not apply the gate to canonical read-only or compute capabilities', async () => {
     for (const capability of [
@@ -1051,6 +1137,13 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       realFs.copyFileSync(
         realPath.join(productionRoot, 'scripts', 'backend_verification_guard.py'),
         realPath.join(dir, 'scripts', 'backend_verification_guard.py'),
+      );
+      // The backend lane merges its block into the shared multi-lane sidecar
+      // through this helper instead of an inline heredoc, so the fixture needs
+      // the real writer to reach a minted receipt.
+      realFs.copyFileSync(
+        realPath.join(productionRoot, 'scripts', 'verification_receipt.py'),
+        realPath.join(dir, 'scripts', 'verification_receipt.py'),
       );
       // The guard records its suppressions through this sibling emitter; copy
       // it so the fixture exercises the same cross-lane receipt path as a real
@@ -2010,6 +2103,143 @@ describe('writeCheckHelper — npm_ci_if_lock_changed runtime', () => {
 });
 
 // ── isPytestCmd ───────────────────────────────────────────────────────────────
+// True when `lane` is NOT nested inside an `if [ "$WITH_TESTS" = "1" ]` block:
+// the most recent WITH_TESTS switch before the lane, if any, was already closed
+// by an `fi` before the lane is reached.
+function laneIsUnconditional(gate: string, lane: string): boolean {
+  const at = gate.indexOf(lane);
+  if (at < 0) return false;
+  const before = gate.slice(0, at);
+  const lastSwitch = before.lastIndexOf('if [ "$WITH_TESTS" = "1" ]');
+  if (lastSwitch < 0) return true;
+  return /^\s*fi\s*$/m.test(before.slice(lastSwitch));
+}
+
+// ── attributed typecheck lanes ───────────────────────────────────────────────
+// Both publication gates (the generated self-repo gate and the tracked
+// developer default) must route TypeScript through the shared base-attribution
+// runner, always-on, so an inherited type error on the integration branch
+// cannot block every agent that touches agent/ or admin-ui.
+describe('writeCheckHelper — attributed typecheck lanes', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  const selfRepoCheck = async (): Promise<string> => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'task-typecheck-lane-1',
+      workBranch: 'blueprint/task-typecheck-lane-1',
+      baseBranch: 'main',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+    const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toBeDefined();
+    return script;
+  };
+
+  it('emits attributed typecheck lanes', async () => {
+    const script = await selfRepoCheck();
+
+    // Literal pins of the exact emitted commands — not the constants asserted
+    // against themselves.
+    expect(script).toContain(
+      'run "agent tsc (attributed)" python3 scripts/typecheck_verification_guard.py --suite agent --base "$BASE" --repo-root "$WORKSPACE"',
+    );
+    expect(script).toContain(
+      'run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"',
+    );
+
+    // The raw, unattributed compiles are gone from the generated gate.
+    expect(script).not.toContain('run "agent tsc" ');
+    expect(script).not.toContain("cd agent && npx tsc --noEmit 2>&1");
+    expect(script).not.toContain('run "admin-ui typecheck" ');
+    expect(script).not.toContain('npm run typecheck 2>&1');
+
+    // Each lane lives inside its own stack block...
+    expect(script).toMatch(
+      /if touches agent\/; then[\s\S]*run "agent tsc \(attributed\)"/,
+    );
+    expect(script).toMatch(
+      /if admin_ui_runtime_touched; then[\s\S]*run "admin-ui typecheck \(attributed\)"/,
+    );
+    // ...and always-on: ./pr open gates on plain ./check, so a lane hidden
+    // behind the developer-only test switch would leave publication unarmed.
+    expect(laneIsUnconditional(script, 'run "agent tsc (attributed)"')).toBe(true);
+    expect(laneIsUnconditional(script, 'run "admin-ui typecheck (attributed)"')).toBe(true);
+  });
+
+  it('generated ./check with the attributed typecheck lanes passes `bash -n`', async () => {
+    const script = await selfRepoCheck();
+    const { execSync } = await import('child_process');
+    execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
+  });
+
+  it('routes the tracked developer gate through the same runner, always-on', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const gate = realFs.readFileSync(
+      realPath.resolve(process.cwd(), '..', 'scripts', 'check-default.sh'),
+      'utf8',
+    );
+
+    expect(gate).toContain(
+      'run "agent tsc (attributed)" python3 scripts/typecheck_verification_guard.py --suite agent --base "$BASE" --repo-root "$WORKSPACE"',
+    );
+    expect(gate).toContain(
+      'run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"',
+    );
+    // The raw whole-project compiles it replaced are gone.
+    expect(gate).not.toContain(`run "agent build" bash -c 'cd "agent" && npm run build'`);
+    expect(gate).not.toContain(`run "admin-ui typecheck" bash -c 'cd "admin-ui" && npm run typecheck'`);
+    // Neither lane sits under the developer-only test switch. The vitest lanes,
+    // which genuinely are test-switch-gated, are the control that proves this
+    // detector can still say no.
+    expect(laneIsUnconditional(gate, 'run "agent tsc (attributed)"')).toBe(true);
+    expect(laneIsUnconditional(gate, 'run "admin-ui typecheck (attributed)"')).toBe(true);
+    expect(laneIsUnconditional(gate, 'run "admin-ui typecheck (test files)"')).toBe(true);
+    expect(laneIsUnconditional(gate, 'run "agent vitest (attributed)"')).toBe(false);
+    expect(laneIsUnconditional(gate, 'run "admin-ui vitest (attributed)"')).toBe(false);
+  });
+
+  // The attributed build lane and the shrink-only test-file baseline are two
+  // different guarantees and BOTH stay armed: the guard compares the build
+  // program against an isolated base checkout (so inherited type errors are
+  // attributed, not blamed), while the baseline snapshot keeps the test-file
+  // program from growing new errors. Retiring either silently widens what a
+  // green ./check permits.
+  it('keeps the shrink-only admin-ui test-typecheck baseline alongside the attributed lane', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const root = realPath.resolve(process.cwd(), '..');
+
+    expect(realFs.existsSync(realPath.join(root, 'admin-ui/scripts/typecheck-tests-baseline.mjs'))).toBe(true);
+    expect(realFs.existsSync(realPath.join(root, 'admin-ui/tsconfig.test.baseline.json'))).toBe(true);
+
+    const pkg = JSON.parse(
+      realFs.readFileSync(realPath.join(root, 'admin-ui/package.json'), 'utf8'),
+    ) as { scripts: Record<string, string> };
+    expect(pkg.scripts.typecheck).toBe('tsc -b --noEmit && node scripts/typecheck-tests-baseline.mjs');
+
+    const defaultGate = realFs.readFileSync(
+      realPath.join(root, 'scripts/check-default.sh'),
+      'utf8',
+    );
+    expect(defaultGate).toContain(
+      'run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui',
+    );
+    expect(defaultGate).toContain('node scripts/typecheck-tests-baseline.mjs');
+  });
+});
+
 describe('isPytestCmd', () => {
   it.each([
     ['pytest', true],

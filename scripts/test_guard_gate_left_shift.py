@@ -500,6 +500,10 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
         tmp_path / "scripts" / "guard_suppression_receipt.py",
     )
     shutil.copy2(
+        REPO_ROOT / "scripts" / "verification_receipt.py",
+        tmp_path / "scripts" / "verification_receipt.py",
+    )
+    shutil.copy2(
         REPO_ROOT / "scripts" / "backend-test-route.sh",
         tmp_path / "scripts" / "backend-test-route.sh",
     )
@@ -576,6 +580,7 @@ def _prepare_docker_attribution_repo(
     (tmp_path / "backend" / "app" / "__init__.py").write_text("")
     for relative in (
         "static_release_guard.py",
+        "verification_receipt.py",
         "guard_suppression_receipt.py",
         "test-backend.sh",
         "backend-test-route.sh",
@@ -1004,6 +1009,7 @@ def test_docker_junit_attribution_distinguishes_existing_and_new_failures(
             **os.environ,
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "TASK_ID": "task-introducer-123",
+            "BLUEPRINT_VERIFICATION_RECEIPT": str(_fixture_receipt(repo)),
         },
         capture_output=True,
         text=True,
@@ -1037,6 +1043,7 @@ def test_identical_failure_with_tree_specific_path_is_preexisting(tmp_path: Path
             **os.environ,
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "TASK_ID": "task-existing-failure-123",
+            "BLUEPRINT_VERIFICATION_RECEIPT": str(_fixture_receipt(repo)),
         },
         capture_output=True,
         text=True,
@@ -1501,6 +1508,12 @@ def test_new_node_in_existing_roster_file_is_attributed_without_usage_error(
     assert '"task_id": "task-new-node-123"' in new_line
 
 
+def _fixture_receipt(repo: Path) -> Path:
+    """Keep a fixture guard run's sidecar inside the fixture, not in /tmp."""
+
+    return repo / ".git" / "verification_receipt.json"
+
+
 def _run_attribution_guard(
     repo: Path, fake_bin: Path, *, task_id: str, call_log: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -1508,6 +1521,7 @@ def _run_attribution_guard(
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "TASK_ID": task_id,
+        "BLUEPRINT_VERIFICATION_RECEIPT": str(_fixture_receipt(repo)),
     }
     if call_log is not None:
         env["STATIC_GUARD_CALL_LOG"] = str(call_log)
@@ -1675,6 +1689,107 @@ def test_new_static_finding_without_task_identity_fails_closed(tmp_path: Path) -
     assert "newly_introduced" in output
 
 
+def _static_corpus_lane(repo: Path) -> dict:
+    payload = json.loads(_fixture_receipt(repo).read_text(encoding="utf-8"))
+    return payload["lanes"]["static-corpus"]
+
+
+def test_static_corpus_suppressions_land_in_the_shared_verification_receipt(
+    tmp_path: Path,
+) -> None:
+    """The standalone corpus lane's suppressions become durable identities."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "preexisting")
+    result = _run_attribution_guard(repo, fake_bin, task_id="task-receipt-preexisting")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    lane = _static_corpus_lane(repo)
+    assert lane["lane"] == "static-corpus"
+    assert lane["state"] == "preexisting_test_failure"
+    assert lane["blocking"] is False
+    assert lane["new_failures"] == {}
+    # Structured route/test/kind identities, never a rendered log line.
+    assert set(lane["suppressed_failures"]) == {
+        "backend/testing/test_existing.py::test_preexisting::failure",
+        "scripts/test_preexisting_roster.py::test_roster_preexisting::failure",
+    }
+
+
+def test_static_corpus_receipt_records_a_blocking_new_failure(tmp_path: Path) -> None:
+    """A blocked corpus lane still names what it introduced and inherited."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "new")
+    result = _run_attribution_guard(repo, fake_bin, task_id="task-receipt-new")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    lane = _static_corpus_lane(repo)
+    assert lane["state"] == "test_failure"
+    assert lane["blocking"] is True
+    assert (
+        "scripts/test_new_roster.py::test_newly_introduced::failure"
+        in lane["new_failures"]
+    )
+
+
+def test_static_corpus_receipt_merges_beside_another_lane(tmp_path: Path) -> None:
+    """An earlier lane's block survives the corpus lane's merge."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "preexisting")
+    receipt_path = _fixture_receipt(repo)
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import verification_receipt  # noqa: PLC0415
+
+    verification_receipt.record_lane(
+        verification_receipt.vitest_lane("agent"),
+        state="preexisting_test_failure",
+        suppressed_failures={"src/a.test.ts::x::failure": "inherited"},
+        receipt_path=receipt_path,
+    )
+
+    result = _run_attribution_guard(repo, fake_bin, task_id="task-receipt-merge")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    lanes = json.loads(receipt_path.read_text(encoding="utf-8"))["lanes"]
+    assert set(lanes) == {"vitest:agent", "static-corpus"}
+    assert lanes["vitest:agent"]["suppressed_failures"] == {
+        "src/a.test.ts::x::failure": {"detail": "inherited"}
+    }
+
+
+def test_an_unwritable_receipt_does_not_change_the_static_corpus_verdict(
+    tmp_path: Path,
+) -> None:
+    """Receipt writing stays advisory for the corpus lane too."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "preexisting")
+    result = subprocess.run(
+        [
+            "python3",
+            "scripts/static_release_guard.py",
+            "--base",
+            "automain",
+            "--repo-root",
+            str(repo),
+        ],
+        cwd=repo,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TASK_ID": "task-receipt-unwritable",
+            # A regular file stands where the sidecar's parent directory must be.
+            "BLUEPRINT_VERIFICATION_RECEIPT": str(
+                repo / "attribution_state" / "receipt.json"
+            ),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "no new failures vs base" in result.stdout
+    assert "could not record lane static-corpus" in result.stderr
+
 # ---------------------------------------------------------------------------
 # Cross-lane suppression receipts
 # ---------------------------------------------------------------------------
@@ -1696,10 +1811,13 @@ def _suppressing_outcome() -> dict[str, object]:
 def _viewport_receipt_commands() -> list[list[str]]:
     """Return the viewport lane's emitter invocations from the generated ./check.
 
-    The viewport suppression lives in generated bash rather than a Python guard,
-    so the call site is read straight out of the generator and executed here —
-    a drifted or deleted invocation fails this test instead of silently leaving
-    the lane unrecorded.
+    Only the capture-skipped branch still lives in generated bash: the viewport
+    suite now runs through the attributed Vitest guard
+    (`--suite admin-ui-viewport`), so a warn-passed inherited viewport failure
+    is recorded by that guard under `vitest:admin-ui-viewport` rather than by a
+    second hand-rolled baseline compare in bash. The bash call site is read
+    straight out of the generator and executed here — a drifted or deleted
+    invocation fails this test instead of silently leaving the lane unrecorded.
     """
     source = (REPO_ROOT / "agent" / "src" / "prompts" / "check-helper.ts").read_text(
         encoding="utf-8"
@@ -1717,7 +1835,10 @@ def _viewport_receipt_commands() -> list[list[str]]:
             .replace("$BASE_REF", "origin/automain")
         )
         commands.append(shlex.split(rendered))
-    assert len(commands) == 2, f"expected both viewport branches wired, got {commands}"
+    assert len(commands) == 1, (
+        f"expected exactly the capture-skipped viewport branch wired, got {commands}"
+    )
+    assert "capture_skipped" in commands[0]
     return commands
 
 
@@ -1758,8 +1879,12 @@ def test_every_guard_lane_emits_machine_readable_suppression_receipt(
     static_release_guard._record_suppressions(outcome)
     vitest_verification_guard._record_suppressions("admin-ui", outcome)
     typecheck_verification_guard._record_suppressions("admin-ui", outcome)
+    # The viewport suite is a Vitest suite of the same guard, so its warn-passed
+    # inherited failures land under their own lane identity rather than sharing
+    # the unit lane's.
+    vitest_verification_guard._record_suppressions("admin-ui-viewport", outcome)
 
-    # 5. Viewport lane: run the CLI exactly as the generated ./check bash does.
+    # 5. Viewport capture-skipped: run the CLI exactly as the generated bash does.
     for command in _viewport_receipt_commands():
         result = subprocess.run(
             command,
@@ -1778,6 +1903,7 @@ def test_every_guard_lane_emits_machine_readable_suppression_receipt(
         "backend",
         "static",
         "vitest:admin-ui",
+        "vitest:admin-ui-viewport",
         "typecheck:admin-ui",
         "viewport",
     }
@@ -1798,12 +1924,12 @@ def test_every_guard_lane_emits_machine_readable_suppression_receipt(
 
     assert lanes["backend"]["buckets"]["suppressed"]["entries"]
     assert lanes["static"]["state"] == "preexisting_test_failure"
-    assert lanes["viewport"]["state"] in {
-        "capture_skipped",
-        "preexisting_viewport_failure",
-    }
+    # The bash-emitted viewport lane is now exactly the capture-skipped branch;
+    # a warn-passed inherited viewport failure is `vitest:admin-ui-viewport`.
+    assert lanes["viewport"]["state"] == "capture_skipped"
+    assert lanes["vitest:admin-ui-viewport"]["buckets"]["suppressed"]["entries"]
     totals = aggregate["totals"]
-    assert totals["lanes"] == 5
+    assert totals["lanes"] == 6
     assert totals["suppressed"] >= 4
     assert "static" in totals["lanes_with_suppressions"]
 

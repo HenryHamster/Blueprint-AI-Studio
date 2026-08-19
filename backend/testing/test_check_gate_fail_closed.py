@@ -236,6 +236,117 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
     assert "[check] PASS" not in combined
 
 
+def test_merge_affected_backend_tests_run_through_the_attributed_lane(
+    tmp_path: Path,
+) -> None:
+    """A conflict-style same-module test is attributed, not raw-exit blocked."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scripts = repo / "scripts"
+    backend = repo / "backend"
+    (backend / "app").mkdir(parents=True)
+    (backend / "testing").mkdir(parents=True)
+    shutil.copy2(
+        _REPO_ROOT / "backend" / "testing" / "impacted_tests.py",
+        backend / "testing" / "impacted_tests.py",
+    )
+    shutil.copy2(
+        _REPO_ROOT / "backend" / "testing" / "fixgate_attribution.py",
+        backend / "testing" / "fixgate_attribution.py",
+    )
+    shutil.copy2(
+        _REPO_ROOT / "scripts" / "backend_verification_guard.py",
+        scripts / "backend_verification_guard.py",
+    )
+    (scripts / "backend-test-route.sh").write_text(
+        "select_backend_test_route() { printf '%s\n' --postgres; }\n",
+        encoding="utf-8",
+    )
+    (scripts / "emit_failure_junit.py").write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                "import sys",
+                "Path(sys.argv[1]).write_text('<testsuite><testcase classname=\"testing.test_merge_affected\" name=\"test_preexisting_failure\"><failure>inherited</failure></testcase></testsuite>', encoding='utf-8')",
+                "raise SystemExit(1)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    harness = scripts / "test-backend.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\n"
+        "exec python3 scripts/emit_failure_junit.py \"$BLUEPRINT_VERIFICATION_JUNIT\"\n",
+        encoding="utf-8",
+    )
+    harness.chmod(harness.stat().st_mode | stat.S_IXUSR)
+    (backend / "app" / "changed.py").write_text("VALUE = 1\n", encoding="utf-8")
+    # No import of app.changed: this must be selected by the retained
+    # same-module convention, not by reverse-dependency inference.
+    (backend / "testing" / "test_changed.py").write_text(
+        "def test_preexisting_failure():\n    assert True\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "branch", "automain")
+    (backend / "app" / "changed.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    fragment = (
+        _REPO_ROOT / "agent" / "src" / "prompts" / "check_backend_verification.sh"
+    ).read_text(encoding="utf-8")
+    for token, value in {
+        "@DIR_RE@": "backend",
+        "@PYTHON_PATH_RE@": r"^backend/.*\.py$",
+        "@TEST_PATH_RE@": r"^backend/(testing|tests)/test_.*\.py$",
+        "@SELECTOR_PREFIX_RE@": "backend/",
+        "@DIR@": "backend",
+        "@HARNESS@": "scripts/test-backend.sh",
+    }.items():
+        fragment = fragment.replace(token, value)
+    gate = repo / "attributed-merge-gate.sh"
+    gate.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -uo pipefail\n"
+        "FAILED=()\n"
+        "BASE=automain\n"
+        "_VERIFY_TASK_ID=merge-attribution\n"
+        "_VERIFY_RECEIPT=\"$WORKSPACE/receipt.json\"\n"
+        "_VERIFY_HARNESS_RECEIPT=\"$WORKSPACE/harness-receipt.json\"\n"
+        "_VERIFY_CAPABILITY_RECEIPT=\"$WORKSPACE/capability-receipt.txt\"\n"
+        "CHANGED='backend/app/changed.py'\n"
+        + fragment
+        + "\nif ! declare -p FAILED | grep -q '=()$'; then exit 1; fi\n",
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"ruff\" ]; then exit 0; fi\n"
+        f"exec {sys.executable} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+    env = os.environ | {"WORKSPACE": str(repo), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    result = subprocess.run(
+        ["bash", str(gate)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "state=preexisting_test_failure" in result.stdout
+    receipt = json.loads((repo / "receipt.json").read_text(encoding="utf-8"))
+    assert receipt["pytest"]["selectors"] == ["testing/test_changed.py"]
+    assert receipt["pytest"]["suppressed_failures"]
+
+
 def test_off_image_pgserver_route_wins_without_baked_paths(tmp_path: Path) -> None:
     """An importable pgserver package is a real route, not a Docker fallback."""
     pg_bin = tmp_path / "pg-bin"

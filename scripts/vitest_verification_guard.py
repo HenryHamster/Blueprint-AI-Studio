@@ -15,6 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "backend"))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 try:
     from guard_suppression_receipt import record_classification  # noqa: E402
@@ -30,25 +31,63 @@ from testing.fixgate_attribution import (  # noqa: E402
     extract_base,
     parse_junit_report,
 )
+from verification_receipt import record_lane, vitest_lane  # noqa: E402
 
 
 @dataclass(frozen=True)
 class Suite:
     directory: str
     install_directory: str
-    config_path: str
+    # Vitest config, relative to `directory`. None means Vitest's default
+    # (`vitest.config.ts`), which is what the two happy-dom unit lanes use.
+    config: str | None = None
+    # Environment the suite's Vite define block reads at transform time.
+    env: tuple[tuple[str, str], ...] = ()
+    # Suite-relative path for Vitest's `json` reporter. The guard passes
+    # explicit `--reporter` flags, which replace the config's `reporters`
+    # array wholesale, so a config-declared JSON manifest has to be restated
+    # here or downstream consumers silently lose it.
+    json_report: str | None = None
+    # Browser-mode suites need a Playwright browser in every tree they run in,
+    # including the isolated base checkout.
+    requires_browser: bool = False
+
+    @property
+    def config_path(self) -> str:
+        """Repo-relative path to the config that DEFINES this suite's roster.
+
+        Derived rather than declared so the roster this guard resolves and the
+        config Vitest actually runs under can never drift apart. The unit and
+        viewport lanes read the same `src/**` tree; their split is exactly the
+        include/exclude globs in their own configs, so reading them is what
+        keeps a changed viewport test from being attributed against the unit
+        config that excludes it (and never actually run).
+        """
+
+        return f"{self.directory}/{self.config or 'vitest.config.ts'}"
 
 
 SUITES = {
     "agent": Suite(
         directory="agent",
         install_directory="agent",
-        config_path="agent/vitest.config.ts",
     ),
     "admin-ui": Suite(
         directory="admin-ui",
         install_directory=".",
-        config_path="admin-ui/vitest.config.ts",
+    ),
+    "admin-ui-viewport": Suite(
+        directory="admin-ui",
+        install_directory=".",
+        config="vitest.viewport.config.ts",
+        env=(
+            ("VITE_API_URL", "http://localhost:8080"),
+            ("VITE_FIREBASE_API_KEY", "ci"),
+            ("VITE_FIREBASE_AUTH_DOMAIN", "ci.firebaseapp.com"),
+            ("VITE_FIREBASE_PROJECT_ID", "ci"),
+        ),
+        json_report="./test-results/viewport-failures.json",
+        requires_browser=True,
     ),
 }
 
@@ -204,6 +243,27 @@ def _changed_test_files(repo: Path, base_ref: str, suite: Suite, roster: _Roster
     ]
 
 
+def _runnable_changed_test_files(
+    repo: Path, base_ref: str, suite: Suite, roster: _Roster
+) -> list[str]:
+    """Return changed suite test files the current side can still execute.
+
+    `_changed_test_files` reports the raw diff, which names deleted and
+    pre-rename paths too. Those cannot appear in a caller's scope -- the tree
+    no longer holds them, so `_current_file_selectors` rejects them -- and a
+    test the diff removes has no current-side behavior left to prove. Keeping
+    them would make a delete or rename an unclearable scope block. Their
+    baseline failures are still handled downstream: the unscoped
+    `changed_test_files` roster runs them against the extracted base tree.
+    """
+
+    return [
+        path
+        for path in _changed_test_files(repo, base_ref, suite, roster)
+        if (repo / path).is_file()
+    ]
+
+
 def _base_file_selectors(
     paths: list[str], suite: Suite, roster: _Roster, base_root: Path
 ) -> list[str]:
@@ -223,6 +283,32 @@ def _base_file_selectors(
     return sorted(selectors)
 
 
+def _current_file_selectors(
+    paths: list[str], suite: Suite, roster: _Roster, repo: Path
+) -> list[str]:
+    """Return validated suite-relative selectors for an explicitly scoped run.
+
+    A caller-supplied scope narrows what the current side executes, so an entry
+    the suite would not run at all -- wrong roster, or missing from the tree --
+    has to raise rather than quietly shrink the executed set.
+    """
+
+    if not paths:
+        raise RuntimeError("--current-files was passed with no test file")
+    prefix = f"{suite.directory}/"
+    selectors: set[str] = set()
+    for path in paths:
+        normalized = path.replace("\\", "/").strip("/")
+        if not normalized.startswith(prefix):
+            normalized = f"{prefix}{normalized}"
+        if not _is_suite_test_file(normalized, suite, roster):
+            raise RuntimeError(f"--current-files entry is not a suite test file: {path}")
+        if not (repo / normalized).is_file():
+            raise RuntimeError(f"--current-files entry does not exist: {path}")
+        selectors.add(normalized[len(prefix) :])
+    return sorted(selectors)
+
+
 def _tail(output: str, *, lines: int = 80) -> str:
     return "\n".join(output.splitlines()[-lines:])
 
@@ -235,6 +321,8 @@ def _run_vitest(
     selectors: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = ["npx", "vitest", "run"]
+    if suite.config:
+        command.append(f"--config={suite.config}")
     if selectors:
         command.extend(selectors)
     command.extend(
@@ -245,11 +333,19 @@ def _run_vitest(
             f"--outputFile.junit={report}",
         ]
     )
+    if suite.json_report:
+        # Restated because the CLI reporter flags above replace the config's
+        # own `reporters` array; the screenshot-upload block downstream reads
+        # this manifest.
+        command.extend(
+            ["--reporter=json", f"--outputFile.json={suite.json_report}"]
+        )
     return subprocess.run(
         command,
         cwd=root / suite.directory,
         env={
             **os.environ,
+            **dict(suite.env),
             "BLUEPRINT_VITEST_EXECUTION_JUNIT": str(execution_report),
         },
         capture_output=True,
@@ -268,6 +364,28 @@ def _install_base(root: Path, suite: Suite) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _install_base_browser(root: Path, suite: Suite) -> subprocess.CompletedProcess[str]:
+    """Ensure the extracted base tree can launch the suite's Playwright browser.
+
+    Mirrors the gate's cache-check-then-install pattern. A failure here makes
+    the baseline unobservable, which is a blocking condition -- never a reason
+    to waive the current side.
+    """
+
+    cache = Path(
+        os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or Path.home() / ".cache" / "ms-playwright"
+    )
+    if cache.is_dir() and any(cache.glob("chromium-*")):
+        return subprocess.CompletedProcess([], 0, stdout="chromium already cached", stderr="")
+    return subprocess.run(
+        ["npx", "playwright", "install", "chromium"],
+        cwd=root / suite.directory,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def _print_result(label: str, result: subprocess.CompletedProcess[str]) -> None:
     output = _tail(f"{result.stdout}\n{result.stderr}")
     if output:
@@ -278,6 +396,25 @@ def _blocking(state: str, **extra: object) -> int:
     detail = " ".join(f"{key}={value}" for key, value in extra.items())
     print(f"[vitest-verification] FAILED state={state}{(' ' + detail) if detail else ''}")
     return 1
+
+
+def _record(suite_name: str, outcome: dict[str, object]) -> None:
+    """Persist this lane's attribution to the shared multi-lane sidecar.
+
+    Advisory by construction: `record_lane` never raises and its return value
+    is deliberately not consulted, so a receipt failure cannot turn this lane
+    red (or green).
+    """
+
+    record_lane(
+        vitest_lane(suite_name),
+        state=str(outcome["state"]),
+        blocking=bool(outcome.get("blocking", False)),
+        new_failures=outcome.get("new_failures"),
+        suppressed_failures=outcome.get("suppressed_failures"),
+        disappeared_failures=outcome.get("disappeared_failures"),
+        skipped_failures=outcome.get("skipped_failures"),
+    )
 
 
 def _execution_errors(report) -> bool:
@@ -319,15 +456,64 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--suite", choices=sorted(SUITES), required=True)
     parser.add_argument("--base", default="automain")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--current-files",
+        nargs="*",
+        default=None,
+        metavar="TEST_FILE",
+        help=(
+            "Restrict the CURRENT-side run to these suite test files. Serialized "
+            "browser-mode suites cannot run their whole roster in the task gate. "
+            "Base-side scoping is unchanged; identity comparison stays per test."
+        ),
+    )
     args = parser.parse_args(argv)
     repo = args.repo_root.resolve()
     suite = SUITES[args.suite]
+
+    current_selectors: list[str] | None = None
+    if args.current_files is not None:
+        try:
+            # The roster comes from the suite's own Vitest config, so a scope
+            # entry is validated against the same include/exclude globs the
+            # runner would apply -- not a second, drift-prone copy of them.
+            scope_roster = _load_roster(repo, suite)
+            current_selectors = _current_file_selectors(
+                args.current_files, suite, scope_roster, repo
+            )
+            scoped_out = sorted(
+                set(
+                    _runnable_changed_test_files(
+                        repo, _base_ref(repo, args.base), suite, scope_roster
+                    )
+                )
+                - {f"{suite.directory}/{relative}" for relative in current_selectors}
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            return _blocking("current_scope_unavailable", error=str(exc))
+        if scoped_out:
+            # The caller's scope omits a suite test file this diff changed, so
+            # a clean scoped run would prove nothing about it.
+            return _blocking(
+                "current_scope_incomplete", unrun_changed_test_files=",".join(scoped_out)
+            )
 
     with tempfile.TemporaryDirectory(prefix="blueprint-vitest-verification-") as temp_dir:
         temp = Path(temp_dir)
         current_junit = temp / "current.xml"
         current_execution_junit = temp / "current-execution.xml"
-        current = _run_vitest(repo, suite, current_junit, current_execution_junit)
+        # Keep the unscoped call shape byte-identical for the two unit lanes;
+        # only an explicitly scoped caller gets the selector argument.
+        if current_selectors is None:
+            current = _run_vitest(repo, suite, current_junit, current_execution_junit)
+        else:
+            current = _run_vitest(
+                repo,
+                suite,
+                current_junit,
+                current_execution_junit,
+                selectors=current_selectors,
+            )
         _print_result(f"{args.suite} current", current)
         try:
             current_report = parse_junit_report(
@@ -376,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
                 current_failures=current_report.failures,
             )
             state = str(outcome["state"])
+            _record(args.suite, outcome)
             if bool(outcome["blocking"]):
                 return _blocking(state)
             print(f"[vitest-verification] PASS state={state}")
@@ -430,6 +617,14 @@ def main(argv: list[str] | None = None) -> int:
                     return _blocking(
                         "baseline_unavailable", base_install_exit_code=install.returncode
                     )
+                if suite.requires_browser:
+                    browser = _install_base_browser(base_root, suite)
+                    _print_result(f"{args.suite} baseline browser", browser)
+                    if browser.returncode != 0:
+                        return _blocking(
+                            "baseline_unavailable",
+                            base_browser_install_exit_code=browser.returncode,
+                        )
                 if base_selectors is None:
                     baseline = _run_vitest(
                         base_root, suite, baseline_junit, baseline_execution_junit
@@ -473,6 +668,7 @@ def main(argv: list[str] | None = None) -> int:
             current_report=current_report,
             baseline_report=baseline_report,
         )
+        _record(args.suite, outcome)
         for key in sorted(outcome.get("suppressed_failures", {})):
             print(f"[vitest-verification] WARN suppressed baseline failure: {key}")
         # Additive and fail-open: the WARN lines above are unchanged and the

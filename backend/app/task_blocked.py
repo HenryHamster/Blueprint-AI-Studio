@@ -64,6 +64,16 @@ PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH = 4000
 # caps: four buckets at their individual maxima would otherwise make one
 # heartbeat carry megabytes and eight archived receipts amplify that cost.
 PUBLICATION_GATE_ATTRIBUTION_MAX_BYTES = 32 * 1024
+# Per-lane truncation rows are derived from the *observed* (pre-bound) identity
+# map, so a receipt naming thousands of lanes would otherwise grow the counts
+# block without limit — the four failure buckets can be evicted to empty and the
+# block would still blow the aggregate byte budget. Cap the rows per bucket and
+# fold everything past the cap into one aggregated remainder row, so no lane's
+# suppressions vanish from the totals while the receipt still reads clean.
+PUBLICATION_GATE_ATTRIBUTION_MAX_LANE_ROWS = 32
+# Not a legal lane name (lanes must start with [a-z0-9]), so a remainder row can
+# never collide with a real lane's row.
+_PUBLICATION_GATE_ATTRIBUTION_LANE_REMAINDER = "+remainder"
 _PUBLICATION_GATE_ATTRIBUTION_BUCKET_KEYS = (
     "new_failures",
     "suppressed_failures",
@@ -71,6 +81,41 @@ _PUBLICATION_GATE_ATTRIBUTION_BUCKET_KEYS = (
     "skipped_failures",
 )
 _PUBLICATION_GATE_ATTRIBUTION_DETAIL_KEYS = ("detail", "reason")
+# The publication gate folds several attributed lanes (targeted backend pytest,
+# the static corpus, each Vitest suite, each typecheck suite) into this ONE flat
+# attribution block, so every projected identity carries the lane that forgave
+# it as a "[lane] " prefix (scripts/verification_receipt.py::namespace_identity).
+# Parsing it back out here is what lets the aggregate byte budget evict fairly
+# across lanes and report per-lane truncation, instead of silently deleting one
+# whole lane's suppressions while the receipt still reads clean.
+_PUBLICATION_GATE_ATTRIBUTION_LANE_RE = re.compile(r"^\[([a-z0-9][a-z0-9._:-]*)\] ")
+
+
+def _publication_gate_attribution_lane(identity: str) -> str | None:
+    """Return the lane a projected identity belongs to, or None if un-namespaced."""
+    match = _PUBLICATION_GATE_ATTRIBUTION_LANE_RE.match(identity)
+    return match.group(1) if match else None
+
+
+def _publication_gate_attribution_lane_count_key(bucket_key: str, lane: str) -> str:
+    """Return the ``attribution_counts`` key holding one lane's bucket counts."""
+    return f"{bucket_key}[{lane}]"
+
+
+def _publication_gate_attribution_eviction_victim(bucket: dict[str, object]) -> str:
+    """Return the next identity to drop, spreading eviction across lanes.
+
+    Identities sort lane-first, so dropping the lexicographically greatest one
+    would chew through the last lane entirely before touching any other. Take
+    from whichever lane currently keeps the MOST identities instead (ties broken
+    by the greatest lane name, then the greatest identity) so the surviving
+    receipt still names every lane that suppressed something.
+    """
+    lanes: dict[str, list[str]] = {}
+    for identity in bucket:
+        lanes.setdefault(_publication_gate_attribution_lane(identity) or "", []).append(identity)
+    widest = max(lanes.items(), key=lambda item: (len(item[1]), item[0]))[1]
+    return max(widest)
 
 # Cross-lane guard-suppression projection ("guard_suppressions"): every guard
 # lane's suppressions (static, vitest, typecheck, viewport, backend pytest —
@@ -86,10 +131,11 @@ GUARD_SUPPRESSIONS_MAX_BYTES = 16 * 1024
 
 def _sanitize_publication_gate_attribution_bucket(
     raw: object,
-) -> tuple[dict[str, str | dict[str, str]], int] | None:
+) -> tuple[dict[str, str | dict[str, str]], dict[str, object]] | None:
     if not isinstance(raw, dict):
         return None
     sanitized: dict[str, str | dict[str, str]] = {}
+    observed_lanes: dict[str, int] = {}
     for identity, value in sorted(raw.items(), key=lambda item: str(item[0])):
         if not isinstance(identity, str):
             return None
@@ -117,41 +163,100 @@ def _sanitize_publication_gate_attribution_bucket(
             return None
         if len(sanitized) >= PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES:
             break
-    return sanitized, len(raw)
+    for identity in raw:
+        if not isinstance(identity, str):
+            continue
+        lane = _publication_gate_attribution_lane(identity)
+        if lane is not None:
+            observed_lanes[lane] = observed_lanes.get(lane, 0) + 1
+    return sanitized, {"total": len(raw), "lanes": observed_lanes}
 
 
 def _publication_gate_attribution_bytes(block: dict[str, object]) -> int:
     return len(json.dumps(block, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
 
 
+def _publication_gate_attribution_counts(
+    attribution: dict[str, object],
+    observed_counts: dict[str, dict[str, object]],
+    lane_row_limit: int,
+) -> dict[str, dict[str, int]]:
+    """Build the truncation counts, with a bounded number of per-lane rows.
+
+    ``observed`` totals come from the raw (unbounded) maps so a reader can see
+    what was dropped; ``kept`` is recomputed from the surviving identities.  The
+    lane rows themselves are bounded: the ``lane_row_limit`` most-observed lanes
+    per bucket get their own row (ties broken by lane name so repeated
+    heartbeats agree), and the rest are aggregated into a single remainder row
+    carrying their summed observed/kept plus the number of lanes folded in.
+    """
+    counts: dict[str, dict[str, int]] = {}
+    for bucket_key, observed in observed_counts.items():
+        bucket = attribution.get(bucket_key)
+        if not isinstance(bucket, dict):
+            continue
+        counts[bucket_key] = {"observed": observed["total"], "kept": len(bucket)}
+        kept_by_lane: dict[str, int] = {}
+        for identity in bucket:
+            lane = _publication_gate_attribution_lane(identity)
+            if lane is not None:
+                kept_by_lane[lane] = kept_by_lane.get(lane, 0) + 1
+        # Per-lane rows only appear once identities are lane-namespaced, so a
+        # legacy single-lane receipt keeps exactly the counts it always had.
+        ranked = sorted(observed["lanes"].items(), key=lambda item: (-item[1], item[0]))
+        for lane, lane_observed in sorted(ranked[:lane_row_limit]):
+            counts[_publication_gate_attribution_lane_count_key(bucket_key, lane)] = {
+                "observed": lane_observed,
+                "kept": kept_by_lane.get(lane, 0),
+            }
+        remainder = ranked[lane_row_limit:]
+        if remainder:
+            counts[
+                _publication_gate_attribution_lane_count_key(
+                    bucket_key, _PUBLICATION_GATE_ATTRIBUTION_LANE_REMAINDER
+                )
+            ] = {
+                "observed": sum(lane_observed for _, lane_observed in remainder),
+                "kept": sum(kept_by_lane.get(lane, 0) for lane, _ in remainder),
+                "lanes": len(remainder),
+            }
+    return counts
+
+
 def _bound_publication_gate_attribution(
     attribution: dict[str, object],
-    observed_counts: dict[str, int],
+    observed_counts: dict[str, dict[str, object]],
 ) -> dict[str, object]:
     """Keep the complete attribution projection within its JSONB budget.
 
-    Once the per-bucket caps and counts are applied, discard the lexicographically
-    greatest identity from the lowest-priority bucket first.  The reverse bucket
-    order is fixed here so repeated heartbeats produce the same durable receipt.
+    Once the per-bucket caps and counts are applied, discard the
+    highest-priority lane's greatest identity from the lowest-priority bucket
+    first.  When every bucket is empty and the block is still over budget, the
+    counts themselves are what remains: shrink the per-lane row limit until they
+    fit.  Both eviction orders are fixed here so repeated heartbeats produce the
+    same durable receipt.
     """
-    counts: dict[str, dict[str, int]] = {}
-    for bucket_key, observed_count in observed_counts.items():
-        bucket = attribution.get(bucket_key)
-        if isinstance(bucket, dict):
-            counts[bucket_key] = {"observed": observed_count, "kept": len(bucket)}
-    attribution["attribution_counts"] = counts
+    lane_row_limit = PUBLICATION_GATE_ATTRIBUTION_MAX_LANE_ROWS
+    attribution["attribution_counts"] = _publication_gate_attribution_counts(
+        attribution, observed_counts, lane_row_limit
+    )
     while _publication_gate_attribution_bytes(attribution) > PUBLICATION_GATE_ATTRIBUTION_MAX_BYTES:
         eviction_bucket_key = next(
             (key for key in reversed(_PUBLICATION_GATE_ATTRIBUTION_BUCKET_KEYS) if attribution.get(key)),
             None,
         )
-        if eviction_bucket_key is None:
+        if eviction_bucket_key is not None:
+            bucket = attribution[eviction_bucket_key]
+            if not isinstance(bucket, dict):
+                break
+            bucket.pop(_publication_gate_attribution_eviction_victim(bucket))
+        elif lane_row_limit > 0:
+            lane_row_limit //= 2
+        else:
             break
-        bucket = attribution[eviction_bucket_key]
-        if not isinstance(bucket, dict):
-            break
-        bucket.pop(next(reversed(bucket)))
-        counts[eviction_bucket_key]["kept"] = len(bucket)
+        attribution["attribution_counts"] = _publication_gate_attribution_counts(
+            attribution, observed_counts, lane_row_limit
+        )
     return attribution
 
 
@@ -320,7 +425,7 @@ def sanitize_publication_gate_receipt(raw: object) -> dict[str, object] | None:
         receipt["attribution_state"] = attribution_state[
             :PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH
         ]
-    observed_counts: dict[str, int] = {}
+    observed_counts: dict[str, dict[str, object]] = {}
     attribution: dict[str, object] = {}
     if "attribution_state" in receipt:
         attribution["attribution_state"] = receipt["attribution_state"]
@@ -329,9 +434,9 @@ def sanitize_publication_gate_receipt(raw: object) -> dict[str, object] | None:
             bounded_bucket = _sanitize_publication_gate_attribution_bucket(raw[bucket_key])
             if bounded_bucket is None:
                 return None
-            bucket, observed_count = bounded_bucket
+            bucket, observed = bounded_bucket
             attribution[bucket_key] = bucket
-            observed_counts[bucket_key] = observed_count
+            observed_counts[bucket_key] = observed
     if attribution:
         receipt.update(_bound_publication_gate_attribution(attribution, observed_counts))
     if "guard_suppressions" in raw and raw["guard_suppressions"] is not None:

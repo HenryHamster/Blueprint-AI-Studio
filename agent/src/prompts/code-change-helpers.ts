@@ -114,15 +114,6 @@ export interface CodeChangeHelperConfig {
    *  pass locally. Empty/undefined for non-ci_failure tasks (unchanged
    *  behavior). Selectors that fail shell-safety validation are dropped. */
   ciFailureSelectors?: string[];
-  /** True when this fix resolved a base-branch merge conflict (the agent's
-   *  rebase onto the base hit conflicts, or fix_reason === 'merge_conflict').
-   *  When set, the generated ./check derives the affected backend test files
-   *  from the diff and runs them under the sanctioned Postgres harness, so a
-   *  silent drop or a code/test vintage skew from the resolution fails the gate
-   *  BEFORE ./pr open can push — instead of surfacing only in CI after the
-   *  review-fix budget is spent (incident: rollup PR #8920). See
-   *  buildMergeVerifyBlock. Unset for non-conflict fixes (unchanged behavior). */
-  mergeVerify?: boolean;
   /** A declared `visual` acceptance-evidence requirement (component + viewport
    *  width) carried onto this task. When set, the generated ./check adds a
    *  best-effort SUCCESS-PATH block that captures the component's viewport

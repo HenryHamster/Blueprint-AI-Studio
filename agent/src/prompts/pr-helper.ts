@@ -303,6 +303,14 @@ render_suppressed_baseline_section() {
   if [ ! -s "$receipt_file" ] || ! command -v python3 >/dev/null 2>&1; then
     return 0
   fi
+  # Blueprint's own repo carries the shared multi-lane receipt writer, which
+  # renders EVERY attributed lane's suppressions (each identity attributed to
+  # the lane that forgave it). A stack without that writer only ever produces
+  # the legacy single-lane sidecar, so it falls through to the reader below.
+  if [ -r scripts/verification_receipt.py ] \\
+    && python3 scripts/verification_receipt.py render-suppressed --receipt "$receipt_file" 2>/dev/null; then
+    return 0
+  fi
   python3 -c 'import json,sys; payload=json.load(open(sys.argv[1],encoding="utf-8")); pytest=payload.get("pytest"); d=pytest.get("suppressed_failures") if isinstance(pytest,dict) and "suppressed_failures" in pytest else payload.get("suppressed_failures"); lines=["### Suppressed baseline failures"]+["- {}{}{}: {}".format(chr(96),k,chr(96),v.get("detail","") if isinstance(v,dict) else v) for k,v in sorted(d.items())] if isinstance(d,dict) and d else []; print("\\n".join(lines),end="") if lines else None' "$receipt_file" 2>/dev/null || true
 }
 
@@ -312,6 +320,14 @@ render_suppressed_baseline_section() {
 # nine-key receipt unchanged.
 persist_verification_attribution() {
   if [ ! -s "$_VERIFY_RECEIPT" ] || ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  # Same split as the PR-body renderer: the shared writer folds every lane's
+  # structured maps into the receipt's closed shape (identities namespaced by
+  # lane, attribution_state naming each lane's own state). Stacks without it
+  # keep the legacy single-lane projection below.
+  if [ -r scripts/verification_receipt.py ] \\
+    && python3 scripts/verification_receipt.py project-attribution --gate "$GATE_RECEIPT_FILE" --receipt "$_VERIFY_RECEIPT" 2>/dev/null; then
     return 0
   fi
   python3 -c 'import json,sys; gate_path,verification_path=sys.argv[1:]; gate=json.load(open(gate_path,encoding="utf-8")); payload=json.load(open(verification_path,encoding="utf-8")); pytest=payload.get("pytest"); data=pytest if isinstance(pytest,dict) and "state" in pytest else payload; keys=("new_failures","suppressed_failures","disappeared_failures","skipped_failures"); attrs={"attribution_state":data["state"],**{key:data.get(key,{}) for key in keys}} if isinstance(data,dict) and isinstance(data.get("state"),str) and all(isinstance(data.get(key,{}),dict) for key in keys) else {}; gate.update(attrs); open(gate_path,"w",encoding="utf-8").write(json.dumps(gate,separators=(",",":"))+"\\n")' "$GATE_RECEIPT_FILE" "$_VERIFY_RECEIPT" 2>/dev/null || true
