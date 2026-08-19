@@ -506,15 +506,20 @@ function AccountRow({
       {isRateLimited && (
         <div className="mt-2 pt-2 border-t border-neutral-800/50">
           {disabledModels.map(([model, info]) => {
-            const cooldownMin = Math.min(30 * Math.pow(2, (info.hits - 1)), 240);
             const disabledAt = info.at ? parseTimestamp(info.at) : null;
-            const recoveryAt = disabledAt ? new Date(disabledAt.getTime() + cooldownMin * 60000) : null;
+            const recoveryAt = disabledAt && typeof info.cooldown_seconds === 'number'
+              ? new Date(disabledAt.getTime() + info.cooldown_seconds * 1000)
+              : null;
             const remaining = recoveryAt ? Math.max(0, Math.round((recoveryAt.getTime() - now) / 60000)) : null;
+            const isQuota = info.kind === 'quota_exhausted';
             const shortModel = model.replace('claude-', '').replace('-4-6', '');
+            const durLabel = remaining === null || remaining <= 0
+              ? 'recovering'
+              : isQuota ? '24h quota' : `${remaining}m left`;
             return (
               <div key={model} className="flex items-center justify-between text-ui-md text-amber-400/80">
                 <span className="font-mono">{shortModel} <span className="text-amber-500/60">hit #{info.hits}</span></span>
-                <span className="text-amber-500/60">{remaining !== null && remaining > 0 ? `${remaining}m left` : 'recovering'}</span>
+                <span className="text-amber-500/60">{durLabel}</span>
               </div>
             );
           })}

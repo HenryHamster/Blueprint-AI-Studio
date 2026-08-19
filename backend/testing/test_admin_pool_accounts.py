@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import json
 import uuid
 from datetime import timedelta
@@ -11,6 +12,7 @@ from sqlmodel import select
 from app.digest_cache import DigestCache, get_digest_cache
 from app.main import app
 from app.providers.base import UsageSnapshot
+from app.rate_limit_cooldown import cooldown_seconds_for_info
 from app.routers import admin_pool_accounts as _admin_pool_accounts
 from app.max_plan_pool import _account_by_id, _max_plan_pools
 from app.models import (
@@ -2751,3 +2753,108 @@ async def test_set_per_project_cap_rejects_other_users_account(client, db_sessio
         json={"project_id": str(uuid.uuid4()), "daily_task_cap": 5},
     )
     assert res.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "kind,hits,retry_after_seconds",
+    list(
+        itertools.product(
+            ("rate_limit", "quarantine", "quota_exhausted", "regression"),
+            (1, 2, 3),
+            (None, 4 * 3600),
+        )
+    ),
+)
+def test_serialize_disabled_models_pins_cooldown_seconds_to_shared_math(
+    kind, hits, retry_after_seconds
+):
+    """The admin-facing serializers must stamp `cooldown_seconds` from the
+    single-sourced app.rate_limit_cooldown.cooldown_seconds_for_info — not
+    leave it as a dead pass-through field with no producer.
+
+    A quota_exhausted entry must always serialize to a flat 86400 (24h),
+    regardless of hits, matching the billing-wall behavior the operator
+    surface depends on to avoid reporting a live billing hold as recovered.
+    """
+    info: Dict[str, Any] = {"hits": hits, "at": _admin_pool_accounts._utcnow()}
+    if kind != "rate_limit":
+        info["kind"] = kind
+    if retry_after_seconds is not None:
+        info["retry_after_seconds"] = retry_after_seconds
+
+    expected = cooldown_seconds_for_info(info)
+    if kind == "quota_exhausted":
+        assert expected == 86400
+
+    mem_serialized = _admin_pool_accounts._serialize_disabled_models(
+        {"claude-opus-4-8": info}
+    )
+    assert mem_serialized["claude-opus-4-8"]["cooldown_seconds"] == expected
+
+    db_account = MaxPlanAccount(
+        user_id="test-user-123",
+        name="Cooldown Parity",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        rate_limit_state={
+            "disabled_models": {
+                "claude-opus-4-8": {**info, "at": info["at"].isoformat()}
+            }
+        },
+    )
+    db_serialized = _admin_pool_accounts._disabled_models_from_db(db_account)
+    assert db_serialized["claude-opus-4-8"]["cooldown_seconds"] == expected
+
+
+async def test_account_roster_quota_exhausted_reports_full_24h_window(
+    client, db_session, inject_pool
+):
+    """Regression guard for the settings panel reading a 24h billing hold as
+    recovering after ~30 minutes: the roster endpoint must serve the real
+    24h window via cooldown_seconds, not leave the field unset."""
+    acct_id = uuid.uuid4()
+    db_session.add(
+        MaxPlanAccount(
+            id=acct_id,
+            user_id="test-user-123",
+            name="Quota Account",
+            provider=LLMProviderName.ANTHROPIC,
+            auth_mode=LLMAuthMode.OAUTH,
+            secret_blob_ref="projects/test/secrets/quota/versions/1",
+            enabled=True,
+        )
+    )
+    await db_session.commit()
+
+    inject_pool(
+        "test-user-123",
+        [
+            {
+                "id": str(acct_id),
+                "user_id": "test-user-123",
+                "name": "Quota Account",
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "runtime_secret": "sk-ant-oat01-secret",
+                "secret_blob_ref": "projects/test/secrets/quota/versions/1",
+                "provider_metadata": {},
+                "enabled": True,
+                "active_tasks": 0,
+                "total_tasks": 0,
+                "disabled_models": {
+                    "claude-sonnet-4-6": {
+                        "hits": 1,
+                        "at": _admin_pool_accounts._utcnow(),
+                        "kind": "quota_exhausted",
+                    }
+                },
+                "runtime_ready": True,
+            }
+        ],
+    )
+
+    roster = await client.get("/api/admin/max-plan-accounts")
+    assert roster.status_code == 200, roster.text
+    accounts = {a["id"]: a for a in roster.json()["accounts"]}
+    entry = accounts[str(acct_id)]["disabled_models"]["claude-sonnet-4-6"]
+    assert entry["cooldown_seconds"] == 86400

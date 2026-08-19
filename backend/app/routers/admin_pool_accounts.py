@@ -37,6 +37,7 @@ from app.models import (
     _utcnow,
 )
 from app.providers.registry import get_provider
+from app.rate_limit_cooldown import cooldown_seconds_for_info
 from app.shared_state import limiter
 
 logger = logging.getLogger(__name__)
@@ -301,11 +302,11 @@ def _serialize_disabled_models(raw: Any) -> dict[str, dict[str, Any]]:
             "kind",
             "provider",
             "retry_after_seconds",
-            "cooldown_seconds",
             "regression_stats",
         ):
             if field in info:
                 entry[field] = info[field]
+        entry["cooldown_seconds"] = cooldown_seconds_for_info(info)
         serialized[str(model)] = entry
     return serialized
 
@@ -326,11 +327,11 @@ def _disabled_models_from_db(account: MaxPlanAccount) -> dict[str, dict[str, Any
             "kind",
             "provider",
             "retry_after_seconds",
-            "cooldown_seconds",
             "regression_stats",
         ):
             if field in info:
                 entry[field] = info[field]
+        entry["cooldown_seconds"] = cooldown_seconds_for_info(info)
         serialized[str(model)] = entry
     return serialized
 
