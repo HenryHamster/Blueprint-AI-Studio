@@ -10831,6 +10831,116 @@ async def test_reassigned_lands_cancelled_no_retry_no_alert(
 
 
 @pytest.mark.asyncio
+async def test_reassigned_with_pushed_head_records_orphaned_push_on_cancellation(
+    client: AsyncClient, db_session, mocker
+):
+    """Kill-path regression (NeurIPS task 38b16082, 2026-08-18): a REASSIGNED
+    report can land here AFTER the agent already `git push`ed a real commit but
+    BEFORE PR creation ran (the heartbeat self-terminate window). With no PR
+    artifact and no task_pr_linkage yet, that pushed branch/commit was
+    previously orphaned — nothing on the task record pointed at it, so no
+    downstream review loop could ever pick it up.
+
+    When the agent's terminal report carries pushed_branch/pushed_head_sha
+    alongside REASSIGNED, the CANCELLED task's context must record
+    orphaned_push = {branch, head_sha, recorded_at} so a recovery sweep can
+    find and resume the work instead of silently discarding it."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = Project(name="Reassigned Orphan Push Test", user_id="test-user-reassigned-push")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-reassigned-push",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-reassigned-push")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_category": "reassigned",
+        "logs": (
+            "Task reassigned/deauthorized — heartbeat POST /api/agent/heartbeat "
+            "still rejected with HTTP 403 after 3 credential re-acquisition "
+            "attempts over ~60s"
+        ),
+        "pushed_branch": "blueprint-fix/orphan-guard-abcd123",
+        "pushed_head_sha": "08823f5a1234567890abcdef1234567890abcdef",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+    assert (task.context or {}).get("failure_category") == "REASSIGNED"
+
+    orphaned_push = (task.context or {}).get("orphaned_push")
+    assert orphaned_push is not None, (
+        "a REASSIGNED cancellation carrying a pushed head must record "
+        "task.context['orphaned_push'] so downstream review can pick it up "
+        "instead of orphaning the commit"
+    )
+    assert orphaned_push["branch"] == "blueprint-fix/orphan-guard-abcd123"
+    assert orphaned_push["head_sha"] == "08823f5a1234567890abcdef1234567890abcdef"
+    assert orphaned_push["recorded_at"], "recorded_at must be populated"
+
+
+@pytest.mark.asyncio
+async def test_reassigned_without_pushed_head_does_not_record_orphaned_push(
+    client: AsyncClient, db_session, mocker
+):
+    """Negative-space regression for the fix above: a REASSIGNED cancellation
+    with NO pushed_branch/pushed_head_sha (the common case — most agents never
+    push before being reassigned) must NOT fabricate an orphaned_push entry."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = Project(name="Reassigned No Push Test", user_id="test-user-reassigned-nopush")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-reassigned-nopush",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-reassigned-nopush")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_category": "reassigned",
+        "logs": "Task reassigned/deauthorized — heartbeat POST /api/agent/heartbeat rejected with HTTP 404 (non-retryable)",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+    assert "orphaned_push" not in (task.context or {})
+
+
+@pytest.mark.asyncio
 async def test_execution_timeout_retry_escalates_effort(
     client: AsyncClient, db_session, mocker
 ):

@@ -3940,6 +3940,29 @@ async def update_agent_status(
                 # neither false-fails the task nor pages the operator.
                 task.status = TaskStatus.CANCELLED
                 persist_failure_category(task, failure_class)
+                # Kill-path (NeurIPS task 38b16082, 2026-08-18): a REASSIGNED
+                # report can land here AFTER the agent already `git push`ed a
+                # real commit but BEFORE the PR-creation call ran — the
+                # heartbeat self-terminate path (agent/src/index.ts) fires in
+                # that exact window. With no PR artifact and no
+                # task_pr_linkage, that pushed branch/commit was previously
+                # orphaned: nothing on the task record pointed at it, so no
+                # downstream review loop could ever pick it up. When the agent
+                # reports a pushed head alongside REASSIGNED, persist it onto
+                # the CANCELLED task's context so a recovery sweep can find and
+                # resume the work instead of silently discarding it. A
+                # separate in-flight fix handles the actual review-loop head
+                # refresh/pickup; this only makes the cancellation record
+                # carry the truth.
+                if payload.pushed_branch or payload.pushed_head_sha:
+                    ctx = dict(task.context or {})
+                    ctx["orphaned_push"] = {
+                        "branch": payload.pushed_branch,
+                        "head_sha": payload.pushed_head_sha,
+                        "recorded_at": _utcnow().isoformat(),
+                    }
+                    task.context = ctx
+                    flag_modified(task, "context")
                 session.add(task)
             elif payload.status == TaskStatus.FAILED:
                 max_r = _runtime_config["max_retries"]

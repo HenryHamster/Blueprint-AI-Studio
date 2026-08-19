@@ -50,7 +50,7 @@ export function startEventLoopLagMonitor(): void {
 }
 
 export function traceHeartbeat(
-  attemptKind: 'initial' | 'periodic' | 'retry-409' | 'sync',
+  attemptKind: 'initial' | 'periodic' | 'retry-409' | 'retry-auth' | 'sync',
   startMs: number,
   endMs: number,
   status: 'ok' | 'err' | 'skip-in-flight' | 'reclaim-wedged',

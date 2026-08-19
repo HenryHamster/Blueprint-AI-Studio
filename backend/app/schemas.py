@@ -325,6 +325,19 @@ class AgentStatusPayload(BaseModel):
     # status endpoint, then upserted as a KnowledgeDocument by the completion
     # handler. Absent payloads are a clean no-op — domain capture is best-effort.
     domain_overview: RepoDomainOverview | None = None
+    # Last branch/head SHA the agent successfully `git push`ed this role, set
+    # ONLY by the heartbeat self-terminate path (agent/src/index.ts,
+    # postTerminalStatusSync's pushedWorkExtras()) when a non-transient
+    # heartbeat 4xx forces a REASSIGNED report after a push already landed a
+    # commit on GitHub but before the PR-creation call could run. Without this,
+    # a REASSIGNED->CANCELLED task with no PR artifact and no task_pr_linkage
+    # orphans that pushed commit entirely — nothing routes it to review (see
+    # kill-path: NeurIPS task 38b16082, 2026-08-18). Persisted into
+    # task.context["orphaned_push"] so downstream review-loop recovery can pick
+    # the commit up instead of treating the branch as never having existed.
+    # Absent for every other status report.
+    pushed_branch: str | None = Field(None, max_length=200)
+    pushed_head_sha: str | None = Field(None, pattern="^[0-9a-fA-F]{7,64}$")
 
     @model_validator(mode="after")
     def _validate_execution_capability_provenance(self):
