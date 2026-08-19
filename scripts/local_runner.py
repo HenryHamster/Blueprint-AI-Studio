@@ -8308,8 +8308,12 @@ def _verification_toolchain_recovery_loop(
             return
         if state.ready():
             return
-        last_attempt_at = time.monotonic()
         _recover_verification_toolchain_once(state, caps, agent_binary, agent_image)
+        # Stamp AFTER the attempt returns so the cadence is a genuine
+        # inter-attempt floor. Stamping before (the prior bug) let the
+        # attempt's own duration eat into the wait, collapsing it to zero
+        # whenever a single attempt took >= the cadence.
+        last_attempt_at = time.monotonic()
 
 
 def _preflight(

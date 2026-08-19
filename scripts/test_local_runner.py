@@ -489,6 +489,59 @@ class TestVerificationToolchainRecovery(unittest.TestCase):
         self.assertFalse(local_runner._verification_recovery_due(10.0, 10.0 + cadence - 0.01))
         self.assertTrue(local_runner._verification_recovery_due(10.0, 10.0 + cadence))
 
+    def test_recovery_loop_keeps_inter_attempt_floor_regardless_of_attempt_duration(self):
+        """Regression test for the collapsed-cadence bug: the loop used to
+        stamp ``last_attempt_at`` BEFORE calling the (possibly slow) recovery
+        attempt, so an attempt lasting >= the cadence made the next wait
+        collapse to zero. The fix stamps after the attempt returns, so the
+        wait requested for the next attempt is a genuine floor independent
+        of how long the previous attempt took."""
+        cadence = local_runner._VERIFICATION_TOOLCHAIN_RECOVERY_SECONDS
+
+        def _drive_loop(attempt_duration):
+            state = local_runner._VerificationToolchainState(
+                self._report(ready=False, reason="not ready")
+            )
+            clock = [0.0]
+            waits = []
+
+            def fake_monotonic():
+                return clock[0]
+
+            def fake_recover(*args, **kwargs):
+                clock[0] += attempt_duration
+                return False
+
+            def fake_wait(remaining):
+                waits.append(remaining)
+                clock[0] += remaining
+                # Stop once we've observed the wait requested for the
+                # SECOND attempt cycle — the one following the timed attempt.
+                return len(waits) >= 2
+
+            with patch.object(local_runner.time, "monotonic", side_effect=fake_monotonic), \
+                 patch.object(
+                     local_runner, "_recover_verification_toolchain_once",
+                     side_effect=fake_recover,
+                 ), \
+                 patch.object(local_runner._shutdown_event, "wait", side_effect=fake_wait):
+                local_runner._verification_toolchain_recovery_loop(
+                    state, _bwrap_caps(), ["node", "/agent/dist/index.js"], None
+                )
+            return waits
+
+        # A slow attempt (>= cadence) must NOT collapse the next wait to
+        # ~zero — this is the bug #17543 newly armed.
+        slow_waits = _drive_loop(cadence + 10.0)
+        self.assertGreaterEqual(slow_waits[1], cadence - 0.01)
+
+        # A fast attempt (<< cadence) must still land close to a single
+        # cadence, not double it — the fix must not turn a fast failure
+        # into a 2x-cadence stall.
+        fast_waits = _drive_loop(5.0)
+        self.assertGreaterEqual(fast_waits[1], cadence - 0.01)
+        self.assertLess(fast_waits[1], cadence + 1.0)
+
     def test_transient_failure_then_success_publishes_report_and_spawn_toolchain(self):
         state = local_runner._VerificationToolchainState(
             self._report(ready=False, reason="bootstrap failed")
