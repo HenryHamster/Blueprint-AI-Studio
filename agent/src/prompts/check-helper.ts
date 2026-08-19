@@ -296,7 +296,12 @@ _VERIFY_TASK_ID="\${TASK_ID:-${cfg.taskId}}"
 _VERIFY_RECEIPT="/tmp/project_verification_receipt_\${_VERIFY_TASK_ID}.json"
 _VERIFY_HARNESS_RECEIPT="/tmp/backend_verification_harness_\${_VERIFY_TASK_ID}.json"
 _VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_\${_VERIFY_TASK_ID}"
-if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT"; then
+# Warm VMs reuse /tmp, so a prior task's per-lane suppression receipts would be
+# attributed to this run. Clear them exactly as the verification receipts above.
+BLUEPRINT_GUARD_SUPPRESSION_DIR="/tmp/guard_suppression_receipts_\${_VERIFY_TASK_ID}"
+export BLUEPRINT_GUARD_SUPPRESSION_DIR
+if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT" \\
+  || ! rm -rf "$BLUEPRINT_GUARD_SUPPRESSION_DIR"; then
   echo "[check] unable to remove prior verification receipt(s) — refusing to run" >&2
   exit 1
 fi
@@ -545,6 +550,7 @@ if admin_ui_runtime_touched; then
       echo "[check] admin-ui playwright chromium OK"
     else
       echo "[check] VIEWPORT_CAPTURE_SKIPPED: Chromium substrate unavailable on this VM; CI frontend-viewport enforces browser verification"
+      if [ -f scripts/guard_suppression_receipt.py ]; then python3 scripts/guard_suppression_receipt.py record --lane viewport --state capture_skipped --skipped "viewport::chromium_substrate_unavailable=playwright chromium bootstrap failed on this VM" || true; fi
       tail -30 "$VIEWPORT_BOOTSTRAP_LOG" || true
       VIEWPORT_RUN=0
     fi
@@ -604,6 +610,7 @@ if admin_ui_runtime_touched; then
       fi
       if [ "$BASELINE_FAILED" = "1" ]; then
         echo "[check] $VIEWPORT_LABEL WARN — also broken on $BASE_REF; not blocking PR"
+        if [ -f scripts/guard_suppression_receipt.py ]; then python3 scripts/guard_suppression_receipt.py record --lane viewport --state preexisting_viewport_failure --suppressed "viewport::baseline_also_broken=$VIEWPORT_LABEL also failing on $BASE_REF" || true; fi
         echo "[check] PR-side tail:"
         tail -30 "$PR_VP_LOG" || true
         echo "[check] Baseline-side tail:"
@@ -752,6 +759,10 @@ ${loadSizeGuardrailScript()}`;
     }
   }
   const footer = `
+# Merge every lane's suppression receipt into one cross-lane aggregate. Purely
+# additive bookkeeping: it never contributes to FAILED.
+if [ -f scripts/guard_suppression_receipt.py ]; then python3 scripts/guard_suppression_receipt.py aggregate --out "$BLUEPRINT_GUARD_SUPPRESSION_DIR/aggregate.json" || true; fi
+
 if [ \${#FAILED[@]} -eq 0 ]; then
   echo ""
   echo "[check] PASS — all checks green"

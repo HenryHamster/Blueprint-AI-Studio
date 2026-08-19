@@ -6,6 +6,9 @@ import uuid
 from app.models import Task, TaskStatus
 from app.schemas import PublicationGateReceipt
 from app.task_blocked import (
+    GUARD_SUPPRESSIONS_MAX_BYTES,
+    GUARD_SUPPRESSIONS_MAX_IDENTITIES_PER_LANE,
+    GUARD_SUPPRESSIONS_MAX_LANES,
     PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH,
     PUBLICATION_GATE_ATTRIBUTION_MAX_BYTES,
     PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES,
@@ -133,6 +136,221 @@ def test_unknown_keys_are_dropped_from_receipt_and_identity_details():
     assert sanitized is not None
     assert "unknown_receipt_key" not in sanitized
     assert sanitized["suppressed_failures"] == {"test": {"detail": "kept", "reason": "kept too"}}
+
+
+def test_sanitizer_bounds_cross_lane_guard_suppressions():
+    """guard_suppressions round-trips, truncates deterministically over-cap,
+    and rejects genuinely malformed shapes without disturbing the legacy
+    nine-key receipt contract."""
+    # 1. Round-trips a small, well-formed cross-lane payload.
+    raw = {**_legacy_receipt(), "guard_suppressions": {
+        "static": {"state": "passed", "suppressed": {}},
+        "vitest": {"state": "preexisting_test_failure",
+                   "suppressed": {"vitest::flaky::test": "AssertionError: inherited"}},
+    }}
+    sanitized = sanitize_publication_gate_receipt(raw)
+    assert sanitized is not None
+    assert sanitized["guard_suppressions"] == {
+        "static": {"state": "passed", "suppressed": {}, "suppressed_observed_count": 0,
+                   "suppressed_truncated": False},
+        "vitest": {"state": "preexisting_test_failure",
+                   "suppressed": {"vitest::flaky::test": "AssertionError: inherited"},
+                   "suppressed_observed_count": 1, "suppressed_truncated": False},
+    }
+    assert sanitized["guard_suppressions_counts"] == {"observed_lanes": 2, "kept_lanes": 2}
+    assert PublicationGateReceipt.model_validate(sanitized).model_dump(exclude_none=True) == sanitized
+
+    # 2. Over-cap lane count and over-cap identities-per-lane truncate deterministically.
+    over_cap_raw = {**_legacy_receipt(), "guard_suppressions": {
+        f"lane-{index:03d}": {
+            "state": "passed",
+            "suppressed": {
+                f"id-{j:03d}": "detail" for j in range(GUARD_SUPPRESSIONS_MAX_IDENTITIES_PER_LANE + 3)
+            } if index == 0 else {},
+        }
+        for index in range(GUARD_SUPPRESSIONS_MAX_LANES + 5)
+    }}
+    over_cap_sanitized = sanitize_publication_gate_receipt(over_cap_raw)
+    assert over_cap_sanitized is not None
+    kept_lanes = over_cap_sanitized["guard_suppressions"]
+    assert len(kept_lanes) == GUARD_SUPPRESSIONS_MAX_LANES
+    expected_lanes = sorted(over_cap_raw["guard_suppressions"])[:GUARD_SUPPRESSIONS_MAX_LANES]
+    assert sorted(kept_lanes) == expected_lanes
+    assert len(kept_lanes["lane-000"]["suppressed"]) == GUARD_SUPPRESSIONS_MAX_IDENTITIES_PER_LANE
+    assert kept_lanes["lane-000"]["suppressed_observed_count"] == GUARD_SUPPRESSIONS_MAX_IDENTITIES_PER_LANE + 3
+    assert over_cap_sanitized["guard_suppressions_counts"]["observed_lanes"] == GUARD_SUPPRESSIONS_MAX_LANES + 5
+    assert over_cap_sanitized["guard_suppressions_counts"]["kept_lanes"] == GUARD_SUPPRESSIONS_MAX_LANES
+
+    # 3. A byte-budget breach truncates (never rejects) a well-formed payload.
+    huge_raw = {**_legacy_receipt(), "guard_suppressions": {
+        f"lane-{index:03d}": {
+            "state": "passed",
+            "suppressed": {
+                f"id-{j:03d}": "d" * PUBLICATION_GATE_ATTRIBUTION_STRING_MAX_LENGTH
+                for j in range(GUARD_SUPPRESSIONS_MAX_IDENTITIES_PER_LANE)
+            },
+        }
+        for index in range(GUARD_SUPPRESSIONS_MAX_LANES)
+    }}
+    huge_sanitized = sanitize_publication_gate_receipt(huge_raw)
+    assert huge_sanitized is not None
+    huge_block = {
+        "guard_suppressions": huge_sanitized["guard_suppressions"],
+        "guard_suppressions_counts": huge_sanitized["guard_suppressions_counts"],
+    }
+    assert (
+        len(json.dumps(huge_block, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
+        <= GUARD_SUPPRESSIONS_MAX_BYTES
+    )
+    assert huge_sanitized["guard_suppressions_counts"]["kept_lanes"] < GUARD_SUPPRESSIONS_MAX_LANES
+
+    # 4. Genuinely malformed shapes reject the WHOLE receipt (same contract as
+    #    the other attribution buckets) rather than silently dropping the key.
+    for malformed in (
+        "not a dict",
+        {"lane": "not a dict"},
+        {"lane": {"state": 7, "suppressed": {}}},
+        {"lane": {"state": "passed", "suppressed": "not a dict"}},
+        {"lane": {"state": "passed", "suppressed": {"id": 7}}},
+        {"lane": {"state": "passed", "suppressed": {1: "detail"}}},
+    ):
+        assert sanitize_publication_gate_receipt(
+            {**_legacy_receipt(), "guard_suppressions": malformed}
+        ) is None
+
+    # 5. Absent key: legacy nine-key receipts sanitize exactly as before.
+    legacy = sanitize_publication_gate_receipt(_legacy_receipt())
+    assert legacy is not None
+    assert "guard_suppressions" not in legacy
+    assert "guard_suppressions_counts" not in legacy
+
+    # 6. Round-trips through the durable record path too.
+    task = _task()
+    assert record_publication_gate_receipt(task, raw) is True
+    assert task.context["publication_gate_receipt"]["guard_suppressions"] == sanitized["guard_suppressions"]
+
+
+
+def test_producer_observed_count_survives_and_beats_len_of_the_projection():
+    """The durable receipt must reveal producer-side truncation.
+
+    The producer (scripts/guard_suppression_receipt.py) already caps each bucket
+    at MAX_ENTRIES_PER_BUCKET, which equals this module's per-lane cap. Deriving
+    the observed count from ``len()`` of the projection here would therefore make
+    ``suppressed_observed_count`` identically equal to the kept count on every
+    production payload, and a 200-suppression static lane would persist as a
+    complete-looking set of 25.
+    """
+    raw = {**_legacy_receipt(), "guard_suppressions": {
+        "static": {
+            "state": "preexisting_test_failure",
+            # What the producer actually forwards: 25 kept entries out of 200 seen.
+            "suppressed": {f"static::route::{j:03d}": "baseline" for j in range(25)},
+            "suppressed_observed_count": 200,
+            "suppressed_truncated": True,
+        },
+    }}
+    sanitized = sanitize_publication_gate_receipt(raw)
+    assert sanitized is not None
+    lane = sanitized["guard_suppressions"]["static"]
+    assert len(lane["suppressed"]) == 25
+    # The whole point: observed differs from len(entries).
+    assert lane["suppressed_observed_count"] == 200
+    assert lane["suppressed_observed_count"] != len(lane["suppressed"])
+    assert lane["suppressed_truncated"] is True
+
+    # A producer count that is absent or nonsensical (below the kept count, or a
+    # bool) falls back to counting the projection rather than persisting a lie.
+    for bogus in ({}, {"suppressed_observed_count": 1}, {"suppressed_observed_count": True}):
+        fallback = sanitize_publication_gate_receipt({**_legacy_receipt(), "guard_suppressions": {
+            "static": {"state": "passed",
+                       "suppressed": {"static::route::a": "d", "static::route::b": "d"},
+                       **bogus},
+        }})
+        assert fallback is not None
+        assert fallback["guard_suppressions"]["static"]["suppressed_observed_count"] == 2
+
+
+def test_disappeared_and_skipped_buckets_are_persisted():
+    """A lane whose only content is outside `suppressed` stays auditable.
+
+    The viewport lane's capture-skipped branch records its identity exclusively
+    in the `skipped` bucket; a suppressed-only projection persisted
+    ``{"state": "capture_skipped", "suppressed": {}}`` and dropped the reason.
+    """
+    raw = {**_legacy_receipt(), "guard_suppressions": {
+        "viewport": {
+            "state": "capture_skipped",
+            "suppressed": {},
+            "suppressed_observed_count": 0,
+            "suppressed_truncated": False,
+            "skipped": {"viewport::chromium_substrate_unavailable": "no chromium on this VM"},
+            "skipped_observed_count": 1,
+            "skipped_truncated": False,
+        },
+        "static": {
+            "state": "baseline_failure_disappeared",
+            "suppressed": {},
+            "disappeared": {"static::route::gone": "baseline failure vanished"},
+            "disappeared_observed_count": 30,
+            "disappeared_truncated": True,
+        },
+    }}
+    sanitized = sanitize_publication_gate_receipt(raw)
+    assert sanitized is not None
+    viewport = sanitized["guard_suppressions"]["viewport"]
+    assert viewport["skipped"] == {
+        "viewport::chromium_substrate_unavailable": "no chromium on this VM"
+    }
+    assert viewport["skipped_observed_count"] == 1
+    # An absent optional bucket simply stays absent (older agent projections).
+    assert "disappeared" not in viewport
+    static = sanitized["guard_suppressions"]["static"]
+    assert static["disappeared"] == {"static::route::gone": "baseline failure vanished"}
+    assert static["disappeared_observed_count"] == 30
+    assert static["disappeared_truncated"] is True
+    assert PublicationGateReceipt.model_validate(sanitized).model_dump(exclude_none=True) == sanitized
+
+    # Malformed optional buckets reject the whole receipt, same as `suppressed`.
+    for malformed in (
+        {"lane": {"state": "passed", "suppressed": {}, "skipped": "not a dict"}},
+        {"lane": {"state": "passed", "suppressed": {}, "disappeared": {"id": 7}}},
+    ):
+        assert sanitize_publication_gate_receipt(
+            {**_legacy_receipt(), "guard_suppressions": malformed}
+        ) is None
+
+
+def test_byte_budget_eviction_drains_low_value_buckets_first_and_flags_truncation():
+    """Eviction must not silently shrink a bucket without saying so."""
+    raw = {**_legacy_receipt(), "guard_suppressions": {
+        f"lane-{index:03d}": {
+            "state": "passed",
+            "suppressed": {f"s-{j:03d}": "d" * 200 for j in range(GUARD_SUPPRESSIONS_MAX_IDENTITIES_PER_LANE)},
+            "suppressed_observed_count": GUARD_SUPPRESSIONS_MAX_IDENTITIES_PER_LANE,
+            "skipped": {f"k-{j:03d}": "d" * 200 for j in range(GUARD_SUPPRESSIONS_MAX_IDENTITIES_PER_LANE)},
+            "skipped_observed_count": GUARD_SUPPRESSIONS_MAX_IDENTITIES_PER_LANE,
+        }
+        for index in range(GUARD_SUPPRESSIONS_MAX_LANES)
+    }}
+    sanitized = sanitize_publication_gate_receipt(raw)
+    assert sanitized is not None
+    block = {
+        "guard_suppressions": sanitized["guard_suppressions"],
+        "guard_suppressions_counts": sanitized["guard_suppressions_counts"],
+    }
+    assert (
+        len(json.dumps(block, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
+        <= GUARD_SUPPRESSIONS_MAX_BYTES
+    )
+    shrunk = [
+        lane for lane in sanitized["guard_suppressions"].values()
+        if len(lane["skipped"]) < lane["skipped_observed_count"]
+        or len(lane["suppressed"]) < lane["suppressed_observed_count"]
+    ]
+    assert shrunk, "byte budget must have evicted something in this fixture"
+    for lane in shrunk:
+        assert lane["skipped_truncated"] or lane["suppressed_truncated"]
 
 
 def test_attribution_only_change_archives_prior_receipt():

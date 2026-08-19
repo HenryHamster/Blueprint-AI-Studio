@@ -88,27 +88,24 @@ def serving_authorship_range(version: Any) -> tuple[str | None, str | None]:
 
 
 def candidate_authorship_range(version: Any) -> tuple[str | None, str | None]:
-    """Return the candidate's entire compare range: base main to candidate head."""
+    """Return the candidate's entire compare range: base main to candidate head.
+
+    ``candidate_sha`` is read from the dedicated ``ReleaseVersion.candidate_sha``
+    column only — stamped by ``run_qualification`` with the candidate that run
+    actually evaluates (the live integration-branch HEAD it resolved), on both a
+    new and a continued attempt, so the gate's range can never disagree with the
+    diff range and dimension rows of the same run. It deliberately does NOT fall
+    back to the mutable ``last_qualification["candidate_sha"]`` JSONB: that field
+    is written by many unrelated code paths (deferrals, blockers, rehearsal
+    dispatch, ...) and a fallback there let an unrelated write silently
+    substitute the range the hard authorship gate evaluates.
+    """
     if isinstance(version, dict):
         base_sha = version.get("base_sha")
         candidate_sha = version.get("candidate_sha")
-        if candidate_sha is None:
-            qualification = version.get("last_qualification")
-            candidate_sha = (
-                qualification.get("candidate_sha")
-                if isinstance(qualification, dict)
-                else None
-            )
     else:
         base_sha = getattr(version, "base_sha", None)
         candidate_sha = getattr(version, "candidate_sha", None)
-        if candidate_sha is None:
-            qualification = getattr(version, "last_qualification", None)
-            candidate_sha = (
-                qualification.get("candidate_sha")
-                if isinstance(qualification, dict)
-                else None
-            )
     return (
         base_sha if isinstance(base_sha, str) else None,
         candidate_sha if isinstance(candidate_sha, str) else None,

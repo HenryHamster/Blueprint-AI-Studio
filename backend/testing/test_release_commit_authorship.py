@@ -26,7 +26,10 @@ from app.release_commit_authorship import (
     resolve_candidate_base_sha,
     validate_authorship_receipt,
 )
-from app.release_scoring import evaluate_merge_grade
+from app.release_scoring import (
+    evaluate_candidate_operator_authorship_gate,
+    evaluate_merge_grade,
+)
 
 
 class _GitHubResponse:
@@ -807,9 +810,57 @@ def test_candidate_authorship_range_covers_base_to_candidate_head():
     assert candidate_authorship_range(
         {"base_sha": base, "candidate_sha": candidate}
     ) == (base, candidate)
+
+
+def test_candidate_authorship_range_ignores_last_qualification_fallback():
+    """The immutable candidate_sha column is authoritative — a mutable
+    last_qualification["candidate_sha"] write must never substitute for it.
+    """
+    base = "a" * 40
+    candidate = "b" * 40
+    other = "c" * 40
+
     assert candidate_authorship_range(
         {"base_sha": base, "last_qualification": {"candidate_sha": candidate}}
+    ) == (base, None)
+    assert candidate_authorship_range(
+        {
+            "base_sha": base,
+            "candidate_sha": candidate,
+            "last_qualification": {"candidate_sha": other},
+        }
     ) == (base, candidate)
+
+
+def test_identical_compare_range_does_not_resolve_authorship_gate():
+    """An identical base/candidate SHA must never vacuously pass a declared
+    authorship contract, even though the resulting GitHub compare is
+    ``total_commits == 0`` and produces a validly-shaped "resolved" receipt.
+    """
+    same_sha = "a" * 40
+    measurement = {
+        "state": "resolved",
+        "count": 0,
+        "offenders": [],
+        "range": {"base_sha": same_sha, "head_sha": same_sha},
+    }
+    candidate_record = {"base_sha": same_sha, "candidate_sha": same_sha}
+    category = {
+        "category_key": "candidate-authorship",
+        "evidence_contract": {
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
+    }
+
+    gate = evaluate_candidate_operator_authorship_gate(
+        candidate_record, measurement, [category]
+    )
+
+    assert gate["status"] == "blocked"
+    assert gate["passed"] is False
+    assert gate["blocker"] == "candidate_authorship_range_identical"
+    assert gate["range"] == {"base_sha": same_sha, "head_sha": same_sha}
 
 
 def test_candidate_authorship_range_drives_declining_graded_criterion():
@@ -2156,7 +2207,9 @@ async def test_candidate_authorship_measurement_derives_base_when_version_has_no
         status="qualifying",
         base_sha=None,
         opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        last_qualification={"candidate_sha": candidate_sha},
+        # The candidate comes from the dedicated column: the authorship
+        # range no longer falls back to the mutable last_qualification JSONB.
+        candidate_sha=candidate_sha,
     )
     db_session.add_all([project, version])
     await db_session.commit()
@@ -2246,7 +2299,9 @@ async def test_candidate_authorship_measurement_names_version_when_derivation_fa
         status="qualifying",
         base_sha=None,
         opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        last_qualification={"candidate_sha": candidate_sha},
+        # The candidate comes from the dedicated column: the authorship
+        # range no longer falls back to the mutable last_qualification JSONB.
+        candidate_sha=candidate_sha,
     )
     db_session.add_all([project, version])
     await db_session.commit()
@@ -2261,3 +2316,68 @@ async def test_candidate_authorship_measurement_names_version_when_derivation_fa
 
     assert measurement["state"] == "unresolved"
     assert measurement["reason"] == "base_sha_unset_v9_github_credentials_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_null_candidate_sha_column_blocks_with_evidence_missing(db_session):
+    """A pre-migration-0761 row (candidate_sha NULL) must fail CLOSED.
+
+    ``candidate_authorship_range`` reads the dedicated column only, so a row
+    written before the column existed yields ``(base, None)``.  That must reach
+    the hard ``candidate_operator_authorship_evidence_missing`` blocker — an
+    unmeasurable range is not a passing one — and a stale
+    ``last_qualification["candidate_sha"]`` must not rescue it, since that
+    mutable-JSONB fallback is exactly what was removed.  The block is
+    self-clearing: run_qualification refills the column on the next attempt
+    (see test_release_qualifier_candidate_sha_stamp.py).
+    """
+    from app.release_commit_authorship import count_non_bot_authored_commits
+    from app.release_scoring import evaluate_candidate_operator_authorship_gate
+
+    base_sha = "b" * 40
+    project = Project(
+        name="Null candidate sha",
+        user_id="null-candidate-sha",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=11,
+        status="qualifying",
+        base_sha=base_sha,
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        # Stale mutable candidate: the removed fallback would have used this.
+        last_qualification={"candidate_sha": "c" * 40},
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.candidate_sha is None
+    assert candidate_authorship_range(version) == (base_sha, None)
+
+    measurement = await count_non_bot_authored_commits(
+        base_sha, None, session=db_session, project=project
+    )
+    assert measurement["state"] == "unresolved"
+    assert measurement["reason"] == "missing_or_malformed_sha"
+
+    gate = evaluate_candidate_operator_authorship_gate(
+        version,
+        measurement,
+        [
+            {
+                "category_key": "candidate-authorship",
+                "evidence_contract": {
+                    "type": "operator_authored_commits",
+                    "predicate": {"max_count": 0},
+                },
+            }
+        ],
+    )
+
+    assert gate["passed"] is False
+    assert gate["blocker"] == "candidate_operator_authorship_evidence_missing"
+    assert gate["range"] == {"base_sha": base_sha, "head_sha": None}

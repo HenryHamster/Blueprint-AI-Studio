@@ -5,7 +5,7 @@ import { useChatChrome, useChatDetailRevealed } from '../hooks/useChatChrome';
 import { auth } from '../firebase';
 import { currentUiSurface, reportUiLoadTiming } from '../uiLoadTiming';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker, acceptPendingConfirmation, dismissPendingConfirmation } from '../api';
-import type { StrategicCycleProgress, StrategicCycleCompletion } from '../hooks/useLogViewer';
+import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from '../hooks/useLogViewer';
 import { parseTimestamp } from '../utils/time';
 import { type EventPref, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
 import { type TemporaryMutes } from './temporaryMutes';
@@ -42,7 +42,15 @@ import {
   type StrategicWorkbenchState,
 } from '../strategicStateApi';
 import { SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
-import { computeResidentActivityState } from '../utils/strategicSessionLive';
+import {
+  computeResidentActivityState,
+  computeStrategicChatLiveState,
+  computeStrategicSessionActivity,
+  computeStrategicStreamingTurn,
+  scopeStrategicTranscript,
+  type StrategicChatLiveState,
+} from '../utils/strategicSessionLive';
+import { StrategicStreamingPreview } from './StrategicStreamingPreview';
 import { buildConversationWorkdayStatus, type ConversationWorkdayStatus } from '../utils/conversationWorkdayStatus';
 import { messageHasClientIdentity, mergeCanonicalConversationMessage } from '../utils/conversationMessageIdentity';
 import { clearComposerDraftIfCurrent, loadComposerDraft, saveComposerDraft } from '../utils/conversationDraftState';
@@ -419,6 +427,19 @@ export interface MessagesPanelProps {
    * status instead of deriving a second, independently-computed readout.
    */
   onWorkdayStatusChange?: (status: ConversationWorkdayStatus | null) => void;
+  /**
+   * Live `strategic_session` transcript deltas from `useLogViewer`. Strictly
+   * additive over the authenticated message poll: it only ever renders the
+   * ephemeral in-flight preview, never a durable row. Omitting it (or passing
+   * an empty buffer) yields exactly the poll-only rendering.
+   */
+  strategicSessionTranscript?: StrategicSessionDelta[];
+  /**
+   * Reports the derived Chat-mode in-flight state so the header's
+   * StrategicSessionControl can render the same live affordance the thread
+   * shows, instead of deriving a second one.
+   */
+  onChatLiveStateChange?: (state: StrategicChatLiveState | null) => void;
   /** Record a successful operator interaction with Strategic workbench state. */
   onStrategicInteraction?: () => void | Promise<void>;
   /** Open the Strategic context workspace from the minimal Strategic composer. */
@@ -500,7 +521,7 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, active = true, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, onOpenDirection, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onWorkdayStatusChange, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, active = true, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, onOpenDirection, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onWorkdayStatusChange, strategicSessionTranscript, onChatLiveStateChange, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -1262,13 +1283,43 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       .slice()
       .sort(compareConversationMessages);
   }, [messages, eventPrefs, tempMutes]);
+  // Scope the hook-global live transcript buffer to THIS project before any
+  // derivation touches it. `useLogViewer` clears the buffer in a project-switch
+  // effect, which runs after render — this closes that one-render window so a
+  // previous project's deltas can never render against this project's messages.
+  const scopedSessionTranscript = useMemo(
+    () => scopeStrategicTranscript(strategicSessionTranscript, selectedProjectId),
+    [strategicSessionTranscript, selectedProjectId],
+  );
+  // The in-flight streamed reply preview. Reconciles against the durable
+  // conversation messages, so it returns null the moment the poll delivers the
+  // real reply — the thread then renders exactly what the poll alone produces.
+  const strategicStreamingTurn = useMemo(
+    () => (conversationMode
+      ? computeStrategicStreamingTurn(scopedSessionTranscript, conversationMessages)
+      : null),
+    [conversationMode, scopedSessionTranscript, conversationMessages],
+  );
+  const strategicLiveActivity = useMemo(
+    () => (conversationMode
+      ? computeStrategicSessionActivity(scopedSessionTranscript, conversationMessages)
+      : { items: [], latestLifecycle: null }),
+    [conversationMode, scopedSessionTranscript, conversationMessages],
+  );
+  const strategicChatLiveState = useMemo(
+    () => computeStrategicChatLiveState(strategicStreamingTurn, strategicLiveActivity),
+    [strategicStreamingTurn, strategicLiveActivity],
+  );
+  useEffect(() => {
+    onChatLiveStateChange?.(strategicChatLiveState);
+  }, [strategicChatLiveState, onChatLiveStateChange]);
   const conversationWorkdayStatus = useMemo(() => {
     const interactionMode = strategicWorkbenchState?.interaction_mode
       ?? currentStrategicState?.workbench?.interaction_mode
       ?? currentStrategicState?.work_session?.mode
       ?? 'chat';
     const residentActivity = computeResidentActivityState(
-      [],
+      scopedSessionTranscript,
       conversationMessages,
       currentStrategicState?.resident_session,
     );
@@ -1280,7 +1331,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       residentTaskId: currentStrategicState?.resident_session?.task_id,
       conversationMessages,
     });
-  }, [conversationMessages, currentStrategicState, strategicWorkbenchState?.interaction_mode]);
+  }, [conversationMessages, currentStrategicState, scopedSessionTranscript, strategicWorkbenchState?.interaction_mode]);
   useEffect(() => {
     onWorkdayStatusChange?.(conversationWorkdayStatus);
   }, [conversationWorkdayStatus, onWorkdayStatusChange]);
@@ -3273,6 +3324,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         handleBulkDeleteResolved={handleBulkDeleteResolved}
         scrollToBottom={scrollToBottom}
       />
+
+      {/* In-flight strategist turn — ephemeral, never a durable row. Rendered
+          BELOW the virtualized message list (at the foot of the thread, above
+          the composer) so the durable message set the poll produces is left
+          untouched; it disappears entirely once the reply persists. */}
+      {conversationMode && (
+        <StrategicStreamingPreview
+          turn={strategicStreamingTurn}
+          activity={strategicLiveActivity}
+        />
+      )}
 
       {/* Batch action bar */}
       {canOperateProject && (!conversationMode || showChatDetail) && selectMode && selectedIds.size > 0 && (

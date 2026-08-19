@@ -444,3 +444,73 @@ describe('StrategicSessionControl walkthrough selector contract', () => {
     expect(onStartSession).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('StrategicSessionControl chat-mode in-flight affordance', () => {
+  test('chat mode with nothing in flight renders only the mode toggle, as before', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="chat"
+        workdayStatus={status({ state: 'off', label: 'Workday off' })}
+        chatLiveState={null}
+        onModeChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('group', { name: 'Strategic interaction mode' })).toBeInTheDocument();
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByTestId('strategic-chat-live-status')).toBeNull();
+  });
+
+  test('chat mode surfaces the streaming turn without borrowing Workday vocabulary', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="chat"
+        // Workday is OFF in chat mode — its status must not be what the
+        // operator sees while a chat reply is actually in flight.
+        workdayStatus={status({ state: 'off', label: 'Workday off' })}
+        chatLiveState={{ phase: 'streaming', label: 'Replying', detail: 'grep release gate' }}
+        onModeChange={vi.fn()}
+      />,
+    );
+
+    const live = screen.getByTestId('strategic-chat-live-status');
+    expect(live).toHaveTextContent('Replying · grep release gate');
+    expect(live).toHaveAttribute('data-chat-live-phase', 'streaming');
+    expect(live).toHaveAttribute('aria-live', 'polite');
+    // It is NOT the Workday readout: no Workday state attribute, no "Workday off".
+    expect(live).not.toHaveAttribute('data-workday-state');
+    expect(screen.queryByLabelText('Workday status')).toBeNull();
+    expect(live.textContent).not.toContain('Workday');
+  });
+
+  test('chat mode shows the working phase when the turn is open but no text has streamed', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="chat"
+        chatLiveState={{ phase: 'working', label: 'Working' }}
+        onModeChange={vi.fn()}
+      />,
+    );
+
+    const live = screen.getByTestId('strategic-chat-live-status');
+    expect(live).toHaveTextContent('Working');
+    expect(live).toHaveAttribute('data-chat-live-phase', 'working');
+  });
+
+  test('the chat affordance never renders in Workday mode, where the Workday readout owns the slot', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionState="active"
+        workdayStatus={status({ state: 'working', label: 'Workday working' })}
+        chatLiveState={{ phase: 'streaming', label: 'Replying' }}
+        onModeChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId('strategic-chat-live-status')).toBeNull();
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+    expect(screen.getByLabelText('Workday status')).toHaveTextContent('Workday working');
+  });
+});

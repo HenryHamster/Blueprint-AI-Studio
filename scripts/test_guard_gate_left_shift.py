@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,11 @@ sys.path.insert(0, str(REPO_ROOT / "backend"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import backend_verification_guard  # noqa: E402
+import guard_suppression_receipt  # noqa: E402
 import static_release_guard  # noqa: E402
+import typecheck_verification_guard  # noqa: E402
+import vitest_verification_guard  # noqa: E402
+from testing.fixgate_attribution import classify_verification  # noqa: E402
 
 
 def test_static_guard_base_unpack_uses_data_filter() -> None:
@@ -475,6 +480,10 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
     (tmp_path / "scripts").mkdir()
     (tmp_path / "backend" / "app").mkdir(parents=True)
     (tmp_path / "backend" / "testing").mkdir(parents=True)
+    # See _prepare_docker_attribution_repo: without __init__.py, PEP 420
+    # namespace-package resolution can shadow this fixture's backend/app with
+    # the real checkout's regular package.
+    (tmp_path / "backend" / "app" / "__init__.py").write_text("")
     shutil.copy2(REPO_ROOT / "check", tmp_path / "check")
     shutil.copy2(
         REPO_ROOT / "scripts" / "check-default.sh",
@@ -483,6 +492,12 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
     shutil.copy2(
         REPO_ROOT / "scripts" / "static_release_guard.py",
         tmp_path / "scripts" / "static_release_guard.py",
+    )
+    # The guard imports its sibling suppression-receipt emitter, so the fixture
+    # tree must carry it too.
+    shutil.copy2(
+        REPO_ROOT / "scripts" / "guard_suppression_receipt.py",
+        tmp_path / "scripts" / "guard_suppression_receipt.py",
     )
     shutil.copy2(
         REPO_ROOT / "scripts" / "backend-test-route.sh",
@@ -552,8 +567,16 @@ def _prepare_docker_attribution_repo(
     (tmp_path / "scripts").mkdir()
     (tmp_path / "backend" / "testing").mkdir(parents=True)
     (tmp_path / "backend" / "app").mkdir(parents=True)
+    # Make backend/app a real regular package in the fixture tree, not a bare
+    # directory. Without this, PEP 420 namespace-package resolution lets
+    # Python continue down sys.path past the fixture's backend/app and bind
+    # `import app.size_limit_policy` to the real checkout's regular package
+    # instead, silently reading the live module_size_limits.json and cap-bump
+    # ledger rather than the fixture's isolated copies.
+    (tmp_path / "backend" / "app" / "__init__.py").write_text("")
     for relative in (
         "static_release_guard.py",
+        "guard_suppression_receipt.py",
         "test-backend.sh",
         "backend-test-route.sh",
     ):
@@ -859,6 +882,106 @@ esac
     _git(tmp_path, "add", "attribution_state", "scripts/static_release_guard.py", "scripts/backend-test-route.sh")
     _git(tmp_path, "commit", "-m", "change static corpus outcome")
     return docker_bin.parent, tmp_path
+
+
+def test_docker_attribution_repo_isolates_size_limit_policy(tmp_path: Path) -> None:
+    """The fixture's backend/app must not be shadowed by the real checkout.
+
+    ``check_size_limits.py`` imports ``app.size_limit_policy`` lazily by
+    inserting its own ``backend`` dir at the front of ``sys.path``. That only
+    wins the import when ``backend/app`` is a REGULAR package: under PEP 420,
+    a bare directory with no ``__init__.py`` is merely a namespace-package
+    portion, so Python keeps searching ``sys.path`` and can bind ``app.*`` to
+    an unrelated ``app`` package found later — such as the real checkout's
+    ``backend/app``, reachable via ``PYTHONPATH`` exactly the way
+    ``scripts/test-backend.sh`` sets it (``PYTHONPATH="$(pwd)"`` from the
+    real ``backend`` dir) during a live test run. Reproduce that condition
+    directly: run the exact import check_size_limits.py performs, from the
+    fixture repo, with the real repo's backend dir on PYTHONPATH, and assert
+    ``app.size_limit_policy`` resolves to the FIXTURE's own copy.
+    """
+    _fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "clean")
+
+    probe = (
+        "import os, sys\n"
+        "backend_dir = os.path.normpath(os.path.join(os.path.dirname(r'"
+        + str(repo / "backend" / "testing" / "check_size_limits.py")
+        + "'), '..'))\n"
+        "if backend_dir not in sys.path:\n"
+        "    sys.path.insert(0, backend_dir)\n"
+        "import app.size_limit_policy as m\n"
+        "print(os.path.realpath(m.__file__))\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=repo,
+        env={
+            **os.environ,
+            # Mirrors what scripts/test-backend.sh sets for a live in-process
+            # run: PYTHONPATH pointed at the REAL repo's backend dir, which is
+            # where the shadowing "app" regular package lives.
+            "PYTHONPATH": str(REPO_ROOT / "backend"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    resolved = os.path.realpath(result.stdout.strip())
+    fixture_policy = os.path.realpath(str(repo / "backend" / "app" / "size_limit_policy.py"))
+    real_policy = os.path.realpath(str(REPO_ROOT / "backend" / "app" / "size_limit_policy.py"))
+    assert resolved != real_policy, (
+        "app.size_limit_policy resolved to the REAL repo checkout instead of "
+        f"the isolated fixture copy: {output}"
+    )
+    assert resolved == fixture_policy, (
+        f"app.size_limit_policy resolved to an unexpected location {resolved}, "
+        f"expected the fixture copy {fixture_policy}: {output}"
+    )
+
+    # check_size_limits.py itself now refuses to run at all when its own
+    # backend/app isn't a regular package, rather than risk this exact silent
+    # shadowing. Exercise BOTH branches of that fail-closed guard directly
+    # through the real checker (not a hand probe): it must run clean with the
+    # fixture as built (backend/app/__init__.py present) even with the real
+    # backend dir polluting PYTHONPATH, and it must refuse to run at all if a
+    # future fixture regresses back to a bare backend/app directory.
+    checker = repo / "backend" / "testing" / "check_size_limits.py"
+    poisoned_env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "backend")}
+    # Cap the copied size_limit_policy.py so the assertions below aren't
+    # incidentally tripped by the unrelated uncapped-large-file guardrail.
+    limits_path = repo / "backend" / "testing" / "module_size_limits.json"
+    limits = json.loads(limits_path.read_text())
+    limits["backend"]["size_limit_policy.py"] = 10000
+    limits_path.write_text(json.dumps(limits) + "\n")
+
+    clean_run = subprocess.run(
+        [sys.executable, str(checker), "--sections", "backend"],
+        cwd=repo,
+        env=poisoned_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    clean_output = clean_run.stdout + clean_run.stderr
+    assert clean_run.returncode == 0, clean_output
+    assert "is not a regular Python package" not in clean_output, clean_output
+
+    (repo / "backend" / "app" / "__init__.py").unlink()
+    regressed_run = subprocess.run(
+        [sys.executable, str(checker), "--sections", "backend"],
+        cwd=repo,
+        env=poisoned_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    regressed_output = regressed_run.stdout + regressed_run.stderr
+    assert regressed_run.returncode != 0, regressed_output
+    assert "is not a regular Python package" in regressed_output, regressed_output
 
 
 @pytest.mark.parametrize("current_state, should_fail", [("preexisting", False), ("new", True)])
@@ -1454,13 +1577,24 @@ def test_collection_error_alongside_resolvable_failure_charges_only_the_new_one(
     assert "test_preexisting" not in new_line
 
 
-def test_unresolvable_failure_id_falls_back_to_full_base_corpus(
+def test_static_lane_blocks_on_baseline_failure_disappeared(
     tmp_path: Path,
 ) -> None:
-    """A failure whose selector cannot be derived forces an UNSCOPED baseline.
+    """A disappeared baseline failure blocks even with an UNCHANGED harness.
 
-    Without the fallback the key is missing from the scoped base report and is
-    charged as new even though base fails identically.
+    A failure whose selector cannot be derived forces an UNSCOPED baseline —
+    the current tree fails on ``<collection>::conftest::error`` (empty
+    classname, no derivable module) plus the ordinary ``test_preexisting``
+    failure. The harness itself is untouched, but the unscoped base corpus
+    also exposes ``test_roster_preexisting`` and the ``test_collect_boom``
+    collection error, neither of which the current tree reports at all.
+
+    Before this guard called the shared ``classify_verification`` classifier,
+    static_release_guard.py re-implemented the verdict and only treated a
+    disappeared/skipped baseline failure as blocking when ``harness_changed``
+    was true — so this exact scenario (harness untouched, two baseline
+    failures silently gone) used to pass clean. The other four verification
+    lanes block on disappearance unconditionally; the static lane must too.
     """
     fake_bin, repo = _prepare_docker_attribution_repo(
         tmp_path, "collect_opaque", base_state="collect_base"
@@ -1471,9 +1605,14 @@ def test_unresolvable_failure_id_falls_back_to_full_base_corpus(
     )
 
     output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    assert "no new failures vs base" in output
+    assert result.returncode != 0, output
     assert "unresolvable failure id(s)" in output
+    assert "made base corpus failure(s) disappear" in output
+    assert "[static guard] PASS" not in output
+    # The two failures that ARE identical to the baseline (the opaque
+    # collection error and the ordinary preexisting failure) are still
+    # suppressed rather than charged as new — only the disappearance blocks.
+    assert "test_newly_introduced" not in output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
     current = [arg for arg in calls[0].split() if not arg.startswith("-")]
@@ -1534,3 +1673,389 @@ def test_new_static_finding_without_task_identity_fails_closed(tmp_path: Path) -
     assert result.returncode != 0
     assert "TASK_ID is missing" in output
     assert "newly_introduced" in output
+
+
+# ---------------------------------------------------------------------------
+# Cross-lane suppression receipts
+# ---------------------------------------------------------------------------
+
+
+def _suppressing_outcome() -> dict[str, object]:
+    """Return a real classify_verification outcome that suppresses a failure."""
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures={"testing/test_x.py::test_fails": "boom"},
+        baseline_failures={"testing/test_x.py::test_fails": "boom"},
+    )
+    assert outcome["state"] == "preexisting_test_failure"
+    assert outcome["suppressed_failures"], "fixture must actually suppress something"
+    return outcome
+
+
+def _viewport_receipt_commands() -> list[list[str]]:
+    """Return the viewport lane's emitter invocations from the generated ./check.
+
+    The viewport suppression lives in generated bash rather than a Python guard,
+    so the call site is read straight out of the generator and executed here —
+    a drifted or deleted invocation fails this test instead of silently leaving
+    the lane unrecorded.
+    """
+    source = (REPO_ROOT / "agent" / "src" / "prompts" / "check-helper.ts").read_text(
+        encoding="utf-8"
+    )
+    commands: list[list[str]] = []
+    for line in source.splitlines():
+        stripped = line.strip()
+        if "guard_suppression_receipt.py record" not in stripped:
+            continue
+        start = stripped.index("python3 scripts/guard_suppression_receipt.py")
+        end = stripped.index("|| true", start)
+        rendered = (
+            stripped[start:end]
+            .replace("$VIEWPORT_LABEL", "admin-ui viewport (changed: 1 file(s))")
+            .replace("$BASE_REF", "origin/automain")
+        )
+        commands.append(shlex.split(rendered))
+    assert len(commands) == 2, f"expected both viewport branches wired, got {commands}"
+    return commands
+
+
+def test_every_guard_lane_emits_machine_readable_suppression_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """All five guard lanes land in one aggregate with parseable identities.
+
+    Before this, only the targeted backend pytest lane left a machine-readable
+    record of what it suppressed; the static, vitest, typecheck and viewport
+    lanes printed to stdout where nothing consumed them, so a candidate's
+    cross-lane suppression set was unrecoverable after the run.
+    """
+    receipt_dir = tmp_path / "receipts"
+    monkeypatch.setenv("BLUEPRINT_GUARD_SUPPRESSION_DIR", str(receipt_dir))
+    monkeypatch.setenv("TASK_ID", "left-shift-receipt-test")
+
+    # 1. Backend lane: drive the real guard end to end over a failure present in
+    #    both trees, so its suppression is produced by the shipped code path.
+    backend_lane_root = tmp_path / "backend-lane"
+    backend_lane_root.mkdir()
+    backend_outcome = _run_backend_guard_with_baseline(
+        backend_lane_root,
+        capsys,
+        monkeypatch,
+        current_junit_text=_FAILING_VERIFICATION_JUNIT,
+        current_exit_code=1,
+        baseline_junit_text=_FAILING_VERIFICATION_JUNIT,
+        baseline_exit_code=1,
+    )
+    assert backend_outcome["state"] == "preexisting_test_failure"
+
+    # 2-4. Static / vitest / typecheck lanes: drive each guard's own emitter call
+    #      site, so the lane identity under test is the one production writes.
+    outcome = _suppressing_outcome()
+    static_release_guard._record_suppressions(outcome)
+    vitest_verification_guard._record_suppressions("admin-ui", outcome)
+    typecheck_verification_guard._record_suppressions("admin-ui", outcome)
+
+    # 5. Viewport lane: run the CLI exactly as the generated ./check bash does.
+    for command in _viewport_receipt_commands():
+        result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env={**os.environ, "BLUEPRINT_GUARD_SUPPRESSION_DIR": str(receipt_dir)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+    aggregate = guard_suppression_receipt.aggregate()
+    assert aggregate["version"] == guard_suppression_receipt.SCHEMA_VERSION
+    lanes = aggregate["lanes"]
+    assert set(lanes) == {
+        "backend",
+        "static",
+        "vitest:admin-ui",
+        "typecheck:admin-ui",
+        "viewport",
+    }
+
+    for lane, record in lanes.items():
+        buckets = record["buckets"]
+        identities = [
+            key
+            for bucket in ("suppressed", "disappeared", "skipped")
+            for key in buckets[bucket]["entries"]
+        ]
+        assert identities, f"{lane} recorded no suppression identity"
+        for key in identities:
+            # Machine-readable keys, not prose: a route/test identity, never a
+            # sentence and never an empty placeholder.
+            assert key.strip() == key and key
+            assert "::" in key or key.endswith(".py") or "/" in key
+
+    assert lanes["backend"]["buckets"]["suppressed"]["entries"]
+    assert lanes["static"]["state"] == "preexisting_test_failure"
+    assert lanes["viewport"]["state"] in {
+        "capture_skipped",
+        "preexisting_viewport_failure",
+    }
+    totals = aggregate["totals"]
+    assert totals["lanes"] == 5
+    assert totals["suppressed"] >= 4
+    assert "static" in totals["lanes_with_suppressions"]
+
+
+def test_suppression_receipt_bounds_payload_and_records_observed_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Full tracebacks cannot blow up the receipt, and truncation is visible."""
+    monkeypatch.setenv("BLUEPRINT_GUARD_SUPPRESSION_DIR", str(tmp_path / "receipts"))
+    oversized = guard_suppression_receipt.MAX_ENTRIES_PER_BUCKET + 7
+    suppressed = {
+        f"testing/test_big.py::test_{index:03d}": {
+            "detail": "T" * (guard_suppression_receipt.MAX_STRING_LENGTH * 4),
+            "reason": "same route/test/failure kind failed on baseline",
+        }
+        for index in range(oversized)
+    }
+    path = guard_suppression_receipt.record_lane(
+        "static", state="preexisting_test_failure", suppressed=suppressed
+    )
+    assert path is not None
+    bucket = json.loads(path.read_text(encoding="utf-8"))["buckets"]["suppressed"]
+
+    assert bucket["observed_count"] == oversized
+    assert bucket["recorded_count"] == guard_suppression_receipt.MAX_ENTRIES_PER_BUCKET
+    assert bucket["truncated"] is True
+    assert len(bucket["entries"]) == guard_suppression_receipt.MAX_ENTRIES_PER_BUCKET
+    for entry in bucket["entries"].values():
+        assert len(entry["detail"]) == guard_suppression_receipt.MAX_STRING_LENGTH
+        assert entry["detail"].endswith("…")
+    assert guard_suppression_receipt.aggregate()["totals"]["truncated"] is True
+
+
+def test_suppression_receipt_write_failure_is_fail_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unwritable receipt directory warns; it never raises into the lane."""
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("", encoding="utf-8")
+    monkeypatch.setenv("BLUEPRINT_GUARD_SUPPRESSION_DIR", str(blocker))
+
+    assert (
+        guard_suppression_receipt.record_lane(
+            "static", state="preexisting_test_failure", suppressed={"a::b": "detail"}
+        )
+        is None
+    )
+    assert "could not record static suppression receipt" in capsys.readouterr().err
+    # And the aggregate over an unusable directory is empty rather than raising.
+    assert guard_suppression_receipt.aggregate()["lanes"] == {}
+
+
+def test_both_check_entry_points_clear_stale_suppression_receipts() -> None:
+    """A warm VM's prior task must not donate its suppressions to this run."""
+    fallback = (REPO_ROOT / "scripts" / "check-default.sh").read_text(encoding="utf-8")
+    generator = (REPO_ROOT / "agent" / "src" / "prompts" / "check-helper.ts").read_text(
+        encoding="utf-8"
+    )
+    for source in (fallback, generator):
+        assert 'BLUEPRINT_GUARD_SUPPRESSION_DIR="/tmp/guard_suppression_receipts_' in source
+        assert "export BLUEPRINT_GUARD_SUPPRESSION_DIR" in source
+        assert 'rm -rf "$BLUEPRINT_GUARD_SUPPRESSION_DIR"' in source
+        assert "guard_suppression_receipt.py aggregate" in source
+
+
+def test_generated_viewport_suppression_uses_plain_cli_not_embedded_python() -> None:
+    """Generated bash invokes the emitter as a CLI (CLAUDE.md escaping rule)."""
+    generator = (REPO_ROOT / "agent" / "src" / "prompts" / "check-helper.ts").read_text(
+        encoding="utf-8"
+    )
+    for line in generator.splitlines():
+        if "guard_suppression_receipt.py" not in line:
+            continue
+        assert "python3 -c" not in line
+        assert "<<" not in line
+
+
+# ---------------------------------------------------------------------------
+# Aggregate -> gate-receipt projection
+# ---------------------------------------------------------------------------
+
+
+def _lane_record(
+    lane: str,
+    state: str,
+    *,
+    suppressed: dict[str, object] | None = None,
+    disappeared: dict[str, object] | None = None,
+    skipped: dict[str, object] | None = None,
+    observed_overrides: dict[str, int] | None = None,
+    truncated_buckets: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Build one aggregate lane record in the shape ``aggregate()`` emits."""
+    entries_by_bucket = {
+        "suppressed": suppressed or {},
+        "disappeared": disappeared or {},
+        "skipped": skipped or {},
+    }
+    overrides = observed_overrides or {}
+    return {
+        "version": guard_suppression_receipt.SCHEMA_VERSION,
+        "lane": lane,
+        "task_id": "projection-test",
+        "state": state,
+        "recorded_at": "2026-08-19T00:00:00+00:00",
+        "buckets": {
+            bucket: {
+                "entries": entries,
+                "observed_count": overrides.get(bucket, len(entries)),
+                "recorded_count": len(entries),
+                "truncated": bucket in truncated_buckets,
+            }
+            for bucket, entries in entries_by_bucket.items()
+        },
+    }
+
+
+def test_gate_projection_forwards_a_lane_whose_only_identity_is_non_suppressed() -> None:
+    """The viewport lane's capture-skipped branch records nothing else.
+
+    A suppressed-only projection would drop the lane's entire audit content, so
+    all three buckets must survive into the durable receipt.
+    """
+    aggregate_payload = {
+        "version": guard_suppression_receipt.SCHEMA_VERSION,
+        "lanes": {
+            "viewport": _lane_record(
+                "viewport",
+                "capture_skipped",
+                skipped={
+                    "admin-ui/src/components/Foo.tsx": {
+                        "detail": "chromium unavailable",
+                        "reason": "capture skipped",
+                    }
+                },
+            ),
+        },
+    }
+
+    projection = guard_suppression_receipt.project_for_gate_receipt(aggregate_payload)
+
+    assert projection["viewport"]["state"] == "capture_skipped"
+    assert projection["viewport"]["skipped"] == {
+        "admin-ui/src/components/Foo.tsx": "chromium unavailable"
+    }
+    assert projection["viewport"]["skipped_observed_count"] == 1
+    assert projection["viewport"]["skipped_truncated"] is False
+    # ``suppressed`` keeps a stable shape for existing consumers even when empty;
+    # the empty ``disappeared`` bucket carries no signal and is dropped.
+    assert projection["viewport"]["suppressed"] == {}
+    assert "disappeared" not in projection["viewport"]
+
+
+def test_gate_projection_preserves_producer_side_truncation() -> None:
+    """A capped bucket can never look complete in the durable receipt."""
+    entries = {f"testing/test_big.py::test_{i:03d}": {"detail": "boom"} for i in range(3)}
+    aggregate_payload = {
+        "lanes": {
+            "static": _lane_record(
+                "static",
+                "preexisting_test_failure",
+                suppressed=entries,
+                observed_overrides={"suppressed": 31},
+                truncated_buckets=("suppressed",),
+            ),
+        },
+    }
+
+    projection = guard_suppression_receipt.project_for_gate_receipt(aggregate_payload)
+
+    assert len(projection["static"]["suppressed"]) == 3
+    assert projection["static"]["suppressed_observed_count"] == 31
+    assert projection["static"]["suppressed_truncated"] is True
+
+
+def test_gate_projection_marks_truncation_even_without_a_producer_flag() -> None:
+    """observed_count > recorded entries is itself proof the set was clipped."""
+    aggregate_payload = {
+        "lanes": {
+            "vitest:admin-ui": _lane_record(
+                "vitest:admin-ui",
+                "preexisting_test_failure",
+                suppressed={"vitest::flaky::test": {"detail": "inherited"}},
+                observed_overrides={"suppressed": 9},
+            ),
+        },
+    }
+
+    projection = guard_suppression_receipt.project_for_gate_receipt(aggregate_payload)
+
+    assert projection["vitest:admin-ui"]["suppressed_observed_count"] == 9
+    assert projection["vitest:admin-ui"]["suppressed_truncated"] is True
+
+
+@pytest.mark.parametrize(
+    "aggregate_text",
+    [
+        pytest.param(None, id="absent"),
+        pytest.param("{not json", id="unparseable"),
+        pytest.param('{"lanes": "not-a-mapping"}', id="wrong-shape"),
+        pytest.param('{"lanes": {}}', id="empty"),
+    ],
+)
+def test_gate_projection_merge_is_fail_open(
+    tmp_path: Path, aggregate_text: str | None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed or absent aggregate leaves the gate receipt byte-identical."""
+    aggregate_path = tmp_path / "aggregate.json"
+    if aggregate_text is not None:
+        aggregate_path.write_text(aggregate_text, encoding="utf-8")
+    gate_path = tmp_path / "gate.json"
+    original = '{"status":"passed","exit_code":0}\n'
+    gate_path.write_text(original, encoding="utf-8")
+
+    assert (
+        guard_suppression_receipt.merge_into_gate_receipt(aggregate_path, gate_path)
+        is False
+    )
+    assert gate_path.read_text(encoding="utf-8") == original
+    if aggregate_text in (None, "{not json"):
+        assert "could not project aggregate" in capsys.readouterr().err
+
+
+def test_gate_projection_merge_writes_guard_suppressions_key(tmp_path: Path) -> None:
+    """The happy path adds ``guard_suppressions`` without disturbing the rest."""
+    aggregate_path = tmp_path / "aggregate.json"
+    aggregate_path.write_text(
+        json.dumps(
+            {
+                "lanes": {
+                    "viewport": _lane_record(
+                        "viewport",
+                        "capture_skipped",
+                        skipped={"admin-ui/src/components/Foo.tsx": "chromium unavailable"},
+                    ),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    gate_path = tmp_path / "gate.json"
+    gate_path.write_text(
+        json.dumps({"status": "passed", "attribution_state": "clean"}), encoding="utf-8"
+    )
+
+    assert (
+        guard_suppression_receipt.merge_into_gate_receipt(aggregate_path, gate_path)
+        is True
+    )
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    assert gate["status"] == "passed"
+    assert gate["attribution_state"] == "clean"
+    assert gate["guard_suppressions"]["viewport"]["skipped"] == {
+        "admin-ui/src/components/Foo.tsx": "chromium unavailable"
+    }

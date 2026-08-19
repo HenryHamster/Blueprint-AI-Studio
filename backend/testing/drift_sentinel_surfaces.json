@@ -35,6 +35,11 @@
       "why": "Same rationale as 0621: test_migration_0626_safe_encrypt_backfill.py loads the migration via importlib; register here so migration body changes trigger the acceptance tests at the task PR."
     },
     {
+      "glob": "backend/testing/check_size_limits.py",
+      "sentinels": ["backend/testing/test_size_limits_checker.py"],
+      "why": "check_size_limits.py lives under backend/testing/, not backend/app/, so impacted_tests.py's reverse-dep scan (scoped to backend/app/<...>.py -> app.* importers) never even considers it as a changed module, regardless of what test_size_limits_checker.py imports (it does `from testing import check_size_limits`). Register here so a change to the checker itself always runs its own test file at merge time instead of only at the promotion matrix."
+    },
+    {
       "glob": "admin-ui/**",
       "sentinels": ["backend/testing/test_vitest_durations_freshness.py"],
       "why": "test_vitest_durations_freshness.py reads admin-ui/.test_durations.json and rglobs admin-ui/src (and eslint-rules/) for the committed Vitest test inventory it must match. It imports nothing under backend/app or backend/testing, and the changed files it cares about live entirely outside backend/, so neither the dotted-import reverse-dep scan nor STATIC_PATH_PREFIXES in scripts/static_release_guard.py can select it. A PR confined to admin-ui/ previously merged with a stale duration artifact undetected until the promotion matrix forced every guard on."

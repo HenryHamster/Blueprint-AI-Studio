@@ -4591,6 +4591,16 @@
           "new_cap": 12250
         }
       ]
+    },
+    "scripts": {
+      "test_guard_gate_left_shift.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T21:02:07.113920+00:00",
+          "old_cap": 1750,
+          "new_cap": 2400
+        }
+      ]
     }
   }
 }

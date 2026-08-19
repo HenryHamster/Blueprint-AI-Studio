@@ -2756,7 +2756,6 @@ async def run_qualification(
     # From here on, mutate the freshly-locked row (its attributes are the
     # post-lock DB truth) rather than the caller's possibly-stale instance.
     version = locked_version
-
     # Re-check the phase under the lock — a concurrent strategic cycle may
     # have flipped it out of stabilize between the cheap guard and the lock.
     if version.phase != "stabilize":
@@ -2802,6 +2801,24 @@ async def run_qualification(
             version.version_number,
         )
         return _promo
+
+    # Stamp the candidate this attempt actually evaluates.  ``candidate_sha``
+    # is re-resolved live from integration-branch HEAD on EVERY call (see the
+    # snapshot above), including a CONTINUED attempt, and every other consumer
+    # in this run — the diff range, the dimension rows, and
+    # ``last_qualification['candidate_sha']`` — uses that fresh value.  Pinning
+    # the column only on a new attempt would let a continued attempt whose
+    # candidate advanced measure base..STALE_head in the hard authorship gate
+    # while the promotion candidate is base..NEW_head, so the write is
+    # unconditional and no gate can disagree with another.
+    #
+    # It is written AFTER the skip guards above (wrong_phase / already_pending
+    # / promotion_check_wait) on purpose: those paths do not evaluate this
+    # candidate at all, and re-pointing the column on a promotion_check_wait
+    # would move the authorship range out from under an already-pending
+    # promotion.
+    version.candidate_sha = candidate_sha
+    session.add(version)
 
     active_criteria = [
         row

@@ -225,7 +225,7 @@ async def test_same_sha_contract_change_spawns_fresh_holistic_review(
         clear=False,
     )
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    candidate = "newcontract" * 4
+    candidate = ("newcontract" * 4)[:40]
     launched_goal = "Ship the original outcome"
     launched_rubric = []
     launched_rubric_fingerprint = rq._rubric_fingerprint(launched_rubric)

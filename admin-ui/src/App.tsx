@@ -62,6 +62,7 @@ import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useStrategicLiveness } from './hooks/useStrategicLiveness';
 import { useStrategicSession } from './hooks/useStrategicSession';
 import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
+import type { StrategicChatLiveState } from './utils/strategicSessionLive';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
@@ -529,6 +530,10 @@ export default function App() {
   // StrategicSessionControl renders the same readout as the utility bar
   // instead of deriving its own from raw session-lifecycle fields.
   const [conversationWorkdayStatus, setConversationWorkdayStatus] = useState<ConversationWorkdayStatus | null>(null);
+  // The in-flight Chat-turn affordance, reported up from MessagesPanel from the
+  // same live transcript the thread renders, so the header shows the operator
+  // that a reply is on its way instead of nothing at all in Chat mode.
+  const [strategicChatLiveState, setStrategicChatLiveState] = useState<StrategicChatLiveState | null>(null);
   useEffect(() => {
     if (strategicReadModel.data) {
       strategicPollEpochRef.current += 1;
@@ -1292,6 +1297,7 @@ export default function App() {
                 sessionActive={strategicSessionActive}
                 sessionState={strategicSessionState}
                 workdayStatus={conversationWorkdayStatus}
+                chatLiveState={strategicChatLiveState}
                 sessionBusy={strategicSessionBusy}
                 sessionRunners={residentStrategicSessionRunners}
                 sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
@@ -1350,6 +1356,8 @@ export default function App() {
                 onOpenTask={handleViewTask}
                 notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
                 onWorkdayStatusChange={setConversationWorkdayStatus}
+                strategicSessionTranscript={s.strategicSessionTranscript}
+                onChatLiveStateChange={setStrategicChatLiveState}
                 strategistActive={s.strategistActive}
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}

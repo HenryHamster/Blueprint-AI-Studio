@@ -144,7 +144,16 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).toMatch(/^#!\/bin\/bash/);
     expect(script).toContain('_VERIFY_TASK_ID="${TASK_ID:-check-direct-1}"');
     expect(script).toContain('_VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${_VERIFY_TASK_ID}"');
-    expect(script).toContain('if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT"; then');
+    expect(script).toContain('if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT" \\\n  || ! rm -rf "$BLUEPRINT_GUARD_SUPPRESSION_DIR"; then');
+    // Warm VMs reuse /tmp: a prior task's per-lane suppression receipts must be
+    // cleared at startup, exactly as the verification receipts above are.
+    expect(script).toContain('BLUEPRINT_GUARD_SUPPRESSION_DIR="/tmp/guard_suppression_receipts_${_VERIFY_TASK_ID}"');
+    expect(script).toContain('export BLUEPRINT_GUARD_SUPPRESSION_DIR');
+    // Every lane's suppressions are merged into one cross-lane aggregate, and
+    // the viewport lane's two suppressing branches record through the CLI.
+    expect(script).toContain('guard_suppression_receipt.py aggregate --out "$BLUEPRINT_GUARD_SUPPRESSION_DIR/aggregate.json"');
+    expect(script).toContain('guard_suppression_receipt.py record --lane viewport --state capture_skipped');
+    expect(script).toContain('guard_suppression_receipt.py record --lane viewport --state preexisting_viewport_failure');
     // Blueprint blocks are the default on the self-repo when no buildConfig is supplied.
     expect(script).toContain('if admin_ui_runtime_touched; then');
     expect(script).toContain('touches agent/');
@@ -1042,6 +1051,13 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       realFs.copyFileSync(
         realPath.join(productionRoot, 'scripts', 'backend_verification_guard.py'),
         realPath.join(dir, 'scripts', 'backend_verification_guard.py'),
+      );
+      // The guard records its suppressions through this sibling emitter; copy
+      // it so the fixture exercises the same cross-lane receipt path as a real
+      // checkout rather than the guard's missing-emitter fallback.
+      realFs.copyFileSync(
+        realPath.join(productionRoot, 'scripts', 'guard_suppression_receipt.py'),
+        realPath.join(dir, 'scripts', 'guard_suppression_receipt.py'),
       );
       realFs.copyFileSync(
         realPath.join(productionRoot, 'backend', 'testing', 'fixgate_attribution.py'),

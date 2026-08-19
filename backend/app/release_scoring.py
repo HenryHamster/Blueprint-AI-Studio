@@ -1052,6 +1052,31 @@ def evaluate_candidate_operator_authorship_gate(
             "reason": "no_operator_authorship_contract_declared",
         }
     max_count = min(max_counts)
+    if (
+        isinstance(base_sha, str)
+        and isinstance(candidate_sha, str)
+        and base_sha == candidate_sha
+    ):
+        # A declared contract expects real evidence over the candidate's
+        # range. An identical base/candidate SHA (e.g. an "identical" GitHub
+        # compare, total_commits == 0) proves nothing about the candidate —
+        # it just means no range was actually measured — so it must not be
+        # able to vacuously satisfy the contract the way a genuine
+        # zero-non-bot-commits range would. Report a distinct blocked status
+        # instead of resolving "passed" through an unmeasured range.
+        return {
+            "status": "blocked",
+            "passed": False,
+            "count": count,
+            "max_count": max_count,
+            "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "blocker": "candidate_authorship_range_identical",
+            "reason": (
+                "candidate_sha equals base_sha; a zero-commit range proves no "
+                "operator-authorship evidence and cannot vacuously satisfy "
+                "the declared evidence contract"
+            ),
+        }
     if isinstance(count, int) and count <= max_count:
         return {
             "status": "passed",
@@ -1571,6 +1596,10 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     "migration_apply_drift": EXECUTION_SITE_DEPLOYED,
     "candidate_operator_authorship_nonzero": EXECUTION_SITE_CANDIDATE,
     "candidate_operator_authorship_evidence_missing": EXECUTION_SITE_CANDIDATE,
+    # Candidate-side: a fresh qualification snapshots a new candidate_sha off
+    # automain HEAD, which stops equaling base_sha the moment automain
+    # advances even one commit past where this version opened.
+    "candidate_authorship_range_identical": EXECUTION_SITE_CANDIDATE,
     # Operator-env site (Slice 4, design 245212a4): the env-preflight judge runs in
     # the DEPLOYED process and compares the candidate's declared boot prerequisites
     # against the deployed process's OWN environ (a presence-proxy of the deploy
@@ -1649,6 +1678,9 @@ HARD_GATE_CLEARING_PATHS: dict[str, dict[str, str]] = {
     },
     "candidate_operator_authorship_evidence_missing": {
         "kind": "input", "evidence": "produce candidate range measurement"
+    },
+    "candidate_authorship_range_identical": {
+        "kind": "input", "evidence": "requalify once automain advances past base_sha"
     },
     "boot_prereq_missing": {
         "kind": "override", "evidence": "bind env or acknowledge same-deploy binding"

@@ -71,6 +71,24 @@ _BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
+# Inserting ``_BACKEND_DIR`` at the front of ``sys.path`` only wins the
+# ``app.size_limit_policy`` import when ``<_BACKEND_DIR>/app`` is a REGULAR
+# package. If it is a bare directory with no ``__init__.py`` (e.g. a stripped
+# test fixture checkout), PEP 420 namespace-package resolution does not stop
+# there — it keeps walking the rest of ``sys.path`` and can silently bind
+# ``app.*`` to an unrelated ``app`` package elsewhere (for example a real repo
+# checkout reachable via ``PYTHONPATH``), so this checker would read that
+# other tree's ``module_size_limits.json`` and cap-bump ledger instead of its
+# own. Fail closed instead of risking a silent misattribution.
+_APP_INIT_PATH = os.path.join(_BACKEND_DIR, "app", "__init__.py")
+if not os.path.isfile(_APP_INIT_PATH):
+    raise RuntimeError(
+        f"{os.path.join(_BACKEND_DIR, 'app')} is not a regular Python package "
+        f"(missing {_APP_INIT_PATH}) — refusing to import app.size_limit_policy "
+        "because PEP 420 namespace-package resolution could silently bind it "
+        "to an unrelated `app` package elsewhere on sys.path"
+    )
+
 
 def _bump_size_limit(
     current_size: int,

@@ -845,6 +845,251 @@ esac
     assertSuppressedBaselineReceipt,
   );
 
+  // ── Cross-lane guard-suppressions aggregate ─────────────────────────────────
+  // scripts/guard_suppression_receipt.py aggregate merges every guard lane's
+  // suppression receipt (static, vitest, typecheck, viewport, backend pytest)
+  // into one file. pr-helper.ts's build_guard_suppressions_aggregate and
+  // persist_guard_suppressions both shell out to that CLI at the cwd-relative
+  // scripts/guard_suppression_receipt.py, so the setup copies the real script
+  // into the tmp workspace and seeds per-lane receipts in a directory pinned by
+  // BLUEPRINT_GUARD_SUPPRESSION_DIR. Both halves therefore run for real
+  // (python3, real execution): aggregate merges the lanes, project writes the
+  // durable guard_suppressions key. The node-rendered markdown section is covered end-to-end
+  // in guard-suppressions-pr-section.test.ts instead: this suite's top-level
+  // `vi.mock('fs', ...)` stubs readFileSync to '', which blanks the base64
+  // embed the same way it already does for the sr/screenshots renderers (see
+  // the "decodes + invokes the screenshots renderer" test below, which only
+  // checks the generated decode/invoke wiring for the same reason).
+  it('persists the cross-lane guard-suppressions aggregate onto the heartbeat payload', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const taskId = 'task-guard-suppressions-1';
+    const aggregatePath = `/tmp/guard_suppression_aggregate_${taskId}.json`;
+    const receiptDir = `/tmp/guard_suppression_receipts_${taskId}`;
+    const receiptScriptPath = new URL(
+      '../../../scripts/guard_suppression_receipt.py',
+      import.meta.url,
+    ).pathname;
+    const bodyPath = `/tmp/pr_body_${taskId}`;
+    const gatePayloadPath = `/tmp/pr_gate_payload_${taskId}.json`;
+    realFs.rmSync(receiptDir, { recursive: true, force: true });
+    realFs.rmSync(aggregatePath, { force: true });
+    realFs.rmSync(bodyPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
+
+    const emptyBucket = { entries: {}, observed_count: 0, recorded_count: 0, truncated: false };
+    const laneReceipts: Record<string, unknown> = {
+      static: {
+        version: 1,
+        lane: 'static',
+        task_id: taskId,
+        state: 'passed',
+        recorded_at: '2026-08-19T00:00:00+00:00',
+        buckets: { suppressed: emptyBucket, disappeared: emptyBucket, skipped: emptyBucket },
+      },
+      vitest: {
+        version: 1,
+        lane: 'vitest',
+        task_id: taskId,
+        state: 'preexisting_test_failure',
+        recorded_at: '2026-08-19T00:00:00+00:00',
+        buckets: {
+          // observed_count > recorded entries: the producer capped this bucket,
+          // and the durable receipt must not look complete.
+          suppressed: {
+            entries: { 'vitest::flaky::test': { detail: 'AssertionError: inherited', reason: 'baseline' } },
+            observed_count: 4,
+            recorded_count: 1,
+            truncated: false,
+          },
+          disappeared: emptyBucket,
+          skipped: emptyBucket,
+        },
+      },
+      // The viewport lane's capture-skipped branch records its only identity in
+      // `skipped` — a suppressed-only projection would drop it entirely.
+      viewport: {
+        version: 1,
+        lane: 'viewport',
+        task_id: taskId,
+        state: 'capture_skipped',
+        recorded_at: '2026-08-19T00:00:00+00:00',
+        buckets: {
+          suppressed: emptyBucket,
+          disappeared: emptyBucket,
+          skipped: {
+            entries: { 'admin-ui/src/components/Foo.tsx': { detail: 'chromium unavailable' } },
+            observed_count: 1,
+            recorded_count: 1,
+            truncated: false,
+          },
+        },
+      },
+    };
+
+    const script = writeScript({
+      taskId,
+      workBranch: `blueprint/${taskId}`,
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      // The emitter/projector the generated script shells out to is resolved
+      // cwd-relative; copy the real one in so both halves execute for real.
+      rfs.mkdirSync(`${dir}/scripts`, { recursive: true });
+      rfs.copyFileSync(receiptScriptPath, `${dir}/scripts/guard_suppression_receipt.py`);
+      rfs.mkdirSync(receiptDir, { recursive: true });
+      for (const [lane, record] of Object.entries(laneReceipts)) {
+        rfs.writeFileSync(`${receiptDir}/lane_${lane}.json`, JSON.stringify(record));
+      }
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/${taskId}"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/heartbeat"*) cat > ${gatePayloadPath}; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) cat > ${bodyPath}; [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    }, { TASK_ID: taskId, BLUEPRINT_GUARD_SUPPRESSION_DIR: receiptDir });
+
+    expect(result.status).toBe(0);
+
+    const body = JSON.parse(realFs.readFileSync(bodyPath, 'utf8')) as { body: string };
+    expect(body.body).toContain('<!-- /blueprint:local-gate -->');
+
+    // The aggregate half ran for real: every seeded lane is merged into one file.
+    const aggregate = JSON.parse(realFs.readFileSync(aggregatePath, 'utf8')) as {
+      lanes: Record<string, unknown>;
+    };
+    expect(Object.keys(aggregate.lanes).sort()).toEqual(['static', 'viewport', 'vitest']);
+
+    const gatePayload = JSON.parse(realFs.readFileSync(gatePayloadPath, 'utf8')) as {
+      publication_gate_receipt: { guard_suppressions?: Record<string, unknown> };
+    };
+    expect(gatePayload.publication_gate_receipt.guard_suppressions).toEqual({
+      static: {
+        state: 'passed',
+        suppressed: {},
+        suppressed_observed_count: 0,
+        suppressed_truncated: false,
+      },
+      vitest: {
+        state: 'preexisting_test_failure',
+        suppressed: { 'vitest::flaky::test': 'AssertionError: inherited' },
+        suppressed_observed_count: 4,
+        // Producer capped the bucket: observed_count outruns the recorded entries.
+        suppressed_truncated: true,
+      },
+      viewport: {
+        state: 'capture_skipped',
+        suppressed: {},
+        suppressed_observed_count: 0,
+        suppressed_truncated: false,
+        // A suppressed-only projection would have dropped this lane's only content.
+        skipped: { 'admin-ui/src/components/Foo.tsx': 'chromium unavailable' },
+        skipped_observed_count: 1,
+        skipped_truncated: false,
+      },
+    });
+
+    realFs.rmSync(receiptDir, { recursive: true, force: true });
+    realFs.rmSync(aggregatePath, { force: true });
+    realFs.rmSync(bodyPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
+    realFs.rmSync(`/tmp/pr_url_${taskId}`, { force: true });
+  });
+
+  it('leaves the PR body and publication verdict unchanged when no guard-suppressions aggregate exists', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const taskId = 'task-guard-suppressions-absent-1';
+    const aggregatePath = `/tmp/guard_suppression_aggregate_${taskId}.json`;
+    const bodyPath = `/tmp/pr_body_${taskId}`;
+    realFs.rmSync(aggregatePath, { force: true });
+    realFs.rmSync(bodyPath, { force: true });
+
+    const script = writeScript({
+      taskId,
+      workBranch: `blueprint/${taskId}`,
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/${taskId}"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/heartbeat"*) cat >/dev/null; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) cat > ${bodyPath}; [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    }, { TASK_ID: taskId });
+
+    expect(result.status).toBe(0);
+    const body = JSON.parse(realFs.readFileSync(bodyPath, 'utf8')) as { body: string };
+    expect(body.body).not.toContain('blueprint:guard-suppressions');
+    expect(body.body).toContain('<!-- /blueprint:local-gate -->');
+
+    realFs.rmSync(bodyPath, { force: true });
+    realFs.rmSync(`/tmp/pr_url_${taskId}`, { force: true });
+  });
+
   // ── Zero-effective-diff guard ────────────────────────────────────────────────
   // A rebased/superseded branch can be commits-ahead by SHA yet net to ZERO
   // effective diff vs base. The guard must refuse to push / open a PR and point
@@ -1541,6 +1786,34 @@ describe('writePrHelper — generated script content', () => {
       "sed '/<!-- blueprint:screenshots -->/,/<!-- \\/blueprint:screenshots -->/d'",
     );
     expect(script).toContain('BODY=$(printf \'%s\\n\\n%s\' "$BODY" "$SHOTS_SECTION")');
+  });
+
+  it('wires the cross-lane guard-suppressions aggregate: builds it, decodes + invokes the renderer, and persists it to the gate receipt', () => {
+    writePrHelper({
+      taskId: 'task-guard-static-1',
+      workBranch: 'blueprint/task-guard-static-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+    // Merges every guard lane's receipt via the shared CLI (as a plain
+    // subprocess call, not an embedded heredoc — see CLAUDE.md).
+    expect(script).toContain('python3 scripts/guard_suppression_receipt.py aggregate --task-id "task-guard-static-1" --out "$GUARD_SUPPRESSIONS_AGGREGATE"');
+    expect(script).toContain('GUARD_SUPPRESSIONS_AGGREGATE="/tmp/guard_suppression_aggregate_task-guard-static-1.json"');
+    // Decodes the embedded renderer and runs it against the aggregate.
+    expect(script).toContain('base64 -d > /tmp/guard_suppressions_section_task-guard-static-1.js');
+    expect(script).toContain('node /tmp/guard_suppressions_section_task-guard-static-1.js "$aggregate_file"');
+    // Persists the same bounded aggregate onto the durable gate receipt so it
+    // reaches task.context via the heartbeat payload.
+    expect(script).toContain('"guard_suppressions"');
+    expect(script).toContain('persist_guard_suppressions');
+    // Section is appended alongside (not instead of) the existing suppressed
+    // baseline section — both fold into the one <!-- blueprint:local-gate -->
+    // block.
+    expect(script).toContain('GATE_SECTION=$(printf \'%s\n%s\' "$GATE_SECTION" "$GUARD_SUPPRESSIONS_SECTION")');
   });
 
   it('emits the mandatory test gate for self-repo automain task PR (baseBranch=automain, promotionTarget=main)', () => {

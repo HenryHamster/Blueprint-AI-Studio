@@ -503,7 +503,7 @@
     {
       "path": "agent/src/handlers/typed-fast-resident.test.ts",
       "completeness": "all",
-      "reason": "Covers the structurally fenced Typed Fast child used by conversational Workday: exact claim binding, at most one public completion and one bounded private request, request/completion coupling, unique idempotency, readiness timeout, circuit fallback, malformed staging rejection, and the narrow direct managed-execution role fence.",
+      "reason": "Covers the structurally fenced Typed Fast child used by conversational Workday: exact claim binding, at most one public completion and one bounded private request, request/completion coupling, unique idempotency, readiness timeout, circuit fallback, malformed staging rejection, and the narrow direct managed-execution role fence, plus the observational event seam that streams a cold-start Fast turn to the operator (re-attachment across crash replacement, dead-generation event drop, private readiness-probe suppression, and subscriber-throw isolation).",
       "test_ids": [
         "poisons the child when direct managed-execution staging violates its role",
         "closes and rejects a readiness probe that never settles",
@@ -515,9 +515,14 @@
         "accepts one exact structured Workday request with its public completion",
         "rejects direct managed execution",
         "accepts neutral strategist prose without body-status classification",
-        "keeps the managed-execution fence bounded on 20k prose"
+        "keeps the managed-execution fence bounded on 20k prose",
+        "delivers text, tool and activity events from the started session",
+        "re-attaches the subscription to the replacement session after a crash",
+        "drops late events from a closed session so they cannot be attributed to its replacement",
+        "suppresses the private readiness probe so no probe delta reaches a subscriber",
+        "never lets a throwing subscriber fail the turn"
       ],
-      "test_count": 11
+      "test_count": 16
     },
     {
       "path": "backend/testing/test_strategic_consultation_status.py",

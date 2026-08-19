@@ -32,6 +32,17 @@ describe('App workbench wiring', () => {
     expect(appSource).toMatch(/<MessagesPanel[\s\S]*onWorkdayStatusChange=\{setConversationWorkdayStatus\}/);
   });
 
+  test('threads the live strategist transcript into chat and its derived state back to the header', () => {
+    // The incremental delivery path is only useful if BOTH ends are wired: the
+    // hook's transcript buffer must reach the conversation surface, and the
+    // in-flight state it derives must reach the header affordance. A dangling
+    // end on either side is exactly the dead last mile this replaces.
+    expect(appSource).toMatch(/<MessagesPanel[\s\S]*strategicSessionTranscript=\{s\.strategicSessionTranscript\}/);
+    expect(appSource).toMatch(/<MessagesPanel[\s\S]*onChatLiveStateChange=\{setStrategicChatLiveState\}/);
+    const control = appSource.match(/<StrategicSessionControl[\s\S]*?\/>/)?.[0] ?? '';
+    expect(control).toContain('chatLiveState={strategicChatLiveState}');
+  });
+
   test('wires the real Strategic MessagesPanel to the context workspace opener', () => {
     expect(appSource).toContain('const openStrategicContextWorkspace = useCallback(');
     expect(appSource).toMatch(/<MessagesPanel[\s\S]*onOpenCommandPalette=\{openCommandPalette\}[\s\S]*onOpenStrategicContextWorkspace=\{openStrategicContextWorkspace\}/);

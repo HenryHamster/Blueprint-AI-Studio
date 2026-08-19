@@ -423,7 +423,8 @@
     "test_strategic_spawning_outcome_evaluation.py": 3276,
     "test_strategic_spawning_capability_verification.py": 3260,
     "test_strategic_spawning_portfolio_messages.py": 3274,
-    "test_strategic_spawning_summaries.py": 2966
+    "test_strategic_spawning_summaries.py": 2966,
+    "check_size_limits.py": 1750
   },
   "scripts": {
     "test_local_runner.py": 14250,
@@ -438,7 +439,7 @@
     "local_app_release.py": 2100,
     "blueprint_node.py": 2100,
     "local_postgres_rehearsal.py": 1850,
-    "test_guard_gate_left_shift.py": 1750,
+    "test_guard_gate_left_shift.py": 2400,
     "test-backend.sh": 1050,
     "static_release_guard.py": 750
   }

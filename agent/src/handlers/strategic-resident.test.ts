@@ -36,6 +36,7 @@ const {
 const typedFastMocks = vi.hoisted(() => ({
   construct: vi.fn(),
   ensureReady: vi.fn<() => Promise<void>>(),
+  onEvent: vi.fn(),
   dispatch: vi.fn(),
   interrupt: vi.fn(),
   replaceAfterCrash: vi.fn(),
@@ -171,6 +172,7 @@ vi.mock('./typed-fast-resident.js', () => ({
   ForegroundTypedController: class {
     constructor(options: unknown) { typedFastMocks.construct(options); }
     ensureReady(): Promise<void> { return typedFastMocks.ensureReady(); }
+    onEvent(cb: (ev: unknown) => void): void { typedFastMocks.onEvent(cb); }
     dispatch(...args: unknown[]): unknown { return typedFastMocks.dispatch(...args); }
     interrupt(): void { typedFastMocks.interrupt(); }
     replaceAfterCrash(): void { typedFastMocks.replaceAfterCrash(); }

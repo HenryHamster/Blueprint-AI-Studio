@@ -18,10 +18,19 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+try:
+    from guard_suppression_receipt import record_classification  # noqa: E402
+except ImportError:  # pragma: no cover - emitting is fail-open by contract
+    # A tree without the emitter (an older base checkout, a synthetic harness
+    # fixture) must still run this lane unchanged: recording suppressions can
+    # never be the reason a verdict, exit code or blocking decision moves.
+    def record_classification(*_args: object, **_kwargs: object) -> None:
+        return None
 from testing.fixgate_attribution import (  # noqa: E402
     JUnitReport,
-    attribute_reports,
+    classify_verification,
     extract_base,
     is_attributable_pytest_result,
     parse_junit_report,
@@ -257,6 +266,15 @@ def _attributed_findings(
         {"task_id": task_id, "test": key, "detail": detail}
         for key, detail in sorted(findings.items())
     ]
+
+
+LANE = "static"
+
+
+def _record_suppressions(outcome: dict[str, object]) -> None:
+    """Record this lane's suppressions in the cross-lane aggregate (fail-open)."""
+
+    record_classification(LANE, outcome)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -498,35 +516,44 @@ def main(argv: list[str] | None = None) -> int:
                             failures.append("standalone static corpus baseline_unavailable")
                             corpus_authoritative = False
                         else:
-                            attributed = attribute_reports(current_report, baseline_report)
-                            new_failures = attributed.new_failures
+                            outcome = classify_verification(
+                                runtime_available=True,
+                                current_exit_code=current_result.returncode,
+                                current_failures=current_report.failures,
+                                current_report=current_report,
+                                baseline_report=baseline_report,
+                            )
+                            new_failures = dict(outcome["new_failures"])
+                            disappeared = outcome.get("disappeared_failures") or {}
+                            skipped = outcome.get("skipped_failures") or {}
                             hidden_by_harness: list[str] = []
-                            if harness_changed and attributed.disappeared_failures:
+                            if disappeared:
                                 hidden_by_harness.append("disappear")
-                            if harness_changed and attributed.skipped_failures:
+                            if skipped:
                                 hidden_by_harness.append("become skipped")
-                            if hidden_by_harness:
+                            if hidden_by_harness and not new_failures:
+                                if harness_changed:
+                                    subject = (
+                                        "changed static test roster"
+                                        if roster_changed
+                                        else "changed static test harness"
+                                    )
+                                else:
+                                    subject = "this diff"
                                 new_failures["<harness>"] = (
-                                    "changed static test harness made base corpus "
+                                    f"{subject} made base corpus "
                                     f"failure(s) {' or '.join(hidden_by_harness)}"
                                 )
-                            elif harness_changed and roster_changed and baseline_report.failures:
-                                new_failures["<harness>"] = (
-                                    "changed static test roster made base corpus "
-                                    "failure(s) disappear"
-                                )
-                            if attributed.suppressed_failures:
-                                suppressed = {
-                                    key: {
-                                        "detail": detail,
-                                        "reason": "same route/test/failure kind failed on baseline",
-                                    }
-                                    for key, detail in attributed.suppressed_failures.items()
-                                }
+                            suppressed_failures = outcome.get("suppressed_failures") or {}
+                            if suppressed_failures:
                                 print(
                                     "[static guard] suppressed baseline failures: "
-                                    f"{json.dumps(suppressed, sort_keys=True)}"
+                                    f"{json.dumps(suppressed_failures, sort_keys=True)}"
                                 )
+                            # Additive and fail-open: the stdout line above is
+                            # unchanged, and the receipt never touches the
+                            # verdict computed from `outcome`.
+                            _record_suppressions(outcome)
 
             if corpus_authoritative and new_failures:
                 try:

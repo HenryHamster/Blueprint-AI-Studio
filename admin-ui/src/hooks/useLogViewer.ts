@@ -110,6 +110,11 @@ function strategicCycleCompletionFromDurableState(cycle: StrategicStateCycle): S
 export interface StrategicSessionDelta {
   /** Local monotonic id for stable React keys (the wire has no unique id). */
   id: number;
+  /** Project this delta was received under, stamped client-side at append time.
+   *  The wire payload is project-scoped by the WS channel but does not repeat
+   *  the id; recording it lets consumers scope the buffer to the currently
+   *  selected project without waiting for the project-switch clear effect. */
+  project_id?: string;
   session_id?: string;
   task_id?: string;
   seq?: number;
@@ -707,6 +712,7 @@ export function useLogViewer({
         if (text || status) {
           const delta: StrategicSessionDelta = {
             id: ++_sessionDeltaIdCounter,
+            project_id: selectedProjectIdRef.current ?? undefined,
             session_id: msg.data?.session_id,
             task_id: msg.data?.task_id,
             seq: msg.data?.seq,

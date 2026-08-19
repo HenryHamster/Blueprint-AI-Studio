@@ -13,8 +13,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
+try:
+    from guard_suppression_receipt import record_classification  # noqa: E402
+except ImportError:  # pragma: no cover - emitting is fail-open by contract
+    # A tree without the emitter (an older base checkout, a synthetic harness
+    # fixture) must still run this lane unchanged: recording suppressions can
+    # never be the reason a verdict, exit code or blocking decision moves.
+    def record_classification(*_args: object, **_kwargs: object) -> None:
+        return None
 from testing.fixgate_attribution import (  # noqa: E402
     JUnitReport,
     classify_verification,
@@ -293,6 +302,18 @@ def _valid_exit_report_pair(exit_code: int, failures: dict[str, str]) -> bool:
     return (exit_code == 0 and not failures) or (exit_code == 1 and bool(failures))
 
 
+def lane_name(suite: str) -> str:
+    """Return this lane's stable identity in the cross-lane aggregate."""
+
+    return f"vitest:{suite}"
+
+
+def _record_suppressions(suite: str, outcome: dict[str, object]) -> None:
+    """Record this lane's suppressions in the cross-lane aggregate (fail-open)."""
+
+    record_classification(lane_name(suite), outcome)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=sorted(SUITES), required=True)
@@ -454,6 +475,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         for key in sorted(outcome.get("suppressed_failures", {})):
             print(f"[vitest-verification] WARN suppressed baseline failure: {key}")
+        # Additive and fail-open: the WARN lines above are unchanged and the
+        # receipt cannot affect the state/exit decision made below.
+        _record_suppressions(args.suite, outcome)
         if current_execution_error:
             return _blocking("execution_failure")
         state = str(outcome["state"])

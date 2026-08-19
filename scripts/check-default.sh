@@ -21,7 +21,12 @@ _VERIFY_TASK_ID="${TASK_ID:-local-developer}"
 _VERIFY_RECEIPT="/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"
 _VERIFY_HARNESS_RECEIPT="/tmp/backend_verification_harness_${_VERIFY_TASK_ID}.json"
 _VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${_VERIFY_TASK_ID}"
-if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT"; then
+# Warm VMs reuse /tmp, so a prior task's per-lane suppression receipts would be
+# attributed to this run. Clear them exactly as the verification receipts above.
+BLUEPRINT_GUARD_SUPPRESSION_DIR="/tmp/guard_suppression_receipts_${_VERIFY_TASK_ID}"
+export BLUEPRINT_GUARD_SUPPRESSION_DIR
+if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT" \
+  || ! rm -rf "$BLUEPRINT_GUARD_SUPPRESSION_DIR"; then
   echo "[check] unable to remove prior verification receipt(s) — refusing to run" >&2
   exit 1
 fi
@@ -439,6 +444,11 @@ if touches "golden_tasks/"; then
   done
 fi
 
+
+# Merge every lane's suppression receipt into one cross-lane aggregate. Purely
+# additive bookkeeping: it never contributes to FAILED.
+python3 scripts/guard_suppression_receipt.py aggregate \
+  --out "$BLUEPRINT_GUARD_SUPPRESSION_DIR/aggregate.json" || true
 
 if [ ${#FAILED[@]} -eq 0 ]; then
   echo ""

@@ -18,8 +18,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
+try:
+    from guard_suppression_receipt import record_classification  # noqa: E402
+except ImportError:  # pragma: no cover - emitting is fail-open by contract
+    # A tree without the emitter (an older base checkout, a synthetic harness
+    # fixture) must still run this lane unchanged: recording suppressions can
+    # never be the reason a verdict, exit code or blocking decision moves.
+    def record_classification(*_args: object, **_kwargs: object) -> None:
+        return None
 from testing.fixgate_attribution import (  # noqa: E402
     classify_verification,
     extract_base,
@@ -172,6 +181,18 @@ def _blocking(state: str, **extra: object) -> int:
     return 1
 
 
+def lane_name(suite: str) -> str:
+    """Return this lane's stable identity in the cross-lane aggregate."""
+
+    return f"typecheck:{suite}"
+
+
+def _record_suppressions(suite: str, outcome: dict[str, object]) -> None:
+    """Record this lane's suppressions in the cross-lane aggregate (fail-open)."""
+
+    record_classification(lane_name(suite), outcome)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=sorted(SUITES), default="admin-ui")
@@ -261,6 +282,9 @@ def main(argv: list[str] | None = None) -> int:
             "[typecheck-verification] WARN suppressed baseline failure: "
             f"{key}{_locations(current_diagnostics, key)}"
         )
+    # Additive and fail-open: stdout above is unchanged and the receipt is
+    # written before, and independent of, the blocking decision below.
+    _record_suppressions(args.suite, outcome)
     disappeared = outcome.get("disappeared_failures", {})
     if not isinstance(disappeared, dict):  # pragma: no cover - contract guard
         disappeared = {}

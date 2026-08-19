@@ -42,7 +42,11 @@ from sqlmodel.sql.sqltypes import GUID
 
 from app.models_base import NaiveUTCDateTime
 from app.time_utils import _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 1642
+# Paired raise 1642 -> 1750 (matching this module's module_size_limits.json
+# entry): the candidate_sha column + its contract comment took the file past
+# the previous cap, which automain sat exactly at.  Deliberate config edit per
+# check_size_limits.py's governance-tightened remediation, not a refactor.
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1750
 
 
 class ReleaseVersion(SQLModel, table=True):
@@ -141,6 +145,18 @@ class ReleaseVersion(SQLModel, table=True):
 
     # promoted_sha: automain HEAD at the time of successful promotion.
     promoted_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # candidate_sha: the candidate this qualification attempt evaluates, stamped
+    # by ``run_qualification`` from the integration-branch HEAD it resolved live
+    # for that run — on a new attempt AND on a continued one, which re-resolves
+    # HEAD and scores that fresher candidate everywhere else.  Never written by
+    # unrelated ``last_qualification`` paths; it is the authoritative source for
+    # ``candidate_authorship_range()``, since a mutable JSONB fallback let those
+    # writes silently substitute a different candidate into the authorship gate.
+    candidate_sha: str | None = Field(
         default=None,
         sa_column=Column(String(40), nullable=True),
     )

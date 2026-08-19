@@ -13,6 +13,8 @@ function MessagesPanel(props: MessagesPanelTestProps) {
 }
 import type { ProjectMessage } from './MessageBubble';
 import type { StrategicStateResponse } from '../strategicStateApi';
+import type { StrategicSessionDelta } from '../hooks/useLogViewer';
+import type { StrategicChatLiveState } from '../utils/strategicSessionLive';
 import {
   enqueueResidentToolHandoff,
   loadQueuedResidentToolHandoffs,
@@ -2392,5 +2394,271 @@ describe('MessagesPanel grouping', () => {
     expect(text.indexOf('newer bug')).toBeLessThan(text.indexOf('older blocker'));
     // No pin label in Recent mode
     expect(text).not.toContain('Pinned');
+  });
+});
+
+/**
+ * Live strategist streaming — the last mile of the incremental delivery path.
+ *
+ * These tests assert the CONVERGENCE contract that makes the preview safe to
+ * layer over the authenticated message poll: the preview is purely additive
+ * while a turn is in flight, and once the durable reply lands the rendered
+ * message set is identical to what the poll alone would have produced.
+ */
+describe('MessagesPanel live strategist streaming', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); });
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  function delta(over: Partial<StrategicSessionDelta> & { id: number }): StrategicSessionDelta {
+    return { project_id: 'proj-1', session_id: 'sess-1', text: '', ...over };
+  }
+
+  const DURABLE_REPLY_AT = '2026-06-01T10:00:10.000Z';
+  const STREAM_AT = '2026-06-01T10:00:05.000Z';
+  // The durable reply the poll eventually delivers. Its `created_at` is NEWER
+  // than every streamed delta's `ts`, which is what retires the preview.
+  const durableReply = () => makeMsg({
+    id: 'reply-1',
+    sequence: 2,
+    from_type: 'strategic',
+    content: 'The durable strategist reply.',
+    surface: 'conversation',
+    created_at: DURABLE_REPLY_AT,
+  });
+  const operatorTurn = () => makeMsg({
+    id: 'ask-1',
+    sequence: 1,
+    from_type: 'user',
+    content: 'Operator question',
+    surface: 'conversation',
+    created_at: '2026-06-01T10:00:00.000Z',
+  });
+
+  async function render(props: Partial<MessagesPanelProps>, messages: _MockMsg[]) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch(messages);
+    host = document.createElement('div');
+    host.style.display = 'flex';
+    host.style.flexDirection = 'column';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          filterChrome="minimal"
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          strategicState={makeStrategicState()}
+          {...props}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  async function rerender(props: Partial<MessagesPanelProps>) {
+    const r = root;
+    if (!r) throw new Error('not rendered');
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          filterChrome="minimal"
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          strategicState={makeStrategicState()}
+          {...props}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+  }
+
+  function preview(el: HTMLElement) {
+    return el.querySelector('[data-testid="strategic-streaming-preview"]');
+  }
+  /** The rendered durable message set — the thing that must be identical with
+   *  and without streaming. Fails loudly if the scroll container is missing so
+   *  the convergence assertion can never degrade into comparing '' to ''. */
+  function messageListHtml(el: HTMLElement): string {
+    const list = el.querySelector('.overflow-y-auto');
+    if (!list) throw new Error('conversation scroll container not found');
+    const html = list.innerHTML;
+    if (!html.includes('The durable strategist reply.')) {
+      throw new Error('durable reply not present in the captured message list');
+    }
+    return html;
+  }
+
+  test('no streaming at all: the preview never appears and only durable rows render', async () => {
+    const el = await render({}, [operatorTurn(), durableReply()]);
+
+    await waitFor(() => expect(el.textContent).toContain('The durable strategist reply.'));
+    expect(preview(el)).toBeNull();
+    expect(el.querySelector('[data-testid="strategic-streaming-bubble"]')).toBeNull();
+    expect(el.querySelector('[data-testid="strategic-live-activity"]')).toBeNull();
+  });
+
+  test('streams then persists: preview shows partial reply, then converges to exactly the poll-only render', async () => {
+    // Baseline: what the poll ALONE renders once the reply is durable.
+    const baselineEl = await render({}, [operatorTurn(), durableReply()]);
+    await waitFor(() => expect(baselineEl.textContent).toContain('The durable strategist reply.'));
+    const pollOnlyHtml = messageListHtml(baselineEl);
+    act(() => root!.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+
+    // In flight: the reply is streaming and NOT yet in the durable set.
+    const transcript: StrategicSessionDelta[] = [
+      delta({ id: 1, seq: 1, status: 'responding', ts: STREAM_AT }),
+      delta({ id: 2, seq: 2, kind: 'message', text: 'The durable ', ts: STREAM_AT }),
+      delta({ id: 3, seq: 3, kind: 'message', text: 'strategist reply.', ts: STREAM_AT }),
+    ];
+    const el = await render({ strategicSessionTranscript: transcript }, [operatorTurn()]);
+
+    const bubble = el.querySelector('[data-testid="strategic-streaming-bubble"]');
+    expect(bubble).toBeTruthy();
+    // Contiguous same-kind fragments concatenate with no injected separator.
+    expect(el.querySelector('[data-testid="strategic-streaming-reply"]')?.textContent)
+      .toBe('The durable strategist reply.');
+    // The preview is NOT a durable message row: no id, no selection checkbox,
+    // and no message-bubble action affordances.
+    expect(bubble?.querySelector('input[type="checkbox"]')).toBeNull();
+    expect(bubble?.querySelector('button')).toBeNull();
+    expect(bubble?.getAttribute('role')).toBe('status');
+
+    // The poll delivers the durable reply. The stream keeps its buffered
+    // deltas (nothing clears them) — convergence must come from reconciliation.
+    _mockMessagesFetch([operatorTurn(), durableReply()]);
+    await rerender({
+      strategicSessionTranscript: [
+        ...transcript,
+        delta({ id: 4, seq: 4, status: 'done', ts: DURABLE_REPLY_AT }),
+      ],
+      realtimeRefreshSignal: 1,
+    });
+
+    await waitFor(() => expect(el.textContent).toContain('The durable strategist reply.'));
+    expect(preview(el)).toBeNull();
+    expect(messageListHtml(el)).toBe(pollOnlyHtml);
+  });
+
+  test('stream dropped mid-reply: no done frame ever arrives, the poll alone converges the thread', async () => {
+    // A truncated stream: reply fragments, no `done`, and the transport dies.
+    const transcript: StrategicSessionDelta[] = [
+      delta({ id: 1, seq: 1, status: 'responding', ts: STREAM_AT }),
+      delta({ id: 2, seq: 2, kind: 'message', text: 'The durable str', ts: STREAM_AT }),
+    ];
+    const el = await render({ strategicSessionTranscript: transcript }, [operatorTurn()]);
+    expect(el.querySelector('[data-testid="strategic-streaming-reply"]')?.textContent)
+      .toBe('The durable str');
+
+    // Only the poll delivers the reply; the stale partial deltas stay buffered.
+    _mockMessagesFetch([operatorTurn(), durableReply()]);
+    await rerender({ strategicSessionTranscript: transcript, realtimeRefreshSignal: 1 });
+
+    await waitFor(() => expect(el.textContent).toContain('The durable strategist reply.'));
+    // The watermark retires the truncated preview even with no `done` frame.
+    expect(preview(el)).toBeNull();
+    expect(el.textContent).not.toContain('The durable str.');
+  });
+
+  test('reasoning segments render set apart from reply segments', async () => {
+    const el = await render({
+      strategicSessionTranscript: [
+        delta({ id: 1, seq: 1, kind: 'reasoning', text: 'Checking the release gate first.' }),
+        delta({ id: 2, seq: 2, kind: 'message', text: 'Here is the answer.' }),
+      ],
+    }, [operatorTurn()]);
+
+    const reasoning = el.querySelector('[data-testid="strategic-streaming-reasoning"]');
+    const reply = el.querySelector('[data-testid="strategic-streaming-reply"]');
+    expect(reasoning?.textContent).toBe('Checking the release gate first.');
+    expect(reply?.textContent).toBe('Here is the answer.');
+    // Set apart, not merged into one block, and visually distinct.
+    expect(reasoning).not.toBe(reply);
+    expect(reasoning?.className).toContain('italic');
+    expect(reply?.className).not.toContain('italic');
+  });
+
+  test('activity strip renders in-flight tool activity and marks the running item', async () => {
+    const el = await render({
+      strategicSessionTranscript: [
+        delta({ id: 1, seq: 1, status: 'responding' }),
+        delta({ id: 2, seq: 2, kind: 'read', text: 'read release_scoring.py' }),
+        delta({ id: 3, seq: 3, kind: 'command', text: 'pytest testing/test_release_scoring.py' }),
+      ],
+    }, [operatorTurn()]);
+
+    const items = [...el.querySelectorAll('[data-testid="strategic-live-activity-item"]')];
+    expect(items.map(i => i.textContent)).toEqual([
+      'readread release_scoring.py',
+      'runpytest testing/test_release_scoring.py',
+    ]);
+    // Only the LAST item of an in-flight turn is marked as still running.
+    expect(items[0].getAttribute('data-in-flight')).toBeNull();
+    expect(items[1].getAttribute('data-in-flight')).toBe('true');
+  });
+
+  test('deltas stamped for another project never render under this project', async () => {
+    const el = await render({
+      strategicSessionTranscript: [
+        delta({ id: 1, seq: 1, project_id: 'proj-2', kind: 'message', text: 'Other project secret' }),
+        delta({ id: 2, seq: 2, project_id: undefined, kind: 'message', text: 'Unattributed delta' }),
+      ],
+    }, [operatorTurn()]);
+
+    expect(preview(el)).toBeNull();
+    expect(el.textContent).not.toContain('Other project secret');
+    expect(el.textContent).not.toContain('Unattributed delta');
+  });
+
+  test('reports the in-flight chat live state up, and clears it when the reply persists', async () => {
+    const seen: (StrategicChatLiveState | null)[] = [];
+    const transcript: StrategicSessionDelta[] = [
+      delta({ id: 1, seq: 1, status: 'responding', ts: STREAM_AT }),
+      delta({ id: 2, seq: 2, kind: 'command', text: 'grep release gate', ts: STREAM_AT }),
+      delta({ id: 3, seq: 3, kind: 'message', text: 'Streaming answer', ts: STREAM_AT }),
+    ];
+    const onChatLiveStateChange = (state: StrategicChatLiveState | null) => { seen.push(state); };
+    const el = await render(
+      { strategicSessionTranscript: transcript, onChatLiveStateChange },
+      [operatorTurn()],
+    );
+
+    expect(seen[seen.length - 1]).toEqual({
+      phase: 'streaming',
+      label: 'Replying',
+      detail: 'grep release gate',
+    });
+
+    _mockMessagesFetch([operatorTurn(), durableReply()]);
+    await rerender({
+      strategicSessionTranscript: [
+        ...transcript,
+        delta({ id: 4, seq: 4, status: 'done', ts: DURABLE_REPLY_AT }),
+      ],
+      onChatLiveStateChange,
+      realtimeRefreshSignal: 1,
+    });
+
+    await waitFor(() => expect(el.textContent).toContain('The durable strategist reply.'));
+    expect(seen[seen.length - 1]).toBeNull();
   });
 });
