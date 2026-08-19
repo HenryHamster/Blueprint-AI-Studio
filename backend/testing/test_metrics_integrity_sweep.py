@@ -6996,6 +6996,108 @@ async def test_capability_proof_trial_stall_mixed_caps(db):
     assert severities["cap-beta"] == "warn"
 
 
+def _make_criterion_trial_task(project_id, criterion_key, *, ran=False, passed=False, could_not_run=False):
+    """Helper: a COMPLETED criterion_named_test_trial task with a contradiction stamp."""
+    contradiction = {
+        "criterion_key": criterion_key,
+        "head_sha": "abc123",
+        "test_refs": [],
+        "ran": ran,
+        "passed": passed,
+        "could_not_run": could_not_run,
+        "recorded_at": _utcnow().isoformat(),
+    }
+    return Task(
+        project_id=project_id,
+        payloads=[{"type": "criterion_named_test_trial", "criterion_key": criterion_key}],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_named_test_trial_contradiction": contradiction},
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_flags_stalled_criterion_named_test_trial(db):
+    """The extended check also covers criterion_named_test_trial, grouped by
+    criterion_key — this is the stalled-trial health surface for Leg 1's
+    consecutive-non-green suppression (acceptance_criteria.enroll_criterion_named_test_trial):
+    the same terminal non-green trials that drive that suppression decision
+    are what this check flags, so a suppressed criterion stays visible."""
+    project = await _project(db)
+    now = _utcnow()
+
+    for _ in range(3):
+        db.add(_make_criterion_trial_task(project.id, "c-stalled", could_not_run=True))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert f.check == "capability_proof_trial_stall"
+    assert f.subject == str(project.id)
+    assert f.severity == "warn"
+    assert f.delta == 3
+    assert f.ground_truth == 0
+    assert "could_not_run=3" in f.detail
+    assert "c-stalled" in f.detail
+    assert "criterion=" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_criterion_population_does_not_affect_cap_population(db):
+    """Extending the check to cover criterion_named_test_trial must not change
+    the pre-existing capability_proof_trial FLAGGED/OK results for the same project."""
+    project = await _project(db)
+    now = _utcnow()
+
+    db.add(_make_trial_task(project.id, "cap-untouched", ran=True, passed=False))
+    for _ in range(3):
+        db.add(_make_criterion_trial_task(project.id, "c-untouched", could_not_run=True))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 2
+    details = {f.detail for f in flagged}
+    assert any("cap='cap-untouched'" in d and "red=1" in d for d in details)
+    assert any("criterion='c-untouched'" in d and "could_not_run=3" in d for d in details)
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_stall_criterion_ok_when_any_green(db):
+    """A green criterion_named_test_trial (no contradiction stamp) → that
+    criterion is NOT flagged, matching the cap population's behavior."""
+    project = await _project(db)
+    now = _utcnow()
+
+    green_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "criterion_named_test_trial", "criterion_key": "c-green"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db.add(green_task)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_trial_stall(ctx)
+
+    assert not any(r.status == CheckStatus.FLAGGED for r in results)
+
+
 # --- check_unmapped_acceptance_criteria -------------------------------------
 
 

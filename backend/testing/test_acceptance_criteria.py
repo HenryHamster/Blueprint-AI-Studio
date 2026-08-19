@@ -12232,6 +12232,225 @@ async def test_criterion_trial_terminal_identity_survives_more_than_200_newer_ta
 
 
 # ---------------------------------------------------------------------------
+# Consecutive-non-green streak suppression: the trial_identity seed includes
+# head_sha, so a project whose candidate SHA bumps continuously can re-arm
+# the SAME (criterion, test, precondition) triple forever even though the
+# execution precondition never changed. This is leg 1 of the fix for the
+# 99-placements/6-criteria/week defect: 33x the healthy re-arm ceiling.
+# ---------------------------------------------------------------------------
+
+
+def _mark_trial_non_green(task, *, could_not_run: bool = True) -> None:
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        "criterion_named_test_trial_contradiction": {
+            "could_not_run": could_not_run,
+            "ran": not could_not_run,
+            "passed": False,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_suppresses_after_consecutive_non_green_streak_across_shas(
+    db_session,
+):
+    """A bare head_sha bump must not re-arm a repeatedly-non-green trial.
+
+    Before the fix, ``trial_identity`` seeds on ``head_sha`` so every SHA bump
+    mints a brand-new identity and the enroller happily re-enrolls forever —
+    this is the O(criteria x SHA bumps) spam mechanism the task describes.
+    After the fix, once
+    ``CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD``
+    consecutive terminal trials for the SAME test+precondition identity come
+    back non-green (independent of head_sha), enrollment stops.
+    """
+    project = await _make_project(db_session, "CriterionTrialStreakSuppression")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Streak-suppressed criterion"
+    )
+    threshold = ac.CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD
+    assert threshold >= 2, "test assumes more than one trial is required to suppress"
+
+    trial = None
+    for index in range(threshold - 1):
+        await _set_candidate_sha(db_session, version, f"{index}" * 40)
+        trial = await _enroll_trial(
+            db_session, project, version, criterion, "testing/test_streak.py"
+        )
+        assert trial is not None, (
+            f"trial #{index} must still enroll — only {index} prior non-green "
+            f"streak entries, below the {threshold} suppression bound"
+        )
+        _mark_trial_non_green(trial)
+        db_session.add(trial)
+        await db_session.commit()
+
+    # One more non-green trial reaches the threshold.
+    await _set_candidate_sha(db_session, version, "f" * 40)
+    trial = await _enroll_trial(
+        db_session, project, version, criterion, "testing/test_streak.py"
+    )
+    assert trial is not None
+    _mark_trial_non_green(trial)
+    db_session.add(trial)
+    await db_session.commit()
+
+    # A brand-new candidate SHA alone must NOT re-arm the streak.
+    await _set_candidate_sha(db_session, version, "9" * 40)
+    suppressed = await _enroll_trial(
+        db_session, project, version, criterion, "testing/test_streak.py"
+    )
+    assert suppressed is None, (
+        "a bare head_sha bump re-armed a trial whose test+precondition identity "
+        "has produced only non-green terminal outcomes — the suppression bound "
+        "is not doing its job"
+    )
+
+    trials = await _select_criterion_trials(db_session, project.id)
+    matching = [
+        t for t in trials
+        if t.first_payload.get("criterion_key") == criterion.criterion_key
+    ]
+    assert len(matching) == threshold, (
+        "no additional trial task may be minted once the streak bound is reached"
+    )
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_streak_suppression_rearms_on_changed_test_identity(
+    db_session,
+):
+    """A changed declared covering-test set must re-arm immediately, even
+    while the streak-suppression bound would otherwise hold enrollment shut."""
+    project = await _make_project(db_session, "CriterionTrialStreakTestIdentity")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Streak test-identity criterion"
+    )
+    threshold = ac.CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD
+
+    for index in range(threshold):
+        await _set_candidate_sha(db_session, version, f"{index}" * 40)
+        trial = await _enroll_trial(
+            db_session, project, version, criterion, "testing/test_streak_old.py"
+        )
+        assert trial is not None
+        _mark_trial_non_green(trial)
+        db_session.add(trial)
+        await db_session.commit()
+
+    await _set_candidate_sha(db_session, version, "9" * 40)
+    still_suppressed = await _enroll_trial(
+        db_session, project, version, criterion, "testing/test_streak_old.py"
+    )
+    assert still_suppressed is None, "sanity check: streak must be suppressing here"
+
+    # The declared covering tests changed — test_identity changes, and the
+    # criterion must re-arm even at the SAME suppressed head_sha.
+    rearmed = await _enroll_trial(
+        db_session, project, version, criterion, "testing/test_streak_new.py"
+    )
+    assert rearmed is not None, (
+        "a changed test_identity must re-arm enrollment even under an active "
+        "consecutive-non-green streak on the OLD test identity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_streak_suppression_rearms_on_changed_precondition_identity(
+    db_session,
+):
+    """A changed execution-precondition contract must re-arm immediately,
+    even while the streak-suppression bound would otherwise hold shut."""
+    project = await _make_project(db_session, "CriterionTrialStreakPrecondition")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Streak precondition criterion"
+    )
+    threshold = ac.CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD
+
+    for index in range(threshold):
+        await _set_candidate_sha(db_session, version, f"{index}" * 40)
+        trial = await _enroll_trial(
+            db_session, project, version, criterion, "testing/test_streak_precond.py"
+        )
+        assert trial is not None
+        _mark_trial_non_green(trial)
+        db_session.add(trial)
+        await db_session.commit()
+
+    await _set_candidate_sha(db_session, version, "9" * 40)
+    still_suppressed = await _enroll_trial(
+        db_session, project, version, criterion, "testing/test_streak_precond.py"
+    )
+    assert still_suppressed is None, "sanity check: streak must be suppressing here"
+
+    with patch.object(
+        ac,
+        "CRITERION_NAMED_TEST_TRIAL_CONTRACT",
+        f"{ac.CRITERION_NAMED_TEST_TRIAL_CONTRACT}:repaired-runner-v2",
+    ):
+        rearmed = await _enroll_trial(
+            db_session, project, version, criterion, "testing/test_streak_precond.py"
+        )
+    assert rearmed is not None, (
+        "a repaired execution precondition must re-arm enrollment even under "
+        "an active consecutive-non-green streak on the OLD precondition identity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_criterion_trial_streak_suppression_ignores_cancelled_superseded_rows(
+    db_session,
+):
+    """A CANCELLED (superseded-before-running) trial carries no pass/fail
+    signal and must neither count toward nor break the non-green streak."""
+    project = await _make_project(db_session, "CriterionTrialStreakCancelledNoise")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Streak cancelled-noise criterion"
+    )
+    threshold = ac.CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD
+
+    for index in range(threshold):
+        await _set_candidate_sha(db_session, version, f"{index}" * 40)
+        trial = await _enroll_trial(
+            db_session, project, version, criterion, "testing/test_streak_cancel.py"
+        )
+        assert trial is not None
+        _mark_trial_non_green(trial)
+        db_session.add(trial)
+        await db_session.commit()
+
+        # Interleave a CANCELLED noise row for the same identity — it must be
+        # skipped by the streak scan, not treated as a green break.
+        noise = Task(
+            project_id=project.id,
+            title="Cancelled noise trial",
+            payloads=[trial.first_payload],
+            context=dict(trial.context or {}),
+            status=TaskStatus.CANCELLED,
+            created_by="SYSTEM_AUTO_REVIEW",
+        )
+        noise.context.pop("criterion_named_test_trial_contradiction", None)
+        noise.context["superseded_by_newer_candidate"] = True
+        db_session.add(noise)
+        await db_session.commit()
+
+    await _set_candidate_sha(db_session, version, "9" * 40)
+    suppressed = await _enroll_trial(
+        db_session, project, version, criterion, "testing/test_streak_cancel.py"
+    )
+    assert suppressed is None, (
+        "interleaved CANCELLED rows must not prevent the non-green streak from "
+        "being detected"
+    )
+
+
+# ---------------------------------------------------------------------------
 # In-flight debounce: at most one non-terminal criterion_named_test_trial per
 # criterion + release version (root-fix for the O(criteria x SHA bumps) spam
 # mechanism — see enroll_criterion_named_test_trial).

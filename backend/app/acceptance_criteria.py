@@ -493,6 +493,29 @@ CRITERION_NAMED_TEST_TRIAL_WALL_CLOCK_SECONDS = 900
 # that can legitimately re-arm a terminal could_not_run trial at the same SHA.
 CRITERION_NAMED_TEST_TRIAL_CONTRACT = "criterion_named_test_trial:v2"
 
+#: The identity match in :func:`enroll_criterion_named_test_trial` seeds
+#: ``trial_identity`` with ``head_sha``, so on a project whose integration head
+#: moves several times a day it can NEVER suppress: an unrepaired precondition
+#: re-arms exactly as readily as a repaired one, minting a fresh VM placement
+#: every time the candidate SHA bumps. This bound replaces that structurally
+#: incapable head_sha-seeded suppressor with a decision keyed on the (criterion,
+#: test, precondition) triple alone: once this many consecutive TERMINAL trials
+#: for the same triple all came back non-green (independent of head_sha), stop
+#: enrolling new placements until either the declared covering tests change
+#: (``test_identity``) or the execution contract changes (``precondition_identity``).
+#: Bounded at a small value (not 1) because ``could_not_run`` is an
+#: infrastructure verdict (e.g. a Docker-less VM) and a single transient miss
+#: must not permanently strand a criterion's earn-up path.
+CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD = 3
+
+#: How many of the most recent terminal trials (for the same triple) to
+#: inspect when computing the consecutive-non-green streak above. Padded past
+#: the threshold itself so CANCELLED (superseded-before-running) rows, which
+#: carry no pass/fail signal, can be skipped without truncating the scan.
+_CRITERION_NAMED_TEST_TRIAL_STREAK_SCAN_LIMIT = (
+    CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD + 5
+)
+
 # Legacy criterion-key aliases.  A walkthrough script may post a semantic slug
 # (e.g. 'c-workday-session-lifecycle') before the script is updated to emit the
 # canonical registered criterion key.  Both evidence-recording lanes apply this
@@ -4897,8 +4920,14 @@ async def enroll_criterion_named_test_trial(
     skipped, a QUEUED trial pinned to a stale candidate SHA is cancelled
     (superseded) and re-enrolled at the current head, and a running
     (PROVISIONING/IN_PROGRESS) trial on a stale SHA is left alone with no new
-    enrollment. A GREEN receipt may mint covered evidence; every degraded path
-    returns ``None`` without raising.
+    enrollment. Also a no-op once the same (criterion, test, precondition)
+    triple has produced
+    :data:`CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD`
+    consecutive non-green terminal trials — independent of ``head_sha``,
+    since a bare candidate-SHA bump is not evidence a broken execution
+    precondition was repaired; a changed ``test_identity`` or
+    ``precondition_identity`` re-arms immediately. A GREEN receipt may mint
+    covered evidence; every degraded path returns ``None`` without raising.
     """
     try:
         from app.shared_state import runtime_config as _rc
@@ -5055,6 +5084,73 @@ async def enroll_criterion_named_test_trial(
             )
             return None
 
+        from app.models import TASK_OUTCOME_TERMINAL_STATUSES
+
+        # Consecutive-non-green streak suppression. The identity check above
+        # only suppresses an EXACT match including head_sha, so it never fires
+        # on a project whose candidate SHA bumps continuously — a bare SHA
+        # change is not evidence that a broken execution precondition was
+        # repaired. Look at the same (criterion, test, precondition) triple
+        # ACROSS every head_sha: if the most recent terminal trials for this
+        # triple all came back non-green, stop enrolling until test_identity
+        # or precondition_identity changes.
+        streak_rows = (
+            await session.execute(
+                select(Task.id, Task.status, Task.context)
+                .where(
+                    Task.project_id == project_id,
+                    Task.context[CRITERION_RELEASE_VERSION_CONTEXT_KEY].as_string()
+                    == str(version_id),
+                    trial_payload["type"].as_string() == "criterion_named_test_trial",
+                    trial_payload["criterion_key"].as_string() == criterion_key,
+                    trial_payload["test_identity"].as_string() == test_identity,
+                    trial_payload["precondition_identity"].as_string()
+                    == precondition_identity,
+                    Task.status.in_(TASK_OUTCOME_TERMINAL_STATUSES),
+                )
+                .order_by(Task.created_at.desc())
+                .limit(_CRITERION_NAMED_TEST_TRIAL_STREAK_SCAN_LIMIT)
+            )
+        ).all()
+
+        consecutive_non_green = 0
+        for _row_id, row_status, row_context in streak_rows:
+            contradiction = (row_context or {}).get(
+                "criterion_named_test_trial_contradiction"
+            )
+            if isinstance(contradiction, dict):
+                consecutive_non_green += 1
+                if (
+                    consecutive_non_green
+                    >= CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD
+                ):
+                    break
+                continue
+            if row_status == TaskStatus.COMPLETED:
+                # COMPLETED with no contradiction stamp means the ingestion
+                # handler recorded green evidence — the streak is broken.
+                break
+            # CANCELLED (superseded before it ran) or FAILED (never reached
+            # ingestion) carries no pass/fail signal for this triple: skip it
+            # without counting it toward, or breaking, the streak.
+            continue
+
+        if (
+            consecutive_non_green
+            >= CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD
+        ):
+            logger.info(
+                "[CRITERION_TRIAL] suppressing enrollment for criterion %s "
+                "(project %s, version %s) — %d consecutive non-green terminal "
+                "trials for this test+precondition identity; unchanged since "
+                "the last attempt (head_sha alone does not re-arm)",
+                criterion_key,
+                project_id,
+                version_id,
+                consecutive_non_green,
+            )
+            return None
+
         # In-flight debounce: at most one non-terminal trial per criterion +
         # release version. The identity check above only suppresses an EXACT
         # match (same head, same refs, same precondition); the moment the
@@ -5066,8 +5162,6 @@ async def enroll_criterion_named_test_trial(
         # match (that case already returned above), so it is pinned to a
         # different candidate SHA or an older test/precondition epoch.
         from sqlalchemy.orm.attributes import flag_modified
-
-        from app.models import TASK_OUTCOME_TERMINAL_STATUSES
 
         inflight_rows = (
             await session.execute(
