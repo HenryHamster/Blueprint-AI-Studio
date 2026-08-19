@@ -15379,10 +15379,12 @@ async def test_converge_refuses_cycle(reaper_db, _no_broadcast):
 
 @pytest.mark.asyncio
 async def test_spawn_converge_within_batch_genuine_duplicate(reaper_db):
-    """(a) Two just-spawned siblings that are genuine duplicates (shared finding
-    origin) — even though they share the one research parent — are serialized: the
-    later child is wired to depend on the earlier (canonical) one at spawn."""
+    """(a) Two just-spawned siblings with an identical finding origin are the
+    SAME finding, not a foundation pair — serializing the later one produced
+    rebase-then-duplicate PRs, so it is DROPPED from the batch instead, stamped
+    with the surviving sibling for the caller's skip receipt."""
     from app.research_completion import converge_spawn_batch_foundations
+    from app.research_sibling_dependencies import DUPLICATE_FINDING_DROP_KEY
 
     project = await _make_project(reaper_db)
     research_parent = _uuid_mod.uuid4()
@@ -15405,14 +15407,55 @@ async def test_spawn_converge_within_batch_genuine_duplicate(reaper_db):
         status=TaskStatus.QUEUED,
     )
 
-    wired = converge_spawn_batch_foundations([canonical, dependent], [])
+    batch = [canonical, dependent]
+    wired = converge_spawn_batch_foundations(batch, [])
 
-    assert [t.id for t in wired] == [dependent.id]
-    assert str(canonical.id) in [str(d) for d in dependent.depends_on]
+    assert wired == []
+    assert [t.id for t in batch] == [canonical.id]
+    assert not dependent.depends_on
     assert not canonical.depends_on
-    assert dependent.context.get("_foundation_converged", {}).get(
-        "foundation_id"
-    ) == str(canonical.id)
+    marker = dependent.context[DUPLICATE_FINDING_DROP_KEY]
+    assert marker["surviving_task_id"] == str(canonical.id)
+    assert marker["finding_hash"] == "spawnhash00000001"
+
+
+@pytest.mark.asyncio
+async def test_spawn_drops_duplicate_finding_child_vs_active_task(reaper_db):
+    """A just-spawned child whose finding_hash matches an already-active task is
+    dropped from the batch — the active task IS the finding's implementation, so
+    serializing behind it only manufactures a duplicate PR after rebase."""
+    from app.research_completion import converge_spawn_batch_foundations
+    from app.research_sibling_dependencies import DUPLICATE_FINDING_DROP_KEY
+
+    project = await _make_project(reaper_db)
+    active = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/a.py"],
+        parent=_uuid_mod.uuid4(),
+        ctx={"finding_hash": "activehash0000001"},
+        created_at=_utcnow() - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+    )
+    child = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/b.py"],
+        parent=_uuid_mod.uuid4(),
+        ctx={"finding_hash": "activehash0000001"},
+        created_at=_utcnow(),
+        status=TaskStatus.QUEUED,
+    )
+
+    batch = [child]
+    wired = converge_spawn_batch_foundations(batch, [active])
+
+    assert wired == []
+    assert batch == []
+    assert not child.depends_on
+    assert child.context[DUPLICATE_FINDING_DROP_KEY]["surviving_task_id"] == str(
+        active.id
+    )
 
 
 @pytest.mark.asyncio

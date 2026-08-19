@@ -1105,6 +1105,12 @@ def deduplicate_findings(
             continue
 
         outcome.deduplicated.append((orig_i, finding, fhash))
+        # Accumulate the survivor's own hash so a second identical finding in
+        # THIS batch trips the hash stage above (same precedent as the
+        # evidence-list accumulator below). Two same-hash survivors would spawn
+        # children sharing one spawn idempotency key, which the active-key
+        # unique index rejects at commit.
+        recent_finding_hashes.add(fhash)
         # Add to evidence list for future comparisons in this cycle
         evidence_list.append(
             (title, finding.get("sources", []), finding.get("claims", []))

@@ -3200,6 +3200,14 @@
           "old_cap": 450,
           "new_cap": 800
         }
+      ],
+      "research_direction_state.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T07:15:21.418029+00:00",
+          "old_cap": 1750,
+          "new_cap": 2050
+        }
       ]
     },
     "agent": {

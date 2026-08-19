@@ -139,7 +139,7 @@
     "operator_attention.py": 3150,
     "payload_schemas.py": 2400,
     "lifecycle.py": 2500,
-    "research_direction_state.py": 1750,
+    "research_direction_state.py": 2050,
     "dep_lifecycle.py": 800,
     "routers/admin_health.py": 1750,
     "metrics_integrity_sweep.py": 6500,

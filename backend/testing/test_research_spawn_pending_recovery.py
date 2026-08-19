@@ -392,3 +392,127 @@ async def test_retry_after_post_spawn_crash_dedupes_child_and_finalizes(
     assert task.context[FINALIZED_RESEARCH_FINDINGS_KEY] is True
     assert "_research_spawn_pending" not in task.context
     assert task.context[RESEARCH_SPAWN_RECOVERY_KEY]["state"] == "recovered"
+
+
+def _patch_research_replay(mocker, finding, Session):
+    """Route the recovery sweep into the real research completion handler."""
+
+    from app.research_completion import _handle_research_completion
+    from test_autonomous_research import _patch_research_externals
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    async def _real_research_handler(task_id, payload, **kwargs):
+        async with Session() as session:
+            source = await session.get(Task, task_id)
+            await _handle_research_completion(source, payload.logs or "", session)
+        return {"status": "accepted"}
+
+    return mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new=AsyncMock(side_effect=_real_research_handler),
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_with_completed_sibling_skips_duplicate_and_receipts(
+    db_session,
+    mocker,
+):
+    """A COMPLETED sibling already delivering the finding suppresses re-spawn.
+
+    The prior child completed WITHOUT pr_merged, so the bounded hash-dedup
+    corpus deliberately leaves the finding eligible for a fresh research cycle
+    — exactly the gap that let a replay spawn a second child for the same
+    finding. The spawn-boundary sibling filter must drop the duplicate and
+    publish a skip receipt on the parent instead.
+    """
+
+    from app.finding_deduplication import canonical_finding_body, finding_hash
+
+    project, task, finding = await _make_stranded_research(db_session)
+    fhash = finding_hash(finding["title"], canonical_finding_body(finding))
+    prior_child = Task(
+        project_id=project.id,
+        parent_task_id=task.id,
+        title=finding["title"],
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        origination="RESEARCH",
+        context={
+            "research_task_id": str(task.id),
+            "parent_research_task_id": str(task.id),
+            "finding_hash": fhash,
+        },
+    )
+    db_session.add(prior_child)
+    await db_session.commit()
+    task_id, prior_child_id = task.id, prior_child.id
+
+    Session = _patch_recovery_runtime(mocker, db_session)
+    process = _patch_research_replay(mocker, finding, Session)
+
+    await _sweep_markerless_research_spawn_pending()
+    await db_session.rollback()
+
+    task = (
+        await db_session.execute(
+            select(Task)
+            .where(Task.id == task_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task_id)))
+        .scalars()
+        .all()
+    )
+
+    assert process.await_count == 1
+    assert [row.id for row in children] == [prior_child_id]
+    skips = task.context["research_duplicate_finding_skips"]
+    assert len(skips) == 1
+    assert skips[0]["finding_hash"] == fhash
+    assert skips[0]["surviving_task_id"] == str(prior_child_id)
+    assert skips[0]["stage"] == "spawn_boundary_replay"
+    assert "Skipped 1 duplicate finding child" in (task.latest_status_message or "")
+    assert task.context[FINALIZED_RESEARCH_FINDINGS_KEY] is True
+    assert "_research_spawn_pending" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_spawned_research_finding_child_pins_idempotency_key(
+    db_session,
+    mocker,
+):
+    """Research-finding children carry the parent-scoped finding claim key that
+    the ux_task_active_idempotency_key index enforces against concurrent
+    duplicates."""
+
+    project, task, finding = await _make_stranded_research(db_session)
+    task_id, project_id = task.id, project.id
+    Session = _patch_recovery_runtime(mocker, db_session)
+    _patch_research_replay(mocker, finding, Session)
+
+    await _sweep_markerless_research_spawn_pending()
+    await db_session.rollback()
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task_id)))
+        .scalars()
+        .all()
+    )
+
+    assert len(children) == 1
+    child = children[0]
+    fhash = child.context["finding_hash"]
+    assert fhash
+    # Literal prefix pin: the active-key namespace is security-relevant — a
+    # renamed prefix would silently stop colliding with rows written before it.
+    assert child.idempotency_key.startswith("research-finding:")
+    assert child.idempotency_key == f"research-finding:{project_id}:{task_id}:{fhash}"

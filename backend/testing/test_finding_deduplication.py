@@ -430,6 +430,25 @@ def test_deduplicate_findings_hash_dedup_counter():
     assert outcome.deduplicated == []
 
 
+def test_deduplicate_findings_intra_batch_identical_hash_yields_one():
+    # Two identical findings in ONE batch: the survivor's own hash joins the
+    # hash stage, so the twin cannot also survive (it would otherwise spawn a
+    # second child for the same finding — the duplicate-PR shape).
+    f = {"title": "same finding", "description": "same body", "priority": "medium"}
+    twin = dict(f)
+    outcome = deduplicate_findings(
+        [f, twin],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+    )
+    assert len(outcome.deduplicated) == 1
+    assert outcome.hash_dedup_count == 1
+    assert outcome.filtered[0]["reason"] == "hash match with prior task"
+
+
 def test_deduplicate_findings_region_identity_skip():
     # Shared region (2+ related_files) AND title corroboration → duplicate.
     finding = {
