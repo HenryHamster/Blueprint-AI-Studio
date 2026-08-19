@@ -322,6 +322,7 @@ from app.reaper_sweeps import (
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
     sweep_recover_stranded_transient_blockers,
+    sweep_recover_stranded_escalated_blockers,
     sweep_activate_staged_directions,
     sweep_stale_staged_directions,
     sweep_merge_gate_verification_degradation,
@@ -3013,6 +3014,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Transient-blocker recovery sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 12c: Recovery — un-strand escalated (need-less,
+                # non-transient) blockers previously hard-parked at the +10y
+                # sentinel so they self-heal once their blocker clears outside
+                # the dependency graph (a runner capability lands, a gate bug
+                # is fixed and deployed) instead of staying dead forever.
+                _mark_reaper_progress()
+                try:
+                    await sweep_recover_stranded_escalated_blockers(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Escalated-blocker recovery sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

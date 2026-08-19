@@ -2468,6 +2468,242 @@ async def test_approval_gate_timeout_reconciles_already_merged_rollup_pr(
     alert_mock.assert_not_awaited()
 
 
+# ── Churn-halt auto-respawn: a live loop must not strand forever ─────────────
+
+
+@pytest.mark.asyncio
+async def test_churn_halt_approval_gate_timeout_respawns_review(eval_db, mocker):
+    """Root-fix regression (PR #17419, 2026-08-18): when
+    review_pipeline's supersession-churn-halt fence cancels every in-flight
+    review/fix task on a PR and parks the chain-root parent behind a
+    ``supersession_churn_halt`` approval hold, the approval-gate companion
+    timeout must NOT just sit on the one-way preserve/FAILED latch forever —
+    it must first spend a bounded automatic respawn attempt
+    (``_CHURN_HALT_AUTO_RESPAWN_MAX``) at the current PR head. A fresh review
+    landing means the loop self-heals once its actual blocker (a gate bug, a
+    missing runner capability, ...) clears, with no operator intervention."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.admin_approval_authority import establish_independent_approval_hold
+    from app.review_loop_convergence import _set_review_loop_terminal_outcome
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # Rollup PR still open (not merged) — the CREDIT-BLINDNESS guard must fall
+    # through to the churn-halt respawn branch rather than reconciling.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "open", "changed_files": 2},
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    fake_review = uuid.uuid4()
+
+    class _FakeReviewTask:
+        id = fake_review
+
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(_FakeReviewTask(), True),
+    )
+
+    project = Project(name="Churn Halt Respawn", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "prompt": "chain-root parent",
+                "pr_number": 17419,
+                "branch": "task/fix-something",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        requires_approval=False,
+        context={"rollup_pr_number": 17419},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # Install the exact provenance the real churn-halt block installs (see
+    # review_pipeline.py's supersede_churn_count >= churn_limit branch): an
+    # independent approval hold whose owner/reason match the terminal-outcome
+    # breadcrumb, so clear_review_escalation_approval_gate can later recognize
+    # and release it by identity.
+    establish_independent_approval_hold(
+        parent, reason="supersession_churn_halt", owner="review_pipeline"
+    )
+    # Backdate the hold past the 2h fail window (but inside the 6h defer
+    # ceiling) so the companion timeout actually fires this sweep. Must happen
+    # BEFORE recording the terminal-outcome breadcrumb below — the breadcrumb
+    # captures the hold's identity (including this timestamp) at that instant,
+    # and clear_review_escalation_approval_gate only releases on an EXACT
+    # identity match against the hold as it exists when the sweep runs.
+    ctx = dict(parent.context or {})
+    ctx["_approval_set_at"] = _naive_utc_ago(hours=5).isoformat()
+    parent.context = ctx
+    flag_modified(parent, "context")
+    _set_review_loop_terminal_outcome(
+        parent,
+        kind="supersession_churn_halt",
+        reason="supersession-churn",
+        pr_number=17419,
+        iterations=5,
+        detail="Supersession churn reached the bound (test).",
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    assert parent.requires_approval is True  # sanity: hold really installed
+
+    await _check_evaluating_timeouts()
+
+    spawn_mock.assert_called_once()
+    call_args, call_kwargs = spawn_mock.call_args
+    assert call_args[0].id == parent.id
+    assert call_args[1] == "review"
+    assert call_args[3] == 17419
+    assert call_kwargs.get("original_task_id") == str(parent.id)
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        "a live loop must self-heal via respawn, never FAIL or sit dead behind "
+        f"the churn-halt hold — got {parent.status}: "
+        f"{parent.latest_status_message!r}"
+    )
+    assert parent.context.get("_churn_halt_respawn_count") == 1
+    assert parent.requires_approval is False, (
+        "the bounded respawn must release the resolvable churn-halt hold so "
+        "the parent isn't left permanently gated behind dead provenance"
+    )
+    msg = parent.latest_status_message or ""
+    assert "respawn" in msg.lower() and "17419" in msg
+    # This is a recovery, not a failure — no failure classification/alert.
+    rec.assert_not_called()
+    alert_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_churn_halt_respawn_cap_honored_falls_through_to_preserve(
+    eval_db, mocker
+):
+    """Complement: the bounded respawn cap must actually bound. Once
+    ``_churn_halt_respawn_count`` already reached ``_CHURN_HALT_AUTO_RESPAWN_MAX``
+    (2 free automatic attempts), a further churn-halt timeout must NOT spawn
+    another review — it falls through unchanged to the existing preserve-for-
+    hand-merge/FAILED disposition, so a genuinely wedged PR still terminates
+    into an explicit, operator-visible state instead of respawning forever."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.admin_approval_authority import establish_independent_approval_hold
+    from app.review_loop_convergence import _set_review_loop_terminal_outcome
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # Clean/mergeable and still open — eligible for hand-merge preserve once
+    # the respawn cap declines to spend another attempt.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "changed_files": 2,
+            "mergeable_state": "clean",
+        },
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+
+    project = Project(name="Churn Halt Cap", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "prompt": "chain-root parent",
+                "pr_number": 17420,
+                "branch": "task/fix-something-else",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        requires_approval=False,
+        context={"rollup_pr_number": 17420},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    establish_independent_approval_hold(
+        parent, reason="supersession_churn_halt", owner="review_pipeline"
+    )
+    ctx = dict(parent.context or {})
+    ctx["_approval_set_at"] = _naive_utc_ago(hours=5).isoformat()
+    # Already spent BOTH free automatic respawn attempts across this task's
+    # lifetime — the cap must now hold, proving the fence still stops a
+    # genuine churn storm instead of respawning indefinitely.
+    ctx["_churn_halt_respawn_count"] = 2
+    parent.context = ctx
+    flag_modified(parent, "context")
+    _set_review_loop_terminal_outcome(
+        parent,
+        kind="supersession_churn_halt",
+        reason="supersession-churn",
+        pr_number=17420,
+        iterations=9,
+        detail="Supersession churn reached the bound (test, storm).",
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    spawn_mock.assert_not_called()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"a wedged PR still gets an explicit operator-visible disposition, not "
+        f"FAILED out from under a mergeable PR — got {parent.status}"
+    )
+    assert parent.context.get("_churn_halt_respawn_count") == 2, (
+        "the cap must not be exceeded — no further respawn credited"
+    )
+    assert parent.context.get("approval_timeout_preserved_for_handmerge") is True
+    # Preserve (unlike respawn) never releases the hold — it stays an
+    # explicit, admin-visible operator-owned state.
+    assert parent.requires_approval is True
+    rec.assert_not_called()
+    alert_mock.assert_awaited()
+
+
 # ── Spend/budget approval holds: clean non-failure decline ────────────────────
 
 
