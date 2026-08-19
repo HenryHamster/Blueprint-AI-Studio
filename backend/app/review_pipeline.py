@@ -134,6 +134,8 @@ from app.review_loop_convergence import (
     build_review_cap_abandon_candidate,
     CROSS_EPISODE_ABANDON_THRESHOLD,
     REVIEW_LOOP_ABANDON_CANDIDATE_KEY,
+    clear_review_escalation_approval_gate,
+    review_loop_park_stale_head,  # noqa: F401 — re-exported for lifecycle/rollup callers
     review_loop_parked_for_operator,  # noqa: F401 — re-exported for lifecycle/rollup callers
 )
 
@@ -2340,15 +2342,59 @@ async def _spawn_pipeline_task(
     # The chain root owns terminal disposition.  Child copies are only a
     # callback breadcrumb; consulting them after reset-iteration-cap would
     # resurrect the cleared park from stale source history.
-    _operator_park_reason = review_loop_parked_for_operator(orig_task or source_task)
+    _park_task = orig_task or source_task
+    _operator_park_reason = review_loop_parked_for_operator(_park_task)
     if _operator_park_reason is not None:
-        source_task.latest_status_message = (
-            f"Review/fix spawn suppressed for PR #{pr_number} — operator owns "
-            f"the parked disposition ({_operator_park_reason})"
-        )
-        _set_spawn_reason(source_task, SPAWN_REASON_ABANDON_CANDIDATE)
-        session.add(source_task)
-        return (None, False)
+        # A stuck/standoff park can go stale: the branch can pick up commits
+        # no review ever examined (e.g. a fix task that pushed a real commit
+        # and passed its own local publication gate, then was CANCELLED by an
+        # unrelated infra event before its review ran — the park recorded at
+        # that moment compared only reviews of the OLD head). Left alone this
+        # guard would keep discarding every spawn attempt into that stale
+        # park forever, including an admin repair pass that re-triggers
+        # rollup after all children go terminal. Only pay for the live-head
+        # GitHub round-trip on this already-rare parked path, never on the
+        # common unparked spawn path.
+        _park_released = False
+        try:
+            from app.github import get_pull_request
+            from app.routers.agent import get_github_token_for_task
+
+            _gh_token, _owner, _repo = await get_github_token_for_task(
+                source_task.id, session
+            )
+            _live_pr = await get_pull_request(_gh_token, _owner, _repo, pr_number)
+            _live_head_sha = str((_live_pr or {}).get("head", {}).get("sha") or "")
+            if _live_head_sha and review_loop_park_stale_head(
+                _park_task, _live_head_sha
+            ):
+                _park_released = clear_review_escalation_approval_gate(
+                    _park_task, resolved_by="head_advanced_past_park"
+                )
+                if _park_released:
+                    session.add(_park_task)
+                    logger.info(
+                        "[PIPELINE] Released stale %s park for PR #%s — live "
+                        "head %s has commits the park never saw",
+                        _operator_park_reason,
+                        pr_number,
+                        _live_head_sha[:8],
+                    )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[PIPELINE] Could not verify live head for stale-park check "
+                "on PR #%s; honoring existing park",
+                pr_number,
+                exc_info=True,
+            )
+        if not _park_released:
+            source_task.latest_status_message = (
+                f"Review/fix spawn suppressed for PR #{pr_number} — operator owns "
+                f"the parked disposition ({_operator_park_reason})"
+            )
+            _set_spawn_reason(source_task, SPAWN_REASON_ABANDON_CANDIDATE)
+            session.add(source_task)
+            return (None, False)
 
     # ── verify_tests fast-path ──────────────────────────────────────────────
     # verify_tests is a one-shot, read-only merge-gate verification: it clones
@@ -3993,17 +4039,25 @@ async def _spawn_pipeline_task(
         curr_entry = new_review_history[-1]
         prev_issues_list = prev_entry.get("issues") or []
         curr_issues_list = curr_entry.get("issues") or []
+        # ``pending_disposition`` marks an issue a review disposed
+        # (fixed/refuted/adjudicated, with a reason) in good faith even though
+        # the backend could not stamp exact-target proof on that pass (see
+        # app.issue_ledger). It stays in the binding open set fail-closed, but
+        # it is NOT a bare unaddressed repeat — counting it here is exactly
+        # the false-positive stuck-park pattern this excludes it from.
         prev_critical_major = {
             i.get("description", "").lower().strip()
             for i in prev_issues_list
             if i.get("severity", "").upper() in ("CRITICAL", "MAJOR")
             and i.get("description", "").strip()
+            and not i.get("pending_disposition")
         }
         curr_critical_major = [
             i.get("description", "").lower().strip()
             for i in curr_issues_list
             if i.get("severity", "").upper() in ("CRITICAL", "MAJOR")
             and i.get("description", "").strip()
+            and not i.get("pending_disposition")
         ]
         # Refactor tasks get a higher threshold — structural review feedback often repeats
         # because the fix agent cannot fully resolve architectural concerns in scope
@@ -4134,6 +4188,13 @@ async def _spawn_pipeline_task(
                         pr_number=pr_number,
                         iterations=iteration,
                         detail=stuck_detail or None,
+                        # Record the exact head the detector compared so a
+                        # later commit landing on the branch (that no review
+                        # ever saw, e.g. a fix task cancelled by unrelated
+                        # infra after pushing) can be told apart from a park
+                        # that is still current. See
+                        # review_loop_park_stale_head.
+                        head_sha=curr_entry.get("reviewed_head_sha") or None,
                     )
                     session.add(stuck_orig)
                     await session.commit()

@@ -11350,6 +11350,189 @@ async def test_changed_head_fix_receives_only_still_open_blockers(tl_db, mocker)
 
 
 @pytest.mark.asyncio
+async def test_self_disposed_blocker_does_not_fabricate_request_changes(
+    tl_db, mocker
+):
+    """Root-fix regression (NeurIPS PR #1717 / plan task 3344347d).
+
+    A review approves the exact commit it was assigned (``_assigned_target_
+    matches`` True) and its own ``resolutions[]`` disposes the sole open
+    blocker with a valid disposition + reason. Meanwhile the live PR head has
+    already raced ahead (a genuinely separate, later commit no review has
+    seen) so the informational live-target fetch cannot stamp
+    ``target_verified_by_backend=True`` on this entry — the ledger alone
+    would leave the blocker "open" and, pre-fix, the withhold override
+    fabricated a REQUEST_CHANGES verdict + "Approval withheld" feedback from
+    that stale open set even though THIS review's own resolutions just
+    disposed it.
+
+    The outer episode still correctly discards the approval as stale (the
+    live head genuinely moved) and respawns a fresh review — that half is
+    unrelated to this fix and stays correct. What must change is what gets
+    persisted into review_history for this completed review: the verdict
+    must stay APPROVE (not silently rewritten) and no "Approval withheld"
+    text may appear, because the withhold must not fire on an issue THIS
+    review's own resolutions just disposed.
+    """
+    import json as _json
+    from app.issue_ledger import ensure_issue_ids
+    from app.task_lifecycle import _process_post_commit
+
+    session, factory = tl_db
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", new_callable=AsyncMock)
+    mocker.patch(
+        "app.task_lifecycle._comment_with_retry", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    assigned_head = "b" * 40
+    live_head = "c" * 40  # raced ahead of what this review examined
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": live_head, "ref": "feat/x"},
+            "base": {"sha": "base-sha-1", "ref": "main"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    project = await _make_project(session)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "X", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+    session.add(original)
+    await session.commit()
+    await session.refresh(original)
+
+    # build_issue_ledger recomputes a fresh backend-owned fingerprint id for
+    # every issue in an entry regardless of a supplied "issue_id" (it is only
+    # consulted afterward as a reference to an ALREADY-open prior record —
+    # useless on the very first entry that raises a finding). Precompute the
+    # exact id the ledger will independently assign for this prior entry
+    # (head "a"*40, iteration 0, ordinal 0) so the resolution below targets
+    # the real open-record id.
+    blocker_id = ensure_issue_ids(
+        [{"description": "stale cache entry never evicted", "severity": "critical"}],
+        reviewed_head_sha="a" * 40,
+        iteration=0,
+    )[0]["issue_id"]
+    ctx: dict = {
+        "review_loop": {
+            "pr_number": 7171,
+            "branch": "feat/x",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+            "iteration": 2,
+            "review_target": {
+                "project_id": str(project.id),
+                "pr_number": 7171,
+                "base_sha": "base-sha-1",
+                "head_sha": assigned_head,
+            },
+            "review_history": [
+                {
+                    "iteration": 0,
+                    "verdict": "REQUEST_CHANGES",
+                    "reviewed_head_sha": "a" * 40,
+                    "reviewed_base_sha": "base-sha-1",
+                    "target_verified_by_backend": True,
+                    "review_task_id": "prior-raising-review",
+                    "issues": [
+                        {
+                            "issue_id": blocker_id,
+                            "description": "stale cache entry never evicted",
+                            "severity": "critical",
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+    review_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 7171,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context=ctx,
+    )
+    session.add(review_task)
+    await session.commit()
+    await session.refresh(review_task)
+
+    verdict_json = _json.dumps(
+        {
+            "verdict": "APPROVE",
+            "feedback": "Looks good, prior blocker fixed.",
+            "issues": [],
+            "resolutions": [
+                {
+                    "issue_id": blocker_id,
+                    "disposition": "fixed",
+                    "reason": "Landed in commit bbbbbbbb",
+                }
+            ],
+            "reviewed_head_sha": assigned_head,
+            "reviewed_base_sha": "base-sha-1",
+        }
+    )
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/o/r/pull/7171",
+        artifact_type=ArtifactType.PULL_REQUEST,
+        verdict_json=verdict_json,
+    )
+
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    await session.refresh(review_task)
+
+    persisted_history = (
+        (review_task.context or {}).get("review_loop", {}).get("review_history") or []
+    )
+    assert persisted_history, "expected the completed review's entry to be persisted"
+    own_entry = next(
+        (
+            row
+            for row in persisted_history
+            if row.get("review_task_id") == str(review_task.id)
+        ),
+        None,
+    )
+    assert own_entry is not None, "this review's own entry must be in history"
+    assert own_entry.get("verdict") == "APPROVE", (
+        "a disposition THIS review's own resolutions made against a "
+        "ledger-open issue must not be overridden to REQUEST_CHANGES: "
+        f"got {own_entry.get('verdict')!r}"
+    )
+    assert "Approval withheld" not in (own_entry.get("feedback") or ""), (
+        "the withhold note must not fire when this review's own resolutions "
+        "disposed the only open blocker"
+    )
+    assert blocker_id not in [
+        issue.get("issue_id") for issue in (own_entry.get("issues") or [])
+    ], "the self-disposed blocker must not be re-listed as still-blocking"
+
+
+@pytest.mark.asyncio
 async def test_stale_head_respawn_idempotent_on_replay(tl_db, mocker):
     """A replay keeps the stale verdict discarded without spawning duplicate work.
 

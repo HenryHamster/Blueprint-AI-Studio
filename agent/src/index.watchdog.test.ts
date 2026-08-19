@@ -130,6 +130,9 @@ import {
   resolveCredentialsFromSecretVersion,
   refreshRuntimeState,
   _resetCredentialStateForTesting,
+  recordPushedWork,
+  _getLastPushedWorkForTesting,
+  _setLastPushedWorkForTesting,
 } from './index.js';
 import {
   __resetTaskCapabilityContractForTesting,
@@ -2542,6 +2545,205 @@ describe('heartbeat 409 task-terminal detection', () => {
     // No curl terminal POST
     const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
     expect(curlCall).toBeUndefined();
+  });
+});
+
+// ── Heartbeat auth-shaped 4xx (401/403) credential-refresh retry cascade ────
+// Kill-path regression (NeurIPS task 38b16082, 2026-08-18): the agent treated
+// the FIRST auth-shaped heartbeat 4xx as an instant, unretried fatal signal —
+// self-terminating 39s after pushing a real fix commit that had already
+// passed its local publication gate, orphaning it (no PR existed yet to carry
+// the head forward). These tests prove: (a) a recoverable auth 4xx does NOT
+// cancel the task, (b) an unrecoverable one DOES cancel, but with a reason
+// that names the actual HTTP status and retry count instead of a bare
+// "heartbeat 4xx", and (c) any pushed-but-not-yet-PR'd work rides along on
+// the terminal cancellation POST so the backend can record it instead of
+// silently discarding it.
+describe('heartbeat auth-shaped 4xx (401/403) credential-refresh retry cascade', () => {
+  let fetchMock: FetchMock;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fetchMock = makeFetchMock();
+    vi.stubGlobal('fetch', fetchMock);
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('');
+    vi.mocked(fs.writeFileSync).mockReset();
+    vi.mocked(fs.unlinkSync).mockReset();
+    _resetCancelRequestedForTesting();
+    _setLastPushedWorkForTesting(null);
+    _setAgentTokenForTesting('');
+  });
+
+  afterEach(() => {
+    _stopHeartbeatForTesting();
+    _resetCancelRequestedForTesting();
+    _setLastPushedWorkForTesting(null);
+    // The recovery test exercises a REAL tryRefreshToken() → setToken() call —
+    // don't let the refreshed token leak into unrelated later describe blocks.
+    _setAgentTokenForTesting('');
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function auth4xxResponse(status: 401 | 403) {
+    return Promise.resolve({
+      ok: false,
+      status,
+      text: () => Promise.resolve(`{"detail":"vm_instance_mismatch"}`),
+      json: () => Promise.resolve({}),
+      headers: { get: () => null },
+    });
+  }
+  function okResponse() {
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({}),
+      text: () => Promise.resolve(''),
+      headers: { get: () => null },
+    });
+  }
+
+  it('recovers from a 403 via credential re-acquisition and does NOT cancel the task', async () => {
+    let heartbeatCalls = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/refresh-token')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ token: 'fresh-token' }),
+          text: () => Promise.resolve(''),
+          headers: { get: () => null },
+        });
+      }
+      if (url.endsWith('/api/agent/heartbeat')) {
+        heartbeatCalls += 1;
+        // Call 1 = initial heartbeat (fires immediately, swallowed silently by
+        // the initial-heartbeat handler — it only self-terminates on 409).
+        // Call 2 = periodic tick's first attempt — this is the one that must
+        // enter the auth-retry cascade instead of instantly self-terminating.
+        // Call 3 = the cascade's first retry attempt, which succeeds.
+        if (heartbeatCalls <= 2) return auth4xxResponse(403);
+        return okResponse();
+      }
+      return okResponse();
+    });
+
+    _startHeartbeatForTesting('task-403-recovers', () => 'running');
+    await vi.advanceTimersByTimeAsync(1); // flush initial heartbeat
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL + 1); // periodic tick fails 403
+    await vi.advanceTimersByTimeAsync(21_000); // first ~20s auth-retry delay elapses, retry succeeds
+
+    expect(_isCancelRequestedForTesting()).toBe(false);
+    expect(heartbeatCalls).toBeGreaterThanOrEqual(3);
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
+    expect(curlCall).toBeUndefined();
+  });
+
+  it('cancels with a status+attempt-count reason after exhausting all credential-refresh retries, and carries the pushed head', async () => {
+    // Simulate a task that already pushed a real commit before PR creation —
+    // exactly the vulnerable window in the kill-path (pushAndCreatePR calls
+    // recordPushedWork immediately after `git push`, before the PR exists).
+    _setLastPushedWorkForTesting({ branch: 'blueprint-fix/orphan-guard-abcd123', headSha: 'deadbeefcafe' });
+
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/refresh-token')) {
+        // Refresh itself also rejects — apiRequest/tryRefreshToken must not
+        // hang retrying refresh; tryRefreshToken returns false immediately on
+        // a 4xx from this endpoint.
+        return Promise.resolve({
+          ok: false,
+          status: 403,
+          text: () => Promise.resolve('{"detail":"token revoked"}'),
+          json: () => Promise.resolve({}),
+          headers: { get: () => null },
+        });
+      }
+      if (url.endsWith('/api/agent/heartbeat')) {
+        return auth4xxResponse(403);
+      }
+      return okResponse();
+    });
+
+    _startHeartbeatForTesting('task-403-exhausts', () => 'running');
+    await vi.advanceTimersByTimeAsync(1); // flush initial heartbeat
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL + 1); // periodic tick fails 403 → enters cascade
+    // 3 attempts * 20s delay lands exactly on the synchronous exhaustion path
+    // (requestCancel + stopHeartbeat + postTerminalStatusSync all run inline
+    // right after the 3rd attempt fails). Deliberately stop short of the
+    // final `setTimeout(() => process.exit(0), 5000)` scheduled at that same
+    // instant — vitest traps a real process.exit call and throws, and the
+    // synchronous cancellation/curl-post assertions below don't need it to
+    // actually fire.
+    await vi.advanceTimersByTimeAsync(3 * 20_000 + 1_000);
+
+    expect(_isCancelRequestedForTesting()).toBe(true);
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
+    expect(curlCall).toBeDefined();
+    const args = curlCall?.[1] as string[];
+    const bodyIdx = args.indexOf('-d');
+    const body = JSON.parse(args[bodyIdx + 1]) as Record<string, unknown>;
+    expect(body.status).toBe('FAILED');
+    expect(body.failure_category).toBe('reassigned');
+    // Surfaced-reasons requirement: never a bare "heartbeat 4xx" — must name
+    // the actual HTTP status, the endpoint, and the retry-attempt count.
+    const logs = String(body.logs ?? '');
+    expect(logs).toMatch(/heartbeat/i);
+    expect(logs).toMatch(/POST \/api\/agent\/heartbeat/);
+    expect(logs).toMatch(/403/);
+    expect(logs).toMatch(/3/); // attempt count
+    expect(logs).not.toBe('non-transient heartbeat 4xx');
+    // The pushed-but-not-yet-PR'd head must ride along so the cancellation
+    // record carries the truth instead of orphaning the commit.
+    expect(body.pushed_branch).toBe('blueprint-fix/orphan-guard-abcd123');
+    expect(body.pushed_head_sha).toBe('deadbeefcafe');
+  });
+
+  it('does NOT enter the auth-retry cascade for a genuinely non-auth 4xx (404 task-gone) — stays immediately fatal', async () => {
+    let heartbeatCalls = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/heartbeat')) {
+        heartbeatCalls += 1;
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          text: () => Promise.resolve('{"detail":"Task not found"}'),
+          json: () => Promise.resolve({}),
+          headers: { get: () => null },
+        });
+      }
+      return okResponse();
+    });
+
+    _startHeartbeatForTesting('task-404-fatal', () => 'running');
+    await vi.advanceTimersByTimeAsync(1); // flush initial heartbeat
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL + 1); // periodic tick fails 404
+
+    // No auth-retry delay (20s) needed — should already be cancelled.
+    expect(_isCancelRequestedForTesting()).toBe(true);
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
+    expect(curlCall).toBeDefined();
+    const args = curlCall?.[1] as string[];
+    const bodyIdx = args.indexOf('-d');
+    const body = JSON.parse(args[bodyIdx + 1]) as Record<string, unknown>;
+    expect(String(body.logs ?? '')).toMatch(/404/);
+    expect(String(body.logs ?? '')).toMatch(/non-retryable/);
+    // Only the initial heartbeat + the one periodic attempt — no 20s-spaced
+    // retry attempts fired for a non-auth-shaped 4xx.
+    expect(heartbeatCalls).toBe(2);
+  });
+
+  it('recordPushedWork / _getLastPushedWorkForTesting round-trip', () => {
+    expect(_getLastPushedWorkForTesting()).toBeNull();
+    recordPushedWork('blueprint-fix/foo-bar', '0123456789abcdef');
+    expect(_getLastPushedWorkForTesting()).toEqual({
+      branch: 'blueprint-fix/foo-bar',
+      headSha: '0123456789abcdef',
+    });
   });
 });
 

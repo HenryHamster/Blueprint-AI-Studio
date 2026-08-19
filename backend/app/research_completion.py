@@ -4532,7 +4532,14 @@ async def _handle_research_completion(
         _compute_threshold = 0.0
         if task_type == "compute_experiment":
             _compute_contract = _author_compute_launch_contract(finding)
-            if not _compute_contract.get("container_image") and _project_default_container_image:
+            if (
+                not _compute_contract.get("container_image")
+                and _compute_contract.get("accelerator")
+                and _project_default_container_image
+            ):
+                # Only accelerator-declaring findings inherit the project default
+                # image: a bare payload (no accelerator, no container_image) must
+                # run without any image attached so no GPU/arch pre-flight arms.
                 _compute_contract["container_image"] = _project_default_container_image
             _stamp_container_image_pin_status(_compute_contract, task)
             _cc_ok, _cc_reason = _validate_compute_launch_contract(_compute_contract)

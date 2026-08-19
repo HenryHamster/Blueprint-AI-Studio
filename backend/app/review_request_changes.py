@@ -51,8 +51,10 @@ from app.retry_prompt import _detect_ci_review_disagreement
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
     build_issue_ledger,
+    clear_review_escalation_approval_gate,
     detect_fix_all_issue_class,
     fix_all_occurrences_directive,
+    review_loop_park_stale_head,
     review_loop_parked_for_operator,
     stale_respawn_delta_base_sha,
     _surface_module_finding_chain_escalation,
@@ -411,11 +413,36 @@ async def run_request_changes(
         _stale_park_reason = None
         if original_task_id:
             try:
-                _stale_park_reason = review_loop_parked_for_operator(
-                    await session.get(
-                        Task, uuid.UUID(original_task_id)
-                    )
+                _chain_root = await session.get(
+                    Task, uuid.UUID(original_task_id)
                 )
+                _stale_park_reason = review_loop_parked_for_operator(_chain_root)
+                if _stale_park_reason is not None and review_loop_park_stale_head(
+                    _chain_root, head_sha
+                ):
+                    # The park predates commits it never saw (defect: a fix
+                    # landed and the branch moved, but the loop's park never
+                    # noticed — every subsequent respawn attempt, including
+                    # an admin repair pass, kept hitting this same discard
+                    # forever). A parked chain whose recorded head_sha
+                    # differs from the just-fetched live head is not evidence
+                    # the loop is still stuck; it is evidence no review has
+                    # ever looked at the new commits. Release the stale hold
+                    # and fall through to the normal discard+respawn path
+                    # below instead of parking forever.
+                    if clear_review_escalation_approval_gate(
+                        _chain_root, resolved_by="head_advanced_past_park"
+                    ):
+                        session.add(_chain_root)
+                        logger.info(
+                            "[REVIEW PIPELINE] Released stale %s park for "
+                            "PR #%s — live head %s has commits the park "
+                            "never saw",
+                            _stale_park_reason,
+                            pr_number,
+                            head_sha[:8],
+                        )
+                        _stale_park_reason = None
             except Exception as _park_err:
                 logger.warning(
                     f"[REVIEW PIPELINE] Could not check operator-park "

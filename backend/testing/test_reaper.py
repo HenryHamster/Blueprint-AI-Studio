@@ -13441,26 +13441,34 @@ async def test_unblock_sweep_deadline_escalation(reaper_db, mocker):
 
 @pytest.mark.asyncio
 async def test_park_horizon_is_never_silent_invariant(reaper_db, mocker):
-    """INVARIANT: a BLOCKED task only reaches the far-future parked horizon AFTER a
-    tracked operator escalation alert has been emitted — a park is never silent.
+    """INVARIANT: a BLOCKED task only reaches escalated (operator-tier) status AFTER
+    a tracked operator escalation alert has been emitted — escalation is never
+    silent, AND it never expresses itself as a fake far-future ``recheck_after``
+    (the old ``_BLOCKED_ESCALATED_PARK`` sentinel is legacy-only now — a live
+    escalation always lands on the bounded, exponentially-backed-off cadence
+    capped at ``_BLOCKED_ESCALATED_RECHECK_MAX``, see the 2026-08-18 incident:
+    5 tasks tombstoned at a 2036 recheck_after until an operator manually
+    requeued them).
 
     Runs the unblock sweep over a mixed population (one past-deadline blocker that
-    must escalate+park, one free-form agent blocker that must remain held until a
-    named precondition changes) and asserts that EVERY task left parked at the
-    horizon carries the ``_blocked_escalated`` flag AND has a matching ERROR
-    escalation alert. This
-    guards the observability of parked blockers (compute_parked_blocker_summary
-    keys off the same flag): a park without an alert would be an uncounted,
-    invisible permanently-stuck task.
+    must escalate, one free-form agent blocker that must remain held until a
+    named precondition changes) and asserts that EVERY newly-escalated task
+    carries the ``_blocked_escalated`` flag, a matching ERROR escalation alert,
+    AND a bounded (never multi-year) ``recheck_after``. This guards the
+    observability of parked blockers (compute_parked_blocker_summary keys off
+    the same flag): an escalation without an alert would be an uncounted,
+    invisible permanently-stuck task, and an escalation without a bounded
+    recheck would be a silent tombstone.
     """
+    from app.blocked_task_unblock_sweeps import _BLOCKED_ESCALATED_RECHECK_MAX
+
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
 
-    # (a) Past-deadline upstream-dependency blocker → escalates terminally and parks
-    # at the far-future horizon.  Use a non-transient blocker_kind (upstream_dependency)
-    # so it gets _BLOCKED_ESCALATED_PARK rather than the bounded cadence that
-    # transient blockers (file_conflict, pending_rollup) now use.
+    # (a) Past-deadline upstream-dependency blocker → escalates. Non-transient
+    # blocker_kind (upstream_dependency): still escalates like any other kind,
+    # just on the bounded cadence rather than the transient re-evaluation path.
     escalated = await _blocked_task(
         reaper_db,
         project,
@@ -13485,47 +13493,44 @@ async def test_park_horizon_is_never_silent_invariant(reaper_db, mocker):
         reaper_db, now, verify_pr_merged=AsyncMock(return_value=False)
     )
 
-    # Park horizon = recheck_after pushed (close to) _BLOCKED_ESCALATED_PARK ahead.
-    park_floor = now + _BLOCKED_ESCALATED_PARK - timedelta(days=1)
-    parked_rows = (
+    # Distinguish "escalated" from "merely held" by the durable, queryable
+    # ``_blocked_escalated`` flag (the actual operator-tier marker) rather than
+    # a recheck_after window — both an escalated and a held row now use bounded,
+    # not-far-future cadences, so a recheck_after range alone can't tell them
+    # apart the way the old +10y-vs-everything-else split could.
+    await reaper_db.refresh(escalated)
+    await reaper_db.refresh(held)
+
+    far_future = now + timedelta(days=3000)
+
+    # The core invariant: the escalated task is escalation-flagged, alerted,
+    # AND bounded (never a multi-year tombstone).
+    assert escalated.status == TaskStatus.BLOCKED
+    assert escalated.context.get("_blocked_escalated") is True
+    assert escalated.recheck_after is not None
+    assert escalated.recheck_after < far_future
+    assert escalated.recheck_after <= now + _BLOCKED_ESCALATED_RECHECK_MAX + timedelta(
+        minutes=1
+    )
+    alerts = (
         (
             await reaper_db.execute(
-                _select(Task).where(
-                    Task.project_id == project.id,
-                    Task.status == TaskStatus.BLOCKED,
-                    Task.recheck_after >= park_floor,
+                _select(Alert).where(
+                    Alert.task_id == escalated.id,
+                    Alert.severity == AlertSeverity.ERROR,
                 )
             )
         )
         .scalars()
         .all()
     )
+    assert len(alerts) == 1, "an escalation must be preceded by an alert"
+    assert "permanently blocked" in alerts[0].title
 
-    # Exactly the escalated task is parked; the receipt-less blocker is held locally.
-    assert {str(r.id) for r in parked_rows} == {str(escalated.id)}
-
-    # The core invariant: every parked task is escalation-flagged AND alerted.
-    for row in parked_rows:
-        assert row.context.get("_blocked_escalated") is True
-        alerts = (
-            (
-                await reaper_db.execute(
-                    _select(Alert).where(
-                        Alert.task_id == row.id,
-                        Alert.severity == AlertSeverity.ERROR,
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        assert len(alerts) == 1, "a park must be preceded by an escalation alert"
-        assert "permanently blocked" in alerts[0].title
-
-    # The receipt-less blocker neither retries nor silently parks, and emits no alert.
-    await reaper_db.refresh(held)
+    # The receipt-less blocker never escalated, neither retries nor silently
+    # parks, and emits no alert.
     assert held.status == TaskStatus.BLOCKED
-    assert held.recheck_after is None or held.recheck_after < park_floor
+    assert held.context.get("_blocked_escalated") is not True
     no_alerts = (
         (await reaper_db.execute(_select(Alert).where(Alert.task_id == held.id)))
         .scalars()
@@ -13693,11 +13698,14 @@ async def test_parked_blocker_resumes_when_need_satisfied_by_completed_work(
 async def test_parked_blocker_stays_parked_when_need_unsatisfiable(reaper_db, mocker):
     """A parked blocker whose need matches nothing live stays BLOCKED+escalated,
     re-parked at the low cadence without re-firing an alert; and a parked blocker
-    with NO structured need keeps the multi-year horizon for the operator."""
+    with NO structured need is re-armed on the bounded, exponentially-backed-off
+    escalated cadence (never a multi-year tombstone — see the 2026-08-18
+    incident: 5 tasks stranded until an operator manually requeued them)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
     from app.reaper_sweeps import _BLOCKED_PARKED_REEVAL_INTERVAL
+    from app.blocked_task_unblock_sweeps import _BLOCKED_ESCALATED_RECHECK_MAX
 
     # (a) Unsatisfiable capability need — no candidate matches.
     needful = await _parked_blocker(
@@ -13706,9 +13714,9 @@ async def test_parked_blocker_stays_parked_when_need_unsatisfiable(reaper_db, mo
         need={"kind": "capability", "ref": "auth-subsystem-that-does-not-exist"},
         now=now,
     )
-    # (b) No structured need at all — must keep the far-future park.
-    # Use a non-transient blocker_kind: transient blockers (file_conflict,
-    # pending_rollup) now re-evaluate when due instead of hard-parking at +10y.
+    # (b) No structured need at all. Use a non-transient blocker_kind (transient
+    # ones — file_conflict, pending_rollup — take the separate precondition-
+    # reevaluation branch just above this one).
     needless = await _blocked_task(
         reaper_db,
         project,
@@ -13731,9 +13739,22 @@ async def test_parked_blocker_stays_parked_when_need_unsatisfiable(reaper_db, mo
     assert needful.recheck_after <= now + _BLOCKED_PARKED_REEVAL_INTERVAL + timedelta(
         minutes=1
     )
-    # No-need blocker: parked far into the future for the operator as before.
+    # No-need blocker: stays BLOCKED+escalated (still an operator-tier marker —
+    # queryable via context['_blocked_escalated']) but re-armed on the bounded
+    # backoff cadence, NEVER a fake far-future timestamp — a fix landing outside
+    # the dependency graph (runner gains a capability, a gate bug is fixed) must
+    # still get picked back up automatically.
     assert needless.status == TaskStatus.BLOCKED
-    assert needless.recheck_after > now + timedelta(days=3000)
+    assert needless.context.get("_blocked_escalated") is True
+    assert needless.recheck_after is not None
+    assert needless.recheck_after <= now + _BLOCKED_ESCALATED_RECHECK_MAX + timedelta(
+        minutes=1
+    )
+    far_future = now + timedelta(days=3000)
+    assert needless.recheck_after < far_future, (
+        "a needless non-transient blocker must never be tombstoned at a fake "
+        "far-future recheck_after"
+    )
 
     # Repeated sweeps neither resume, loop, nor create a duplicate alert.
     await sweep_unblock_blocked_tasks(reaper_db, now + timedelta(hours=7))
@@ -17440,6 +17461,192 @@ async def test_recovery_sweep_then_unblock_sweep_requeues(reaper_db, mocker):
     assert requeued == 1
     await reaper_db.refresh(t)
     assert t.status == TaskStatus.QUEUED
+
+
+# ── Fix 4: need-less NON-transient escalated blockers get bounded backoff ──────
+#
+# Regression coverage for the 2026-08-18 incident (5 tasks stranded BLOCKED
+# with recheck_after stamped ~2036): a need-less, non-transient escalated
+# blocker (e.g. a missing runner capability, a repo-wide gate bug) used to be
+# parked at _BLOCKED_ESCALATED_PARK (+10y) — a fake far-future timestamp that
+# evicted the row from the due-query forever. It must now stay on the bounded
+# _BLOCKED_ESCALATED_RECHECK_MAX (24h) cadence, self-healing when the fix
+# lands outside the dependency graph, and its BLOCKED status message must
+# name the blocker and the next recheck time.
+
+
+@pytest.mark.asyncio
+async def test_needless_escalated_blocker_recheck_capped_at_24h_not_10y(
+    reaper_db, mocker
+):
+    """An already-escalated, need-less, NON-transient blocker (blocker_kind not
+    in {file_conflict, pending_rollup}) whose recheck comes due must be
+    rescheduled on the bounded _BLOCKED_ESCALATED_RECHECK_MAX (24h) cadence —
+    never the old _BLOCKED_ESCALATED_PARK (+10y) sentinel — and the status
+    message must name the blocker and the next recheck time."""
+    from app.blocked_task_unblock_sweeps import _BLOCKED_ESCALATED_RECHECK_MAX
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="runner_capability",
+        blocked_reason="Waiting: runner capability playwright_chromium_usable",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "gate",
+                "waiting_on": "runner_capability",
+                "escalation_detail": "no runner advertises playwright_chromium_usable",
+            },
+            "_blocked_escalated": True,
+            # Many prior escalated-recheck cycles: proves the cadence is
+            # capped at 24h, not merely under the old +10y sentinel (a bug
+            # that used the ordinary 1h cap here would also pass a
+            # "< 10y" assertion, so this pins the cap specifically).
+            "_blocked_escalated_recheck_count": 10,
+        },
+        recheck_after=now - timedelta(minutes=1),  # due
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    # Need-less non-transient blocker never auto-resumes — it stays parked
+    # for the operator, but on the bounded cadence.
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_escalated") is True
+
+    assert t.recheck_after is not None
+    # Bounded at the 24h escalated cap (with slack for the doubled backoff
+    # at count=11 exceeding the cap and the small alert/commit window).
+    expected_min = now + _BLOCKED_ESCALATED_RECHECK_MAX - timedelta(minutes=5)
+    expected_max = now + _BLOCKED_ESCALATED_RECHECK_MAX + timedelta(minutes=5)
+    assert expected_min <= t.recheck_after <= expected_max, (
+        f"expected recheck_after within 5min of the 24h escalated cap, got "
+        f"{t.recheck_after} (now={now})"
+    )
+    # Never the old multi-year tombstone.
+    far_future = now + _BLOCKED_ESCALATED_PARK - timedelta(days=1)
+    assert t.recheck_after < far_future
+
+    # Surfaced-reasons requirement: the status message names the blocker and
+    # the next recheck time, not a silent/unexplained stall.
+    msg = t.latest_status_message or ""
+    assert "runner_capability" in msg
+    assert "next automatic recheck at" in msg
+    assert t.recheck_after.strftime("%Y-%m-%d %H:%M") in msg
+
+
+@pytest.mark.asyncio
+async def test_needless_escalated_blocker_resumes_when_capability_need_satisfied(
+    reaper_db, mocker
+):
+    """An already-escalated blocker that DOES carry a structured (machine-
+    resolvable) need must automatically resume to QUEUED once that need is
+    satisfied by completed work — the exact 2026-08-18 incident shape (runner
+    gains a capability outside the dependency graph) — with NO operator
+    action required. This is the "recheck after the blocker clears actually
+    requeues the task" half of the regression."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # The foundation that supplies the capability the blocked task needs —
+    # already COMPLETED, advertising the capability via the marker convention
+    # (app.capability_registry / _classify_blocker_needs conservative match).
+    provider = Task(
+        project_id=project.id,
+        title="capability provider",
+        description="lands the missing runner capability",
+        status=TaskStatus.COMPLETED,
+        created_by="test-user",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "playwright-chromium", "pr_merged": True},
+        status_log=[],
+    )
+    reaper_db.add(provider)
+    await reaper_db.commit()
+
+    need = {"kind": "capability", "ref": "playwright-chromium"}
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="runner_capability",
+        blocked_reason="Waiting: runner capability playwright-chromium",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "capability",
+                "needs": [need],
+                "need": need,
+            },
+            "_blocked_escalated": True,
+            "_blocked_escalated_recheck_count": 3,
+        },
+        recheck_after=now - timedelta(minutes=1),  # due
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1, (
+        "an already-escalated (parked) blocker with a satisfiable need must "
+        "auto-resume once the need is met — never wait for a manual operator "
+        "requeue"
+    )
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_recovery_sweep_resets_hard_parked_non_transient_escalated_blocker(
+    reaper_db, mocker
+):
+    """sweep_recover_stranded_escalated_blockers un-strands a NON-transient
+    escalated blocker a prior deploy already hard-parked at the old +10y
+    sentinel, resetting it to the bounded backoff cadence."""
+    from app.reaper_sweeps import sweep_recover_stranded_escalated_blockers
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="runner_capability",
+        blocked_reason="Waiting: runner capability playwright_chromium_usable",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={
+            "blocker": {"source": "gate"},
+            "_blocked_escalated": True,
+            "_blocked_escalated_recheck_count": 40,
+        },
+        # Hard-parked at the old +10y sentinel by a prior deploy.
+        recheck_after=now + timedelta(days=3650),
+    )
+
+    recovered = await sweep_recover_stranded_escalated_blockers(reaper_db, now)
+
+    assert recovered == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED  # still parked, not requeued blind
+    assert t.context.get("_blocked_escalated") is True
+    # Backoff counter restarted so the recovered row re-earns its cadence
+    # from the bottom instead of instantly re-parking near the cap.
+    assert t.context.get("_blocked_escalated_recheck_count") == 0
+    far_future = now + _TRANSIENT_BLOCKER_PARK_SENTINEL
+    assert t.recheck_after is not None
+    assert t.recheck_after < far_future
 
 
 @pytest.mark.asyncio

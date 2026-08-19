@@ -6216,24 +6216,76 @@ def _build_artifact_archive(artifact_dir: str) -> tuple[str | None, dict]:
     if not files:
         return None, {"status": "not_produced", "reason": "no_artifact_files"}
     files.sort()
+
+    # A file the runner user cannot read (e.g. root-owned files written from
+    # inside a container) must not sink the WHOLE delivery. Best-effort chmod
+    # covers the case where the runner user owns the file but it has overly
+    # restrictive permissions; when that fails too (the common cross-user
+    # case) the file is skipped, not the archive.
+    readable: list[tuple[str, str, int]] = []
+    skipped: list[dict] = []
+    for relpath, path, size in files:
+        if not os.access(path, os.R_OK):
+            try:
+                os.chmod(path, os.stat(path).st_mode | stat.S_IRUSR)
+            except OSError:
+                pass
+        if os.access(path, os.R_OK):
+            readable.append((relpath, path, size))
+        else:
+            skipped.append({"path": relpath, "reason": "permission_denied"})
+
+    if not readable:
+        return None, {
+            "status": "failed",
+            "reason": f"all {len(files)} artifact files unreadable (permission)",
+            "skipped_files": skipped,
+        }
+
     fd, archive_path = tempfile.mkstemp(prefix=".bp-artifact-", suffix=".tar.gz")
     os.close(fd)
     try:
+        archived_count = 0
+        archived_bytes = 0
         with open(archive_path, "wb") as raw:
             writer = _ChecksummedWriter(raw)
             with tarfile.open(
                 fileobj=typing.cast(typing.BinaryIO, writer), mode="w|gz"
             ) as tar:
-                for relpath, path, _size in files:
-                    tar.add(path, arcname=relpath, recursive=False)
+                for relpath, path, size in readable:
+                    try:
+                        tar.add(path, arcname=relpath, recursive=False)
+                    except PermissionError as exc:
+                        # os.access said readable but a race (or an ACL layer
+                        # os.access cannot see through) denied the real read —
+                        # skip this one file rather than aborting the archive.
+                        skipped.append(
+                            {"path": relpath, "reason": f"permission_denied:{exc}"}
+                        )
+                        continue
+                    archived_count += 1
+                    archived_bytes += size
             writer.flush()
-        return archive_path, {
-            "status": "prepared",
-            "file_count": len(files),
-            "total_bytes": sum(item[2] for item in files),
+        if archived_count == 0:
+            try:
+                os.remove(archive_path)
+            except OSError:
+                pass
+            return None, {
+                "status": "failed",
+                "reason": f"all {len(files)} artifact files unreadable (permission)",
+                "skipped_files": skipped,
+            }
+        result = {
+            "status": "prepared" if not skipped else "partial",
+            "file_count": archived_count,
+            "total_bytes": archived_bytes,
             "archive_size": writer.size,
             "crc32c": _crc32c_b64(writer.crc_state),
         }
+        if skipped:
+            result["skipped_files"] = skipped
+        return archive_path, result
     except Exception:
         try:
             os.remove(archive_path)

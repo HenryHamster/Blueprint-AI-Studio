@@ -1818,6 +1818,15 @@ export function resolveTerminalStatus(
 ): TerminalStatusDecision {
   if (CLEAN_STOP_REASONS.has(stopReason)) return { status: 'COMPLETED' };
   if (providerFailureCategory) return { status: 'FAILED', failureCategory: providerFailureCategory };
+  if (stopReason === 'consultation_abandoned_process_exit') {
+    // The CLI child died (SIGINT-on-abandon exits the whole process, not just
+    // the turn) while a typed Workday consultation turn was in flight, and
+    // in-place recovery from checkpoint (recoverFromConsultationAbandonedExit)
+    // also failed to keep the session alive. This is never a clean end of
+    // work — reporting COMPLETED here previously masked consultation churn
+    // (the reconciler would see "success" and respawn, repeating the loop).
+    return { status: 'FAILED', failureCategory: 'consultation_abandoned' };
+  }
   if (stopReason === 'session_process_exited') {
     // Orderly exit(0) is clean; non-zero or signal-kill (null) is a crash.
     return exitCode === 0
@@ -1829,6 +1838,29 @@ export function resolveTerminalStatus(
   }
   // loop_error: … and any other unexpected reason.
   return { status: 'FAILED', failureCategory: 'claude_code_failed' };
+}
+
+// Safety margin added to the server's configured autonomous turn timeout when
+// deriving the typed-consultation client abandon-deadline (ms).
+export const CONSULTATION_DEADLINE_MARGIN_MS = 60_000;
+
+// Floor for the typed-consultation client abandon-deadline (ms), independent
+// of the configured autonomous turn timeout.
+export const CONSULTATION_DEADLINE_FLOOR_MS = 240_000;
+
+/**
+ * Derive the typed-consultation client abandon-deadline from the server's
+ * configured autonomous turn timeout (`cfg.autonomousTurnTimeoutMs`).
+ *
+ * Previously hardcoded to 240s while the server's default autonomous turn
+ * timeout is 300s: the client gave up on (and SIGINT'd) a turn the server
+ * still considered live, and `session.interrupt()` kills the whole Claude
+ * Code child process, not just the active turn — so every such abandon also
+ * tore down the resident session. The client must never abandon before the
+ * server would, plus a margin for renewal/network latency.
+ */
+export function consultationAbandonDeadlineMs(autonomousTurnTimeoutMs: number): number {
+  return Math.max(CONSULTATION_DEADLINE_FLOOR_MS, autonomousTurnTimeoutMs + CONSULTATION_DEADLINE_MARGIN_MS);
 }
 
 /** The `kind` vocabulary the backend `strategic_session` delta accepts

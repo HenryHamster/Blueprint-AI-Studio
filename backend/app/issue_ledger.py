@@ -184,6 +184,11 @@ def _public_open_record(record: dict) -> dict:
         "last_seen_head_sha": record["last_seen_head_sha"],
         "last_seen_base_sha": record["last_seen_base_sha"],
         "last_seen_target_verified": record["last_seen_target_verified"],
+        **(
+            {"pending_disposition": record["pending_disposition"]}
+            if record.get("pending_disposition")
+            else {}
+        ),
     }
 
 
@@ -203,6 +208,17 @@ def build_issue_ledger(
       exact-target review.  A verified review may explicitly reconcile a
       legacy blocker whose original target was not stamped; implicit omission
       never may.
+    * A resolution from an entry whose own review target could not be
+      backend-verified (``target_verified_by_backend`` false, e.g. the live
+      PR head raced ahead between that review starting and completing) can
+      never itself close a demand, but it is recorded as a non-authoritative
+      ``pending_disposition`` on the still-open record. This is bookkeeping
+      only -- it does not move the record out of ``open`` -- but it lets a
+      downstream consumer (the stuck-cycle detector) distinguish "reviewer
+      never addressed this" from "reviewer disposed this in good faith and
+      the backend simply couldn't stamp exact-target proof on this pass".
+      Re-raising the same finding in a later entry's ``issues`` clears any
+      stale pending claim.
     * ``fixed`` requires a changed exact head when the prior demand also has
       backend-verified SHA provenance.
     * Structured CRITICAL/MAJOR findings remain binding even when the verdict
@@ -295,9 +311,7 @@ def build_issue_ledger(
         # resolution from a COMMENT/malformed row would be the inverse
         # fail-open bug.
         for resolution in (
-            (entry.get("resolutions") or [])
-            if verdict_is_authoritative and target_verified
-            else []
+            (entry.get("resolutions") or []) if verdict_is_authoritative else []
         ):
             if not isinstance(resolution, dict):
                 continue
@@ -308,6 +322,20 @@ def build_issue_ledger(
             if record is None or disposition not in ISSUE_RESOLUTION_DISPOSITIONS:
                 continue
             if not reason:
+                continue
+            if not target_verified:
+                # This entry's own review target was not backend-verified, so
+                # it cannot prove closure (fail-closed rule above). Record the
+                # good-faith claim without touching open/resolved bucketing.
+                record["pending_disposition"] = {
+                    "disposition": disposition,
+                    "reason": reason,
+                    "iteration": iteration,
+                    "head_sha": head_sha,
+                    "review_task_id": str(entry.get("review_task_id") or "")
+                    .strip()
+                    or None,
+                }
                 continue
             if disposition == "fixed":
                 # For fully proven chains, "fixed" still means the bytes
@@ -478,6 +506,11 @@ def build_issue_ledger(
                         existing["last_seen_head_sha"] = head_sha
                         existing["last_seen_base_sha"] = base_sha
                         existing["last_seen_target_verified"] = True
+                    # This entry re-raised the finding, so any earlier
+                    # not-yet-authoritative "believed fixed" claim no longer
+                    # applies -- it is once again an actively contested
+                    # blocker, not a quietly-omitted one.
+                    existing.pop("pending_disposition", None)
 
     result = {
         "open": [_public_open_record(record) for record in open_records.values()],
@@ -510,3 +543,34 @@ def build_issue_ledger(
         if seed_through_key:
             result["through_entry_key"] = seed_through_key
     return result
+
+
+def exclude_self_disposed_blockers(
+    open_blockers: list[dict], resolutions: list | None
+) -> list[dict]:
+    """Drop ledger-open blockers that the review being processed RIGHT NOW
+    disposed in its own ``resolutions[]`` with a valid disposition + reason.
+
+    Only for the current review's own verdict/issue list (caller must have
+    proven the review examined the backend-assigned commit, e.g. via
+    ``_assigned_target_matches``): when the live head raced ahead and
+    ``build_issue_ledger`` could not stamp exact-target proof on this entry,
+    the ledger keeps the blocker open (fail-closed), but the withhold override
+    must not fabricate a REQUEST_CHANGES from an issue this same review just
+    adjudicated. Ledger open/resolved membership is untouched.
+    """
+    self_disposed_ids = {
+        str(res.get("issue_id") or "").strip()
+        for res in (resolutions or [])
+        if isinstance(res, dict)
+        and str(res.get("disposition") or "").lower().strip()
+        in ISSUE_RESOLUTION_DISPOSITIONS
+        and str(res.get("reason") or "").strip()
+    }
+    if not self_disposed_ids:
+        return open_blockers
+    return [
+        blocker
+        for blocker in open_blockers
+        if str(blocker.get("issue_id") or "") not in self_disposed_ids
+    ]

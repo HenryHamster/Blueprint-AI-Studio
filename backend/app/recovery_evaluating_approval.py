@@ -67,6 +67,17 @@ APPROVAL_GATE_FAIL_SECONDS = 2 * 3600
 # genuinely wedged chain still terminates.
 APPROVAL_GATE_DEFER_WINDOW_HOURS = 6
 
+# Bounded automatic-respawn cap for supersession_churn_halt holds (see
+# _respawn_review_after_churn_halt below). Persisted forever on
+# ``_churn_halt_respawn_count`` — deliberately never reset — so a task that
+# keeps re-triggering the fence over its lifetime gets at most this many
+# free automatic second chances before landing on the existing, explicit,
+# admin-visible preserve-for-handmerge/FAILED disposition. That disposition
+# is itself the "operator-only terminal tier": requires_approval plus the
+# review_loop_terminal_outcome breadcrumb are both queryable, so exhausting
+# the cap is never a silently-vanishing state, just a human-owned one.
+_CHURN_HALT_AUTO_RESPAWN_MAX = 2
+
 
 async def _handle_approval_gate_timeout(
     task,
@@ -312,6 +323,32 @@ async def _handle_approval_gate_timeout(
                 )
                 return True
 
+        # BOUNDED AUTO-RESPAWN for supersession_churn_halt holds specifically.
+        # Unlike stuck/standoff/repeat_fingerprint_halt (which flag the parent
+        # but leave the review/fix chain RUNNING — see
+        # review_loop_convergence._RESOLVABLE_ESCALATION_GATE_KINDS), a
+        # supersession_churn_halt CANCELS every in-flight review/fix task on
+        # the PR (review_pipeline.py churn-halt block). Nothing is left
+        # running to ever produce the APPROVE or merge that
+        # clear_review_escalation_approval_gate waits for, so without this
+        # branch the loop fell through to the one-way
+        # approval_timeout_preserved_for_handmerge latch (or FAILED) and sat
+        # dead until an operator manually respawned a review (incident: PR
+        # #17419, 2026-08-18 — days of silent stranding). Give the loop a
+        # bounded number of automatic fresh attempts first; the existing
+        # preserve/FAILED dispositions below still apply once the cap is
+        # exhausted, so a genuine infinite-churn PR still terminates — this
+        # only recovers a loop whose actual blocker (a gate bug, a missing
+        # runner capability, ...) was fixed after the halt tripped.
+        if ctx.get("approval_hold_reason") == "supersession_churn_halt":
+            _churn_respawn_count = int(ctx.get("_churn_halt_respawn_count", 0))
+            if _churn_respawn_count < _CHURN_HALT_AUTO_RESPAWN_MAX:
+                if await _respawn_review_after_churn_halt(task, session):
+                    return True
+                # Respawn declined (PR merged/closed meanwhile, cap reached,
+                # branch/PR number unrecoverable, ...) — fall through to the
+                # existing preserve/FAILED disposition below unchanged.
+
         # If the PR is still clean/mergeable and not yet preserved, leave it
         # open for hand-merge instead of silently abandoning it. Guard with
         # the preserve flag so re-entering sweeps are idempotent (no repeat
@@ -443,3 +480,120 @@ async def _handle_approval_gate_timeout(
     # Non-spend approval hold still within its 2h window — fall through
     # to the remaining recovery branches unchanged.
     return False
+
+
+async def _respawn_review_after_churn_halt(task, session) -> bool:
+    """Bounded automatic respawn for a supersession_churn_halt hold.
+
+    Mirrors the exact ``_spawn_pipeline_task`` call shape already used by
+    the analogous ``recovery_evaluating_pr_check._handle_pr_state_check_pending``
+    open-PR branch: derive branch/base_branch/original_prompt straight off
+    the chain-root task's own payload/context (no live GitHub call needed
+    here — the caller already ran the merged-PR check above this branch, and
+    ``_spawn_pipeline_task`` itself no-ops on a ``pr_merged``/
+    ``pr_closed_unmerged`` context flag), then spawn a fresh review chained
+    to ``task`` via ``original_task_id=str(task.id)``.
+
+    Returns ``True`` when a fresh review was spawned and the hold released
+    (caller treats the row as handled this pass) or ``False`` when respawn
+    was declined/failed (caller falls through to the existing preserve/
+    FAILED disposition unchanged).
+    """
+    import app.shared_state as _shared_state
+    from app import services
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.models import Project
+    from app.review_pipeline import (
+        SPAWN_REASON_KEY,
+        _REVIEW_SUPERSEDE_CHURN_COUNT_KEY,
+        _REVIEW_SUPERSEDE_CHURN_LAST_KEY,
+        _spawn_pipeline_task,
+    )
+    from app.review_loop_convergence import clear_review_escalation_approval_gate
+
+    ctx = dict(task.context or {})
+    pr_number = ctx.get("rollup_pr_number") or (task.first_payload or {}).get(
+        "pr_number"
+    )
+    if not pr_number:
+        logger.info(
+            f"[EVAL TIMEOUT approval-gate] Task {str(task.id)[:8]}: no "
+            f"recoverable PR number for churn-halt respawn — declining"
+        )
+        return False
+
+    task_type_str = (task.first_payload or {}).get("type", "") or ""
+    proj = await session.get(Project, task.project_id)
+    branch = services._derive_task_branch(
+        task.id,
+        task_type_str,
+        _shared_state.get_project_task_branch_namespace(proj),
+    )
+    base_branch = (task.first_payload or {}).get(
+        "base_branch"
+    ) or _shared_state.get_project_integration_branch(proj)
+    original_prompt = (task.first_payload or {}).get("prompt") or (
+        task.description or ""
+    )
+
+    try:
+        review_task, _was_created = await _spawn_pipeline_task(
+            task,
+            "review",
+            session,
+            int(pr_number),
+            branch,
+            base_branch,
+            original_prompt=original_prompt,
+            original_task_id=str(task.id),
+        )
+    except Exception:
+        logger.warning(
+            f"[EVAL TIMEOUT approval-gate] Churn-halt respawn failed for "
+            f"task {str(task.id)[:8]} PR #{pr_number}",
+            exc_info=True,
+        )
+        return False
+    if review_task is None:
+        # Spawn suppressed (PR merged/closed meanwhile, iteration cap
+        # reached, a different-type task already in flight, ...) — nothing
+        # to respawn. Let the caller fall through to the existing terminal
+        # disposition rather than looping here.
+        logger.info(
+            f"[EVAL TIMEOUT approval-gate] Task {str(task.id)[:8]}: "
+            f"churn-halt respawn suppressed for PR #{pr_number} "
+            f"(spawn_reason={(task.context or {}).get(SPAWN_REASON_KEY)!r})"
+        )
+        return False
+
+    released = clear_review_escalation_approval_gate(
+        task, resolved_by="churn_halt_bounded_respawn"
+    )
+    ctx = dict(task.context or {})
+    respawn_count = int(ctx.get("_churn_halt_respawn_count", 0)) + 1
+    ctx["_churn_halt_respawn_count"] = respawn_count
+    # Give the fresh review a clean churn-detection window instead of
+    # inheriting the count that just tripped the halt.
+    ctx.pop(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, None)
+    ctx.pop(_REVIEW_SUPERSEDE_CHURN_LAST_KEY, None)
+    task.context = ctx
+    flag_modified(task, "context")
+    task.latest_status_message = (
+        f"Churn-halt bounded auto-respawn: spawned review {review_task.id} "
+        f"for PR #{pr_number} (attempt {respawn_count}/"
+        f"{_CHURN_HALT_AUTO_RESPAWN_MAX})"
+    )
+    session.add(task)
+    await session.commit()
+    logger.info(
+        f"[EVAL TIMEOUT approval-gate] Task {str(task.id)[:8]}: churn-halt "
+        f"bounded auto-respawn spawned review {review_task.id} for PR "
+        f"#{pr_number} (attempt {respawn_count}/{_CHURN_HALT_AUTO_RESPAWN_MAX}, "
+        f"hold_released={released})"
+    )
+    await services.broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": task.status},
+    )
+    return True
