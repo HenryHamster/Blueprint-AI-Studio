@@ -364,11 +364,12 @@ async def test_compare_rejects_base_in_commit_set(monkeypatch):
     [
         _github_commit("b" * 40, "blueprintagentorchestrator[bot]", verified=True),
         _github_commit("b" * 40, "blueprintagentorchestrator[bot]", login="other[bot]", identity_type="Bot", verified=True),
-        _github_commit("b" * 40, "blueprintagentorchestrator[bot]", login="blueprintagentorchestrator[bot]", identity_type="User", verified=True),
         _github_commit("b" * 40, "blueprintagentorchestrator[bot]", login="blueprintagentorchestrator[bot]", identity_type="Bot", verified=False),
     ],
 )
 async def test_bot_shaped_commit_requires_full_verified_github_identity(monkeypatch, commit):
+    """Commits with no genuine GitHub PR-merge committer proof, and a broken
+    direct-bot author identity, stay counted as offenders."""
     from app import github
 
     base, head = "a" * 40, "b" * 40
@@ -381,6 +382,136 @@ async def test_bot_shaped_commit_requires_full_verified_github_identity(monkeypa
     assert report["state"] == "resolved"
     assert report["count"] == 1
     assert report["offenders"] == [{"sha": head[:12], "author": "blueprintagentorchestrator[bot]"}]
+
+
+@pytest.mark.asyncio
+async def test_github_merge_committer_trusts_a_non_bot_authored_commit(monkeypatch):
+    """A GitHub PR-merge commit (committer=web-flow, verified) is trusted
+    regardless of the author identity — this is the fix under test: the
+    merge-committer branch must not be gated behind a bot-shaped author."""
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    commit = _github_commit(
+        head,
+        "blueprintagentorchestrator[bot]",
+        login="blueprintagentorchestrator[bot]",
+        identity_type="User",
+        verified=True,
+    )
+    project = Project(id="release-authorship-merge-non-bot-author", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [commit]))))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 0
+    assert report["offenders"] == []
+
+
+@pytest.mark.asyncio
+async def test_human_authored_pr_merge_is_trusted_and_a_raw_push_still_counts(monkeypatch):
+    """Regression pin for the measured defect: a human-authored commit merged
+    through GitHub (committer=web-flow, verified) is trusted, while a raw
+    push by the same human (no PR-merge committer proof) still counts."""
+    from app import github
+
+    base, head_merged, head_raw = "a" * 40, "b" * 40, "c" * 40
+    human_merged = {
+        "sha": head_merged,
+        "author": {"login": "henryhamster", "type": "User", "id": 1},
+        "committer": {"login": "web-flow", "id": 19864447, "type": "User"},
+        "commit": {
+            "author": {"name": "Henry Hamster", "email": "henry@example.com"},
+            "committer": {"name": "GitHub", "email": "noreply@github.com"},
+            "verification": {"verified": True, "reason": "valid"},
+        },
+    }
+    human_raw = {
+        "sha": head_raw,
+        "author": {"login": "henryhamster", "type": "User", "id": 1},
+        "committer": {"login": "henryhamster", "id": 1, "type": "User"},
+        "commit": {
+            "author": {"name": "Henry Hamster", "email": "henry@example.com"},
+            "committer": {"name": "Henry Hamster", "email": "henry@example.com"},
+            "verification": {"verified": True, "reason": "valid"},
+        },
+    }
+    project = Project(id="release-authorship-human-pr-vs-raw-push", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(
+        github,
+        "_github_request",
+        AsyncMock(return_value=_GitHubResponse(200, _compare(base, head_raw, [human_merged, human_raw]))),
+    )
+
+    report = await count_non_bot_authored_commits(base, head_raw, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 1
+    assert report["offenders"] == [{"sha": head_raw[:12], "author": "Henry Hamster"}]
+
+
+@pytest.mark.asyncio
+async def test_github_merge_committer_without_valid_verification_still_counts(monkeypatch):
+    """Fail-closed: a web-flow-shaped committer with missing/invalid
+    verification does not grant trust."""
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    commit = {
+        "sha": head,
+        "author": {"login": "henryhamster", "type": "User", "id": 1},
+        "committer": {"login": "web-flow", "id": 19864447, "type": "User"},
+        "commit": {
+            "author": {"name": "Henry Hamster", "email": "henry@example.com"},
+            "committer": {"name": "GitHub", "email": "noreply@github.com"},
+            "verification": {"verified": False, "reason": "unsigned"},
+        },
+    }
+    project = Project(id="release-authorship-merge-unverified", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [commit]))))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_spoofed_display_author_with_unchanged_committer_still_counts(monkeypatch):
+    """A commit that spoofs only the display author/login while leaving the
+    committer fields as a raw (non-web-flow) push must still count."""
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    spoofed = {
+        "sha": head,
+        "author": {
+            "login": "blueprintagentorchestrator[bot]",
+            "type": "Bot",
+            "id": 272093198,
+        },
+        "committer": {"login": "henryhamster", "id": 1, "type": "User"},
+        "commit": {
+            "author": {
+                "name": "blueprintagentorchestrator[bot]",
+                "email": "272093198+blueprintagentorchestrator[bot]@users.noreply.github.com",
+            },
+            "committer": {"name": "Henry Hamster", "email": "henry@example.com"},
+            "verification": {"verified": True, "reason": "valid"},
+        },
+    }
+    project = Project(id="release-authorship-spoofed-display-author", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [spoofed]))))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 1
 
 
 @pytest.mark.asyncio
