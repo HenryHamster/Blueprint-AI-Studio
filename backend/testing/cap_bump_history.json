@@ -267,6 +267,12 @@
           "commit_date": "2026-07-17T04:40:41Z",
           "old_cap": 3000,
           "new_cap": 3550
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T06:25:47.230554+00:00",
+          "old_cap": 3550,
+          "new_cap": 4150
         }
       ],
       "orchestrator_health.py": [
@@ -1647,8 +1653,8 @@
           "new_cap": 2100
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-18T23:47:35.593117+00:00",
+          "commit_sha": "8c36ed35f6c51ef366805e125c4f29868e6207b1",
+          "commit_date": "2026-08-19T00:43:57Z",
           "old_cap": 2100,
           "new_cap": 2500
         }
@@ -4481,6 +4487,12 @@
           "commit_date": "2026-08-11T03:14:02+00:00",
           "old_cap": 1900,
           "new_cap": 2250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T06:25:47.230554+00:00",
+          "old_cap": 2250,
+          "new_cap": 2800
         }
       ],
       "test_release_scoring.py": [
@@ -4501,8 +4513,8 @@
       ],
       "test_release_qualifier__sweep_stuck_qualifications.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-18T23:47:35.593117+00:00",
+          "commit_sha": "8c36ed35f6c51ef366805e125c4f29868e6207b1",
+          "commit_date": "2026-08-19T00:43:57Z",
           "old_cap": 6100,
           "new_cap": 7200
         }
@@ -4521,6 +4533,14 @@
           "commit_date": "2026-08-19T00:35:20.857479+00:00",
           "old_cap": 17150,
           "new_cap": 19850
+        }
+      ],
+      "test_pipeline_reliability.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T06:25:47.230554+00:00",
+          "old_cap": 4100,
+          "new_cap": 4850
         }
       ]
     }
