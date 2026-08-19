@@ -331,6 +331,12 @@
           "commit_date": "2026-07-17T02:29:44Z",
           "old_cap": 3100,
           "new_cap": 3600
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T00:58:07.222996+00:00",
+          "old_cap": 3600,
+          "new_cap": 4250
         }
       ],
       "admin.py": [

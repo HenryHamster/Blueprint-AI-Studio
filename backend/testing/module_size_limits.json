@@ -13,7 +13,7 @@
     "orchestrator.py": 5900,
     "orchestrator_ci_monitor.py": 3550,
     "orchestrator_health.py": 1400,
-    "orchestrator_runner_dispatch.py": 3600,
+    "orchestrator_runner_dispatch.py": 4250,
     "orchestrator_runtime_env.py": 400,
     "orchestrator_provision.py": 800,
     "admin.py": 5350,
