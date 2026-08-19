@@ -217,8 +217,12 @@ if touches "admin-ui/"; then
   fi
   # Use typecheck-only on agent VMs: vite build is OOM-killed (exit 137) under
   # memory cgroup constraints. tsc -b --noEmit catches all type errors; the
-  # full vite bundle runs in CI after ./pr open.
-  run "admin-ui typecheck" bash -c 'cd "admin-ui" && npm run typecheck'
+  # full vite bundle runs in CI after ./pr open. The build half is attributed
+  # against an isolated base checkout so an inherited type error doesn't
+  # block whichever task touches admin-ui next; the test-file half keeps its
+  # existing shrink-only baseline gate.
+  run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
+  run "admin-ui typecheck (test files)" bash -c 'cd "admin-ui" && node scripts/typecheck-tests-baseline.mjs'
   if [ "$WITH_TESTS" = "1" ]; then
     run "admin-ui vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
   fi

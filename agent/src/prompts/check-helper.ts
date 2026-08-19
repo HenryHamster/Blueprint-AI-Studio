@@ -617,8 +617,12 @@ ${buildViewportUploadBlock(cfg.taskId)}      fi
     fi
   fi
 
-  # Typecheck on agent VM; vite bundle OOMs here and is CI's job.
-  run "admin-ui typecheck" bash -c 'cd admin-ui && npm run typecheck 2>&1'
+  # Typecheck on agent VM; vite bundle OOMs here and is CI's job. The build
+  # half (tsc -b --noEmit) is attributed against an isolated base checkout so
+  # an inherited type error doesn't block whichever task touches admin-ui
+  # next; the test-file half keeps its existing shrink-only baseline gate.
+  run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
+  run "admin-ui typecheck (test files)" bash -c 'cd admin-ui && node scripts/typecheck-tests-baseline.mjs 2>&1'
 
   # Run the admin-ui unit suite on EVERY ./check. The guard compares its JUnit
   # identities with an isolated base checkout, so only confirmed inherited

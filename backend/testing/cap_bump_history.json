@@ -269,8 +269,8 @@
           "new_cap": 3550
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-19T06:25:47.230554+00:00",
+          "commit_sha": "f585313bd4fd15a929e2146a27f181bf0ef43a68",
+          "commit_date": "2026-08-18T23:26:30-07:00",
           "old_cap": 3550,
           "new_cap": 4150
         }
@@ -4411,6 +4411,12 @@
           "commit_date": "2026-07-28T15:00:00Z",
           "old_cap": 100,
           "new_cap": 350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-19T06:38:25.767908+00:00",
+          "old_cap": 350,
+          "new_cap": 700
         }
       ],
       "test_admin_routers__strategic_directions.py": [
@@ -4503,8 +4509,8 @@
           "new_cap": 2250
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-19T06:25:47.230554+00:00",
+          "commit_sha": "f585313bd4fd15a929e2146a27f181bf0ef43a68",
+          "commit_date": "2026-08-18T23:26:30-07:00",
           "old_cap": 2250,
           "new_cap": 2800
         }
@@ -4551,8 +4557,8 @@
       ],
       "test_pipeline_reliability.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-19T06:25:47.230554+00:00",
+          "commit_sha": "f585313bd4fd15a929e2146a27f181bf0ef43a68",
+          "commit_date": "2026-08-18T23:26:30-07:00",
           "old_cap": 4100,
           "new_cap": 4850
         }

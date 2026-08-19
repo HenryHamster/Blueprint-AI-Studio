@@ -8,9 +8,19 @@ min-heap), which is what we simulate here.  A max/avg imbalance ratio above
 the threshold means at least one shard runs significantly longer than average,
 defeating the parallelism benefit.
 
+The simulation packs the *measured* durations plus a mean-imputed entry for
+every collected test ID that has no entry in backend/.test_durations, because
+that is what pytest-split itself does at split time (see
+scripts/durations_quality.py::impute_missing_mean). Packing only the measured
+subset understates the weight of coverage gaps and, on this suite's item
+count, makes the imbalance ratio converge to ~1.000 regardless of input --
+i.e. a threshold picked to match that number is unreachable by construction.
+
 Runs under --noconftest (no DB, no conftest fixtures).
 """
+import ast
 import heapq
+import importlib.util
 import json
 import warnings
 from pathlib import Path
@@ -25,11 +35,21 @@ except ModuleNotFoundError:  # Python 3.10: tomllib was added in Python 3.11.
 BACKEND_ROOT = Path(__file__).parents[1]
 DURATIONS_PATH = BACKEND_ROOT / ".test_durations"
 PYPROJECT_PATH = BACKEND_ROOT / "pyproject.toml"
+TEST_FILE_GLOB = "testing/test_*.py"
 
 NUM_SHARDS = 8
-# Allow up to 50 % above average before we flag it.  A perfectly balanced split
-# has ratio 1.00; real LDF packing of this suite is typically 1.00–1.05.
-MAX_IMBALANCE_RATIO = 1.50
+# Independently-justified, not derived from this run's own measured ratio: the
+# analytic ceiling for greedy LDF packing is (average_shard + largest_item) /
+# average_shard. On this suite (thousands of sub-second items, largest single
+# item ~27s, per-shard average in the thousands of seconds) that ceiling sits
+# just above 1.00, and empirically the packer lands within a few parts-per-
+# million of 1.000 no matter how the input durations are shuffled. 1.05 (5%
+# above perfectly-balanced) keeps meaningful headroom above that noise floor
+# while still being reachable: it trips if a single newly-added test costs
+# roughly 5% of a shard's average load (tens to ~100+ seconds depending on
+# suite size), which is exactly the "one contiguous expensive test dominates
+# a shard" regression this guard exists to catch.
+MAX_IMBALANCE_RATIO = 1.05
 
 
 def _parse_pytest_addopts_fallback(pyproject_text: str) -> str:
@@ -172,6 +192,98 @@ def _load_durations() -> dict:
         return json.load(f)
 
 
+def _extract_valid_test_ids(filepath: Path) -> set:
+    """
+    Return the set of valid pytest node IDs for a test file, using AST.
+
+    Duplicated from test_test_durations_freshness.py::_extract_valid_test_ids
+    (not imported) because this module runs standalone under --noconftest,
+    where cross-importing another test_*.py module is not a stable dependency
+    across the CI Docker image, --standalone local runs, and Docker-less VMs.
+    """
+    try:
+        tree = ast.parse(filepath.read_text(encoding="utf-8"))
+    except (SyntaxError, OSError):
+        return set()
+
+    valid_ids: set = set()
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            for item in node.body:
+                if (
+                    isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name.startswith("test_")
+                ):
+                    valid_ids.add(f"{node.name}::{item.name}")
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        ):
+            valid_ids.add(node.name)
+
+    return valid_ids
+
+
+def _enumerate_collected_test_ids() -> set:
+    """Enumerate every ``testing/test_<file>.py::<id>`` pytest would collect."""
+    universe: set = set()
+    for path in sorted(BACKEND_ROOT.glob(TEST_FILE_GLOB)):
+        rel = path.relative_to(BACKEND_ROOT).as_posix()
+        for test_id in _extract_valid_test_ids(path):
+            universe.add(f"{rel}::{test_id}")
+    return universe
+
+
+def _resolve_quality_path() -> Path | None:
+    """Locate scripts/durations_quality.py across local and Docker-mount layouts."""
+    candidates = [
+        BACKEND_ROOT.parent / "scripts" / "durations_quality.py",
+        Path("/repo/scripts/durations_quality.py"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _impute_missing_mean(known_durations: dict) -> float:
+    """
+    Local copy of scripts/durations_quality.py::impute_missing_mean.
+
+    Duplicated (rather than imported) for the same standalone-execution
+    reason as ``_extract_valid_test_ids`` above; cross-checked against the
+    production function by test_impute_missing_mean_matches_durations_quality.
+    """
+    if not known_durations:
+        return 0.0
+    return sum(known_durations.values()) / len(known_durations)
+
+
+def _with_imputed_durations(durations: dict) -> dict:
+    """
+    Merge measured durations with a mean-imputed entry for every collected
+    test ID missing from ``durations``.
+
+    pytest-split assigns the suite mean to any collected test absent from the
+    durations file rather than dropping it from the shard plan, so the LDF
+    simulation must model that same fallback or it will understate the real
+    weight CI carries for coverage gaps.
+    """
+    universe = _enumerate_collected_test_ids()
+    known_bases = {
+        f"{file_key}::{node_id.split('[')[0]}"
+        for key in durations
+        for file_key, _, node_id in [key.partition("::")]
+    }
+    missing = universe - known_bases
+    merged = dict(durations)
+    if missing:
+        mean = _impute_missing_mean(durations)
+        for index, test_id in enumerate(sorted(missing)):
+            merged[f"__imputed__::{index}::{test_id}"] = mean
+    return merged
+
+
 def _simulate_ldf_allocation(durations: dict, num_shards: int) -> list[float]:
     """
     Simulate pytest-split's greedy Longest-Duration-First allocation.
@@ -195,8 +307,9 @@ def _simulate_ldf_allocation(durations: dict, num_shards: int) -> list[float]:
 
 def test_projected_shard_balance_within_threshold() -> None:
     """
-    Simulate 8-shard LDF allocation from committed durations and assert that
-    no shard exceeds MAX_IMBALANCE_RATIO × average.
+    Simulate 8-shard LDF allocation from committed durations (plus mean-
+    imputed entries for every collected test the file has no measurement
+    for) and assert that no shard exceeds MAX_IMBALANCE_RATIO x average.
 
     A balanced split keeps all shards close to the average; an imbalanced
     split means the slowest shard gates the whole CI run — silently if no
@@ -208,14 +321,16 @@ def test_projected_shard_balance_within_threshold() -> None:
         warnings.warn("backend/.test_durations is empty — skipping balance check.", stacklevel=2)
         return
 
-    shard_totals = _simulate_ldf_allocation(data, NUM_SHARDS)
+    merged = _with_imputed_durations(data)
+    shard_totals = _simulate_ldf_allocation(merged, NUM_SHARDS)
     avg_total = sum(shard_totals) / NUM_SHARDS
     max_total = max(shard_totals)
     ratio = max_total / avg_total if avg_total > 0 else 1.0
 
     report_lines = [
         f"Projected shard balance (LDF, {NUM_SHARDS} shards, "
-        f"{len(data)} durations, total={sum(shard_totals):.1f}s):"
+        f"{len(data)} measured + {len(merged) - len(data)} imputed durations, "
+        f"total={sum(shard_totals):.1f}s):"
     ]
     for i, t in enumerate(sorted(shard_totals, reverse=True), 1):
         report_lines.append(f"  shard {i}: {t:.1f}s")
@@ -228,4 +343,128 @@ def test_projected_shard_balance_within_threshold() -> None:
         f"Slowest shard: {max_total:.1f}s, average: {avg_total:.1f}s. "
         f"Regenerate backend/.test_durations via scripts/store-backend-durations.sh "
         f"or rebalance the test suite so no single shard dominates."
+    )
+
+
+def test_ldf_allocation_includes_imputed_missing_tests() -> None:
+    """
+    A collected test ID absent from the durations map must still appear in
+    the merged map fed to the simulation, at the mean of known durations.
+
+    Without this, pytest-split's real fallback for uncovered tests (assign
+    the suite mean) is invisible to the guard: a coverage regression that
+    drops thousands of tests out of the durations file would look identical
+    to a perfectly-covered file, because dropped tests contribute zero
+    weight instead of their real (imputed) weight.
+    """
+    known = {
+        "testing/test_fixture_example.py::test_measured_one": 2.0,
+        "testing/test_fixture_example.py::test_measured_two": 6.0,
+    }
+    universe = {
+        "testing/test_fixture_example.py::test_measured_one",
+        "testing/test_fixture_example.py::test_measured_two",
+        "testing/test_fixture_example.py::test_uncovered",
+    }
+    known_bases = {
+        f"{file_key}::{node_id.split('[')[0]}"
+        for key in known
+        for file_key, _, node_id in [key.partition("::")]
+    }
+    missing = universe - known_bases
+    assert missing == {"testing/test_fixture_example.py::test_uncovered"}
+
+    merged = dict(known)
+    mean = _impute_missing_mean(known)
+    for index, test_id in enumerate(sorted(missing)):
+        merged[f"__imputed__::{index}::{test_id}"] = mean
+
+    assert len(merged) == 3
+    imputed_values = [v for k, v in merged.items() if k.startswith("__imputed__")]
+    assert imputed_values == [4.0]  # mean(2.0, 6.0)
+
+
+def test_imputation_uses_mean_of_known_durations() -> None:
+    """``_impute_missing_mean`` is the arithmetic mean, not a fixed constant."""
+    assert _impute_missing_mean({"a": 1.0, "b": 2.0, "c": 3.0}) == pytest.approx(2.0)
+    assert _impute_missing_mean({"a": 10.0}) == pytest.approx(10.0)
+    assert _impute_missing_mean({}) == 0.0
+
+
+def test_impute_missing_mean_matches_durations_quality() -> None:
+    """
+    Cross-check the local imputation formula against the production
+    implementation in scripts/durations_quality.py::impute_missing_mean,
+    which scripts/merge_durations.py and scripts/regenerate-durations.py use
+    when generating backend/.test_durations. The two must agree or the guard
+    would be modeling a fallback CI's own generators don't actually apply.
+    """
+    quality_path = _resolve_quality_path()
+    assert quality_path is not None, (
+        "Cannot locate scripts/durations_quality.py. Tried: "
+        + str(BACKEND_ROOT.parent / "scripts" / "durations_quality.py")
+        + " (local) and /repo/scripts/durations_quality.py (Docker mount)."
+    )
+
+    spec = importlib.util.spec_from_file_location("durations_quality", quality_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    sample = {"testing/test_a.py::test_one": 1.0, "testing/test_a.py::test_two": 9.0}
+    assert module.impute_missing_mean(sample) == pytest.approx(
+        _impute_missing_mean(sample)
+    )
+    assert module.impute_missing_mean({}) == _impute_missing_mean({}) == 0.0
+
+
+def test_projected_shard_balance_threshold_is_reachable() -> None:
+    """
+    Prove MAX_IMBALANCE_RATIO can actually fail, not just pass by construction.
+
+    The previous 1.50 threshold was mathematically unreachable: greedy LDF
+    packing of this suite's thousands of sub-second items bounds the max
+    shard at essentially average + largest_item, which never approaches 1.50.
+    This test injects one synthetic, deliberately oversized test duration
+    into a realistic imputed dataset and asserts the *same* simulation and
+    *same* MAX_IMBALANCE_RATIO used by test_projected_shard_balance_within_threshold
+    would flag it — demonstrating the guard has real discriminating power,
+    not just a threshold no input can trip.
+    """
+    data = _load_durations()
+    if not data:
+        pytest.skip("backend/.test_durations is empty — nothing to perturb.")
+
+    merged = _with_imputed_durations(data)
+    baseline_totals = _simulate_ldf_allocation(merged, NUM_SHARDS)
+    baseline_avg = sum(baseline_totals) / NUM_SHARDS
+    baseline_ratio = max(baseline_totals) / baseline_avg if baseline_avg > 0 else 1.0
+    assert baseline_ratio <= MAX_IMBALANCE_RATIO, (
+        "baseline must be green going into this perturbation test, otherwise "
+        "it proves nothing about reachability"
+    )
+
+    # A single test cannot be split across shards, so whichever shard receives
+    # it has total >= oversized_duration regardless of how well thousands of
+    # small filler items rebalance the rest (this is why the earlier, smaller
+    # synthetic value below the threshold got fully absorbed by filler). Solve
+    # oversized_duration / ((baseline_total + oversized_duration) / NUM_SHARDS)
+    # > MAX_IMBALANCE_RATIO for oversized_duration, then double it for margin,
+    # so tripping the guard here does not depend on the filler distribution.
+    baseline_total = sum(merged.values())
+    required_duration = (
+        MAX_IMBALANCE_RATIO * baseline_total / (NUM_SHARDS - MAX_IMBALANCE_RATIO)
+    )
+    oversized_duration = required_duration * 2.0
+    poisoned = dict(merged)
+    poisoned["testing/test_shard_balance_synthetic.py::test_oversized"] = oversized_duration
+
+    poisoned_totals = _simulate_ldf_allocation(poisoned, NUM_SHARDS)
+    poisoned_avg = sum(poisoned_totals) / NUM_SHARDS
+    poisoned_ratio = max(poisoned_totals) / poisoned_avg
+
+    assert poisoned_ratio > MAX_IMBALANCE_RATIO, (
+        f"Injecting a single {oversized_duration:.1f}s synthetic test failed to "
+        f"exceed MAX_IMBALANCE_RATIO ({poisoned_ratio:.3f} <= {MAX_IMBALANCE_RATIO}). "
+        "The threshold is unreachable and this guard cannot fail on a real "
+        "regression."
     )

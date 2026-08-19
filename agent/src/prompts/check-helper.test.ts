@@ -151,8 +151,14 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).toContain('touches backend/');
     expect(script).toContain('admin-ui playwright chromium');
     // The admin-ui typecheck runs on the agent VM (safe, no OOM); vite bundle
-    // is deferred to CI where it has room to breathe.
-    expect(script).toContain('run "admin-ui typecheck" bash -c \'cd admin-ui && npm run typecheck 2>&1\'');
+    // is deferred to CI where it has room to breathe. The build half is
+    // base-attributed so an inherited type error isn't blamed on this task.
+    expect(script).toContain(
+      'run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"',
+    );
+    expect(script).toContain(
+      'run "admin-ui typecheck (test files)" bash -c \'cd admin-ui && node scripts/typecheck-tests-baseline.mjs 2>&1\'',
+    );
     expect(script).not.toContain('npm run build 2>&1'); // no vite build on agent VM
     // The agent suite remains always-on, but its result now comes from the
     // shared fail-closed base-attribution guard rather than console output.

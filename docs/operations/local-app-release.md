@@ -34,7 +34,9 @@ The first rollout uses `bootstrap_local_app_release.py` because hamsterwheel's
 currently installed immutable bundle predates the release command and deploy
 SHA forwarding. Transfer that script and its allowlisted sibling files to one
 root-owned `0700` bootstrap directory, verify their reviewed SHA-256 values,
-then run:
+stage a `RELEASE_REVISION` file in the same directory containing exactly the
+reviewed full Git SHA (no trailing content beyond optional whitespace), then
+run:
 
 ```bash
 sudo env -i \
@@ -43,6 +45,14 @@ sudo env -i \
   /var/lib/blueprint/bootstrap/local-app-release/bootstrap_local_app_release.py \
   --revision FULL_GIT_SHA
 ```
+
+Bootstrap first verifies the staged `RELEASE_REVISION` marker matches
+`--revision` exactly; a missing or mismatched marker aborts before any
+systemd unit is touched, so a stale or unreviewed staging directory can never
+silently install and restart against the wrong candidate. The marker's
+content is folded into the immutable bundle's content digest alongside the
+other allowlisted sources, so the installed bundle stays bound to the
+declared revision.
 
 The bootstrap installs a new content-addressed script bundle and redirects only
 the API unit's future starts to the new wrapper, installs the always-on

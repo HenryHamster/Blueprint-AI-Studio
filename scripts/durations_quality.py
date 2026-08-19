@@ -28,7 +28,23 @@ OUTLIER_CAP = 60.0  # seconds
 IN_BAND_SETUP_MIN = 15.0
 IN_BAND_SETUP_MAX = 21.1
 IN_BAND_SETUP_MIN_COUNT = 100
-IN_BAND_SETUP_GAP_MAX = 27.4
+IN_BAND_SETUP_GAP_MAX = 27.5
+
+
+def derive_in_band_setup_gap_max(data: dict[str, float]) -> float:
+    """Return the true boundary of the post-plateau diagnostic gap.
+
+    IN_BAND_SETUP_GAP_MAX is a pin on "the next real observation after the
+    15-21s setup-attribution plateau" — it must always be at least the
+    smallest duration actually observed at or above IN_BAND_SETUP_MAX, or
+    the pinned literal has drifted below the data it is meant to bound.
+    Callers use this to validate the pin against a freshly regenerated
+    backend/.test_durations rather than trusting the literal blindly.
+    """
+    following = [value for value in data.values() if value >= IN_BAND_SETUP_MAX]
+    if not following:
+        return IN_BAND_SETUP_MAX
+    return min(following)
 
 
 def in_band_setup_artifacts(data: dict[str, float]) -> set[str]:
@@ -55,3 +71,16 @@ MIN_CV = 1.0         # minimum coefficient of variation (stdev / mean)
 def quality_ok(n: int, uv: int, cv: float) -> bool:
     """Return True if all quality thresholds are met."""
     return n >= MIN_ENTRIES and uv >= MIN_UNIQUE and cv > MIN_CV
+
+
+def impute_missing_mean(known_durations: dict) -> float:
+    """Return the fallback duration pytest-split assigns to an uncovered test.
+
+    pytest-split falls back to the mean of known durations for any collected
+    test absent from the durations file, so shard-balance simulations must
+    model that same fallback rather than silently dropping uncovered tests
+    from the weight they will actually carry in CI.
+    """
+    if not known_durations:
+        return 0.0
+    return sum(known_durations.values()) / len(known_durations)

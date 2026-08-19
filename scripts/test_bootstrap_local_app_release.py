@@ -236,6 +236,25 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             },
         )
 
+    def test_verify_staged_revision_accepts_matching_marker(self):
+        revision = "a" * 40
+        payloads = {bootstrap._REVISION_MARKER_NAME: revision.encode("ascii")}
+        bootstrap._verify_staged_revision(payloads, revision)
+
+    def test_verify_staged_revision_rejects_mismatched_marker(self):
+        payloads = {bootstrap._REVISION_MARKER_NAME: (b"a" * 40)}
+        with self.assertRaisesRegex(ValueError, "does not.*match"):
+            bootstrap._verify_staged_revision(payloads, "b" * 40)
+
+    def test_verify_staged_revision_rejects_missing_marker(self):
+        with self.assertRaisesRegex(ValueError, "missing"):
+            bootstrap._verify_staged_revision({}, "a" * 40)
+
+    def test_verify_staged_revision_tolerates_trailing_whitespace(self):
+        revision = "c" * 40
+        payloads = {bootstrap._REVISION_MARKER_NAME: (revision + "\n").encode("ascii")}
+        bootstrap._verify_staged_revision(payloads, revision)
+
     def test_bundle_digest_is_order_independent(self):
         first = bootstrap._bundle_digest({"a.py": b"a", "b.py": b"b"})
         second = bootstrap._bundle_digest({"b.py": b"b", "a.py": b"a"})

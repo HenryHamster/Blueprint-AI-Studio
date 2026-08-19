@@ -394,7 +394,7 @@
     "test_compute_runner_dispatch.py": 3350,
     "test_compute_gcp_startup.py": 2200,
     "test_max_plan_pool_usage.py": 2750,
-    "test_shard_balance.py": 350,
+    "test_shard_balance.py": 700,
     "test_admin_routers__messages.py": 5250,
     "test_admin_routers__version_lifecycle.py": 5600,
     "test_admin_routers__runners.py": 1600,

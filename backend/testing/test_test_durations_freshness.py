@@ -163,7 +163,7 @@ _IMPLAUSIBLE_OUTLIER_CAP = 60.0
 _IN_BAND_SETUP_MIN = 15.0
 _IN_BAND_SETUP_MAX = 21.1
 _IN_BAND_SETUP_MIN_COUNT = 100
-_IN_BAND_SETUP_GAP_MAX = 27.4
+_IN_BAND_SETUP_GAP_MAX = 27.5
 
 
 def test_durations_are_not_degenerate_synthetic_placeholders() -> None:
@@ -611,3 +611,91 @@ def test_staleness_detection_split_file_stale_in_original() -> None:
 
     assert "test_moved_to_new_file" not in valid_ids
     assert "test_remaining" in valid_ids
+
+
+def test_in_band_setup_thresholds_match_durations_quality() -> None:
+    """
+    _IN_BAND_SETUP_MIN/MAX/MIN_COUNT/GAP_MAX here must match the authoritative
+    definitions in scripts/durations_quality.py.  Same standalone cross-check
+    rationale as test_outlier_cap_matches_durations_quality: this guard runs
+    under --noconftest where scripts/ is not importable, so drift between the
+    two files would otherwise go undetected.
+
+    If this test fails, update the local literals above to match
+    scripts/durations_quality.py.
+    """
+    quality_path = _resolve_quality_path()
+    assert quality_path is not None, (
+        "Cannot locate scripts/durations_quality.py. "
+        "Tried: "
+        + str(BACKEND_ROOT.parent / "scripts" / "durations_quality.py")
+        + " (local) and /repo/scripts/durations_quality.py (Docker mount)."
+    )
+
+    names = {
+        "IN_BAND_SETUP_MIN": _IN_BAND_SETUP_MIN,
+        "IN_BAND_SETUP_MAX": _IN_BAND_SETUP_MAX,
+        "IN_BAND_SETUP_MIN_COUNT": _IN_BAND_SETUP_MIN_COUNT,
+        "IN_BAND_SETUP_GAP_MAX": _IN_BAND_SETUP_GAP_MAX,
+    }
+    tree = ast.parse(quality_path.read_text())
+    canonical = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in names
+            and isinstance(node.value, ast.Constant)
+        ):
+            canonical[node.targets[0].id] = node.value.value
+
+    missing = names.keys() - canonical.keys()
+    assert not missing, (
+        f"scripts/durations_quality.py is missing assignment(s) for: {sorted(missing)}"
+    )
+    for name, local_value in names.items():
+        assert canonical[name] == local_value, (
+            f"In-band setup threshold mismatch: scripts/durations_quality.py "
+            f"defines {name} = {canonical[name]}, but this guard uses "
+            f"_{name} = {local_value}. Update the local literal to match."
+        )
+
+
+def test_in_band_setup_gap_max_is_derived_from_observed_data() -> None:
+    """
+    _IN_BAND_SETUP_GAP_MAX must bound the real gap boundary observed in
+    backend/.test_durations, not just a hand-snapshotted number.
+
+    Loads scripts/durations_quality.py::derive_in_band_setup_gap_max (via
+    importlib, same pattern test_shard_balance.py uses for
+    impute_missing_mean) and computes the smallest duration actually observed
+    at or above IN_BAND_SETUP_MAX in the committed data. The pinned
+    _IN_BAND_SETUP_GAP_MAX must be >= that derived value, so regenerating
+    backend/.test_durations with a real "next observation" surfaces a failing
+    assertion here instead of silently requiring a hand-edited constant.
+    """
+    quality_path = _resolve_quality_path()
+    assert quality_path is not None, (
+        "Cannot locate scripts/durations_quality.py. "
+        "Tried: "
+        + str(BACKEND_ROOT.parent / "scripts" / "durations_quality.py")
+        + " (local) and /repo/scripts/durations_quality.py (Docker mount)."
+    )
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("durations_quality", quality_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    data = _load_durations()
+    derived_gap_max = module.derive_in_band_setup_gap_max(data)
+
+    assert derived_gap_max <= _IN_BAND_SETUP_GAP_MAX, (
+        f"_IN_BAND_SETUP_GAP_MAX ({_IN_BAND_SETUP_GAP_MAX}) is smaller than the "
+        f"real gap boundary derived from backend/.test_durations "
+        f"({derived_gap_max}) — the pinned literal has drifted below the data "
+        f"it is meant to bound. Update _IN_BAND_SETUP_GAP_MAX (and "
+        f"IN_BAND_SETUP_GAP_MAX in scripts/durations_quality.py) to match."
+    )
