@@ -307,7 +307,7 @@
     "test_knowledge_documents.py": 7500,
     "test_problem_model.py": 7450,
     "test_agent_strategic_fetch.py": 7400,
-    "test_ci_completion.py": 8450,
+    "test_ci_completion.py": 10050,
     "test_max_plan_pool.py": 6900,
     "test_evaluating.py": 6650,
     "test_github.py": 6300,

@@ -161,6 +161,11 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # rollup_management.py; they carry the same background-worker log-and-continue
 # broad-except pattern.
 "app/rollup_pr_verification.py" = ["BLE001"]
+# rollup_deliverable_guard.py is the same completion-path fail-open pattern as
+# rollup_pr_verification.py: any GitHub/credential blip must degrade to
+# "indeterminate" (never block a merged rollup's completion), so its except
+# blocks are intentionally broad log-and-continue.
+"app/rollup_deliverable_guard.py" = ["BLE001"]
 "app/rollup_branch_cleanup.py" = ["BLE001"]
 # rollup_migration_validation.py was extracted from rollup_management.py; its
 # except blocks are the same fail-safe "could not fetch/parse the PR's migration

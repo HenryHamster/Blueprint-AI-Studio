@@ -918,17 +918,17 @@ async def _attempt_merge_with_retry_and_escalation(
                         if orig.status == TaskStatus.EVALUATING and not (
                             orig.context or {}
                         ).get("review_loop", {}).get("ci_waiting"):
-                            if (
-                                not _orig_is_custom_staged_rollup
-                                or _terminal_rollup_merge
-                            ):
-                                orig.status = TaskStatus.COMPLETED
-                                orig.latest_status_message = "Rollup PR merged"
-                            else:
-                                orig.latest_status_message = (
-                                    f"Rollup PR merged into {ci_base}; awaiting "
-                                    "downstream landing"
-                                )
+                            # Terminal stamp + ghost-success deliverable guard (PR #17480 class).
+                            from app.rollup_deliverable_guard import finalize_rollup_parent_after_merge
+
+                            await finalize_rollup_parent_after_merge(
+                                orig, orig_project, _orig_session,
+                                terminal=not _orig_is_custom_staged_rollup or _terminal_rollup_merge,
+                                base_branch=ci_base, pr_number=ci_pr_number,
+                                github_credentials=(gh_token, owner, repo),
+                                ci_loop=ci_loop, merge_task=task,
+                                source="ci_completion.original_merge_success",
+                            )
                         _orig_session.add(orig)
                         await _orig_session.commit()
                         # Refresh the direction's research-history merge counts:

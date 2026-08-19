@@ -5484,20 +5484,17 @@ async def _process_post_commit(
                                             orig.status == TaskStatus.EVALUATING
                                         )
                                         if orig.status == TaskStatus.EVALUATING:
-                                            if (
-                                                not _orig_is_custom_staged_rollup
-                                                or _terminal_rollup_merge
-                                            ):
-                                                orig.status = TaskStatus.COMPLETED
-                                                orig.latest_status_message = (
-                                                    "Rollup PR merged"
-                                                )
-                                            else:
-                                                orig.latest_status_message = (
-                                                    f"Rollup PR merged into "
-                                                    f"{base_branch}; awaiting "
-                                                    "downstream landing"
-                                                )
+                                            # Terminal stamp + ghost-success deliverable guard (PR #17480 class).
+                                            from app.rollup_deliverable_guard import finalize_rollup_parent_after_merge
+
+                                            await finalize_rollup_parent_after_merge(
+                                                orig, _orig_project, session,
+                                                terminal=not _orig_is_custom_staged_rollup or _terminal_rollup_merge,
+                                                base_branch=base_branch, pr_number=pr_number,
+                                                github_credentials=(gh_token, owner, repo),
+                                                ci_loop=review_loop, merge_task=task,
+                                                source="task_lifecycle.review_merge_success",
+                                            )
                                         session.add(orig)
                                         _o_ctx = orig.context or {}
                                         # Audit W1: auto_remediation is now a column.
