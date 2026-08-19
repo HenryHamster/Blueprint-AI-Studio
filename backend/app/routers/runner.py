@@ -1317,10 +1317,18 @@ async def next_task(
     from app.orchestrator_runner_dispatch import (
         _runner_lacks_required_browser as _task_runner_lacks_required_browser,
     )
+    from app.orchestrator_runner_dispatch import (
+        _runner_lacks_required_project_verification as _lacks_project_verification,
+    )
 
     def _runner_lacks_required_browser(candidate: Task) -> bool:
         """This runner cannot satisfy a browser-required candidate pinned to it."""
         return _task_runner_lacks_required_browser(runner, candidate)
+
+    def _runner_lacks_required_project_verification(candidate: Task) -> bool:
+        """This runner cannot satisfy a project-verification-required candidate
+        pinned to it (no valid v1 write-agent proof for ruff + Docker/Postgres)."""
+        return _lacks_project_verification(runner, candidate)
 
     def _note_skip(candidate: Task, code: str, reason: str) -> None:
         skipped.append(
@@ -1349,6 +1357,23 @@ async def next_task(
             reason = (
                 "runner reports no usable Chromium (playwright_chromium_usable) "
                 "but the task requires browser-based acceptance evidence"
+            )
+            _note_skip(candidate, SKIP_CODE_CAPABILITY_MISMATCH, reason)
+            to_release_capability.append((candidate, reason))
+            continue
+        # Same deterministic mismatch, for the project-verification (Docker
+        # publication gate) contract: a task that needs a v1 write-agent proof
+        # of ruff + live Docker/Postgres was pinned to a runner that cannot
+        # supply one. Also a hardware/registration property, not a transient
+        # cooldown — release now rather than stamp a skip and wait out the
+        # escalation clock. This backstops the same pin paths as the browser
+        # check above (direct pins, or a runner that lost the capability after
+        # being pinned).
+        if _runner_lacks_required_project_verification(candidate):
+            reason = (
+                "runner has no valid v1 write-agent proof for python3 -m ruff "
+                "and live Docker/Postgres but the task requires project "
+                "verification"
             )
             _note_skip(candidate, SKIP_CODE_CAPABILITY_MISMATCH, reason)
             to_release_capability.append((candidate, reason))

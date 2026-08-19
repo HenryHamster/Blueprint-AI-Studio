@@ -1040,6 +1040,127 @@ async def test_try_runner_dispatch_falls_through_to_cloud_without_verification(
     assert (task.context or {}).get("runner_target_id") is None
 
 
+@pytest.mark.asyncio
+async def test_try_runner_dispatch_names_missing_verification_capability_for_hold(
+    db_session,
+):
+    """Zero active runners advertise project verification: the local_only hold's
+    reason and message name the missing capability, not a generic wait.
+
+    ``_try_runner_dispatch`` stamps this in-memory onto ``task.context`` when it
+    fails to find an eligible runner; ``_hold_task_for_local_only_placement`` —
+    called immediately after in the real orchestrator cycle, same transaction,
+    same ORM object — folds it into the durable wait record and status message.
+    """
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _hold_task_for_local_only_placement,
+        _try_runner_dispatch,
+    )
+
+    project = make_project(name="verified-authoring-local-only", user_id=_TEST_USER)
+    project.build_config = {
+        **_BACKEND_VERIFICATION_BUILD_CONFIG,
+        "resource_envelope": {"execution_placement_policy": "local_only"},
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "author backend"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    # Registered and otherwise generically eligible, but carries no
+    # project_verification proof at all — the fleet-wide gap this test proves
+    # gets named, not just a generic "waiting for capacity" message.
+    incapable = RunnerDispatchSnapshot(
+        uuid.uuid4(), project.id, {"task_types": "all", "max_concurrent": 1}
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [incapable]}, {}
+    )
+    assert dispatched is False
+
+    handled = await _hold_task_for_local_only_placement(db_session, task)
+    assert handled is True
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    wait = ctx["execution_placement_wait"]
+    assert wait["reason"] == (
+        "requires project verification (ruff + Docker/Postgres); "
+        "no active runner advertises it"
+    )
+    assert wait["reason"] in (task.latest_status_message or "")
+    # Transient marker is consumed once folded into the durable wait record.
+    assert "capability_dispatch_reason" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_try_runner_dispatch_names_missing_browser_capability_for_hold(
+    db_session,
+):
+    """Same as above for the browser (Chromium) contract, the other capability
+    ``_fleet_missing_capability_reason`` names — the exact reason text a
+    zero-runner-fleet must surface: "requires playwright_chromium_usable; no
+    active runner advertises it".
+    """
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _hold_task_for_local_only_placement,
+        _try_runner_dispatch,
+    )
+
+    project = make_project(name="viewport-authoring-local-only", user_id=_TEST_USER)
+    project.build_config = {
+        "resource_envelope": {"execution_placement_policy": "local_only"}
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix the viewport",
+                "acceptance_evidence": {"kind": "viewport"},
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    # Registered, generically eligible, but its isolation_backends never claim
+    # Chromium — the whole fleet, not just this one runner, lacks it.
+    incapable = RunnerDispatchSnapshot(
+        uuid.uuid4(), project.id, {"task_types": "all", "max_concurrent": 1}
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [incapable]}, {}
+    )
+    assert dispatched is False
+
+    handled = await _hold_task_for_local_only_placement(db_session, task)
+    assert handled is True
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    wait = ctx["execution_placement_wait"]
+    assert wait["reason"] == (
+        "requires playwright_chromium_usable; no active runner advertises it"
+    )
+    assert wait["reason"] in (task.latest_status_message or "")
+    assert "capability_dispatch_reason" not in ctx
+
+
 @pytest.mark.parametrize("identity_source", ["deploy-identity", "legacy-flag"])
 @pytest.mark.asyncio
 async def test_deploy_repo_dispatch_requires_proof_without_build_config_declaration(

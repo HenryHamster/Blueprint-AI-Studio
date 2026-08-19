@@ -283,7 +283,7 @@
     "test_reaper.py": 21750,
     "test_review_pipeline.py": 21650,
     "test_autonomous_research.py": 20850,
-    "test_orchestrator.py": 17150,
+    "test_orchestrator.py": 19850,
     "test_local_runner.py": 15100,
     "test_invariants.py": 14850,
     "test_directions.py": 13400,

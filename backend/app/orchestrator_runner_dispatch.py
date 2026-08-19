@@ -126,8 +126,21 @@ def _stage_local_only_placement_wait(task: Task, *, reason: str) -> bool:
     wait immediately, while timeout/recovery code can stage it together with its
     other updates.  The original ``since`` is retained while the policy and
     reason are stable so queue age is truthful across dispatcher cycles.
+
+    When ``_try_runner_dispatch`` detected that ZERO active runners advertise a
+    capability this task requires, it stamps that finding into
+    ``task.context["capability_dispatch_reason"]`` (in-memory, same cycle, same
+    transaction) before falling through to this hold. When present, it wins
+    over the generic ``reason`` so both the structured wait record and the
+    operator-facing message name the missing capability instead of reading as
+    generic backpressure.
     """
     ctx = dict(task.context or {})
+    capability_reason = ctx.pop("capability_dispatch_reason", None)
+    has_capability_reason = bool(
+        isinstance(capability_reason, str) and capability_reason.strip()
+    )
+    effective_reason = capability_reason if has_capability_reason else reason
     current = ctx.get(EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY)
     current_since = (
         current.get("since")
@@ -136,16 +149,20 @@ def _stage_local_only_placement_wait(task: Task, *, reason: str) -> bool:
     )
     wait_record = {
         "policy": "local_only",
-        "reason": reason,
+        "reason": effective_reason,
         "since": current_since or _utcnow().isoformat(),
     }
     changed = ctx.get(EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY) != wait_record
+    if has_capability_reason:
+        changed = True
     if ctx.pop("runner_target_id", None) is not None:
         changed = True
     if ctx.pop("runner_hostname", None) is not None:
         changed = True
     ctx[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY] = wait_record
     message = "Waiting for local execution capacity (project policy: local_only)."
+    if has_capability_reason:
+        message = f"{message} ({capability_reason})"
     if task.latest_status_message != message:
         task.latest_status_message = message
         changed = True
@@ -810,6 +827,56 @@ def _runner_lacks_required_browser(runner: LocalRunner, task: Task) -> bool:
     return not _runner_chromium_usable(runner) and _task_requires_browser(task)
 
 
+def _task_requires_project_verification_pinned(task: Task) -> bool:
+    """Read the project-verification contract stamped onto ``task`` at pin time.
+
+    Unlike the browser contract above, this cannot be recomputed as a pure
+    function of the task alone: it depends on the task's project
+    (``is_deploy_repo`` / ``build_config``), which costs a DB round-trip.
+    ``_try_runner_dispatch`` already computes ``requires_project_verification``
+    once, at pin time; it stamps the result into ``task.context`` so this claim
+    -time check can read it back cheaply instead of re-querying the project for
+    every polled candidate in ``next-task``'s lock-free pre-pass.
+    """
+    return bool((task.context or {}).get("requires_project_verification"))
+
+
+def _runner_lacks_required_project_verification(runner: LocalRunner, task: Task) -> bool:
+    """Return whether ``runner`` must refuse this task's project-verification contract."""
+    return not _runner_has_project_verification(
+        runner
+    ) and _task_requires_project_verification_pinned(task)
+
+
+def _fleet_missing_capability_reason(
+    candidates: list,
+    *,
+    requires_project_verification: bool,
+    requires_browser: bool,
+) -> str | None:
+    """Name the capability, if any, that ZERO active runners advertise.
+
+    Used only when ``_select_eligible_runner`` failed to find a runner for a
+    capability-gated task, so a task held for local-only placement gets a
+    reason that names the missing capability instead of a generic "waiting
+    for capacity" message. Capability advertisement is independent of current
+    load/capacity, so this checks the raw candidate pool, not eligibility.
+    Order matches ``_select_eligible_runner``'s filter order (project
+    verification, then browser) so the reported reason is deterministic when
+    both are missing.
+    """
+    if requires_project_verification and not any(
+        _runner_has_project_verification(r) for r in candidates
+    ):
+        return (
+            "requires project verification (ruff + Docker/Postgres); "
+            "no active runner advertises it"
+        )
+    if requires_browser and not any(_runner_chromium_usable(r) for r in candidates):
+        return "requires playwright_chromium_usable; no active runner advertises it"
+    return None
+
+
 async def _try_runner_dispatch(
     session: AsyncSession,
     task: Task,
@@ -930,6 +997,7 @@ async def _try_runner_dispatch(
             min_cc_error,
         )
         return False
+    requires_browser = _task_requires_browser(task)
     runner = _select_eligible_runner(
         active_runners_cache,
         task.project_id,
@@ -951,14 +1019,34 @@ async def _try_runner_dispatch(
         # declines still look transient, re-pick the decliner instead.
         declined_exclusion_advisory=decline_exclusion_is_advisory(task, task_type),
         requires_project_verification=requires_project_verification,
-        requires_browser=_task_requires_browser(task),
+        requires_browser=requires_browser,
     )
     if runner is None:
+        # Zero-fleet-wide-capability case: surface WHICH capability is missing
+        # rather than a generic "waiting for capacity" reason. This mutation is
+        # in-memory only (no commit) — the immediately-following
+        # ``_hold_task_for_local_only_placement`` call reads the same ORM
+        # object in the same transaction and folds it into the held task's
+        # durable reason/message; any other path (cloud fallback, a future
+        # cycle) simply leaves it stale until overwritten or the task pins.
+        capability_reason = _fleet_missing_capability_reason(
+            active_runners_cache.get(task.project_id) or [],
+            requires_project_verification=requires_project_verification,
+            requires_browser=requires_browser,
+        )
+        if capability_reason:
+            ctx_with_reason = dict(ctx)
+            ctx_with_reason["capability_dispatch_reason"] = capability_reason
+            task.context = ctx_with_reason
         return False
 
     new_ctx = dict(ctx)
     new_ctx["runner_target_id"] = str(runner.id)
     new_ctx["runner_hostname"] = runner.hostname
+    # Stamped so the claim-time backstop in POST /next-task
+    # (_runner_lacks_required_project_verification) can read the requirement
+    # back cheaply instead of re-querying the project per polled candidate.
+    new_ctx["requires_project_verification"] = requires_project_verification
     # A task that was held (enforce-local) and is now pinned must not carry the
     # stale wait stamp — otherwise the bounded-timeout sweep could fail it after
     # it has already been claimed by a runner.
@@ -967,6 +1055,7 @@ async def _try_runner_dispatch(
     new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
     new_ctx.pop(EXECUTION_CAPABILITY_WAIT_CONTEXT_KEY, None)
     new_ctx.pop("runner_pin_hold", None)
+    new_ctx.pop("capability_dispatch_reason", None)
     _clear_execution_placement_wait(new_ctx)
     task.context = new_ctx
     task.vm_instance_id = f"runner:{runner.id}"
