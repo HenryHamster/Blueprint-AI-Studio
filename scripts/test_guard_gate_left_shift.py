@@ -72,6 +72,26 @@ def test_manifest_protected_prefixes_falls_back_when_manifest_unusable(
     assert static_release_guard._manifest_protected_prefixes(malformed) == ()
 
 
+def test_static_scope_reaches_admin_ui_via_drift_sentinel_manifest() -> None:
+    """A path outside STATIC_PATH_PREFIXES enters scope via the surface manifest.
+
+    Before this, an admin-ui-only PR matched neither the reverse-dep scan nor
+    STATIC_PATH_PREFIXES, so the standalone corpus (which contains the guards
+    whose inputs actually live under admin-ui/ and agent/, e.g.
+    test_vitest_durations_freshness.py) never ran on that PR.
+    """
+    assert static_release_guard._is_static_scope("admin-ui/src/components/MessagesPanel.tsx")
+    assert static_release_guard._is_static_scope("agent/src/handlers/strategic.ts")
+    # A path outside every registered surface glob stays out of scope.
+    assert not static_release_guard._is_static_scope("docs/README.md")
+
+
+def test_static_scope_is_static_scope_default_repo_root_matches_live_manifest() -> None:
+    """The single-arg call form (used elsewhere in this module) still resolves
+    against the live repo's manifest, not an empty/omitted root."""
+    assert static_release_guard._is_static_scope("admin-ui/src/App.tsx")
+
+
 class _OrderedStderr:
     def __init__(self, process: _ArchiveProcess) -> None:
         self._process = process
@@ -477,6 +497,10 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
         tmp_path / "backend" / "testing" / "fixgate_attribution.py",
     )
     shutil.copy2(
+        REPO_ROOT / "backend" / "testing" / "impacted_tests.py",
+        tmp_path / "backend" / "testing" / "impacted_tests.py",
+    )
+    shutil.copy2(
         REPO_ROOT / "backend" / "app" / "size_limit_policy.py",
         tmp_path / "backend" / "app" / "size_limit_policy.py",
     )
@@ -542,6 +566,14 @@ def _prepare_docker_attribution_repo(
     shutil.copy2(
         REPO_ROOT / "backend" / "testing" / "fixgate_attribution.py",
         tmp_path / "backend" / "testing" / "fixgate_attribution.py",
+    )
+    shutil.copy2(
+        REPO_ROOT / "backend" / "testing" / "impacted_tests.py",
+        tmp_path / "backend" / "testing" / "impacted_tests.py",
+    )
+    shutil.copy2(
+        REPO_ROOT / "backend" / "testing" / "drift_sentinel_surfaces.json",
+        tmp_path / "backend" / "testing" / "drift_sentinel_surfaces.json",
     )
     (tmp_path / "backend" / "requirements.txt").write_text("pytest\n")
     (tmp_path / "backend" / "Dockerfile").write_text("FROM scratch\n")

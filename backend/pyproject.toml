@@ -47,6 +47,13 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # exemption as the __<domain>.py buckets.
 "testing/test_release_qualifier__*.py" = ["F405"]
 "testing/_release_qualifier_testhelpers.py" = ["F401"]
+# The test_strategic_spawning_* family imports its shared fixtures
+# (`_ensure_test_account_pool`, `_lts_split_active`) by name from
+# `_strategic_spawning_test_helpers.py`. A test that requests an imported
+# fixture as a parameter shadows the imported name, which pyflakes reports as
+# F811 at every such test — the standard cost of sharing pytest fixtures via
+# import rather than duplicating them per module.
+"testing/test_strategic_spawning_*.py" = ["F811"]
 # main.py has many intentional except Exception blocks for background-task error handling
 # B904: FastAPI pattern — raise HTTPException in except block is intentional HTTP conversion
 # E402: Deferred imports for circular dependency / module load order (lines 113, 202, 2035, 2042, 2174)

@@ -507,6 +507,11 @@ _CROSS_CUTTING_TEST_FILES: frozenset[str] = frozenset({
     # release_version and models — no single ``ci_compliance_gate.py`` module
     # exists, so its stem cannot ground via the per-module heuristic.
     "backend/testing/test_ci_compliance_gate.py",
+    # Validates CI configuration directly (pyproject.toml addopts, the
+    # committed .test_durations file, module_size_limits.json) rather than a
+    # single production module named ``shard_balance.py`` — no such module
+    # exists, so its stem cannot ground via the per-module heuristic.
+    "backend/testing/test_shard_balance.py",
 })
 
 

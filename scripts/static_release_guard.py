@@ -26,6 +26,7 @@ from testing.fixgate_attribution import (  # noqa: E402
     is_attributable_pytest_result,
     parse_junit_report,
 )
+from testing.impacted_tests import load_surface_manifest
 
 MANIFEST_PATH = (
     Path(__file__).resolve().parents[1]
@@ -63,6 +64,8 @@ STATIC_PATH_PREFIXES = (
     "scripts/static_release_guard.py",
 ) + _manifest_protected_prefixes()
 
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -91,13 +94,27 @@ def _changed_files(repo: Path, base: str) -> list[str]:
     return sorted({path for path in (*committed, *uncommitted, *untracked) if path})
 
 
-def _is_static_scope(path: str) -> bool:
+def _is_static_scope(path: str, repo_root: str = _REPO_ROOT) -> bool:
+    """Whether ``path`` falls in scope for the static release guard corpus.
+
+    In scope either by legacy prefix match, or by matching a surface glob
+    registered in the drift-sentinel manifest (``drift_sentinel_surfaces.json``)
+    — the same manifest that drives the merge-time impacted-test selector, so
+    the two selection layers agree on which non-backend surfaces (e.g.
+    admin-ui/, agent/) have guards with inputs the static corpus must also run
+    for, rather than maintaining a second, independently drifting path list.
+    """
     normalized = path.replace("\\", "/").strip("/")
-    return any(
+    if any(
         normalized == prefix.rstrip("/")
         or normalized.startswith(f"{prefix.rstrip('/')}/")
         for prefix in STATIC_PATH_PREFIXES
-    )
+    ):
+        return True
+    for regex, _sentinels in load_surface_manifest(repo_root):
+        if regex.match(normalized):
+            return True
+    return False
 
 
 _extract_base = extract_base

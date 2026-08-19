@@ -1,5 +1,5 @@
 {
-  "_note": "Single source of truth for the list-class section keys in cycle_start_reconciliation, built by _build_cycle_start_reconciliation in backend/app/strategic_spawning.py. Adding or renaming a key requires updating this file AND the backend function. Agent-side: buildCycleStartReconciliationSection in agent/src/handlers/strategic-sections.ts must render every key listed here. Contract tests in backend/testing/test_strategic_spawning.py (TestReconciliationSectionsContract) and agent/src/handlers/strategic-sections.test.ts read this fixture and fail on drift.",
+  "_note": "Single source of truth for the list-class section keys in cycle_start_reconciliation, built by _build_cycle_start_reconciliation in backend/app/strategic_spawning.py. Adding or renaming a key requires updating this file AND the backend function. Agent-side: buildCycleStartReconciliationSection in agent/src/handlers/strategic-sections.ts must render every key listed here. Contract tests in backend/testing/test_strategic_spawning_summaries.py (TestReconciliationSectionsContract) and agent/src/handlers/strategic-sections.test.ts read this fixture and fail on drift.",
   "schema_version": 1,
   "list_keys": [
     "capability_contradictions",

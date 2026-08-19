@@ -1,456 +1,435 @@
 {
   "_meta": {
     "suite": "admin-ui",
-    "generated": "2026-08-18T21:46:16.098Z",
+    "generated": "2026-08-19T09:00:54.369Z",
     "runs": 1,
     "flake_detection": false
   },
   "files": [
     {
-      "file": "src/components/KnowledgeBrowser.test.tsx",
-      "duration_ms": 20392,
-      "tests": 46,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/components/MessagesPanel.test.tsx",
-      "duration_ms": 4648,
+      "duration_ms": 4470,
       "tests": 66,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/MessagesPanel.filters.test.tsx",
-      "duration_ms": 3856,
+      "duration_ms": 3703,
       "tests": 55,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/MessagesPanel.send.test.tsx",
-      "duration_ms": 3615,
-      "tests": 38,
+      "duration_ms": 3352,
+      "tests": 37,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/MessagesPanel.interactions.test.tsx",
-      "duration_ms": 3362,
+      "duration_ms": 3216,
       "tests": 52,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/MessagesPanel.notifications.test.tsx",
-      "duration_ms": 2539,
-      "tests": 65,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/hooks/useStrategicSession.test.tsx",
-      "duration_ms": 2533,
+      "duration_ms": 2526,
       "tests": 26,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/MessagesPanel.notifications.test.tsx",
+      "duration_ms": 2458,
+      "tests": 65,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/hooks/useDeploymentState.test.ts",
-      "duration_ms": 2325,
+      "duration_ms": 2400,
       "tests": 34,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ComputeJobsPanel.test.tsx",
-      "duration_ms": 1864,
-      "tests": 215,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/components/OperatorWorkspaces.test.tsx",
-      "duration_ms": 1792,
+      "duration_ms": 1750,
       "tests": 18,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/ComputeJobsPanel.test.tsx",
+      "duration_ms": 1605,
+      "tests": 215,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/OuterReviewLoopConvergenceWidget.test.tsx",
-      "duration_ms": 1129,
+      "duration_ms": 1109,
       "tests": 12,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/NewTaskModal.test.tsx",
-      "duration_ms": 1096,
-      "tests": 20,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/MessagesPanel.advanced.test.tsx",
-      "duration_ms": 1041,
-      "tests": 32,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/components/DashboardHome.test.tsx",
-      "duration_ms": 952,
+      "duration_ms": 955,
       "tests": 80,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/MessagesPanel.advanced.test.tsx",
+      "duration_ms": 902,
+      "tests": 32,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/NewTaskModal.test.tsx",
+      "duration_ms": 878,
+      "tests": 20,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/FleetRunnersPanel.test.tsx",
-      "duration_ms": 815,
+      "duration_ms": 851,
       "tests": 94,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/CommandPalette.test.tsx",
-      "duration_ms": 813,
+      "duration_ms": 808,
       "tests": 15,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/test/mock-factory-export-coverage.test.ts",
-      "duration_ms": 799,
-      "tests": 17,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/components/PipelineWorkspace.test.tsx",
-      "duration_ms": 739,
+      "duration_ms": 744,
       "tests": 23,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/hooks/useProjectResourceSummary.test.tsx",
-      "duration_ms": 645,
-      "tests": 16,
+      "file": "src/test/mock-factory-export-coverage.test.ts",
+      "duration_ms": 678,
+      "tests": 17,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/VersionLifecyclePanel.test.tsx",
-      "duration_ms": 633,
-      "tests": 175,
+      "duration_ms": 676,
+      "tests": 176,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/hooks/useProjectResourceSummary.test.tsx",
+      "duration_ms": 646,
+      "tests": 16,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/NewProjectModal.test.tsx",
-      "duration_ms": 616,
+      "duration_ms": 597,
       "tests": 15,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/SettingsOrchestratorSection.test.tsx",
-      "duration_ms": 568,
+      "duration_ms": 545,
       "tests": 31,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/KnowledgeBrowser.test.tsx",
+      "duration_ms": 501,
+      "tests": 46,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/TaskDetailDrawer.test.tsx",
-      "duration_ms": 435,
+      "duration_ms": 464,
       "tests": 29,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/TaskDetailDrawerMeta.test.tsx",
-      "duration_ms": 431,
-      "tests": 109,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/components/ImprovementLanesPanel.test.tsx",
-      "duration_ms": 429,
+      "duration_ms": 427,
       "tests": 30,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/TaskDetailDrawerMeta.test.tsx",
+      "duration_ms": 416,
+      "tests": 109,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/StrategicContextArtifactSlot.test.tsx",
-      "duration_ms": 426,
+      "duration_ms": 414,
       "tests": 34,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/WarmReuseVsCostTrend.test.tsx",
-      "duration_ms": 400,
+      "duration_ms": 401,
       "tests": 9,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/WarmVmPanel.test.tsx",
-      "duration_ms": 400,
-      "tests": 67,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/hooks/useWorkbenchCommands.test.tsx",
-      "duration_ms": 382,
-      "tests": 58,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/components/SrTrendBreakdown.test.tsx",
-      "duration_ms": 377,
+      "duration_ms": 394,
       "tests": 149,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/StrategicContextRail.test.tsx",
-      "duration_ms": 370,
+      "duration_ms": 385,
       "tests": 60,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/RemediationFunnelSection.test.tsx",
-      "duration_ms": 367,
-      "tests": 42,
+      "file": "src/components/WarmVmPanel.test.tsx",
+      "duration_ms": 373,
+      "tests": 67,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/MessagesComposer.test.tsx",
-      "duration_ms": 366,
-      "tests": 16,
+      "file": "src/hooks/useWorkbenchCommands.test.tsx",
+      "duration_ms": 370,
+      "tests": 58,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/FixLoopConvergenceWidget.test.tsx",
-      "duration_ms": 354,
+      "duration_ms": 359,
       "tests": 2,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ResearchBrowser.test.tsx",
-      "duration_ms": 304,
-      "tests": 33,
+      "file": "src/components/MessagesComposer.test.tsx",
+      "duration_ms": 354,
+      "tests": 12,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ArchiveView.test.tsx",
-      "duration_ms": 291,
+      "file": "src/components/RemediationFunnelSection.test.tsx",
+      "duration_ms": 354,
+      "tests": 42,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "eslint-rules/no-oversized-file.test.js",
+      "duration_ms": 284,
       "tests": 5,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/TaskCard.test.tsx",
-      "duration_ms": 288,
+      "duration_ms": 281,
       "tests": 79,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/ResearchBrowser.test.tsx",
+      "duration_ms": 276,
+      "tests": 33,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/StrategicContextWorkspace.test.tsx",
-      "duration_ms": 286,
+      "duration_ms": 275,
       "tests": 20,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "eslint-rules/no-oversized-file.test.js",
-      "duration_ms": 278,
+      "file": "src/components/ArchiveView.test.tsx",
+      "duration_ms": 272,
       "tests": 5,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/hooks/useTaskModal.test.ts",
-      "duration_ms": 266,
+      "duration_ms": 261,
       "tests": 79,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ProjectResourceEnvelopeSection.test.tsx",
-      "duration_ms": 266,
-      "tests": 16,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/DirectionCard.test.tsx",
-      "duration_ms": 246,
-      "tests": 72,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/components/AutonomousStatus.test.tsx",
-      "duration_ms": 243,
+      "duration_ms": 241,
       "tests": 22,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/hooks/useDirectionsData.readOnly.test.ts",
-      "duration_ms": 234,
+      "duration_ms": 233,
       "tests": 6,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/DirectionsPanel.test.tsx",
-      "duration_ms": 226,
+      "duration_ms": 229,
       "tests": 17,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/ProjectResourceEnvelopeSection.test.tsx",
+      "duration_ms": 229,
+      "tests": 16,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/DirectionCard.test.tsx",
+      "duration_ms": 221,
+      "tests": 72,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/hooks/useStrategicLiveness.test.tsx",
-      "duration_ms": 218,
+      "duration_ms": 220,
       "tests": 6,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/KanbanBoard.test.tsx",
-      "duration_ms": 192,
-      "tests": 12,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/SettingsNotificationsSection.test.tsx",
-      "duration_ms": 186,
-      "tests": 15,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/components/MetricsDashboard.test.tsx",
-      "duration_ms": 177,
+      "duration_ms": 174,
       "tests": 14,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/SettingsNotificationsSection.test.tsx",
+      "duration_ms": 170,
+      "tests": 15,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/KanbanBoard.test.tsx",
+      "duration_ms": 168,
+      "tests": 12,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/TaskDetailDrawerSections.test.tsx",
-      "duration_ms": 175,
+      "duration_ms": 150,
       "tests": 81,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/PipelineView.test.tsx",
-      "duration_ms": 165,
+      "duration_ms": 146,
       "tests": 21,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ProviderModelBreakdownPanel.test.tsx",
-      "duration_ms": 161,
-      "tests": 13,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/PRMonitorSection.test.tsx",
-      "duration_ms": 155,
-      "tests": 24,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/MessageBubble.test.tsx",
-      "duration_ms": 152,
-      "tests": 40,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ProjectToolHost.test.tsx",
-      "duration_ms": 149,
-      "tests": 28,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/components/DirectionPortfolioSection.test.tsx",
-      "duration_ms": 147,
+      "duration_ms": 144,
       "tests": 20,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/ProviderModelBreakdownPanel.test.tsx",
+      "duration_ms": 141,
+      "tests": 13,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/TaskContextRail.test.tsx",
-      "duration_ms": 144,
+      "duration_ms": 140,
       "tests": 18,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/SettingsAccountsSection.test.tsx",
-      "duration_ms": 142,
-      "tests": 9,
+      "file": "src/components/ProjectToolHost.test.tsx",
+      "duration_ms": 137,
+      "tests": 28,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/VersionLifecyclePanelPrimitives.test.tsx",
-      "duration_ms": 142,
+      "duration_ms": 135,
       "tests": 107,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/EffortEfficiencyPanel.test.tsx",
-      "duration_ms": 139,
+      "file": "src/components/MessageBubble.test.tsx",
+      "duration_ms": 130,
+      "tests": 40,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/PRMonitorSection.test.tsx",
+      "duration_ms": 128,
       "tests": 24,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/WhiteboardTool.test.tsx",
-      "duration_ms": 138,
-      "tests": 14,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/KeyboardShortcutsOverlay.test.tsx",
-      "duration_ms": 136,
-      "tests": 3,
+      "file": "src/components/EffortEfficiencyPanel.test.tsx",
+      "duration_ms": 123,
+      "tests": 24,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/hooks/useDirectionsData.test.ts",
-      "duration_ms": 127,
+      "duration_ms": 121,
       "tests": 3,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/hooks/useLogViewer.test.ts",
-      "duration_ms": 123,
-      "tests": 47,
+      "file": "src/components/SettingsAccountsSection.test.tsx",
+      "duration_ms": 120,
+      "tests": 10,
       "measured": true,
       "flaky": false
     },
@@ -462,324 +441,310 @@
       "flaky": false
     },
     {
+      "file": "src/components/KeyboardShortcutsOverlay.test.tsx",
+      "duration_ms": 117,
+      "tests": 3,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/firebase.test.ts",
-      "duration_ms": 116,
+      "duration_ms": 114,
       "tests": 2,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/EvergreenFillObservabilityPanel.test.tsx",
-      "duration_ms": 112,
-      "tests": 17,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/uiLoadTiming.test.ts",
-      "duration_ms": 106,
-      "tests": 4,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/LaneDiagPanel.test.tsx",
-      "duration_ms": 105,
-      "tests": 16,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/TaskDetailDrawerSideboardContext.test.tsx",
-      "duration_ms": 105,
-      "tests": 7,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/KanbanColumn.test.tsx",
-      "duration_ms": 104,
-      "tests": 6,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/utils/renderWhiteboardArtifact.test.ts",
-      "duration_ms": 99,
+      "duration_ms": 113,
       "tests": 8,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/WhiteboardTool.test.tsx",
+      "duration_ms": 113,
+      "tests": 14,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/uiLoadTiming.test.ts",
+      "duration_ms": 105,
+      "tests": 4,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/EvergreenFillObservabilityPanel.test.tsx",
+      "duration_ms": 100,
+      "tests": 17,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/TaskDetailDrawerSideboardContext.test.tsx",
+      "duration_ms": 96,
+      "tests": 7,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/LaneDiagPanel.test.tsx",
+      "duration_ms": 94,
+      "tests": 16,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/KanbanColumn.test.tsx",
+      "duration_ms": 90,
+      "tests": 6,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/DriftSignalsCard.test.tsx",
-      "duration_ms": 99,
+      "duration_ms": 89,
       "tests": 11,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ProblemModelViewer.test.tsx",
-      "duration_ms": 99,
-      "tests": 13,
+      "file": "src/components/ComputeArtifactGallery.test.tsx",
+      "duration_ms": 87,
+      "tests": 24,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/hooks/useConversation.test.tsx",
-      "duration_ms": 90,
+      "duration_ms": 86,
       "tests": 28,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/hooks/useLogViewer.test.ts",
+      "duration_ms": 86,
+      "tests": 47,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/AlertsBanner.test.tsx",
-      "duration_ms": 90,
+      "duration_ms": 85,
       "tests": 12,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/RuntimeAccountsPanel.test.tsx",
-      "duration_ms": 90,
+      "duration_ms": 84,
       "tests": 7,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/ProjectBuildConfigSection.test.tsx",
-      "duration_ms": 88,
+      "duration_ms": 80,
       "tests": 2,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ConsoleHome.test.tsx",
-      "duration_ms": 87,
-      "tests": 7,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ComputeArtifactGallery.test.tsx",
-      "duration_ms": 85,
-      "tests": 24,
+      "file": "src/components/ProblemModelViewer.test.tsx",
+      "duration_ms": 76,
+      "tests": 13,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/NotesTool.test.tsx",
-      "duration_ms": 82,
+      "duration_ms": 75,
       "tests": 15,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/SettingsDeploySection.test.tsx",
-      "duration_ms": 82,
-      "tests": 13,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ProjectManagementModal.test.tsx",
-      "duration_ms": 77,
-      "tests": 16,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ProjectMembers.test.tsx",
-      "duration_ms": 76,
-      "tests": 7,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/OrchestratorHealthBar.test.tsx",
-      "duration_ms": 73,
-      "tests": 24,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/StrategicAuditPanel.test.tsx",
-      "duration_ms": 72,
+      "duration_ms": 74,
       "tests": 13,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/FleetCapacityCard.test.tsx",
-      "duration_ms": 68,
+      "duration_ms": 71,
       "tests": 22,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/EvergreenBacklogPanel.test.tsx",
-      "duration_ms": 67,
-      "tests": 12,
+      "file": "src/components/ConsoleHome.test.tsx",
+      "duration_ms": 69,
+      "tests": 7,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/FleetHealthCard.test.tsx",
-      "duration_ms": 65,
-      "tests": 16,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/BulkActionBar.test.tsx",
-      "duration_ms": 64,
+      "file": "src/components/MessagesSummaryCard.test.tsx",
+      "duration_ms": 68,
       "tests": 5,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/ProjectManagementModal.test.tsx",
+      "duration_ms": 67,
+      "tests": 16,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/OrchestratorHealthBar.test.tsx",
+      "duration_ms": 64,
+      "tests": 24,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/ProjectMembers.test.tsx",
+      "duration_ms": 64,
+      "tests": 7,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/StrategicAuditPanel.test.tsx",
+      "duration_ms": 64,
+      "tests": 13,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/EvergreenBacklogPanel.test.tsx",
+      "duration_ms": 63,
+      "tests": 12,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/AttachmentPreviewModal.test.tsx",
-      "duration_ms": 62,
+      "duration_ms": 58,
       "tests": 15,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/SettingsGeneralSection.test.tsx",
-      "duration_ms": 62,
+      "duration_ms": 58,
       "tests": 8,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/StrategicSessionControl.test.tsx",
-      "duration_ms": 61,
-      "tests": 23,
+      "file": "src/components/PoolAccountHealthPanel.test.tsx",
+      "duration_ms": 57,
+      "tests": 15,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/UILoadTimingPanel.test.tsx",
-      "duration_ms": 61,
-      "tests": 27,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/MessagesSummaryCard.test.tsx",
-      "duration_ms": 60,
+      "file": "src/components/BulkActionBar.test.tsx",
+      "duration_ms": 56,
       "tests": 5,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/NullBranchDiagnosticsPanel.test.tsx",
-      "duration_ms": 60,
+      "duration_ms": 56,
       "tests": 10,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/PoolAccountHealthPanel.test.tsx",
-      "duration_ms": 59,
-      "tests": 15,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ProviderCostPanel.test.tsx",
-      "duration_ms": 59,
-      "tests": 10,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/SystemMaturityCard.test.tsx",
-      "duration_ms": 58,
-      "tests": 13,
+      "file": "src/components/FleetHealthCard.test.tsx",
+      "duration_ms": 55,
+      "tests": 16,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/SaveViewDialog.test.tsx",
-      "duration_ms": 57,
+      "duration_ms": 55,
       "tests": 4,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/RecentErrorsWidget.test.tsx",
+      "file": "src/components/StrategicSessionControl.test.tsx",
       "duration_ms": 54,
-      "tests": 4,
+      "tests": 24,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/HeaderBar.test.tsx",
+      "file": "src/components/SystemMaturityCard.test.tsx",
       "duration_ms": 53,
-      "tests": 5,
+      "tests": 13,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ProjectWorkspace.readOnly.test.tsx",
-      "duration_ms": 52,
-      "tests": 5,
+      "file": "src/components/UILoadTimingPanel.test.tsx",
+      "duration_ms": 53,
+      "tests": 27,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/CapabilityTrialsPanel.test.tsx",
+      "file": "src/components/MarkdownContentInner.test.tsx",
       "duration_ms": 50,
       "tests": 11,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/DashboardMetricCards.test.tsx",
+      "file": "src/components/ProviderCostPanel.test.tsx",
+      "duration_ms": 50,
+      "tests": 10,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/MetricsIntegrityObservabilityPanel.test.tsx",
       "duration_ms": 49,
-      "tests": 24,
+      "tests": 3,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ErrorBoundary.test.tsx",
+      "file": "src/components/RecentErrorsWidget.test.tsx",
       "duration_ms": 49,
-      "tests": 11,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/SettingsSectionRouter.test.tsx",
-      "duration_ms": 49,
-      "tests": 7,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/DependencyHealthCard.test.tsx",
-      "duration_ms": 48,
-      "tests": 9,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/RecurringPatternsSection.test.tsx",
-      "duration_ms": 48,
-      "tests": 12,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/DirectionAutoPauseWidget.test.tsx",
-      "duration_ms": 47,
       "tests": 4,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/ErrorBoundary.test.tsx",
+      "duration_ms": 48,
+      "tests": 11,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/MessageTypeDropdown.test.tsx",
-      "duration_ms": 46,
+      "duration_ms": 47,
       "tests": 7,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/ProjectWorkspace.readOnly.test.tsx",
+      "duration_ms": 47,
+      "tests": 5,
       "measured": true,
       "flaky": false
     },
@@ -791,23 +756,16 @@
       "flaky": false
     },
     {
-      "file": "src/components/MetricsIntegrityObservabilityPanel.test.tsx",
+      "file": "src/components/DashboardMetricCards.test.tsx",
       "duration_ms": 45,
-      "tests": 3,
+      "tests": 24,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ProjectAlertDomainsSection.test.tsx",
+      "file": "src/components/DirectionAutoPauseWidget.test.tsx",
       "duration_ms": 45,
-      "tests": 3,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ScopeTrendsSection.test.tsx",
-      "duration_ms": 45,
-      "tests": 17,
+      "tests": 4,
       "measured": true,
       "flaky": false
     },
@@ -819,58 +777,107 @@
       "flaky": false
     },
     {
-      "file": "eslint-rules/min-touch-target.test.js",
-      "duration_ms": 42,
-      "tests": 29,
+      "file": "src/components/CapabilityTrialsPanel.test.tsx",
+      "duration_ms": 43,
+      "tests": 11,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/MarkdownContentInner.test.tsx",
+      "file": "src/components/TaskStreamPanel.test.tsx",
       "duration_ms": 42,
-      "tests": 6,
+      "tests": 4,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/DependencyHealthCard.test.tsx",
+      "duration_ms": 41,
+      "tests": 9,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/HeaderBar.test.tsx",
+      "duration_ms": 41,
+      "tests": 5,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/ProjectAlertDomainsSection.test.tsx",
+      "duration_ms": 41,
+      "tests": 3,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/RecurringPatternsSection.test.tsx",
+      "duration_ms": 41,
+      "tests": 12,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/ScopeTrendsSection.test.tsx",
+      "duration_ms": 41,
+      "tests": 17,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/SettingsSectionRouter.test.tsx",
+      "duration_ms": 41,
+      "tests": 7,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/MediumScopeWidget.test.tsx",
-      "duration_ms": 42,
+      "duration_ms": 40,
       "tests": 28,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/components/MessageAttachments.test.tsx",
+      "duration_ms": 39,
+      "tests": 3,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "eslint-rules/min-touch-target.test.js",
+      "duration_ms": 38,
+      "tests": 29,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/ProjectAutoReviewSection.test.tsx",
-      "duration_ms": 40,
+      "duration_ms": 37,
       "tests": 2,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "eslint-rules/no-fixed-width-overflow.test.js",
-      "duration_ms": 39,
-      "tests": 27,
+      "file": "src/components/SavedViewsTabStrip.test.tsx",
+      "duration_ms": 37,
+      "tests": 8,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/ScopeConversionRatesSection.test.tsx",
-      "duration_ms": 39,
+      "duration_ms": 37,
       "tests": 26,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/AccountMenu.test.tsx",
+      "file": "eslint-rules/no-fixed-width-overflow.test.js",
       "duration_ms": 35,
-      "tests": 6,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/LlmCostBreakdownPanel.test.tsx",
-      "duration_ms": 35,
-      "tests": 6,
+      "tests": 27,
       "measured": true,
       "flaky": false
     },
@@ -882,212 +889,170 @@
       "flaky": false
     },
     {
-      "file": "src/components/StrategicCallMode.test.tsx",
-      "duration_ms": 35,
-      "tests": 11,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/WhiteboardRailSection.test.tsx",
-      "duration_ms": 35,
-      "tests": 5,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/hooks/useTasksState.test.ts",
+      "file": "src/components/AccountMenu.test.tsx",
       "duration_ms": 33,
-      "tests": 18,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/SystemHealthCard.test.tsx",
-      "duration_ms": 33,
-      "tests": 11,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/hooks/__tests__/useLogViewer.test.ts",
-      "duration_ms": 32,
-      "tests": 8,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/MuteWindowMenu.test.tsx",
-      "duration_ms": 32,
-      "tests": 4,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ReleaseEvidence.test.tsx",
-      "duration_ms": 32,
-      "tests": 16,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/SystemStatusCard.test.tsx",
-      "duration_ms": 32,
-      "tests": 9,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/TaskStreamPanel.test.tsx",
-      "duration_ms": 32,
-      "tests": 4,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/MessageAttachments.test.tsx",
-      "duration_ms": 31,
-      "tests": 3,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/PrimaryTabNav.test.tsx",
-      "duration_ms": 31,
-      "tests": 12,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ProjectResourceAvailabilityCard.test.tsx",
-      "duration_ms": 31,
-      "tests": 3,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/SavedViewsTabStrip.test.tsx",
-      "duration_ms": 31,
-      "tests": 8,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/hooks/useOperatorKeyboardShortcuts.test.tsx",
-      "duration_ms": 29,
-      "tests": 17,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/EvidenceTierBadge.test.tsx",
-      "duration_ms": 29,
-      "tests": 16,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/hooks/useWorkbenchShortcutRouter.test.tsx",
-      "duration_ms": 28,
       "tests": 6,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/hooks/useTasksState.test.ts",
+      "duration_ms": 32,
+      "tests": 18,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/LlmCostBreakdownPanel.test.tsx",
+      "duration_ms": 32,
+      "tests": 6,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/hooks/__tests__/useLogViewer.test.ts",
+      "duration_ms": 31,
+      "tests": 8,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "eslint-rules/canonical-radius.test.js",
+      "duration_ms": 30,
+      "tests": 16,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/MuteWindowMenu.test.tsx",
+      "duration_ms": 30,
+      "tests": 4,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/components/StrategicContextMap.test.tsx",
-      "duration_ms": 28,
+      "duration_ms": 30,
       "tests": 5,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/TaskDurationWidget.test.tsx",
+      "file": "src/components/SystemHealthCard.test.tsx",
+      "duration_ms": 30,
+      "tests": 11,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/SystemStatusCard.test.tsx",
+      "duration_ms": 30,
+      "tests": 9,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/WhiteboardRailSection.test.tsx",
+      "duration_ms": 30,
+      "tests": 5,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/ReleaseEvidence.test.tsx",
+      "duration_ms": 29,
+      "tests": 16,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "eslint-rules/no-surface-colour.test.js",
       "duration_ms": 28,
-      "tests": 7,
+      "tests": 17,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/hooks/useOperatorKeyboardShortcuts.test.tsx",
+      "duration_ms": 28,
+      "tests": 17,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/PrimaryTabNav.test.tsx",
+      "duration_ms": 28,
+      "tests": 12,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/ToolResidentHandoffControls.test.tsx",
+      "duration_ms": 28,
+      "tests": 3,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "eslint-rules/require-workbench-focus.test.js",
+      "duration_ms": 27,
+      "tests": 15,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/EvidenceTierBadge.test.tsx",
+      "duration_ms": 27,
+      "tests": 16,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/EventVisibilityMenu.test.tsx",
-      "duration_ms": 27,
+      "duration_ms": 26,
       "tests": 5,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/TaskComputeJobsSection.test.tsx",
-      "duration_ms": 27,
+      "duration_ms": 25,
       "tests": 3,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/TaskDurationWidget.test.tsx",
+      "duration_ms": 25,
+      "tests": 7,
       "measured": true,
       "flaky": false
     },
     {
       "file": "eslint-rules/no-disabled-react-hooks.test.js",
-      "duration_ms": 25,
+      "duration_ms": 24,
       "tests": 11,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/hooks/useCommandPaletteShortcut.test.tsx",
-      "duration_ms": 25,
-      "tests": 10,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/hooks/useStrategicReadModel.test.tsx",
-      "duration_ms": 25,
-      "tests": 17,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/DirectionsPanel.readOnly.test.tsx",
-      "duration_ms": 25,
-      "tests": 1,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ToolResidentHandoffControls.test.tsx",
-      "duration_ms": 25,
-      "tests": 3,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ui/Badge.test.tsx",
-      "duration_ms": 25,
-      "tests": 18,
+      "file": "src/hooks/useWorkbenchShortcutRouter.test.tsx",
+      "duration_ms": 23,
+      "tests": 6,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/MessagesPanel.utils.test.ts",
-      "duration_ms": 24,
+      "duration_ms": 23,
       "tests": 180,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/test/viewport-coverage.test.ts",
+      "file": "src/components/ProjectResourceAvailabilityCard.test.tsx",
       "duration_ms": 23,
-      "tests": 23,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/CompletionDebtPanel.test.tsx",
-      "duration_ms": 23,
-      "tests": 1,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/ParkWakeHealthCard.test.tsx",
-      "duration_ms": 23,
-      "tests": 6,
+      "tests": 3,
       "measured": true,
       "flaky": false
     },
@@ -1099,51 +1064,86 @@
       "flaky": false
     },
     {
-      "file": "src/hooks/useSearchFilters.test.ts",
+      "file": "src/hooks/useStrategicReadModel.test.tsx",
       "duration_ms": 22,
-      "tests": 22,
+      "tests": 17,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/ProjectReadOnlyEditors.test.tsx",
-      "duration_ms": 22,
-      "tests": 2,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/Toasts.test.tsx",
-      "duration_ms": 22,
-      "tests": 2,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/hooks/useStrategicCall.test.ts",
+      "file": "src/hooks/useCommandPaletteShortcut.test.tsx",
       "duration_ms": 21,
-      "tests": 12,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/hooks/useUrlFilterState.test.ts",
-      "duration_ms": 20,
-      "tests": 14,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/useMessageList.test.ts",
-      "duration_ms": 20,
-      "tests": 14,
+      "tests": 10,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/MergeGateFleetHealthCard.test.tsx",
-      "duration_ms": 19,
+      "duration_ms": 21,
       "tests": 7,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/ProjectReadOnlyEditors.test.tsx",
+      "duration_ms": 21,
+      "tests": 2,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/useMessageList.test.ts",
+      "duration_ms": 21,
+      "tests": 14,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/ui/Badge.test.tsx",
+      "duration_ms": 21,
+      "tests": 18,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/hooks/useSearchFilters.test.ts",
+      "duration_ms": 20,
+      "tests": 22,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/CompletionDebtPanel.test.tsx",
+      "duration_ms": 20,
+      "tests": 1,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/DirectionsPanel.readOnly.test.tsx",
+      "duration_ms": 20,
+      "tests": 1,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/ParkWakeHealthCard.test.tsx",
+      "duration_ms": 20,
+      "tests": 6,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/StrategicSessionEvents.test.tsx",
+      "duration_ms": 20,
+      "tests": 4,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/Toasts.test.tsx",
+      "duration_ms": 20,
+      "tests": 2,
       "measured": true,
       "flaky": false
     },
@@ -1155,58 +1155,44 @@
       "flaky": false
     },
     {
-      "file": "src/hooks/useStrategicContextNavigation.test.tsx",
+      "file": "src/hooks/usePersistedState.test.ts",
       "duration_ms": 18,
-      "tests": 7,
+      "tests": 9,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/AnomalyThrottleBanner.test.tsx",
+      "file": "src/hooks/useUrlFilterState.test.ts",
       "duration_ms": 18,
-      "tests": 3,
+      "tests": 14,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/ConversationUtilityBar.test.tsx",
       "duration_ms": 18,
-      "tests": 15,
+      "tests": 18,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/StrategicSessionEvents.test.tsx",
-      "duration_ms": 18,
-      "tests": 4,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/StrategicChallengeChip.test.tsx",
-      "duration_ms": 17,
-      "tests": 7,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/hooks/dashboardAccessGating.test.tsx",
+      "file": "src/components/AnomalyThrottleBanner.test.tsx",
       "duration_ms": 16,
-      "tests": 2,
+      "tests": 3,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/utils/attachments.test.ts",
-      "duration_ms": 16,
-      "tests": 5,
+      "file": "src/hooks/useStrategistStatus.test.ts",
+      "duration_ms": 15,
+      "tests": 10,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/components/FailureStageWidget.test.tsx",
-      "duration_ms": 16,
-      "tests": 5,
+      "file": "src/test/viewport-coverage.test.ts",
+      "duration_ms": 15,
+      "tests": 23,
       "measured": true,
       "flaky": false
     },
@@ -1218,16 +1204,16 @@
       "flaky": false
     },
     {
-      "file": "src/components/SearchFilterBar.test.tsx",
+      "file": "src/components/StrategicChallengeChip.test.tsx",
       "duration_ms": 15,
-      "tests": 1,
+      "tests": 7,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/strategicStateApi.test.ts",
+      "file": "src/hooks/dashboardAccessGating.test.tsx",
       "duration_ms": 14,
-      "tests": 28,
+      "tests": 2,
       "measured": true,
       "flaky": false
     },
@@ -1239,72 +1225,72 @@
       "flaky": false
     },
     {
-      "file": "src/hooks/useStrategistStatus.test.ts",
+      "file": "src/hooks/useStrategicContextNavigation.test.tsx",
       "duration_ms": 14,
-      "tests": 10,
+      "tests": 7,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/hooks/usePersistedState.test.ts",
-      "duration_ms": 13,
-      "tests": 9,
+      "file": "src/components/FailureStageWidget.test.tsx",
+      "duration_ms": 14,
+      "tests": 5,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/SearchFilterBar.test.tsx",
+      "duration_ms": 14,
+      "tests": 1,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/components/WarmStartOriginRow.test.tsx",
-      "duration_ms": 13,
+      "duration_ms": 14,
       "tests": 3,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/hooks/useConversationSend.test.tsx",
+      "duration_ms": 13,
+      "tests": 5,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/taskCsv.test.ts",
+      "duration_ms": 13,
+      "tests": 6,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/__tests__/strategicReconnect.test.tsx",
+      "duration_ms": 12,
+      "tests": 1,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/attachments.test.ts",
       "duration_ms": 12,
       "tests": 5,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/hooks/useProjectConfig.test.tsx",
+      "file": "src/strategicStateApi.test.ts",
       "duration_ms": 11,
-      "tests": 2,
+      "tests": 28,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/hooks/useViewPreferences.test.ts",
-      "duration_ms": 11,
+      "duration_ms": 10,
       "tests": 5,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/SrBadges.test.tsx",
-      "duration_ms": 11,
-      "tests": 1,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/__tests__/strategicReconnect.test.tsx",
-      "duration_ms": 10,
-      "tests": 1,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/test/viewport-diff.test.ts",
-      "duration_ms": 10,
-      "tests": 4,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/utils/taskCsv.test.ts",
-      "duration_ms": 10,
-      "tests": 6,
       "measured": true,
       "flaky": false
     },
@@ -1316,6 +1302,13 @@
       "flaky": false
     },
     {
+      "file": "src/test/viewport-diff.test.ts",
+      "duration_ms": 9,
+      "tests": 4,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/utils/strategicSessionLive.test.ts",
       "duration_ms": 9,
       "tests": 29,
@@ -1323,16 +1316,16 @@
       "flaky": false
     },
     {
-      "file": "src/operatorWorkbenchContracts.test.ts",
-      "duration_ms": 7,
-      "tests": 3,
+      "file": "src/components/SrBadges.test.tsx",
+      "duration_ms": 9,
+      "tests": 1,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/utils/outcomeKinds.test.ts",
+      "file": "src/hooks/useProjectConfig.test.tsx",
       "duration_ms": 7,
-      "tests": 35,
+      "tests": 2,
       "measured": true,
       "flaky": false
     },
@@ -1344,13 +1337,6 @@
       "flaky": false
     },
     {
-      "file": "src/utils/pendingWhiteboardArtifactRef.test.ts",
-      "duration_ms": 7,
-      "tests": 6,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/accountManager.test.ts",
       "duration_ms": 6,
       "tests": 9,
@@ -1358,9 +1344,9 @@
       "flaky": false
     },
     {
-      "file": "src/utils/conversationDraftState.test.ts",
+      "file": "src/operatorWorkbenchContracts.test.ts",
       "duration_ms": 6,
-      "tests": 6,
+      "tests": 3,
       "measured": true,
       "flaky": false
     },
@@ -1372,9 +1358,9 @@
       "flaky": false
     },
     {
-      "file": "src/utils/directionHelpers.test.ts",
+      "file": "src/utils/conversationDraftState.test.ts",
       "duration_ms": 5,
-      "tests": 17,
+      "tests": 6,
       "measured": true,
       "flaky": false
     },
@@ -1386,23 +1372,16 @@
       "flaky": false
     },
     {
-      "file": "src/utils/newProjectOAuthResume.test.ts",
+      "file": "src/utils/outcomeKinds.test.ts",
       "duration_ms": 5,
-      "tests": 5,
+      "tests": 35,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/utils/strategicContextDescriptor.test.ts",
+      "file": "src/utils/pendingWhiteboardArtifactRef.test.ts",
       "duration_ms": 5,
-      "tests": 10,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/MessagesPanel.invariant.test.ts",
-      "duration_ms": 5,
-      "tests": 9,
+      "tests": 6,
       "measured": true,
       "flaky": false
     },
@@ -1421,9 +1400,9 @@
       "flaky": false
     },
     {
-      "file": "src/hooks/browserPlayoutTracker.test.ts",
+      "file": "src/utils/directionHelpers.test.ts",
       "duration_ms": 4,
-      "tests": 2,
+      "tests": 17,
       "measured": true,
       "flaky": false
     },
@@ -1442,9 +1421,30 @@
       "flaky": false
     },
     {
+      "file": "src/utils/sidecarTasks.test.ts",
+      "duration_ms": 4,
+      "tests": 15,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/strategicContextDescriptor.test.ts",
+      "duration_ms": 4,
+      "tests": 10,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/utils/strategicWorkbenchSession.test.ts",
       "duration_ms": 4,
       "tests": 4,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/MessagesPanel.invariant.test.ts",
+      "duration_ms": 4,
+      "tests": 9,
       "measured": true,
       "flaky": false
     },
@@ -1456,9 +1456,9 @@
       "flaky": false
     },
     {
-      "file": "src/accessControl.test.ts",
-      "duration_ms": 3,
-      "tests": 8,
+      "file": "src/components/eventPrefs.test.ts",
+      "duration_ms": 4,
+      "tests": 40,
       "measured": true,
       "flaky": false
     },
@@ -1470,9 +1470,16 @@
       "flaky": false
     },
     {
-      "file": "src/utils/fixLoopLayers.test.ts",
+      "file": "src/utils/citationLinks.test.ts",
       "duration_ms": 3,
-      "tests": 6,
+      "tests": 13,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/convergenceVerdict.test.ts",
+      "duration_ms": 3,
+      "tests": 4,
       "measured": true,
       "flaky": false
     },
@@ -1484,16 +1491,9 @@
       "flaky": false
     },
     {
-      "file": "src/utils/projectSelection.test.ts",
+      "file": "src/utils/newProjectOAuthResume.test.ts",
       "duration_ms": 3,
-      "tests": 2,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/utils/sidecarTasks.test.ts",
-      "duration_ms": 3,
-      "tests": 15,
+      "tests": 5,
       "measured": true,
       "flaky": false
     },
@@ -1519,20 +1519,6 @@
       "flaky": false
     },
     {
-      "file": "src/components/eventPrefs.test.ts",
-      "duration_ms": 3,
-      "tests": 40,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/messageArming.test.ts",
-      "duration_ms": 3,
-      "tests": 29,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/App.test.tsx",
       "duration_ms": 2,
       "tests": 4,
@@ -1540,9 +1526,16 @@
       "flaky": false
     },
     {
-      "file": "src/qualificationStateVocab.contract.test.ts",
+      "file": "src/accessControl.test.ts",
       "duration_ms": 2,
-      "tests": 4,
+      "tests": 8,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/appWorkbenchConstants.test.ts",
+      "duration_ms": 2,
+      "tests": 3,
       "measured": true,
       "flaky": false
     },
@@ -1550,20 +1543,6 @@
       "file": "src/hooks/useUIState.test.ts",
       "duration_ms": 2,
       "tests": 3,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/types/workbenchEvents.test.ts",
-      "duration_ms": 2,
-      "tests": 4,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/types/workbenchTargets.test.ts",
-      "duration_ms": 2,
-      "tests": 4,
       "measured": true,
       "flaky": false
     },
@@ -1589,16 +1568,23 @@
       "flaky": false
     },
     {
-      "file": "src/utils/computeAnalysisLabels.test.ts",
+      "file": "src/types/workbenchEvents.test.ts",
       "duration_ms": 2,
-      "tests": 12,
+      "tests": 4,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/utils/convergenceVerdict.test.ts",
+      "file": "src/types/workbenchTargets.test.ts",
       "duration_ms": 2,
       "tests": 4,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/computeAnalysisLabels.test.ts",
+      "duration_ms": 2,
+      "tests": 12,
       "measured": true,
       "flaky": false
     },
@@ -1610,23 +1596,16 @@
       "flaky": false
     },
     {
-      "file": "src/utils/conversationMessageIdentity.test.ts",
-      "duration_ms": 2,
-      "tests": 2,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/utils/conversationSendState.test.ts",
-      "duration_ms": 2,
-      "tests": 1,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/utils/externalUrl.test.ts",
       "duration_ms": 2,
       "tests": 12,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/fixLoopLayers.test.ts",
+      "duration_ms": 2,
+      "tests": 6,
       "measured": true,
       "flaky": false
     },
@@ -1641,6 +1620,27 @@
       "file": "src/utils/mergeGateSummary.test.ts",
       "duration_ms": 2,
       "tests": 7,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/projectSelection.test.ts",
+      "duration_ms": 2,
+      "tests": 2,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/strategicAttention.test.ts",
+      "duration_ms": 2,
+      "tests": 3,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/taskGraph.test.ts",
+      "duration_ms": 2,
+      "tests": 11,
       "measured": true,
       "flaky": false
     },
@@ -1666,9 +1666,16 @@
       "flaky": false
     },
     {
-      "file": "src/appWorkbenchConstants.test.ts",
-      "duration_ms": 1,
-      "tests": 3,
+      "file": "src/components/messageArming.test.ts",
+      "duration_ms": 2,
+      "tests": 23,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/components/projectToolHidden.test.ts",
+      "duration_ms": 2,
+      "tests": 6,
       "measured": true,
       "flaky": false
     },
@@ -1676,6 +1683,13 @@
       "file": "src/branch-literal-regression.test.ts",
       "duration_ms": 1,
       "tests": 3,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/qualificationStateVocab.contract.test.ts",
+      "duration_ms": 1,
+      "tests": 4,
       "measured": true,
       "flaky": false
     },
@@ -1701,6 +1715,20 @@
       "flaky": false
     },
     {
+      "file": "src/utils/conversationMessageIdentity.test.ts",
+      "duration_ms": 1,
+      "tests": 2,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/conversationSendState.test.ts",
+      "duration_ms": 1,
+      "tests": 1,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/utils/failureClass.test.ts",
       "duration_ms": 1,
       "tests": 4,
@@ -1722,13 +1750,6 @@
       "flaky": false
     },
     {
-      "file": "src/utils/strategicAttention.test.ts",
-      "duration_ms": 1,
-      "tests": 3,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/utils/strategicWorkSessionMetrics.test.ts",
       "duration_ms": 1,
       "tests": 2,
@@ -1736,23 +1757,9 @@
       "flaky": false
     },
     {
-      "file": "src/utils/taskGraph.test.ts",
-      "duration_ms": 1,
-      "tests": 11,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/components/AdversarialQualityPanel.test.tsx",
-      "duration_ms": 1,
+      "duration_ms": 0,
       "tests": 1,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/components/projectToolHidden.test.ts",
-      "duration_ms": 1,
-      "tests": 6,
       "measured": true,
       "flaky": false
     }

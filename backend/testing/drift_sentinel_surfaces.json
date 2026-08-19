@@ -33,6 +33,36 @@
       "glob": "backend/alembic/versions/0626_*.py",
       "sentinels": ["backend/testing/test_migration_0626_safe_encrypt_backfill.py"],
       "why": "Same rationale as 0621: test_migration_0626_safe_encrypt_backfill.py loads the migration via importlib; register here so migration body changes trigger the acceptance tests at the task PR."
+    },
+    {
+      "glob": "admin-ui/**",
+      "sentinels": ["backend/testing/test_vitest_durations_freshness.py"],
+      "why": "test_vitest_durations_freshness.py reads admin-ui/.test_durations.json and rglobs admin-ui/src (and eslint-rules/) for the committed Vitest test inventory it must match. It imports nothing under backend/app or backend/testing, and the changed files it cares about live entirely outside backend/, so neither the dotted-import reverse-dep scan nor STATIC_PATH_PREFIXES in scripts/static_release_guard.py can select it. A PR confined to admin-ui/ previously merged with a stale duration artifact undetected until the promotion matrix forced every guard on."
+    },
+    {
+      "glob": "admin-ui/src/**",
+      "sentinels": ["backend/testing/test_conversational_workday_protection.py"],
+      "why": "test_conversational_workday_protection.py validates conversational_workday_manifest.json's PROTECT list, which names files under admin-ui/src. Same selection gap as the durations sentinel: no backend/app import, no backend/ prefix match."
+    },
+    {
+      "glob": "agent/**",
+      "sentinels": ["backend/testing/test_vitest_durations_freshness.py"],
+      "why": "Same rationale as admin-ui/** above, for the agent/ Vitest suite: test_vitest_durations_freshness.py reads agent/.test_durations.json and rglobs agent/src for the committed test inventory."
+    },
+    {
+      "glob": "agent/src/**",
+      "sentinels": ["backend/testing/test_conversational_workday_protection.py"],
+      "why": "conversational_workday_manifest.json's PROTECT list also names files under agent/src; same selection gap as the admin-ui/src/** entry above."
+    },
+    {
+      "glob": "scripts/test_runner_isolation.py",
+      "sentinels": ["backend/testing/test_conversational_workday_protection.py"],
+      "why": "conversational_workday_manifest.json's PROTECT list names this exact file. Scoped to the file itself (not a scripts/** wildcard) so it does not widen STATIC_PATH_PREFIXES's deliberately narrow scripts/ scope (e.g. scripts/test-backend.sh.bak must stay out of scope, per test_static_scope_matches_path_boundaries)."
+    },
+    {
+      "glob": "scripts/test_local_runner.py",
+      "sentinels": ["backend/testing/test_conversational_workday_protection.py"],
+      "why": "conversational_workday_manifest.json's PROTECT list names this exact file. Same scoping rationale as scripts/test_runner_isolation.py above."
     }
   ]
 }

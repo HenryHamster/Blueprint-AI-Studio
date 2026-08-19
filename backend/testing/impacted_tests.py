@@ -390,6 +390,18 @@ def _load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]
     return compiled
 
 
+def load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]]":
+    """Public accessor for the compiled drift-sentinel surface manifest.
+
+    Thin wrapper around :func:`_load_surface_manifest` so a non-testing
+    production script (e.g. ``scripts/static_release_guard.py``) can reuse the
+    same compiled ``(glob_regex, [sentinel_path, ...])`` pairs that drive the
+    merge-time impacted-test selector, instead of re-deriving its own
+    prefix/glob list that can silently drift out of sync with this manifest.
+    """
+    return _load_surface_manifest(repo_root)
+
+
 def _sentinel_exists(sentinel: str, repo_root: str) -> bool:
     """Whether a registered sentinel exists on disk (harness-layout aware).
 

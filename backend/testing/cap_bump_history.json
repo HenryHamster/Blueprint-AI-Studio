@@ -1645,8 +1645,8 @@
           "new_cap": 1700
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-19T12:21:31.979838+00:00",
+          "commit_sha": "a713e4e320e6011157f6c51746a37f8f067993e7",
+          "commit_date": "2026-08-19T15:33:45+00:00",
           "old_cap": 1700,
           "new_cap": 2050
         }
@@ -4579,8 +4579,8 @@
       ],
       "test_strategic_state.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-19T12:21:31.979838+00:00",
+          "commit_sha": "a713e4e320e6011157f6c51746a37f8f067993e7",
+          "commit_date": "2026-08-19T15:33:45+00:00",
           "old_cap": 10600,
           "new_cap": 12250
         }

@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import IntegrityError
 
 from app import release_version as rv
@@ -946,6 +947,28 @@ async def test_open_version_inserts_open_build_row(db_session):
     assert version.phase == "build"
     assert version.base_sha == "abc123"
     assert version.opened_at is not None
+
+
+@pytest.mark.asyncio
+async def test_open_version_deploy_artifacts_readable_without_lazy_load(db_session):
+    """open_version returns a version whose deploy_artifacts collection is loaded.
+
+    The serving-summary readers (release_artifacts.version_serving_summary,
+    project_outcome_projection) read ``version.deploy_artifacts`` synchronously
+    and rely on callers eager-loading it. A version handed back by open_version
+    never goes through one of those selectinload queries, so once it is flushed
+    and persistent an unloaded collection would emit an async lazy-load from
+    that synchronous read (MissingGreenlet). Marking the — necessarily empty —
+    collection loaded at construction removes the lazy-load entirely.
+    """
+    project = await _make_project(db_session)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    # Persistent instance: the collection must already be loaded, so the
+    # synchronous read below performs no IO.
+    assert "deploy_artifacts" not in sa_inspect(version).unloaded
+    assert getattr(version, "deploy_artifacts", None) == []
 
 
 @pytest.mark.asyncio

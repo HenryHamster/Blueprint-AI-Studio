@@ -279,7 +279,6 @@
     "test_compute.py": 9400,
     "test_research_completion.py": 23850,
     "test_strategic_completion.py": 22750,
-    "test_strategic_spawning.py": 22650,
     "test_reaper.py": 21750,
     "test_review_pipeline.py": 21650,
     "test_autonomous_research.py": 20850,
@@ -416,7 +415,15 @@
     "test_size_limits_checker.py": 1750,
     "test_release_commit_authorship.py": 2650,
     "test_approved_pr_stranding.py": 1800,
-    "test_admin_approval_authority.py": 1750
+    "test_admin_approval_authority.py": 1750,
+    "test_strategic_spawning_type_selection.py": 3287,
+    "test_strategic_spawning_capability_prediction.py": 3277,
+    "test_strategic_spawning_scope_budget.py": 3252,
+    "test_strategic_spawning_version_phase.py": 3371,
+    "test_strategic_spawning_outcome_evaluation.py": 3276,
+    "test_strategic_spawning_capability_verification.py": 3260,
+    "test_strategic_spawning_portfolio_messages.py": 3274,
+    "test_strategic_spawning_summaries.py": 2966
   },
   "scripts": {
     "test_local_runner.py": 14250,

@@ -786,6 +786,80 @@ def test_live_surface_manifest_is_valid_and_registers_websocket_sentinel():
     assert "backend/testing/test_websocket_emitter_inventory.py" in selected
 
 
+def test_load_surface_manifest_is_thin_wrapper_over_private_loader(tmp_path):
+    """The public accessor returns exactly what the private loader compiles.
+
+    ``scripts/static_release_guard.py`` (outside backend/testing) consumes the
+    manifest via this public wrapper rather than reaching into the
+    underscore-prefixed ``_load_surface_manifest``; the two must stay in lockstep.
+    """
+    root = str(tmp_path)
+    _make_tree(root)
+    _write_surface_manifest(
+        root,
+        [
+            {
+                "glob": "admin-ui/**",
+                "sentinels": ["backend/testing/test_tree_sentinel.py"],
+            }
+        ],
+    )
+    _write(root, "backend/testing/test_tree_sentinel.py", "x = 1\n")
+    private = impacted_tests._load_surface_manifest(root)
+    public = impacted_tests.load_surface_manifest(root)
+    assert [p.pattern for p, _ in public] == [p.pattern for p, _ in private]
+    assert [s for _, s in public] == [s for _, s in private]
+    assert public, "wrapper compiled no surfaces from a valid manifest"
+
+
+def test_admin_ui_surface_change_resolves_the_vitest_durations_sentinel():
+    """A changed admin-ui/ path selects the vitest durations freshness sentinel.
+
+    This is the live-manifest regression for the gap this feature closes:
+    ``test_vitest_durations_freshness.py`` reads admin-ui/.test_durations.json
+    and rglobs admin-ui/src, but imports no backend/app module and lives outside
+    STATIC_PATH_PREFIXES, so an admin-ui-only PR previously selected neither the
+    reverse-dep scan nor the static release guard's scope gate for it.
+    """
+    repo_root = impacted_tests._DEFAULT_REPO_ROOT
+    selected = impacted_tests.resolve_impacted(
+        ["admin-ui/src/components/MessagesPanel.tsx"], repo_root
+    )
+    assert "backend/testing/test_vitest_durations_freshness.py" in selected
+
+
+def test_agent_surface_change_resolves_the_vitest_durations_sentinel():
+    """Same coverage as the admin-ui case above, for the agent/ Vitest suite."""
+    repo_root = impacted_tests._DEFAULT_REPO_ROOT
+    selected = impacted_tests.resolve_impacted(
+        ["agent/src/handlers/strategic.ts"], repo_root
+    )
+    assert "backend/testing/test_vitest_durations_freshness.py" in selected
+
+
+def test_admin_ui_src_change_resolves_conversational_workday_sentinel():
+    """A changed admin-ui/src/ path selects the conversational Workday guard.
+
+    ``conversational_workday_manifest.json``'s PROTECT list names files under
+    admin-ui/src, agent/src, and scripts/ — none of which fall under
+    STATIC_PATH_PREFIXES or the dotted-import reverse-dep scan.
+    """
+    repo_root = impacted_tests._DEFAULT_REPO_ROOT
+    selected = impacted_tests.resolve_impacted(
+        ["admin-ui/src/components/MessagesPanel.tsx"], repo_root
+    )
+    assert "backend/testing/test_conversational_workday_protection.py" in selected
+
+
+def test_scripts_change_resolves_conversational_workday_sentinel():
+    """A changed protected scripts/ file also selects the conversational Workday guard."""
+    repo_root = impacted_tests._DEFAULT_REPO_ROOT
+    selected = impacted_tests.resolve_impacted(
+        ["scripts/test_runner_isolation.py"], repo_root
+    )
+    assert "backend/testing/test_conversational_workday_protection.py" in selected
+
+
 def test_indirectly_reached_module_via_two_hop_chain(tmp_path):
     """A two-hop chain (test -> intermediate -> changed leaf) selects the test.
 

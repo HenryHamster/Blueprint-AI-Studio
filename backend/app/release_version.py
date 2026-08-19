@@ -71,6 +71,7 @@ from app.acceptance_gate import (
 )
 from app.landed_signal import landed_signal_predicate
 from app.models import Artifact, ArtifactType, Project, ReleaseVersion, Task, TaskStatus
+from app.release_audit_child_state import _audit_child_crashed
 from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.time_utils import _coerce_naive_utc, _utcnow
 _MODULE_SIZE_GOVERNANCE_CAP: int = 1839
@@ -189,6 +190,17 @@ async def open_version(
         base_sha=base_sha,
         goal=goal[:_GOAL_MAX] if goal else None,
     )
+    # A version that is only now being opened cannot yet have any
+    # ReleaseDeployArtifact rows pointing at it. Setting the collection
+    # explicitly marks it loaded, so the synchronous readers that rely on the
+    # eager-load contract (e.g. version_serving_summary's
+    # `getattr(version, "deploy_artifacts", None)`) never need a lazy load on
+    # this instance — once it is flushed and persistent, an unloaded
+    # collection would emit one from async context (MissingGreenlet). The
+    # session factory sets expire_on_commit=False, so a commit does not undo
+    # this. Covered by
+    # testing/test_release_version.py::test_open_version_deploy_artifacts_readable_without_lazy_load.
+    version.deploy_artifacts = []
     session.add(version)
     from app.acceptance_criteria import ensure_operator_authorship_criterion
 
@@ -713,43 +725,6 @@ def format_promotion_freshness(state: Mapping[str, Any] | None) -> str:
     elif state.get("promotion_nearing_timeout"):
         phrase += ", nearing timeout"
     return f" — {phrase}"
-
-
-# Audit-child task statuses that are NOT a crash when no report is present.
-# Mirrors the frontend ``classifyAuditNoReport`` (VersionLifecyclePanel.tsx) so
-# the operator panel's top badge and its audit-findings section agree by
-# construction:
-#   - non-terminal (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING) → still running
-#   - BLOCKED → waiting on a precondition, distinct from a crash
-#   - COMPLETED with no report → finished-but-empty anomaly, not a crash
-# FAILED / CANCELLED / any other (unknown) terminal status with no report is a
-# genuine crash.
-_AUDIT_NONCRASH_STATUSES = frozenset(
-    {"QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "BLOCKED", "COMPLETED"}
-)
-
-
-def _audit_child_crashed(audit_child: dict[str, Any] | None) -> bool:
-    """Return True when the audit child reached a terminal-failed state with no report.
-
-    ``audit_child`` is the version-scoped audit-evidence envelope (the
-    ``latest_audit`` dict resolved by ``resolve_lifecycle_audit_evidence``),
-    carrying ``task_status`` and ``report``.
-    ``None`` (no current audit child resolved) → not a crash, so callers that
-    pass no signal preserve the prior ``qualifying`` behavior. Pure/sync — no I/O.
-    """
-    if not isinstance(audit_child, dict):
-        return False
-    if audit_child.get("report"):
-        # The audit produced a report — by construction not a crashed-no-report.
-        return False
-    status = str(audit_child.get("task_status") or "").strip().upper()
-    if not status:
-        # No status signal — do not assert a crash.
-        return False
-    # FAILED / CANCELLED / unknown terminal status, with no report → crashed;
-    # everything in the noncrash set (running / blocked / completed-empty) is not.
-    return status not in _AUDIT_NONCRASH_STATUSES
 
 
 def summarize_qualification_state(

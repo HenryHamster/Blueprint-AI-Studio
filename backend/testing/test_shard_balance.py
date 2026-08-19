@@ -22,6 +22,7 @@ import ast
 import heapq
 import importlib.util
 import json
+import shlex
 import warnings
 from pathlib import Path
 
@@ -142,6 +143,54 @@ def test_ci_uses_least_duration_splitting() -> None:
         "pytest-split must use least_duration so CI matches this LDF balance "
         "guard; its default duration_based_chunks algorithm previously put "
         "nearly half the suite in one contiguous shard"
+    )
+
+
+def test_rerun_allowlist_is_pinned_to_event_loop_signatures() -> None:
+    """Pin the ``--only-rerun`` allowlist that scopes ``--reruns 2``.
+
+    ``--reruns 2`` alone would retry any failure, including ordinary
+    regressions, on both the base-tree and current-tree runs of every
+    differential guard. ``--only-rerun`` narrows pytest-rerunfailures'
+    retries to failures whose message matches one of the given patterns
+    (see pytest-rerunfailures==14.0, pinned in backend/requirements.txt).
+    Today that allowlist only covers the two event-loop-teardown flake
+    signatures that ``_dispose_production_engine_per_test`` in conftest.py
+    defends against as its root-cause fix. Widening the allowlist, adding
+    unrelated patterns, or dropping ``--only-rerun`` (making ``--reruns``
+    unconditional) would silently convert this signature-scoped net into a
+    blanket retry that can mask real regressions -- assert the exact set so
+    that change requires touching this test.
+    """
+    addopts = shlex.split(_load_pytest_addopts(PYPROJECT_PATH))
+
+    reruns_values = [
+        addopts[index + 1]
+        for index, option in enumerate(addopts[:-1])
+        if option == "--reruns"
+    ]
+    assert reruns_values == ["2"], (
+        "expected exactly one '--reruns 2' in pytest addopts; found "
+        f"{reruns_values!r}. A missing --reruns disables the event-loop "
+        "flake net entirely; more than one or a different count changes "
+        "the retry budget without this test being updated."
+    )
+
+    only_rerun_values = [
+        addopts[index + 1]
+        for index, option in enumerate(addopts[:-1])
+        if option == "--only-rerun"
+    ]
+    assert only_rerun_values == [
+        "attached to a different loop",
+        "Event loop is closed",
+    ], (
+        "pytest addopts --only-rerun allowlist changed from the pinned "
+        f"event-loop signatures; found {only_rerun_values!r}. Widening "
+        "this allowlist (or dropping --only-rerun so --reruns retries "
+        "unconditionally) turns the signature-scoped rerun net into a "
+        "blanket retry on both sides of every differential guard, which "
+        "can mask ordinary regressions as flakes."
     )
 
 
