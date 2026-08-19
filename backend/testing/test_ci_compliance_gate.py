@@ -2806,3 +2806,56 @@ def test_git_refs_has_no_ci_compliance_branch_literal_fallback():
         + "\n".join(violations)
         + "\nResolve the branch through a named constant or per-project config."
     )
+
+
+@pytest.mark.asyncio
+async def test_scan_capped_files_uses_ref_declared_governance_cap_not_local_tree(
+    mocker,
+):
+    """Leg 2 regression: the at-SHA evaluator must classify a module against
+    the ``*_SIZE_GOVERNANCE_CAP`` declared IN THE FETCHED REF TEXT, not
+    whatever the local/installed tree resolves for that ``module_key``.
+
+    ``ref_only_governed.py`` has no counterpart on the local disk tree that
+    ``ci_compliance._scan_capped_files`` runs on, so resolving governance from
+    the local tree (the pre-fix behavior) finds NO governance cap at all and
+    misses this breach — the module reads as compliant at 150/200 lines
+    against the looser JSON cap alone. Resolving from the ref's own fetched
+    text (the fix) finds the tighter governance cap of 100 declared at that
+    ref and correctly flags the breach. Same fetched text, opposite verdict
+    depending on which tree the governance cap is read from.
+    """
+    ref_module_text = "\n".join(
+        ["_MODULE_SIZE_GOVERNANCE_CAP: int = 100"] + ["# pad"] * 149
+    )
+    assert len(ref_module_text.splitlines()) == 150
+
+    async def _reader(path, *, token, owner, repo, ref, project_id=None):
+        if path == "backend/app/ref_only_governed.py":
+            return ref_module_text
+        return None
+
+    mocker.patch.object(ci_compliance.github, "get_file_text_at_ref", new=_reader)
+
+    limits = {"backend": {"ref_only_governed.py": 200}}  # looser JSON cap
+    violations, checked = await ci_compliance._scan_capped_files(
+        limits=limits,
+        token="token",
+        owner="owner",
+        repo="repo",
+        ref=_HEAD_SHA,
+        project_id=None,
+    )
+
+    assert checked == 1
+    assert violations == [
+        {
+            "section": "backend",
+            "rel": "ref_only_governed.py",
+            "count": 150,
+            "cap": 200,
+        }
+    ], (
+        "must flag the breach against the ref-declared governance cap (100), "
+        f"not silently pass on the looser JSON cap (200); got {violations}"
+    )

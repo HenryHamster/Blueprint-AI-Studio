@@ -134,6 +134,7 @@ def classify_size_record(
     override_chronic: bool = False,
     with_verdict: bool = True,
     repo_root: str | None = None,
+    governance_caps: "list[int] | None" = None,
 ) -> dict:
     """Content-injectable breach-and-bump classification for ONE counted record.
 
@@ -156,10 +157,14 @@ def classify_size_record(
         ``breach`` (and ``with_verdict``), else ``None``. ``with_verdict=False``
         skips the (git-touching) chronic lookup for the plain check path, which
         only needs the breach flag.
+
+    ``governance_caps``, passed by the at-SHA evaluator with the cap parsed from
+    the same ref text it fetched, overrides the local-tree lookup (see
+    ``resolve_effective_cap``).
     """
     from app.size_limit_policy import is_breach, resolve_effective_cap
 
-    effective_cap = resolve_effective_cap(rel, section, cap, repo_root=repo_root)
+    effective_cap = resolve_effective_cap(rel, section, cap, repo_root=repo_root, governance_caps=governance_caps)
     breach = is_breach(count, effective_cap)
     verdict = None
     if breach and with_verdict:
@@ -1034,16 +1039,16 @@ def main(argv: list[str] | None = None) -> int:
                 override_chronic=args.force_chronic,
                 repo_root=args.repo_root,
             )["verdict"]
-            if verdict["is_chronic"] and not args.force_chronic:
-                print(
-                    f"[chronic] {section}/{rec['rel']}: {rec['count']} lines — "
-                    f"{verdict['reason']} Skipping cap bump; use --force-chronic "
-                    f"to override with operator approval."
-                )
+            if verdict["suggested_new_limit"] is None:
+                # First-class refusal — chronic (no override) or already beyond
+                # governance (no override can help; never suggest one).
+                governance_refusal = verdict["reason"].startswith("Refusing cap bump:")
+                hint = "" if governance_refusal else " Skipping cap bump; use --force-chronic to override with operator approval."
+                label = "[refused]" if governance_refusal else "[chronic]"
+                print(f"{label} {section}/{rec['rel']}: {rec['count']} lines — {verdict['reason']}{hint}")
                 chronic_skipped.append((section, rec, verdict["reason"]))
             else:
                 new_cap = verdict["suggested_new_limit"]
-                assert new_cap is not None
                 data[section][rec["rel"]] = new_cap
                 label = "[fix-chronic]" if verdict["is_chronic"] else "[fix]"
                 print(
@@ -1183,9 +1188,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{'; '.join(actions)} in {args.json_path}.")
         if chronic_skipped:
             print(
-                f"\n{len(chronic_skipped)} chronic offender(s) skipped — "
-                "decomposition required before bumping cap. "
-                "Use --force-chronic with operator approval to override."
+                f"\n{len(chronic_skipped)} cap bump(s) refused (see reasons above) — decompose "
+                "the module, or for a governance-tightened cap make a deliberate paired raise "
+                f"of the source-declared *_SIZE_GOVERNANCE_CAP constant AND its {os.path.basename(args.json_path)} entry."
             )
             return 1
         return 0
@@ -1235,6 +1240,12 @@ def main(argv: list[str] | None = None) -> int:
         breaches, base_breached
     )
     if blocking_breaches:
+        from app.size_limit_policy import governance_source_relpath, resolve_effective_cap
+
+        # A module already beyond its OWN governance cap cannot be repaired by
+        # --fix/--force-chronic (both refuse unconditionally) — cheap AST-only
+        # check, no git, so guidance never points at a dead end.
+        zero_headroom: list[tuple[str, dict]] = []
         for section, rec, base_count in blocking_breaches:
             grew = f"; grew from {base_count} lines on base" if base_count is not None else ""
             cap_note = (
@@ -1244,13 +1255,23 @@ def main(argv: list[str] | None = None) -> int:
                 if rec.get("cap") is not None
                 else f"cap: {rec['effective_cap']} (governance cap, no JSON entry)"
             )
+            print(f"[breach] {section}/{rec['rel']}: {rec['count']} lines ({cap_note}){grew}")
+            governance_cap = resolve_effective_cap(rec["rel"], section, None, repo_root=args.repo_root)
+            if governance_cap is not None and rec["count"] > governance_cap:
+                zero_headroom.append((section, rec))
+
+        fixable_count = len(blocking_breaches) - len(zero_headroom)
+        if fixable_count:
+            print(f"\n{fixable_count} size breach(es) fixable. Run with --fix to bump the breached caps to the canonical policy value.")
+        if zero_headroom:
             print(
-                f"[breach] {section}/{rec['rel']}: {rec['count']} lines ({cap_note}){grew}"
+                f"\n{len(zero_headroom)} size breach(es) are already beyond their own governance "
+                "cap — --fix and --force-chronic cannot bump these. Decompose the module, or make "
+                f"a deliberate paired raise of the source-declared *_SIZE_GOVERNANCE_CAP constant AND its {args.json_path} entry:"
             )
-        print(
-            f"\n{len(blocking_breaches)} size breach(es). Run with --fix to bump "
-            f"the breached caps to the canonical policy value."
-        )
+            for section, rec in zero_headroom:
+                source_path = governance_source_relpath(section, rec["rel"]) or "<source module>"
+                print(f"  {section}/{rec['rel']}: raise the cap in {source_path} and {args.json_path}")
         exit_code = 1
 
     blocking_stale_caps, preexisting_stale_caps = _split_preexisting_records(

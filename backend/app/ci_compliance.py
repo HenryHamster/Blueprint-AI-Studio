@@ -336,6 +336,7 @@ async def _scan_capped_files(
     ``{section, rel, count, cap}`` dicts and checked is the number of files
     actually read at the ref.
     """
+    from app.size_limit_policy import governance_caps_from_source_text
     from testing.check_size_limits import classify_size_record
 
     # Collect all (section, rel, cap, path) entries to fetch in parallel.
@@ -379,7 +380,20 @@ async def _scan_capped_files(
             continue
         checked += 1
         count = len(text.splitlines())
-        rec = classify_size_record(rel, count, cap, section, with_verdict=False)
+        # ``text`` is this module's own source AT THE CANDIDATE REF (the same
+        # fetch used to count lines), so any *_SIZE_GOVERNANCE_CAP it declares
+        # is parsed from that ref directly — never from the serving image's
+        # local tree, which would apply the WRONG (deployed-code) governance
+        # cap to a candidate that legitimately raised its own cap.
+        governance_caps = governance_caps_from_source_text(text)
+        rec = classify_size_record(
+            rel,
+            count,
+            cap,
+            section,
+            with_verdict=False,
+            governance_caps=governance_caps,
+        )
         if rec["breach"]:
             violations.append(
                 {"section": section, "rel": rel, "count": count, "cap": cap}

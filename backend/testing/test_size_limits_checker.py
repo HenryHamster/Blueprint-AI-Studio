@@ -11,6 +11,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 import app.size_limit_policy as slp
 from app.size_limit_policy import bump_size_limit
 from testing import check_size_limits as csl
@@ -1714,3 +1716,35 @@ def test_ungoverned_release_surface_module_fails_with_named_file(tmp_path, capsy
     _write_governed_module(release_module, total_lines=1, governance_cap=1)
     assert csl.find_ungoverned_release_surface_modules(repo) == []
     assert _run(jp, repo, "--sections", "backend") == 0
+
+
+# Zero-headroom escape hatch: --fix/--force-chronic cannot bump a module
+# already beyond its own governance cap; the checker must refuse cleanly.
+def _build_zero_headroom_governed_module(tmp_path, name: str):
+    repo, jp = _build_repo(tmp_path, backend={})
+    _write_governed_module(os.path.join(repo, "backend", "app", name), total_lines=110, governance_cap=100)
+    data = json.loads(_read(jp))
+    data["backend"][name] = 100
+    with open(jp, "w") as f:
+        json.dump(data, f)
+    return repo, jp
+
+
+@pytest.mark.parametrize("extra_args", [(), ("--force-chronic",)])
+def test_fix_refuses_zero_headroom_governed_module_without_crash(tmp_path, capsys, mocker, extra_args):
+    """--force-chronic waives the chronic gate, not the governance ceiling."""
+    repo, jp = _build_zero_headroom_governed_module(tmp_path, "governed_over.py")
+    with mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[]):
+        rc = _run(jp, repo, "--fix", *extra_args, "--sections", "backend")  # AssertionError here IS the defect
+    out = capsys.readouterr().out
+    assert rc == 1 and "governed_over.py is already 110 lines, beyond its governing cap 100" in out, out
+    assert json.loads(_read(jp))["backend"]["governed_over.py"] == 100
+
+
+def test_report_mode_zero_headroom_breach_names_paired_raise_not_fix(tmp_path, capsys):
+    """Check mode names the paired-raise remedy, never RECOMMENDS --fix/--force-chronic."""
+    repo, jp = _build_zero_headroom_governed_module(tmp_path, "governed_over_rpt.py")
+    rc = _run(jp, repo, "--sections", "backend")
+    out = capsys.readouterr().out
+    assert rc == 1 and "backend/app/governed_over_rpt.py" in out and "module_size_limits.json" in out
+    assert "Run with --fix to bump the breached caps" not in out and "use --force-chronic" not in out

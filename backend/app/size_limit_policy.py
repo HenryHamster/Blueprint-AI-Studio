@@ -40,35 +40,11 @@ _SECTION_SOURCE_DIRS = {
 }
 
 
-def _governing_caps_for_module(
-    module_key: str, section: str, repo_root: str | None = None
-) -> list[int]:
-    """Discover integer ``*_SIZE_GOVERNANCE_CAP`` declarations for a module.
-
-    Governance belongs next to the source it protects. Reading the declaration
-    from the module's AST keeps this policy generic: a future module can opt in
-    by declaring its own governing constant without adding a filename-specific
-    branch here. Invalid or unavailable source is treated as having no
-    discovered relationship; the ordinary cap policy remains available.
-    """
-    root = repo_root or _REPO_ROOT
-    source_root_parts = _SECTION_SOURCE_DIRS.get(section)
-    if source_root_parts is None:
-        return []
-    source_root = os.path.abspath(os.path.join(root, *source_root_parts))
-    if section == "backend" and not os.path.isdir(source_root):
-        # The production backend image installs the package at /app/app rather
-        # than carrying a full repository checkout. Keep source-adjacent
-        # governance effective there instead of silently applying generic
-        # headroom.
-        source_root = os.path.abspath(os.path.dirname(__file__))
-    source_path = os.path.abspath(os.path.join(source_root, module_key))
+def governance_caps_from_source_text(source_text: str) -> list[int]:
+    """``*_SIZE_GOVERNANCE_CAP`` int declarations in source text (no disk I/O)."""
     try:
-        if os.path.commonpath((source_root, source_path)) != source_root:
-            return []
-        with open(source_path, encoding="utf-8") as source_file:
-            tree = ast.parse(source_file.read(), filename=source_path)
-    except (OSError, SyntaxError, UnicodeError, ValueError):
+        tree = ast.parse(source_text)
+    except (SyntaxError, ValueError):
         return []
 
     caps: list[int] = []
@@ -92,6 +68,41 @@ def _governing_caps_for_module(
             ):
                 caps.append(value.value)
     return caps
+
+
+def _governing_caps_for_module(
+    module_key: str, section: str, repo_root: str | None = None
+) -> list[int]:
+    """Discover integer ``*_SIZE_GOVERNANCE_CAP`` declarations for a module.
+
+    Governance belongs next to the source it protects. Reading the declaration
+    from the module's AST keeps this policy generic: a future module can opt in
+    by declaring its own governing constant without adding a filename-specific
+    branch here. Invalid or unavailable source is treated as having no
+    discovered relationship; the ordinary cap policy remains available.
+    Reads the LOCAL tree; a caller holding ref-fetched text should call
+    :func:`governance_caps_from_source_text` directly instead.
+    """
+    root = repo_root or _REPO_ROOT
+    source_root_parts = _SECTION_SOURCE_DIRS.get(section)
+    if source_root_parts is None:
+        return []
+    source_root = os.path.abspath(os.path.join(root, *source_root_parts))
+    if section == "backend" and not os.path.isdir(source_root):
+        # The production backend image installs the package at /app/app rather
+        # than carrying a full repository checkout. Keep source-adjacent
+        # governance effective there instead of silently applying generic
+        # headroom.
+        source_root = os.path.abspath(os.path.dirname(__file__))
+    source_path = os.path.abspath(os.path.join(source_root, module_key))
+    try:
+        if os.path.commonpath((source_root, source_path)) != source_root:
+            return []
+        with open(source_path, encoding="utf-8") as source_file:
+            source_text = source_file.read()
+    except (OSError, UnicodeError, ValueError):
+        return []
+    return governance_caps_from_source_text(source_text)
 
 
 def bump_size_limit(
@@ -269,6 +280,18 @@ def governing_cap_source_path(section: str, module_key: str) -> str | None:
     return governing["source_path"] if governing else None
 
 
+def governance_source_relpath(section: str, module_key: str) -> str | None:
+    """Repo-relative path where ``module_key``'s own governance cap lives.
+
+    Pure path construction; covers any governed module, unlike
+    :func:`governing_cap_source_path` (curated ``_GOVERNING_CAPS`` only).
+    """
+    source_root_parts = _SECTION_SOURCE_DIRS.get(section)
+    if source_root_parts is None:
+        return None
+    return "/".join((*source_root_parts, module_key))
+
+
 def governing_cap_repair(
     section: str, module_key: str, new_limit: int
 ) -> GoverningCapRepair | None:
@@ -359,6 +382,8 @@ def resolve_effective_cap(
     section: str,
     json_cap: int | None,
     repo_root: str | None = None,
+    *,
+    governance_caps: list[int] | None = None,
 ) -> int | None:
     """Fold a source-declared governance cap into the cap the breach test uses.
 
@@ -370,8 +395,15 @@ def resolve_effective_cap(
     number actually gates a breach" is decided: the tighter of the two when
     both exist, the governance cap alone when there is no JSON entry, and the
     JSON cap unchanged when the module declares no governance cap.
+    ``governance_caps``, when passed (even ``[]``), is used AS-IS instead of
+    reading the local tree — pass ``governance_caps_from_source_text(ref_text)``
+    to gate against a specific ref instead of the local tree.
     """
-    governing_caps = _governing_caps_for_module(module_key, section, repo_root)
+    governing_caps = (
+        governance_caps
+        if governance_caps is not None
+        else _governing_caps_for_module(module_key, section, repo_root)
+    )
     if not governing_caps:
         return json_cap
     governance_cap = min(governing_caps)
