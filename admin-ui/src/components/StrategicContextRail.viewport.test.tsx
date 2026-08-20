@@ -502,7 +502,8 @@ describe('StrategicContextRail — viewport regression', () => {
     const rail = host?.querySelector('aside');
     const contextButton = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
     expect(host?.querySelector('[data-testid="strategic-chat-primary"]')?.textContent).toContain('Strategic chat');
-    expect(host?.querySelector('[data-testid="strategic-context-descriptor"]')?.tagName).toBe('DIV');
+    // Composer-adjacent StrategicContextDescriptor bar was removed in #17499.
+    expect(host?.querySelector('[data-testid="strategic-context-descriptor"]')).toBeNull();
     expect(host?.querySelector('[data-testid="strategic-context-package-summary"]')?.textContent).toContain('Strategic context');
     expect(host?.querySelector('[data-testid="strategic-chat-artifact-slot"]')).toBeNull();
     expect(host?.querySelector('[data-testid="strategic-context-descriptor-context_map"]')).toBeNull();
@@ -520,7 +521,8 @@ describe('StrategicContextRail — viewport regression', () => {
     const contextButton = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
     expect(rail).toBeTruthy();
     expect(contextButton).toBeTruthy();
-    expect(host?.querySelector('[data-testid="strategic-context-descriptor"]')?.tagName).toBe('DIV');
+    // Composer-adjacent StrategicContextDescriptor bar was removed in #17499.
+    expect(host?.querySelector('[data-testid="strategic-context-descriptor"]')).toBeNull();
     expect(host?.querySelector('[data-testid="strategic-chat-artifact-slot"]')).toBeNull();
     expect(getComputedStyle(rail!).display).toBe('none');
     expect(getComputedStyle(contextButton!).display).not.toBe('none');

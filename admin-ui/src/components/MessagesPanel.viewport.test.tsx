@@ -330,21 +330,17 @@ describe('MessagesPanel — viewport regression', () => {
     if (!host) throw new Error('Expected host to be mounted');
     const conversationColumn = host.querySelector<HTMLElement>('[data-testid="strategic-conversation-column"]');
     const composerBox = host.querySelector<HTMLElement>('[data-testid="strategic-composer-box"]');
-    const contextDescriptor = host.querySelector<HTMLElement>('[data-testid="strategic-context-descriptor"]');
     if (!conversationColumn || !composerBox) {
       throw new Error('Expected conversation column and composer box to be rendered');
     }
-    if (!contextDescriptor) {
-      throw new Error('Expected live Strategic context descriptor to render above the composer');
-    }
+    // Composer-adjacent StrategicContextDescriptor bar was removed in #17499;
+    // only the in-message receipt variant may render.
+    expect(host.querySelector('[data-testid="strategic-context-descriptor"]')).toBeNull();
 
     const columnRect = conversationColumn.getBoundingClientRect();
     const composerRect = composerBox.getBoundingClientRect();
-    const descriptorRect = contextDescriptor.getBoundingClientRect();
     expect(Math.abs(columnRect.left - composerRect.left)).toBeLessThanOrEqual(1);
     expect(Math.abs(columnRect.right - composerRect.right)).toBeLessThanOrEqual(1);
-    expect(descriptorRect.left).toBeGreaterThanOrEqual(columnRect.left - 1);
-    expect(descriptorRect.right).toBeLessThanOrEqual(columnRect.right + 1);
     expect(composerRect.width).toBeLessThanOrEqual(942);
   });
 

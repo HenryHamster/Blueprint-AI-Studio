@@ -27,6 +27,12 @@ export default defineConfig({
     setupFiles: ['./src/test/setup.ts'],
     include: ['src/**/*.test.{ts,tsx}', 'eslint-rules/**/*.test.{js,ts}'],
     exclude: ['node_modules/**', 'src/**/*.viewport.test.{ts,tsx}'],
+    // setup.ts raises Testing Library's asyncUtilTimeout to 5s so UI waits
+    // survive scheduling pressure on the shared self-hosted shards. Vitest's
+    // default 5s testTimeout capped the whole test at that same budget, so a
+    // slow-but-correct waitFor died as an opaque "Test timed out in 5000ms"
+    // instead of resolving (or failing with its own descriptive error).
+    testTimeout: 15_000,
     // A retry can turn a nondeterministic failure into a green build. Unit
     // tests must pass on their first execution so flakes remain actionable.
     retry: 0,
