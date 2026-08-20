@@ -1733,6 +1733,10 @@ async def _attempt_merge_with_retry_and_escalation(
                         ci_base,
                         fix_prompt=rebase_prompt,
                         original_task_id=ci_orig_id,
+                        # Conflict-only provenance: this spawn exists solely to rebase
+                        # a merge GitHub rejected. Lets the agent stale-premise exit
+                        # fire when a sibling merge already cleared it.
+                        fix_reason="merge_conflict",
                         # Phase 2d: post-APPROVE — review approved + CI passed
                         # but merge rejected. Rebase fix must cold-provision
                         # (release-on-APPROVE).

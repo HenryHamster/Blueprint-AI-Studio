@@ -3058,13 +3058,25 @@ async def test_suppress_warm_handoff_merge_blocked_rebase(db_session, mocker):
         task, "fake-token", "owner", "repo", db_session, source="webhook"
     )
 
-    # The rebase-fix path passes neither fix_reason nor a custom kwarg beyond
-    # suppress_warm_handoff=True; the call signature is identifiable by the
-    # absence of update_branch_failed/merge_conflict.
+    # 2026-08-20: this spawn now DOES set fix_reason. The previous assertion
+    # pinned its ABSENCE purely as a call-signature fingerprint (see the old
+    # comment: "identifiable by the absence of update_branch_failed/
+    # merge_conflict") — the subject of this test is suppress_warm_handoff, not
+    # the label. The fingerprint moves to the prompt, which is unique to this
+    # site. Flagging the self-certifying shape explicitly: this diff changes
+    # both the emitted value and the assertion on it, so the independent
+    # evidence lives elsewhere — the provenance guards in test_pipeline.py and
+    # the agent-side tests in agent/src/handlers/review-fix.test.ts that make
+    # the obsolete-exit conditional on the label.
     spawn_mock.assert_called_once()
     kw = spawn_mock.call_args.kwargs
-    assert kw.get("fix_reason", "") == "", (
-        f"merge-blocked rebase spawn must NOT set fix_reason, got {kw.get('fix_reason')!r}"
+    assert "GitHub rejected the merge" in kw.get("fix_prompt", ""), (
+        "wrong spawn site fired — this test targets the merge-blocked rebase path"
+    )
+    assert kw.get("fix_reason") == "merge_conflict", (
+        "the merge-blocked rebase spawn is conflict-only work; it must be "
+        "labelled so the agent's obsolete-exit may fire when a sibling merge "
+        "already cleared the block"
     )
     assert kw.get("suppress_warm_handoff") is True, (
         "merge-blocked rebase spawn (ci_completion.py:568) must pass "

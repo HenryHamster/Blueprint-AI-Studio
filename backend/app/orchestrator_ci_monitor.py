@@ -1979,6 +1979,18 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     original_task_id=ci_orig_id,
                     fix_target=_conflict_fix_target,
                     reviewed_head_sha=_fix_head_sha,
+                    # Structured spawn provenance. The agent obsolete-exit
+                    # (review-fix.ts CONFLICT_ONLY_FIX_REASONS) completes a fix
+                    # WITHOUT running Claude when the PR turns out clean, so it
+                    # must only fire for tasks whose entire job is the rebase.
+                    # This is the highest-volume such producer; leaving it
+                    # unstamped makes every conflict fix here re-run Claude on
+                    # an already-clean PR.
+                    fix_reason=(
+                        "update_branch_failed"
+                        if _behind_fallthrough
+                        else "merge_conflict"
+                    ),
                 )
                 ci_task = await _lock_task_for_mutation(
                     session,

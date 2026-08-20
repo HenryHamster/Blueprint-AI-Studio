@@ -2386,7 +2386,10 @@ describe('handleFix — stale-premise detection', () => {
         branch: 'feature/x', base_branch: 'main', pr_number: 99,
         prompt: 'resolve the merge conflicts blocking this PR',
       },
-      { context: { scope: 'small' } },
+      // fix_reason is what licenses the obsolete-exit: the backend spawned this
+      // task purely to resolve a conflict, so a clean PR really does mean there
+      // is nothing left to do. Without it the task is assumed to carry real work.
+      { context: { scope: 'small', review_loop: { fix_reason: 'merge_conflict' } } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
@@ -2398,6 +2401,86 @@ describe('handleFix — stale-premise detection', () => {
     const status = statusCalls[0][1];
     expect(status.status).toBe('COMPLETED');
     expect(String(status.logs)).toContain('stale premise');
+  });
+
+  // ── Regression 2026-08-20: the obsolete-exit voided real work ─────────────
+  // Operator fix task 10384f8e named three BP- review findings, mentioned that
+  // a merge conflict had already been resolved, met a clean PR, and was
+  // completed with zero commits and all three findings untouched. The exit is
+  // only correct when resolving the conflict WAS the whole job; `prompt`
+  // prose cannot establish that, so it now requires the backend's structured
+  // fix_reason and the absence of scoped review findings.
+
+  /** Clean PR, no failing checks — the state that used to void the task. */
+  function mockCleanPr(headSha: string): void {
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'git' && args && args.includes('grep')) return '';
+      if (cmd === 'curl' && args) {
+        const url = args[args.length - 1] || '';
+        if (url.includes('/pulls/')) {
+          return JSON.stringify({ mergeable: true, head: { sha: headSha } });
+        }
+        if (url.includes('/check-runs')) return JSON.stringify({ check_runs: [] });
+      }
+      return '';
+    });
+  }
+
+  it('runs the task instead of voiding it when the backend supplied no fix_reason', async () => {
+    mockCleanPr('nofr01');
+
+    await handleFix(
+      'task-fix-no-reason',
+      {
+        branch: 'feature/x', base_branch: 'main', pr_number: 101,
+        prompt: 'An operator resolved the merge conflicts. Now tighten the retry backoff.',
+      },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('Stale-premise notice');
+    expect(prompt).toContain('does NOT make this task obsolete');
+    expect(prompt).toContain('tighten the retry backoff');
+  });
+
+  it('runs a conflict-reason task that also carries scoped BP- review findings', async () => {
+    mockCleanPr('bpid01');
+
+    await handleFix(
+      'task-fix-bp-ids',
+      {
+        branch: 'feature/x', base_branch: 'main', pr_number: 102,
+        prompt:
+          'The merge conflict is resolved. Fix BP-4c1a9de20b77, BP-9f0e3ab41c62 and ' +
+          'BP-71bd6e5904af from the review.',
+      },
+      { context: { scope: 'small', review_loop: { fix_reason: 'merge_conflict' } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // fix_reason alone would have voided this; the BP- ids override it.
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+    expect(capturedFixPrompt()).toContain('BP-4c1a9de20b77');
+  });
+
+  it('runs a non-conflict fix_reason (code_review) task on a clean PR', async () => {
+    mockCleanPr('cr0001');
+
+    await handleFix(
+      'task-fix-code-review',
+      {
+        branch: 'feature/x', base_branch: 'main', pr_number: 103,
+        prompt: 'Rebase onto main and resolve the reviewer comments about naming.',
+      },
+      { context: { scope: 'small', review_loop: { fix_reason: 'code_review' } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+    expect(capturedFixPrompt()).toContain('Stale-premise notice');
   });
 
   it('warns about GitHub-reported unmergeable state when rebase is clean but mergeable=false', async () => {
