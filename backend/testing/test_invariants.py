@@ -10449,9 +10449,20 @@ def test_release_blocker_codes_are_classified_and_scannable():
         "release_reconciliation.py",
         "release_stall_alerts.py",
     }
-    stall_source = (app_dir / "release_stall_alerts.py").read_text(encoding="utf-8")
+    # The latch registry lives in release_gate_latch.py (extracted from
+    # release_stall_alerts.py so that module stays inside its size cap).
+    latch_source = (app_dir / "release_gate_latch.py").read_text(encoding="utf-8")
+    # Scope to the _GATE_SOURCES tuple itself — the file also carries a
+    # separate _SUPPLEMENTAL_GATE_IMPLEMENTING_PATHS map naming predicate
+    # modules (e.g. release_commit_authorship.py) that are deliberately NOT
+    # members of this literal-scan registry, so scanning the whole file would
+    # conflate the two mechanisms.
+    gate_sources_block = re.search(
+        r'_GATE_SOURCES = \((.*?)\n\)', latch_source, re.DOTALL
+    )
+    assert gate_sources_block is not None, "_GATE_SOURCES tuple not found"
     registry_names = set(
-        re.findall(r'backend/app/(release_[a-z_]+\.py)', stall_source)
+        re.findall(r'backend/app/(release_[a-z_]+\.py)', gate_sources_block.group(1))
     )
     assert registry_names == source_names, (
         "release latch source inventory drifted: "
@@ -10495,6 +10506,7 @@ def test_latch_implicated_paths_are_hotfix_eligible():
         "backend/app/message_audience.py",
         "backend/app/project_message_creation.py",
         "backend/app/release_stall_alerts.py",
+        "backend/app/release_gate_latch.py",
     }
     assert latch_support_paths <= hotfix_policy.HOTFIX_ELIGIBLE_MODULES, (
         "latch repair paths missing from HOTFIX_ELIGIBLE_MODULES: "
@@ -10514,6 +10526,63 @@ def test_latch_implicated_paths_are_hotfix_eligible():
     assert not hotfix_policy.evaluate_hotfix_scope(
         ["backend/testing/test_message_audience.py"]
     ).eligible, "unbounded backend tests must remain outside the hotfix lane"
+
+
+def test_narrow_repair_scope_isolates_the_repair_from_a_wide_candidate():
+    """The lane's ACTUAL input — not a hand-written path set — must be narrow.
+
+    ``evaluate_hotfix_scope`` was never the defect: it was fed the whole
+    promotion-target..integration compare, so in the exact situation the lane
+    exists for (a latched gate whose repair integration already carries) it
+    always saw hundreds of product files.  This pins the repaired input path:
+    the union of the NAMED repair commits' own diffs is what gets scope-checked.
+    """
+    import asyncio
+
+    from app import hotfix_narrow_candidate
+
+    repair = "a" * 40
+    unrelated = "b" * 40
+    per_commit = {
+        repair: [
+            {"filename": "backend/app/release_stall_alerts.py", "patch": "@@\n+x\n"},
+            {"filename": "backend/testing/test_invariants.py", "patch": "@@\n+y\n"},
+        ],
+        # The same integration branch also carries 400 unrelated product files.
+        unrelated: [
+            {"filename": f"backend/app/product_{i}.py", "patch": None}
+            for i in range(400)
+        ],
+    }
+
+    async def _fake_compare(token, owner, repo, base_ref, head_ref, project_id=None):
+        return list(per_commit[head_ref])
+
+    import app.github_refs as _refs
+
+    original = _refs.get_changed_files_with_patches_between_refs
+    _refs.get_changed_files_with_patches_between_refs = _fake_compare
+    try:
+        narrow = asyncio.run(
+            hotfix_narrow_candidate.narrow_repair_scope("t", "o", "r", [repair])
+        )
+        wide = asyncio.run(
+            hotfix_narrow_candidate.narrow_repair_scope(
+                "t", "o", "r", [repair, unrelated]
+            )
+        )
+    finally:
+        _refs.get_changed_files_with_patches_between_refs = original
+
+    assert narrow["status"] == "eligible", narrow["reason"]
+    assert narrow["changed_files"] == [
+        "backend/app/release_stall_alerts.py",
+        "backend/testing/test_invariants.py",
+    ]
+    # Naming a commit that carries unrelated product code still fails CLOSED —
+    # the narrow lane changes the INPUT, never the authorization predicate.
+    assert wide["status"] == "scope_rejected"
+    assert "backend/app/product_0.py" in wide["offending_files"]
 
 
 def test_summarize_release_artifacts_callers_always_pass_project():
@@ -11210,8 +11279,10 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         "release_hotfix_promotion.py:hotfix_promote_current_version",
         # The scope preview mirrors hotfix_promote_current_version's SHA reads
         # exactly (same live=True for both integration HEAD and promotion-target
-        # HEAD) — the diff is meaningless if the SHAs are stale.
-        "release_hotfix_promotion.py:check_hotfix_scope_preview",
+        # HEAD) — the diff is meaningless if the SHAs are stale.  It lives in
+        # hotfix_narrow_candidate.py (release_hotfix_promotion.py re-exports it)
+        # to keep that module inside its declared governance cap.
+        "hotfix_narrow_candidate.py:check_hotfix_scope_preview",
         "release_qualifier.py:hotfix_promote_current_version",
         # The scope preview mirrors hotfix_promote_current_version's SHA reads
         # exactly (same live=True for both integration HEAD and promotion-target

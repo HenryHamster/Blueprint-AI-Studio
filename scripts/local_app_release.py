@@ -1784,7 +1784,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rehearse",
         action="store_true",
-        help="validate candidate preconditions without stopping or changing units",
+        help="disabled: refuses standalone candidate execution on the production host",
     )
     return parser
 

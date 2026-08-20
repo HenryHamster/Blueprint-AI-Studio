@@ -255,6 +255,63 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         payloads = {bootstrap._REVISION_MARKER_NAME: (revision + "\n").encode("ascii")}
         bootstrap._verify_staged_revision(payloads, revision)
 
+    def test_bootstrap_rejects_staged_source_that_does_not_match_the_passed_revision(self):
+        """A staged bundle naming the wrong candidate must never reach systemd.
+
+        Bootstrap is the step that stops and restarts the live API/worker/edge
+        units, so this exercises the real ``bootstrap()`` entrypoint end-to-end
+        (with only filesystem/systemd boundary crossings stubbed) and proves
+        the mismatch is caught before any of the unit-installing/teardown
+        helpers run.
+        """
+        requested_revision = "a" * 40
+        staged_revision = "b" * 40
+        called = []
+
+        def fake_trusted_file(path):
+            if path.name == bootstrap._REVISION_MARKER_NAME:
+                return staged_revision.encode("ascii")
+            return f"payload-for-{path.name}".encode("ascii")
+
+        def record(name):
+            def _fail(*_args, **_kwargs):
+                called.append(name)
+                raise AssertionError(f"{name} must not run before revision verification")
+
+            return _fail
+
+        with (
+            unittest.mock.patch.object(bootstrap.os, "geteuid", return_value=0),
+            unittest.mock.patch.dict(os.environ, {"SUDO_USER": "henry_hamster"}),
+            unittest.mock.patch.object(bootstrap, "_trusted_directory", lambda path: None),
+            unittest.mock.patch.object(bootstrap, "_trusted_file", fake_trusted_file),
+            unittest.mock.patch.object(
+                bootstrap, "_source_path", lambda source, name: source / name
+            ),
+            unittest.mock.patch.object(
+                bootstrap, "_provision_github_cli_config", record("_provision_github_cli_config")
+            ),
+            unittest.mock.patch.object(bootstrap, "_edge_runtime", record("_edge_runtime")),
+            unittest.mock.patch.object(
+                bootstrap, "_install_service_configuration", record("_install_service_configuration")
+            ),
+            unittest.mock.patch.object(
+                bootstrap, "_install_deploy_agent", record("_install_deploy_agent")
+            ),
+            unittest.mock.patch.object(bootstrap, "_run", record("_run")),
+        ):
+            with self.assertRaisesRegex(ValueError, "RELEASE_REVISION"):
+                bootstrap.bootstrap(requested_revision)
+
+        self.assertEqual(called, [])
+
+    def test_rehearse_flag_help_does_not_claim_to_check_preconditions(self):
+        action = next(
+            a for a in bootstrap.build_parser()._actions if a.dest == "rehearse"
+        )
+        self.assertNotIn("check candidate preconditions", action.help)
+        self.assertIn("disabled", action.help)
+
     def test_bundle_digest_is_order_independent(self):
         first = bootstrap._bundle_digest({"a.py": b"a", "b.py": b"b"})
         second = bootstrap._bundle_digest({"b.py": b"b", "a.py": b"a"})

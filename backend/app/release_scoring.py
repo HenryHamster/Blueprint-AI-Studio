@@ -1594,8 +1594,14 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     # current validator runs, not an impossible requirement to promote first.
     "migration_identity_collision": EXECUTION_SITE_DEPLOYED,
     "migration_apply_drift": EXECUTION_SITE_DEPLOYED,
-    "candidate_operator_authorship_nonzero": EXECUTION_SITE_CANDIDATE,
-    "candidate_operator_authorship_evidence_missing": EXECUTION_SITE_CANDIDATE,
+    # Deployed-side: the authorship validator (count + evidence-contract
+    # checks) runs in the DEPLOYED backend against the deployed measurement
+    # predicate in release_commit_authorship.py. Re-cutting the candidate
+    # never clears either gate — only a deploy or the hotfix lane does, so a
+    # candidate-side label here would send an operator chasing an automain fix
+    # that cannot take effect until this version itself promotes.
+    "candidate_operator_authorship_nonzero": EXECUTION_SITE_DEPLOYED,
+    "candidate_operator_authorship_evidence_missing": EXECUTION_SITE_DEPLOYED,
     # Candidate-side: a fresh qualification snapshots a new candidate_sha off
     # automain HEAD, which stops equaling base_sha the moment automain
     # advances even one commit past where this version opened.

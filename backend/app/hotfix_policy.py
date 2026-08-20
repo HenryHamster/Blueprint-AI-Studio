@@ -55,6 +55,7 @@ HOTFIX_ELIGIBLE_MODULES: frozenset[str] = frozenset(
         # repairable through the lane they recommend.  These files are the
         # complete production surface of the shipped latch-announcement fix.
         "backend/app/release_stall_alerts.py",
+        "backend/app/release_gate_latch.py",
         "backend/app/message_audience.py",
         "backend/app/project_message_creation.py",
         # The scope validator itself must be hotfixable so the channel can

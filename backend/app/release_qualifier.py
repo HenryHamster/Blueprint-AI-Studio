@@ -3495,6 +3495,14 @@ async def run_qualification(
             )
             walkthrough_e2e_task_id = str(walkthrough_e2e_task.id)
         if _audit_needed:
+            # Measure the candidate's real base-to-head authorship receipt so
+            # the audit prompt's release_evidence reflects the actual range
+            # instead of always taking the receipt-missing degrade branch.
+            # Mirrors the finalize-time pattern (_finalize_qualification).
+            (
+                _audit_authorship_receipt,
+                _audit_authorship_range,
+            ) = await _measured_authorship_receipt_for_audit_spawn(session, version)
             audit_task = await _spawn_release_audit_task(
                 session,
                 project_id,
@@ -3506,11 +3514,21 @@ async def run_qualification(
                 audit_base_sha=incremental_audit_base_sha,
                 version_goal=version.goal,
                 categories=[
-                    {"category_key": c.get("criterion_key"), "text": c.get("text")}
+                    {
+                        "category_key": c.get("criterion_key"),
+                        "text": c.get("text"),
+                        **(
+                            {"evidence_contract": c["evidence_contract"]}
+                            if isinstance(c.get("evidence_contract"), dict)
+                            else {}
+                        ),
+                    }
                     for c in rubric_snapshot
                     if c.get("criterion_key")
                 ],
                 rubric_fingerprint=rubric_fingerprint,
+                candidate_authorship_receipt=_audit_authorship_receipt,
+                candidate_authorship_measured_range=_audit_authorship_range,
             )
             audit_task_id = str(audit_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
@@ -6305,6 +6323,35 @@ async def _measure_candidate_operator_authorship(
         }
 
 
+async def _measured_authorship_receipt_for_audit_spawn(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> tuple[dict[str, Any], tuple[str | None, str | None]]:
+    """Measure the candidate range and wrap it as a validated receipt.
+
+    Returns the receipt alongside the EXACT (base_sha, head_sha) pair it was
+    measured against, so a caller can pass both into
+    ``_spawn_release_audit_task`` and the payload's ``release_evidence`` can
+    validate the receipt against the same range it was built from — a base_sha
+    the version has no stored column for is derived from the measurement's own
+    range (mirrors ``_finalize_qualification``'s handling), so re-deriving it a
+    second time independently cannot land on a different value and fail
+    ``validate_authorship_receipt`` closed by mismatch.
+    """
+    measurement = await _measure_candidate_operator_authorship(session, version)
+    base_sha, head_sha = candidate_authorship_range(version)
+    if base_sha is None:
+        measured_range = (
+            measurement.get("range") if isinstance(measurement, dict) else None
+        )
+        if isinstance(measured_range, dict) and isinstance(
+            measured_range.get("base_sha"), str
+        ) and measured_range.get("head_sha") == head_sha:
+            base_sha = measured_range["base_sha"]
+    receipt = authorship_receipt_for_measurement(measurement, base_sha, head_sha)
+    return receipt, (base_sha, head_sha)
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -6608,6 +6655,12 @@ async def _finalize_qualification(
                         fp.get("diff_range", "")
                         or f"{_integration_branch}...{candidate_sha}"
                     )
+                    (
+                        _respawn_authorship_receipt,
+                        _respawn_authorship_range,
+                    ) = await _measured_authorship_receipt_for_audit_spawn(
+                        session, version
+                    )
                     new_audit_task = await _spawn_release_audit_task(
                         session,
                         version.project_id,
@@ -6618,6 +6671,10 @@ async def _finalize_qualification(
                         qualification_attempt_id=attempt_id,
                         audit_base_sha=fp.get("audit_base_sha"),
                         version_goal=_frozen_version_goal,
+                        categories=fp.get("categories"),
+                        rubric_fingerprint=fp.get("rubric_fingerprint"),
+                        candidate_authorship_receipt=_respawn_authorship_receipt,
+                        candidate_authorship_measured_range=_respawn_authorship_range,
                     )
                     new_count = rl_respawn_count + 1
                     updated_qual = {
@@ -6668,6 +6725,12 @@ async def _finalize_qualification(
                         fp.get("diff_range", "")
                         or f"{_integration_branch}...{candidate_sha}"
                     )
+                    (
+                        _respawn_authorship_receipt,
+                        _respawn_authorship_range,
+                    ) = await _measured_authorship_receipt_for_audit_spawn(
+                        session, version
+                    )
                     new_audit_task = await _spawn_release_audit_task(
                         session,
                         version.project_id,
@@ -6678,6 +6741,10 @@ async def _finalize_qualification(
                         qualification_attempt_id=attempt_id,
                         audit_base_sha=fp.get("audit_base_sha"),
                         version_goal=_frozen_version_goal,
+                        categories=fp.get("categories"),
+                        rubric_fingerprint=fp.get("rubric_fingerprint"),
+                        candidate_authorship_receipt=_respawn_authorship_receipt,
+                        candidate_authorship_measured_range=_respawn_authorship_range,
                     )
                     new_count = infra_respawn_count + 1
                     updated_qual = append_infra_failure_child_event(
@@ -6734,6 +6801,12 @@ async def _finalize_qualification(
                         fp.get("diff_range", "")
                         or f"{_integration_branch}...{candidate_sha}"
                     )
+                    (
+                        _respawn_authorship_receipt,
+                        _respawn_authorship_range,
+                    ) = await _measured_authorship_receipt_for_audit_spawn(
+                        session, version
+                    )
                     new_audit_task = await _spawn_release_audit_task(
                         session,
                         version.project_id,
@@ -6744,6 +6817,10 @@ async def _finalize_qualification(
                         qualification_attempt_id=attempt_id,
                         audit_base_sha=fp.get("audit_base_sha"),
                         version_goal=_frozen_version_goal,
+                        categories=fp.get("categories"),
+                        rubric_fingerprint=fp.get("rubric_fingerprint"),
+                        candidate_authorship_receipt=_respawn_authorship_receipt,
+                        candidate_authorship_measured_range=_respawn_authorship_range,
                     )
                     new_count = admin_cancel_respawn_count + 1
                     updated_qual = append_infra_failure_child_event(

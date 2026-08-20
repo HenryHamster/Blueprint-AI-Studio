@@ -424,6 +424,153 @@ async def test_attempt24_release_safety_contract(tmp_path, monkeypatch, mocker):
     deploy_doc = (REPO_ROOT / "Deploy.md").read_text(encoding="utf-8")
     assert "/promote/hotfix/preview" in deploy_doc
     assert "do not substitute the whole-tree force-promotion" in deploy_doc
+    # The narrow lane is the documented answer to "integration accumulated
+    # unrelated work since the last promotion", so it must be in the runbook.
+    assert "repair_commit_shas" in deploy_doc
+
+
+@pytest.mark.asyncio
+async def test_hotfix_lane_ships_a_surgical_machinery_repair_from_a_wide_candidate(
+    monkeypatch,
+):
+    """The lane must ship a two-file machinery repair out of a 402-file candidate.
+
+    This is the exact situation the hotfix lane exists for and the exact one it
+    could not serve: the latched gate's repair is already sitting in the
+    integration branch, but the lane scope-checked the WHOLE
+    promotion-target..integration compare, so it always returned
+    ``scope_rejected`` and the operator had to hand-cut a branch.
+
+    End-to-end over the real production path (only GitHub I/O is faked):
+    ``materialize_narrow_hotfix_candidate`` -> ``narrow_repair_scope`` ->
+    ``evaluate_hotfix_scope`` -> ``create_dangling_commit_from_blob_refs``.
+    """
+    from app import github, github_refs, hotfix_narrow_candidate, hotfix_policy
+
+    prior_deployed = "d" * 40
+    repair_sha = "a" * 40
+    integration_head = "c" * 40
+    repair_files = [
+        "backend/app/release_stall_alerts.py",
+        "backend/testing/test_release_stall_alerts.py",
+    ]
+    # 400 unrelated product files landed on integration since the last promotion.
+    accumulated = [
+        {"filename": f"backend/app/product_{i}.py", "patch": None} for i in range(400)
+    ]
+    repair_entries = [
+        {"filename": path, "patch": "@@ -1 +1 @@\n-old\n+new\n"}
+        for path in repair_files
+    ]
+
+    async def _fake_compare(token, owner, repo, base_ref, head_ref, project_id=None):
+        if head_ref == integration_head:
+            # The WHOLE accumulated candidate: repair + everything else.
+            return list(repair_entries) + list(accumulated)
+        assert (base_ref, head_ref) == (f"{repair_sha}~1", repair_sha)
+        return list(repair_entries)
+
+    monkeypatch.setattr(
+        github_refs, "get_changed_files_with_patches_between_refs", _fake_compare
+    )
+
+    # 1. The pre-existing whole-candidate input is (and stays) ineligible — that
+    #    is the latch this task repairs, not something the fix should paper over.
+    wide = await github_refs.get_changed_files_with_patches_between_refs(
+        "t", "o", "r", prior_deployed, integration_head
+    )
+    wide_verdict = hotfix_policy.evaluate_hotfix_scope([f["filename"] for f in wide])
+    assert wide_verdict.eligible is False
+    assert len(wide_verdict.offending_files) == 400
+
+    # 2. GitHub blob/tree/commit plumbing for the narrow materialization.
+    blob_shas = {path: f"blob-{i}" for i, path in enumerate(repair_files)}
+
+    async def _fake_blob_sha(path, *, token, owner, repo, ref, project_id=None):
+        assert ref == integration_head, "content must come from the repair's tree"
+        return (True, blob_shas[path])
+
+    monkeypatch.setattr(github, "get_file_blob_sha_at_ref", _fake_blob_sha)
+
+    calls: list[tuple[str, str, dict]] = []
+
+    async def _fake_request(method, url, headers, json=None, **kwargs):
+        calls.append((method, url, json or {}))
+        if url.endswith(f"/git/commits/{prior_deployed}"):
+            return SimpleNamespace(
+                status_code=200, json=lambda: {"tree": {"sha": "base-tree"}}
+            )
+        if url.endswith("/git/trees"):
+            return SimpleNamespace(status_code=201, json=lambda: {"sha": "new-tree"})
+        if url.endswith("/git/commits"):
+            return SimpleNamespace(status_code=201, json=lambda: {"sha": "e" * 40})
+        raise AssertionError(f"unexpected GitHub call: {method} {url}")
+
+    monkeypatch.setattr(github, "_github_request", _fake_request)
+
+    result = await hotfix_narrow_candidate.materialize_narrow_hotfix_candidate(
+        "t",
+        "o",
+        "r",
+        prior_deployed_sha=prior_deployed,
+        repair_commit_shas=[repair_sha],
+        content_ref=integration_head,
+    )
+
+    # 3. The surgical repair IS shippable, as a commit parented on the promotion
+    #    target that carries ONLY the two machinery files.
+    assert result["status"] == "materialized", result
+    assert result["candidate_sha"] == "e" * 40
+    assert result["changed_files"] == repair_files
+    assert result["content_ref"] == integration_head
+
+    tree_call = next(c for c in calls if c[1].endswith("/git/trees"))
+    assert tree_call[2]["base_tree"] == "base-tree"
+    assert tree_call[2]["tree"] == [
+        {"path": repair_files[0], "mode": "100644", "type": "blob", "sha": "blob-0"},
+        {"path": repair_files[1], "mode": "100644", "type": "blob", "sha": "blob-1"},
+    ], "the narrow commit must carry the repair's EXISTING blobs and nothing else"
+    commit_call = next(
+        c for c in calls if c[0] == "POST" and c[1].endswith("/git/commits")
+    )
+    assert commit_call[2]["parents"] == [prior_deployed], (
+        "the narrow candidate must be parented on the promotion target, so its "
+        "diff is exactly the repair — not the accumulated integration history"
+    )
+    assert commit_call[2]["tree"] == "new-tree"
+    # No ref was created or moved: promote()'s own create_branch is what first
+    # points a ref at this object.
+    assert not [c for c in calls if "/git/refs" in c[1] or "/git/ref/" in c[1]]
+
+    # 4. Fail-closed is preserved: naming a commit that also carries product code
+    #    is still rejected, and nothing is committed for it.
+    calls.clear()
+    product_sha = "b" * 40
+
+    async def _compare_with_product(
+        token, owner, repo, base_ref, head_ref, project_id=None
+    ):
+        return [
+            {"filename": "backend/app/release_stall_alerts.py", "patch": None},
+            {"filename": "backend/app/reaper.py", "patch": None},
+        ]
+
+    monkeypatch.setattr(
+        github_refs,
+        "get_changed_files_with_patches_between_refs",
+        _compare_with_product,
+    )
+    rejected = await hotfix_narrow_candidate.materialize_narrow_hotfix_candidate(
+        "t",
+        "o",
+        "r",
+        prior_deployed_sha=prior_deployed,
+        repair_commit_shas=[product_sha],
+        content_ref=product_sha,
+    )
+    assert rejected["status"] == "scope_rejected"
+    assert rejected["offending_files"] == ["backend/app/reaper.py"]
+    assert calls == [], "a rejected scope must create no blob, tree, or commit"
 
 
 class TestVerifyEncryptionConfigBootGate:

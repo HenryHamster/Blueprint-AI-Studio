@@ -695,6 +695,22 @@ export interface CurrentVersion {
    *  resolved|stale|unresolved state) plus the gating counts and reason. */
   requalification_ready?: boolean | null;
   requalification_readiness?: RequalificationReadiness | null;
+  /** Detected deployed-gate latch (additive; nullable). Populated when a
+   *  persisted, undismissed gate-latch Alert exists for this open version —
+   *  i.e. the candidate itself modifies the deployed implementation of the
+   *  blocker gate, so re-cutting the candidate can never clear it and only a
+   *  deploy or the hotfix lane can. Distinct from
+   *  last_qualification.is_permanent_gate_incapacity, which only fires on a
+   *  same-signature INFRA-error streak and never on a clean scoring blocker. */
+  gate_latch?: GateLatchDetection | null;
+}
+
+/** Detected deployed-gate latch (see CurrentVersion.gate_latch). */
+export interface GateLatchDetection {
+  gate: string | null;
+  compare_range: string | null;
+  message: string;
+  detected_at: string | null;
 }
 
 /** Auto-trigger mode for the qualification trigger resolver. */

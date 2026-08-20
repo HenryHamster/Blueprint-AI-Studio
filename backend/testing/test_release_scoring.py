@@ -1416,6 +1416,35 @@ class TestBlockerExecutionSite:
             == rs.EXECUTION_SITE_DEPLOYED
         )
 
+    def test_candidate_authorship_blockers_are_deployed_site(self):
+        """The authorship validator (count + evidence-contract checks) runs in
+        the DEPLOYED backend against release_commit_authorship.py's measurement
+        predicate. Despite the ``candidate_`` name prefix, re-cutting the
+        candidate never clears either blocker — only a deploy or the hotfix
+        lane does — so both must be classified deployed-side, not
+        candidate-side, or an operator-facing alert would tell them an
+        automain-only fix takes effect before it is deployed.
+        """
+        assert (
+            rs.blocker_execution_site("candidate_operator_authorship_nonzero")
+            == rs.EXECUTION_SITE_DEPLOYED
+        )
+        assert (
+            rs.blocker_execution_site(
+                "candidate_operator_authorship_evidence_missing"
+            )
+            == rs.EXECUTION_SITE_DEPLOYED
+        )
+        # The clearing paths remain valid non-promotional entries even though
+        # the site flipped — HARD_GATE_CLEARING_PATHS is keyed on the blocker
+        # code, independent of BLOCKER_EXECUTION_SITE.
+        for code in (
+            "candidate_operator_authorship_nonzero",
+            "candidate_operator_authorship_evidence_missing",
+        ):
+            evidence = rs.HARD_GATE_CLEARING_PATHS[code]["evidence"]
+            assert "promot" not in evidence.lower(), code
+
     def test_criterion_coverage_gate_is_deployed_side(self):
         """Coverage is rendered and its evidence is minted by deployed code.
 

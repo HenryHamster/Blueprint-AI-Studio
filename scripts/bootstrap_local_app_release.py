@@ -902,7 +902,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rehearse",
         action="store_true",
-        help="check candidate preconditions without changing units or files",
+        help="disabled: refuses candidate execution on the production host",
     )
     return parser
 

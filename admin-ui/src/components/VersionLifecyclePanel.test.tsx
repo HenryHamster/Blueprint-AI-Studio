@@ -4926,6 +4926,37 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByTestId('hotfix-remediation-panel')).not.toBeInTheDocument();
     });
 
+    it('shows hotfix remediation panel for a detected deployed-gate latch without infra incapacity', () => {
+      const latchedVersion = makeCurrentVersion({
+        phase: 'stabilize',
+        active_candidate_sha: 'abc1234567890',
+        last_qualification: makeQualification({
+          status: 'not_promoted',
+          blocker: 'candidate_operator_authorship_nonzero',
+          is_permanent_gate_incapacity: false,
+        }),
+        gate_latch: {
+          gate: 'candidate_operator_authorship_nonzero',
+          compare_range: 'deadbeef...abc1234567890',
+          message:
+            'v7 is blocked by gate candidate_operator_authorship_nonzero, but the candidate modifies its deployed implementation: backend/app/release_commit_authorship.py. Compare range deadbeef...abc1234567890. This repair cannot clear the gate from inside the qualifier; use the approved release-machinery hotfix lane.',
+          detected_at: '2026-08-19T00:00:00Z',
+        },
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: latchedVersion })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('hotfix-remediation-panel')).toBeInTheDocument();
+      expect(screen.getByText(/Gate latched: candidate_operator_authorship_nonzero/)).toBeInTheDocument();
+      expect(screen.getByTestId('hotfix-open-btn')).toBeInTheDocument();
+    });
+
     it('does not show hotfix panel without a projectId', () => {
       render(
         <VersionLifecyclePanel

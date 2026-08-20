@@ -4641,6 +4641,86 @@ async def test_commit_file_changes_delete_uses_sha_null(mocker):
 
 
 @pytest.mark.asyncio
+async def test_create_dangling_commit_reuses_blobs_and_moves_no_ref(mocker):
+    """The narrow-hotfix primitive commits EXISTING blobs and updates no ref."""
+    from app.github import create_dangling_commit_from_blob_refs
+
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(200, {"tree": {"sha": "basetree"}}),  # get-commit
+            MockResponse(201, {"sha": "newtree"}),  # create-tree
+            MockResponse(201, {"sha": "newcommit"}),  # create-commit
+        ],
+    )
+    sha = await create_dangling_commit_from_blob_refs(
+        "t",
+        "o",
+        "r",
+        base_ref="d" * 40,
+        tree_entries=[
+            {
+                "path": "backend/app/release_scoring.py",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "existing-blob",
+            }
+        ],
+        message="narrow",
+    )
+    assert sha == "newcommit"
+    # No blob was created: the content is referenced by its existing SHA.
+    assert not [
+        c for c in req.call_args_list if str(c.args[1]).endswith("/git/blobs")
+    ]
+    tree_json = req.call_args_list[1].kwargs["json"]
+    assert tree_json["base_tree"] == "basetree"
+    assert tree_json["tree"][0]["sha"] == "existing-blob"
+    commit_json = req.call_args_list[2].kwargs["json"]
+    assert commit_json["parents"] == ["d" * 40]
+    # Exactly three calls — no PATCH of any ref.
+    assert len(req.call_args_list) == 3
+    assert not [c for c in req.call_args_list if c.args[0] == "PATCH"]
+
+
+@pytest.mark.asyncio
+async def test_create_dangling_commit_refuses_empty_tree_result(mocker):
+    """A tree identical to the base ships nothing — refuse instead of no-op."""
+    from app.github import (
+        DanglingCommitUnchangedError,
+        create_dangling_commit_from_blob_refs,
+    )
+
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(200, {"tree": {"sha": "basetree"}}),
+            MockResponse(201, {"sha": "basetree"}),  # unchanged tree
+        ],
+    )
+    with pytest.raises(DanglingCommitUnchangedError):
+        await create_dangling_commit_from_blob_refs(
+            "t",
+            "o",
+            "r",
+            base_ref="d" * 40,
+            tree_entries=[
+                {"path": "a.py", "mode": "100644", "type": "blob", "sha": "b1"}
+            ],
+            message="narrow",
+        )
+    # Stopped before create-commit.
+    assert len(req.call_args_list) == 2
+
+    with pytest.raises(DanglingCommitUnchangedError):
+        await create_dangling_commit_from_blob_refs(
+            "t", "o", "r", base_ref="d" * 40, tree_entries=[], message="narrow"
+        )
+
+
+@pytest.mark.asyncio
 async def test_commit_file_changes_raises_on_bad_status(mocker):
     from app.github import commit_file_changes
 

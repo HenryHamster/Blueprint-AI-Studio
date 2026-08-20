@@ -378,6 +378,51 @@ async def resolve_newest_qualification_verdict(
     )
 
 
+# Terminal outcomes a ``QualificationVerdict`` row can carry once it is
+# finalized. A row whose ``terminal_status`` is empty is an in-flight
+# projection, not durable evidence of a completed qualification.
+TERMINAL_VERDICT_STATUSES: frozenset[str] = frozenset(
+    {"dry_run", "not_promoted", "promoted", "promotion_failed"}
+)
+
+
+async def resolve_newest_finalized_qualification_verdict(
+    session: AsyncSession,
+    version: ReleaseVersion,
+) -> QualificationVerdict | None:
+    """Return the newest FINALIZED verdict row for *version*, any attempt.
+
+    Deliberately NOT scoped to ``active_qualification_attempt_id`` the way
+    :func:`resolve_newest_qualification_verdict` is. That scoping is correct for
+    read surfaces that must show the attempt currently in flight, but it makes
+    the durable record invisible to the stall detectors: the auto-retrigger
+    stamps a fresh PENDING attempt seconds after finalize, so the active attempt
+    almost never has a verdict row while the terminal one it just wrote does.
+    Detectors asking "what did this version's last completed qualification
+    actually conclude?" need the newest finalized row regardless of what is in
+    flight now.
+
+    ``finalized_at`` orders the rows with ``created_at`` as the tiebreaker;
+    NULLs sort last so a row that never recorded a finalize timestamp can never
+    outrank one that did.
+    """
+    stmt = (
+        select(QualificationVerdict)
+        .where(QualificationVerdict.release_version_id == version.id)
+        .where(
+            QualificationVerdict.terminal_status.in_(
+                sorted(TERMINAL_VERDICT_STATUSES)
+            )
+        )
+        .order_by(
+            QualificationVerdict.finalized_at.desc().nullslast(),
+            QualificationVerdict.created_at.desc(),
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalars().first()
+
+
 async def resolve_promotion_blocking_result(
     session: AsyncSession,
     version: ReleaseVersion,

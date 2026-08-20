@@ -996,11 +996,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                     )}
                   </div>
                 )}
-                {cv.last_qualification.is_permanent_gate_incapacity && projectId && !readOnly && (
+                {(cv.last_qualification.is_permanent_gate_incapacity || cv.gate_latch) && projectId && !readOnly && (
                   <div className="mt-1 pl-2 border-l-2 border-red-500/40 space-y-2" data-testid="hotfix-remediation-panel">
                     <p className="text-ui-sm text-red-400 font-medium">
-                      Permanent gate incapacity — the release is held by a structural gate failure.
-                      The operator hotfix-deploy channel may unblock it.
+                      {cv.gate_latch
+                        ? `Gate latched${cv.gate_latch.gate ? `: ${cv.gate_latch.gate}` : ''} — the candidate carries the repair to the deployed gate, so re-cutting it cannot clear the release. The operator hotfix-deploy channel may unblock it.`
+                        : 'Permanent gate incapacity — the release is held by a structural gate failure. The operator hotfix-deploy channel may unblock it.'}
                     </p>
                     {!hotfixPanelOpen ? (
                       <button

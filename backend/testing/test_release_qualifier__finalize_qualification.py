@@ -4476,6 +4476,209 @@ async def test_hotfix_promote_managed_check_wait_still_writes_audit_trail(
     assert alert.severity == "WARNING"
 
 
+@pytest.mark.asyncio
+async def test_hotfix_promote_narrow_lane_ships_named_repair_from_wide_candidate(
+    db_session, mocker
+):
+    """The lane ships a two-file machinery repair out of a wide candidate.
+
+    Integration has accumulated unrelated product work since the last promotion,
+    so the whole-candidate compare is ineligible (asserted below via the
+    no-repair-named control).  Naming the repair commit makes the lane
+    materialize a narrow candidate on the promotion target and promote THAT SHA:
+    the release branch is cut at the narrow SHA, CI is resolved against the
+    commit the repair was actually built on, and the audit trail records both
+    which commits were asserted and which files shipped.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    integration_head = "facec0de" * 5
+    prior_deployed = "mainnew" * 5 + "00000"
+    repair_sha = "ab" * 20
+    narrow_sha = "9f" * 20
+    repair_files = [
+        "backend/app/release_stall_alerts.py",
+        "backend/testing/test_release_stall_alerts.py",
+    ]
+    wide_entries = [
+        {"filename": name, "patch": None}
+        for name in repair_files + ["backend/app/reaper.py", "backend/app/admin.py"]
+    ]
+    repair_entries = [{"filename": name, "patch": None} for name in repair_files]
+
+    branch_mock, create_pr_mock = _patch_hotfix_promote_github(
+        mocker, changed_files=[(name, None) for name in repair_files]
+    )
+
+    async def _compare(token, owner, repo, base_ref, head_ref, project_id=None):
+        if head_ref == integration_head:
+            return list(wide_entries)  # the accumulated candidate — ineligible
+        if (base_ref, head_ref) == (f"{repair_sha}~1", repair_sha):
+            return list(repair_entries)  # the repair's own diff
+        if (base_ref, head_ref) == (prior_deployed, narrow_sha):
+            return list(repair_entries)  # what the narrow candidate actually ships
+        raise AssertionError(f"unexpected compare {base_ref}...{head_ref}")
+
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new=AsyncMock(side_effect=_compare),
+    )
+    mocker.patch(
+        "app.github.get_file_blob_sha_at_ref",
+        new=AsyncMock(return_value=(True, "blob-sha")),
+    )
+    dangling_mock = mocker.patch(
+        "app.github.create_dangling_commit_from_blob_refs",
+        new=AsyncMock(return_value=narrow_sha),
+    )
+    ci_mock = mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(return_value=(True, {"state": "green", "detail": "ci green"})),
+    )
+    mocker.patch(
+        "app.database.AsyncSessionLocal", new=_shared_session_factory(db_session)
+    )
+
+    # Control: without naming the repair, the accumulated candidate still fails
+    # closed — the narrow lane changes the INPUT, not the predicate.
+    control = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="latched gate repair",
+        session_factory=_shared_session_factory(db_session),
+    )
+    assert control["status"] == "scope_rejected"
+    assert "backend/app/reaper.py" in control["offending_files"]
+    dangling_mock.assert_not_awaited()
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="latched gate repair",
+        scope_modules=["backend/app/release_stall_alerts.py"],
+        repair_commit_shas=[repair_sha],
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted", result
+    # The narrow commit is parented on the promotion target and carries only the
+    # repair's paths.
+    assert dangling_mock.await_args.kwargs["base_ref"] == prior_deployed
+    assert [e["path"] for e in dangling_mock.await_args.kwargs["tree_entries"]] == (
+        repair_files
+    )
+    # promote() cut the release branch at the NARROW sha, not integration HEAD.
+    assert branch_mock.call_args.args[3] == "release-v1"
+    assert branch_mock.call_args.args[4] == narrow_sha
+    assert create_pr_mock.call_args.kwargs["base"] == "main"
+    # CI is resolved against the content source (the tested commit), never the
+    # just-synthesized object that no CI run has ever seen.
+    assert ci_mock.await_args.args[2] == integration_head
+
+    await db_session.commit()
+    debt = (
+        (
+            await db_session.execute(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.project_id == project.id,
+                    CompletionDebtEntry.kind == "hotfix_deploy_pending_backfill",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert debt is not None
+    detail = debt.detail if isinstance(debt.detail, dict) else json.loads(debt.detail)
+    assert detail["repair_commit_shas"] == [repair_sha]
+    assert detail["diff_file_list"] == repair_files
+    assert detail["candidate_sha"] == narrow_sha
+
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.last_qualification.get("hotfix_promote_repair_commit_shas") == [
+        repair_sha
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hotfix_promote_narrow_lane_rejects_repair_commit_with_product_code(
+    db_session, mocker
+):
+    """Naming a repair commit that ALSO touches product code fails closed.
+
+    The narrow lane must never become a way to smuggle non-machinery files into
+    the bypass: the scope check runs over the named commits' own diffs, and a
+    rejection must create no commit, cut no branch, and open no PR."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    repair_sha = "cd" * 20
+    branch_mock, create_pr_mock = _patch_hotfix_promote_github(
+        mocker, changed_files=[("backend/app/release_scoring.py", None)]
+    )
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new=AsyncMock(
+            return_value=[
+                {"filename": "backend/app/release_scoring.py", "patch": None},
+                {"filename": "backend/app/reaper.py", "patch": None},
+            ]
+        ),
+    )
+    dangling_mock = mocker.patch(
+        "app.github.create_dangling_commit_from_blob_refs", new=AsyncMock()
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="latched gate repair",
+        repair_commit_shas=[repair_sha],
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "scope_rejected"
+    assert result["offending_files"] == ["backend/app/reaper.py"]
+    dangling_mock.assert_not_awaited()
+    branch_mock.assert_not_called()
+    create_pr_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_hotfix_promote_narrow_lane_rejects_abbreviated_repair_sha(
+    db_session, mocker
+):
+    """An abbreviated/symbolic repair ref is ambiguous about what deploys."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    branch_mock, create_pr_mock = _patch_hotfix_promote_github(
+        mocker, changed_files=[("backend/app/release_scoring.py", None)]
+    )
+    dangling_mock = mocker.patch(
+        "app.github.create_dangling_commit_from_blob_refs", new=AsyncMock()
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="latched gate repair",
+        repair_commit_shas=["2a5a9833"],
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "scope_rejected"
+    assert "full 40-hex" in result["reason"]
+    dangling_mock.assert_not_awaited()
+    branch_mock.assert_not_called()
+    create_pr_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+
+
 def test_evaluate_hotfix_scope_pure_predicate():
     """Unit coverage for the pure fail-closed scope predicate."""
     from app import hotfix_policy

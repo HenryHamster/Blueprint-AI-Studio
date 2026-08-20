@@ -389,20 +389,30 @@ def _qualifier_ci_resolves_green(mocker, monkeypatch):
     # tests use synthetic SHAs and exercise its decision contract separately;
     # keep their unrelated finalize assertions deterministic with a clean
     # candidate-range measurement.
+    def _synthetic_candidate_head(version):
+        # The real ``candidate_authorship_range`` reads the ``candidate_sha``
+        # COLUMN, which ``run_qualification`` stamps before it spawns any
+        # child (before ``last_qualification['candidate_sha']`` is written at
+        # the final pending-record stamp). Prefer the column so a spawn-time
+        # authorship measurement sees the same candidate a finalize-time one
+        # does; fall back to the qual dict for tests that seed a candidate via
+        # ``last_qualification`` only.
+        return (
+            getattr(version, "candidate_sha", None)
+            or (version.last_qualification or {}).get("candidate_sha")
+            or "b" * 40
+        )
+
     async def _clean_candidate_authorship(session, version):
-        candidate_sha = (version.last_qualification or {}).get("candidate_sha")
         return {
             "state": "resolved",
             "count": 0,
             "offenders": [],
-            "range": {"base_sha": "a" * 40, "head_sha": candidate_sha},
+            "range": {"base_sha": "a" * 40, "head_sha": _synthetic_candidate_head(version)},
         }
 
     def _synthetic_candidate_range(version):
-        return (
-            "a" * 40,
-            (version.last_qualification or {}).get("candidate_sha") or "b" * 40,
-        )
+        return ("a" * 40, _synthetic_candidate_head(version))
 
     mocker.patch.object(
         rq,

@@ -17,7 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert
-_MODULE_SIZE_GOVERNANCE_CAP: int = 183
+# Deliberate paired raise 183 -> 200: the recovery path now also restores the
+# narrow lane's repair_commit_shas provenance.  Still a bounded recovery cluster.
+_MODULE_SIZE_GOVERNANCE_CAP: int = 200
 
 
 def _hotfix_audit_was_attempted(qual: dict[str, Any]) -> bool:
@@ -99,6 +101,7 @@ async def _reconcile_hotfix_audit_trail(
             scope_modules=qual.get("hotfix_promote_scope_modules"),
             diff_file_list=qual.get("hotfix_promote_diff_file_list"),
             prior_deployed_sha=qual.get("hotfix_promote_prior_deployed_sha"),
+            repair_commit_shas=qual.get("hotfix_promote_repair_commit_shas"),
             record_debt=debt is None,
             record_alert=alert is None,
         )
