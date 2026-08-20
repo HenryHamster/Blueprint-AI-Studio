@@ -178,9 +178,12 @@ export default function App() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [pipelineContextTask, setPipelineContextTask] = useState<Task | null>(null);
   const pipelineContextRequestRef = useRef(0);
-  // Dedup guard: track the last lastCycleCompletion object we toasted for so a
-  // WS reconnect that re-emits the same event doesn't fire a second toast.
-  const lastCycleCompletionToastRef = useRef<typeof s.lastCycleCompletion>(null);
+  // Dedup guard: track the identity of the last completion we toasted for so a
+  // WS reconnect or durable read-model poll that re-surfaces the same terminal
+  // receipt doesn't fire a second toast. Keyed on cycle_id + status rather
+  // than object identity: upstream state merges can rebuild the receipt as an
+  // equal-but-fresh object on every poll, and identity dedup re-toasts each one.
+  const lastCycleCompletionToastKeyRef = useRef<string | null>(null);
   const { lastCycleCompletion: cycleCompletion, addToast, handleViewLogs: openTaskDetailDrawer } = s;
   const handleOpenTaskDetails = useCallback((task: Task) => {
     pipelineContextRequestRef.current += 1;
@@ -189,8 +192,13 @@ export default function App() {
   }, [openTaskDetailDrawer]);
   useEffect(() => {
     if (!cycleCompletion) return;
-    if (cycleCompletion === lastCycleCompletionToastRef.current) return;
-    lastCycleCompletionToastRef.current = cycleCompletion;
+    // A receipt without a cycle_id cannot be semantically deduped; it falls
+    // back to once-per-object (the effect only re-runs on identity change).
+    const toastKey = cycleCompletion.cycle_id
+      ? `${cycleCompletion.cycle_id}:${cycleCompletion.status ?? ''}`
+      : null;
+    if (toastKey !== null && toastKey === lastCycleCompletionToastKeyRef.current) return;
+    lastCycleCompletionToastKeyRef.current = toastKey;
     if (shouldSuppressCompletionToast(
       cycleCompletion.status,
       cycleCompletion.failure_reason,

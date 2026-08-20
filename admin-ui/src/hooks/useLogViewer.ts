@@ -279,7 +279,7 @@ export function useLogViewer({
       // The durable cycle is authoritative for status and every field it
       // exposes. Preserve only receipt details that the read model cannot
       // represent, such as the live challenge summary and direction ids.
-      return {
+      const next = {
         ...durableCompletion,
         ...(previous.staged_count !== undefined ? { staged_count: previous.staged_count } : {}),
         ...(previous.updated_count !== undefined ? { updated_count: previous.updated_count } : {}),
@@ -293,6 +293,18 @@ export function useLogViewer({
           ? { strategic_judgment_challenge: previous.strategic_judgment_challenge }
           : {}),
       };
+      // Identity-preserve when nothing changed: this runs on every durable
+      // read-model poll while the strategist is idle, and returning a fresh
+      // but equal object each tick re-fires every downstream effect keyed on
+      // the receipt (the failure toast among them) once per poll, forever.
+      const keys = new Set([
+        ...Object.keys(previous),
+        ...Object.keys(next),
+      ]) as Set<keyof StrategicCycleCompletion>;
+      for (const key of keys) {
+        if (previous[key] !== next[key]) return next;
+      }
+      return previous;
     });
   }, []);
   const gatedTypesRefreshSeqRef = useRef(0);
