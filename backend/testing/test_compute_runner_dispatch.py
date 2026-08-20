@@ -3305,6 +3305,12 @@ async def test_compute_experiment_defaults_container_image_to_project_image(
                     "prompt": "run the training script",
                     "type": "compute_experiment",
                     "command": "python train.py",
+                    # Default-image inheritance is gated on the subtask declaring an
+                    # accelerator (#17458): a bare payload must dispatch image-less so
+                    # the runner's fatal GPU-arch pre-flight is never armed for
+                    # CPU-only work. This test covers the digest-pinning half of that
+                    # contract, so it declares an accelerator; the bare-payload half is
+                    # covered by test_plan_completion_atomic.py.
                     "accelerator": "T4",
                     "spend_cap_usd": 1.0,
                     "deadline_seconds": 300,

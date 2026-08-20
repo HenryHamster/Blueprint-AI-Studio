@@ -3585,8 +3585,8 @@
           "new_cap": 1250
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-19T23:06:47.403718+00:00",
+          "commit_sha": "b42c7f62d4c38572afce6d049184f141022083ae",
+          "commit_date": "2026-08-19T23:10:01+00:00",
           "old_cap": 1250,
           "new_cap": 1500
         }

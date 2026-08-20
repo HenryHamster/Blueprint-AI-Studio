@@ -227,3 +227,168 @@ class TestOrchestratorProvisionModuleExists:
         prov = importlib.import_module("app.orchestrator_provision")
         orch = importlib.import_module("app.orchestrator")
         assert orch.provision_and_handle is prov.provision_and_handle
+
+
+# ── Runner-dispatch facade ───────────────────────────────────────────────────
+# ``orchestrator_runner_dispatch.py`` is itself a chronic size-limit offender
+# (6 recorded cap bumps). Cap bumps are forbidden by ``app.size_limit_policy``,
+# so it was decomposed along the same facade contract the orchestrator uses:
+# each cohesive seam moved to a sibling module and is re-exported so every
+# existing ``from app.orchestrator_runner_dispatch import X`` call site (and the
+# ``from app.orchestrator import X`` chain behind it) keeps working unchanged.
+#
+# The tripwire below is what stops the module from re-growing: an agent that
+# adds a NEW top-level definition here under one of these names shadows the
+# canonical implementation, and the two copies drift silently.
+RUNNER_DISPATCH_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__), "..", "app", "orchestrator_runner_dispatch.py"
+    )
+)
+
+
+DISPATCH_EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "app.orchestrator_runner_placement": (
+        "EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY",
+        "_stage_local_only_placement_wait",
+        "_clear_execution_placement_wait",
+        "_hold_task_for_local_only_placement",
+    ),
+    "app.runner_capability_contracts": (
+        "_coerce_vram_gb",
+        "_coerce_min_compute_capability",
+        "_container_image_min_free_disk_bytes",
+        "_container_workspace_min_free_disk_bytes",
+        "_paths_require_browser",
+        "_payload_requires_browser",
+        "_task_requires_browser",
+        "_runner_lacks_required_browser",
+        "_task_requires_project_verification_pinned",
+        "_runner_lacks_required_project_verification",
+        "_fleet_missing_capability_reason",
+    ),
+    "app.orchestrator_runner_selection": (
+        "FORCED_RUNNER_TARGET_CONTEXT_KEY",
+        "_num_or_none",
+        "_payload_runner_target",
+        "_PIN_HOLD_DIGITS_RE",
+        "_pin_hold_stable_key",
+        "_diagnose_strict_runner_pin_hold",
+        "_lookup_runner_hostname",
+        "_select_eligible_runner",
+    ),
+    "app.orchestrator_compute_experiment_dispatch": (
+        "AWAITING_FORCED_RUNNER_CONTEXT_KEY",
+        "COMPUTE_RUNNER_HOLD_CONTEXT_KEYS",
+        "COMPUTE_LAUNCH_DEFERRED_REASON_CONTEXT_KEY",
+        "COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY",
+        "_COMPUTE_CAP_DEFER_BASE_MINUTES",
+        "_COMPUTE_CAP_DEFER_MAX_MINUTES",
+        "_COMPUTE_CAP_DEFER_ALERT_AFTER_DEFERS",
+        "_COMPUTE_CAP_DEFER_ALERT_TITLE",
+        "_build_compute_launch_kwargs",
+        "_fail_compute_experiment_task",
+        "_defer_compute_experiment_task",
+        "_maybe_alert_saturated_compute_cap_defer",
+        "_dispatch_compute_experiment_directly",
+    ),
+}
+
+
+def _flatten_dispatch_symbols() -> list[tuple[str, str]]:
+    """Return (source_module, symbol_name) pairs from DISPATCH_EXTRACTED_SYMBOLS."""
+    return [
+        (module, name)
+        for module, names in DISPATCH_EXTRACTED_SYMBOLS.items()
+        for name in names
+    ]
+
+
+class TestRunnerDispatchExtractedSymbolsNotRedefined:
+    """Tripwire — an extracted seam must not be re-defined in the dispatch module."""
+
+    def test_no_extracted_symbol_is_redefined(self):
+        with open(RUNNER_DISPATCH_PATH, encoding="utf-8") as fh:
+            defs = _top_level_definitions(fh.read())
+
+        violations = [
+            f"  {name} ({defs[name]}) — canonical home: {module}"
+            for module, name in _flatten_dispatch_symbols()
+            if name in defs
+        ]
+
+        assert not violations, (
+            "orchestrator_runner_dispatch.py re-defines symbols that were "
+            "extracted to sibling modules. It is a chronic size-limit offender, "
+            "so a shadowing copy both re-grows the module and silently drifts "
+            "from the canonical implementation.\n\n"
+            "Re-defined symbols:\n"
+            + "\n".join(violations)
+            + "\n\nFix: keep the definition in its canonical sibling module and "
+            "re-export it via `from app.<module> import <name>  # noqa: F401`."
+        )
+
+
+class TestRunnerDispatchExtractedSymbolsReExported:
+    """Tripwire — every extracted seam stays importable from the dispatch facade.
+
+    ``app.routers.runner``, ``app.blocked_retry_authority``,
+    ``app.release_qualifier_audit`` and a large body of tests import these by
+    name from ``app.orchestrator_runner_dispatch``; dropping a re-export breaks
+    them at import time (or, worse, at first call inside a lazy import).
+    """
+
+    @pytest.mark.parametrize(
+        "source_module,symbol",
+        _flatten_dispatch_symbols(),
+        ids=lambda v: v if isinstance(v, str) else "",
+    )
+    def test_symbol_reexported_and_identical(self, source_module: str, symbol: str):
+        dispatch = importlib.import_module("app.orchestrator_runner_dispatch")
+        canonical = importlib.import_module(source_module)
+
+        assert hasattr(canonical, symbol), (
+            f"{source_module}.{symbol} is missing — the canonical home for this "
+            f"extracted symbol no longer defines it."
+        )
+        assert hasattr(dispatch, symbol), (
+            f"app.orchestrator_runner_dispatch.{symbol} is no longer importable. "
+            f"Add the re-export:\n"
+            f"    from {source_module} import {symbol}  # noqa: F401"
+        )
+        assert getattr(dispatch, symbol) is getattr(canonical, symbol), (
+            f"app.orchestrator_runner_dispatch.{symbol} is not the same object as "
+            f"{source_module}.{symbol} — the facade is shadowing the canonical "
+            f"implementation."
+        )
+
+
+class TestRunnerDispatchSiblingModulesImportLeafFirst:
+    """Each extracted sibling must import standalone, before the facade.
+
+    The facade imports all four siblings at module load, so a sibling that
+    imported the facade back would deadlock only when the LEAF is imported
+    first — exactly what ``app.routers.runner``'s lazy
+    ``from app.orchestrator_runner_dispatch import ...`` does at request time.
+    Importing each leaf in a fresh interpreter proves the dependency edges run
+    one way.
+    """
+
+    @pytest.mark.parametrize("module_name", sorted(DISPATCH_EXTRACTED_SYMBOLS))
+    def test_leaf_module_imports_standalone(self, module_name: str):
+        import subprocess
+        import sys
+
+        repo_backend = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+        proc = subprocess.run(
+            [sys.executable, "-c", f"import {module_name}"],
+            cwd=repo_backend,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, (
+            f"{module_name} could not be imported on its own — the extracted "
+            f"sibling has an import cycle back to the dispatch facade.\n"
+            f"{proc.stderr[-2000:]}"
+        )
