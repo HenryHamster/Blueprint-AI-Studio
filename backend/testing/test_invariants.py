@@ -13132,9 +13132,9 @@ class TestProblemModelWritePathInvariants:
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
         ("strategic_completion.py", 7146): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
-        ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1256): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
-        ("reaper_sweeps.py", 1381): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1384): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
         (
             "routers/admin_projects.py",
