@@ -4611,8 +4611,8 @@
       ],
       "test_invariants.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-20T00:51:27.786986+00:00",
+          "commit_sha": "96cb89dce0c6026855abc3b18d7136a307df9303",
+          "commit_date": "2026-08-20T06:56:03Z",
           "old_cap": 14850,
           "new_cap": 17100
         }

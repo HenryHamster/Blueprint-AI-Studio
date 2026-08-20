@@ -29,6 +29,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
+# This module is two narrow debounce helpers for the sweep, not a home for
+# general qualification logic. The cap keeps a small explicit margin over its
+# current ~130 lines rather than generic headroom: the release/verification
+# surface requires every module to declare one, and a loose figure here would
+# just recreate the sweep's own chronic-growth problem one module over.
+_MODULE_SIZE_GOVERNANCE_CAP: int = 200
+
 # Durable per-project head-stability marker for the auto-qualification quiet
 # window.  Stored as ``{"head_sha": str, "first_seen_at": iso}`` in
 # project_telemetry: records when the sweep first observed the current automain
