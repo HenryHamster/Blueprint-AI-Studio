@@ -2315,6 +2315,12 @@
           "commit_date": "2026-08-01T20:08:12-07:00",
           "old_cap": 2660,
           "new_cap": 3100
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-20T07:48:46.139881+00:00",
+          "old_cap": 3100,
+          "new_cap": 3600
         }
       ],
       "routers/admin_debug.py": [
