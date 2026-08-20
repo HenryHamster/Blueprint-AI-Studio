@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import exists, or_, select
@@ -532,6 +532,15 @@ _DRIFT_SENTINEL_RERUN_BUDGET = 1
 _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY = "_drift_sentinel_cancelled_redispatch"
 _DRIFT_SENTINEL_CANCELLED_REDISPATCH_COOLDOWN_SECONDS = 30 * 60
 _DRIFT_SENTINEL_TERMINAL_DISPATCH_KEY = "_drift_sentinel_terminal_dispatch"
+
+# Durable per-project head-stability marker for the auto-qualification quiet
+# window.  Stored as ``{"head_sha": str, "first_seen_at": iso}`` in
+# project_telemetry: records when the sweep first observed the current automain
+# HEAD, so ``_fire_auto_triggered_qualification`` can tell the resolver how long
+# the head has been quiet.  A new HEAD rewrites the marker (restarting the
+# window); marker unavailability degrades to ``None`` — the resolver's legacy
+# fire-immediately behavior — never to a suppressed qualification.
+_AUTOMAIN_HEAD_FIRST_SEEN_KEY = "_automain_head_first_seen"
 
 
 def _drift_sentinel_cancelled_redispatch_due(
@@ -1347,6 +1356,65 @@ async def _fire_auto_triggered_qualification(
                 version_id,
                 exc_info=True,
             )
+        # Head-stability accounting for the candidate_advanced quiet window:
+        # persist when this HEAD was first observed so a burst of merges holds
+        # auto-fire until the tip settles (one qualification + audit pair per
+        # settled tip, not one per delta).  Marker failure degrades to None —
+        # the resolver's legacy fire-immediately behavior — so telemetry
+        # unavailability can never suppress qualification.
+        automain_head_quiet_seconds: float | None = None
+        if automain_sha:
+            try:
+                from app.project_telemetry import read_telemetry, upsert_telemetry
+
+                _head_marker = await read_telemetry(
+                    fire_session,
+                    version.project_id,
+                    _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
+                )
+                _now = _utcnow()
+                _first_seen: datetime | None = None
+                if (
+                    isinstance(_head_marker, dict)
+                    and _head_marker.get("head_sha") == automain_sha
+                ):
+                    try:
+                        _first_seen = datetime.fromisoformat(
+                            _head_marker.get("first_seen_at") or ""
+                        )
+                        if _first_seen.tzinfo is None:
+                            _first_seen = _first_seen.replace(tzinfo=timezone.utc)
+                    except (ValueError, TypeError):
+                        _first_seen = None
+                if _first_seen is not None:
+                    automain_head_quiet_seconds = max(
+                        0.0, (_now - _first_seen).total_seconds()
+                    )
+                else:
+                    # New HEAD (or unparseable marker): restart the window.
+                    # Commit immediately — the fresh-head branch HOLDS the fire
+                    # below and returns before the fire path's commit, and an
+                    # uncommitted marker would roll back, restarting the window
+                    # every sweep and holding auto-fire forever.
+                    await upsert_telemetry(
+                        fire_session,
+                        version.project_id,
+                        _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
+                        {
+                            "head_sha": automain_sha,
+                            "first_seen_at": _now.isoformat(),
+                        },
+                    )
+                    await fire_session.commit()
+                    automain_head_quiet_seconds = 0.0
+            except Exception:  # noqa: BLE001 — best-effort; degrade to None
+                automain_head_quiet_seconds = None
+                logger.warning(
+                    "[RELEASE_QUALIFIER] sweep: automain head-stability marker "
+                    "unavailable for version %s; quiet window disabled this cycle",
+                    version_id,
+                    exc_info=True,
+                )
         decision = resolve_qualification_trigger(
             phase=version.phase or "",
             status=status,
@@ -1363,6 +1431,7 @@ async def _fire_auto_triggered_qualification(
             promotion_check_wait=bool(qual.get("promotion_pending")),
             consecutive_infra_errors=int(qual.get("consecutive_infra_errors") or 0),
             rubric_redrive_count=int(qual.get("rubric_redrive_count") or 0),
+            automain_head_quiet_seconds=automain_head_quiet_seconds,
         )
         if not decision.fire:
             return False
@@ -1405,6 +1474,45 @@ async def _fire_auto_triggered_qualification(
                 "stored CI-compliance record shows the integration HEAD breaches "
                 "the guardrails",
                 version.version_number,
+            )
+            return False
+        # A live qualifier audit lane means a prior attempt's opus-tier
+        # release_audit / release_audit_challenge pair is still running.
+        # Auto-firing another qualification now would stack a second pair on
+        # top of it (the per-delta audit-spam class): defer to the running
+        # lane — when it finalizes, ``last_qualification`` updates and a later
+        # sweep re-resolves cleanly against the settled tip.  Mirrors the
+        # infra_failure re-driver's live-audit skip.
+        from app.models import Task, TaskStatus
+
+        _live_audit_id = (
+            await fire_session.execute(
+                select(Task.id)
+                .where(
+                    Task.project_id == version.project_id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                            TaskStatus.BLOCKED,
+                            TaskStatus.PARKED,
+                        ]
+                    ),
+                    Task.payloads[0]["type"]
+                    .as_string()
+                    .in_(["release_audit", "release_audit_challenge"]),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if _live_audit_id is not None:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: deferring auto-trigger for v%d — "
+                "qualifier audit task %s is already live",
+                version.version_number,
+                _live_audit_id,
             )
             return False
         result = await release_qualifier.run_qualification(

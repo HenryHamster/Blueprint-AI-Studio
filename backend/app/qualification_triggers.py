@@ -56,6 +56,16 @@ _MAX_RUBRIC_REDRIVE_ATTEMPTS: int = 2
 # CI state string representing a known-red build (from ci_resolution.py).
 _CI_RED = "red"
 
+# Quiet window (seconds) the automain HEAD must hold still before a
+# ``candidate_advanced`` re-qualification auto-fires.  Without it, every merge
+# to automain immediately re-fires qualification — and with it a fresh
+# release_audit + release_audit_challenge pair (opus tier) — so a burst of
+# small merges multiplies real spend for near-zero marginal information.
+# Holding until the head is quiet coalesces a merge burst into ONE
+# qualification of the final tip.  Operator-requested qualifications
+# (POST /qualify) bypass the resolver entirely and are unaffected.
+CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS: int = 30 * 60
+
 
 class TriggerDecision:
     """Result of ``resolve_qualification_trigger``.
@@ -118,6 +128,7 @@ def resolve_qualification_trigger(
     promotion_check_wait: bool,
     consecutive_infra_errors: int = 0,
     rubric_redrive_count: int = 0,
+    automain_head_quiet_seconds: float | None = None,
 ) -> TriggerDecision:
     """Return a fire/hold decision for the open version.
 
@@ -174,6 +185,14 @@ def resolve_qualification_trigger(
         infra_failure_redrive tier against ``_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS``.
         Defaults to 0 so callers that don't resolve the streak still get a
         safe (fire-eligible) decision.
+    automain_head_quiet_seconds:
+        How long (seconds) the current ``automain_sha`` has been the observed
+        automain HEAD, or None when the caller does not track head stability
+        (read-only surfaces).  When provided and below
+        ``CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS``, the T1 candidate_advanced
+        fire is held ("candidate_quiet_window") so a burst of merges coalesces
+        into one qualification of the settled tip.  None preserves the legacy
+        fire-immediately behavior.
     """
     # T0 — Hard hold guards (mirror run_qualification's self-defending phase/lock guards).
     # These are informational; the guards in run_qualification remain the authority.
@@ -246,6 +265,25 @@ def resolve_qualification_trigger(
                 blocking=[
                     "automain advanced past the not_promoted candidate but CI "
                     "for the new SHA is red — suppressing auto-fire"
+                ],
+            )
+        if (
+            automain_head_quiet_seconds is not None
+            and automain_head_quiet_seconds < CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS
+        ):
+            remaining = int(
+                CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS - automain_head_quiet_seconds
+            )
+            return TriggerDecision(
+                fire=False,
+                trigger="none",
+                reason="candidate_quiet_window",
+                blocking=[
+                    "automain advanced, but the new HEAD has only been stable "
+                    f"for ~{int(automain_head_quiet_seconds)}s — holding auto-fire "
+                    f"until it is quiet for {CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS}s "
+                    f"(~{remaining}s left) so a merge burst coalesces into one "
+                    "qualification"
                 ],
             )
         return TriggerDecision(
@@ -431,6 +469,7 @@ def explain_qualification_trigger(
     qualification_provenance: dict[str, Any] | None = None,
     consecutive_infra_errors: int = 0,
     rubric_redrive_count: int = 0,
+    automain_head_quiet_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Return an operator-facing explanation of the qualification trigger state.
 
@@ -476,6 +515,7 @@ def explain_qualification_trigger(
         promotion_check_wait=promotion_check_wait,
         consecutive_infra_errors=consecutive_infra_errors,
         rubric_redrive_count=rubric_redrive_count,
+        automain_head_quiet_seconds=automain_head_quiet_seconds,
     )
 
     # Map decision to auto_trigger label
@@ -512,6 +552,9 @@ def explain_qualification_trigger(
         "infra_failure_attempt_cap": "operator_or_strategist_only",
         "rubric_redrive_cap": "operator_or_strategist_only",
         "ci_red": "new_candidate_commit",
+        # Quiet-window hold self-resolves: a later sweep fires once the head
+        # settles (or restarts the window if another merge lands first).
+        "candidate_quiet_window": "sweep_retry",
         "findings_unresolved": "findings_resolved",
         "not_applicable": "operator_or_strategist_only",
         "armed": "sweep_retry",  # fire=True means next sweep will fire

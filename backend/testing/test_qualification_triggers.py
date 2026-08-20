@@ -10,6 +10,7 @@ Covers:
 import pytest
 
 from app.qualification_triggers import (
+    CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS,
     _MAX_ERROR_REDRIVE_ATTEMPTS,
     _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
     _MAX_RUBRIC_REDRIVE_ATTEMPTS,
@@ -203,6 +204,109 @@ class TestT1InitialFire:
         )
         assert not d.fire
         assert d.reason == "same_candidate"
+
+
+class TestT1CandidateAdvancedQuietWindow:
+    """The candidate_advanced quiet window (per-delta audit-spam debounce).
+
+    A merge burst on automain must coalesce into ONE qualification (and one
+    opus-tier audit pair) of the settled tip, not one per delta.  The executor
+    passes how long the current automain HEAD has been observed; below the
+    window the T1 fire holds with ``candidate_quiet_window``.
+    """
+
+    _ADVANCED = dict(
+        status="not_promoted",
+        blocker="below_threshold",
+        candidate_sha="aaaa1111",
+        automain_sha="bbbb2222",
+    )
+
+    def test_fresh_head_holds_with_quiet_window_reason(self):
+        d = _resolve(**self._ADVANCED, automain_head_quiet_seconds=0.0)
+        assert not d.fire
+        assert d.trigger == "none"
+        assert d.reason == "candidate_quiet_window"
+        assert d.blocking
+
+    def test_head_just_under_window_still_holds(self):
+        d = _resolve(
+            **self._ADVANCED,
+            automain_head_quiet_seconds=CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS - 1,
+        )
+        assert not d.fire
+        assert d.reason == "candidate_quiet_window"
+
+    def test_settled_head_fires(self):
+        d = _resolve(
+            **self._ADVANCED,
+            automain_head_quiet_seconds=CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS,
+        )
+        assert d.fire
+        assert d.trigger == "candidate_advanced"
+        assert d.reason == "armed"
+
+    def test_none_preserves_legacy_fire_immediately(self):
+        # Read surfaces and callers that don't track head stability pass None
+        # and must keep the pre-quiet-window behavior.
+        d = _resolve(**self._ADVANCED, automain_head_quiet_seconds=None)
+        assert d.fire
+        assert d.trigger == "candidate_advanced"
+
+    def test_window_is_thirty_minutes(self):
+        # Literal pin: the debounce is a spend control; silently shrinking it
+        # reintroduces per-delta audit spam.
+        assert CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS == 30 * 60
+
+    def test_ci_red_wins_over_quiet_window(self):
+        d = _resolve(
+            **self._ADVANCED,
+            automain_ci_state="red",
+            automain_head_quiet_seconds=0.0,
+        )
+        assert not d.fire
+        assert d.reason == "ci_red"
+
+    def test_same_candidate_wins_over_quiet_window(self):
+        d = _resolve(
+            status="not_promoted",
+            blocker="below_threshold",
+            candidate_sha="aaaa1111",
+            automain_sha="aaaa1111",
+            automain_head_quiet_seconds=0.0,
+        )
+        assert not d.fire
+        assert d.reason == "same_candidate"
+
+    def test_initial_fire_ignores_quiet_window(self):
+        # status=None (never attempted) is not a per-delta re-fire; the quiet
+        # window only debounces candidate_advanced.
+        d = _resolve(status=None, automain_head_quiet_seconds=0.0)
+        assert d.fire
+        assert d.trigger == "coverage_complete"
+
+    def test_quiet_window_explains_as_waiting_with_sweep_retry(self):
+        exp = explain_qualification_trigger(
+            phase="stabilize",
+            status="not_promoted",
+            error_code=None,
+            qualification_attempts=3,
+            error_redrive_count=0,
+            is_candidate_fully_met=False,
+            requalification_ready=None,
+            candidate_sha="aaaa1111",
+            automain_sha="bbbb2222",
+            automain_ci_state="green",
+            blocker="below_threshold",
+            in_flight=False,
+            promotion_check_wait=False,
+            last_attempt=None,
+            knob="on",
+            evaluated_at="2026-08-19T00:00:00+00:00",
+            automain_head_quiet_seconds=0.0,
+        )
+        assert exp["auto_trigger"] == "waiting"
+        assert exp["next_expected_trigger"] == "sweep_retry"
 
 
 # ---------------------------------------------------------------------------
