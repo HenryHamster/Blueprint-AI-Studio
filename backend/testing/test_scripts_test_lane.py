@@ -121,8 +121,14 @@ def _script_test_parameters() -> list[object]:
                     marks=pytest.mark.skip(reason=f"capability exemption: {reason}"),
                 )
             )
-        else:
-            parameters.append(pytest.param(path, id=path.name))
+            continue
+        marks: list = []
+        budget_override = _FILE_BUDGET_SECONDS_OVERRIDES.get(path.name)
+        if budget_override is not None:
+            marks.append(
+                pytest.mark.timeout(budget_override + _OUTER_TIMEOUT_GRACE_SECONDS)
+            )
+        parameters.append(pytest.param(path, id=path.name, marks=marks))
     return parameters
 
 
@@ -145,6 +151,15 @@ _FILE_BUDGET_SECONDS_DEFAULT = 25
 _FILE_BUDGET_SECONDS_OVERRIDES = {
     "test_local_runner.py": 180,
 }
+
+# CI's sharded pytest invocation passes ``--timeout=30`` (pytest-timeout), which
+# kills the OUTER lane test before an override budget above 30s can matter. A
+# ``pytest.mark.timeout`` marker takes precedence over the CLI option, so every
+# override param carries one at budget + this grace. The grace keeps the layers
+# ordered: the inner subprocess timeout fires first (diagnosable per-file
+# failure with captured output), and the outer marker only fires if the lane
+# harness itself wedges.
+_OUTER_TIMEOUT_GRACE_SECONDS = 60
 
 
 @pytest.mark.parametrize("script_test", _script_test_parameters())
