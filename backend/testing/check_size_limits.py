@@ -227,6 +227,13 @@ SECTIONS = ("backend", "agent", "frontend", "testing", "scripts")
 # is exactly how the surface reopened after growth was first bounded: it adds
 # a file rather than growing an existing one, so the per-file caps never see
 # it.
+# --force-chronic is the operator-approval bypass for the chronic-offender
+# refusal. It ran unguarded until an autonomous auto-fix task used it to raise
+# ci_completion.py 3100 -> 3600 on its seventh bump (PR #17587, reverted). The
+# flag now demands this variable so the approval has to come from outside the
+# task: an agent that hits a chronic offender must decompose it or block.
+_OPERATOR_APPROVAL_ENV = "SIZE_CAP_OPERATOR_APPROVAL"
+
 _RELEASE_SURFACE_PREFIXES = ("release_", "acceptance_")
 _RELEASE_SURFACE_EXTRA_MODULES = ("approved_pr_stranding.py",)
 
@@ -909,8 +916,9 @@ def main(argv: list[str] | None = None) -> int:
         dest="force_chronic",
         help=(
             "operator-approval override: allow --fix to bump a chronic offender's cap. "
-            "Attribution is recorded in the output. Without this flag, chronic offenders "
-            "are skipped and exit 1 is returned."
+            f"Requires {_OPERATOR_APPROVAL_ENV} in the environment -- it is an operator "
+            "lever, not a task-agent one. Attribution is recorded in the output. Without "
+            "this flag, chronic offenders are skipped and exit 1 is returned."
         ),
     )
     parser.add_argument(
@@ -939,6 +947,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.force_chronic and not os.environ.get(_OPERATOR_APPROVAL_ENV, "").strip():
+        print(
+            f"[refused] --force-chronic requires operator approval: set "
+            f"{_OPERATOR_APPROVAL_ENV} to the approving operator's identifier. A task "
+            "agent must not pass this flag -- decompose the module, or raise a blocker "
+            "so an operator can decide. See PR #16787 for a reverted unapproved bump.",
+            file=sys.stderr,
+        )
+        return 1
     repo_root_explicit = args.repo_root is not None
     if args.repo_root is None:
         args.repo_root = _DEFAULT_REPO_ROOT
@@ -1061,7 +1078,7 @@ def main(argv: list[str] | None = None) -> int:
                 # First-class refusal — chronic (no override) or already beyond
                 # governance (no override can help; never suggest one).
                 governance_refusal = verdict["reason"].startswith("Refusing cap bump:")
-                hint = "" if governance_refusal else " Skipping cap bump; use --force-chronic to override with operator approval."
+                hint = "" if governance_refusal else " Skipping cap bump: a chronic offender is not task-bumpable. Decompose the module, or raise a blocker for an operator."
                 label = "[refused]" if governance_refusal else "[chronic]"
                 print(f"{label} {section}/{rec['rel']}: {rec['count']} lines — {verdict['reason']}{hint}")
                 chronic_skipped.append((section, rec, verdict["reason"]))

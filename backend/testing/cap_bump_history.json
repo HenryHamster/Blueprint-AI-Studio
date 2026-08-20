@@ -2317,8 +2317,8 @@
           "new_cap": 3100
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-20T07:48:46.139881+00:00",
+          "commit_sha": "ce7b2bd91879531e6d8e2e0882fb855643efd57e",
+          "commit_date": "2026-08-20T07:54:41Z",
           "old_cap": 3100,
           "new_cap": 3600
         }
@@ -4615,6 +4615,14 @@
           "commit_date": "2026-08-20T06:56:03Z",
           "old_cap": 14850,
           "new_cap": 17100
+        }
+      ],
+      "test_size_limits_checker.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-20T08:13:56.509948+00:00",
+          "old_cap": 1750,
+          "new_cap": 2100
         }
       ]
     },

@@ -729,8 +729,9 @@ def test_fix_chronic_git_read_failure_refuses_bump(tmp_path, capsys, mocker):
     )
 
 
-def test_force_chronic_flag_overrides_chronic_gate(tmp_path, capsys, mocker):
+def test_force_chronic_flag_overrides_chronic_gate(tmp_path, capsys, mocker, monkeypatch):
     """--force-chronic grants operator-approved bump even for chronic offenders."""
+    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, "henry")
     from datetime import datetime, timedelta, timezone
 
     from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
@@ -763,6 +764,45 @@ def test_force_chronic_flag_overrides_chronic_gate(tmp_path, capsys, mocker):
     assert data["backend"]["chronic.py"] == bump_size_limit(1720)
     # Should label it as operator-approved, not a silent bump.
     assert "chronic" in out.lower()
+
+
+def test_force_chronic_without_operator_approval_env_is_refused(tmp_path, capsys, mocker):
+    """The chronic bypass must not be reachable from inside a task.
+
+    Before 2026-08-20 ``--force-chronic`` was self-service: an autonomous auto-fix
+    task ran it and raised ci_completion.py 3100 -> 3600 on its seventh bump
+    (PR #17587, reverted) -- exactly the move test_ci_compliance_gate.py pins as
+    forbidden. The approval now has to arrive from outside the process.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
+
+    repo, jp = _build_repo(tmp_path, backend={"chronic.py": (1720, 1600)})
+
+    def _rec(old, new, days_ago):
+        date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        return BumpRecord(
+            commit_sha=f"sha{days_ago}", commit_date=date, old_cap=old, new_cap=new
+        )
+
+    history = [
+        _rec(1000, 1200, CHRONIC_WINDOW_DAYS - 10),
+        _rec(1200, 1400, CHRONIC_WINDOW_DAYS - 60),
+        _rec(1400, 1600, 30),
+    ]
+
+    with mocker.patch(
+        "app.size_limit_policy.parse_bump_history", return_value=history
+    ):
+        rc = _run(jp, repo, "--fix", "--force-chronic", "--sections", "backend")
+
+    err = capsys.readouterr().err
+    assert rc == 1, "an unapproved chronic bypass must fail closed"
+    assert csl._OPERATOR_APPROVAL_ENV in err, err
+    assert json.loads(_read(jp))["backend"]["chronic.py"] == 1600, (
+        "the cap must be left exactly as it was"
+    )
 
 
 def test_coverage_threshold_in_sync_with_test_invariants():
@@ -1731,8 +1771,9 @@ def _build_zero_headroom_governed_module(tmp_path, name: str):
 
 
 @pytest.mark.parametrize("extra_args", [(), ("--force-chronic",)])
-def test_fix_refuses_zero_headroom_governed_module_without_crash(tmp_path, capsys, mocker, extra_args):
+def test_fix_refuses_zero_headroom_governed_module_without_crash(tmp_path, capsys, mocker, extra_args, monkeypatch):
     """--force-chronic waives the chronic gate, not the governance ceiling."""
+    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, "henry")
     repo, jp = _build_zero_headroom_governed_module(tmp_path, "governed_over.py")
     with mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[]):
         rc = _run(jp, repo, "--fix", *extra_args, "--sections", "backend")  # AssertionError here IS the defect

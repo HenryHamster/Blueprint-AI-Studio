@@ -56,7 +56,7 @@ else
   fi
   if [ "$SIZE_GR_RC" = "0" ]; then
     echo "[check] size guardrail WARN — every offender pre-exists on $SIZE_GR_BASE_REF; not blocking this PR"
-    echo "[check] Upstream remediation (separate chore PR): python3 backend/testing/check_size_limits.py --fix (chronic offenders need operator approval via --force-chronic)"
+    echo "[check] Upstream remediation (separate chore PR): python3 backend/testing/check_size_limits.py --fix. A chronic offender is NOT bumpable from a task -- decompose it, or raise a blocker for an operator."
     cat "$SIZE_GR_LOG" || true
   else
     echo "[check] size guardrail FAILED — size breach introduced or grown by this change."

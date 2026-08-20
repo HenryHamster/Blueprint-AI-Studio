@@ -355,12 +355,21 @@ async def test_size_breach_chronic_offender_no_new_limit(
 
 
 @pytest.mark.asyncio
-async def test_size_breach_force_chronic_override_grants_bump(
+async def test_size_breach_force_chronic_override_is_refused_on_an_agent_token(
     client: AsyncClient,
     db_session,
     mocker,
 ):
-    """force_chronic_override=True on a chronic offender must still grant new_limit."""
+    """An agent must not be able to grant itself the operator-approval bypass.
+
+    This asserts the OPPOSITE of what it asserted before 2026-08-20. The route
+    authenticates with ``verify_agent_token``, so there is no operator anywhere on
+    it, yet ``force_chronic_override`` was read straight off the request body --
+    self-approval by construction. An autonomous auto-fix task duly used it to
+    raise ci_completion.py 3100 -> 3600 on its seventh bump (PR #17587, reverted),
+    the exact move test_ci_compliance_gate.py pins as forbidden. The flag is now
+    ignored here and the refusal is reported back in the annotation context.
+    """
     from datetime import datetime, timedelta, timezone
 
     from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
@@ -414,8 +423,11 @@ async def test_size_breach_force_chronic_override_grants_bump(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["status"] == "ok"
-    assert "new_limit" in body, f"Override must grant new_limit: {body}"
-    assert body["new_limit"] == _bump_size_limit(1720)
+    assert body.get("is_chronic") is True, f"Chronic verdict must stand: {body}"
+    assert "new_limit" not in body, (
+        "An agent token carries no operator approval, so force_chronic_override "
+        f"must not produce a cap bump: {body}"
+    )
 
 
 def test_bump_size_limit_policy():
