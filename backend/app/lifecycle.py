@@ -1196,6 +1196,7 @@ async def lifespan(app):
             publish_service,
         )
         from app.notification_dispatch import notification_retry_drain_service
+        from app.max_plan_pool import max_plan_pool_refresh_service
 
         config_sync_task = asyncio.create_task(runtime_config_sync_service())
         jwt_revocation_task_nl = asyncio.create_task(jwt_revocation_service())
@@ -1205,6 +1206,12 @@ async def lifespan(app):
         notification_retry_task_nl = asyncio.create_task(
             notification_retry_drain_service()
         )
+        # Not leader-only: this instance answers runner pulls, and the pull
+        # decision reads the same in-memory account pool the orchestrator
+        # reconciles. Without a local refresh its active_tasks counter only
+        # ratchets up and eventually rejects every account as
+        # "probe already in flight" -- a fleet-wide dispatch wedge.
+        pool_refresh_task_nl = asyncio.create_task(max_plan_pool_refresh_service())
         from app.shared_state import background_tasks as _bg_tasks_nl
 
         _bg_tasks_nl["config_sync"] = config_sync_task
@@ -1213,6 +1220,7 @@ async def lifespan(app):
         _bg_tasks_nl["agent_log_relay"] = agent_log_relay_task_nl
         _bg_tasks_nl["publish"] = publish_task_nl
         _bg_tasks_nl["notification_retry_drain"] = notification_retry_task_nl
+        _bg_tasks_nl["max_plan_pool_refresh"] = pool_refresh_task_nl
 
         # Minimal watchdog: restart per-instance services if they crash, AND
         # periodically probe the leader advisory lock so we can take over
@@ -1297,6 +1305,19 @@ async def lifespan(app):
                         )
                         _bg_tasks_nl["notification_retry_drain"] = asyncio.create_task(
                             notification_retry_drain_service()
+                        )
+                    if pool_refresh_task_nl.done():
+                        exc = (
+                            pool_refresh_task_nl.exception()
+                            if not pool_refresh_task_nl.cancelled()
+                            else None
+                        )
+                        logger.error(
+                            f"[MONITOR] max_plan_pool_refresh DIED on non-leader "
+                            f"(exc={exc}); restarting"
+                        )
+                        _bg_tasks_nl["max_plan_pool_refresh"] = asyncio.create_task(
+                            max_plan_pool_refresh_service()
                         )
 
                     # API-only instances are permanently fenced out of worker

@@ -1482,6 +1482,47 @@ async def load_max_plan_pool():
         )
 
 
+_POOL_REFRESH_INTERVAL_SECONDS = 300
+
+
+async def max_plan_pool_refresh_service() -> None:
+    """Reconcile this process's pool cache on instances that are not leader.
+
+    ``load_max_plan_pool`` is the only path that rebuilds ``active_tasks``
+    from durable task state, and it ran periodically ONLY inside the
+    leader-gated orchestrator cycle. Non-leader instances loaded the pool
+    once at startup and never refreshed it, so their per-account
+    ``active_tasks`` could only ratchet upward: every dispatch increments
+    it, while the release path floors at ``max(db_count, cached - 1)`` and
+    so never recovers a slot leaked by a task that terminated without
+    firing the in-memory release callback.
+
+    That divergence is not cosmetic. ``_account_state_for_model`` returns
+    "probing" for every model whose cooldown has elapsed, and a probing
+    account is selectable only while ``active_tasks == 0`` -- the probe is
+    deliberately serialized to one task. Once the leaked counter passes
+    zero for every account, that instance rejects every candidate with
+    "cooldown elapsed, probe already in flight" and answers runner pulls
+    with ``no_eligible_account``. It never recovers on its own, because
+    clearing a cooldown requires running the very task it is refusing to
+    dispatch. Observed 2026-08-20: the leader reconciled to 0 active tasks
+    every 300s while the HTTP instance served a stale 17 and starved the
+    whole fleet.
+
+    The rebuild reads account and task state and rewrites only this
+    process's in-memory caches, so it is safe on every instance.
+    """
+
+    while True:
+        try:
+            await asyncio.sleep(_POOL_REFRESH_INTERVAL_SECONDS)
+            await load_max_plan_pool()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[POOL-REFRESH] Pool reconciliation failed: %s", exc)
+
+
 _DAILY_WINDOW_SECONDS = 24 * 60 * 60
 
 

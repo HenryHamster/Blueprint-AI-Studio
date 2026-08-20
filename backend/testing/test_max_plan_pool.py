@@ -6232,3 +6232,133 @@ class TestGetMeterReliabilityStats:
         finally:
             pool_mod._usage_persist_failing_accounts.clear()
             pool_mod._usage_persist_failing_accounts.update(original_failing)
+
+
+class TestNonLeaderPoolRefresh:
+    """The pool reconciliation must run wherever dispatch decisions are made.
+
+    Regression for the 2026-08-20 fleet wedge: ``load_max_plan_pool`` is the
+    only path that rebuilds ``active_tasks`` from durable task state, and its
+    periodic invocation lived exclusively inside the leader-gated orchestrator
+    cycle. The HTTP instance that answers runner pulls is usually NOT the
+    leader, so its counter only ever ratcheted upward until every account
+    failed the ``probing and active_tasks == 0`` gate and every pull returned
+    ``no_eligible_account`` -- unrecoverable, because clearing a cooldown
+    requires running the task the instance is refusing to dispatch.
+    """
+
+    async def test_refresh_service_reconciles_once_per_interval(self):
+        import app.max_plan_pool as pool_mod
+
+        loads = 0
+        sleeps = []
+
+        async def _fake_load():
+            nonlocal loads
+            loads += 1
+            if loads >= 3:
+                raise asyncio.CancelledError
+
+        async def _fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        with patch.object(pool_mod, "load_max_plan_pool", _fake_load), patch.object(
+            pool_mod.asyncio, "sleep", _fake_sleep
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await pool_mod.max_plan_pool_refresh_service()
+
+        assert loads == 3
+        # Pinned literal, not the constant under test: a cadence change that
+        # silently lengthens the reconciliation window is exactly the drift
+        # this guard exists to surface.
+        assert sleeps == [300, 300, 300]
+        assert pool_mod._POOL_REFRESH_INTERVAL_SECONDS == 300
+
+    async def test_refresh_service_survives_a_failing_reconciliation(self):
+        """One bad rebuild must not silently end the loop.
+
+        A service that dies on the first transient DB error reintroduces the
+        wedge on a longer fuse -- the counter resumes ratcheting and nothing
+        reports it.
+        """
+
+        import app.max_plan_pool as pool_mod
+
+        loads = 0
+
+        async def _fake_load():
+            nonlocal loads
+            loads += 1
+            if loads == 1:
+                raise RuntimeError("transient database failure")
+            if loads >= 3:
+                raise asyncio.CancelledError
+
+        async def _fake_sleep(_seconds):
+            return None
+
+        with patch.object(pool_mod, "load_max_plan_pool", _fake_load), patch.object(
+            pool_mod.asyncio, "sleep", _fake_sleep
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await pool_mod.max_plan_pool_refresh_service()
+
+        assert loads == 3, "loop must keep reconciling after a failed rebuild"
+
+    def test_non_leader_startup_starts_and_supervises_the_refresh(self):
+        """The service is useless unless the non-leader path actually starts it.
+
+        Asserted against the source of the non-leader branch specifically --
+        starting it only on the leader is precisely the bug, so a check that
+        merely finds the name somewhere in the module would still pass.
+        """
+
+        import inspect
+
+        import app.lifecycle as lifecycle_mod
+
+        source = inspect.getsource(lifecycle_mod)
+        marker = "# Per-instance services still run on non-leader instances."
+        assert marker in source, (
+            "non-leader startup block not found in lifecycle.py; update this "
+            "guard rather than deleting it"
+        )
+        non_leader_block = source.split(marker, 1)[1]
+
+        # Split again at the watchdog. The restart clause names the same
+        # service, the same background_tasks key and the same log line, so a
+        # guard that only searched the whole block stayed green when the
+        # startup create_task was deleted -- the exact regression it exists
+        # to catch. Startup and supervision are asserted separately.
+        monitor_marker = "async def _monitor_non_leader():"
+        assert monitor_marker in non_leader_block, (
+            "non-leader watchdog not found; update this guard rather than "
+            "deleting it"
+        )
+        startup, watchdog = non_leader_block.split(monitor_marker, 1)
+
+        assert (
+            "pool_refresh_task_nl = asyncio.create_task("
+            "max_plan_pool_refresh_service())" in startup
+        ), (
+            "non-leader instances must start the periodic pool reconciliation "
+            "at startup, not only from the watchdog; without it their "
+            "active_tasks counter only ratchets upward and every runner pull "
+            "eventually returns no_eligible_account"
+        )
+        assert (
+            '_bg_tasks_nl["max_plan_pool_refresh"] = pool_refresh_task_nl'
+            in startup
+        ), (
+            "the refresh task must be registered in background_tasks so the "
+            "non-leader watchdog can restart it"
+        )
+        assert "max_plan_pool_refresh DIED on non-leader" in watchdog, (
+            "the non-leader watchdog must supervise the refresh task; an "
+            "unsupervised loop that dies restores the original wedge"
+        )
+        assert "max_plan_pool_refresh_service()" in watchdog, (
+            "the watchdog must actually restart the refresh service, not "
+            "merely log that it died"
+        )
