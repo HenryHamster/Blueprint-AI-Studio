@@ -336,7 +336,7 @@
       "test_ids": [
         "test_bwrap_backend_probes_the_exact_agent_plan_when_available"
       ],
-      "test_count": 611
+      "test_count": 631
     },
     {
       "path": "agent/src/index.provider-runner.test.ts",

@@ -1,5 +1,6 @@
 """Tests for scripts/local_runner.py."""
 
+import ast
 import contextlib
 import base64
 import io
@@ -24,19 +25,76 @@ import local_runner
 import runner_isolation as iso
 
 
+# Every runner-owned background thread is started with this name prefix
+# (``blueprint-reaper``, ``blueprint-heartbeat``, ``blueprint-compute-poll``,
+# ``blueprint-cli-maintenance``, ``blueprint-verification-recovery``). Matching
+# on the prefix rather than one hardcoded name is what lets the reset below
+# reach a NEW loop without anyone remembering to update this file.
+_RUNNER_THREAD_PREFIX = "blueprint-"
+
+
+def _live_runner_threads():
+    """Return the runner-owned background threads still alive in this process."""
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith(_RUNNER_THREAD_PREFIX) and thread.is_alive()
+    ]
+
+
 def _reset_local_runner_test_state():
     """Stop runner-owned background work before restoring process globals.
 
-    Several tests exercise ``main()`` in-process.  Keep those tests from
-    leaking the verification-toolchain cache or reviving a maintenance thread
-    when the shutdown event is cleared for the next test.
+    Several tests exercise ``main()`` in-process, and ``main()`` starts daemon
+    loops (reaper, heartbeat, compute poll) that outlive the test.  Setting
+    ``_shutdown_event`` is not on its own enough: the loops only observe it at
+    their next 1-second tick, and this helper CLEARS the event again two lines
+    later for the following test.  A loop that had not yet woken therefore
+    survives the reset and keeps calling ``_post`` — landing inside a LATER
+    test's mock.  That is a cross-test failure with no local cause:
+    ``TestInitialOrchestratorRetry`` saw ``_post`` called twice instead of once
+    and passed in isolation, because the second call came from a heartbeat
+    thread leaked ~200 tests earlier by ``TestCredentialPersistence``.
+
+    So JOIN each live runner thread while the event is still set, before
+    clearing it.  The join is bounded; ``_assert_no_leaked_runner_threads``
+    then fails the test that actually leaked.
     """
     local_runner._shutdown_event.set()
-    for thread in threading.enumerate():
-        if thread.name == "blueprint-cli-maintenance":
-            thread.join(timeout=1.0)
-    local_runner._verification_toolchain = None
-    local_runner._shutdown_event.clear()
+    try:
+        for thread in _live_runner_threads():
+            # Loops poll _shutdown_event on a 1s tick; 5s is ample headroom on a
+            # loaded CI box while still bounding a genuinely wedged thread.
+            thread.join(timeout=5.0)
+    finally:
+        local_runner._verification_toolchain = None
+        local_runner._shutdown_event.clear()
+
+
+def _configure_iso_mock(mock_iso):
+    """Give a whole-module ``iso`` MagicMock its REAL string constants.
+
+    A plain MagicMock attribute answers ``__index__`` with 1, so
+    ``shutil.copy2(iso.PROJECT_VERIFICATION_PROBE_PATH, dst)`` inside
+    ``_earn_project_verification`` treats it as FILE DESCRIPTOR 1, adopts the
+    process's stdout as the source file, and closes it on exit. Every later
+    test that prints then dies with ``OSError: [Errno 9] Bad file descriptor``.
+
+    It is invisible on a terminal (fd 1 gets reallocated fast enough to hide
+    it) and catastrophic anywhere stdout is a pipe or a file: at 0806443aba
+    the whole file reported 16 failures + 4 errors on a tty and 17 failures +
+    85 errors with stdout redirected to a file. That second shape is how CI
+    runs it, so single-source the constants here rather than leaving five
+    copies of a mock that can be mistaken for an fd.
+    """
+    mock_iso.PROJECT_VERIFICATION_PROBE_PATH = iso.PROJECT_VERIFICATION_PROBE_PATH
+    mock_iso.PROJECT_VERIFICATION_VERSION = iso.PROJECT_VERIFICATION_VERSION
+    mock_iso.CLASS_AGENT = iso.CLASS_AGENT
+    mock_iso.CLASS_COMPUTE = iso.CLASS_COMPUTE
+    mock_iso.DECLINE = iso.DECLINE
+    mock_iso.AGENT_DOCKER_TYPES = []
+    mock_iso.sweep_stale_containers.return_value = None
+    return mock_iso
 
 
 class _LocalRunnerTestCase(unittest.TestCase):
@@ -44,7 +102,66 @@ class _LocalRunnerTestCase(unittest.TestCase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Cleanups run LIFO, so this registration order executes as:
+        #   1. _assert_stdio_fds_survived  — did the test close fd 1/2?
+        #   2. _reset_local_runner_test_state — stop and JOIN the runner loops
+        #   3. _assert_no_leaked_runner_threads — did anything survive the join?
+        # The leak assertion runs LAST, after the join, so it fires only for a
+        # thread that IGNORED _shutdown_event rather than for the ordinary case
+        # of a main()-driven test having started the loops at all.
+        self.addCleanup(self._assert_no_leaked_runner_threads)
         self.addCleanup(_reset_local_runner_test_state)
+        self.addCleanup(self._assert_stdio_fds_survived)
+
+    def _assert_no_leaked_runner_threads(self):
+        """Fail the test whose runner loop outlived its own cleanup.
+
+        A surviving daemon loop is a whole-process side effect exactly like a
+        closed stdio fd: it keeps issuing real ``_post`` calls, so it lands in
+        an unrelated LATER test's mock and that test reports the failure. That
+        is how ``TestInitialOrchestratorRetry`` came to see ``_post`` called
+        twice while passing in isolation — the extra call came from a heartbeat
+        thread started ~200 tests earlier by ``TestCredentialPersistence``.
+        Because it is order- and timing-dependent, the file passed under
+        ``unittest`` and failed under ``pytest``.
+
+        This runs AFTER ``_reset_local_runner_test_state`` has set the shutdown
+        event and joined each loop, so reaching it means a loop did not honour
+        ``_shutdown_event`` within the join budget — a real production defect,
+        not test bookkeeping. Checking per-test pins the blame where it belongs
+        and is un-gameable: a thread is either alive or it is not.
+        """
+        leaked = _live_runner_threads()
+        if leaked:
+            names = ", ".join(sorted(thread.name for thread in leaked))
+            self.fail(
+                f"this test leaked runner background thread(s): {names}. A live "
+                "loop keeps calling _post after the test ends and corrupts a "
+                "LATER test's mock. Stop the loop before the test returns "
+                "(set local_runner._shutdown_event and join it), or avoid "
+                "starting the daemon loops from this test."
+            )
+
+    def _assert_stdio_fds_survived(self):
+        """Fail the test that closed stdout/stderr, not the 85 tests after it.
+
+        Closing fd 1 or 2 is a whole-process side effect: every later test that
+        prints raises OSError(EBADF) from inside production code, so the file
+        reports a cascade of unrelated errors and the real culprit is invisible.
+        Checking the sentinel per-test pins the blame where it belongs and is
+        un-gameable — an fd is either open or it is not.
+        """
+        for fd, name in ((1, "stdout"), (2, "stderr")):
+            try:
+                os.fstat(fd)
+            except OSError as exc:
+                self.fail(
+                    f"this test closed fd {fd} ({name}): {exc}. A closed stdio "
+                    "descriptor breaks every subsequent test in the process. "
+                    "Usual cause: a MagicMock passed where a path is expected — "
+                    "open()/shutil.copy2() accept it as an INTEGER fd via "
+                    "__index__ (see _configure_iso_mock)."
+                )
 
 
 class TestLocalRunnerTestIsolation(unittest.TestCase):
@@ -62,6 +179,119 @@ class TestLocalRunnerTestIsolation(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertIsNone(local_runner._verification_toolchain)
         self.assertFalse(local_runner._shutdown_event.is_set())
+
+    def test_cleanup_joins_every_runner_owned_loop_name(self):
+        """The reset must reach ALL runner loops, not just the maintenance one.
+
+        It previously matched the single literal ``blueprint-cli-maintenance``,
+        so the reaper, heartbeat and compute-poll loops started by ``main()``
+        were never joined and survived into later tests.
+        """
+        local_runner._shutdown_event.clear()
+        threads = []
+        for name in (
+            "blueprint-reaper",
+            "blueprint-heartbeat",
+            "blueprint-compute-poll",
+            "blueprint-cli-maintenance",
+            "blueprint-verification-recovery",
+        ):
+            thread = threading.Thread(
+                target=local_runner._shutdown_event.wait, name=name
+            )
+            thread.start()
+            threads.append(thread)
+
+        _reset_local_runner_test_state()
+
+        for thread in threads:
+            self.assertFalse(
+                thread.is_alive(), f"{thread.name} survived the reset"
+            )
+        self.assertEqual(_live_runner_threads(), [])
+
+    def test_live_runner_threads_ignores_foreign_threads(self):
+        """The prefix match must not claim threads the runner does not own."""
+        stop = threading.Event()
+        foreign = threading.Thread(target=stop.wait, name="pytest-worker-3")
+        foreign.start()
+        try:
+            self.assertNotIn(
+                foreign, _live_runner_threads(), "matched a non-runner thread"
+            )
+        finally:
+            stop.set()
+            foreign.join(timeout=5.0)
+
+    def test_leak_guard_fails_when_a_loop_ignores_shutdown(self):
+        """The leak assertion must be able to FAIL, not merely report green.
+
+        A loop that never honours ``_shutdown_event`` outlives the join, and
+        that is exactly the production defect the guard exists to catch — so
+        drive it with such a loop and require the failure.
+        """
+        release = threading.Event()
+        wedged = threading.Thread(
+            target=release.wait, name="blueprint-heartbeat", daemon=True
+        )
+        wedged.start()
+        try:
+
+            class _Probe(_LocalRunnerTestCase):
+                def runTest(self):  # noqa: N802 - unittest naming
+                    pass
+
+            probe = _Probe()
+            with self.assertRaises(AssertionError) as caught:
+                probe._assert_no_leaked_runner_threads()
+            self.assertIn("blueprint-heartbeat", str(caught.exception))
+            self.assertIn("leaked runner background thread", str(caught.exception))
+        finally:
+            release.set()
+            wedged.join(timeout=5.0)
+
+    def test_main_loop_threads_are_named_for_the_harness(self):
+        """Pin the seam: every ``main()`` loop must carry a ``blueprint-`` name.
+
+        ``_reset_local_runner_test_state`` finds threads BY NAME. An unnamed
+        ``threading.Thread`` gets ``Thread-N``, which the prefix match cannot
+        see, so the loop would silently leak again. Assert on the source so a
+        newly-added loop fails here instead of surfacing as a flake in an
+        unrelated test hundreds of cases later.
+        """
+        source = Path(local_runner.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {"_reap_loop", "_heartbeat_loop", "_compute_poll_loop"}
+        seen = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (
+                (isinstance(func, ast.Attribute) and func.attr == "Thread")
+                or (isinstance(func, ast.Name) and func.id == "Thread")
+            ):
+                continue
+            keywords = {kw.arg: kw.value for kw in node.keywords}
+            target = keywords.get("target")
+            if not isinstance(target, ast.Name) or target.id not in wanted:
+                continue
+            name_node = keywords.get("name")
+            self.assertIsInstance(
+                name_node,
+                ast.Constant,
+                f"{target.id} thread must be started with a literal name=",
+            )
+            self.assertTrue(
+                name_node.value.startswith(_RUNNER_THREAD_PREFIX),
+                f"{target.id} thread name {name_node.value!r} must start with "
+                f"{_RUNNER_THREAD_PREFIX!r} so the test harness can join it",
+            )
+            seen[target.id] = name_node.value
+
+        self.assertEqual(
+            set(seen), wanted, f"did not find a named thread for every loop: {seen}"
+        )
 
 
 # ── Capability factories (isolation core) ─────────────────────────────────────
@@ -1284,6 +1514,48 @@ class TestManagedCliMaintenance(unittest.TestCase):
         )
 
 
+def _preflight_line(testcase, output: str, label: str) -> str:
+    """Return the single `  <label> : ...` line from --check output.
+
+    Preflight prints one labelled line per subsystem and several of them share
+    vocabulary ("NONE" appears under both `provider creds` and `supervisor`).
+    Asserting against the whole blob makes a test fail for a change in an
+    unrelated line, so every preflight assertion goes through this.
+    """
+    lines = [ln for ln in output.splitlines() if ln.strip().startswith(label)]
+    testcase.assertEqual(
+        len(lines), 1, f"expected exactly one {label!r} line in preflight output:\n{output}"
+    )
+    return lines[0]
+
+
+def _is_container_run(argv) -> bool:
+    """True when *argv* is the container-backend `run` that executes the job.
+
+    A compute job legitimately shells out several times before (and instead of)
+    the run: `docker info` to locate the image root, `docker pull` to warm the
+    image ahead of the GPU probe, `docker login` for a private registry. Tests
+    that mean "the job executed" must name the run, not index popen_calls[0] or
+    assert the list is empty — both conflate a read-only host probe with
+    actually starting untrusted job code.
+    """
+    parts = [str(a) for a in argv]
+    if len(parts) < 2:
+        return False
+    return os.path.basename(parts[0]) in ("docker", "podman") and parts[1] == "run"
+
+
+def _docker_run_argv(testcase, popen_calls) -> list:
+    """Return the single container `run` argv from *popen_calls*."""
+    runs = [list(c) for c in popen_calls if _is_container_run(c)]
+    testcase.assertEqual(
+        len(runs),
+        1,
+        f"expected exactly one container `run` in {[list(c) for c in popen_calls]!r}",
+    )
+    return runs[0]
+
+
 def _gpu_state(indices):
     return {
         "allowed": list(indices),
@@ -1364,19 +1636,26 @@ class TestEnvVarValidation(unittest.TestCase):
         env = os.environ.copy()
         env.pop("BLUEPRINT_RUNNER_TOKEN", None)
         env.pop("BLUEPRINT_ORCHESTRATOR_URL", None)
-        if env_overrides:
-            env.update(env_overrides)
-        if strip_vars:
-            for k in strip_vars:
-                env.pop(k, None)
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).parent / "local_runner.py")],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return result
+        # Point the credential dir at an empty temp dir, exactly as
+        # TestCheckModeAggregatesFailures does. Without it a real saved
+        # ~/.blueprint/runner_token on the host satisfies the token
+        # requirement, the runner BOOTS instead of exiting, and the case dies
+        # on the 5s subprocess timeout — 5s of wall clock spent proving
+        # nothing, and a red that names a timeout rather than the missing exit.
+        with tempfile.TemporaryDirectory() as tmp:
+            env["BLUEPRINT_CREDENTIAL_DIR"] = tmp
+            if env_overrides:
+                env.update(env_overrides)
+            if strip_vars:
+                for k in strip_vars:
+                    env.pop(k, None)
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).parent / "local_runner.py")],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
 
     def test_missing_token_exits_1(self):
         result = self._run_script(
@@ -1400,51 +1679,106 @@ class TestEnvVarValidation(unittest.TestCase):
     # the main loop's _locate_agent_binary re-resolution.
 
 
-class TestCheckModeAggregatesFailures(_LocalRunnerTestCase):
-    """`--check` reports ALL missing prerequisites in one pass (not first-fail)."""
+class TestCheckModeExitDecision(unittest.TestCase):
+    """`--check` reports ALL missing prerequisites in one pass (not first-fail).
 
-    def _run_check(self, env_overrides=None, strip_vars=None):
+    These exercise ``_check_mode_exit``, the decision ``main()`` delegates to.
+    They run in-process: the end-to-end proof that a real ``--check`` boot
+    reaches this decision with a correctly-collected list lives in
+    :class:`TestCheckModePreflightEndToEnd` below, which pays a runner boot for
+    it once instead of once per case.
+    """
+
+    def test_two_missing_prereqs_are_both_named_in_one_report(self):
+        """The historical regression: --check died naming only the token."""
+        code, report = local_runner._check_mode_exit(
+            ["BLUEPRINT_RUNNER_TOKEN", "BLUEPRINT_ORCHESTRATOR_URL"], True
+        )
+        self.assertEqual(code, 1)
+        combined = "\n".join(report)
+        self.assertIn("BLUEPRINT_RUNNER_TOKEN", combined)
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", combined)
+        self.assertIn("2 missing prerequisite(s)", combined)
+
+    def test_report_names_only_the_prereqs_it_was_given(self):
+        """A prerequisite that is present must not appear in the report."""
+        code, report = local_runner._check_mode_exit(["BLUEPRINT_ORCHESTRATOR_URL"], True)
+        self.assertEqual(code, 1)
+        combined = "\n".join(report)
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", combined)
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", combined)
+        self.assertIn("1 missing prerequisite(s)", combined)
+
+    def test_missing_prereqs_outrank_a_healthy_setup(self):
+        """setup_ok must not turn a missing prerequisite into a green check."""
+        code, _ = local_runner._check_mode_exit(["BLUEPRINT_RUNNER_TOKEN"], True)
+        self.assertEqual(code, 1)
+
+    def test_no_missing_prereqs_defers_to_setup_ok(self):
+        self.assertEqual(local_runner._check_mode_exit([], True), (0, []))
+
+    def test_no_missing_prereqs_but_bad_setup_exits_1_silently(self):
+        """An unhealthy box exits 1, but with no missing-prerequisite report."""
+        code, report = local_runner._check_mode_exit([], False)
+        self.assertEqual(code, 1)
+        self.assertEqual(report, [])
+
+    def test_report_instructs_the_operator_to_rerun(self):
+        _, report = local_runner._check_mode_exit(["BLUEPRINT_RUNNER_TOKEN"], True)
+        self.assertTrue(
+            any("re-run" in line for line in report),
+            msg=f"expected a re-run instruction, got: {report}",
+        )
+
+
+class TestCheckModePreflightEndToEnd(_LocalRunnerTestCase):
+    """One real `--check` boot, shared by every assertion that needs one.
+
+    A real boot probes the host's isolation backends (bwrap/docker/podman/GPU)
+    and costs ~1.7s. This file runs in the scripts CI lane under a 25-second
+    per-file budget shared with whatever else the shard is running, so the boot
+    is paid ONCE in ``setUpClass`` rather than once per test method. The cheap
+    decision-table cases live in :class:`TestCheckModeExitDecision`.
+    """
+
+    _result = None
+
+    @classmethod
+    def setUpClass(cls):
         env = os.environ.copy()
         env.pop("BLUEPRINT_RUNNER_TOKEN", None)
         env.pop("BLUEPRINT_ORCHESTRATOR_URL", None)
-        # Point the credential file at an empty temp dir so a real saved token on
-        # the test box can't mask a "missing token" case.
+        # Point the credential file at an empty temp dir so a real saved token
+        # on the test box can't mask a "missing token" case.
         with tempfile.TemporaryDirectory() as tmp:
             env["BLUEPRINT_CREDENTIAL_DIR"] = tmp
-            if env_overrides:
-                env.update(env_overrides)
-            if strip_vars:
-                for k in strip_vars:
-                    env.pop(k, None)
-            return subprocess.run(
+            cls._result = subprocess.run(
                 [sys.executable, str(Path(__file__).parent / "local_runner.py"), "--check"],
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                # Generous: this competes for CPU with the rest of the shard.
+                # The budget this protects is the whole file's, not this call's.
+                timeout=120,
             )
+        cls._combined = cls._result.stdout + cls._result.stderr
 
-    def test_check_missing_both_reports_both_and_exits_1(self):
-        # Regression: today --check dies naming only the token; it must name BOTH.
-        result = self._run_check()
-        combined = result.stdout + result.stderr
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("BLUEPRINT_RUNNER_TOKEN", combined)
-        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", combined)
+    def test_check_exits_1_when_prereqs_are_missing(self):
+        self.assertEqual(self._result.returncode, 1)
 
-    def test_check_missing_url_still_runs_preflight_probes(self):
-        # Token present, URL absent: the preflight report must still print (the
-        # probes ran despite the missing URL) rather than a bare first-fail exit.
-        result = self._run_check(env_overrides={"BLUEPRINT_RUNNER_TOKEN": "tok-abc-123456"})
-        combined = result.stdout + result.stderr
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", combined)
-        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", combined.split("missing prerequisite")[-1])
-        # Preflight probe output (isolation / task classes) proves probes ran.
+    def test_check_names_both_missing_vars_from_a_real_boot(self):
+        """End-to-end: main() COLLECTS both, not just the first one it hits."""
+        self.assertIn("BLUEPRINT_RUNNER_TOKEN", self._combined)
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", self._combined)
+        self.assertIn("2 missing prerequisite(s)", self._combined)
+
+    def test_check_still_runs_preflight_probes_despite_missing_prereqs(self):
+        """Probes must still run and print, rather than a bare first-fail exit."""
         self.assertTrue(
-            ("isolation" in combined.lower()) or ("task class" in combined.lower())
-            or ("claimable" in combined.lower()),
-            msg=f"expected preflight probe output, got:\n{combined}",
+            ("isolation" in self._combined.lower())
+            or ("task class" in self._combined.lower())
+            or ("claimable" in self._combined.lower()),
+            msg=f"expected preflight probe output, got:\n{self._combined}",
         )
 
 
@@ -1879,7 +2213,21 @@ class TestLowDiskGuard(unittest.TestCase):
 # ── Host-load throttle ─────────────────────────────────────────────────────────
 
 class TestHostLoadThrottle(unittest.TestCase):
-    """_compute_poll_loop and agent poll skip claims when load thresholds are met."""
+    """_compute_poll_loop and agent poll skip claims when load thresholds are met.
+
+    Every case here drives the loop SYNCHRONOUSLY and ends it on the signal it
+    is actually asserting about, rather than starting a daemon thread and
+    sleeping a fixed 0.15s. The sleep was both slower (8 cases x 150ms, the
+    second-largest cost in this file, which runs under a 25-second per-file CI
+    budget) and weaker: it proved only that 150ms elapsed, never that the loop
+    had reached the decision under test. A throttled case in particular could
+    pass because the loop had not yet run at all.
+
+    For a case that expects a claim, the signal is the POST itself. For a case
+    that expects NO claim, the signal is the throttle probe the loop must
+    consult before deciding to skip — so "did not claim" is now asserted
+    together with "and it did get as far as looking".
+    """
 
     def setUp(self):
         local_runner._shutdown_event.clear()
@@ -1898,27 +2246,62 @@ class TestHostLoadThrottle(unittest.TestCase):
         lock = threading.Lock()
         return active_jobs, lock
 
+    @staticmethod
+    def _stop_after(record, sink=None):
+        """Wrap a probe/post so the loop stops as soon as it is observed.
+
+        Returns a side_effect that appends to ``sink`` (when given), sets the
+        shutdown event, and then returns ``record``'s value. This is what lets
+        the loop be run in-thread: it terminates on the observation the test
+        cares about instead of on a timer.
+        """
+        def _side_effect(*args, **kwargs):
+            if sink is not None:
+                sink.append(args[0] if args else None)
+            local_runner._shutdown_event.set()
+            return record(*args, **kwargs) if callable(record) else record
+        return _side_effect
+
     def _run_compute_poll(self, gpu_util_pct_ret, max_gpu_util_pct, post_side_effect):
-        """Run _compute_poll_loop in a thread for 0.15s, return list of posted calls."""
+        """Drive one pass of _compute_poll_loop; return the list of posted URLs.
+
+        Ends on whichever comes first: the POST (claim allowed) or the GPU
+        probe (claim throttled) — so both outcomes terminate deterministically.
+        """
         calls = []
+        gpu_probe_calls = []
 
         def fake_post(url, token, body, **kwargs):
             calls.append(url)
+            local_runner._shutdown_event.set()
             return post_side_effect(url)
 
-        active_jobs, lock = self._make_compute_deps()
-        with patch.object(local_runner, "_gpu_utilization_pct", return_value=gpu_util_pct_ret), \
-             patch.object(local_runner, "_post", side_effect=fake_post):
-            t = threading.Thread(
-                target=local_runner._compute_poll_loop,
-                args=("http://test", "tok", active_jobs, lock, 1),
-                kwargs={"max_gpu_util_pct": max_gpu_util_pct, "base_poll_interval": 0.05},
-                daemon=True,
-            )
-            t.start()
-            time.sleep(0.15)
+        def fake_gpu(*_args, **_kwargs):
+            gpu_probe_calls.append(True)
+            # Stop after the probe so a THROTTLED loop (which never POSTs)
+            # still terminates on an observation rather than on a timeout.
             local_runner._shutdown_event.set()
-            t.join(timeout=2)
+            return gpu_util_pct_ret
+
+        active_jobs, lock = self._make_compute_deps()
+        with patch.object(local_runner, "_gpu_utilization_pct", side_effect=fake_gpu), \
+             patch.object(local_runner, "_post", side_effect=fake_post):
+            local_runner._compute_poll_loop(
+                "http://test", "tok", active_jobs, lock, 1,
+                max_gpu_util_pct=max_gpu_util_pct, base_poll_interval=0.001,
+            )
+        if max_gpu_util_pct > 0:
+            self.assertTrue(
+                gpu_probe_calls,
+                "a configured GPU threshold must be consulted before deciding",
+            )
+        else:
+            # local_runner.py guards the probe with `if max_gpu_util_pct > 0`:
+            # a disabled threshold must not pay an nvidia-smi call every poll.
+            self.assertEqual(
+                gpu_probe_calls, [],
+                "a disabled GPU threshold must not probe the GPU at all",
+            )
         return calls
 
     def test_cpu_load_disabled_by_default(self):
@@ -1970,6 +2353,7 @@ class TestHostLoadThrottle(unittest.TestCase):
 
         def fake_post(url, token, body, **kwargs):
             calls.append(url)
+            local_runner._shutdown_event.set()
             return (204, None, None)
 
         active_jobs, lock = self._make_compute_deps()
@@ -1977,18 +2361,18 @@ class TestHostLoadThrottle(unittest.TestCase):
              patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
              patch.object(local_runner, "_min_free_disk_bytes", return_value=1_000_000), \
              patch.object(local_runner, "_disk_below_min", return_value=True), \
-             patch.object(local_runner, "_prune_docker_images", return_value={"reason": "removed_stale"}) as prune_images, \
+             patch.object(
+                 local_runner,
+                 "_prune_docker_images",
+                 # The reclaim attempt is the loop's observable proof that it
+                 # reached the low-disk branch; stop there.
+                 side_effect=self._stop_after({"reason": "removed_stale"}),
+             ) as prune_images, \
              patch.object(local_runner, "_post", side_effect=fake_post):
-            t = threading.Thread(
-                target=local_runner._compute_poll_loop,
-                args=("http://test", "tok", active_jobs, lock, 1),
-                kwargs={"base_poll_interval": 0.05},
-                daemon=True,
+            local_runner._compute_poll_loop(
+                "http://test", "tok", active_jobs, lock, 1,
+                base_poll_interval=0.001,
             )
-            t.start()
-            time.sleep(0.15)
-            local_runner._shutdown_event.set()
-            t.join(timeout=2)
         self.assertEqual(calls, [], "must not poll for compute work while disk is low")
         self.assertEqual(prune_images.call_count, 1)
 
@@ -1999,23 +2383,22 @@ class TestHostLoadThrottle(unittest.TestCase):
         def fake_disk_below(*_args):
             return next(disk_states, False)
 
+        def fake_post(*_args, **_kwargs):
+            # Reached only on the second pass, after the reclaim freed space.
+            local_runner._shutdown_event.set()
+            return (204, None, None)
+
         active_jobs, lock = self._make_compute_deps()
         with patch.object(local_runner, "_gpu_utilization_pct", return_value=None), \
              patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
              patch.object(local_runner, "_min_free_disk_bytes", return_value=1_000_000), \
              patch.object(local_runner, "_disk_below_min", side_effect=fake_disk_below), \
              patch.object(local_runner, "_prune_docker_images", return_value={"reason": "removed_stale"}) as prune_images, \
-             patch.object(local_runner, "_post", side_effect=lambda *_args, **_kwargs: (204, None, None)) as post:
-            t = threading.Thread(
-                target=local_runner._compute_poll_loop,
-                args=("http://test", "tok", active_jobs, lock, 1),
-                kwargs={"base_poll_interval": 0.05},
-                daemon=True,
+             patch.object(local_runner, "_post", side_effect=fake_post) as post:
+            local_runner._compute_poll_loop(
+                "http://test", "tok", active_jobs, lock, 1,
+                base_poll_interval=0.001,
             )
-            t.start()
-            time.sleep(0.15)
-            local_runner._shutdown_event.set()
-            t.join(timeout=2)
         self.assertEqual(prune_images.call_count, 1)
         self.assertGreaterEqual(post.call_count, 1)
 
@@ -2090,6 +2473,7 @@ class TestHostLoadThrottle(unittest.TestCase):
 
         def fake_post(url, token, body, **kwargs):
             calls.append(url)
+            local_runner._shutdown_event.set()
             return (204, None, None)
 
         active_jobs, lock = self._make_compute_deps()
@@ -2098,16 +2482,10 @@ class TestHostLoadThrottle(unittest.TestCase):
              patch.object(local_runner, "_min_free_disk_bytes", return_value=1_000_000), \
              patch.object(local_runner, "_disk_below_min", return_value=False), \
              patch.object(local_runner, "_post", side_effect=fake_post):
-            t = threading.Thread(
-                target=local_runner._compute_poll_loop,
-                args=("http://test", "tok", active_jobs, lock, 1),
-                kwargs={"base_poll_interval": 0.05},
-                daemon=True,
+            local_runner._compute_poll_loop(
+                "http://test", "tok", active_jobs, lock, 1,
+                base_poll_interval=0.001,
             )
-            t.start()
-            time.sleep(0.15)
-            local_runner._shutdown_event.set()
-            t.join(timeout=2)
         self.assertTrue(len(calls) >= 1)
 
 
@@ -3328,13 +3706,21 @@ class TestGracefulShutdown(unittest.TestCase):
         proc.terminate.assert_called_once()
 
     def test_shutdown_waits_for_compute_jobs(self):
-        """Shutdown waits for active compute jobs to complete before exiting."""
+        """Shutdown waits for active compute jobs to complete before exiting.
+
+        The drain delay and the poll interval are both scaled down from the
+        production 0.5s: what is under test is the SEMANTICS (block until the
+        set empties, then return promptly), and those are unchanged by the
+        scale. At production scale this single case cost ~0.5s of the file's
+        25-second CI budget to re-prove arithmetic it does not own.
+        """
         lock = threading.Lock()
         active: set[str] = {"job-a", "job-b"}
+        drain_delay = 0.05
 
         def _drain() -> None:
             """Simulate a worker completing and removing itself from the set."""
-            time.sleep(0.3)
+            time.sleep(drain_delay)
             with lock:
                 active.clear()
 
@@ -3342,15 +3728,18 @@ class TestGracefulShutdown(unittest.TestCase):
         drainer.start()
 
         start = time.monotonic()
-        local_runner._wait_for_compute_jobs(active, lock, "https://api.example.com", "test-token", timeout=5)
+        with patch.object(local_runner, "_COMPUTE_DRAIN_POLL_INTERVAL", 0.01):
+            local_runner._wait_for_compute_jobs(
+                active, lock, "https://api.example.com", "test-token", timeout=5
+            )
         elapsed = time.monotonic() - start
         drainer.join()
 
         # Must have waited for the drainer to clear the set (not instant).
         self.assertGreaterEqual(
             elapsed,
-            0.15,
-            "Should have waited at least ~300 ms for compute jobs to finish",
+            drain_delay,
+            "Should have blocked until the compute jobs finished draining",
         )
         # Must NOT have hit the full 5 s timeout.
         self.assertLess(
@@ -3359,6 +3748,41 @@ class TestGracefulShutdown(unittest.TestCase):
             "Should have returned as soon as all jobs finished, not waited full timeout",
         )
         self.assertFalse(active, "All jobs should have been drained")
+
+    def test_shutdown_drain_does_not_overshoot_a_short_timeout(self):
+        """A timeout shorter than the poll interval must still be honoured.
+
+        The drain loop used to sleep a bare 0.5s before its first re-check, so
+        ``timeout=0.05`` blocked for the full half-second — a 10x overshoot of
+        the deadline the caller asked for, and on a normal drain it held
+        SIGTERM handling open for up to a full interval after the last job had
+        already finished. The sleep is now clamped to the remaining budget.
+        """
+        lock = threading.Lock()
+        active: set[str] = {"stuck-job"}
+        timeout = 0.05
+
+        with patch.object(local_runner, "_report_compute_job", lambda *a, **k: True), \
+             patch.object(local_runner, "_COMPUTE_DRAIN_POLL_INTERVAL", 5.0), \
+             contextlib.redirect_stdout(io.StringIO()):
+            start = time.monotonic()
+            local_runner._wait_for_compute_jobs(
+                active, lock, "https://api.example.com", "test-token", timeout=timeout
+            )
+            elapsed = time.monotonic() - start
+
+        # Pinned against the POLL INTERVAL (5.0s), not merely "fast": before the
+        # clamp this returned in ~interval regardless of the timeout.
+        self.assertLess(
+            elapsed,
+            1.0,
+            f"drain overshot a {timeout}s timeout by sleeping the poll interval "
+            f"({elapsed:.3f}s elapsed against a 5.0s interval)",
+        )
+        self.assertGreaterEqual(
+            elapsed, 0.0, "elapsed time must be a real measurement"
+        )
+        self.assertIn("stuck-job", active, "the stuck job must remain in the set")
 
     def test_shutdown_no_compute_jobs_returns_immediately(self):
         """Shutdown with zero active compute jobs returns without delay."""
@@ -3376,14 +3800,27 @@ class TestGracefulShutdown(unittest.TestCase):
         lock = threading.Lock()
         active: set[str] = {"stuck-job"}
         buf = io.StringIO()
+        reports = []
 
-        with contextlib.redirect_stdout(buf):
+        def fake_report(orchestrator_url, token, job_id, **kwargs):
+            reports.append(job_id)
+            return True
+
+        # Stub the terminal report, exactly as the sibling
+        # test_shutdown_reports_stranded_jobs_as_failed does. Unstubbed, the
+        # stranded-job report is a REAL HTTP POST to api.example.com and its
+        # retry ladder ran for 30.6s — 63% of this whole file's wall clock, for
+        # a test whose subject is a log line. It also made the case depend on
+        # the VM having no network path to that name.
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             contextlib.redirect_stdout(buf):
             local_runner._wait_for_compute_jobs(active, lock, "https://api.example.com", "test-token", timeout=0.05)
 
         output = buf.getvalue()
         self.assertIn("timeout", output, "Should log a timeout message")
         self.assertIn("reporting as failed", output, "Should report stranded jobs as failed")
         self.assertIn("stuck-job", active, "Stuck job must remain in set")
+        self.assertEqual(reports, ["stuck-job"], "the stranded job must be reported")
 
     def test_shutdown_reports_stranded_jobs_as_failed(self):
         """Stranded compute jobs after shutdown deadline are reported as failed."""
@@ -3911,7 +4348,23 @@ class TestRunComputeJob(unittest.TestCase):
         active_jobs: set = {"test-job-001"}
         lock = threading.Lock()
 
+        pulls: list = []
+
+        def fake_pull(plan, image, timeout=1800):
+            pulls.append([plan.argv[0], "pull", image])
+            return True, "pulled"
+
+        # The pre-run image pull and the in-sandbox nvidia-smi probe both need a
+        # real container runtime and a real GPU; stub them so this test keeps
+        # asserting the one thing it is about — the `docker run` argv this host
+        # would construct. (Their own behaviour is covered by
+        # TestGpuSandboxSmoke and test_runner_isolation.py.)
         with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(iso, "pull_container_image", fake_pull), \
+             patch.object(
+                 iso, "probe_gpu_in_sandbox",
+                 lambda plan, timeout=30: (True, "GPU 0: Tesla V100 (UUID: GPU-abc)\n"),
+             ), \
              patch("subprocess.Popen", side_effect=fake_popen):
             local_runner._run_compute_job(
                 job, "https://api.example.com", "tok",
@@ -3920,11 +4373,23 @@ class TestRunComputeJob(unittest.TestCase):
                 gpu_state=_gpu_state([0]),
             )
 
-        docker_args = popen_calls[0]
+        # `docker run` is NOT the first Popen: a GPU container job pre-pulls the
+        # image (and probes it) first, so index [0] is `docker pull`. Select the
+        # run by argv shape instead of position, or this reads the pull's argv
+        # and reports a missing --gpus that is really a missing subcommand.
+        docker_args = _docker_run_argv(self, popen_calls)
         self.assertIn("--gpus", docker_args)
         gpus_idx = docker_args.index("--gpus")
         # GPUs are scoped to the ASSIGNED device, not "all".
         self.assertEqual(docker_args[gpus_idx + 1], "device=0")
+        # The pull really did precede the run: a GPU container job must warm the
+        # image before the probe, or the probe's 30s timeout races a cold
+        # multi-GB download and the job dies naming the wrong cause.
+        self.assertEqual(
+            pulls,
+            [["docker", "pull", "pytorch/pytorch:latest"]],
+            "the image pull must precede the run",
+        )
 
     def test_cancel_requested_on_claim_skips_execution(self):
         """When cancel_requested is True on the job body, no subprocess is started."""
@@ -5139,7 +5604,20 @@ class TestDockerLogin(unittest.TestCase):
                                           active_jobs, lock, capabilities=_docker_caps())
 
         self.assertIn("failed", reports)
-        self.assertEqual(popen_calls, [], "docker run must not be called on login failure")
+        # Host PROBES (`docker info --format {{.DockerRootDir}}`) legitimately run
+        # before the login gate; what must not happen is the job actually
+        # executing. Assert on `docker run`/`podman run` specifically rather than
+        # on "no subprocess at all", which conflates a read-only host probe with
+        # running untrusted job code against an unauthenticated registry.
+        run_calls = [c for c in popen_calls if _is_container_run(c)]
+        self.assertEqual(
+            run_calls, [], "docker run must not be called on login failure"
+        )
+        self.assertNotIn(
+            ["docker", "pull", "nvcr.io/nvidia/pytorch:latest"],
+            [list(c) for c in popen_calls],
+            "the image must not be pulled from a private registry after login failed",
+        )
 
 
 # ── Compute working-directory resolution ──────────────────────────────────────
@@ -6008,8 +6486,12 @@ class TestComputeJobTelemetry(_LocalRunnerTestCase):
             reports.append({"exec_status": exec_status, "command_log": command_log})
             return False
 
+        # allow_host_fallback is REQUIRED for the downgrade to happen at all:
+        # an image job on a runtime-less host is otherwise declined fail-closed.
+        # The note under test only exists on the permitted path.
         job = self._make_job(command="exit 0",
-                             container_image="nvcr.io/nvidia/pytorch:24.01")
+                             container_image="nvcr.io/nvidia/pytorch:24.01",
+                             allow_host_fallback=True)
         active_jobs, lock = {"test-job-001"}, threading.Lock()
         with patch.object(local_runner, "_report_compute_job", fake_report), \
              patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
@@ -6023,6 +6505,35 @@ class TestComputeJobTelemetry(_LocalRunnerTestCase):
         self.assertIsNotNone(cl)
         self.assertIn("nvcr.io/nvidia/pytorch:24.01", cl["text"])
         self.assertIn("image-less on host toolchain", cl["text"])
+
+    def test_image_job_declined_when_host_fallback_not_permitted(self):
+        """Without allow_host_fallback, an image job on a runtime-less host is
+        DECLINED — it must not silently downgrade to the host toolchain.
+
+        The downgrade drops the image's entire runtime (CUDA, pinned libs), so
+        it is only legitimate when the launch contract opted into it. This is
+        the fail-closed half of the pair above; asserting only the downgrade
+        would let a regression that made it unconditional pass.
+        """
+        reports = []
+
+        def fake_report(orch, token, job_id, *, exec_status, exit_code=None,
+                        result_metrics=None, command_log=None, progress=None, **_kw):
+            reports.append({"exec_status": exec_status, "command_log": command_log})
+            return False
+
+        job = self._make_job(command="exit 0",
+                             container_image="nvcr.io/nvidia/pytorch:24.01")
+        active_jobs, lock = {"test-job-001"}, threading.Lock()
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
+            local_runner._run_compute_job(job, "https://api", "tok", active_jobs, lock,
+                                          capabilities=_bwrap_caps())
+
+        terminal = [r for r in reports if r["exec_status"] in ("succeeded", "failed")]
+        self.assertTrue(terminal)
+        self.assertEqual(terminal[-1]["exec_status"], "failed")
+        self.assertIn("declined", terminal[-1]["command_log"]["text"].lower())
 
 
 class TestHeartbeatTelemetryPayload(unittest.TestCase):
@@ -8510,14 +9021,19 @@ class TestCredentialPersistence(_LocalRunnerTestCase):
              patch.object(local_runner, "_detect_gpu", return_value={}), \
              patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
              patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(
+                 local_runner, "_bootstrap_verification_toolchain", return_value=None
+             ), \
              patch.object(local_runner, "iso") as mock_iso:
+            # The verification-toolchain bootstrap shells out 6-8 times (venv,
+            # pip, ruff --version): ~1.6s of real subprocess per main() call,
+            # resolving differently on every host. It has its own dedicated
+            # coverage in TestVerificationToolchain (subprocess mocked); no
+            # main()-driven case here asserts on it.
             mock_iso.detect_capabilities.return_value = _bwrap_caps()
             mock_iso.claimable_classes.return_value = {"agent": False, "compute": False}
             mock_iso.agent_decline_reason.return_value = "no binary"
-            mock_iso.CLASS_AGENT = "agent"
-            mock_iso.CLASS_COMPUTE = "compute"
-            mock_iso.sweep_stale_containers.return_value = None
-            mock_iso.AGENT_DOCKER_TYPES = []
+            _configure_iso_mock(mock_iso)
             try:
                 local_runner.main()
             except SystemExit:
@@ -8550,14 +9066,19 @@ class TestCredentialPersistence(_LocalRunnerTestCase):
              patch.object(local_runner, "_detect_gpu", return_value={}), \
              patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
              patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(
+                 local_runner, "_bootstrap_verification_toolchain", return_value=None
+             ), \
              patch.object(local_runner, "iso") as mock_iso:
+            # The verification-toolchain bootstrap shells out 6-8 times (venv,
+            # pip, ruff --version): ~1.6s of real subprocess per main() call,
+            # resolving differently on every host. It has its own dedicated
+            # coverage in TestVerificationToolchain (subprocess mocked); no
+            # main()-driven case here asserts on it.
             mock_iso.detect_capabilities.return_value = _bwrap_caps()
             mock_iso.claimable_classes.return_value = {"agent": False, "compute": False}
             mock_iso.agent_decline_reason.return_value = "no binary"
-            mock_iso.CLASS_AGENT = "agent"
-            mock_iso.CLASS_COMPUTE = "compute"
-            mock_iso.sweep_stale_containers.return_value = None
-            mock_iso.AGENT_DOCKER_TYPES = []
+            _configure_iso_mock(mock_iso)
             try:
                 local_runner.main()
             except SystemExit:
@@ -8688,14 +9209,20 @@ class TestInitialOrchestratorRetry(unittest.TestCase):
                           return_value=True), \
              patch.object(local_runner, "_retry_initial_orchestrator_connection"
                           ) as retry_mock, \
+             patch.object(
+                 local_runner, "_bootstrap_verification_toolchain", return_value=None
+             ), \
              patch.object(local_runner, "iso") as mock_iso:
+            # The verification-toolchain bootstrap shells out 6-8 times (venv,
+            # pip, ruff --version): ~1.6s of real subprocess per main() call,
+            # resolving differently on every host. It has its own dedicated
+            # coverage in TestVerificationToolchain (subprocess mocked); no
+            # main()-driven case here asserts on it.
             mock_iso.claimable_classes.return_value = {
                 "agent": False, "compute": False,
             }
             mock_iso.agent_decline_reason.return_value = "no binary"
-            mock_iso.CLASS_AGENT = "agent"
-            mock_iso.CLASS_COMPUTE = "compute"
-            mock_iso.AGENT_DOCKER_TYPES = []
+            _configure_iso_mock(mock_iso)
             with self.assertRaises(SystemExit) as raised:
                 local_runner.main()
 
@@ -8760,8 +9287,14 @@ class TestConcurrencyPresetMismatch(_LocalRunnerTestCase):
             return 200, {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}
 
         checkout_sha = "c" * 40
+        # _runner_version must be stubbed CLEAN. preflight derives git_sha via
+        # _clean_source_sha(version), which returns None for any "-dirty"
+        # version — so on a checkout with uncommitted edits (i.e. every agent
+        # and developer working tree) this asserted None != sha and read as a
+        # git_sha regression rather than "the tree is dirty".
         with patch.object(local_runner, "_post", side_effect=fake_post), \
              patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(local_runner, "_runner_version", return_value="v1-test"), \
              patch.object(local_runner, "_checkout_source_sha", return_value=checkout_sha):
             local_runner._preflight(
                 "https://api.example.com", "tok", None,
@@ -8772,6 +9305,31 @@ class TestConcurrencyPresetMismatch(_LocalRunnerTestCase):
         self.assertFalse(captured["body"]["active_work_report"])
         self.assertEqual(captured["body"]["active_task_ids"], [])
         self.assertEqual(captured["body"]["git_sha"], checkout_sha)
+
+    def test_preflight_omits_git_sha_on_a_dirty_checkout(self):
+        """A dirty checkout reports git_sha=None, not a misleading commit identity.
+
+        The sha is an actionable commit the orchestrator may check out; a tree
+        with uncommitted edits is not that commit, so preflight must withhold it
+        rather than name a sha whose content the runner is not actually running.
+        """
+        captured = {}
+
+        def fake_post(url, token, body, **kwargs):
+            captured["body"] = body
+            return 200, {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}
+
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(local_runner, "_runner_version", return_value="v1-test-dirty"), \
+             patch.object(local_runner, "_checkout_source_sha", return_value="c" * 40):
+            local_runner._preflight(
+                "https://api.example.com", "tok", None,
+                _bwrap_caps(), _gpu_state(()), 2, 2,
+            )
+
+        self.assertIsNone(captured["body"]["git_sha"])
+        self.assertEqual(captured["body"]["version"], "v1-test-dirty")
 
     def test_no_warn_only_mismatch_path(self):
         """main() no longer emits the warn-only "disagrees" advisory when the env
@@ -8809,14 +9367,19 @@ class TestConcurrencyPresetMismatch(_LocalRunnerTestCase):
              patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
              patch.object(local_runner, "_workspace_writable", return_value=True), \
              patch("builtins.print", side_effect=capture_print), \
+             patch.object(
+                 local_runner, "_bootstrap_verification_toolchain", return_value=None
+             ), \
              patch.object(local_runner, "iso") as mock_iso:
+            # The verification-toolchain bootstrap shells out 6-8 times (venv,
+            # pip, ruff --version): ~1.6s of real subprocess per main() call,
+            # resolving differently on every host. It has its own dedicated
+            # coverage in TestVerificationToolchain (subprocess mocked); no
+            # main()-driven case here asserts on it.
             mock_iso.detect_capabilities.return_value = _bwrap_caps()
             mock_iso.claimable_classes.return_value = {"agent": False, "compute": False}
             mock_iso.agent_decline_reason.return_value = "no binary"
-            mock_iso.CLASS_AGENT = "agent"
-            mock_iso.CLASS_COMPUTE = "compute"
-            mock_iso.sweep_stale_containers.return_value = None
-            mock_iso.AGENT_DOCKER_TYPES = []
+            _configure_iso_mock(mock_iso)
             try:
                 local_runner.main()
             except SystemExit:
@@ -8862,14 +9425,19 @@ class TestConcurrencyPresetMismatch(_LocalRunnerTestCase):
              patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
              patch.object(local_runner, "_workspace_writable", return_value=True), \
              patch("builtins.print", side_effect=capture_print), \
+             patch.object(
+                 local_runner, "_bootstrap_verification_toolchain", return_value=None
+             ), \
              patch.object(local_runner, "iso") as mock_iso:
+            # The verification-toolchain bootstrap shells out 6-8 times (venv,
+            # pip, ruff --version): ~1.6s of real subprocess per main() call,
+            # resolving differently on every host. It has its own dedicated
+            # coverage in TestVerificationToolchain (subprocess mocked); no
+            # main()-driven case here asserts on it.
             mock_iso.detect_capabilities.return_value = _bwrap_caps()
             mock_iso.claimable_classes.return_value = {"agent": False, "compute": False}
             mock_iso.agent_decline_reason.return_value = "no binary"
-            mock_iso.CLASS_AGENT = "agent"
-            mock_iso.CLASS_COMPUTE = "compute"
-            mock_iso.sweep_stale_containers.return_value = None
-            mock_iso.AGENT_DOCKER_TYPES = []
+            _configure_iso_mock(mock_iso)
             try:
                 local_runner.main()
             except SystemExit:
@@ -8915,7 +9483,7 @@ class BlueprintRunnerInstallTests(_LocalRunnerTestCase):
         with resolved host paths, writes it to the user unit path, and preserves the
         crash-loop burst cap directives (StartLimitIntervalSec / StartLimitBurst)."""
         calls = []
-        from scripts.test_blueprint_runner import _systemctl_recorder
+        from test_blueprint_runner import _systemctl_recorder  # scripts/ is on sys.path (top of this file); a "scripts." prefix only resolves when the repo root happens to be on sys.path
         run = _systemctl_recorder(record=calls)
 
         patches = [
@@ -8996,7 +9564,7 @@ class BlueprintRunnerInstallTests(_LocalRunnerTestCase):
         """System install path also includes the crash-loop guard in the
         rendered unit."""
         calls = []
-        from scripts.test_blueprint_runner import _systemctl_recorder
+        from test_blueprint_runner import _systemctl_recorder  # scripts/ is on sys.path (top of this file); a "scripts." prefix only resolves when the repo root happens to be on sys.path
         run = _systemctl_recorder(record=calls)
 
         sys_unit = os.path.join(self.tmp, "etc-system", "blueprint-runner.service")
@@ -9037,7 +9605,7 @@ class BlueprintRunnerInstallTests(_LocalRunnerTestCase):
         unit = os.path.join(self.tmp, "installed.service")
         Path(unit).write_text("[Unit]\n")
         calls = []
-        from scripts.test_blueprint_runner import _systemctl_recorder
+        from test_blueprint_runner import _systemctl_recorder  # scripts/ is on sys.path (top of this file); a "scripts." prefix only resolves when the repo root happens to be on sys.path
         run = _systemctl_recorder(record=calls)
 
         with patch.object(br, "_user_unit_path", return_value=unit), \
@@ -9115,10 +9683,18 @@ class TestProviderCredentialCheck(unittest.TestCase):
             "BLUEPRINT_RUNNER_TOKEN": "tok-acceptance",
             "BLUEPRINT_ORCHESTRATOR_URL": "https://api.example.com",
         }
+        # Stub the codex CLI probe: it SHELLS OUT to `codex --version`, so on a
+        # host without the CLI this test reported rc=1 for a missing binary and
+        # attributed it to the credential warning it is actually about. Stub the
+        # one host dependency rather than skipping the whole case.
         with patch.dict("os.environ", env, clear=True), \
              patch("builtins.print", side_effect=capture_print), \
              patch.object(br, "_node_major", return_value=22), \
              patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
+             patch.object(
+                 br, "_codex_prerequisite",
+                 return_value=br.Prereq("codex", True, "codex-cli 0.144.1 (/usr/bin/codex)"),
+             ), \
              patch.object(br, "run_local_runner", return_value=0):
             rc = br.main(["check"])
 
@@ -9445,7 +10021,11 @@ class TestProviderCredentials(unittest.TestCase):
 
     def test_preflight_no_provider_credentials_warns(self):
         """Preflight --check warns when no provider credentials are set."""
-        caps = _bwrap_caps()
+        # BOUNDED bwrap: without a proven aggregate MemoryMax scope the runner
+        # is compute-only, and preflight correctly prints
+        # "NONE (compute-only runner - not required)" with no WARNING. The
+        # warning under test only exists for an AGENT-capable host.
+        caps = _bounded_bwrap_caps()
         gpu_state = {"allowed": [], "in_use": set(), "per_job": 1}
 
         def fake_post(url, token, body, **kwargs):
@@ -9476,7 +10056,7 @@ class TestProviderCredentials(unittest.TestCase):
 
     def test_preflight_with_provider_credentials_does_not_warn(self):
         """Preflight does NOT warn when provider credentials are set."""
-        caps = _bwrap_caps()
+        caps = _bounded_bwrap_caps()
         gpu_state = {"allowed": [], "in_use": set(), "per_job": 1}
 
         def fake_post(url, token, body, **kwargs):
@@ -9500,9 +10080,14 @@ class TestProviderCredentials(unittest.TestCase):
             )
 
         output = buf.getvalue()
-        self.assertNotIn("NONE", output)
-        self.assertIn("present", output)
-        self.assertIn("provider creds", output)
+        # Scope the assertion to the provider-creds LINE. A bare
+        # assertNotIn("NONE", output) also matches the unrelated
+        # "supervisor: NONE - UNSUPERVISED" line, so it reports a
+        # provider-credential regression whenever preflight is run off a
+        # supervised host.
+        creds_line = _preflight_line(self, output, "provider creds")
+        self.assertNotIn("NONE", creds_line)
+        self.assertIn("present", creds_line)
         self.assertTrue(result["setup_ok"])
 
 
@@ -9663,7 +10248,10 @@ class TestPreflightAgentDepsMessage(unittest.TestCase):
     def _run_preflight(self, deps_missing, caps=None):
         """Run _preflight with mocked agent_binary and return captured output."""
         if caps is None:
-            caps = _bwrap_caps()
+            # BOUNDED bwrap: an unbounded-bwrap host is compute-only, so
+            # preflight never reaches the agent-deps line at all and every
+            # assertion here would pass or fail on the DECLINED message.
+            caps = _bounded_bwrap_caps()
         gpu_state = {"allowed": [], "in_use": set(), "per_job": 1}
 
         def fake_post(url, token, body, **kwargs):
@@ -9850,7 +10438,13 @@ class TestCredentialFileTraversalGuard(_LocalRunnerTestCase):
                     vm_instance_id="runner:local",
                     orchestrator_url="https://api.example.com",
                     workspace=workspace,
-                    caps=_bwrap_caps(),
+                    # BOUNDED bwrap: an agent spawn fail-closes before it ever
+                    # reaches the traversal guard on a host with no aggregate
+                    # MemoryMax scope ("refusing an unbounded agent process
+                    # tree"). Plain _bwrap_caps() made every assertion in this
+                    # class pass/fail on the decline message instead of on the
+                    # guard under test.
+                    caps=_bounded_bwrap_caps(),
                     agent_binary=["node", "/agent/dist/index.js"],
                     agent_image=None,
                     active_tasks=active_tasks,
@@ -9877,8 +10471,9 @@ class TestCredentialFileTraversalGuard(_LocalRunnerTestCase):
             self.assertTrue(os.path.isfile(dest), "normal path must be written")
             with open(dest) as f:
                 self.assertEqual(f.read(), '{"provider": "anthropic"}')
-            # No warning about skipping
-            self.assertNotIn("skipping", output.lower())
+            # A legitimate path is not refused.
+            self.assertNotIn("directory traversal", output)
+            self.assertNotIn("failed to write credential file", output)
 
     def test_simple_traversal_skipped_and_warns(self):
         """A path with ../ is rejected (not written) and a warning is logged."""
@@ -9903,9 +10498,17 @@ class TestCredentialFileTraversalGuard(_LocalRunnerTestCase):
             self.assertFalse(os.path.isfile(inside),
                              "traversal path must not be written inside workspace")
 
-            # Warning must mention the path and the word "skipping"
-            self.assertIn("outside workspace", output.lower())
-            self.assertIn("skipping", output.lower())
+            # The warning must NAME the rejected path and say why. The wording
+            # moved when the inline check became _safe_credential_path (it now
+            # raises "credential path contains '..' (directory traversal)"), so
+            # pin the literal reason the guard emits today plus the offending
+            # path — an operator reading the log must be able to tell WHICH
+            # credential was refused and that it was refused for traversal.
+            self.assertIn("directory traversal", output)
+            self.assertIn("../escape.txt", output)
+            # The spawn is not aborted: a bad credential file is skipped, the
+            # task still starts.
+            self.assertTrue(spawned, "a rejected credential file must not abort the spawn")
 
     def test_deep_traversal_skipped(self):
         """A deeper ../ sequence (../../x/y) is also rejected by the guard."""
@@ -9924,8 +10527,9 @@ class TestCredentialFileTraversalGuard(_LocalRunnerTestCase):
             ))
             self.assertFalse(os.path.isfile(escaped),
                              "deep traversal must not write outside workspace")
-            self.assertIn("outside workspace", output.lower())
-            self.assertIn("skipping", output.lower())
+            self.assertIn("directory traversal", output)
+            self.assertIn("../../etc/__blueprint_escape_test", output)
+            self.assertTrue(spawned, "a rejected credential file must not abort the spawn")
 
     def test_mixed_paths_normal_writes_traversal_skipped(self):
         """A normal path is still written when a traversal path is also present."""
@@ -9956,8 +10560,8 @@ class TestCredentialFileTraversalGuard(_LocalRunnerTestCase):
             ))
             self.assertFalse(os.path.isfile(escaped),
                              "traversal path must not be written despite sibling normal path")
-            self.assertIn("outside workspace", output.lower())
-            self.assertIn("skipping", output.lower())
+            self.assertIn("directory traversal", output)
+            self.assertIn("../escape.txt", output)
 
     def test_leading_slash_normalized_still_in_workspace(self):
         """A leading-slash path is normalized to workspace-relative and passes."""
@@ -9975,7 +10579,8 @@ class TestCredentialFileTraversalGuard(_LocalRunnerTestCase):
             dest = os.path.join(tmpdir, "home/user/.config/credentials.json")
             self.assertTrue(os.path.isfile(dest),
                             "leading-slash path must be treated as relative to workspace")
-            self.assertNotIn("skipping", output.lower())
+            self.assertNotIn("directory traversal", output)
+            self.assertNotIn("failed to write credential file", output)
 
 
 class TestInputArtifactRehydration(unittest.TestCase):
@@ -11293,7 +11898,27 @@ class TestClassifyViewable(_LocalRunnerTestCase):
         self.assertEqual(local_runner._classify_viewable("clip.webm"), ("video/webm", "video"))
 
     def test_svg_excluded(self):
-        self.assertIsNone(local_runner._classify_viewable("image.svg"))
+        """SVG is NOT excluded: it is classified as an image.
+
+        Kept under the historical name because it is the pin that caught the
+        drift. SVG became viewable in #15522 (server-side sanitization strips
+        script tags before storage), and the runner must classify it the same
+        way ``app.storage.viewable_content_type_for_filename`` does — otherwise
+        the runner silently withholds an artifact the server would happily
+        serve. The literal content_type is pinned, not merely non-None.
+        """
+        self.assertEqual(
+            local_runner._classify_viewable("image.svg"), ("image/svg+xml", "image")
+        )
+        self.assertEqual(
+            local_runner._classify_viewable("IMAGE.SVG"), ("image/svg+xml", "image")
+        )
+
+    def test_pdf_classified_as_pdf(self):
+        """PDF is viewable with its own kind (server caps it as a non-video)."""
+        self.assertEqual(
+            local_runner._classify_viewable("report.pdf"), ("application/pdf", "pdf")
+        )
 
     def test_unknown_extension_returns_none(self):
         self.assertIsNone(local_runner._classify_viewable("model.pkl"))
@@ -12260,33 +12885,45 @@ class TestRunnerEnrollmentDocumentation(unittest.TestCase):
             f"{reenroll_line!r}",
         )
 
-    # ── docs/runner-install.md: Section 8 consistency ─────────────────────────
+    # ── docs/runner-install.md: Re-enrollment consistency ──────────────────────
 
-    def test_section8_reenroll_matches_two_button_flow(self):
-        """Section 8 re-enrollment must reference the Runtime tab and Devices and runners."""
+    def test_reenrollment_section_matches_two_button_flow(self):
+        """The Re-enrollment section must reference the Runtime tab and Devices and runners.
+
+        Located by heading TEXT, not by ordinal: 67d433fd8 renumbered this
+        section 8 -> 9 and the ordinal pin turned a still-correct doc into a
+        red "could not locate section".
+        """
         content = self._RUNNER_INSTALL_MD.read_text()
         import re
-        m = re.search(
-            r"## 8\. Re-enrollment(.*?)$",
+        matches = re.findall(
+            r"## \d+\. Re-enrollment[^\n]*\n(.*?)(?=\n## \d+\.|\Z)",
             content,
             re.DOTALL,
         )
-        self.assertIsNotNone(m, "Could not locate '## 8. Re-enrollment' section")
-        section8 = m.group(1)
+        self.assertEqual(
+            len(matches),
+            1,
+            "expected exactly one '## <n>. Re-enrollment' section in "
+            f"runner-install.md, found {len(matches)}",
+        )
+        section = matches[0]
         self.assertIn(
             "Runtime",
-            section8,
-            "runner-install.md Section 8 must reference the Runtime tab.",
+            section,
+            "runner-install.md Re-enrollment section must reference the Runtime tab.",
         )
         self.assertIn(
             "Devices and runners",
-            section8,
-            "runner-install.md Section 8 must reference the 'Devices and runners' section.",
+            section,
+            "runner-install.md Re-enrollment section must reference the "
+            "'Devices and runners' section.",
         )
         self.assertIn(
             "Enroll runner",
-            section8,
-            "runner-install.md Section 8 must mention the 'Enroll runner' button.",
+            section,
+            "runner-install.md Re-enrollment section must mention the "
+            "'Enroll runner' button.",
         )
 
     # ── scripts/local_runner.py: --help / module docstring ────────────────────
@@ -12345,26 +12982,38 @@ class TestRunnerEnrollmentDocExtendedSections(unittest.TestCase):
     _SCRIPTS_ROOT = Path(__file__).resolve().parent
     _LOCAL_RUNNER_PY = _SCRIPTS_ROOT / "local_runner.py"
 
-    def _section_text(self, section_num: int, section_title_fragment: str) -> str:
-        """Extract the text of a numbered section from runner-install.md."""
+    def _section_text(self, section_title_fragment: str) -> str:
+        """Extract a numbered section's body from runner-install.md by TITLE.
+
+        Deliberately matches on the heading TEXT and treats the ordinal as a
+        wildcard. These tests exist to pin the doc's CONTENT, not its table of
+        contents: pinning the ordinal made every insertion or reorder of an
+        unrelated section (67d433fd8 moved Verify 7->8 and Re-enrollment 8->9)
+        fail here with "could not locate section", which reads as a missing
+        section rather than a renumber and teaches readers to ignore the file.
+        Titles are unique in this doc, so the lookup stays unambiguous, and a
+        genuinely deleted or renamed section still fails loudly.
+        """
         import re
         content = self._RUNNER_INSTALL_MD.read_text()
-        m = re.search(
-            rf"## {section_num}\. {re.escape(section_title_fragment)}(.*?)(?=\n## \d+\.|\Z)",
+        matches = re.findall(
+            rf"## \d+\. {re.escape(section_title_fragment)}[^\n]*\n(.*?)(?=\n## \d+\.|\Z)",
             content,
             re.DOTALL,
         )
-        self.assertIsNotNone(
-            m,
-            f"Could not locate '## {section_num}. {section_title_fragment}' section in runner-install.md",
+        self.assertEqual(
+            len(matches),
+            1,
+            f"expected exactly one '## <n>. {section_title_fragment}' section in "
+            f"runner-install.md, found {len(matches)}",
         )
-        return m.group(1)
+        return matches[0]
 
     # ── Section 2: First launch / credential persistence ──────────────────────
 
     def test_section2_mentions_token_credential_file(self):
         """Section 2 must document that the runner saves the token to a credential file."""
-        text = self._section_text(2, "First launch")
+        text = self._section_text("First launch")
         self.assertIn(
             "runner_token",
             text,
@@ -12374,7 +13023,7 @@ class TestRunnerEnrollmentDocExtendedSections(unittest.TestCase):
 
     def test_section2_mentions_credential_path(self):
         """Section 2 must document the ~/.blueprint/ credential directory."""
-        text = self._section_text(2, "First launch")
+        text = self._section_text("First launch")
         self.assertIn(
             "~/.blueprint",
             text,
@@ -12384,7 +13033,7 @@ class TestRunnerEnrollmentDocExtendedSections(unittest.TestCase):
 
     def test_section2_explains_no_reenroll_after_reboot(self):
         """Section 2 must clarify that re-enrollment is NOT needed after a reboot."""
-        text = self._section_text(2, "First launch")
+        text = self._section_text("First launch")
         self.assertIn(
             "reboot",
             text.lower(),
@@ -12396,7 +13045,7 @@ class TestRunnerEnrollmentDocExtendedSections(unittest.TestCase):
 
     def test_section3_mentions_install_command(self):
         """Section 3 must document the blueprint-runner install command."""
-        text = self._section_text(3, "Install")
+        text = self._section_text("Install")
         self.assertIn(
             "blueprint-runner install",
             text,
@@ -12406,7 +13055,7 @@ class TestRunnerEnrollmentDocExtendedSections(unittest.TestCase):
 
     def test_section3_mentions_token_flag(self):
         """Section 3 must document the --token flag for the install command."""
-        text = self._section_text(3, "Install")
+        text = self._section_text("Install")
         self.assertIn(
             "--token",
             text,
@@ -12416,7 +13065,7 @@ class TestRunnerEnrollmentDocExtendedSections(unittest.TestCase):
 
     def test_section3_mentions_systemd(self):
         """Section 3 must reference systemd as the durable service mechanism."""
-        text = self._section_text(3, "Install")
+        text = self._section_text("Install")
         self.assertIn(
             "systemd",
             text,
@@ -12426,7 +13075,7 @@ class TestRunnerEnrollmentDocExtendedSections(unittest.TestCase):
 
     def test_section3_mentions_dry_run(self):
         """Section 3 must document the --dry-run flag for safe preview."""
-        text = self._section_text(3, "Install")
+        text = self._section_text("Install")
         self.assertIn(
             "--dry-run",
             text,
@@ -12434,25 +13083,25 @@ class TestRunnerEnrollmentDocExtendedSections(unittest.TestCase):
             "preview the install without touching the host.",
         )
 
-    # ── Section 7: Verify / preflight ────────────────────────────────────────
+    # ── Verify / preflight section ──────────────────────────────────────────
 
-    def test_section7_mentions_check_flag(self):
-        """Section 7 must document the --check preflight flag."""
-        text = self._section_text(7, "Verify")
+    def test_verify_section_mentions_check_flag(self):
+        """The Verify section must document the --check preflight flag."""
+        text = self._section_text("Verify")
         self.assertIn(
             "--check",
             text,
-            "runner-install.md Section 7 must document the --check preflight flag "
+            "runner-install.md's Verify section must document the --check preflight flag "
             "that verifies the runner without claiming work.",
         )
 
-    def test_section7_check_exits_zero_on_success(self):
-        """Section 7 must describe what a successful --check run looks like (exit 0)."""
-        text = self._section_text(7, "Verify")
+    def test_verify_section_check_exits_zero_on_success(self):
+        """The Verify section must describe a successful --check run (exit 0)."""
+        text = self._section_text("Verify")
         self.assertIn(
             "0",
             text,
-            "runner-install.md Section 7 must mention exit code 0 so operators know "
+            "runner-install.md's Verify section must mention exit code 0 so operators know "
             "what a successful --check result looks like.",
         )
 

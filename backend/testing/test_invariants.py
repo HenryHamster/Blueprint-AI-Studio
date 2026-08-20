@@ -14002,6 +14002,73 @@ def test_every_script_test_is_discovered_or_has_a_written_exemption():
     )
 
 
+def _ci_workflow_path() -> Path:
+    """Resolve the CI workflow in both the CI mount and local checkout."""
+    candidates = (
+        Path("/repo/.github/workflows/ci.yml"),
+        BACKEND_ROOT.parent / ".github" / "workflows" / "ci.yml",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    pytest.fail(".github/workflows/ci.yml is unavailable; roster cannot be reconciled")
+
+
+def _parse_ci_runner_script_suite(workflow: Path) -> tuple[str, ...]:
+    """Parse the hardcoded file list of ci.yml's 'Runner-script suite' step.
+
+    This step is a third, independent roster of scripts test files (alongside
+    scripts/test-backend.sh's discovery glob and
+    backend/testing/test_scripts_test_lane.py's discovery glob): it is a
+    workflow file, an operator-only surface this repo cannot edit, so a stray
+    or renamed entry here can only be caught by reading it, never fixed here.
+    """
+    source = workflow.read_text(encoding="utf-8")
+    match = re.search(
+        r"name: Runner-script suite \(scripts/\).*?python -m pytest \\\n"
+        r"(?P<body>.*?)\n\s*-v --tb=short",
+        source,
+        re.DOTALL,
+    )
+    assert match is not None, (
+        f"{workflow} must define the 'Runner-script suite (scripts/)' step "
+        "with its hardcoded pytest file list"
+    )
+    entries = []
+    for raw_line in match.group("body").splitlines():
+        line = raw_line.strip().rstrip("\\").strip()
+        if not line:
+            continue
+        entries.append(line)
+    assert entries, f"{workflow} Runner-script suite step must list at least one file"
+    return tuple(entries)
+
+
+def test_ci_runner_script_suite_names_only_files_that_exist_on_disk():
+    """ci.yml's hardcoded scripts roster cannot silently rot out of sync.
+
+    ci.yml cannot be edited from this repo (operator-only surface), so this
+    check is read-only reconciliation: it proves every file the workflow
+    names still exists at the path it names, catching a rename or deletion
+    that the workflow step itself would only surface as a CI failure days
+    later.
+    """
+    workflow = _ci_workflow_path()
+    entries = _parse_ci_runner_script_suite(workflow)
+    repo_root = workflow.parent.parent.parent
+    scripts_root = repo_root / "scripts"
+
+    missing = [
+        entry
+        for entry in entries
+        if not (scripts_root / entry).resolve().is_file()
+    ]
+    assert not missing, (
+        "ci.yml Runner-script suite names file(s) that do not exist on disk: "
+        + ", ".join(missing)
+    )
+
+
 def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path):
     """Docker-less standalone execution must not silently drop discovered entries."""
     bash_executable = "bash"
@@ -14256,8 +14323,14 @@ def test_every_test_module_has_executing_tests_or_an_explicit_zero_test_marker()
     declared_roots = {
         root.relative_to(harness.parent.parent).as_posix() for root in roots
     }
-    assert {"scripts", "backend/testing"} <= declared_roots, (
-        "CI_TEST_MODULE_ROOTS must cover both scripts/ and backend/testing/: "
+    assert {
+        "scripts",
+        "backend/testing",
+        "infra/db_recovery",
+        "infra/livekit/tests",
+    } <= declared_roots, (
+        "CI_TEST_MODULE_ROOTS must cover scripts/, backend/testing/, "
+        "infra/db_recovery/, and infra/livekit/tests/: "
         + ", ".join(sorted(declared_roots))
     )
     dark_modules = [

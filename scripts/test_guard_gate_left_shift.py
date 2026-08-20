@@ -452,6 +452,18 @@ def test_backend_verification_docker_preserves_configured_junit_path(
         env={
             **os.environ,
             "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            # This test is about the DOCKER route: it puts a fake `docker` on
+            # PATH and asserts the mount/JUnit contract the docker branch
+            # implements. But `--postgres` auto-upgrades to the off-image
+            # pgserver sandbox whenever select_backend_test_route finds one
+            # (test-backend.sh: the `_AUTO_POSTGRES_FLAG = --sandbox-postgres`
+            # branch), and BLUEPRINT_SANDBOX_PYTHON is inherited through
+            # **os.environ. On any host that provisions a pgserver sandbox the
+            # harness therefore took the sandbox branch, never reached the fake
+            # docker, and this test failed while appearing to cover the docker
+            # path. Point the sandbox interpreter at a path that does not exist
+            # so the route falls through to docker, which is what is under test.
+            "BLUEPRINT_SANDBOX_PYTHON": str(tmp_path / "absent-sandbox-python"),
             "BLUEPRINT_VERIFICATION_JUNIT": str(configured),
             "BLUEPRINT_VERIFICATION_RESULT_FILE": str(receipt),
             "FAKE_DOCKER_VERIFICATION_MOUNT_LOG": str(mount_log),

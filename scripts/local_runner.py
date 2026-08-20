@@ -3221,9 +3221,11 @@ _RUNNER_LIVE_TAIL_CHARS = 4096
 # the strategic canvas instead of only at job completion. The extension allowlist,
 # per-kind byte caps, and 25-file budget MIRROR the server's (app.storage
 # ._VIEWABLE_CONTENT_TYPES + the /viewable endpoint) so the runner does not waste
-# an upload the server would reject: png/jpg/jpeg/webp/gif images ≤ 8 MiB, mp4/webm
-# videos ≤ 512 MiB, at most 25 distinct viewable objects per job. SVG is sanitized
-# server-side (script tags stripped) before being stored and served.
+# an upload the server would reject: png/jpg/jpeg/webp/gif/svg images and pdf
+# ≤ 8 MiB, mp4/webm videos ≤ 512 MiB, at most 25 distinct viewable objects per
+# job. SVG is sanitized server-side (script tags stripped) before being stored
+# and served. Only "video" gets the larger ceiling — pdf and svg share the 8 MiB
+# image cap, matching compute_backends._viewable_size_cap_for_kind.
 _VIEWABLE_CONTENT_TYPES = {
     "png": ("image/png", "image"),
     "jpg": ("image/jpeg", "image"),
@@ -3600,6 +3602,13 @@ def _handle_signal(signum, frame):  # noqa: ARG001
         _shutdown_event.set()
 
 
+# How often the graceful-shutdown drain re-reads the active compute-job set.
+# Named (not a bare literal) so the drain's responsiveness is one reviewable
+# knob, and so a test can exercise the drain semantics without paying a
+# real half-second of wall clock per poll.
+_COMPUTE_DRAIN_POLL_INTERVAL = 0.5
+
+
 def _wait_for_compute_jobs(
     active_compute_jobs: set[str],
     compute_lock: threading.Lock,
@@ -3629,7 +3638,13 @@ def _wait_for_compute_jobs(
     )
     deadline = time.monotonic() + timeout
     while remaining and time.monotonic() < deadline:
-        time.sleep(0.5)
+        # Clamp the poll to what is actually left of the caller's budget. A
+        # bare sleep(_COMPUTE_DRAIN_POLL_INTERVAL) overshoots every timeout
+        # shorter than the interval — a `timeout=0.05` shutdown slept the full
+        # 0.5s, ten times the deadline it was given — and on a normal drain it
+        # holds SIGTERM handling open for up to a full interval after the last
+        # job already finished.
+        time.sleep(min(_COMPUTE_DRAIN_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
         with compute_lock:
             remaining = set(active_compute_jobs)
 
@@ -5467,8 +5482,16 @@ def _classify_viewable(filename: str) -> "tuple[str, str] | None":
     """Return ``(content_type, kind)`` for a viewable filename, else ``None``.
 
     Mirrors ``app.storage.viewable_content_type_for_filename``: classification is
-    by the lowercased extension only (png/jpg/jpeg/webp/gif/svg → image, mp4/webm →
-    video). A name with no recognised viewable extension yields ``None``.
+    by the lowercased extension only (png/jpg/jpeg/webp/gif/svg → image, mp4/webm
+    → video, pdf → pdf). A name with no recognised viewable extension yields
+    ``None``.
+
+    Keep this enumeration exhaustive and in step with
+    ``_VIEWABLE_CONTENT_TYPES``: it had gone stale on ``pdf``, and it is the only
+    place a reader can check the runner's allowlist against the server's without
+    opening both files. ``svg`` became viewable in #15522 (sanitized server-side
+    before storage); a test asserted the opposite for a month because nothing
+    here contradicted it.
     """
     if not isinstance(filename, str) or "." not in filename:
         return None
@@ -9124,6 +9147,34 @@ def _spawn_agent_task(
     return True
 
 
+def _check_mode_exit(
+    missing_prereqs: "list[str]", setup_ok: bool
+) -> "tuple[int, list[str]]":
+    """Decide ``--check``'s exit code and operator report from the collected state.
+
+    Surfaces EVERY missing prerequisite together rather than one-at-a-time, so
+    the operator fixes the whole list in a single pass instead of the
+    fix-one/re-run ladder ``--check`` used to impose. The report names exactly
+    the prerequisites it was given, in the order they were collected.
+
+    Split out of ``main()`` so the aggregate-vs-first-fail contract is
+    exercisable without booting a runner and probing the host's isolation
+    backends: that boot costs ~1.7s and is the reason this contract had only
+    subprocess coverage.
+
+    Returns ``(exit_code, stderr_lines)``. With no missing prerequisites the
+    exit code defers to ``setup_ok`` and the report is empty.
+    """
+    if missing_prereqs:
+        return 1, [
+            "\n[runner] --check found "
+            f"{len(missing_prereqs)} missing prerequisite(s): "
+            + ", ".join(missing_prereqs),
+            "[runner] Set the variable(s) above and re-run `--check`.",
+        ]
+    return (0 if setup_ok else 1), []
+
+
 def main() -> None:
     if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
         # Print the module docstring (which carries the RUNNER_RUNBOOK) and exit.
@@ -9359,22 +9410,11 @@ def main() -> None:
     compute_claimable = claimable[iso.CLASS_COMPUTE]
 
     if check_mode:
-        # Claim no work; exit reflects whether the box is ready. Surface EVERY
-        # missing prerequisite together (not one-at-a-time) so the operator can
-        # fix the whole list in a single pass.
-        if missing_prereqs:
-            print(
-                "\n[runner] --check found "
-                f"{len(missing_prereqs)} missing prerequisite(s): "
-                + ", ".join(missing_prereqs),
-                file=sys.stderr,
-            )
-            print(
-                "[runner] Set the variable(s) above and re-run `--check`.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        sys.exit(0 if result["setup_ok"] else 1)
+        # Claim no work; exit reflects whether the box is ready.
+        code, report = _check_mode_exit(missing_prereqs, result["setup_ok"])
+        for line in report:
+            print(line, file=sys.stderr)
+        sys.exit(code)
 
     # A transient boot-time DNS/default-route loss must not turn the service's
     # crash-loop guard into a terminal failed unit. Stay in this process and
@@ -9463,6 +9503,7 @@ def main() -> None:
 
     reaper = threading.Thread(
         target=_reap_loop,
+        name="blueprint-reaper",
         args=(active_tasks, lock, agent_capacity),
         kwargs={
             "agent_started_at": agent_started_at,
@@ -9477,6 +9518,7 @@ def main() -> None:
 
     heartbeat = threading.Thread(
         target=_heartbeat_loop,
+        name="blueprint-heartbeat",
         args=(
             orchestrator_url,
             token,
@@ -9523,6 +9565,7 @@ def main() -> None:
     if compute_claimable:
         compute_poll = threading.Thread(
             target=_compute_poll_loop,
+            name="blueprint-compute-poll",
             args=(
                 orchestrator_url,
                 token,

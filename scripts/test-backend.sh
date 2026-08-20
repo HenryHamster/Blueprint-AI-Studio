@@ -539,6 +539,19 @@ _run() {
 CI_TEST_MODULE_ROOTS=(
   scripts
   backend/testing
+  infra/db_recovery
+  infra/livekit/tests
+)
+
+# infra/db_recovery and infra/livekit/tests hold pure static-assertion tests
+# (path reads + string asserts against checked-in IaC/config text, no Docker/
+# DB/cloud dependency) that ran in no lane at all before this: they are outside
+# CI_TEST_MODULE_ROOTS's old coverage and outside backend/testing/, so nothing
+# executed them and nothing flagged that. Unlike the scripts/ roster they need
+# no capability exemption list -- every discovered file always runs.
+INFRA_TEST_ROOTS=(
+  infra/db_recovery
+  "infra/livekit/tests"
 )
 
 # Discover the scripts test corpus at runtime. This is intentionally a glob,
@@ -561,10 +574,18 @@ CI_SCRIPT_TEST_DISCOVERY_GLOB="test_*.py"
 # calls a real API or Docker daemon. Keep it in the roster; if a specific test
 # genuinely needs a capability this lane lacks, exempt that one test with
 # pytest.mark.skipif, not the whole file.
+#
+# test_local_runner.py is no longer here either. It carried the reason
+# "requires an enrolled local runner and its host services", but its 648 tests
+# import local_runner in-process and mock the host: no test enrolls a runner,
+# and the handful that genuinely touched the host (a real `codex --version`
+# probe, a real HTTP POST to api.example.com, a saved ~/.blueprint token, a
+# clean git checkout) were each scoped or stubbed per-test rather than by
+# exempting the file. The blanket exemption is what let the file drift 20-red
+# and 49s long while reporting nothing; it now runs in 9s.
 CI_SCRIPT_TEST_EXEMPTIONS=(
   "test_blueprint_node.py|requires a root-owned system Python and systemd deployment host"
   "test_local_postgres_cutover_integration.py|requires a Docker daemon and two real PostgreSQL containers"
-  "test_local_runner.py|requires an enrolled local runner and its host services"
 )
 
 STANDALONE_SCRIPT_TEST_ARGS=()
@@ -600,6 +621,23 @@ if [ "$USE_DOCKER" = "1" ]; then
 elif [ -f "$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py" ]; then
   STANDALONE_RELEASE_TEST_ARGS+=("$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py")
 fi
+
+# Discover the infra test corpus the same way: a glob, not a second per-file
+# roster. Every discovered test_*.py under an INFRA_TEST_ROOTS entry always
+# runs -- these files are static-assertion-only, so there is no capability
+# axis to exempt against.
+STANDALONE_INFRA_TEST_ARGS=()
+for infra_root in "${INFRA_TEST_ROOTS[@]}"; do
+  if [ "$USE_DOCKER" = "1" ]; then
+    infra_test_root="/repo/$infra_root"
+  else
+    infra_test_root="../$infra_root"
+  fi
+  for infra_test_path in "$infra_test_root"/$CI_SCRIPT_TEST_DISCOVERY_GLOB; do
+    [ -f "$infra_test_path" ] || continue
+    STANDALONE_INFRA_TEST_ARGS+=("$infra_test_path")
+  done
+done
 
 STATIC_GUARD_SELECTORS_ARGS=()
 if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ]; then
@@ -703,6 +741,7 @@ if [ "${1:-}" = "--standalone" ]; then
     # This exit-proof release suite covers durable handoff, serving confirmation,
     # and receipt retry behavior that pytest's backend shards do not collect.
     STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
+    STANDALONE_ARGS+=("${STANDALONE_INFRA_TEST_ARGS[@]}")
   fi
   STANDALONE_JUNIT_ARGS=()
   if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
