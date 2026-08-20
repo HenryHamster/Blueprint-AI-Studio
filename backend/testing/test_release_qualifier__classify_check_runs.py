@@ -1187,9 +1187,25 @@ async def test_run_qualification_spawns_one_holistic_audit_when_goal_set(
             "text": "Render analytics for the operator",
         },
     ]
+    # Criteria with a machine-checkable evidence contract carry it into the
+    # audit payload so the auditor grades against the same predicate the
+    # promotion gate enforces; text-only criteria stay text-only.
     assert payload["categories"] == [
-        {"category_key": row["criterion_key"], "text": row["text"]}
-        for row in lq["rubric_snapshot"]
+        {
+            "category_key": "c-operator-authorship",
+            "text": (
+                "The candidate contains no operator-authored commits across "
+                "its complete release range."
+            ),
+            "evidence_contract": {
+                "type": "operator_authored_commits",
+                "predicate": {"max_count": 0},
+            },
+        },
+        {
+            "category_key": "c-analytics-ui",
+            "text": "Render analytics for the operator",
+        },
     ]
     assert payload["rubric_fingerprint"] == lq["rubric_fingerprint"]
     assert uuid.UUID(lq["qualification_attempt_id"])

@@ -551,6 +551,7 @@
         "spaces the flushed frames across rate windows instead of bursting them",
         "seals the ending turn\u2019s open text so the next turn\u2019s delta starts a fresh frame",
         "interleaves tool frames between adjacent text deltas in order",
+        "streams warm typed-Fast turn deltas to the operator",
         "places reply authority outside the mutable Git workspace",
         "removes stale reply artifacts before the session starts or autonomous work runs",
         "unlinks a pre-existing reply-key symlink and exclusively creates a file without touching its target",

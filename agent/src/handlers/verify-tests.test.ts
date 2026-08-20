@@ -150,7 +150,7 @@ describe('handleVerifyTests', () => {
 
     await handleVerifyTests('base-attributed', payload, task, 'tok', 'o', 'r', null, { value: '' });
 
-    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalledWith(
+    expectCalledWith(captureTestBaseline,
       null,
       expect.anything(),
       undefined,

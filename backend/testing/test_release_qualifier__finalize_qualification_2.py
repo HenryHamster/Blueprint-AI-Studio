@@ -6676,6 +6676,25 @@ async def test_sweep_leaves_resolved_blocker_stale_verdict_for_strategic(
     mocker.patch(
         "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
     )
+    # Pre-age the head-stability marker past the candidate_advanced quiet
+    # window so this test's actual subject — the stale not_promoted verdict
+    # must not suppress requalification — still decides the outcome.
+    from datetime import timedelta
+
+    from app.project_telemetry import upsert_telemetry
+    from app.release_qualifier_debounce import _AUTOMAIN_HEAD_FIRST_SEEN_KEY
+    from app.time_utils import _utcnow
+
+    await upsert_telemetry(
+        db_session,
+        project.id,
+        _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
+        {
+            "head_sha": new_sha,
+            "first_seen_at": (_utcnow() - timedelta(seconds=31 * 60)).isoformat(),
+        },
+    )
+    await db_session.commit()
 
     count = await rq.sweep_stuck_qualifications(
         db_session, session_factory=_shared_session_factory(db_session)
