@@ -2806,6 +2806,11 @@ export async function handleStrategicResident(
         effort: typedFastConfig.effort,
       });
       foregroundTyped = warmingController;
+      // Registered before the first session exists; the controller re-attaches
+      // it to every session it starts, including a mid-turn crash replacement.
+      // Bound before ensureReady() so no post-warmup turn can slip in unbound,
+      // though suppressEvents scopes the private READY probe out regardless.
+      warmingController.onEvent(handleSessionEvent);
       await warmingController.ensureReady();
       const warmingStillCurrent = foregroundTyped === warmingController
         && typedFastLease.leaseId === acquiredLease.leaseId

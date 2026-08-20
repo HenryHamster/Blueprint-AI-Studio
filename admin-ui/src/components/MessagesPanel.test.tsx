@@ -603,6 +603,73 @@ describe('MessagesPanel chrome modes', () => {
     }
   });
 
+  test('returning to chat re-anchors deterministically at newest or at the unread boundary', async () => {
+    // The chat surface stays mounted (hidden, not unmounted) across tab
+    // switches, so a divider that never renders in conversation mode and a
+    // one-shot settle latch both leave re-entry landing wherever the hidden
+    // ancestor's scroll happened to sit. This proves the unread boundary is
+    // now a real, positioned row in conversation mode — the deterministic
+    // anchor target — rather than relying on browser-preserved scroll.
+    const seenAt = Date.now() - 3_600_000;
+    localStorage.setItem('messages_panel_last_seen:test-user@example.com:proj-1', String(seenAt));
+    const older = makeMsg({
+      id: 'seen-1', sequence: 1, from_type: 'user', content: 'Already seen message',
+      surface: 'conversation', created_at: new Date(seenAt - 60_000).toISOString(),
+    });
+    const newer = makeMsg({
+      id: 'unread-1', sequence: 2, from_type: 'strategic', content: 'Freshly arrived message',
+      surface: 'conversation', created_at: new Date(seenAt + 60_000).toISOString(),
+    });
+    _mockMessagesFetch([older, newer], seenAt);
+
+    const baseProps: Partial<MessagesPanelProps> = {
+      selectedProjectId: 'proj-1',
+      filterChrome: 'minimal',
+      addToast: () => {},
+      onMessageCountChange: () => {},
+      strategicState: makeStrategicState(),
+    };
+    const el = await mountPanel({ ...baseProps, active: false });
+    const r = root;
+    if (!r) throw new Error('root not mounted');
+    const rerender = async (next: Partial<MessagesPanelProps>) => {
+      await act(async () => {
+        r.render(<MessagesPanel {...(baseProps as MessagesPanelProps)} {...next} />);
+      });
+      await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    };
+
+    // Operator navigates into chat.
+    await rerender({ active: true });
+    await waitFor(() => {
+      expect(el.textContent).toContain('Freshly arrived message');
+    });
+    const column = () => el.querySelector('[data-testid="strategic-conversation-column"]') as HTMLElement | null;
+    expect(column()).toBeTruthy();
+    const markerAfterFirstEntry = column()?.querySelector('[data-divider-marker]');
+    expect(markerAfterFirstEntry).toBeTruthy();
+    expect(markerAfterFirstEntry?.textContent).toContain('NEW since');
+
+    // Operator leaves chat and returns — same message set, a fresh
+    // navigation. The boundary must still be present and correctly placed,
+    // not lost to a one-shot latch.
+    await rerender({ active: false });
+    await rerender({ active: true });
+
+    await waitFor(() => {
+      expect(el.textContent).toContain('Freshly arrived message');
+    });
+    const rows = Array.from(
+      column()?.querySelectorAll('[data-message-id], [data-divider-marker]') ?? [],
+    );
+    const seenIdx = rows.findIndex(node => node.getAttribute('data-message-id') === 'seen-1');
+    const dividerIdx = rows.findIndex(node => node.hasAttribute('data-divider-marker'));
+    const unreadIdx = rows.findIndex(node => node.getAttribute('data-message-id') === 'unread-1');
+    expect(seenIdx).toBeGreaterThanOrEqual(0);
+    expect(dividerIdx).toBeGreaterThan(seenIdx);
+    expect(unreadIdx).toBeGreaterThan(dividerIdx);
+  });
+
   test.each([
     { accessLabel: 'false', canOperateProject: false },
     { accessLabel: 'undefined at runtime', canOperateProject: undefined as never },

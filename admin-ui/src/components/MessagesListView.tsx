@@ -10,6 +10,7 @@ import { MessagesSummaryCard } from './MessagesSummaryCard';
 import { type MessageSummaryCounts } from './useMessageList';
 import { type TemporaryMutes } from './temporaryMutes';
 import { preserveScrollAnchorAfterPrepend } from '../utils/conversationScrollAnchor';
+import { parseTimestamp } from '../utils/time';
 
 type BubbleProps = Omit<MessageBubbleProps, 'msg' | 'faded' | 'readOnly' | 'replyTarget'>;
 
@@ -739,6 +740,10 @@ export interface MessagesListViewProps {
   loadingOlderTriageMessages?: boolean;
   onLoadOlderTriageMessages?: () => void;
   conversationListRef?: RefObject<ConversationListImperativeApi | null>;
+  /** Bumped whenever the operator returns to chat (an inactive → active transition).
+   *  Drives a deterministic re-anchor to the newest message / unread boundary in
+   *  conversation mode instead of relying on browser-preserved scroll of a hidden ancestor. */
+  navigationEpoch?: number;
   // Refs
   scrollRef: RefObject<HTMLDivElement | null>;
   dividerDismissedRef: RefObject<boolean>;
@@ -832,6 +837,7 @@ type ConversationRow =
   | { kind: 'loading' }
   | { kind: 'empty' }
   | { kind: 'divider'; label: string }
+  | { kind: 'unread_divider'; label: string }
   | { kind: 'message'; message: ProjectMessage };
 
 interface ConversationRowData {
@@ -841,6 +847,7 @@ interface ConversationRowData {
   highlightedMessageId?: string | null;
   loadingOlderConversationMessages?: boolean;
   onLoadOlder: () => void;
+  onDismissDivider: () => void;
 }
 
 function ConversationRowView({
@@ -853,6 +860,7 @@ function ConversationRowView({
   highlightedMessageId,
   loadingOlderConversationMessages,
   onLoadOlder,
+  onDismissDivider,
 }: RowComponentProps<ConversationRowData>) {
   const row = rows[index];
   return (
@@ -878,6 +886,25 @@ function ConversationRowView({
           </div>
         )}
         {row.kind === 'divider' && <TimeDividerRow label={row.label} className="my-1" />}
+        {row.kind === 'unread_divider' && (
+          <div data-divider-marker className="flex items-center gap-2 px-2 py-3 text-ui-md text-blue-300/70">
+            <div className="flex-1 border-t border-blue-500/40" />
+            <div className="flex items-center gap-2 whitespace-nowrap font-medium">
+              <span className="flex items-center gap-1">
+                <ChevronUp className="w-3 h-3" />
+                NEW since {row.label}
+              </span>
+              <button
+                onClick={onDismissDivider}
+                className="px-2 py-0.5 text-xs bg-blue-600/50 hover:bg-blue-600/70 rounded border border-blue-500/60 text-blue-200 transition-colors min-h-[44px] md:min-h-[28px] flex items-center"
+                title="Mark all caught up and dismiss this divider"
+              >
+                All caught up
+              </button>
+            </div>
+            <div className="flex-1 border-t border-blue-500/40" />
+          </div>
+        )}
         {row.kind === 'message' && (
           <MessageBubble
             msg={row.message}
@@ -905,6 +932,9 @@ function ConversationVirtualList({
   loadingOlderConversationMessages,
   onLoadOlderConversationMessages,
   conversationListRef,
+  dividerTime,
+  onDismissDivider,
+  navigationEpoch = 0,
 }: MessagesListViewProps) {
   const listRef = useListRef(null);
   // Owns the visibility toggle for the settle-detection anchor loop below.
@@ -916,7 +946,10 @@ function ConversationVirtualList({
   const olderHistoryIntentRef = useRef(false);
   const initialBottomAnchorRef = useRef(false);
   const initialBottomAnchorFrameRef = useRef<number | null>(null);
-  const initialBottomAnchoredRef = useRef(false);
+  // Tracks which navigation epoch the settle-to-bottom loop last ran for, so
+  // returning to chat (a new epoch, same message set) re-anchors deterministically
+  // instead of relying on browser-preserved scroll position of a hidden ancestor.
+  const anchoredEpochRef = useRef<number | null>(null);
   const autoLoadingOlderRef = useRef(false);
   const pendingNavigationRef = useRef<{
     index: number;
@@ -934,13 +967,20 @@ function ConversationVirtualList({
     if (loading) next.push({ kind: 'loading' });
     else if (messages.length === 0) next.push({ kind: 'empty' });
     else {
+      const unreadSince = dividerTime;
+      const unreadMessageId = unreadSince
+        ? messages.find(m => m.created_at && parseTimestamp(m.created_at).getTime() > unreadSince)?.id ?? null
+        : null;
       for (const item of insertTimeDividers(messages)) {
-        if (item.kind === 'divider') next.push({ kind: 'divider', label: item.label });
-        else next.push({ kind: 'message', message: item.msg });
+        if (item.kind === 'divider') { next.push({ kind: 'divider', label: item.label }); continue; }
+        if (unreadSince && unreadMessageId && item.msg.id === unreadMessageId) {
+          next.push({ kind: 'unread_divider', label: formatTimestamp(unreadSince) });
+        }
+        next.push({ kind: 'message', message: item.msg });
       }
     }
     return next;
-  }, [hasOlderConversationMessages, loading, messages]);
+  }, [hasOlderConversationMessages, loading, messages, dividerTime]);
 
   // Always holds the latest rows so the settle loop below (whose closure is
   // created once per anchor cycle) never scrolls to an index computed from a
@@ -1083,14 +1123,20 @@ function ConversationVirtualList({
   // correction happens off-screen. A frame cap is a safety fallback only,
   // not the primary stop condition. Any operator scroll/touch/key intent
   // cancels the loop and reveals immediately (see stopInitialAnchor).
+  //
+  // Gated per navigationEpoch (not a one-shot latch): the chat surface stays
+  // mounted behind a display:none wrapper across tab switches, so returning
+  // to chat with the same message set must still re-run this loop rather
+  // than trusting whatever scroll position the hidden ancestor happened to
+  // retain — that behavior is browser-dependent and untested.
   useEffect(() => {
     if (messages.length === 0) {
       initialBottomAnchorRef.current = false;
-      initialBottomAnchoredRef.current = false;
+      anchoredEpochRef.current = null;
       return;
     }
-    if (initialBottomAnchorRef.current || initialBottomAnchoredRef.current) return;
-    initialBottomAnchoredRef.current = true;
+    if (anchoredEpochRef.current === navigationEpoch) return;
+    anchoredEpochRef.current = navigationEpoch;
     initialBottomAnchorRef.current = true;
     const MAX_SETTLE_FRAMES = 30;
     const STABLE_FRAMES_TARGET = 2;
@@ -1127,7 +1173,7 @@ function ConversationVirtualList({
       initialBottomAnchorFrameRef.current = window.requestAnimationFrame(settle);
     };
     initialBottomAnchorFrameRef.current = window.requestAnimationFrame(settle);
-  }, [listRef, messages.length, rows.length]);
+  }, [listRef, messages.length, rows.length, navigationEpoch]);
 
   useEffect(() => {
     if (!loadingOlderConversationMessages) autoLoadingOlderRef.current = false;
@@ -1140,12 +1186,14 @@ function ConversationVirtualList({
     highlightedMessageId,
     loadingOlderConversationMessages,
     onLoadOlder: handleLoadOlder,
+    onDismissDivider,
   }), [
     bubbleProps,
     handleLoadOlder,
     highlightedMessageId,
     loadingOlderConversationMessages,
     messagesById,
+    onDismissDivider,
     rows,
   ]);
 

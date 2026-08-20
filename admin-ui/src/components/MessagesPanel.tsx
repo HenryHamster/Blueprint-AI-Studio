@@ -1827,9 +1827,18 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
   const chatMountStartRef = useRef(performance.now());
   const chatReadyReportRef = useRef<{ navigationKey: string; reported: boolean } | null>(null);
   const chatNavigationEpochRef = useRef(0);
+  // Mirrors chatNavigationEpochRef as state so the virtualized conversation
+  // list re-renders on each inactive -> active transition and can re-anchor
+  // to the newest message / unread boundary deterministically (see
+  // MessagesListView's navigationEpoch prop) instead of trusting whatever
+  // scroll position a hidden ancestor happened to retain.
+  const [chatNavigationEpoch, setChatNavigationEpoch] = useState(0);
   const wasActiveRef = useRef(active);
   useEffect(() => {
-    if (active && !wasActiveRef.current) chatNavigationEpochRef.current += 1;
+    if (active && !wasActiveRef.current) {
+      chatNavigationEpochRef.current += 1;
+      setChatNavigationEpoch(chatNavigationEpochRef.current);
+    }
     wasActiveRef.current = active;
     const navigationKey = `${selectedProjectId ?? ''}:${chatNavigationEpochRef.current}`;
     if (chatReadyReportRef.current?.navigationKey !== navigationKey) {
@@ -3282,6 +3291,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         loadingOlderTriageMessages={loadingOlderTriageMessages}
         onLoadOlderTriageMessages={loadOlderTriageMessages}
         conversationListRef={conversationListRef}
+        navigationEpoch={chatNavigationEpoch}
         scrollRef={scrollRef}
         dividerDismissedRef={dividerDismissedRef}
         messages={conversationMode ? renderedConversationMessages : messages}
