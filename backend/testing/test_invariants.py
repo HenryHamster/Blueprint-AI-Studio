@@ -17,6 +17,7 @@ import subprocess
 import symtable
 import sys
 import tokenize
+from collections import Counter
 from functools import cache
 from pathlib import Path
 
@@ -13479,67 +13480,177 @@ class TestProblemModelWritePathInvariants:
     """
 
     # Manual allowlist of safe write sites.
-    # Key: (rel_path_from_app, lineno). Each entry is the reviewed safety
-    # rationale — the scanner does NOT classify; it only discovers.
-    # When changing a file, update these line numbers.
-    _SAFE_SITES: dict[tuple[str, int], str] = {
+    #
+    # Key: (rel_path_from_app, enclosing_qualname, unparsed_RHS_expression).
+    # Value: (expected_occurrences, reviewed safety rationale).
+    #
+    # The key is deliberately NOT the line number.  A line-number key made this
+    # invariant fire on every unrelated edit ABOVE a write site: the same write
+    # path was reported simultaneously as an unlisted new site and a stale
+    # allowlist entry, with nothing about the sanitization actually changed.
+    # That false positive is a recurring automain-CI-red generator and it has
+    # already produced at least one no-op "refresh the line numbers" fix PR
+    # (#17591) whose entire content was renumbering.  Eleven of the twenty-two
+    # entries were stale again by the time this was rewritten.
+    #
+    # (file, enclosing function, RHS expression) is stable under line drift and
+    # under moving a function within its module, while still changing — and so
+    # still demanding review — when the write path itself changes: a different
+    # enclosing function, a different right-hand side, or a different number of
+    # writes of the same expression inside one function.  Pinning the RHS
+    # expression source is also strictly more self-certifying than pinning a
+    # line number: the reviewed value is now visible in the allowlist.
+    #
+    # The scanner does NOT classify; it only discovers.
+    _SAFE_SITES: dict[tuple[str, str, str], tuple[int, str]] = {
         # task_locking.py: project.problem_model write-back inside with_problem_model_locked
-        ("task_locking.py", 1291): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
+        ("task_locking.py", "with_problem_model_locked", "problem_model"): (
+            1,
+            "sanitize_problem_model_raw(...) -> project.problem_model write-back inside with_problem_model_locked",
+        ),
         # lifecycle.py: sanitize_problem_model_raw -> startup healing write-back
-        ("lifecycle.py", 505): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
+        ("lifecycle.py", "_heal_poisoned_problem_models", "sanitized"): (
+            1,
+            "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
+        ),
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
-        ("direction_lifecycle.py", 846): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
+        (
+            "direction_lifecycle.py",
+            "_process_direction_lifecycle_locked._reconcile_retired_gap",
+            "_reconciled",
+        ): (
+            1,
+            "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
+        ),
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
-        ("direction_lifecycle.py", 874): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
-        # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5436): "apply_agent_update inline-sanitizes both current and proposed",
-        # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5473): "apply_agent_update result, then _normalize_active_moves_writeback",
+        (
+            "direction_lifecycle.py",
+            "_process_direction_lifecycle_locked._reconcile_gap_status",
+            "result['problem_model']",
+        ): (
+            1,
+            "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
+        ),
+        # strategic_completion.py: apply_agent_update write-back, and the same
+        # value re-assigned after _normalize_active_moves_writeback.
+        ("strategic_completion.py", "_handle_strategic_completion", "new_pm_raw"): (
+            2,
+            "apply_agent_update inline-sanitizes both current and proposed; second write is the same result after _normalize_active_moves_writeback",
+        ),
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 7156): "parse_problem_model(…) validated pydantic model_dump",
+        (
+            "strategic_completion.py",
+            "_handle_strategic_completion",
+            "_pm_model.model_dump()",
+        ): (
+            1,
+            "parse_problem_model(...) validated pydantic model_dump",
+        ),
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
-        ("reaper_sweeps.py", 1278): "parse_problem_model(…) validated pydantic model_dump",
+        (
+            "reaper_sweeps.py",
+            "sweep_auto_clear_moot_pending_confirmations",
+            "model.model_dump()",
+        ): (
+            1,
+            "parse_problem_model(...) validated pydantic model_dump",
+        ),
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
-        ("reaper_sweeps.py", 1406): "parse_problem_model(…) validated pydantic model_dump",
+        (
+            "reaper_sweeps.py",
+            "sweep_decay_stale_pending_confirmations",
+            "model.model_dump()",
+        ): (
+            1,
+            "parse_problem_model(...) validated pydantic model_dump",
+        ),
         # admin_projects.py: validated.model_dump()
-        (
-            "routers/admin_projects.py",
-            878,
-        ): "apply_user_intent_patch(sanitize_problem_model_raw(...)) validated model_dump",
+        ("routers/admin_projects.py", "update_project", "validated.model_dump()"): (
+            1,
+            "apply_user_intent_patch(sanitize_problem_model_raw(...)) validated model_dump",
+        ),
         # admin_projects.py: current_model.model_dump()
         (
             "routers/admin_projects.py",
-            1296,
-        ): "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
+            "dismiss_pending_confirmation",
+            "current_model.model_dump()",
+        ): (
+            1,
+            "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
+        ),
         # admin_projects.py: current_model.model_dump()
         (
             "routers/admin_projects.py",
-            1408,
-        ): "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
+            "accept_pending_confirmation",
+            "current_model.model_dump()",
+        ): (
+            1,
+            "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
+        ),
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
-        ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
+        ("routers/admin_onboard.py", "_seed_strategic_intent", "pm.model_dump()"): (
+            1,
+            "pm parsed from ProblemModel, model_dump",
+        ),
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
-        ("routers/admin_agent_ops.py", 1966): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2393): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2843): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2957): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 3214): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4888): "apply_agent_update result",
-        # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4916): "apply_agent_update result, then _normalize_active_moves_writeback",
-        # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5456): "validated current_model pydantic model_dump",
-        # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5539): "validated current_model pydantic model_dump",
+        (
+            "routers/admin_agent_ops.py",
+            "strategic_operation",
+            "_gap_reconcile['problem_model']",
+        ): (
+            5,
+            "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ),
+        # admin_agent_ops.py: apply_agent_update write-back, and the same value
+        # re-assigned after _normalize_active_moves_writeback.
+        ("routers/admin_agent_ops.py", "strategic_operation", "new_pm_raw"): (
+            2,
+            "apply_agent_update result; second write is the same result after _normalize_active_moves_writeback",
+        ),
+        # admin_agent_ops.py: current_model.model_dump() (pending_confirm and
+        # resolve_pending_confirm ops)
+        (
+            "routers/admin_agent_ops.py",
+            "strategic_operation",
+            "current_model.model_dump()",
+        ): (
+            2,
+            "validated current_model pydantic model_dump",
+        ),
     }
+
+    @staticmethod
+    def _enclosing_qualnames(tree: ast.AST) -> dict[ast.AST, str]:
+        """Map every node to the dotted qualname of its enclosing def/class scopes.
+
+        ``ast`` gives no parent pointers, so walk the tree once and record the
+        scope chain each node sits inside.  A module-level node maps to "".
+        """
+        out: dict[ast.AST, str] = {}
+
+        def walk(node: ast.AST, prefix: tuple[str, ...]) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    inner = (*prefix, child.name)
+                    out[child] = ".".join(inner)
+                    walk(child, inner)
+                else:
+                    out[child] = ".".join(prefix)
+                    walk(child, prefix)
+
+        walk(tree, ())
+        return out
 
     def test_all_problem_model_write_paths_are_sanitized(self):
         """Every ``project.problem_model = <expr>`` in ``backend/app/`` must
         be in the reviewed allowlist of safe sanitized write paths."""
         app_dir = BACKEND_ROOT / "app"
-        discovered: dict[tuple[str, int], str] = {}
-        # (rel_path, lineno) -> friendly description of the RHS
+        # (rel_path, enclosing qualname, unparsed RHS) -> occurrence count
+        discovered: Counter = Counter()
+        # Keep one representative line per key purely for the failure message.
+        first_lineno: dict[tuple[str, str, str], int] = {}
 
         for py_file in sorted(app_dir.rglob("*.py")):
             source = py_file.read_text(encoding="utf-8")
@@ -13550,52 +13661,66 @@ class TestProblemModelWritePathInvariants:
                 tree = ast.parse(source, filename=str(py_file))
             except SyntaxError:
                 continue
+            qualnames = self._enclosing_qualnames(tree)
 
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Assign):
                     continue
                 for tgt in node.targets:
                     if isinstance(tgt, ast.Attribute) and tgt.attr == "problem_model":
-                        lineno = node.lineno
-                        key = (rel, lineno)
-                        if isinstance(node.value, ast.Call) and isinstance(
-                            node.value.func, ast.Attribute
-                        ):
-                            desc = f"{node.value.func.attr}() call"
-                        elif isinstance(node.value, ast.Call) and isinstance(
-                            node.value.func, ast.Name
-                        ):
-                            desc = f"{node.value.func.id}(...) call"
-                        elif isinstance(node.value, ast.Name):
-                            desc = f"variable `{node.value.id}`"
-                        elif isinstance(node.value, ast.Subscript):
-                            desc = "subscript expression"
-                        elif isinstance(node.value, ast.Dict):
-                            desc = "dict literal"
-                        else:
-                            desc = type(node.value).__name__
-                        discovered[key] = desc
+                        key = (rel, qualnames.get(node, ""), ast.unparse(node.value))
+                        discovered[key] += 1
+                        first_lineno.setdefault(key, node.lineno)
+
+        def _fmt(key: tuple[str, str, str]) -> str:
+            rel, qual, expr = key
+            where = f"{rel}:{first_lineno[key]}" if key in first_lineno else rel
+            return f"  {where} in {qual or '<module>'}(): project.problem_model = {expr}"
 
         # Everything discovered must be in the allowlist
         missing = set(discovered) - set(self._SAFE_SITES)
         assert not missing, (
-            f"{len(missing)} project.problem_model = <expr> site(s) found "
+            f"{len(missing)} project.problem_model = <expr> write path(s) found "
             "that are NOT in the reviewed SAFE_SITES allowlist.\n"
             "Each new write path must be reviewed for packer-marker sanitization "
-            "and added to TestProblemModelWritePathInvariants._SAFE_SITES.\n\n"
-            "Unlisted sites:\n"
-            + "\n".join(
-                f"  {rel}:{ln} ({discovered.get((rel, ln), '?')})"
-                for (rel, ln) in sorted(missing)
-            ) + "\n" + format_offender_marker(str(offender) for offender in missing)
+            "and added to TestProblemModelWritePathInvariants._SAFE_SITES.\n"
+            "The key is (file, enclosing function, RHS expression) — NOT a line "
+            "number — so this fires only when a write path genuinely changed.\n\n"
+            "Unlisted write paths:\n"
+            + "\n".join(_fmt(key) for key in sorted(missing)) + "\n"
+            + format_offender_marker(str(offender) for offender in sorted(missing))
         )
 
-        # Warn about stale allowlist entries (sites that no longer exist)
+        # Allowlist entries whose write path no longer exists
         stale = set(self._SAFE_SITES) - set(discovered)
         assert not stale, (
             f"{len(stale)} SAFE_SITES entry/entries no longer found in the codebase. "
             "Remove or update these stale allowlist entries:\n"
-            + "\n".join(f"  {rel}:{ln}" for (rel, ln) in sorted(stale)) + "\n" + format_offender_marker(str(offender) for offender in stale)
+            + "\n".join(
+                f"  {rel} in {qual or '<module>'}(): project.problem_model = {expr}"
+                for (rel, qual, expr) in sorted(stale)
+            ) + "\n"
+            + format_offender_marker(str(offender) for offender in sorted(stale))
+        )
+
+        # The number of writes of a given expression inside a given function is
+        # itself reviewed state: adding a sixth _gap_reconcile write, or
+        # deleting one, changes the surface even though the key is unchanged.
+        miscounted = sorted(
+            (key, self._SAFE_SITES[key][0], discovered[key])
+            for key in set(self._SAFE_SITES) & set(discovered)
+            if self._SAFE_SITES[key][0] != discovered[key]
+        )
+        assert not miscounted, (
+            f"{len(miscounted)} allowlisted write path(s) changed occurrence count. "
+            "A write path was added to or removed from a function that already "
+            "had one; re-review the sanitization and update the count:\n"
+            + "\n".join(
+                f"  {rel} in {qual or '<module>'}(): "
+                f"project.problem_model = {expr} — allowlisted {expected}, found {found}"
+                for ((rel, qual, expr), expected, found) in miscounted
+            ) + "\n"
+            + format_offender_marker(str(key) for (key, _e, _f) in miscounted)
         )
 
 
