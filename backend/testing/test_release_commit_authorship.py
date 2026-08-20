@@ -12,7 +12,12 @@ from sqlalchemy.orm.attributes import flag_modified
 from testing.conftest import USE_POSTGRES
 
 from app.auth import create_agent_token
-from app.models import Project, ReleaseVersion, Task
+from app.models import (
+    Project,
+    ReleaseAuthorshipReconciliationState,
+    ReleaseVersion,
+    Task,
+)
 from app.release_commit_authorship import (
     AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
     AUTHORSHIP_RECEIPT_SOURCE,
@@ -2009,14 +2014,32 @@ async def test_reconciliation_deadline_cancels_slow_external_measurement(db_sess
         last_qualification={},
     )
     db_session.add_all([project, row])
+    # Seed the scan cursor straight into the served_at partition. Without it
+    # the sweep first walks the empty ``served_at IS NULL`` partition and
+    # commits the partition flip before it can even see ``row`` -- two full
+    # session/select/commit round-trips charged to the deadline below before
+    # any external I/O happens. That is not what this test asserts, and on a
+    # loaded shard those round-trips alone spent the budget, so the sweep
+    # selected nothing and this failed on ``attempted == 1``.
+    #
+    # merge(), not add(): id=1 is seeded by migration 0756, so it is already
+    # present unless an earlier test's table-wipe removed it. A bare insert
+    # raises UniqueViolation in the first case and this test must work in both.
+    await db_session.merge(
+        ReleaseAuthorshipReconciliationState(id=1, cursor_partition=1)
+    )
     await db_session.commit()
     from app.database import AsyncSessionLocal
 
+    # Deadline and external sleep scale together: the property under test is
+    # that a measurement far slower than the budget gets cancelled by it. A
+    # sleep 6x over budget proves that with room for a slow runner, where the
+    # original 0.2s/0.05s pair left none.
     async def slow_measure(*_args, **_kwargs):
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(3.0)
 
     mocker.patch(
-        "app.release_commit_authorship._RECONCILIATION_MAX_SECONDS", 0.05
+        "app.release_commit_authorship._RECONCILIATION_MAX_SECONDS", 0.5
     )
     mocker.patch(
         "app.release_commit_authorship.measure_serving_authorship_evidence",
@@ -2027,7 +2050,7 @@ async def test_reconciliation_deadline_cancels_slow_external_measurement(db_sess
     elapsed = asyncio.get_running_loop().time() - started
 
     assert attempted == 1
-    assert elapsed < 0.15
+    assert elapsed < 1.5
 
 
 @pytest.mark.asyncio
