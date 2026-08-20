@@ -2167,7 +2167,11 @@ def test_promote_recover_force_promote_posts_candidate_and_reason(monkeypatch):
         (path, body) for method, path, body in calls
         if method == "POST" and "promote/force" in path
     ]
-    assert len(posts) == 1, f"expected exactly one force-promote POST, got {posts}"
+    assert len(posts) == 1, (
+        f"expected exactly one force-promote POST, got {posts}"
+        + "\n"
+        + format_offender_marker(str(post) for post in posts)
+    )
     path, body = posts[0]
     assert path == "/api/admin/projects/proj-1/promote/force"
     assert body["candidate_sha"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
