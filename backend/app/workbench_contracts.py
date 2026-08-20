@@ -198,6 +198,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/operator_inbox_liveness.py",
         "backend/app/orchestrator.py",
         "backend/app/orchestrator_ci_monitor.py",
+        "backend/app/orchestrator_compute_experiment_dispatch.py",
         "backend/app/orchestrator_provision.py",
         "backend/app/orchestrator_runner_dispatch.py",
         "backend/app/plan_completion.py",
