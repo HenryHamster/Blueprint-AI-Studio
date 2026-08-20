@@ -401,6 +401,83 @@ exit 0
     expect(result.stderr).toContain(competingSha);
   });
 
+  /** Overwrite setupPushRace's git so the second ls-remote reports a checkpoint tip. */
+  const setupOwnCheckpointRace = (
+    dir: string,
+    realFs: typeof import('node:fs'),
+    taskId: string,
+    expectedSha: string,
+    tipSha: string,
+    localSha: string,
+    tipSubject: string,
+  ): void => {
+    setupPushRace(dir, realFs, taskId, expectedSha, tipSha, localSha);
+    realFs.writeFileSync(`${dir}/bin/git`, `#!/bin/sh
+STATE="${dir}/ls-remote-count"
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\n' 'src/app.ts'; exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\n'; exit 0 ;;
+  *"ls-remote --heads origin refs/heads/blueprint/${taskId}"*)
+    N=$(cat "$STATE" 2>/dev/null || printf '0'); N=$((N + 1)); printf '%s' "$N" > "$STATE"
+    if [ "$N" = 1 ]; then printf '%s\t%s\n' '${expectedSha}' 'refs/heads/blueprint/${taskId}';
+    else printf '%s\t%s\n' '${tipSha}' 'refs/heads/blueprint/${taskId}'; fi
+    exit 0 ;;
+  *"push --force-with-lease=refs/heads/blueprint/${taskId}:${expectedSha}"*)
+    printf '%s\n' ' ! [rejected] HEAD -> blueprint/${taskId} (stale info)' >&2; exit 1 ;;
+  *"push --force-with-lease=refs/heads/blueprint/${taskId}:${tipSha}"*) exit 0 ;;
+  *"show -s --format=%s ${tipSha}"*) printf '%s\n' '${tipSubject}'; exit 0 ;;
+  *"rev-parse HEAD"*) printf '%s\n' '${localSha}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+  };
+
+  it("adopts this task's own unshipped-work checkpoint as the lease authority", async () => {
+    // Regression: the remote tip is the checkpoint THIS task wrote on an earlier
+    // attempt's fail-closed path. Treating it as a competing writer stranded
+    // finished, ./check-passing work forever (NeurIPS 37eea260, df1c89d0,
+    // 9884994c, 0396aaee). Publication is the step that retires the checkpoint.
+    const taskId = 'task-own-ckpt';
+    const expectedSha = 'a'.repeat(40);
+    const checkpointSha = 'd'.repeat(40);
+    const localSha = 'b'.repeat(40);
+    const script = writeScript({ taskId, workBranch: `blueprint/${taskId}`, baseBranch: 'main', owner: 'acme', repo: 'repo', testsOnMainBranch: false });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      setupOwnCheckpointRace(
+        dir, realFs, taskId, expectedSha, checkpointSha, localSha,
+        `blueprint-checkpoint: preserve unshipped task ${taskId}`,
+      );
+    });
+
+    expect(result.stdout).toContain("is this task's own unshipped-work checkpoint");
+    expect(result.stdout).toContain(checkpointSha);
+    expect(result.stderr).not.toContain('remote branch advanced to a competing SHA');
+    expect(result.status).toBe(0);
+  });
+
+  it("refuses a checkpoint tip belonging to a different task", async () => {
+    // The adoption is keyed on THIS task's id, not the checkpoint prefix: another
+    // task's checkpoint is still a competing writer and must fail closed.
+    const taskId = 'task-foreign-ckpt';
+    const expectedSha = 'a'.repeat(40);
+    const foreignSha = 'e'.repeat(40);
+    const localSha = 'b'.repeat(40);
+    const script = writeScript({ taskId, workBranch: `blueprint/${taskId}`, baseBranch: 'main', owner: 'acme', repo: 'repo', testsOnMainBranch: false });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      setupOwnCheckpointRace(
+        dir, realFs, taskId, expectedSha, foreignSha, localSha,
+        'blueprint-checkpoint: preserve unshipped task some-other-task',
+      );
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('remote branch advanced to a competing SHA');
+    expect(result.stderr).toContain(foreignSha);
+    expect(result.stdout).not.toContain("is this task's own unshipped-work checkpoint");
+  });
+
   it('surfaces the GATE-ENVIRONMENT marker after a passing ./check test', async () => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const markerPath = '/tmp/check_gate_env_task-lts-2.txt';

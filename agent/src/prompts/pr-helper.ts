@@ -722,6 +722,32 @@ TASK_ID="${cfg.taskId}"
 # writer.  Snapshot the exact remote SHA once, reconcile a lost response only
 # when remote == our HEAD, and otherwise fail closed on any competing advance.
 _PR_REMOTE_REF="refs/heads/${cfg.workBranch}"
+# This task's own unshipped-work checkpoint subject (task-checkpoint.ts
+# writes it verbatim).  A tip carrying THIS subject is state we authored on
+# an earlier attempt's fail-closed path; prepareTaskWorkBranch already
+# restored it into this working tree and publication is documented to be
+# what replaces it.  It is recovery state of ours, not a competing writer.
+_PR_CHECKPOINT_SUBJECT="blueprint-checkpoint: preserve unshipped task ${cfg.taskId}"
+_PR_CHECKPOINT_ADOPTED=0
+_pr_tip_is_own_checkpoint() {
+  # $1 = the SHA ls-remote just reported for this branch.  True only when
+  # that commit is this task's own checkpoint.  Read it locally when the
+  # object is already present (prepareTaskWorkBranch fetched the checkpoint
+  # it restored); otherwise fetch only the branch tip, preserving the
+  # clone's existing shallow/full shape so the pending push is unaffected.
+  [ -n "$1" ] || return 1
+  _PR_PROBE_REF=refs/remotes/origin/_pr_lease_probe
+  if ! git cat-file -e "$1^{commit}" 2>/dev/null; then
+    if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+      git fetch --no-tags --quiet --depth=1 origin "+$_PR_REMOTE_REF:$_PR_PROBE_REF" 2>/dev/null || return 1
+    else
+      git fetch --no-tags --quiet origin "+$_PR_REMOTE_REF:$_PR_PROBE_REF" 2>/dev/null || return 1
+    fi
+    git cat-file -e "$1^{commit}" 2>/dev/null || return 1
+  fi
+  _PR_PROBE_SUBJECT=$(git show -s --format=%s "$1" 2>/dev/null || true)
+  [ "$_PR_PROBE_SUBJECT" = "$_PR_CHECKPOINT_SUBJECT" ]
+}
 _PR_EXPECTED_QUERY=$(git ls-remote --heads origin "$_PR_REMOTE_REF" 2>/tmp/pr_ls_remote.log)
 _PR_EXPECTED_QUERY_STATUS=$?
 if [ "$_PR_EXPECTED_QUERY_STATUS" -ne 0 ]; then
@@ -755,6 +781,20 @@ for attempt in 1 2 3; do
     break
   fi
   if [ "$_PR_OBSERVED_REMOTE_SHA" != "$_PR_EXPECTED_REMOTE_SHA" ]; then
+    # Our own checkpoint is not a competing writer.  Publication is the step
+    # that retires it, so refusing here strands finished, ./check-passing work
+    # on a branch nothing else will ever publish (NeurIPS 37eea260, df1c89d0,
+    # 9884994c and 0396aaee each blocked permanently this way).  Adopt it as
+    # the lease authority exactly ONCE per invocation, and only when the tip
+    # carries THIS task's checkpoint subject: a genuine third-party writer
+    # still cannot walk the lease forward one race at a time.
+    if [ "$_PR_CHECKPOINT_ADOPTED" = "0" ] && _pr_tip_is_own_checkpoint "$_PR_OBSERVED_REMOTE_SHA"; then
+      _PR_CHECKPOINT_ADOPTED=1
+      _PR_EXPECTED_REMOTE_SHA="$_PR_OBSERVED_REMOTE_SHA"
+      _PR_LEASE="--force-with-lease=$_PR_REMOTE_REF:$_PR_EXPECTED_REMOTE_SHA"
+      echo "[pr] remote tip $_PR_OBSERVED_REMOTE_SHA is this task's own unshipped-work checkpoint; adopting it as the lease authority and retrying."
+      continue
+    fi
     echo "[pr] remote branch advanced to a competing SHA; refusing to overwrite it." >&2
     echo "[pr] expected: \${_PR_EXPECTED_REMOTE_SHA:-<absent>}" >&2
     echo "[pr] observed: \${_PR_OBSERVED_REMOTE_SHA:-<absent>}" >&2
