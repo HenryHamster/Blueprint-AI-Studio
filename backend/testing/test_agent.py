@@ -42,7 +42,7 @@ from app.models import (
     get_task_lifetime_attempt_ordinal,
 )
 from app.auth import create_agent_token, create_vm_scoped_token
-from app.schemas import AgentStatusPayload
+from app.schemas import AgentStatusPayload, PublicationGateReceipt
 from app.routers.agent_status import _is_task_llm_auth_hard_disable
 from app.task_capabilities import TaskType, task_type_catalog
 from app.time_utils import _utcnow
@@ -1441,6 +1441,7 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
         "authoritative_ci_required": False,
         "recorded_at": "2026-08-11T00:00:00Z",
     }
+    normalized_receipt = dict(receipt)
     resp = await client.post(
         "/api/agent/heartbeat",
         json={
@@ -1453,7 +1454,7 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
     assert resp.status_code == 200
 
     await db_session.refresh(task)
-    assert (task.context or {}).get("publication_gate_receipt") == receipt
+    assert (task.context or {}).get("publication_gate_receipt") == normalized_receipt
     # Non-terminal: the task keeps running on the same VM.
     assert task.status == TaskStatus.IN_PROGRESS
     assert task.vm_instance_id == "agent-vm-gate-receipt"
@@ -1463,7 +1464,7 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
 
     # A later gate run overwrites the receipt: the latest verdict is the
     # authoritative one.
-    passed = {**receipt, "status": "passed", "exit_code": 0}
+    passed = {**normalized_receipt, "status": "passed", "exit_code": 0}
     resp = await client.post(
         "/api/agent/heartbeat",
         json={"task_id": str(task.id), "publication_gate_receipt": passed},
@@ -1472,7 +1473,9 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
     assert resp.status_code == 200
     await db_session.refresh(task)
     assert (task.context or {}).get("publication_gate_receipt") == passed
-    assert (task.context or {}).get("publication_gate_receipt_history") == [receipt]
+    assert (task.context or {}).get("publication_gate_receipt_history") == [
+        normalized_receipt
+    ]
 
     # A malformed receipt is dropped, never partially persisted, and never
     # 422s the heartbeat itself.
@@ -1480,14 +1483,44 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
         "/api/agent/heartbeat",
         json={
             "task_id": str(task.id),
-            "publication_gate_receipt": {"status": "failed"},
+            "publication_gate_receipt": {
+                **passed,
+                "new_failures": "not-a-dict",
+            },
         },
         headers=headers,
     )
     assert resp.status_code == 200
     await db_session.refresh(task)
     assert (task.context or {}).get("publication_gate_receipt") == passed
-    assert (task.context or {}).get("publication_gate_receipt_history") == [receipt]
+    assert (task.context or {}).get("publication_gate_receipt_history") == [
+        normalized_receipt
+    ]
+
+
+def test_publication_gate_receipt_schema_bounds_attribution():
+    base = {
+        "status": "failed",
+        "command": "./check test",
+        "timeout_seconds": 600,
+        "hard_timeout_seconds": 1800,
+        "elapsed_seconds": 42,
+        "deadline_extended": False,
+        "exit_code": 23,
+        "authoritative_ci_required": False,
+        "recorded_at": "2026-08-11T00:00:00Z",
+    }
+    from app.task_blocked import sanitize_publication_gate_receipt
+
+    assert (
+        sanitize_publication_gate_receipt(PublicationGateReceipt(**base).model_dump())
+        == base
+    )
+    with pytest.raises(ValueError, match="String should have at most 4000 characters"):
+        PublicationGateReceipt(
+            **base,
+            attribution_state="s" * 4001,
+        )
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import merge_durations
+from testing.fixgate_attribution import format_offender_marker
 
 
 REGENERATE_PATH = Path(__file__).with_name("regenerate-durations.py")
@@ -191,9 +192,15 @@ def test_vitest_artifact_marks_unexecuted_files_unmeasured() -> None:
     assert by_file["src/measured.test.ts"]["duration_ms"] == 300
 
     for missing in ("src/never-ran.test.ts", "src/also-never-ran.test.ts"):
-        assert by_file[missing]["measured"] is False, by_file[missing]
-        assert by_file[missing]["duration_ms"] is None, by_file[missing]
-        assert by_file[missing]["tests"] is None, by_file[missing]
+        assert by_file[missing]["measured"] is False, (
+            f"{by_file[missing]}\n{format_offender_marker([missing])}"
+        )
+        assert by_file[missing]["duration_ms"] is None, (
+            f"{by_file[missing]}\n{format_offender_marker([missing])}"
+        )
+        assert by_file[missing]["tests"] is None, (
+            f"{by_file[missing]}\n{format_offender_marker([missing])}"
+        )
 
     assert sorted(entry["file"] for entry in result["unmeasured"]) == [
         "src/also-never-ran.test.ts",

@@ -23,6 +23,7 @@ from app.auth import (
     require_admin,
 )
 from app.main import app
+from testing.fixgate_attribution import format_offender_marker
 
 # Intentional exceptions — expected to be empty.
 # When a route genuinely should be unauthenticated (e.g. a public health check
@@ -94,4 +95,6 @@ def test_all_admin_routes_require_auth():
         "dependency — add Depends(require_admin) to each route signature, or add to "
         "ALLOWLIST if the route is intentionally public:\n"
         + "\n".join(f"  - {r}" for r in sorted(offenders))
+        + "\n"
+        + format_offender_marker(offenders)
     )

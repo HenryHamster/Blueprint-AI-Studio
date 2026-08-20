@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from testing.fixgate_attribution import format_offender_marker
+
 MANIFEST_PATH = Path(__file__).resolve().parent / "conversational_workday_manifest.json"
 
 
@@ -245,6 +247,8 @@ def test_all_protect_paths_exist():
         "The following PROTECT-listed files are missing from the working tree. "
         "Either restore them or update the manifest (with operator sign-off):\n"
         + "\n".join(f"  - {p}" for p in missing)
+        + "\n"
+        + format_offender_marker(missing)
     )
 
 
@@ -266,6 +270,8 @@ def test_no_protect_path_is_also_safe_to_cut():
         "These paths appear in both 'protect' and 'deleted_frontend[status=SAFE-TO-CUT]' — "
         "a path cannot be both live coverage and dead:\n"
         + "\n".join(f"  - {p}" for p in sorted(overlap))
+        + "\n"
+        + format_offender_marker(overlap)
     )
 
 
@@ -295,6 +301,8 @@ def test_no_duplicate_test_ids_in_protect_entry():
         "The following protect entries contain duplicate test_ids. "
         "Duplicates weaken the manifest completeness guarantee — remove them:\n"
         + "\n".join(f"  - {d}" for d in duplicates)
+        + "\n"
+        + format_offender_marker(duplicates)
     )
 
 
@@ -323,6 +331,8 @@ def test_all_protect_test_ids_exist_in_their_files():
         "The following PROTECT-listed test_ids no longer exist in their files. "
         "Either restore the test or update the manifest (with operator sign-off):\n"
         + "\n".join(f"  - {m}" for m in missing)
+        + "\n"
+        + format_offender_marker(missing)
     )
 
 
@@ -360,6 +370,7 @@ def test_every_protected_file_meets_declared_test_count():
         "Protected test files must retain their declared test-count floor; "
         "update conversational_workday_manifest.json after an intentional test removal:\n"
         + "\n".join(f"  - {item}" for item in mismatches)
+        + "\n" + format_offender_marker(str(offender) for offender in mismatches)
     )
 
 
@@ -411,7 +422,7 @@ def test_removed_backend_resident_seams_are_absent():
         "source files. These belong to the autonomous resident control plane "
         "that was permanently removed in migration 0657. Remove the class "
         "definitions or revert the restore:\n"
-        + "\n".join(f"  - {c}" for c in reintroduced)
+        + "\n".join(f"  - {c}" for c in reintroduced) + "\n" + format_offender_marker(str(offender) for offender in reintroduced)
     )
 
 
@@ -624,7 +635,7 @@ def test_removed_authority_modules_are_absent():
         "The following authority modules from the removed autonomous resident "
         "control plane have reappeared on disk. These were permanently removed "
         "in migration 0657 — remove them:\n"
-        + "\n".join(f"  - {m}" for m in reappeared)
+        + "\n".join(f"  - {m}" for m in reappeared) + "\n" + format_offender_marker(str(offender) for offender in reappeared)
     )
 
     # strategic_authority_locks.py must exist and must not contain code
@@ -690,7 +701,7 @@ def test_authority_plane_field_names_are_absent():
         "ORM column definitions. These field names belong to the removed second-engine "
         "authority row (migration 0657). Remove them or update this guard with "
         "operator sign-off:\n"
-        + "\n".join(f"  - {r}" for r in reintroduced)
+        + "\n".join(f"  - {r}" for r in reintroduced) + "\n" + format_offender_marker(str(offender) for offender in reintroduced)
     )
 
 
@@ -718,7 +729,7 @@ def test_no_removed_resident_strategic_backend_modules():
         "Only strategic_resident_session.py is kept for the conversational "
         "Workday path. These belong to the deleted autonomous resident "
         "subsystem (migration 0657) and must be removed:\n"
-        + "\n".join(f"  - {m}" for m in unexpected)
+        + "\n".join(f"  - {m}" for m in unexpected) + "\n" + format_offender_marker(str(offender) for offender in unexpected)
     )
 
 
@@ -741,6 +752,7 @@ def test_protect_entries_marked_complete_have_all_tests():
             f"missing={violation['missing']!r}, extra={violation['extra']!r}"
             for violation in violations
         )
+        + "\n" + format_offender_marker(str(violation['path']) for violation in violations)
     )
 
 
@@ -841,7 +853,7 @@ def test_no_removed_resident_task_type_in_task_capabilities():
         + "\n".join(f"  {h}" for h in hits)
         + "\nThis TaskType belonged to the autonomous resident control plane "
         "removed in migration 0657. Remove it to prevent reinstating the "
-        "resident turn processing path."
+        "resident turn processing path." + "\n" + format_offender_marker(str(offender) for offender in hits)
     )
 
 
@@ -925,6 +937,8 @@ def test_ts_label_extraction_single_quote_only_regex_misses_double_quoted():
     assert old_regex_result == set(), (
         "Sanity check failed: old single-quote regex should return nothing for "
         f"a double-quoted label, but got {old_regex_result!r}"
+        + "\n"
+        + format_offender_marker(old_regex_result)
     )
 
     # The fixed helper correctly finds the label.
@@ -948,6 +962,8 @@ def test_ts_label_extraction_single_quote_only_regex_misses_backtick():
     assert old_regex_result == set(), (
         "Sanity check failed: old single-quote regex should return nothing for "
         f"a backtick label, but got {old_regex_result!r}"
+        + "\n"
+        + format_offender_marker(old_regex_result)
     )
 
     fixed_result = _extract_ts_it_labels(source)
@@ -1003,7 +1019,7 @@ def test_reaper_resident_exemption_seam_is_guarded():
     assert not missing_tests, (
         "The following resident reaper-exemption tests no longer exist in test_reaper.py. "
         "Restore them or update this guard with operator sign-off:\n"
-        + "\n".join(f"  - {t}" for t in missing_tests)
+        + "\n".join(f"  - {t}" for t in missing_tests) + "\n" + format_offender_marker(str(offender) for offender in missing_tests)
     )
 
     # (c) Both tests must be listed in the manifest protect entry for test_reaper.py.
@@ -1018,7 +1034,7 @@ def test_reaper_resident_exemption_seam_is_guarded():
     assert not not_listed, (
         "The following resident reaper-exemption tests exist in test_reaper.py but "
         "are not listed in the protect manifest:\n"
-        + "\n".join(f"  - {t}" for t in not_listed)
+        + "\n".join(f"  - {t}" for t in not_listed) + "\n" + format_offender_marker(str(offender) for offender in not_listed)
     )
 
 

@@ -23,6 +23,49 @@ import blueprint_api
 import local_app_release as local_release
 import pytest
 
+# scripts/*.py tests run with --noconftest, so the shared offender-identity
+# producer is reached by the same explicit path insertion the other scripts
+# guards use rather than by a conftest-installed sys.path entry.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+
+from testing.fixgate_attribution import format_offender_marker  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_blueprint_config(monkeypatch, tmp_path):
+    """Guarantee blueprint_api.load_config() resolves without touching the host.
+
+    Most tests here mock blueprint_api.api directly, but several blueprint.py
+    helpers call the *real* load_config() unconditionally on the way to that
+    mocked api() (e.g. _using_scoped_service_credential(), which many CLI
+    flows consult before ever making a request). On a dev host that has an
+    ambient ~/.blueprint-config.json or repo-root .blueprint-config.json,
+    that real call silently succeeds — but the CI lane runs this file with
+    --noconftest in a container with no config anywhere in the search order
+    (see blueprint_api._config_search_paths), so the same call raises
+    APIError there. Point BLUEPRINT_CONFIG at a throwaway file with the
+    minimal shape load_config()/api() actually read (api_url, api_key) so
+    every test gets the same deterministic, host-independent resolution
+    regardless of what config files exist on the machine running pytest.
+    BLUEPRINT_CONFIG is checked first in load_config(), ahead of the
+    BLUEPRINT_API_URL/KEY pair, the repo-root/home search paths, and the
+    gcloud/agent-token fallbacks, so this fully short-circuits config
+    discovery. Also reset the process-global _config_cache so no test can
+    leak a resolved config into the next one.
+
+    Tests that exercise load_config()'s own search/precedence/error behavior
+    (test_load_config_*) or that replace load_config() outright override this
+    fixture via their own monkeypatch calls, which run after this fixture's
+    setup and are undone independently at teardown.
+    """
+    dummy_config = tmp_path / "hermetic-blueprint-config.json"
+    dummy_config.write_text(
+        json.dumps({"api_url": "https://blueprint-cli-test.invalid", "api_key": "test-key"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINT_CONFIG", str(dummy_config))
+    monkeypatch.setattr(blueprint_api, "_config_cache", None)
+
 
 @pytest.fixture(autouse=True)
 def _hermetic_blueprint_config(monkeypatch, tmp_path):
@@ -637,6 +680,8 @@ def test_no_duplicate_top_level_defs():
                     seen[name] = node.lineno
         assert not dups, (
             f"{module_name} has duplicate top-level definitions: {', '.join(dups)}"
+            + "\n"
+            + format_offender_marker(str(duplicate) for duplicate in dups)
         )
 
 
@@ -5680,7 +5725,11 @@ def test_compute_run_local_single_command_wrapped_in_docker(tmp_path, monkeypatc
 
     # The run command must use docker, not bare bash
     run_cmds = [c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]]
-    assert run_cmds, f"expected a 'docker run' invocation; got commands: {captured_cmds}"
+    assert run_cmds, (
+        f"expected a 'docker run' invocation; got commands: {captured_cmds}"
+        + "\n"
+        + format_offender_marker(str(command) for command in captured_cmds)
+    )
     docker_cmd = run_cmds[0]
     assert "myregistry.io/myimage:latest" in docker_cmd
     assert "BLUEPRINT_RESULT_FILE" in " ".join(docker_cmd)
@@ -5718,7 +5767,11 @@ def test_compute_run_local_single_command_docker_gpus_when_gpu_detected(tmp_path
     blueprint._compute_run_local(args)
 
     run_cmds = [c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]]
-    assert run_cmds, f"expected 'docker run'; got: {captured_cmds}"
+    assert run_cmds, (
+        f"expected 'docker run'; got: {captured_cmds}"
+        + "\n"
+        + format_offender_marker(str(command) for command in captured_cmds)
+    )
     docker_cmd = run_cmds[0]
     assert "--gpus" in docker_cmd
     assert "all" in docker_cmd
@@ -5754,12 +5807,20 @@ def test_compute_run_local_no_container_uses_bare_bash(tmp_path, monkeypatch, ca
     assert any(
         isinstance(c, list) and c[:2] == ["bash", "-lc"]
         for c in captured_cmds
-    ), f"expected bare 'bash -lc'; got: {captured_cmds}"
+    ), (
+        f"expected bare 'bash -lc'; got: {captured_cmds}"
+        + "\n"
+        + format_offender_marker(str(command) for command in captured_cmds)
+    )
     # No docker invocation
     assert not any(
         isinstance(c, list) and "docker" in c
         for c in captured_cmds
-    ), f"expected no docker call; got: {captured_cmds}"
+    ), (
+        f"expected no docker call; got: {captured_cmds}"
+        + "\n"
+        + format_offender_marker(str(command) for command in captured_cmds)
+    )
 
 
 def test_compute_run_local_arms_wrapped_in_docker_per_arm(tmp_path, monkeypatch, capsys):
@@ -5799,7 +5860,11 @@ def test_compute_run_local_arms_wrapped_in_docker_per_arm(tmp_path, monkeypatch,
         c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]
     ]
     # One docker run per arm
-    assert len(docker_run_cmds) == 2, f"expected 2 docker run invocations; got: {captured_cmds}"
+    assert len(docker_run_cmds) == 2, (
+        f"expected 2 docker run invocations; got: {captured_cmds}"
+        + "\n"
+        + format_offender_marker(str(command) for command in captured_cmds)
+    )
     for docker_cmd in docker_run_cmds:
         assert "myregistry.io/myimage:latest" in docker_cmd
         assert "BLUEPRINT_RESULT_FILE" in " ".join(docker_cmd)
@@ -6363,7 +6428,11 @@ def test_messages_answer_targets_real_endpoint(mock_api, monkeypatch, capsys):
     assert body["resolution"] == "This is my answer"
     # The old /answer POST route must NOT have been called
     old_route_calls = [p for _, p, _ in mock_api if "/answer" in p]
-    assert not old_route_calls, f"Old /answer route was called: {old_route_calls}"
+    assert not old_route_calls, (
+        f"Old /answer route was called: {old_route_calls}"
+        + "\n"
+        + format_offender_marker(str(call) for call in old_route_calls)
+    )
 
 
 def test_messages_confirm_list_json(mock_api, capsys):

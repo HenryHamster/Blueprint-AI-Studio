@@ -23,7 +23,23 @@ import guard_suppression_receipt  # noqa: E402
 import static_release_guard  # noqa: E402
 import typecheck_verification_guard  # noqa: E402
 import vitest_verification_guard  # noqa: E402
-from testing.fixgate_attribution import classify_verification  # noqa: E402
+from testing.fixgate_attribution import (  # noqa: E402
+    classify_verification,
+    format_offender_marker,
+)
+
+
+def _offender_detail(items) -> str:
+    """Render a guard's offender collection with a stable machine identity.
+
+    The prose stays readable; the appended marker gives the differential
+    attributor a set identity so an inherited breach whose membership or
+    ordering shifts is not charged to a diff that introduced nothing.
+    """
+
+    rendered = [str(item) for item in items]
+    identities = [line.replace("\n", " ").strip() or "<empty>" for line in rendered]
+    return " | ".join(rendered) + "\n" + format_offender_marker(identities)
 
 
 def test_static_guard_base_unpack_uses_data_filter() -> None:
@@ -813,13 +829,32 @@ XML
     fi
     if [ "$state" = "collect_mixed" ]; then
       cat >"$report" <<XML
-<testsuite tests="3" failures="3">$pre_backend$collect_module$new_roster</testsuite>
+<testsuite tests="4" failures="4">$pre_backend$pre_scripts$collect_module$new_roster</testsuite>
 XML
       exit 1
     fi
     if [ "$state" = "collect_opaque" ]; then
       cat >"$report" <<XML
 <testsuite tests="2" failures="2">$pre_backend$collect_opaque</testsuite>
+XML
+      exit 1
+    fi
+    if [ "$state" = "deleted_corpus" ] || [ "$state" = "renamed_corpus" ]; then
+      cat >"$report" <<XML
+<testsuite tests="1" failures="0"><testcase classname="guard" name="clean" /></testsuite>
+XML
+      exit 0
+    fi
+    if [ "$state" = "skipped_corpus" ]; then
+      skipped_scripts="<testcase classname=\"...repo.scripts.test_preexisting_roster\" name=\"test_roster_preexisting\"><skipped message=\"test disabled\" /></testcase>"
+      cat >"$report" <<XML
+<testsuite tests="1" failures="0" skipped="1">$skipped_scripts</testsuite>
+XML
+      exit 0
+    fi
+    if [ "$state" = "deleted_base_failure" ]; then
+      cat >"$report" <<XML
+<testsuite tests="1" failures="1">$pre_scripts</testsuite>
 XML
       exit 1
     fi
@@ -857,7 +892,7 @@ XML
         exit "$abnormal_exit"
         ;;
     esac
-    if [ "$state" = "new_node" ]; then
+    if [ "$state" = "new_node" ] || [ "$state" = "new_node_existing_roster" ]; then
       # The new failure is a node that does not exist in the base tree, inside a
       # roster file that does.
       cat >"$report" <<XML
@@ -886,17 +921,28 @@ esac
     (tmp_path / "scripts" / "backend-test-route.sh").write_bytes(route_contents)
     _git(tmp_path, "switch", "-c", "task")
     (tmp_path / "attribution_state").write_text(f"{current_state}\n")
-    # Current-tree-only sources behind the two new-failure shapes: a brand new
+    # Current-tree-only sources behind the new-failure shapes: a brand new
     # roster FILE, and a new NODE inside a roster file that already exists in
     # base. Both must resolve against the current tree and be absent from base.
-    (tmp_path / "scripts" / "test_new_roster.py").write_text(
-        "def test_newly_introduced():\n    raise AssertionError('fixture only')\n"
-    )
-    with (tmp_path / "backend" / "testing" / "test_existing.py").open("a") as existing:
-        existing.write("\n\ndef test_added_here():\n    raise AssertionError('new node')\n")
+    # Keep them out of unrelated states so the corpus inventory only changes
+    # when that fixture is specifically exercising roster drift.
+    if current_state in {"new", "new_node", "collect_mixed"}:
+        (tmp_path / "scripts" / "test_new_roster.py").write_text(
+            "def test_newly_introduced():\n    raise AssertionError('fixture only')\n"
+        )
+    if current_state in {"new_node", "new_node_existing_roster", "collect_mixed"}:
+        with (tmp_path / "backend" / "testing" / "test_existing.py").open("a") as existing:
+            existing.write("\n\ndef test_added_here():\n    raise AssertionError('new node')\n")
     with (tmp_path / "scripts" / "static_release_guard.py").open("a") as guard:
         guard.write("# task changes static-guard path\n")
+    if current_state == "deleted_corpus":
+        (tmp_path / "scripts" / "test_preexisting_roster.py").unlink()
+    elif current_state == "renamed_corpus":
+        (tmp_path / "scripts" / "test_preexisting_roster.py").rename(
+            tmp_path / "scripts" / "test_renamed_roster.py"
+        )
     _git(tmp_path, "add", "attribution_state", "scripts/static_release_guard.py", "scripts/backend-test-route.sh")
+    _git(tmp_path, "add", "-A", "scripts")
     _git(tmp_path, "commit", "-m", "change static corpus outcome")
     return docker_bin.parent, tmp_path
 
@@ -1263,8 +1309,8 @@ def test_changed_harness_partial_invocation_cannot_hide_base_corpus_failure(
     # of inheriting the candidate's one-selector weakening.
     current = [arg for arg in calls[0].split() if not arg.startswith("-")]
     baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
-    assert len(current) == 1, current
-    assert set(current) < set(baseline), baseline
+    assert len(current) == 1, _offender_detail(current)
+    assert set(current) < set(baseline), _offender_detail(baseline)
 
 
 def test_unchanged_harness_clean_current_keeps_lazy_base_control(
@@ -1293,6 +1339,102 @@ def test_unchanged_harness_clean_current_keeps_lazy_base_control(
     assert "[static guard] PASS" in output
 
 
+def test_deleted_node_in_unchanged_corpus_file_blocks_a_clean_current_run(
+    tmp_path: Path,
+) -> None:
+    """A source edit must baseline nodes even when file inventory is unchanged."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path,
+        "clean",
+        base_state="preexisting",
+    )
+    (repo / "scripts" / "test_preexisting_roster.py").write_text(
+        "# test_roster_preexisting deleted by task\n"
+    )
+    call_log = tmp_path / "deleted-node-clean-calls.log"
+
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id="task-deleted-node-clean-123",
+        call_log=call_log,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "baseline failures disappeared" in output
+    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::failure" in output
+    calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
+    assert len(calls) == 2, _offender_detail(calls)
+    assert calls[1].replace("base.xml", "current.xml") == calls[0]
+
+
+def test_deleted_base_failing_corpus_test_blocks_a_clean_current_run(
+    tmp_path: Path,
+) -> None:
+    """Deleting a failing standalone member cannot make a clean task green."""
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path, "deleted_corpus", base_state="deleted_base_failure"
+    )
+    call_log = tmp_path / "deleted-corpus-calls.log"
+
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id="task-deleted-corpus-test-123",
+        call_log=call_log,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "baseline failures disappeared" in output
+    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::failure" in output
+    assert "task-deleted-corpus-test-123" in output
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 2, _offender_detail(calls)
+    assert "scripts/test_preexisting_roster.py" not in calls[0]
+    assert calls[1].split("|", 1)[1].replace("base.xml", "current.xml") == calls[0].split("|", 1)[1]
+
+
+def test_renamed_base_failing_corpus_test_blocks_a_clean_current_run(
+    tmp_path: Path,
+) -> None:
+    """Renaming a failing standalone member preserves the vanished identity."""
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path, "renamed_corpus", base_state="deleted_base_failure"
+    )
+    result = _run_attribution_guard(
+        repo, fake_bin, task_id="task-renamed-corpus-test-123"
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::failure" in output
+
+
+def test_skipped_base_failing_corpus_test_blocks_with_same_route_identity(
+    tmp_path: Path,
+) -> None:
+    """Turning a failing standalone member into a skip is also baseline erosion."""
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path, "skipped_corpus", base_state="deleted_base_failure"
+    )
+    call_log = tmp_path / "skipped-corpus-calls.log"
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id="task-skipped-corpus-test-123",
+        call_log=call_log,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "baseline failures became skipped" in output
+    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::failure" in output
+    assert len(call_log.read_text(encoding="utf-8").splitlines()) == 2
+
+
 def test_unchanged_harness_failing_current_keeps_scoped_baseline_control(
     tmp_path: Path,
 ) -> None:
@@ -1317,10 +1459,40 @@ def test_unchanged_harness_failing_current_keeps_scoped_baseline_control(
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     assert len(calls) == 2
     baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
-    assert baseline == ["testing/test_existing.py"], baseline
+    assert baseline == ["testing/test_existing.py"], _offender_detail(baseline)
     assert "/repo/scripts/test_preexisting_roster.py" not in calls[1]
     assert "no new failures vs base" in output
     assert "[static guard] PASS" in output
+
+
+def test_deleted_node_with_surviving_failure_runs_full_baseline_and_blocks(
+    tmp_path: Path,
+) -> None:
+    """A surviving failure cannot scope away a deleted baseline sibling node."""
+
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path,
+        "partial_preexisting",
+        base_state="preexisting",
+    )
+    (repo / "scripts" / "test_preexisting_roster.py").write_text(
+        "# test_roster_preexisting deleted by task\n"
+    )
+    call_log = tmp_path / "deleted-node-surviving-calls.log"
+
+    result = _run_attribution_guard(
+        repo,
+        fake_bin,
+        task_id="task-deleted-node-surviving-123",
+        call_log=call_log,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "made base corpus failure(s) disappear" in output
+    calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
+    assert len(calls) == 2, _offender_detail(calls)
+    assert calls[1].replace("base.xml", "current.xml") == calls[0]
 
 
 @pytest.mark.parametrize(
@@ -1428,7 +1600,7 @@ def test_changed_harness_cannot_hide_a_base_corpus_failure(tmp_path: Path) -> No
 def test_baseline_scopes_to_current_failures_and_survives_roster_drift(
     tmp_path: Path,
 ) -> None:
-    """Only base-present failed nodes are selected for subtraction."""
+    """A changed corpus inventory upgrades comparison to the full base run."""
     fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "new")
     call_log = tmp_path / "corpus-calls.log"
     result = subprocess.run(
@@ -1456,14 +1628,8 @@ def test_baseline_scopes_to_current_failures_and_survives_roster_drift(
     assert result.returncode != 0, output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     assert calls[0].startswith("testing/test_security.py")
-    # Scoped to the FILES that failed in the current tree and exist in base —
-    # never the full corpus, and never a node id (see the new-node test below).
-    baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
-    assert baseline == [
-        "/repo/scripts/test_preexisting_roster.py",
-        "testing/test_existing.py",
-    ], baseline
-    assert "test_new_roster" not in calls[1]
+    baseline = calls[1].replace("base.xml", "current.xml")
+    assert baseline == calls[0]
     assert "newly_introduced" in output
     assert "standalone static corpus attribution" not in output
     # Only the new file's failure is charged; the two pre-existing ones (one of
@@ -1482,7 +1648,9 @@ def test_new_node_in_existing_roster_file_is_attributed_without_usage_error(
     JUnit report is written — which the guard would then report as an
     unattributable corpus failure naming no test at all.
     """
-    fake_bin, repo = _prepare_docker_attribution_repo(tmp_path, "new_node")
+    fake_bin, repo = _prepare_docker_attribution_repo(
+        tmp_path, "new_node_existing_roster"
+    )
     call_log = tmp_path / "corpus-calls.log"
     result = subprocess.run(
         [
@@ -1509,7 +1677,7 @@ def test_new_node_in_existing_roster_file_is_attributed_without_usage_error(
     assert result.returncode != 0, output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     # The base run selects the containing FILE, so it always resolves.
-    assert "::" not in calls[1], calls[1]
+    assert "--junitxml=/static-guard-output/base.xml" in calls[1]
     assert "testing/test_existing.py" in calls[1]
     assert "ERROR: not found" not in output
     # The new node is named; the pre-existing failures in the same file are not.
@@ -1575,8 +1743,8 @@ def test_sole_collection_error_is_subtracted_without_blocking_missing_routes(tmp
     assert "no new failures vs base" in output
     # The baseline actually ran and stayed scoped to the collection-error file.
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
-    assert len(calls) == 2, calls
-    assert "testing/test_collect_boom.py" in calls[1], calls[1]
+    assert len(calls) == 2, _offender_detail(calls)
+    assert "testing/test_collect_boom.py" in calls[1], _offender_detail(calls)
 
 
 def test_collection_error_alongside_resolvable_failure_charges_only_the_new_one(
@@ -1594,8 +1762,7 @@ def test_collection_error_alongside_resolvable_failure_charges_only_the_new_one(
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
-    baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]
-    assert "testing/test_collect_boom.py" in baseline
+    assert calls[1].replace("base.xml", "current.xml") == calls[0]
     assert "standalone static corpus attribution" not in output
     new_line = output.split("new failures:", 1)[1].split("\n")[0]
     assert "test_newly_introduced" in new_line
@@ -1644,7 +1811,7 @@ def test_static_lane_blocks_on_baseline_failure_disappeared(
     current = [arg for arg in calls[0].split() if not arg.startswith("-")]
     # Unscoped: the baseline runs the same roster as the current tree, including
     # files that did not fail — not the scoped two-file subset.
-    assert baseline == current, baseline
+    assert baseline == current, _offender_detail(baseline)
     assert "testing/test_security.py" in baseline
 
 

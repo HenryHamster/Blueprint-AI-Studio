@@ -1153,6 +1153,10 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
         realPath.join(dir, 'scripts', 'guard_suppression_receipt.py'),
       );
       realFs.copyFileSync(
+        realPath.join(productionRoot, 'scripts', 'static_release_guard.py'),
+        realPath.join(dir, 'scripts', 'static_release_guard.py'),
+      );
+      realFs.copyFileSync(
         realPath.join(productionRoot, 'backend', 'testing', 'fixgate_attribution.py'),
         realPath.join(dir, 'backend', 'testing', 'fixgate_attribution.py'),
       );
@@ -1849,6 +1853,19 @@ describe('writeCheckHelper — attributed backend verification', () => {
       owner: 'HenryHamster',
       repo: 'BlueprintAIStudio',
       testsOnMainBranch: true,
+      taskCapability: { agent_mode: 'write', run_shape: 'workflow', output_kind: 'pr' },
+      buildConfig: {
+        directories: [{
+          path: 'backend',
+          type: 'python',
+          lint_cmd: 'ruff check .',
+          test_cmd: 'python3 -m pytest',
+          project_verification: {
+            protocol: 'blueprint-v1',
+            harness: 'scripts/test-backend.sh',
+          },
+        }],
+      },
     });
     const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();

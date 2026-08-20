@@ -26,6 +26,7 @@ from app.rollup_management import (
     _extract_rollup_migration_sources,
     _validate_rollup_migration_chain,
 )
+from testing.fixgate_attribution import format_offender_marker
 
 
 def _migration_src(revision: str, down_revision: str | None) -> str:
@@ -84,6 +85,8 @@ def test_migration_files_do_not_import_app_modules():
         "executes candidate migrations in the serving process, where app imports "
         "resolve against the serving tree rather than the candidate. "
         f"Offenders: {offenders}"
+        + "\n"
+        + format_offender_marker(offenders)
     )
 
 

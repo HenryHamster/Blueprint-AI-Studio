@@ -17,6 +17,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,24 @@ def _normalize_failure_detail(detail: str, *, tree_root: Path | None) -> str:
 _OFFENDER_SET_RE = re.compile(
     r"(?m)^[ \t]*BLUEPRINT_OFFENDERS:[ \t]*(\[[^\r\n]*\])[ \t]*$"
 )
+
+
+def format_offender_marker(offenders: Iterable[str]) -> str:
+    """Render a deterministic, machine-readable identity set for a guard.
+
+    Guard diagnostics remain written for humans, but their rendered prose often
+    includes counts, ordering, and other context that can legitimately change
+    while the underlying failure is inherited.  Appending this marker gives the
+    differential gate a stable identity without weakening its route, testcase,
+    or failure-kind checks.
+    """
+
+    values = list(offenders)
+    if not all(isinstance(value, str) and value and "\n" not in value for value in values):
+        raise ValueError("offender identities must be non-empty single-line strings")
+    return "BLUEPRINT_OFFENDERS: " + json.dumps(
+        sorted(set(values)), separators=(",", ":")
+    )
 
 
 def _extract_offender_set(detail: str) -> frozenset[str] | None:
@@ -431,6 +450,7 @@ __all__ = [
     "attribute_reports",
     "classify_verification",
     "extract_base",
+    "format_offender_marker",
     "is_attributable_pytest_result",
     "parse_junit_failures",
     "parse_junit_report",

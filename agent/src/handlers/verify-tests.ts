@@ -530,12 +530,11 @@ async function attachDeclaredBuildProbe(
 }
 
 // ── Diff-impacted scoping for an unbounded whole-suite pytest runner ─────────
-// Mirrors the local ``./check`` impacted-test gate
-// (agent/src/prompts/check_impacted_test.sh): resolve the backend test files
-// IMPACTED by the PR diff via the committed reverse-dep resolver, cap the count,
-// and run ONLY those instead of the whole ~hundreds-of-file suite. The cap +
-// resolver wall clock mirror the check gate's IMPACTED_TEST_CAP (8) and
-// IMPACTED_RESOLVER_TIMEOUT_SECS (30s). This is what turns a bare
+// Mirrors the baseline-attributed backend verification fragment
+// (agent/src/prompts/check_backend_verification.sh): resolve the backend test
+// files IMPACTED by the PR diff via the committed reverse-dep resolver, cap the
+// count, and run ONLY those instead of the whole ~hundreds-of-file suite. This
+// runner additionally bounds resolver execution at 30 seconds. This is what turns a bare
 // ``python3 -m pytest`` (which reaches collection then dies at the runner wall
 // clock) into a bounded, fast ``pytest <impacted files>`` run.
 const IMPACTED_TEST_CAP = 8;

@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app import acceptance_criteria as ac
-from app.models import Project, Task, TaskStatus
+from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
 from testing.test_acceptance_criteria import (
     _make_project,

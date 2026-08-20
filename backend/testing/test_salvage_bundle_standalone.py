@@ -496,6 +496,8 @@ from __future__ import annotations
 
 import pytest
 
+from testing.fixgate_attribution import format_offender_marker
+
 
 # --------------------------------------------------------------------------- #
 # Findings #3 and #12 — infra-failure signature does NOT use child failures
@@ -3252,6 +3254,11 @@ def test_dual_write_spec_matches_ledger_registry():
         f"_DUAL_WRITE_SPEC_DIMENSIONS content differs from the expected 11-dimension set; "
         f"extra: {sorted(_DUAL_WRITE_SPEC_DIMENSIONS - expected)}, "
         f"missing: {sorted(expected - _DUAL_WRITE_SPEC_DIMENSIONS)}"
+        + "\n"
+        + format_offender_marker(
+            [*(f"extra:{item}" for item in _DUAL_WRITE_SPEC_DIMENSIONS - expected),
+             *(f"missing:{item}" for item in expected - _DUAL_WRITE_SPEC_DIMENSIONS)]
+        )
     )
 
 
@@ -5471,6 +5478,8 @@ def test_m2_all_alert_constructors_have_event_type():
         "These Alert() constructors are missing event_type= and will fail-open "
         "to the operator badge via the NULL read filter:\n"
         + "\n".join(f"  {loc}" for loc in missing)
+        + "\n"
+        + format_offender_marker(missing)
     )
 
 
@@ -5770,7 +5779,7 @@ def test_max_active_directions_all_read_sites_use_ten():
                 mismatch.append(f"{py_file.name}:{node.lineno} fallback={fallback.value}")
     assert not mismatch, (
         "max_active_directions .get() fallback must be 10 everywhere — "
-        f"found wrong fallbacks at: {mismatch}"
+        f"found wrong fallbacks at: {mismatch}" + "\n" + format_offender_marker(str(offender) for offender in mismatch)
     )
 
 

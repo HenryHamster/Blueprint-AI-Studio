@@ -175,7 +175,6 @@ describe('handleVerifyTests — bounded/fall-open safety net', () => {
       fileURLToPath(new URL('../prompts/check_backend_verification.sh', import.meta.url)),
       'utf8',
     );
-
     // The production lane must attribute both successful and failed JUnit runs
     // through the shared route-aware guard; a rendered traceback comparison is
     // not an acceptable substitute for these structured fields.

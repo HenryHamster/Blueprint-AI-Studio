@@ -5,7 +5,13 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.failure_classification import _CRED_FIELD_RE, _CRED_REDACT_SUBS
 from app.execution_capability_requirements import (

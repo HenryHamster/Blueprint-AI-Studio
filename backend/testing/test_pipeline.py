@@ -40,6 +40,7 @@ from app.models import (
     TaskStatus,
     DeploymentStatus,
 )
+from testing.fixgate_attribution import format_offender_marker
 
 
 # ── Verdict Parsing ─────────────────────────────────────────────────────────
@@ -3878,6 +3879,8 @@ async def test_rollup_merge_queue_updates_siblings_fifo_by_pr_created_at(
     assert updated_pr_order == [903, 902, 901], (
         f"siblings must be updated FIFO by PR created_at (closed #904 skipped), "
         f"got {updated_pr_order}"
+        + "\n"
+        + format_offender_marker(str(pr) for pr in updated_pr_order)
     )
     # Each updated sibling carries the in-flight marker + a forced PR refetch.
     from app.rollup_state import (
@@ -3953,6 +3956,8 @@ async def test_rollup_merge_queue_skips_not_behind_sibling(rollup_db, mocker):
     updated_pr_order = [c.args[3] for c in mock_update.await_args_list]
     assert updated_pr_order == [902], (
         f"only the genuinely-behind sibling gets update_branch, got {updated_pr_order}"
+        + "\n"
+        + format_offender_marker(str(pr) for pr in updated_pr_order)
     )
 
 
@@ -5921,7 +5926,11 @@ async def test_anomaly_detection_includes_top_patterns(spawn_db, mocker):
     assert len(patterns) >= 1
     # The "process exited" pattern should appear 3 times (same fingerprint)
     counts = sorted([p["count"] for p in patterns], reverse=True)
-    assert counts[0] == 3, f"Expected top pattern count=3, got {counts}"
+    assert counts[0] == 3, (
+        f"Expected top pattern count=3, got {counts}"
+        + "\n"
+        + format_offender_marker(str(count) for count in counts)
+    )
     assert counts[1] == 1
 
 

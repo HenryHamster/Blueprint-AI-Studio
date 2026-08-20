@@ -11,6 +11,7 @@ import re
 import tempfile
 import warnings
 from pathlib import Path
+from testing.fixgate_attribution import format_offender_marker
 
 BACKEND_ROOT = Path(__file__).parents[1]
 DURATIONS_PATH = BACKEND_ROOT / ".test_durations"
@@ -55,7 +56,7 @@ def test_durations_values_are_numeric() -> None:
     bad = {k: v for k, v in data.items() if not isinstance(v, (int, float))}
     assert not bad, (
         f"backend/.test_durations has {len(bad)} non-numeric value(s). "
-        f"First offenders: {dict(list(bad.items())[:5])}"
+        f"First offenders: {dict(list(bad.items())[:5])}" + "\n" + format_offender_marker(str(offender) for offender in bad)
     )
 
 
@@ -66,7 +67,7 @@ def test_durations_key_format() -> None:
     assert not bad, (
         f"backend/.test_durations has {len(bad)} key(s) with unexpected format. "
         f"Expected 'testing/test_<name>.py::<node_id>'. "
-        f"First offenders: {bad[:5]}"
+        f"First offenders: {bad[:5]}" + "\n" + format_offender_marker(str(offender) for offender in bad)
     )
 
 
@@ -143,6 +144,8 @@ def test_durations_coverage_fraction_within_threshold() -> None:
         f"({len(covered)}/{len(all_test_files)}), below the {MIN_COVERAGE_FRACTION:.0%} threshold. "
         f"Regenerate via scripts/store-backend-durations.sh. "
         f"Uncovered files ({len(uncovered)}): {uncovered[:10]}"
+        + "\n"
+        + format_offender_marker(uncovered)
     )
 
 
@@ -290,7 +293,7 @@ def test_durations_no_implausible_outliers() -> None:
         f"to the first test in a batch rather than real test cost.\n"
         f"Offending entries: {dict(list(outliers.items())[:5])}\n"
         f"Fix: strip entries > {_IMPLAUSIBLE_OUTLIER_CAP}s then recommit, or regenerate "
-        f"via scripts/batch-store-durations.sh (which caps automatically)."
+        f"via scripts/batch-store-durations.sh (which caps automatically)." + "\n" + format_offender_marker(str(offender) for offender in outliers)
     )
 
 
@@ -318,6 +321,7 @@ def test_durations_no_in_band_setup_attribution() -> None:
         f"{_IN_BAND_SETUP_MIN:g}-{_IN_BAND_SETUP_MAX:g}s setup-attribution band "
         f"with no observations through {_IN_BAND_SETUP_GAP_MAX:g}s. "
         "Strip these entries and regenerate via scripts/batch-store-durations.sh."
+        + "\n" + format_offender_marker(sorted(band))
     )
 
 
@@ -406,7 +410,7 @@ def test_durations_no_stale_entries() -> None:
         f"Stale entries ({min(len(stale), 10)} of {len(stale)} shown): "
         f"{stale[:10]}\n"
         f"Fix: remove these entries from backend/.test_durations, or regenerate "
-        f"via scripts/store-backend-durations.sh."
+        f"via scripts/store-backend-durations.sh." + "\n" + format_offender_marker(str(offender) for offender in stale)
     )
 
 
@@ -653,12 +657,14 @@ def test_in_band_setup_thresholds_match_durations_quality() -> None:
     missing = names.keys() - canonical.keys()
     assert not missing, (
         f"scripts/durations_quality.py is missing assignment(s) for: {sorted(missing)}"
+        + "\n" + format_offender_marker(sorted(missing))
     )
     for name, local_value in names.items():
         assert canonical[name] == local_value, (
             f"In-band setup threshold mismatch: scripts/durations_quality.py "
             f"defines {name} = {canonical[name]}, but this guard uses "
             f"_{name} = {local_value}. Update the local literal to match."
+            + "\n" + format_offender_marker([name])
         )
 
 

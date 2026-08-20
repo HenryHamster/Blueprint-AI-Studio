@@ -13,7 +13,7 @@ import os
 import pytest
 
 from testing import impacted_tests
-from testing.fixgate_attribution import parse_junit_report
+from testing.fixgate_attribution import format_offender_marker, parse_junit_report
 
 
 def _write(root: str, rel: str, content: str = "") -> None:
@@ -236,6 +236,30 @@ def test_junit_parser_extracts_offender_set_marker(tmp_path):
     }
 
 
+def test_offender_marker_formatter_is_deterministic_and_parseable(tmp_path):
+    marker = format_offender_marker(["app/z.py", "app/a.py", "app/z.py"])
+
+    assert marker == 'BLUEPRINT_OFFENDERS: ["app/a.py","app/z.py"]'
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        '<testsuite><testcase classname="testing.test_x" name="test_old">'
+        f"<failure>human diagnostic\n{marker}</failure>"
+        "</testcase></testsuite>",
+        encoding="utf-8",
+    )
+
+    parsed = parse_junit_report(report)
+
+    assert parsed.offender_sets == {
+        "testing.test_x::test_old::failure": frozenset({"app/a.py", "app/z.py"})
+    }
+
+
+def test_offender_marker_formatter_rejects_ambiguous_identities():
+    with pytest.raises(ValueError, match="single-line"):
+        format_offender_marker(["app/a.py\napp/b.py"])
+
+
 def test_backend_verification_treats_changed_failure_detail_as_new():
     current = {"backend/testing/test_x.py::test_old::failure": "line 99: changed"}
     baseline = {"backend/testing/test_x.py::test_old::failure": "line 12: old"}
@@ -304,6 +328,40 @@ def test_offender_set_new_path_remains_blocking():
     assert outcome["blocking"] is True
     assert outcome["new_failures"] == {key: current.failures[key]}
 
+
+def test_offender_marker_includes_snapshot_entry_identity():
+    """A second bad entry with the same field must not be suppressed as inherited."""
+    key = "backend/testing/test_event_type_invariants.py::test_snapshot_has_required_fields::failure"
+    current = impacted_tests.JUnitReport(
+        failures={
+            key: "Event type 'new_event' missing fields: {'audience'}\n"
+            'BLUEPRINT_OFFENDERS: ["new_event:audience"]'
+        },
+        test_routes={
+            "backend/testing/test_event_type_invariants.py::test_snapshot_has_required_fields"
+        },
+    )
+    baseline = impacted_tests.JUnitReport(
+        failures={
+            key: "Event type 'old_event' missing fields: {'audience'}\n"
+            'BLUEPRINT_OFFENDERS: ["old_event:audience"]'
+        },
+        test_routes={
+            "backend/testing/test_event_type_invariants.py::test_snapshot_has_required_fields"
+        },
+    )
+
+    outcome = impacted_tests.classify_backend_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures=current.failures,
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == {key: current.failures[key]}
 
 def test_backend_verification_keeps_diff_introduced_route_blocking():
     current = {"backend/testing/test_x.py::test_new::failure": "introduced"}
@@ -952,7 +1010,11 @@ def test_resolver_reads_each_app_and_test_source_once(tmp_path, monkeypatch):
         or os.sep + "backend" + os.sep + "testing" + os.sep in path
     ]
     assert app_and_test_sources
-    assert all(opened_py[path] == 1 for path in app_and_test_sources), opened_py
+    assert all(opened_py[path] == 1 for path in app_and_test_sources), (
+        str(opened_py)
+        + "\n"
+        + format_offender_marker(sorted(app_and_test_sources))
+    )
 
 
 def test_main_reads_stdin_and_writes_stdout(tmp_path, monkeypatch, capsys):

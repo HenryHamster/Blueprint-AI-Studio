@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from testing.fixgate_attribution import format_offender_marker
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10: tomllib was added in Python 3.11.
@@ -174,6 +176,7 @@ def test_rerun_allowlist_is_pinned_to_event_loop_signatures() -> None:
         f"{reruns_values!r}. A missing --reruns disables the event-loop "
         "flake net entirely; more than one or a different count changes "
         "the retry budget without this test being updated."
+        + "\n" + format_offender_marker(reruns_values)
     )
 
     only_rerun_values = [
@@ -191,6 +194,7 @@ def test_rerun_allowlist_is_pinned_to_event_loop_signatures() -> None:
         "unconditionally) turns the signature-scoped rerun net into a "
         "blanket retry on both sides of every differential guard, which "
         "can mask ordinary regressions as flakes."
+        + "\n" + format_offender_marker(only_rerun_values)
     )
 
 

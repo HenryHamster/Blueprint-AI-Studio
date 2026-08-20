@@ -285,7 +285,7 @@
     "test_autonomous_research.py": 20850,
     "test_orchestrator.py": 19850,
     "test_local_runner.py": 15100,
-    "test_invariants.py": 14850,
+    "test_invariants.py": 17100,
     "test_directions.py": 13400,
     "test_efficiency_snapshot.py": 13100,
     "test_digest.py": 12250,

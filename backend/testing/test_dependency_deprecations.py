@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from testing.fixgate_attribution import format_offender_marker
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -187,6 +189,8 @@ def test_no_pydantic_v1_idioms_in_app_source():
     assert not violations, (
         "Pydantic v1 idioms found in backend/app — replace with v2 equivalents:\n"
         + "\n".join(f"  {v}" for v in violations)
+        + "\n"
+        + format_offender_marker(violations)
     )
 
 
