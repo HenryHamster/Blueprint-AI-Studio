@@ -782,7 +782,7 @@ for attempt in 1 2 3; do
   fi
   if [ "$_PR_OBSERVED_REMOTE_SHA" != "$_PR_EXPECTED_REMOTE_SHA" ]; then
     # Our own checkpoint is not a competing writer.  Publication is the step
-    # that retires it, so refusing here strands finished, ./check-passing work
+    # that retires it, so refusing here strands finished, check-passing work
     # on a branch nothing else will ever publish (NeurIPS 37eea260, df1c89d0,
     # 9884994c and 0396aaee each blocked permanently this way).  Adopt it as
     # the lease authority exactly ONCE per invocation, and only when the tip

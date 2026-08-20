@@ -437,7 +437,7 @@ esac
   it("adopts this task's own unshipped-work checkpoint as the lease authority", async () => {
     // Regression: the remote tip is the checkpoint THIS task wrote on an earlier
     // attempt's fail-closed path. Treating it as a competing writer stranded
-    // finished, ./check-passing work forever (NeurIPS 37eea260, df1c89d0,
+    // finished, check-passing work forever (NeurIPS 37eea260, df1c89d0,
     // 9884994c, 0396aaee). Publication is the step that retires the checkpoint.
     const taskId = 'task-own-ckpt';
     const expectedSha = 'a'.repeat(40);
