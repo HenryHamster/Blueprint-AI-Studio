@@ -133,9 +133,26 @@ def _timeout_output(value: str | bytes | None) -> str:
     return value or ""
 
 
+# Per-file budget for the subprocess run below. 25 seconds keeps the lane
+# honest for ordinary static-assertion script tests. test_local_runner.py is
+# the one sanctioned outlier: it runs real subprocess integration checks
+# (venv provisioning, one real `--check` boot probing isolation backends)
+# whose combined cost on a loaded 2-vCPU CI runner exceeds the default.
+# Its budget must stay ABOVE the 120-second timeout its real-boot setUpClass
+# passes to subprocess.run, so a hung probe surfaces as that test's own
+# TimeoutExpired (a diagnosable failure) instead of an opaque budget kill.
+_FILE_BUDGET_SECONDS_DEFAULT = 25
+_FILE_BUDGET_SECONDS_OVERRIDES = {
+    "test_local_runner.py": 180,
+}
+
+
 @pytest.mark.parametrize("script_test", _script_test_parameters())
 def test_script_test_module_executes(script_test: Path) -> None:
     """Run each non-exempt script test as a real pytest subprocess."""
+    budget = _FILE_BUDGET_SECONDS_OVERRIDES.get(
+        script_test.name, _FILE_BUDGET_SECONDS_DEFAULT
+    )
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     pythonpath = [str(SCRIPT_ROOT), str(REPOSITORY_ROOT / "backend")]
@@ -161,12 +178,12 @@ def test_script_test_module_executes(script_test: Path) -> None:
             env=environment,
             capture_output=True,
             text=True,
-            timeout=25,
+            timeout=budget,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
         pytest.fail(
-            f"{script_test.name} exceeded the 25-second per-file test budget: "
+            f"{script_test.name} exceeded the {budget}-second per-file test budget: "
             f"{_timeout_output(exc.stdout)}{_timeout_output(exc.stderr)}"
         )
 

@@ -5442,10 +5442,17 @@ class TestDockerLogin(unittest.TestCase):
             m.stderr = b""
             return m
 
-        result = local_runner._docker_login(
-            {"server": "nvcr.io", "username": "$oauthtoken", "password": "mykey"},
-            _subprocess_run=fake_run,
-        )
+        # Stub runtime detection: the CI test container ships no docker CLI,
+        # and this test's subject is the login argv, not runtime discovery.
+        with patch.object(
+            local_runner.shutil,
+            "which",
+            side_effect=lambda name: "/usr/bin/docker" if name == "docker" else None,
+        ):
+            result = local_runner._docker_login(
+                {"server": "nvcr.io", "username": "$oauthtoken", "password": "mykey"},
+                _subprocess_run=fake_run,
+            )
         self.assertTrue(result)
         self.assertIn("docker", captured["cmd"])
         self.assertIn("login", captured["cmd"])
@@ -5710,11 +5717,17 @@ class TestRegistryHostDerivation(unittest.TestCase):
             m.stderr = b""
             return m
 
-        result = local_runner._docker_login(
-            {"username": "$oauthtoken", "password": "ngc-key"},  # no 'server'
-            container_image="nvcr.io/nvidia/tensorflow:25.01",
-            _subprocess_run=fake_run,
-        )
+        # Stub runtime detection: the CI test container ships no docker CLI.
+        with patch.object(
+            local_runner.shutil,
+            "which",
+            side_effect=lambda name: "/usr/bin/docker" if name == "docker" else None,
+        ):
+            result = local_runner._docker_login(
+                {"username": "$oauthtoken", "password": "ngc-key"},  # no 'server'
+                container_image="nvcr.io/nvidia/tensorflow:25.01",
+                _subprocess_run=fake_run,
+            )
         self.assertTrue(result)
         # Derived host appended as the docker login server argument.
         self.assertEqual(captured["cmd"][-1], "nvcr.io")
@@ -5730,11 +5743,17 @@ class TestRegistryHostDerivation(unittest.TestCase):
             m.stderr = b""
             return m
 
-        local_runner._docker_login(
-            {"username": "u", "password": "pw"},  # no 'server'
-            container_image="pytorch/pytorch:latest",
-            _subprocess_run=fake_run,
-        )
+        # Stub runtime detection: the CI test container ships no docker CLI.
+        with patch.object(
+            local_runner.shutil,
+            "which",
+            side_effect=lambda name: "/usr/bin/docker" if name == "docker" else None,
+        ):
+            local_runner._docker_login(
+                {"username": "u", "password": "pw"},  # no 'server'
+                container_image="pytorch/pytorch:latest",
+                _subprocess_run=fake_run,
+            )
         # No registry host appended — last token is the flag/value, not a host.
         self.assertNotIn("pytorch/pytorch:latest", captured["cmd"])
         self.assertEqual(captured["cmd"][-1], "u")  # ends with --username value
@@ -5749,11 +5768,17 @@ class TestRegistryHostDerivation(unittest.TestCase):
             m.stderr = b""
             return m
 
-        local_runner._docker_login(
-            {"server": "explicit.example.com", "password": "pw"},
-            container_image="nvcr.io/nvidia/tensorflow:25.01",
-            _subprocess_run=fake_run,
-        )
+        # Stub runtime detection: the CI test container ships no docker CLI.
+        with patch.object(
+            local_runner.shutil,
+            "which",
+            side_effect=lambda name: "/usr/bin/docker" if name == "docker" else None,
+        ):
+            local_runner._docker_login(
+                {"server": "explicit.example.com", "password": "pw"},
+                container_image="nvcr.io/nvidia/tensorflow:25.01",
+                _subprocess_run=fake_run,
+            )
         self.assertEqual(captured["cmd"][-1], "explicit.example.com")
 
 
