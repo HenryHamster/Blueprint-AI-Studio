@@ -688,6 +688,29 @@ async def sweep_stalled_strategic_cycles(
                         f"heartbeat ({hb}) — skipping stall declaration"
                     )
                     continue
+                # A QUEUED/PROVISIONING phase task has no running agent and so
+                # cannot heartbeat: after a rate-limit requeue the previous
+                # run's heartbeat is gone and this branch used to fall straight
+                # through to force-terminate a task that was actively
+                # recovering (sc-93fd806a: killed 60s into PROVISIONING).
+                # ``updated_at`` advances on every lifecycle write — requeue,
+                # claim, provision — so a recent row touch means recovery is
+                # in flight, not a stall. IN_PROGRESS stays heartbeat-governed
+                # above so a zombie agent is still reaped.
+                if (
+                    linked_task.status
+                    in (TaskStatus.QUEUED, TaskStatus.PROVISIONING)
+                    and linked_task.updated_at is not None
+                    and linked_task.updated_at >= hb_cutoff
+                ):
+                    logger.info(
+                        f"[REAPER] Cycle {c.id} in {stalled_phase} >3h "
+                        f"but linked task {linked_task_id} is "
+                        f"{linked_task.status} with recent lifecycle "
+                        f"activity ({linked_task.updated_at}) — recovery in "
+                        f"flight, skipping stall declaration"
+                    )
+                    continue
                 from app.failure_classification import (
                     AGENT_STALLED,
                     persist_failure_category,

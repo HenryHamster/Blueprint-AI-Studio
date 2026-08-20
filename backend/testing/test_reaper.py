@@ -6224,6 +6224,131 @@ async def test_step7_stalled_cycle_live_task_not_declared_stalled(
 
 
 @pytest.mark.asyncio
+async def test_step7_requeued_phase_task_with_recent_activity_not_reaped(
+    reaper_db, mocker
+):
+    """A rate-limit-requeued phase task mid-recovery must not be force-killed.
+
+    sc-93fd806a: the phase2 resident session hit a provider 429 session limit,
+    self-requeued (FAILED -> PROVISIONING -> QUEUED -> PROVISIONING), and 60
+    seconds later the stall sweep force-terminated it — the requeue cleared
+    ``last_heartbeat`` and a QUEUED/PROVISIONING task has no agent to
+    heartbeat, so the NULL-heartbeat path fell straight through to the kill.
+    A recent ``updated_at`` (every lifecycle write advances it) is the
+    liveness signal for that window.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2-requeued",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.PROVISIONING,
+        last_heartbeat=None,
+        latest_status_message="Rate Limit — requeued",
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 0
+    assert task.status == TaskStatus.PROVISIONING, (
+        "a requeued phase task with recent lifecycle activity is recovering, "
+        "not stalled — the reaper must not force-terminate it"
+    )
+    assert cycle.outcome == "phase2_running"
+    assert cycle.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_step7_wedged_queued_phase_task_without_activity_still_reaped(
+    reaper_db, mocker
+):
+    """The recent-activity skip must not shield a genuinely wedged QUEUED task.
+
+    Mutation guard for the requeue exemption above: a phase task that has sat
+    QUEUED with no heartbeat AND no lifecycle write for hours is the exact
+    wedge the stall sweep exists to converge.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2-wedged",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    # Force updated_at into the past (bypassing the onupdate hook): the task
+    # row has not been touched since long before the liveness window.
+    from sqlalchemy import update as _sa_update
+
+    await reaper_db.execute(
+        _sa_update(Task)
+        .where(Task.id == task.id)
+        .values(updated_at=_utcnow() - timedelta(hours=2))
+    )
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 1
+    assert task.status == TaskStatus.FAILED
+    assert cycle.outcome == "stalled_phase2"
+    assert cycle.failure_reason == (
+        "reaper_stall: cycle in phase2 >3h with no completion"
+    )
+
+
+@pytest.mark.asyncio
 async def test_step7_reconciles_already_terminal_task_while_pipeline_paused(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
