@@ -2056,6 +2056,138 @@ def test_promote_recover_cut_falls_back_when_lifecycle_read_fails(monkeypatch):
     assert prompts[0] == "About to abandon the open version and open the next. Proceed? [y/N] "
     assert not any(method == "POST" and "version-cut" in path for method, path, _ in calls)
 
+def _force_promote_harness(monkeypatch, lifecycle, answer="n"):
+    """Wire promote-recover force-promote against a canned lifecycle read.
+
+    Returns ``(calls, prompts)``; ``lifecycle`` may be an Exception to simulate
+    a failed read.
+    """
+    calls = []
+    prompts = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "GET" and "version-lifecycle" in path:
+            if isinstance(lifecycle, Exception):
+                raise lifecycle
+            return lifecycle
+        if method == "POST" and "promote/force" in path:
+            return {"status": "promoted", "pr_number": 999}
+        raise AssertionError(f"unexpected API call: {method} {path}")
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or answer)
+    return calls, prompts
+
+
+_FORCE_PROMOTE_LIFECYCLE = {
+    "current_version": {
+        "version_number": 34,
+        "phase": "stabilize",
+        "in_flight_task_count": 2,
+        "active_candidate_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "last_qualification": {
+            "status": "blocked",
+            "blocker": "candidate_operator_authorship_nonzero",
+            "confidence": 0.0,
+            "threshold": 0.75,
+        },
+    }
+}
+
+
+def test_promote_recover_force_promote_discloses_what_it_overrides(monkeypatch):
+    """The most privileged lever must name the version, candidate and blocker.
+
+    A bare "About to FORCE-PROMOTE. Proceed?" is not an informed confirmation:
+    the operator cannot tell which commit ships or which gate is being skipped.
+    """
+    calls, prompts = _force_promote_harness(monkeypatch, _FORCE_PROMOTE_LIFECYCLE)
+
+    rc = blueprint.main(["promote-recover", "force-promote"])
+    assert rc == 0
+    assert prompts, "expected a confirmation prompt"
+    prompt = prompts[0]
+    assert "FORCE-PROMOTE v34" in prompt
+    assert "SKIPPING the audit gate" in prompt
+    assert "candidate_operator_authorship_nonzero" in prompt
+    assert "aaaaaaaaaaaa" in prompt
+    assert "2 in-flight tasks will NOT be" in prompt
+    # CI is NOT waived by force-promote, and a red run destroys the promotion
+    # PR + branch (see the force-promote endpoint docstring). Declining to say
+    # so would invite an operator to fire this at a red candidate.
+    assert "CI is NOT skipped" in prompt
+    assert "DELETES" in prompt
+    assert not any("promote/force" in path for _, path, _ in calls), (
+        "declining the prompt must not fire the mutation"
+    )
+
+
+def test_promote_recover_force_promote_warns_when_pinned_sha_is_not_the_candidate(monkeypatch):
+    """A pinned --candidate-sha that is not the evaluated candidate is called out."""
+    _calls, prompts = _force_promote_harness(monkeypatch, _FORCE_PROMOTE_LIFECYCLE)
+
+    rc = blueprint.main([
+        "promote-recover", "force-promote", "--candidate-sha", "bbbbbbbbbbbb",
+    ])
+    assert rc == 0
+    prompt = prompts[0]
+    assert "PINNED commit bbbbbbbbbbbb" in prompt
+    assert "NOT the candidate under evaluation" in prompt
+
+
+def test_promote_recover_force_promote_still_warns_when_lifecycle_read_fails(monkeypatch):
+    """A failed lifecycle read must not silently degrade to a bare y/N."""
+    _calls, prompts = _force_promote_harness(monkeypatch, RuntimeError("boom"))
+
+    rc = blueprint.main(["promote-recover", "force-promote"])
+    assert rc == 0
+    prompt = prompts[0]
+    assert "SKIPPING the audit gate" in prompt
+    assert "Lifecycle read FAILED" in prompt
+    assert "CI is NOT skipped" in prompt
+
+
+def test_promote_recover_force_promote_posts_candidate_and_reason(monkeypatch):
+    """With --yes the lever POSTs to promote/force carrying sha + reason."""
+    calls, _prompts = _force_promote_harness(monkeypatch, _FORCE_PROMOTE_LIFECYCLE)
+
+    rc = blueprint.main([
+        "--json", "promote-recover", "force-promote", "--yes",
+        "--candidate-sha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--reason", "authorship gate latched",
+    ])
+    assert rc == 0
+    posts = [
+        (path, body) for method, path, body in calls
+        if method == "POST" and "promote/force" in path
+    ]
+    assert len(posts) == 1, f"expected exactly one force-promote POST, got {posts}"
+    path, body = posts[0]
+    assert path == "/api/admin/projects/proj-1/promote/force"
+    assert body["candidate_sha"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    assert body["reason"] == "authorship gate latched"
+
+
+def test_promote_recover_force_promote_read_only_config_refuses(monkeypatch):
+    """A read-only (agent-JWT) config must not reach the most privileged lever."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+
+    def fake_api(method, path, body=None, timeout=30):
+        raise AssertionError(f"read-only config must not call the API: {method} {path}")
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    with pytest.raises(SystemExit):
+        blueprint.main(["promote-recover", "force-promote", "--yes"])
+
+
 
 def test_ops_requeue_failed_aborts_without_confirmation(mock_api, monkeypatch, capsys):
     """ops requeue-failed without --yes on non-interactive stdin must not fire."""
